@@ -68,6 +68,23 @@ pub struct InputSourceCut {
     pub tail: Option<InputId>,
 }
 
+// A staged selection changes only the original mailbox's eligible heads.
+// It neither registers a Source nor changes resource ownership or lock order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputSourceMode {
+    All,
+    Only(ActorId),
+    Prefer(ActorId),
+}
+impl InputSourceMode {
+    pub(crate) fn contending_source(self) -> Option<ActorId> {
+        match self {
+            Self::All => None,
+            Self::Only(source) | Self::Prefer(source) => Some(source),
+        }
+    }
+}
+
 pub struct ActorStep<'a, E> {
     scope: &'a crate::transaction::ScopeHandle,
     turn: &'a mut TurnBudget,
@@ -86,7 +103,7 @@ pub struct ActorStep<'a, E> {
     >,
     metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
-    input_source: Option<Option<ActorId>>,
+    input_source: Option<InputSourceMode>,
     input_source_cut: Option<InputSourceCut>,
 }
 impl<'a, E> ActorStep<'a, E> {
@@ -205,7 +222,17 @@ impl<'a, E> ActorStep<'a, E> {
     /// Callers keep protocol ingress distinct from these continuation sources;
     /// changing a Source identity to bypass its earlier input is invalid.
     pub fn select_input_source(&mut self, source: Option<ActorId>) {
-        self.input_source = Some(source);
+        self.input_source = Some(source.map_or(InputSourceMode::All, InputSourceMode::Only));
+    }
+    /// Prefer this original source and the actor's own source while it has a
+    /// current queued head; otherwise retain normal all-source selection.
+    /// This is a staged idle/start choice, not a frozen drain boundary. A
+    /// caller freezes its finite prefix and switches to `select_input_source`
+    /// before continuing that phase. A real bootstrap step must install this
+    /// choice before competing protocol inputs; registration still defaults
+    /// to All. No Source identity, input, Work or capacity is created here.
+    pub fn prefer_input_source(&mut self, source: ActorId) {
+        self.input_source = Some(InputSourceMode::Prefer(source));
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
     /// handoff as its neutral effect. No queue/capture may bind it beforehand.
@@ -326,7 +353,7 @@ pub(crate) struct MetadataEffect<E> {
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
     pub(crate) stop_producing: bool,
-    pub(crate) input_source: Option<Option<ActorId>>,
+    pub(crate) input_source: Option<InputSourceMode>,
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,

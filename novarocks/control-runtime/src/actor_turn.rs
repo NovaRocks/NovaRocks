@@ -28,7 +28,10 @@ pub use poller_observation::{
 };
 
 use crate::{
-    actor::{Actor, ActorConfig, ActorFailurePolicy, ActorStep, InputSourceCut, StepEnvelope},
+    actor::{
+        Actor, ActorConfig, ActorFailurePolicy, ActorStep, InputSourceCut, InputSourceMode,
+        StepEnvelope,
+    },
     notify::Notify,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
@@ -459,7 +462,7 @@ struct Inbox<A: Actor> {
     sealed: bool,
     payloads: BTreeMap<InputId, A::Input>,
     mailbox: MailboxState,
-    input_source: Option<ActorId>,
+    input_source: InputSourceMode,
     prefer_actor_source: bool,
     inputs: BTreeMap<InputId, InputRecord>,
     standing_inputs: BTreeMap<StandingInputId, StandingInputRecord>,
@@ -487,10 +490,18 @@ struct Inbox<A: Actor> {
     failure_action_watermark: u64,
 }
 impl<A: Actor> Inbox<A> {
+    fn selected_source(&self) -> Option<ActorId> {
+        match self.input_source {
+            InputSourceMode::All => None,
+            InputSourceMode::Only(source) => Some(source),
+            InputSourceMode::Prefer(source) => self.mailbox.tail_from(source).map(|_| source),
+        }
+    }
     fn ready_classes(&self, actor: ActorId) -> [bool; 4] {
+        let selected = self.selected_source();
         std::array::from_fn(|index| {
             let class = InputClass::ALL[index];
-            self.input_source.map_or_else(
+            selected.map_or_else(
                 || self.mailbox.has_ready(class),
                 |source| {
                     self.mailbox.has_ready_from(class, source)
@@ -503,7 +514,7 @@ impl<A: Actor> Inbox<A> {
         self.ready_classes(actor).into_iter().any(|ready| ready)
     }
     fn pop_selected(&mut self, actor: ActorId, class: InputClass) -> Option<InputEnvelope> {
-        let Some(source) = self.input_source else {
+        let Some(source) = self.selected_source() else {
             return self.mailbox.pop(class);
         };
         let continuation = self.mailbox.has_ready_from(class, source);
@@ -2487,7 +2498,7 @@ impl<A: Actor> ActorRuntime<A> {
                     sealed: false,
                     payloads: BTreeMap::new(),
                     mailbox: MailboxState::new(config.mailbox),
-                    input_source: None,
+                    input_source: InputSourceMode::All,
                     prefer_actor_source: false,
                     inputs: BTreeMap::new(),
                     standing_inputs: BTreeMap::new(),
@@ -3256,8 +3267,10 @@ impl<A: Actor> ActorRuntime<A> {
                     if let Some(source) = input_source
                         && inbox.input_source != source
                     {
+                        if inbox.input_source.contending_source() != source.contending_source() {
+                            inbox.prefer_actor_source = false;
+                        }
                         inbox.input_source = source;
-                        inbox.prefer_actor_source = false;
                     }
                     inbox
                         .inputs
