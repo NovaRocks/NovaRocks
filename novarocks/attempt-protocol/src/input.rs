@@ -251,14 +251,26 @@ pub enum WithdrawalOutcome {
     TooLate,
 }
 
+/// Actual result of the SAME original publication owner. It carries no
+/// completion/visibility or work-exit authority beyond that specific apply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationApplied {
+    RootStatus,
+    ProtocolBatch { published: bool },
+    FinalTaskInfo,
+    Diagnostics,
+    DevRootObservation,
+}
+
 #[derive(Clone, Debug)]
 pub enum ExecutorFact {
     Operation(OperationReply),
-    /// The original protocol publisher has actually applied this batch (or
-    /// returned its original failure). Effect handoff alone is not this fact.
-    ProtocolPublicationApplied {
+    /// The selected original publisher has actually returned. Match both the
+    /// effect and its original publication kind before releasing the phase.
+    /// Handoff, result filling and actual job exit cannot supply this result.
+    PublicationApplied {
         effect: AttemptActionId,
-        result: Result<bool, AttemptFailure>,
+        result: Result<PublicationApplied, AttemptFailure>,
     },
     /// The executor job won its start arbitration. This grants no Create gate.
     SendStarted {

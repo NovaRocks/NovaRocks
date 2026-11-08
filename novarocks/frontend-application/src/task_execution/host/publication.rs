@@ -27,6 +27,7 @@ use crate::task_execution::{
 };
 use novarocks_attempt_protocol::{
     effect::Publication,
+    input::PublicationApplied,
     publication::{DiagnosticPublication, DiagnosticSources, SplitDiagnosticObservation},
     start::PayloadRef,
 };
@@ -286,7 +287,7 @@ impl PublicationRecord {
         &mut self,
         publication: Publication,
         mut sources: Option<DiagnosticSourceSnapshot>,
-    ) -> Result<(), PublicationError> {
+    ) -> Result<PublicationApplied, PublicationError> {
         match publication {
             Publication::RootStatus(projection) => {
                 let failure = match projection.failure {
@@ -301,11 +302,14 @@ impl PublicationRecord {
                     .ok_or(PublicationError::MissingRootPublisher)?
                     .publish_attempt_observation(projection.status, failure)
                     .map_err(PublicationError::Root)?;
+                Ok(PublicationApplied::RootStatus)
             }
             Publication::ProtocolBatch(batch) => {
-                self.protocol
+                let published = self
+                    .protocol
                     .publish_core_batch(self.activation, batch)
                     .map_err(PublicationError::Protocol)?;
+                Ok(PublicationApplied::ProtocolBatch { published })
             }
             Publication::FinalTaskInfo(info) => {
                 self.profile
@@ -313,6 +317,7 @@ impl PublicationRecord {
                     .ok_or(PublicationError::MissingProfileObserver)?
                     .collected
                     .push(Arc::new(info));
+                Ok(PublicationApplied::FinalTaskInfo)
             }
             Publication::Diagnostics(cut) => {
                 let ready = self
@@ -326,6 +331,7 @@ impl PublicationRecord {
                     .ok_or(PublicationError::MissingProfileObserver)?
                     .publish_core_cut(ready, cut, sources)
                     .map_err(PublicationError::Protocol)?;
+                Ok(PublicationApplied::Diagnostics)
             }
             Publication::DevRootObservation { status, installed } => {
                 #[cfg(novarocks_dev_controls)]
@@ -340,9 +346,9 @@ impl PublicationRecord {
                 }
                 #[cfg(not(novarocks_dev_controls))]
                 let _ = (status, installed);
+                Ok(PublicationApplied::DevRootObservation)
             }
         }
-        Ok(())
     }
     /// The bridge consumes this exact publisher for the original seal reply.
     /// There is no Clone path and no replacement root publisher is constructed.
@@ -354,3 +360,6 @@ impl PublicationRecord {
             .ok_or(PublicationError::MissingRootPublisher)
     }
 }
+
+#[cfg(test)]
+mod tests;
