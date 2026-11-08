@@ -18,5 +18,5 @@
 pub(crate) mod observations;
 pub(crate) mod subscriptions;
 
-pub(crate) mod pumps;
 pub(crate) mod publication;
+pub(crate) mod pumps;

@@ -1195,7 +1195,7 @@ mod tests {
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 0,
-                    changes: Box::default(),
+                    changes: Vec::new(),
                     selected_failure: None,
                     root_success_sealed: false,
                 },
@@ -1236,7 +1236,7 @@ mod tests {
         ] {
             assert!(
                 publisher
-                    .publish_core_batch(activation(1), batch(bad.into_boxed_slice()))
+                    .publish_core_batch(activation(1), batch(bad))
                     .is_err()
             );
             assert_eq!(*publisher.revisions.borrow(), original_revision);
@@ -1249,7 +1249,7 @@ mod tests {
         }
         assert!(
             publisher
-                .publish_core_batch(activation(2), batch(Box::default()))
+                .publish_core_batch(activation(2), batch(Vec::new()))
                 .is_err()
         );
         assert_eq!(*publisher.revisions.borrow(), original_revision);
@@ -1265,7 +1265,7 @@ mod tests {
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 0,
-                    changes: Box::default(),
+                    changes: Vec::new(),
                     selected_failure: None,
                     root_success_sealed: false,
                 },
@@ -1283,7 +1283,7 @@ mod tests {
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 1,
-                    changes: Box::new([
+                    changes: vec![
                         ProtocolTaskChange {
                             identity: identity(1),
                             status: Some(status(1, 2)),
@@ -1294,7 +1294,7 @@ mod tests {
                             status: Some(status(2, 3)),
                             first_writer_witness: Some(witness.clone()),
                         },
-                    ]),
+                    ],
                     selected_failure: Some(failure.clone()),
                     root_success_sealed: true,
                 },

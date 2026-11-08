@@ -910,6 +910,13 @@ impl QueryTaskExecution {
         self.accepted_protocol_dirty_tasks.clear();
     }
 
+    /// Transfer this original dirty root at the publication point. The Core
+    /// must hold its primary-input barrier until the batch is actually applied.
+    /// No second Task snapshot store is created by this transfer.
+    pub(crate) fn take_accepted_protocol_task_changes(&mut self) -> BTreeSet<TaskId> {
+        std::mem::take(&mut self.accepted_protocol_dirty_tasks)
+    }
+
     pub(crate) fn accepted_protocol_writer_witness(
         &self,
         task: TaskId,
@@ -4467,3 +4474,6 @@ mod stage_demand_cut_tests {
         assert!(!execution.has_pending_stage_propagation());
     }
 }
+
+#[cfg(test)]
+mod protocol_publication_tests;

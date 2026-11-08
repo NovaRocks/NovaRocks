@@ -254,6 +254,12 @@ pub enum WithdrawalOutcome {
 #[derive(Clone, Debug)]
 pub enum ExecutorFact {
     Operation(OperationReply),
+    /// The original protocol publisher has actually applied this batch (or
+    /// returned its original failure). Effect handoff alone is not this fact.
+    ProtocolPublicationApplied {
+        effect: AttemptActionId,
+        result: Result<bool, AttemptFailure>,
+    },
     /// The executor job won its start arbitration. This grants no Create gate.
     SendStarted {
         effect: AttemptActionId,

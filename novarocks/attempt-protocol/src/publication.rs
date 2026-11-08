@@ -17,6 +17,8 @@
 
 //! Core-authored cuts published atomically through the original host records.
 
+pub(crate) mod protocol_cursor;
+
 use novarocks_coordination_contract::{AttemptComputationCut, SelectedTaskTermination};
 use novarocks_execution_contract::{FinalTaskInfo, OperationOutcome, TaskIdentity, TaskStatus};
 
@@ -33,7 +35,8 @@ pub struct ProtocolTaskChange {
 #[derive(Clone, Debug)]
 pub struct ProtocolPublication {
     pub owner_revision: u64,
-    pub changes: Box<[ProtocolTaskChange]>,
+    /// Move the charged assembly without a final shrink/copy on the poller.
+    pub changes: Vec<ProtocolTaskChange>,
     pub selected_failure: Option<SelectedTaskTermination>,
     pub root_success_sealed: bool,
 }
