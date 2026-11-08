@@ -300,10 +300,8 @@ fn bound() -> crate::repository::MvProjectionInventoryBound {
     crate::repository::MvProjectionInventoryBound {
         entries: 4,
         snapshot_bytes: 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: PersistenceDecodeBudget::default(),
     }
 }
 

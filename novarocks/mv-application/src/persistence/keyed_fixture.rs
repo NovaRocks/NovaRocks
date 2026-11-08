@@ -35,12 +35,9 @@ impl KeyedProjectionFixture {
         let f = crate::persistence::test_support::MvDocumentFixture::new();
         let (catalog, view) =
             crate::persistence::keyed_documents::keyed_view_fixture(snapshot, snapshot.is_some());
-        let observed = crate::persistence::keyed_documents::decode_current_keyed_documents(
-            view,
-            catalog,
-            Default::default(),
-        )
-        .expect("keyed fixture");
+        let observed =
+            crate::persistence::keyed_documents::decode_current_keyed_documents(view, catalog)
+                .expect("keyed fixture");
         Self {
             target,
             object_id: f.object_id,
@@ -144,8 +141,7 @@ impl KeyedProjectionFixture {
                 .map_err(|e| e.to_string())?
                 .records;
         }
-        let observed = decode_current_keyed_documents(view, catalog, Default::default())
-            .map_err(|e| e.to_string())?;
+        let observed = decode_current_keyed_documents(view, catalog).map_err(|e| e.to_string())?;
         MvKeyedDocumentProjection::try_from_current(observed)
     }
 }
@@ -201,6 +197,5 @@ pub fn observed_current_keyed(
                 .records
         })
         .unwrap_or_default();
-    decode_current_keyed_documents(view, catalog, Default::default())
-        .expect("typed keyed Current fixture")
+    decode_current_keyed_documents(view, catalog).expect("typed keyed Current fixture")
 }

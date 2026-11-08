@@ -3562,8 +3562,7 @@ fn installed_keyed_drop_fixture() -> (
         .complete_keyed_current_observation(pending, &lease, request.clone())
         .unwrap();
     assert_eq!(phase, ManagementObservationPhase::Ready);
-    let documents =
-        decode_current_keyed_documents(view, target.catalog().clone(), Default::default()).unwrap();
+    let documents = decode_current_keyed_documents(view, target.catalog().clone()).unwrap();
     assert!(documents.publication.is_some());
     let dependencies = documents.management_dependencies(lease.control_runtime_id());
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
@@ -3584,23 +3583,18 @@ fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
         ConnectorCommittedVersion::try_new(Bytes::from_static(b"external"), Some(3)).unwrap();
     external.current_records.clear();
     *caps.reply.lock().unwrap() = Ok(external.clone());
-    assert!(
-        decode_current_keyed_documents(external, target.catalog().clone(), Default::default())
-            .is_err()
-    );
+    assert!(decode_current_keyed_documents(external, target.catalog().clone()).is_err());
     assert!(
         entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .is_err()
     );
     let (first, _) = entrance
-        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .observe_keyed_drop(&lease, request.clone())
         .unwrap();
     assert_eq!(first.target(), &target);
     let mut management = entrance.acquire(first.request(), || false).unwrap();
-    let (second, _) = entrance
-        .observe_keyed_drop(&lease, request, Default::default())
-        .unwrap();
+    let (second, _) = entrance.observe_keyed_drop(&lease, request).unwrap();
     assert!(first.matches(&second));
     management
         .mark_dispatched(EffectResponsibility::new(
@@ -3621,10 +3615,7 @@ fn keyed_drop_of_external_data_snapshot_preserves_current_projection_refusal() {
     // This management-only operation did not change the provider's data facts.
     let retained = caps.reply.lock().unwrap().as_ref().unwrap().clone();
     assert!(retained.current_records.is_empty());
-    assert!(
-        decode_current_keyed_documents(retained, target.catalog().clone(), Default::default())
-            .is_err()
-    );
+    assert!(decode_current_keyed_documents(retained, target.catalog().clone()).is_err());
     assert!(!original.current_records.is_empty());
 }
 
@@ -3650,11 +3641,7 @@ fn keyed_drop_refuses_foreign_owner_and_incarnation_without_renewing_admission()
             .unwrap()
             .value =
             management_slot(&owner(marker_owner), &incarnation(marker_incarnation)).unwrap();
-        assert!(
-            entrance
-                .observe_keyed_drop(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_drop(&lease, request).is_err());
         assert_eq!(entrance.management_phase(target.table()), expected);
     }
 }
@@ -3669,11 +3656,7 @@ fn keyed_drop_refuses_exact_scope_changes_before_observation() {
         } else {
             request.object_id = object(b"replacement");
         }
-        assert!(
-            entrance
-                .observe_keyed_drop(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_drop(&lease, request).is_err());
         assert_eq!(caps.calls.load(std::sync::atomic::Ordering::SeqCst), calls);
         assert_eq!(
             entrance.management_phase(target.table()),
@@ -3685,7 +3668,7 @@ fn keyed_drop_refuses_exact_scope_changes_before_observation() {
     let (another_runtime, _, _) = keyed_management_lease(&target, view);
     assert!(
         entrance
-            .observe_keyed_drop(&another_runtime, request, Default::default())
+            .observe_keyed_drop(&another_runtime, request)
             .is_err()
     );
 }
@@ -3721,11 +3704,7 @@ fn keyed_drop_does_not_bypass_publication_unknown_or_committed_convergence() {
             ))
             .unwrap();
         publication.record_terminal(disposition).unwrap();
-        assert!(
-            entrance
-                .observe_keyed_drop(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_drop(&lease, request).is_err());
         assert_ne!(
             entrance.management_phase(target.table()),
             MvManagementPhase::Manageable
@@ -3775,7 +3754,7 @@ fn keyed_drop_reconciles_soft_slot_evidence_through_the_retained_lease() {
         CommitConclusion::Committed(CommitProof::SlotWriter),
     ]);
     let (first, unknown) = entrance
-        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .observe_keyed_drop(&lease, request.clone())
         .unwrap();
     assert!(unknown.conclusions.is_empty());
     assert_eq!(entrance.pending_slot_changes(target.table()), 1);
@@ -3784,9 +3763,7 @@ fn keyed_drop_reconciles_soft_slot_evidence_through_the_retained_lease() {
         MvManagementPhase::Manageable
     );
     let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
-    let (second, committed) = entrance
-        .observe_keyed_drop(&lease, request, Default::default())
-        .unwrap();
+    let (second, committed) = entrance.observe_keyed_drop(&lease, request).unwrap();
     assert!(first.matches(&second));
     assert!(committed.reinstall_current_projection);
     assert_eq!(
@@ -3813,11 +3790,7 @@ fn keyed_drop_requires_an_intact_current_root_closure() {
         let root = view.roots["novarocks.mv"].identity;
         view.versions.remove(&root);
     }
-    assert!(
-        entrance
-            .observe_keyed_drop(&lease, request, Default::default())
-            .is_err()
-    );
+    assert!(entrance.observe_keyed_drop(&lease, request).is_err());
     assert_eq!(
         entrance.management_phase(target.table()),
         MvManagementPhase::Manageable
@@ -3830,7 +3803,7 @@ fn fresh_foreign_keyed_admission_closes_old_authority_even_without_current_p() {
     for publication in ["valid", "missing", "malformed"] {
         let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
         let (_, prior_admission, _) = entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .unwrap();
         assert!(prior_admission.is_open());
         {
@@ -3848,11 +3821,7 @@ fn fresh_foreign_keyed_admission_closes_old_authority_even_without_current_p() {
                 _ => {}
             }
         }
-        assert!(
-            entrance
-                .observe_keyed_admission(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_admission(&lease, request).is_err());
         assert!(!prior_admission.is_open());
         assert_eq!(
             entrance.management_phase(target.table()),
@@ -3882,7 +3851,7 @@ fn keyed_drop_freezes_configuration_content_and_rejects_changed_root_semantics()
     };
     let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
     let (first, _) = entrance
-        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .observe_keyed_drop(&lease, request.clone())
         .unwrap();
     {
         let mut reply = caps.reply.lock().unwrap();
@@ -3891,8 +3860,7 @@ fn keyed_drop_freezes_configuration_content_and_rejects_changed_root_semantics()
             .slots
             .get_mut(&configuration_slot_name().unwrap())
             .unwrap();
-        let mut configuration =
-            decode_configuration(&slot.value.content, Default::default()).unwrap();
+        let mut configuration = decode_configuration(&slot.value.content).unwrap();
         configuration.paused = !configuration.paused;
         slot.value = keyed_configuration_slot_change(&configuration)
             .unwrap()
@@ -3902,7 +3870,7 @@ fn keyed_drop_freezes_configuration_content_and_rejects_changed_root_semantics()
             .unwrap();
     }
     let (second, _) = entrance
-        .observe_keyed_drop(&lease, request.clone(), Default::default())
+        .observe_keyed_drop(&lease, request.clone())
         .unwrap();
     assert!(!first.matches(&second));
     let mut changed = KeyedProjectionFixture::new(
@@ -3919,11 +3887,7 @@ fn keyed_drop_freezes_configuration_content_and_rejects_changed_root_semantics()
         old.slots[&management_slot_name().unwrap()].clone(),
     );
     *caps.reply.lock().unwrap() = Ok(view);
-    assert!(
-        entrance
-            .observe_keyed_drop(&lease, request, Default::default())
-            .is_err()
-    );
+    assert!(entrance.observe_keyed_drop(&lease, request).is_err());
 }
 
 #[test]
@@ -3940,7 +3904,7 @@ fn keyed_drop_revokes_foreign_management_before_corrupt_configuration_or_root() 
             let (entrance, target, dependencies, lease, request, caps) =
                 installed_keyed_drop_fixture();
             let (_, prior, _) = entrance
-                .observe_keyed_admission(&lease, request.clone(), Default::default())
+                .observe_keyed_admission(&lease, request.clone())
                 .unwrap();
             let old_request = ManagementRequest::try_new(
                 target.catalog().clone(),
@@ -4006,11 +3970,7 @@ fn keyed_drop_revokes_foreign_management_before_corrupt_configuration_or_root() 
             } else {
                 *caps.reply.lock().unwrap() = Ok(foreign);
             }
-            assert!(
-                entrance
-                    .observe_keyed_drop(&lease, request, Default::default())
-                    .is_err()
-            );
+            assert!(entrance.observe_keyed_drop(&lease, request).is_err());
             assert!(!prior.is_open());
             assert_eq!(
                 entrance.management_phase(target.table()),
@@ -4035,7 +3995,7 @@ fn keyed_drop_corrupt_configuration_or_root_still_refuses_for_the_matching_owner
     for corrupt_configuration in [false, true] {
         let (entrance, _, _, lease, request, caps) = installed_keyed_drop_fixture();
         let (_, prior, _) = entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .unwrap();
         {
             let mut reply = caps.reply.lock().unwrap();
@@ -4050,11 +4010,7 @@ fn keyed_drop_corrupt_configuration_or_root_still_refuses_for_the_matching_owner
                 view.roots.get_mut("novarocks.mv").unwrap().dangling = true;
             }
         }
-        assert!(
-            entrance
-                .observe_keyed_drop(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_drop(&lease, request).is_err());
         assert!(prior.is_open());
     }
 }
@@ -4066,7 +4022,7 @@ fn keyed_drop_foreign_scope_does_not_revoke_another_targets_authority() {
         let (entrance, target, dependencies, lease, mut request, caps) =
             installed_keyed_drop_fixture();
         let (_, prior, _) = entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .unwrap();
         {
             let mut reply = caps.reply.lock().unwrap();
@@ -4081,11 +4037,7 @@ fn keyed_drop_foreign_scope_does_not_revoke_another_targets_authority() {
                 view.object_id = object(b"another-current-object");
             }
         }
-        assert!(
-            entrance
-                .observe_keyed_drop(&lease, request, Default::default())
-                .is_err()
-        );
+        assert!(entrance.observe_keyed_drop(&lease, request).is_err());
         assert!(prior.is_open());
         assert_eq!(
             entrance.management_phase(target.table()),
@@ -4118,7 +4070,7 @@ fn shared_current_reader_revokes_foreign_authority_before_publication_decoding()
     for publication in ["valid", "missing", "malformed"] {
         let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
         let (_, prior, _) = entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .unwrap();
         {
             let mut reply = caps.reply.lock().unwrap();
@@ -4134,12 +4086,7 @@ fn shared_current_reader_revokes_foreign_authority_before_publication_decoding()
             }
         }
         let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
-        let result = observe_current_keyed_documents_with_management(
-            &lease,
-            request,
-            Default::default(),
-            &entrance,
-        );
+        let result = observe_current_keyed_documents_with_management(&lease, request, &entrance);
         assert_eq!(
             caps.calls.load(std::sync::atomic::Ordering::SeqCst),
             before + 1
@@ -4187,7 +4134,7 @@ fn shared_current_reader_revokes_from_the_actual_post_resolution_reload() {
     };
     let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
     let (_, prior, _) = entrance
-        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .observe_keyed_admission(&lease, request.clone())
         .unwrap();
     let old_request = ManagementRequest::try_new(
         target.catalog().clone(),
@@ -4241,15 +4188,7 @@ fn shared_current_reader_revokes_from_the_actual_post_resolution_reload() {
         .unwrap()
         .push_back(CommitConclusion::Committed(CommitProof::SlotWriter));
     let before = caps.calls.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        observe_current_keyed_documents_with_management(
-            &lease,
-            request,
-            Default::default(),
-            &entrance
-        )
-        .is_err()
-    );
+    assert!(observe_current_keyed_documents_with_management(&lease, request, &entrance).is_err());
     assert_eq!(
         caps.calls.load(std::sync::atomic::Ordering::SeqCst),
         before + 2
@@ -4270,7 +4209,7 @@ fn shared_current_reader_foreign_scope_does_not_revoke_another_target() {
     };
     let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
     let (_, prior, _) = entrance
-        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .observe_keyed_admission(&lease, request.clone())
         .unwrap();
     {
         let mut reply = caps.reply.lock().unwrap();
@@ -4281,15 +4220,7 @@ fn shared_current_reader_foreign_scope_does_not_revoke_another_target() {
             .unwrap()
             .value = management_slot(&owner("deployment-b"), &incarnation("inc-b")).unwrap();
     }
-    assert!(
-        observe_current_keyed_documents_with_management(
-            &lease,
-            request,
-            Default::default(),
-            &entrance
-        )
-        .is_err()
-    );
+    assert!(observe_current_keyed_documents_with_management(&lease, request, &entrance).is_err());
     assert!(prior.is_open());
     assert_eq!(
         entrance.management_phase(target.table()),
@@ -4361,7 +4292,7 @@ fn actual_provider_view_revokes_foreign_management_without_projection_or_another
     for publication in ["valid", "missing", "malformed"] {
         let (entrance, target, dependencies, lease, request, caps) = installed_keyed_drop_fixture();
         let (_, prior, _) = entrance
-            .observe_keyed_admission(&lease, request.clone(), Default::default())
+            .observe_keyed_admission(&lease, request.clone())
             .unwrap();
         {
             let mut reply = caps.reply.lock().unwrap();
@@ -4417,7 +4348,7 @@ fn actual_provider_view_revokes_foreign_management_without_projection_or_another
 fn actual_foreign_provider_scope_cannot_revoke_another_management_target() {
     let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
     let (_, prior, _) = entrance
-        .observe_keyed_admission(&lease, request.clone(), Default::default())
+        .observe_keyed_admission(&lease, request.clone())
         .unwrap();
     {
         use crate::persistence::keyed_documents::{management_slot, management_slot_name};
@@ -4794,8 +4725,7 @@ async fn async_keyed_drop_preserves_the_original_pending_observation_and_exact_g
     let (entrance, target, _, lease, request, caps) = installed_keyed_drop_fixture();
     let (release, gate) = tokio::sync::oneshot::channel();
     *caps.async_gate.lock().unwrap() = Some(gate);
-    let mut original =
-        Box::pin(entrance.observe_keyed_drop_async(&lease, request.clone(), Default::default()));
+    let mut original = Box::pin(entrance.observe_keyed_drop_async(&lease, request.clone()));
     let mut borrowed = Box::pin(std::future::poll_fn(|cx| original.as_mut().poll(cx)));
     assert!(futures::poll!(borrowed.as_mut()).is_pending());
     assert_eq!(caps.async_calls.load(SeqCst), 1);
@@ -4812,7 +4742,7 @@ async fn async_keyed_drop_preserves_the_original_pending_observation_and_exact_g
         .await
         .unwrap();
     let (second, _) = entrance
-        .observe_keyed_drop_async(&lease, request, Default::default())
+        .observe_keyed_drop_async(&lease, request)
         .await
         .unwrap();
     assert!(first.matches(&second));

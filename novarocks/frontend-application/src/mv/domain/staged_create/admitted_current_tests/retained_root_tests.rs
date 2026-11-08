@@ -214,7 +214,6 @@ async fn current_registration_retains_exact_g1_after_same_root_cpu_and_qb_footer
     let observed = decode_current_keyed_documents(
         fixture.caps.current.lock().unwrap().clone(),
         fixture.catalog.clone(),
-        Default::default(),
     )
     .unwrap();
     let entrance = ManagementEntrance::new(

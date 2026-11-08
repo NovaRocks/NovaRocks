@@ -28,9 +28,6 @@ use crate::persistence::schema::MvSchemaContract;
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 use novarocks_types::naming::normalize_identifier;
 
-/// Maximum retained SQL source accepted by the MV semantic constructor.
-pub const RAW_QUERY_SOURCE_MAX_BYTES: usize = 64 * 1024;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescriptorDependency {
     pub catalog: String,
@@ -144,12 +141,6 @@ impl MvDesiredSemantics {
         query_definition
             .validate()
             .map_err(|error| format!("invalid MV descriptor query definition: {error}"))?;
-        if query_definition.raw_query_source.len() > RAW_QUERY_SOURCE_MAX_BYTES {
-            return Err(format!(
-                "MV descriptor raw query source exceeds 64KiB cap of {} bytes",
-                RAW_QUERY_SOURCE_MAX_BYTES
-            ));
-        }
         if visible_columns.is_empty() {
             return Err("MV descriptor must contain at least one visible column".to_string());
         }

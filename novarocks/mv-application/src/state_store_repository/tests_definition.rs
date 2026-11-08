@@ -18,7 +18,6 @@
 use super::StateStoreMvRepository;
 use crate::persistence::keyed_documents::MvKeyedDocumentProjection;
 use crate::persistence::test_support::KeyedProjectionFixture;
-use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::product::MvTarget;
 use crate::repository::MvRepositoryErrorKind;
 use bytes::Bytes;
@@ -93,10 +92,7 @@ async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
     .expect("reopen MV Accelerator repository");
     assert_eq!(
         reopened
-            .find_keyed_by_target(
-                &created.projection.facts.target(),
-                PersistenceDecodeBudget::default()
-            )
+            .find_keyed_by_target(&created.projection.facts.target())
             .await
             .unwrap()
             .unwrap()
@@ -133,7 +129,7 @@ async fn whole_keyed_projection_cas_replaces_root_and_dependency_indexes() {
 
     assert_eq!(
         repository
-            .find_keyed_by_target(&target("orders_mv"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("orders_mv"))
             .await
             .unwrap()
             .unwrap(),
@@ -161,7 +157,7 @@ async fn whole_keyed_projection_cas_replaces_root_and_dependency_indexes() {
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert_eq!(
         repository
-            .find_keyed_by_target(&target("orders_mv"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("orders_mv"))
             .await
             .unwrap(),
         Some(replaced.clone())
@@ -208,21 +204,21 @@ async fn different_target_install_refuses_without_changing_either_projection() {
     }
     assert_eq!(
         repository
-            .find_keyed_by_target(&target("first"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("first"))
             .await
             .unwrap(),
         Some(first.clone())
     );
     assert_eq!(
         repository
-            .find_keyed_by_target(&target("second"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("second"))
             .await
             .unwrap(),
         Some(second.clone())
     );
     assert!(
         repository
-            .find_keyed_by_target(&target("unoccupied"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("unoccupied"))
             .await
             .unwrap()
             .is_none()
@@ -254,7 +250,7 @@ async fn different_target_install_refuses_without_changing_either_projection() {
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert_eq!(
         repository
-            .find_keyed_by_target(&target("second"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("second"))
             .await
             .unwrap(),
         Some(second)
@@ -286,10 +282,7 @@ async fn delete_requires_exact_object_source_and_version() {
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert!(
         repository
-            .find_keyed_by_target(
-                &created.projection.facts.target(),
-                PersistenceDecodeBudget::default()
-            )
+            .find_keyed_by_target(&created.projection.facts.target())
             .await
             .unwrap()
             .is_some()
@@ -307,7 +300,7 @@ async fn delete_requires_exact_object_source_and_version() {
         .expect("exact guarded delete");
     assert!(
         repository
-            .find_keyed_by_target(&target("delete_me"), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target("delete_me"))
             .await
             .unwrap()
             .is_none()

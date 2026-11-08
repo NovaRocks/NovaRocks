@@ -58,7 +58,6 @@ fn request(version: u8, cancellation: Arc<Cancellation>) -> MvCurrentProjectionR
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap(),
-        PersistenceDecodeBudget::default(),
     )
     .unwrap()
 }
@@ -359,7 +358,6 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap(),
-        PersistenceDecodeBudget::default(),
     )
     .unwrap();
 
@@ -483,10 +481,7 @@ async fn fixed_repository_cas_is_captured_before_source_observation() {
         MvKeyedProjectionInstallOutcome::Superseded,
     ));
     assert_eq!(
-        repository
-            .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
-            .await
-            .unwrap(),
+        repository.find_keyed_by_target(&target()).await.unwrap(),
         Some(external),
     );
     assert!(service.load_ready(&target()).await.is_err());
@@ -596,7 +591,7 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
     );
     assert!(
         repository
-            .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&target())
             .await
             .unwrap()
             .is_some()
@@ -708,14 +703,83 @@ fn local_inventory_bound() -> crate::repository::MvProjectionInventoryBound {
     crate::repository::MvProjectionInventoryBound {
         entries: 64,
         snapshot_bytes: 16 * 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: PersistenceDecodeBudget {
-            max_working_set_bytes: 4 * 1024 * 1024,
-            ..Default::default()
-        },
     }
+}
+
+#[tokio::test]
+async fn encoded_projection_over_one_mebibyte_remains_a_ready_candidate() {
+    use crate::persistence::keyed_documents::StoredKeyedMvProjection;
+    use crate::state_store_repository::codec::encode_keyed_projection;
+    use novarocks_state_store_testkit::testing::{
+        IN_MEMORY_STATE_STORE_CAPACITY, InMemoryStateStore,
+    };
+
+    let mut fixture = KeyedProjectionFixture::new(target(), Some(1));
+    fixture
+        .definition
+        .query
+        .effective_sql
+        .push_str(&format!(" /*{}*/", "界".repeat(400_000)));
+    let facts = fixture.build().expect("large coherent keyed documents");
+    let encoded = encode_keyed_projection(
+        Uuid::now_v7(),
+        &StoredKeyedMvProjection {
+            mv_id: 1,
+            facts: facts.clone(),
+        },
+    )
+    .expect("actual Accelerator encoding");
+    assert!(encoded.as_bytes().len() > 1024 * 1024);
+
+    // Isolate the reference provider's explicit capacity from MV admission.
+    // Size this test instance from the actual encoded value, including room
+    // for the sequence and index records in the same transaction.
+    let mut limits = IN_MEMORY_STATE_STORE_CAPACITY.limits();
+    limits.max_value_bytes = encoded.as_bytes().len() + 65_536;
+    limits.max_transaction_bytes = limits.max_value_bytes * 2;
+    let repository = StateStoreMvRepository::open(
+        Arc::new(InMemoryStateStore::with_limits(
+            format!("large-keyed-readiness-{}", Uuid::now_v7()),
+            limits,
+        )),
+        novarocks_state_store_runtime::StateStoreRunPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let service =
+        MvKeyedReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
+    let source = Source {
+        facts,
+        entered: None,
+        release: None,
+        fail: false,
+    };
+    let outcome = service
+        .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source)
+        .await
+        .unwrap();
+    let MvKeyedProjectionInstallOutcome::Installed(installed) = outcome else {
+        panic!("large Current must install its projection");
+    };
+    let actual = encode_keyed_projection(Uuid::now_v7(), &installed.projection).unwrap();
+    eprintln!(
+        "large ready candidate encoded Value bytes={}",
+        actual.as_bytes().len()
+    );
+    assert!(actual.as_bytes().len() > 1024 * 1024);
+    assert_eq!(installed.projection.facts, source.facts);
+    assert_eq!(
+        service.load_ready(&target()).await.unwrap(),
+        Some(installed.clone())
+    );
+    let mut candidates = service
+        .bounded_projection_inventory(local_inventory_bound())
+        .await
+        .unwrap();
+    assert_eq!(candidates.next_ready().await.unwrap(), Some(installed));
+    assert!(candidates.next_ready().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -730,7 +794,7 @@ async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_
         .await
         .unwrap();
     let old = repository
-        .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+        .find_keyed_by_target(&target())
         .await
         .unwrap()
         .unwrap();
@@ -781,7 +845,7 @@ async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration
         .await
         .unwrap();
     let old = repository
-        .find_keyed_by_target(&target(), PersistenceDecodeBudget::default())
+        .find_keyed_by_target(&target())
         .await
         .unwrap()
         .unwrap();
@@ -843,23 +907,30 @@ async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_rea
 }
 
 #[tokio::test]
-async fn bounded_listing_refuses_a_large_reason_before_cloning_it_into_a_row() {
+async fn bounded_listing_preserves_large_reasons_without_a_decode_quota() {
     let (_, service) = service().await;
     service
         .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
+    let reason = "x".repeat(4 * 1024 * 1024);
     service
-        .invalidate_current(target(), "x".repeat(4 * 1024 * 1024))
+        .invalidate_current(target(), reason.clone())
         .await
         .unwrap();
     let mut inventory = service
         .bounded_projection_inventory(local_inventory_bound())
         .await
         .unwrap();
-    let error = inventory.next_listable().await.unwrap_err();
-    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
-    assert!(error.to_string().contains("readiness reason"));
+    let listed = inventory.next_listable().await.unwrap().unwrap();
+    let MvListedManageability::Unavailable(actual) = listed.manageability else {
+        panic!("invalidated target must retain its unavailable reason");
+    };
+    assert!(
+        actual.as_bytes() == reason.as_bytes(),
+        "exact readiness reason"
+    );
+    assert!(inventory.next_listable().await.unwrap().is_none());
 }
 
 #[tokio::test]

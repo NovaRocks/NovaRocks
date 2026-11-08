@@ -526,8 +526,7 @@ impl Fixture {
             .derive_document_storage_lease()
             .unwrap();
         let view = caps.current.lock().unwrap().clone();
-        let current =
-            decode_current_keyed_documents(view, catalog.clone(), Default::default()).unwrap();
+        let current = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         let entrance = ManagementEntrance::new(
             current.deployment_owner.clone(),
             current.process_incarnation.clone(),
@@ -579,8 +578,7 @@ impl Fixture {
             )
             .unwrap();
         assert_eq!(phase, ManagementObservationPhase::Ready);
-        let observed =
-            decode_current_keyed_documents(view, catalog.clone(), Default::default()).unwrap();
+        let observed = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         entrance
             .install_observed_target(
                 &state,
@@ -599,13 +597,8 @@ impl Fixture {
     }
 
     fn request(&self) -> MvCurrentProjectionRequest {
-        MvCurrentProjectionRequest::try_new(
-            self.catalog.clone(),
-            self.target.clone(),
-            context(),
-            Default::default(),
-        )
-        .unwrap()
+        MvCurrentProjectionRequest::try_new(self.catalog.clone(), self.target.clone(), context())
+            .unwrap()
     }
 
     async fn observe(&self, convergence: MvConvergence) -> CurrentResult {
@@ -631,7 +624,6 @@ impl Fixture {
         let current = decode_current_keyed_documents(
             self.caps.current.lock().unwrap().clone(),
             self.catalog.clone(),
-            Default::default(),
         )
         .unwrap();
         ManagementRequest::try_new(
@@ -960,7 +952,6 @@ async fn admitted_current_rejects_a_foreign_catalog_before_metadata_or_document_
         ),
         fixture.target.clone(),
         context(),
-        Default::default(),
     )
     .unwrap();
     let error = fixture

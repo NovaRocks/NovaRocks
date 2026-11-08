@@ -168,26 +168,6 @@ fn desired_semantics_rejects_missing_package_query_and_negative_creation_time() 
 }
 
 #[test]
-fn desired_semantics_enforces_the_raw_query_source_byte_limit() {
-    let mut value = sample_semantics();
-    value.query_definition.raw_query_source = format!(
-        "SELECT 1 /*{}*/",
-        "x".repeat(RAW_QUERY_SOURCE_MAX_BYTES - 13)
-    );
-    assert_eq!(
-        value.query_definition.raw_query_source.len(),
-        RAW_QUERY_SOURCE_MAX_BYTES
-    );
-    rebuild(value.clone()).unwrap();
-    value.query_definition.raw_query_source.push(' ');
-    assert!(
-        rebuild(value)
-            .unwrap_err()
-            .contains("raw query source exceeds 64KiB")
-    );
-}
-
-#[test]
 fn desired_semantics_rejects_noncanonical_or_duplicate_output_names() {
     let mut value = sample_semantics();
     value.visible_columns.clear();

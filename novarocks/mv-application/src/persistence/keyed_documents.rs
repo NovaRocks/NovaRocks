@@ -6,10 +6,7 @@
 //! MV-owned keyed document mapping. Legacy documents remain only for the
 //! staged FE migration; this path never converts a keyed record into legacy P.
 
-use super::{
-    codec::keyed::*, codec::*, documents::MvDocumentError, identity::DocumentRevision,
-    validation::PersistenceDecodeBudget,
-};
+use super::{codec::keyed::*, codec::*, documents::MvDocumentError, identity::DocumentRevision};
 use crate::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
 use bytes::Bytes;
 use novarocks_spi::connector::*;
@@ -70,25 +67,10 @@ fn version(
         refs,
         Bytes::from(content),
     )?;
-    // Compute the exact canonical outer JSON value size before provider dispatch.
-    let refs = value
-        .references()
-        .iter()
-        .map(|(rel, id)| serde_json::json!({"rel":rel,"id":id.to_hex()}))
-        .collect::<Vec<_>>();
-    let envelope = serde_json::json!({"v":2,"owner":value.owner(),"name":value.name(),"format":{"owner":value.format().owner(),"name":value.format().name(),"version":value.format().version()},"refs":refs,"content":base64url(value.content()),"id":value.identity().to_hex()});
-    let size = serde_json::to_vec(&envelope)
-        .map_err(|e| MvDocumentError::Contract(e.to_string()))?
-        .len();
-    if size > KEYED_DOCUMENT_VERSION_BYTES {
-        return contract(format!(
-            "document version {name} uses {size} bytes, exceeding limit {KEYED_DOCUMENT_VERSION_BYTES}"
-        ));
-    }
     Ok(value)
 }
 
-/// Build D with its complete MV-owned semantic identity and envelope limit.
+/// Build D with its complete MV-owned semantic identity.
 pub(crate) fn definition_version(
     definition: &DefinitionDocument,
 ) -> Result<ConnectorDocumentVersion, MvDocumentError> {
@@ -158,17 +140,6 @@ pub fn build_keyed_versions(
             .map_err(|e| MvDocumentError::Contract(format!("document version binding: {e}")))?
             .into_bytes(),
     )?;
-    let max_payload = maximum_publication_payload_bytes(&binding)?;
-    let max_record = "novarocks.doc.v2.record.novarocks.mv~publication".len()
-        + 2
-        + 64
-        + 1
-        + (max_payload * 4).div_ceil(3);
-    if max_record > KEYED_DOCUMENT_RECORD_BYTES {
-        return contract(format!(
-            "snapshot record publication maximum uses {max_record} bytes, exceeding limit {KEYED_DOCUMENT_RECORD_BYTES}"
-        ));
-    }
     Ok(MvKeyedVersions {
         definition: d,
         interpretation: l,
@@ -390,8 +361,6 @@ fn decode_keyed_binding_documents(
     view: &KeyedDocumentView,
     binding_id: DocumentIdentity,
     configuration_content: &[u8],
-    publication_payload: Option<&[u8]>,
-    budget: PersistenceDecodeBudget,
 ) -> Result<(DefinitionDocument, InterpretationDocument, MvKeyedVersions), MvDocumentError> {
     let b = exact_version(view, binding_id, "binding", 1)?;
     let d_id = *b
@@ -411,17 +380,10 @@ fn decode_keyed_binding_documents(
     {
         return contract("invalid D/L document reference closure");
     }
-    preflight_keyed_document_set(
-        d.content(),
-        l.content(),
-        b.content(),
-        configuration_content,
-        publication_payload,
-        budget,
-    )?;
-    let definition = decode_definition(d.content(), budget)?;
-    let interpretation = decode_keyed_interpretation(l.content(), budget)?;
-    let binding = decode_binding(b.content(), budget)?;
+    preflight_keyed_document_set(d.content(), l.content(), b.content(), configuration_content)?;
+    let definition = decode_definition(d.content())?;
+    let interpretation = decode_keyed_interpretation(l.content())?;
+    let binding = decode_binding(b.content())?;
     super::validation::validate_definition_interpretation(
         &definition,
         revision(d_id),
@@ -455,7 +417,6 @@ pub(crate) struct MvKeyedDropDocuments {
 pub(crate) fn decode_keyed_drop_documents(
     view: &KeyedDocumentView,
     catalog: CatalogHandle,
-    budget: PersistenceDecodeBudget,
 ) -> Result<MvKeyedDropDocuments, MvDocumentError> {
     if view.metadata_version.snapshot_id() != view.current_snapshot
         || catalog.catalog_name() != &view.table.instance_id
@@ -477,19 +438,14 @@ pub(crate) fn decode_keyed_drop_documents(
     if configuration.value.format != format("configuration", 1)? {
         return contract("unsupported MV configuration slot format");
     }
-    decode_configuration(&configuration.value.content, budget)?;
+    decode_configuration(&configuration.value.content)?;
     let root = view
         .roots
         .get(MV_DOCUMENT_OWNER)
         .filter(|root| !root.dangling)
         .ok_or_else(|| MvDocumentError::Contract("MV binding root is absent or dangling".into()))?;
-    let (_, _, versions) = decode_keyed_binding_documents(
-        view,
-        root.identity,
-        &configuration.value.content,
-        None,
-        budget,
-    )?;
+    let (_, _, versions) =
+        decode_keyed_binding_documents(view, root.identity, &configuration.value.content)?;
     Ok(MvKeyedDropDocuments {
         target,
         owner,
@@ -504,7 +460,6 @@ pub(crate) fn decode_keyed_drop_documents(
 pub fn decode_current_keyed_documents(
     view: KeyedDocumentView,
     catalog: CatalogHandle,
-    budget: PersistenceDecodeBudget,
 ) -> Result<MvKeyedObservedCurrentDocuments, MvDocumentError> {
     if view.metadata_version.snapshot_id() != view.current_snapshot {
         return contract("MV keyed metadata version and current snapshot disagree");
@@ -529,7 +484,7 @@ pub fn decode_current_keyed_documents(
     if c.value.format != format("configuration", 1)? {
         return contract("unsupported MV configuration slot format");
     }
-    let configuration = decode_configuration(&c.value.content, budget)?;
+    let configuration = decode_configuration(&c.value.content)?;
     let configuration_revision = DocumentRevision::from_canonical_bytes(&c.value.content);
     let records = view
         .current_records
@@ -558,25 +513,8 @@ pub fn decode_current_keyed_documents(
                 MvDocumentError::Contract("MV binding root is absent or dangling".into())
             })?,
     };
-    if let Some(record) = record {
-        let bytes = "novarocks.doc.v2.record.novarocks.mv~publication".len()
-            + 2
-            + 64
-            + 1
-            + (record.payload.len() * 4).div_ceil(3);
-        if bytes > KEYED_DOCUMENT_RECORD_BYTES {
-            return contract(format!(
-                "snapshot record publication uses {bytes} bytes, exceeding limit {KEYED_DOCUMENT_RECORD_BYTES}"
-            ));
-        }
-    }
-    let (definition, interpretation, versions) = decode_keyed_binding_documents(
-        &view,
-        binding_id,
-        &c.value.content,
-        record.map(|r| r.payload.as_ref()),
-        budget,
-    )?;
+    let (definition, interpretation, versions) =
+        decode_keyed_binding_documents(&view, binding_id, &c.value.content)?;
     let publication = record
         .map(|r| {
             decode_publication_payload(
@@ -615,13 +553,12 @@ pub fn decode_current_keyed_documents(
 pub fn observe_current_keyed_documents(
     lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
-    budget: PersistenceDecodeBudget,
 ) -> Result<MvKeyedObservedCurrentDocuments, MvDocumentError> {
     let catalog = request.catalog_handle.clone();
     let view = lease
         .observe_keyed_documents(request)
         .map_err(MvDocumentError::KeyedStorage)?;
-    decode_current_keyed_documents(view, catalog, budget)
+    decode_current_keyed_documents(view, catalog)
 }
 
 pub fn snapshot_record_frame(record: &ConnectorSnapshotRecord) -> Vec<u8> {
@@ -771,7 +708,6 @@ pub struct StoredKeyedMvProjection {
 pub fn observe_current_keyed_documents_with_management(
     lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
-    budget: PersistenceDecodeBudget,
     entrance: &crate::management::ManagementEntrance,
 ) -> Result<
     (
@@ -782,14 +718,13 @@ pub fn observe_current_keyed_documents_with_management(
 > {
     let catalog = request.catalog_handle.clone();
     let (view, convergence) = observe_current_keyed_view_with_management(lease, request, entrance)?;
-    let observed = decode_current_keyed_documents(view, catalog, budget)?;
+    let observed = decode_current_keyed_documents(view, catalog)?;
     Ok((observed, convergence))
 }
 
 pub async fn observe_current_keyed_documents_with_management_async(
     lease: &ConnectorDocumentStorage,
     request: KeyedDocumentObservationRequest,
-    budget: PersistenceDecodeBudget,
     entrance: &crate::management::ManagementEntrance,
 ) -> Result<
     (
@@ -801,7 +736,7 @@ pub async fn observe_current_keyed_documents_with_management_async(
     let catalog = request.catalog_handle.clone();
     let (view, convergence) =
         observe_current_keyed_view_with_management_async(lease, request, entrance).await?;
-    let observed = decode_current_keyed_documents(view, catalog, budget)?;
+    let observed = decode_current_keyed_documents(view, catalog)?;
     Ok((observed, convergence))
 }
 
@@ -974,39 +909,20 @@ pub(crate) mod tests {
         let (catalog, mut view) = fixture(Some(17), false);
         assert!(never_published(&view));
         assert!(
-            decode_current_keyed_documents(
-                view.clone(),
-                catalog.clone(),
-                PersistenceDecodeBudget::default()
-            )
-            .unwrap()
-            .is_never_published()
+            decode_current_keyed_documents(view.clone(), catalog.clone())
+                .unwrap()
+                .is_never_published()
         );
         view.current_snapshot_file_totals.data_files = None;
         assert!(!never_published(&view));
-        assert!(
-            decode_current_keyed_documents(
-                view.clone(),
-                catalog.clone(),
-                PersistenceDecodeBudget::default()
-            )
-            .is_err()
-        );
+        assert!(decode_current_keyed_documents(view.clone(), catalog.clone()).is_err());
         view.current_snapshot_file_totals.data_files = Some(1);
-        assert!(
-            decode_current_keyed_documents(view, catalog, PersistenceDecodeBudget::default())
-                .is_err()
-        );
+        assert!(decode_current_keyed_documents(view, catalog).is_err());
     }
     #[test]
     fn copied_record_projects_its_current_carrier_and_c_revision_ignores_writer() {
         let (catalog, view) = fixture(Some(17), true);
-        let first = decode_current_keyed_documents(
-            view.clone(),
-            catalog.clone(),
-            PersistenceDecodeBudget::default(),
-        )
-        .unwrap();
+        let first = decode_current_keyed_documents(view.clone(), catalog.clone()).unwrap();
         let mut later = view;
         later.current_snapshot = Some(18);
         later.metadata_version =
@@ -1018,9 +934,7 @@ pub(crate) mod tests {
             .unwrap()
             .writer = Some(18);
         later.roots.get_mut(MV_DOCUMENT_OWNER).unwrap().dangling = true;
-        let second =
-            decode_current_keyed_documents(later, catalog, PersistenceDecodeBudget::default())
-                .unwrap();
+        let second = decode_current_keyed_documents(later, catalog).unwrap();
         assert_eq!(first.configuration_revision, second.configuration_revision);
         assert_eq!(first.publication_revision, second.publication_revision);
         assert_eq!(second.publication_snapshot, Some(18));
@@ -1060,6 +974,108 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn p04_union_documents_cross_legacy_sizes_and_keep_exact_current_facts() {
+        use crate::persistence::test_support::{
+            observed_current_keyed, union_all_keyed_projection_fixture,
+        };
+        // Component proof of the native case's shape; the native runner still
+        // owns CREATE/publication/refresh/restart validation.
+        let fixture = union_all_keyed_projection_fixture(
+            crate::product::MvTarget::from_parts(Some("ice"), "sales", "capacity_mv"),
+            Some(17),
+            370,
+            10,
+            196_609,
+        );
+        let expected_definition = fixture.definition.clone();
+        let expected_inputs = fixture.publication.as_ref().unwrap().inputs.clone();
+        let facts = fixture.build().unwrap();
+        let d = facts.definition();
+        let items = d.relation_occurrences.len()
+            + d.outputs.len()
+            + d.relation_occurrences
+                .iter()
+                .map(|r| r.fields.len())
+                .sum::<usize>()
+            + d.outputs
+                .iter()
+                .map(|o| o.expression.source_fields.len())
+                .sum::<usize>();
+        assert_eq!(d.relation_occurrences.len(), 370);
+        assert_eq!(d.outputs.len(), 10);
+        assert_eq!(items, 4_450);
+        assert_eq!(d, &expected_definition);
+        assert!(facts.versions().definition.content().len() > 65_536);
+        assert_eq!(facts.interpretation().branches.len(), 370);
+        assert_eq!(facts.versions().binding_document.data_versions.len(), 370);
+        let publication = facts.publication().unwrap();
+        assert_eq!(publication.inputs, expected_inputs);
+        assert_eq!(publication.logical_result_rows, Some(740));
+        let payload =
+            encode_publication_payload(publication, d, &facts.versions().binding_document).unwrap();
+        assert!(payload.len() > 4_096);
+        assert_eq!(payload.len(), 4_106);
+        assert_eq!(
+            decode_publication_payload(
+                &payload,
+                d,
+                facts.versions().definition_revision(),
+                facts.versions().interpretation_revision(),
+                &facts.versions().binding_document,
+            )
+            .unwrap(),
+            *publication
+        );
+        let set = keyed_publication_document_set(facts.versions(), d, publication).unwrap();
+        assert_eq!(set.records.len(), 1);
+        assert!(snapshot_record_frame(&set.records[0]).len() > 4_096);
+        let catalog = CatalogHandle::new(
+            facts.source_revision().target.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        );
+        let restored =
+            MvKeyedDocumentProjection::try_from_current(observed_current_keyed(&facts, catalog))
+                .unwrap();
+        assert_eq!(restored, facts);
+        assert_eq!(
+            restored.definition().query.effective_sql.as_bytes(),
+            expected_definition.query.effective_sql.as_bytes(),
+        );
+        for (before, after) in facts
+            .versions()
+            .versions()
+            .iter()
+            .zip(restored.versions().versions())
+        {
+            assert_eq!(before.identity(), after.identity());
+            assert_eq!(before.content(), after.content());
+        }
+        let projection = StoredKeyedMvProjection {
+            mv_id: 7,
+            facts: facts.clone(),
+        };
+        let encoded_projection = crate::state_store_repository::codec::encode_keyed_projection(
+            uuid::Uuid::from_u128(7),
+            &projection,
+        )
+        .unwrap();
+        assert!(encoded_projection.as_bytes().len() > 65_536);
+        eprintln!(
+            "P04 component documents: occurrences={}, outputs={}, items={}, sql_bytes={}, D_bytes={}, L_bytes={}, B_bytes={}, P_bytes={}, record_frame_bytes={}, projection_bytes={}",
+            d.relation_occurrences.len(),
+            d.outputs.len(),
+            items,
+            d.query.effective_sql.len(),
+            facts.versions().definition.content().len(),
+            facts.versions().interpretation.content().len(),
+            facts.versions().binding.content().len(),
+            payload.len(),
+            snapshot_record_frame(&set.records[0]).len(),
+            encoded_projection.as_bytes().len(),
+        );
+    }
+
+    #[test]
     fn semantic_definition_identity_covers_the_document_header() {
         let (_, view) = fixture(None, false);
         let b = &view.versions[&view.roots[MV_DOCUMENT_OWNER].identity];
@@ -1069,11 +1085,9 @@ pub(crate) mod tests {
             id.to_bytes().as_slice(),
             DocumentRevision::from_canonical_bytes(d.content()).as_bytes()
         );
-        let bytes = decode_keyed_interpretation(
-            view.versions[&b.references()["interpretation"]].content(),
-            PersistenceDecodeBudget::default(),
-        )
-        .unwrap();
+        let bytes =
+            decode_keyed_interpretation(view.versions[&b.references()["interpretation"]].content())
+                .unwrap();
         assert_eq!(bytes.definition_revision, revision(id));
     }
 }

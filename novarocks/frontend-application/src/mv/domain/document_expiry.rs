@@ -13,7 +13,6 @@ use novarocks_mv_application::management::{
     ManagementTimestamp,
 };
 use novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents;
-use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
@@ -241,24 +240,21 @@ pub(crate) fn try_execute_document_expiry(
         context,
     };
     let entrance = ports.management_entrance()?.as_ref();
-    let (initial, _, convergence) = match entrance.observe_keyed_admission(
-        &documents,
-        request(context.clone()),
-        PersistenceDecodeBudget::default(),
-    ) {
-        Ok(observed) => observed,
-        Err(error) => {
-            entrance
-                .close_on_keyed_current_management_mismatch(
-                    &documents,
-                    request(context.clone().after_external_effect()),
-                )
-                .map_err(|e| e.to_string())?;
-            return Err(format!(
-                "admit fresh MV document expiry observation: {error}"
-            ));
-        }
-    };
+    let (initial, _, convergence) =
+        match entrance.observe_keyed_admission(&documents, request(context.clone())) {
+            Ok(observed) => observed,
+            Err(error) => {
+                entrance
+                    .close_on_keyed_current_management_mismatch(
+                        &documents,
+                        request(context.clone().after_external_effect()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Err(format!(
+                    "admit fresh MV document expiry observation: {error}"
+                ));
+            }
+        };
     if convergence.reinstall_current_projection {
         on_reconciled_current(
             catalog.clone(),
@@ -302,12 +298,8 @@ pub(crate) fn try_execute_document_expiry(
             admitted_context.clone().after_external_effect(),
         )?;
     }
-    let observed = decode_current_keyed_documents(
-        full.current.clone(),
-        catalog.clone(),
-        PersistenceDecodeBudget::default(),
-    )
-    .map_err(|e| format!("decode MV document expiry Current: {e}"))?;
+    let observed = decode_current_keyed_documents(full.current.clone(), catalog.clone())
+        .map_err(|e| format!("decode MV document expiry Current: {e}"))?;
     if observed.management_target != initial.management_target
         || observed.deployment_owner != *entrance.owner()
         || observed.process_incarnation != *entrance.incarnation()

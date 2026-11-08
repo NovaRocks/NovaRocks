@@ -17,7 +17,6 @@
 
 use super::tests_definition;
 
-use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::repository::MvRepositoryErrorKind;
 
 #[tokio::test]
@@ -33,10 +32,7 @@ async fn keyed_owner_exposes_whole_projection_cas_and_guarded_delete() {
         .expect("create projection through port");
     assert_eq!(
         repository
-            .find_keyed_by_target(
-                &tests_definition::target("orders_mv"),
-                PersistenceDecodeBudget::default()
-            )
+            .find_keyed_by_target(&tests_definition::target("orders_mv"))
             .await
             .unwrap(),
         Some(created.clone())
@@ -131,10 +127,7 @@ async fn keyed_owner_reports_a_lost_committed_response_without_retry_or_rollback
     ));
 
     let committed = reader
-        .find_keyed_by_target(
-            &tests_definition::target("unknown"),
-            PersistenceDecodeBudget::default(),
-        )
+        .find_keyed_by_target(&tests_definition::target("unknown"))
         .await
         .unwrap()
         .unwrap();
@@ -189,10 +182,7 @@ async fn keyed_owner_pre_dispatch_failure_is_unavailable_with_no_projection() {
     assert_eq!(error.kind(), MvRepositoryErrorKind::Unavailable);
     assert!(
         reader
-            .find_keyed_by_target(
-                &tests_definition::target("failed"),
-                PersistenceDecodeBudget::default()
-            )
+            .find_keyed_by_target(&tests_definition::target("failed"))
             .await
             .unwrap()
             .is_none()

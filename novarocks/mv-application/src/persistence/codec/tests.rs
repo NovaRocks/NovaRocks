@@ -21,9 +21,7 @@ use crate::persistence::identity::{
     ObjectIdentity, OutputIdentity, PartitionSpecVersion, SchemaVersion, StateSlotIdentity,
 };
 use crate::persistence::validation::runtime::{RuntimeDefinitionFacts, RuntimeInterpretationFacts};
-use crate::persistence::validation::{
-    DEFAULT_MAX_DOCUMENT_BYTES, PersistenceDecodeBudget, validate_live_relation_binding,
-};
+use crate::persistence::validation::validate_live_relation_binding;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
@@ -314,64 +312,6 @@ fn sample_configuration() -> ConfigurationDocument {
     }
 }
 
-fn keyed_facts() -> crate::persistence::keyed_documents::MvKeyedDocumentProjection {
-    crate::persistence::test_support::KeyedProjectionFixture::new(
-        crate::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
-        Some(17),
-    )
-    .build()
-    .unwrap()
-}
-#[test]
-fn current_document_set_charges_one_aggregate_item_budget() {
-    let facts = keyed_facts();
-    let versions = facts.versions();
-    let configuration = encode_configuration(facts.configuration()).unwrap();
-    let inputs: [(&[u8], wire::Schema); 4] = [
-        (
-            versions.definition.content(),
-            wire::Schema::DefinitionDocument,
-        ),
-        (
-            versions.interpretation.content(),
-            wire::Schema::InterpretationDocument,
-        ),
-        (versions.binding.content(), wire::Schema::BindingDocument),
-        (
-            configuration.as_bytes(),
-            wire::Schema::ConfigurationDocument,
-        ),
-    ];
-    let default = PersistenceDecodeBudget::default();
-    let usages = inputs
-        .iter()
-        .map(|(bytes, schema)| wire::preflight(bytes, *schema, default).unwrap())
-        .collect::<Vec<_>>();
-    let largest = usages.iter().map(|u| u.expanded_items).max().unwrap();
-    assert!(usages.iter().map(|u| u.expanded_items).sum::<usize>() > largest);
-    let budget = PersistenceDecodeBudget {
-        max_items: largest,
-        ..default
-    };
-    for (bytes, schema) in inputs {
-        wire::preflight(bytes, schema, budget).expect("each document fits independently");
-    }
-    assert!(matches!(
-        keyed::preflight_keyed_document_set(
-            inputs[0].0,
-            inputs[1].0,
-            inputs[2].0,
-            inputs[3].0,
-            None,
-            budget,
-        ),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "keyed Current items",
-            ..
-        })
-    ));
-}
-
 #[test]
 fn current_query_runtime_maps_purely_without_reprinting_sql() {
     let runtime = PersistedQueryDefinition::new(
@@ -426,7 +366,7 @@ fn target_partition_fields_roundtrip_in_provider_order_and_validate_arguments() 
     ];
     let encoded = encode_interpretation(&interpretation).unwrap();
     assert_eq!(
-        decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default()).unwrap(),
+        decode_interpretation(encoded.as_bytes()).unwrap(),
         interpretation
     );
     interpretation.target.partition_fields.reverse();
@@ -453,11 +393,7 @@ fn definition_interpretation_configuration_round_trip_with_exact_references() {
     let definition = sample_definition();
     let encoded_definition = encode_definition(&definition).expect("encode definition");
     assert_eq!(
-        decode_definition(
-            encoded_definition.as_bytes(),
-            PersistenceDecodeBudget::default()
-        )
-        .expect("decode definition"),
+        decode_definition(encoded_definition.as_bytes()).expect("decode definition"),
         definition
     );
 
@@ -465,22 +401,14 @@ fn definition_interpretation_configuration_round_trip_with_exact_references() {
     let encoded_interpretation =
         encode_interpretation(&interpretation).expect("encode interpretation");
     assert_eq!(
-        decode_interpretation(
-            encoded_interpretation.as_bytes(),
-            PersistenceDecodeBudget::default()
-        )
-        .expect("decode interpretation"),
+        decode_interpretation(encoded_interpretation.as_bytes()).expect("decode interpretation"),
         interpretation
     );
 
     let configuration = sample_configuration();
     let encoded_configuration = encode_configuration(&configuration).expect("encode configuration");
     assert_eq!(
-        decode_configuration(
-            encoded_configuration.as_bytes(),
-            PersistenceDecodeBudget::default()
-        )
-        .expect("decode configuration"),
+        decode_configuration(encoded_configuration.as_bytes()).expect("decode configuration"),
         configuration
     );
 
@@ -553,7 +481,7 @@ fn decode_rejects_noncanonical_set_order_instead_of_minting_a_second_revision() 
     let definition = sample_definition();
     let mut dto = definition_to_proto(&definition);
     dto.relation_occurrences[0].fields.reverse();
-    let error = decode_definition(&dto.encode_to_vec(), PersistenceDecodeBudget::default())
+    let error = decode_definition(&dto.encode_to_vec())
         .expect_err("noncanonical set order must fail in wire preflight");
     assert!(error.to_string().contains("noncanonical set order"));
 
@@ -562,11 +490,8 @@ fn decode_rejects_noncanonical_set_order_instead_of_minting_a_second_revision() 
     duplicate.relation_occurrences[0]
         .fields
         .push(duplicate_field);
-    let error = decode_definition(
-        &duplicate.encode_to_vec(),
-        PersistenceDecodeBudget::default(),
-    )
-    .expect_err("duplicate canonical set key must fail in wire preflight");
+    let error = decode_definition(&duplicate.encode_to_vec())
+        .expect_err("duplicate canonical set key must fail in wire preflight");
     assert!(error.to_string().contains("duplicate or noncanonical"));
 }
 
@@ -574,24 +499,24 @@ fn decode_rejects_noncanonical_set_order_instead_of_minting_a_second_revision() 
 fn wire_preflight_rejects_tag_order_nonminimal_varints_and_illegal_bool() {
     // All values are otherwise a complete MANUAL configuration.
     let noncanonical_tags = [0x18, 0x00, 0x08, 0x01, 0x10, 0x01];
-    let error = decode_configuration(&noncanonical_tags, PersistenceDecodeBudget::default())
+    let error = decode_configuration(&noncanonical_tags)
         .expect_err("descending field tags must fail before prost decode");
     assert!(error.to_string().contains("canonical tag order"));
 
     // Field-one tag 8 is encoded with an unnecessary continuation byte.
     let nonminimal_tag = [0x88, 0x00, 0x01, 0x10, 0x01, 0x18, 0x00];
-    let error = decode_configuration(&nonminimal_tag, PersistenceDecodeBudget::default())
+    let error = decode_configuration(&nonminimal_tag)
         .expect_err("nonminimal field tag must fail before prost decode");
     assert!(error.to_string().contains("non-minimal varint"));
 
     // Version 1 is encoded as 0x81 0x00 instead of its one-byte form.
     let nonminimal_value = [0x08, 0x81, 0x00, 0x10, 0x01, 0x18, 0x00];
-    let error = decode_configuration(&nonminimal_value, PersistenceDecodeBudget::default())
+    let error = decode_configuration(&nonminimal_value)
         .expect_err("nonminimal scalar must fail before prost decode");
     assert!(error.to_string().contains("non-minimal varint"));
 
     let illegal_bool = [0x08, 0x01, 0x10, 0x01, 0x18, 0x02];
-    let error = decode_configuration(&illegal_bool, PersistenceDecodeBudget::default())
+    let error = decode_configuration(&illegal_bool)
         .expect_err("boolean values outside zero and one must fail before prost decode");
     assert!(error.to_string().contains("illegal value 2"));
 }
@@ -634,8 +559,7 @@ fn a_branch_aggregate_names_the_branch_it_computed() {
     let definition = encode_definition(&sample_definition()).expect("definition");
     let interpretation = sample_interpretation(&definition);
     let encoded = encode_interpretation(&interpretation).expect("interpretation");
-    let restored = decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default())
-        .expect("restored");
+    let restored = decode_interpretation(encoded.as_bytes()).expect("restored");
 
     assert_eq!(
         restored.aggregates[0].branch_id, interpretation.aggregates[0].branch_id,
@@ -677,8 +601,7 @@ fn avg_state_slots_and_union_branch_identity_survive_round_trip() {
     let definition = encode_definition(&sample_definition()).expect("definition");
     let interpretation = sample_interpretation(&definition);
     let encoded = encode_interpretation(&interpretation).expect("interpretation");
-    let restored = decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default())
-        .expect("restored");
+    let restored = decode_interpretation(encoded.as_bytes()).expect("restored");
     assert_eq!(restored.state_slots.len(), 2);
     assert!(
         restored
@@ -740,8 +663,8 @@ fn canonical_internal_count_owns_the_automatic_retraction_count_state() {
     );
 
     let encoded = encode_interpretation(&interpretation).expect("canonical internal owner");
-    let restored = decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default())
-        .expect("canonical internal owner round trip");
+    let restored =
+        decode_interpretation(encoded.as_bytes()).expect("canonical internal owner round trip");
     let internal = restored
         .aggregates
         .iter()
@@ -919,14 +842,14 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
     let mut unknown_field = encoded.as_bytes().to_vec();
     unknown_field.extend_from_slice(&[0x98, 0x06, 0x01]); // field 99, varint 1
     assert!(matches!(
-        decode_configuration(&unknown_field, PersistenceDecodeBudget::default()),
+        decode_configuration(&unknown_field),
         Err(PersistenceCodecError::MalformedWire(_))
     ));
 
     let mut duplicate_format = vec![0x08, 0x01];
     duplicate_format.extend_from_slice(encoded.as_bytes());
     assert!(matches!(
-        decode_configuration(&duplicate_format, PersistenceDecodeBudget::default()),
+        decode_configuration(&duplicate_format),
         Err(PersistenceCodecError::MalformedWire(_))
     ));
 
@@ -939,7 +862,7 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
     }
     .encode_to_vec();
     assert!(matches!(
-        decode_configuration(&missing_paused, PersistenceDecodeBudget::default()),
+        decode_configuration(&missing_paused),
         Err(PersistenceCodecError::MissingField("configuration.paused"))
     ));
 
@@ -952,7 +875,7 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
     }
     .encode_to_vec();
     assert!(matches!(
-        decode_configuration(&unknown_enum, PersistenceDecodeBudget::default()),
+        decode_configuration(&unknown_enum),
         Err(PersistenceCodecError::UnknownEnum { .. })
     ));
 
@@ -965,7 +888,7 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
     }
     .encode_to_vec();
     assert!(matches!(
-        decode_configuration(&unknown_version, PersistenceDecodeBudget::default()),
+        decode_configuration(&unknown_version),
         Err(PersistenceCodecError::UnknownFormatVersion { .. })
     ));
 
@@ -973,106 +896,9 @@ fn strict_wire_rejects_unknown_duplicate_missing_and_unknown_enum() {
     let mut interpretation_dto = interpretation_to_proto(&sample_interpretation(&definition));
     interpretation_dto.state_slots[0].encoding = Some(99);
     assert!(matches!(
-        decode_interpretation(
-            &interpretation_dto.encode_to_vec(),
-            PersistenceDecodeBudget::default()
-        ),
+        decode_interpretation(&interpretation_dto.encode_to_vec()),
         Err(PersistenceCodecError::UnknownEnum {
             field: "interpretation.state_slot.encoding",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn decode_budget_is_enforced_before_generated_decode() {
-    let encoded = encode_definition(&sample_definition()).expect("definition");
-    let budget = PersistenceDecodeBudget {
-        max_document_bytes: encoded.as_bytes().len() - 1,
-        ..PersistenceDecodeBudget::default()
-    };
-    assert!(matches!(
-        decode_definition(encoded.as_bytes(), budget),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "encoded document",
-            ..
-        })
-    ));
-
-    let depth_budget = PersistenceDecodeBudget {
-        max_depth: 1,
-        ..PersistenceDecodeBudget::default()
-    };
-    assert!(matches!(
-        decode_definition(encoded.as_bytes(), depth_budget),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "structure depth",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn encode_budget_is_enforced_before_generated_dto_conversion() {
-    let mut definition = sample_definition();
-    definition.query.effective_sql = "x".repeat(DEFAULT_MAX_DOCUMENT_BYTES + 1);
-    assert!(matches!(
-        encode_definition(&definition),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "source document estimate",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn packed_repeated_values_consume_the_decode_item_budget() {
-    let dto = super::proto::InterpretationDocument {
-        format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
-        definition_revision: None,
-        computation_identity: None,
-        outputs: Vec::new(),
-        state_slots: Vec::new(),
-        apply_key: None,
-        aggregates: Vec::new(),
-        branches: vec![super::proto::BranchInterpretation {
-            branch_id: Some(vec![1]),
-            relation_occurrence_ids: vec![1; PersistenceDecodeBudget::default().max_items + 1],
-            output_ids: Vec::new(),
-        }],
-        target: None,
-    };
-    assert!(matches!(
-        decode_interpretation(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "expanded document items",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn tiny_nested_headers_consume_the_pre_prost_working_set_budget() {
-    let dto = super::proto::DefinitionDocument {
-        format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
-        created_at_ms: Some(1_700_000_000_000),
-        query: None,
-        relation_occurrences: Vec::new(),
-        outputs: vec![super::proto::OutputDefinition::default(); 32],
-        computation_identity: None,
-    };
-    let bytes = dto.encode_to_vec();
-    let old_byte_only_bound = bytes.len() * 4;
-    let budget = PersistenceDecodeBudget {
-        max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
-        max_working_set_bytes: old_byte_only_bound,
-        max_items: PersistenceDecodeBudget::default().max_items,
-        max_depth: PersistenceDecodeBudget::default().max_depth,
-    };
-    assert!(matches!(
-        decode_definition(&bytes, budget),
-        Err(PersistenceCodecError::ResourceBudget {
-            resource: "decode working set",
             ..
         })
     ));
@@ -1101,7 +927,7 @@ fn created_time_changes_document_revision_but_not_computation_identity() {
     let first = encode_definition(&original).unwrap();
     let second = encode_definition(&later).unwrap();
     assert_ne!(first.revision(), second.revision());
-    let decoded = decode_definition(second.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    let decoded = decode_definition(second.as_bytes()).unwrap();
     assert_eq!(decoded.computation_identity, original.computation_identity);
     assert_eq!(decoded.created_at_ms, later.created_at_ms);
 }
@@ -1112,7 +938,63 @@ fn definition_time_is_a_required_wire_fact() {
     let mut dto = super::proto::DefinitionDocument::decode(encoded.as_bytes()).unwrap();
     dto.created_at_ms = None;
     assert!(matches!(
-        decode_definition(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
+        decode_definition(&dto.encode_to_vec()),
         Err(PersistenceCodecError::MissingField(_))
     ));
+}
+
+#[test]
+fn large_definition_roundtrips_exact_utf8_sql_without_a_byte_quota() {
+    let mut fixture = crate::persistence::test_support::union_all_keyed_projection_fixture(
+        crate::product::MvTarget::from_parts(Some("ice"), "sales", "large_utf8"),
+        Some(17),
+        2,
+        2,
+        1,
+    );
+    fixture
+        .definition
+        .query
+        .effective_sql
+        .push_str(&format!(" /*{}*/", "容量".repeat(12_000)));
+    let expected_source = fixture.definition.query.effective_sql.clone();
+    assert!(expected_source.len() > 65_536);
+    let definition = build_definition(
+        fixture.definition.created_at_ms,
+        fixture.definition.query,
+        fixture.definition.relation_occurrences,
+        fixture.definition.outputs,
+    )
+    .unwrap();
+    let bytes = encode_definition(&definition).unwrap();
+    assert!(bytes.as_bytes().len() > 65_536);
+    let decoded = decode_definition(bytes.as_bytes()).unwrap();
+    assert_eq!(
+        decoded.query.effective_sql.as_bytes(),
+        expected_source.as_bytes()
+    );
+    assert_eq!(decoded, definition);
+    assert_eq!(
+        encode_definition(&decoded).unwrap().as_bytes(),
+        bytes.as_bytes()
+    );
+}
+
+#[test]
+fn valid_definition_with_many_outputs_and_source_fields_roundtrips() {
+    let fixture = crate::persistence::test_support::union_all_keyed_projection_fixture(
+        crate::product::MvTarget::from_parts(Some("ice"), "sales", "wide_definition"),
+        Some(17),
+        2,
+        4_100,
+        1,
+    );
+    assert!(fixture.definition.outputs.len() > 4_096);
+    let bytes = encode_definition(&fixture.definition).unwrap();
+    let decoded = decode_definition(bytes.as_bytes()).unwrap();
+    assert_eq!(decoded, fixture.definition);
+    assert_eq!(
+        encode_definition(&decoded).unwrap().as_bytes(),
+        bytes.as_bytes()
+    );
 }

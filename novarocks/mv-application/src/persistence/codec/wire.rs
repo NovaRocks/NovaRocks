@@ -15,29 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Allocation-free protobuf structural preflight.
+//! Canonical protobuf structural preflight before generated DTO conversion.
 //!
-//! Prost intentionally accepts unknown fields and the last occurrence of a
-//! singular field. Durable MV facts use a stricter contract, so this scanner
-//! rejects both before DTO allocation and recursively applies the decode
-//! depth/item budgets.
+//! Durable MV facts reject unknown fields, duplicate singular fields and
+//! noncanonical encodings. Recursion follows a closed, acyclic schema graph.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::persistence::codec::PersistenceCodecError;
-use crate::persistence::validation::PersistenceDecodeBudget;
-
-// The encoded input remains live through prost decode, runtime conversion, the
-// canonical runtime clone, regenerated DTO, and canonical re-encoding. Six
-// copies of all payload bytes cover those simultaneously live representations;
-// 512 bytes per observed field/value/message is larger than every generated v1
-// DTO header and also covers Vec growth/allocator bookkeeping per item. A
-// separate frame allowance covers the fixed recursion stack. The bound is
-// based on scanner-observed structure, so many tiny nested headers cannot hide
-// behind a byte-only multiplier.
-const WIRE_BYTE_WORKING_SET_MULTIPLIER: usize = 6;
-const STRUCTURAL_ITEM_WORKING_SET_BYTES: usize = 512;
-const DEPTH_FRAME_WORKING_SET_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Schema {
@@ -308,181 +293,11 @@ impl Schema {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct PreflightUsage {
-    pub encoded_bytes: usize,
-    pub estimated_working_set_bytes: usize,
-    pub expanded_items: usize,
+pub(super) fn preflight(bytes: &[u8], schema: Schema) -> Result<(), PersistenceCodecError> {
+    scan_message(bytes, schema)
 }
 
-pub(super) fn preflight(
-    bytes: &[u8],
-    schema: Schema,
-    budget: PersistenceDecodeBudget,
-) -> Result<PreflightUsage, PersistenceCodecError> {
-    if bytes.len() > budget.max_document_bytes {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "encoded document",
-            maximum: budget.max_document_bytes,
-            actual: bytes.len(),
-        });
-    }
-    let mut measurement = MeasureState {
-        expanded_items: 0,
-        structural_items: 0,
-        maximum_depth: 0,
-        budget,
-    };
-    // This first pass uses only slices, integer counters, and bounded recursion.
-    // It allocates no sets or canonical-key buffers, so the complete bound is
-    // established before either the canonical scanner or prost can allocate.
-    measure_message(bytes, schema, 1, &mut measurement)?;
-    let estimated_working_set = bytes
-        .len()
-        .saturating_mul(WIRE_BYTE_WORKING_SET_MULTIPLIER)
-        .saturating_add(
-            measurement
-                .structural_items
-                .saturating_mul(STRUCTURAL_ITEM_WORKING_SET_BYTES),
-        )
-        .saturating_add(
-            measurement
-                .maximum_depth
-                .saturating_mul(DEPTH_FRAME_WORKING_SET_BYTES),
-        );
-    if estimated_working_set > budget.max_working_set_bytes {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "decode working set",
-            maximum: budget.max_working_set_bytes,
-            actual: estimated_working_set,
-        });
-    }
-    let mut state = ScanState {
-        expanded_items: 0,
-        budget,
-    };
-    scan_message(bytes, schema, 1, &mut state)?;
-    Ok(PreflightUsage {
-        encoded_bytes: bytes.len(),
-        estimated_working_set_bytes: estimated_working_set,
-        expanded_items: measurement.expanded_items,
-    })
-}
-
-struct MeasureState {
-    expanded_items: usize,
-    structural_items: usize,
-    maximum_depth: usize,
-    budget: PersistenceDecodeBudget,
-}
-
-fn measure_message(
-    mut bytes: &[u8],
-    schema: Schema,
-    depth: usize,
-    state: &mut MeasureState,
-) -> Result<(), PersistenceCodecError> {
-    state.structural_items = state.structural_items.saturating_add(1);
-    state.maximum_depth = state.maximum_depth.max(depth);
-    if depth > state.budget.max_depth {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "structure depth",
-            maximum: state.budget.max_depth,
-            actual: depth,
-        });
-    }
-    while !bytes.is_empty() {
-        state.structural_items = state.structural_items.saturating_add(1);
-        let (key, key_len) = read_varint(bytes)?;
-        bytes = &bytes[key_len..];
-        let number =
-            u32::try_from(key >> 3).map_err(|_| malformed("field number does not fit u32"))?;
-        if number == 0 {
-            return Err(malformed("field number zero is invalid"));
-        }
-        let actual_wire = match key & 0x07 {
-            0 => WireType::Varint,
-            2 => WireType::LengthDelimited,
-            value => return Err(malformed(format!("unsupported wire type {value}"))),
-        };
-        let Some(field) = schema.fields().iter().find(|field| field.number == number) else {
-            return Err(malformed(format!("unknown field {number} in {schema:?}")));
-        };
-        if actual_wire != field.wire_type {
-            return Err(malformed(format!(
-                "field {number} in {schema:?} uses the wrong wire type"
-            )));
-        }
-        if field.repeated && !field.packed_varints {
-            record_measured_item(state)?;
-        }
-        match actual_wire {
-            WireType::Varint => {
-                let (value, consumed) = read_varint(bytes)?;
-                if matches!(field.scalar_kind, Some(ScalarKind::Boolean)) && value > 1 {
-                    return Err(malformed(format!(
-                        "boolean field {number} in {schema:?} has illegal value {value}"
-                    )));
-                }
-                bytes = &bytes[consumed..];
-            }
-            WireType::LengthDelimited => {
-                let (length, prefix_len) = read_varint(bytes)?;
-                bytes = &bytes[prefix_len..];
-                let length = usize::try_from(length)
-                    .map_err(|_| malformed("length-delimited field is too large"))?;
-                if bytes.len() < length {
-                    return Err(malformed("truncated length-delimited field"));
-                }
-                let value = &bytes[..length];
-                bytes = &bytes[length..];
-                if field.packed_varints {
-                    let mut packed = value;
-                    while !packed.is_empty() {
-                        let (_, consumed) = read_varint(packed)?;
-                        packed = &packed[consumed..];
-                        state.structural_items = state.structural_items.saturating_add(1);
-                        record_measured_item(state)?;
-                    }
-                } else if let Some(nested) = field.nested {
-                    measure_message(value, nested, depth + 1, state)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn record_measured_item(state: &mut MeasureState) -> Result<(), PersistenceCodecError> {
-    state.expanded_items = state.expanded_items.saturating_add(1);
-    if state.expanded_items > state.budget.max_items {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "expanded document items",
-            maximum: state.budget.max_items,
-            actual: state.expanded_items,
-        });
-    }
-    Ok(())
-}
-
-struct ScanState {
-    expanded_items: usize,
-    budget: PersistenceDecodeBudget,
-}
-
-fn scan_message(
-    mut bytes: &[u8],
-    schema: Schema,
-    depth: usize,
-    state: &mut ScanState,
-) -> Result<(), PersistenceCodecError> {
-    if depth > state.budget.max_depth {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "structure depth",
-            maximum: state.budget.max_depth,
-            actual: depth,
-        });
-    }
+fn scan_message(mut bytes: &[u8], schema: Schema) -> Result<(), PersistenceCodecError> {
     let mut seen_singular = BTreeSet::new();
     let mut previous_field_number = 0;
     let mut previous_set_keys = BTreeMap::<u32, Vec<u8>>::new();
@@ -513,16 +328,7 @@ fn scan_message(
                 "field {number} in {schema:?} uses the wrong wire type"
             )));
         }
-        if field.repeated && !field.packed_varints {
-            state.expanded_items = state.expanded_items.saturating_add(1);
-            if state.expanded_items > state.budget.max_items {
-                return Err(PersistenceCodecError::ResourceBudget {
-                    resource: "expanded document items",
-                    maximum: state.budget.max_items,
-                    actual: state.expanded_items,
-                });
-            }
-        } else if !seen_singular.insert(number) {
+        if (!field.repeated || field.packed_varints) && !seen_singular.insert(number) {
             return Err(malformed(format!(
                 "singular field {number} occurs more than once in {schema:?}"
             )));
@@ -553,17 +359,9 @@ fn scan_message(
                     while !packed.is_empty() {
                         let (_, consumed) = read_varint(packed)?;
                         packed = &packed[consumed..];
-                        state.expanded_items = state.expanded_items.saturating_add(1);
-                        if state.expanded_items > state.budget.max_items {
-                            return Err(PersistenceCodecError::ResourceBudget {
-                                resource: "expanded document items",
-                                maximum: state.budget.max_items,
-                                actual: state.expanded_items,
-                            });
-                        }
                     }
                 } else if let Some(nested) = field.nested {
-                    scan_message(value, nested, depth + 1, state)?;
+                    scan_message(value, nested)?;
                     if let Some(key_spec) = field.canonical_key {
                         let key = extract_canonical_key(value, key_spec)?;
                         if let Some(previous) = previous_set_keys.get(&number)
@@ -647,39 +445,4 @@ fn read_key_bytes(bytes: &[u8], expected_field: u32) -> Result<Vec<u8>, Persiste
 
 fn malformed(message: impl Into<String>) -> PersistenceCodecError {
     PersistenceCodecError::MalformedWire(message.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::STRUCTURAL_ITEM_WORKING_SET_BYTES;
-    use crate::persistence::generated as proto;
-
-    #[test]
-    fn structural_allowance_covers_every_generated_dto_header() {
-        let generated_sizes = [
-            std::mem::size_of::<proto::DefinitionDocument>(),
-            std::mem::size_of::<proto::QuerySource>(),
-            std::mem::size_of::<proto::ResolutionContext>(),
-            std::mem::size_of::<proto::RelationOccurrence>(),
-            std::mem::size_of::<proto::SourceFieldBinding>(),
-            std::mem::size_of::<proto::OutputDefinition>(),
-            std::mem::size_of::<proto::ExpressionShape>(),
-            std::mem::size_of::<proto::SourceFieldReference>(),
-            std::mem::size_of::<proto::InterpretationDocument>(),
-            std::mem::size_of::<proto::OutputBinding>(),
-            std::mem::size_of::<proto::StateSlot>(),
-            std::mem::size_of::<proto::ApplyKey>(),
-            std::mem::size_of::<proto::ApplyKeyComponent>(),
-            std::mem::size_of::<proto::AggregateInterpretation>(),
-            std::mem::size_of::<proto::BranchInterpretation>(),
-            std::mem::size_of::<proto::TargetBinding>(),
-            std::mem::size_of::<proto::PhysicalFieldBinding>(),
-            std::mem::size_of::<proto::ConfigurationDocument>(),
-        ];
-        let largest = generated_sizes.into_iter().max().expect("generated DTOs");
-        assert!(
-            largest <= STRUCTURAL_ITEM_WORKING_SET_BYTES,
-            "largest generated DTO header is {largest} bytes"
-        );
-    }
 }

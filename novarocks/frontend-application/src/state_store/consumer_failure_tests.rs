@@ -46,7 +46,6 @@ use novarocks_catalog_application::{
 use novarocks_mv_application::persistence::codec::RefreshPolicy;
 use novarocks_mv_application::persistence::keyed_documents::MvKeyedDocumentProjection;
 use novarocks_mv_application::persistence::test_support::KeyedProjectionFixture;
-use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::repository::MvRepositoryErrorKind;
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
@@ -672,7 +671,7 @@ async fn mv_accelerator_reports_an_unknown_commit_instead_of_calling_it_absent()
     // write "not done".
     assert!(
         repository
-            .find_keyed_by_target(&mv_target(), PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&mv_target())
             .await
             .expect("target lookup")
             .is_none()
@@ -1013,4 +1012,107 @@ async fn catalog_attachment_stops_replaying_a_proven_uncommitted_drop() {
             .attachment,
         created.attachment
     );
+}
+
+/// The Accelerator must survive a real SQLite close/reopen with a value above
+/// the former application document quota, preserving the exact persisted bytes.
+#[tokio::test]
+async fn large_mv_projection_survives_sqlite_shutdown_and_reopen() {
+    use novarocks_mv_application::state_store_repository::codec::encode_keyed_projection;
+    use novarocks_state_store_api::{
+        StateStoreOpenRequest, StateStoreProviderFactory, StateStoreProviderLifecycle,
+    };
+    use novarocks_state_store_sqlite::{
+        SQLITE_STATE_STORE_CAPACITY, SqliteStateStoreProviderFactory,
+    };
+    use std::time::Instant;
+
+    let directory = tempfile::tempdir().expect("SQLite directory");
+    let path = directory.path().join("mv-projection.sqlite");
+    let cluster_id = format!("large-mv-reopen-{}", Uuid::now_v7());
+    let open_request = || StateStoreOpenRequest {
+        cluster_id: cluster_id.clone(),
+        limits: SQLITE_STATE_STORE_CAPACITY.limits(),
+        deadline: Instant::now() + Duration::from_secs(10),
+    };
+    let mut instance = Box::new(SqliteStateStoreProviderFactory::new(path.clone()))
+        .open(open_request())
+        .await
+        .expect("open first SQLite instance");
+    let store = instance.state_store().expect("SQLite port");
+    let repository =
+        StateStoreMvRepository::open(store.clone(), quick_policy(Duration::from_secs(3)))
+            .await
+            .expect("open first MV repository");
+    let mut fixture = KeyedProjectionFixture::new(mv_target(), Some(9));
+    fixture
+        .definition
+        .query
+        .effective_sql
+        .push_str(&format!(" /*{}*/", "界".repeat(30_000),));
+    let facts = fixture.build().expect("large coherent keyed documents");
+    let operation_id = Uuid::now_v7();
+    let installed = repository
+        .install_keyed_projection(operation_id, facts, None)
+        .await
+        .expect("install large MV projection");
+    let expected_value = encode_keyed_projection(operation_id, &installed.projection)
+        .expect("actual Accelerator value");
+    assert!(expected_value.as_bytes().len() > 65_536);
+    assert_eq!(
+        repository.find_keyed_by_target(&mv_target()).await.unwrap(),
+        Some(installed.clone())
+    );
+
+    // Read the actual root through the repository's key author; source length
+    // alone does not measure the persisted StateStore value.
+    let root_key = novarocks_mv_application::state_store_repository::key::projection_by_id_key(
+        installed.projection.mv_id,
+    )
+    .unwrap();
+    let mut transaction = store.begin_read().await.expect("read persisted root");
+    let root = transaction
+        .get(&root_key)
+        .await
+        .unwrap()
+        .expect("large root was actually persisted");
+    assert_eq!(root.value, expected_value);
+    transaction.abort().await.expect("close first reader");
+    eprintln!(
+        "SQLite persisted MV root Value bytes={}",
+        root.value.as_bytes().len()
+    );
+    assert!(root.value.as_bytes().len() > 65_536);
+    drop(repository);
+    drop(store);
+    instance
+        .shutdown(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect("all first-instance aliases exited");
+    assert_eq!(instance.lifecycle(), StateStoreProviderLifecycle::Stopped);
+    drop(instance);
+
+    let mut reopened = Box::new(SqliteStateStoreProviderFactory::new(path))
+        .open(open_request())
+        .await
+        .expect("reopen same SQLite file and cluster");
+    let store = reopened.state_store().expect("reopened SQLite port");
+    let repository =
+        StateStoreMvRepository::open(store.clone(), quick_policy(Duration::from_secs(3)))
+            .await
+            .expect("reopen MV repository");
+    assert_eq!(
+        repository.find_keyed_by_target(&mv_target()).await.unwrap(),
+        Some(installed)
+    );
+    let mut transaction = store.begin_read().await.expect("read reopened root");
+    assert_eq!(transaction.get(&root.key).await.unwrap(), Some(root));
+    transaction.abort().await.expect("close reopened reader");
+    drop(repository);
+    drop(store);
+    reopened
+        .shutdown(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect("all reopened aliases exited");
+    assert_eq!(reopened.lifecycle(), StateStoreProviderLifecycle::Stopped);
 }

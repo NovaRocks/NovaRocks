@@ -18,7 +18,6 @@
 use super::StateStoreMvRepository;
 use super::keyed::LoadedKeyedMvProjection;
 use super::tests_definition::{projection_facts, repository, target};
-use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::repository::{MvProjectionInventoryBound, MvRepositoryErrorKind};
 use novarocks_state_store_api::{
     AttemptSupervisor, Key, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
@@ -196,10 +195,8 @@ fn bound() -> MvProjectionInventoryBound {
     MvProjectionInventoryBound {
         entries: 4,
         snapshot_bytes: 16 * 1024,
-        raw_page_bytes: 128 * 1024,
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: PersistenceDecodeBudget::default(),
     }
 }
 
@@ -253,6 +250,85 @@ async fn inventory_reads_one_snapshot_in_single_record_pages_and_returns_thin_id
             .unwrap(),
         Some(first),
     );
+}
+
+#[tokio::test]
+async fn inventory_and_exact_lookup_accept_a_stored_projection_above_one_mib() {
+    use crate::persistence::test_support::KeyedProjectionFixture;
+    use novarocks_state_store_api::StateStoreCapacity;
+    use novarocks_state_store_testkit::testing::InMemoryStateStore;
+
+    // The test store explicitly admits the payload; its ordinary small default
+    // is a separate provider fixture policy and must not mask MV acceptance.
+    let inner = Arc::new(InMemoryStateStore::with_limits(
+        format!("large-inventory-{}", Uuid::now_v7()),
+        StateStoreCapacity::new(8 * 1024, usize::MAX, usize::MAX, 10_000).limits(),
+    ));
+    let store = RecordingStore::new(inner);
+    let repository = StateStoreMvRepository::open(store.clone(), StateStoreRunPolicy::default())
+        .await
+        .unwrap();
+    let mut fixture = KeyedProjectionFixture::new(target("large"), Some(17));
+    fixture.definition.query.effective_sql.push_str(" /*");
+    fixture
+        .definition
+        .query
+        .effective_sql
+        .push_str(&"x".repeat(1024 * 1024 + 1));
+    fixture.definition.query.effective_sql.push_str("*/");
+    let expected_sql = fixture.definition.query.effective_sql.clone();
+    // Build reauthors computation identity, revisions and the actual keyed view.
+    let loaded = repository
+        .install_keyed_projection(Uuid::now_v7(), fixture.build().unwrap(), None)
+        .await
+        .unwrap();
+    let root = super::key::projection_by_id_key(loaded.projection.mv_id).unwrap();
+    let mut raw_read = store.inner.begin_read().await.unwrap();
+    let persisted = raw_read.get(&root).await.unwrap().unwrap();
+    assert!(persisted.value.as_bytes().len() > 1024 * 1024);
+    raw_read
+        .abort()
+        .await
+        .expect("close actual encoded-value read");
+
+    store.reset();
+    let inventory = repository
+        .list_keyed_projection_inventory(bound())
+        .await
+        .unwrap();
+    store.assert_scan_closed(1);
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].mv_id, loaded.projection.mv_id);
+    assert_eq!(inventory[0].target, loaded.projection.facts.target());
+    assert_eq!(
+        &inventory[0].object_id,
+        &loaded.projection.facts.source_revision().target_object_id
+    );
+
+    store.reset();
+    let exact = repository
+        .find_keyed_by_target_bounded(&inventory[0].target, bound())
+        .await
+        .unwrap()
+        .expect("exact large projection");
+    assert_eq!(
+        exact
+            .projection
+            .facts
+            .definition()
+            .query
+            .effective_sql
+            .as_bytes(),
+        expected_sql.as_bytes()
+    );
+    assert_eq!(exact, loaded);
+    let trace = store.trace.lock().unwrap();
+    assert_eq!(
+        trace.begins, 2,
+        "lookup and root reads keep their existing snapshots"
+    );
+    assert_eq!(trace.aborts, 2, "both exact reads must close");
+    assert!(trace.ranges.is_empty());
 }
 
 #[tokio::test]
@@ -352,45 +428,6 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
 }
 
 #[tokio::test]
-async fn inventory_raw_and_decode_refusals_abort_without_following_the_continuation() {
-    let (store, repository) = recorded_repository().await;
-    seed(&repository, "first").await;
-    seed(&repository, "second").await;
-    let mut raw = bound();
-    raw.raw_page_bytes = 1;
-    let mut document = bound();
-    document.decode.max_document_bytes = 1;
-    let mut workspace = bound();
-    workspace.decode.max_working_set_bytes = 1;
-    for (tiny, kind, message) in [
-        (
-            raw,
-            MvRepositoryErrorKind::InvalidRequest,
-            "raw page byte bound",
-        ),
-        (
-            document,
-            MvRepositoryErrorKind::Corruption,
-            "keyed MV cache document exceeds decode bound",
-        ),
-        (
-            workspace,
-            MvRepositoryErrorKind::Corruption,
-            "working set bound",
-        ),
-    ] {
-        store.reset();
-        let error = repository
-            .list_keyed_projection_inventory(tiny)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), kind);
-        assert!(error.message().contains(message), "{error}");
-        store.assert_scan_closed(1);
-    }
-}
-
-#[tokio::test]
 async fn bounded_target_lookup_returns_the_current_exact_version_after_replacement() {
     let (_, repository) = recorded_repository().await;
     let created = seed(&repository, "first").await;
@@ -419,7 +456,7 @@ async fn bounded_target_lookup_returns_the_current_exact_version_after_replaceme
     assert_eq!(fresh, replacement);
     assert_eq!(
         repository
-            .find_keyed_by_target(&inventory[0].target, PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&inventory[0].target)
             .await
             .unwrap(),
         Some(fresh),
@@ -525,31 +562,6 @@ async fn bounded_dependencies_refuse_before_retaining_or_following_an_over_budge
             },
             1,
             "continuation token byte bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                inventory: MvProjectionInventoryBound {
-                    raw_page_bytes: 1,
-                    ..bound()
-                },
-                ..dependency_bound()
-            },
-            0,
-            "raw page byte bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                inventory: MvProjectionInventoryBound {
-                    decode: PersistenceDecodeBudget {
-                        max_working_set_bytes: 1,
-                        ..PersistenceDecodeBudget::default()
-                    },
-                    ..bound()
-                },
-                ..dependency_bound()
-            },
-            0,
-            "outer decode working set bound",
         ),
     ] {
         store.reset();

@@ -1405,11 +1405,7 @@ mod repository_original_cause_tests {
             novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "orders");
         let error = match repository
             .in_requests(&requests)
-            .find_keyed_by_target(
-                &target,
-                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(
-                ),
-            )
+            .find_keyed_by_target(&target)
             .await
         {
             Err(error) => error,
