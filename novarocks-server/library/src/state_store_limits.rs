@@ -17,8 +17,7 @@
 
 use anyhow::{Result, bail};
 use novarocks_state_store_api::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
-    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
+    DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, StateStoreCapacity, StateStoreLimits,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -33,12 +32,14 @@ pub struct StateStoreLimitOverrides {
 
 pub(crate) fn resolve_state_store_limits(
     overrides: &StateStoreLimitOverrides,
-    provider_max_key_bytes: usize,
+    capacity: StateStoreCapacity,
 ) -> Result<StateStoreLimits> {
-    if provider_max_key_bytes == 0 || provider_max_key_bytes > MAX_KEY_BYTES {
-        bail!(
-            "InvalidStateStoreConfig: provider_max_key_bytes must be between 1 and {MAX_KEY_BYTES}, got {provider_max_key_bytes}"
-        );
+    if capacity.max_key_bytes == 0
+        || capacity.max_value_bytes == 0
+        || capacity.max_transaction_bytes == 0
+        || capacity.max_transaction_operations == 0
+    {
+        bail!("InvalidStateStoreConfig: provider capacity must be positive");
     }
     let deadline_ms = tightened_u64(
         "transaction_timeout_ms",
@@ -49,23 +50,23 @@ pub(crate) fn resolve_state_store_limits(
         max_key_bytes: tightened_usize(
             "max_key_bytes",
             overrides.max_key_bytes,
-            provider_max_key_bytes,
+            capacity.max_key_bytes,
         )?,
         max_value_bytes: tightened_usize(
             "max_value_bytes",
             overrides.max_value_bytes,
-            MAX_VALUE_BYTES,
+            capacity.max_value_bytes,
         )?,
         max_page_size: tightened_usize("max_page_size", overrides.max_page_size, MAX_PAGE_SIZE)?,
         max_transaction_operations: tightened_usize(
             "max_transaction_operations",
             overrides.max_transaction_operations,
-            MAX_TRANSACTION_OPERATIONS,
+            capacity.max_transaction_operations,
         )?,
         max_transaction_bytes: tightened_usize(
             "max_transaction_bytes",
             overrides.max_transaction_bytes,
-            MAX_TRANSACTION_BYTES,
+            capacity.max_transaction_bytes,
         )?,
         transaction_deadline: std::time::Duration::from_millis(deadline_ms),
     })
@@ -93,20 +94,26 @@ mod tests {
 
     use super::*;
 
+    const TEST_CAPACITY: StateStoreCapacity =
+        StateStoreCapacity::new(8 * 1024, 64 * 1024, 4 * 1024 * 1024, 10_000);
+
     #[test]
-    fn state_store_limits_use_fixed_contract_defaults() {
+    fn state_store_limits_use_provider_capacity() {
         let limits =
-            resolve_state_store_limits(&StateStoreLimitOverrides::default(), MAX_KEY_BYTES)
+            resolve_state_store_limits(&StateStoreLimitOverrides::default(), TEST_CAPACITY)
                 .expect("common limits");
 
-        assert_eq!(limits.max_key_bytes, MAX_KEY_BYTES);
-        assert_eq!(limits.max_value_bytes, MAX_VALUE_BYTES);
+        assert_eq!(limits.max_key_bytes, TEST_CAPACITY.max_key_bytes);
+        assert_eq!(limits.max_value_bytes, TEST_CAPACITY.max_value_bytes);
         assert_eq!(limits.max_page_size, MAX_PAGE_SIZE);
         assert_eq!(
             limits.max_transaction_operations,
-            MAX_TRANSACTION_OPERATIONS
+            TEST_CAPACITY.max_transaction_operations
         );
-        assert_eq!(limits.max_transaction_bytes, MAX_TRANSACTION_BYTES);
+        assert_eq!(
+            limits.max_transaction_bytes,
+            TEST_CAPACITY.max_transaction_bytes
+        );
         assert_eq!(limits.transaction_deadline, DEFAULT_TRANSACTION_DEADLINE);
     }
 
@@ -121,7 +128,7 @@ mod tests {
             transaction_timeout_ms: Some(500),
         };
 
-        let limits = resolve_state_store_limits(&overrides, MAX_KEY_BYTES).expect("tighter limits");
+        let limits = resolve_state_store_limits(&overrides, TEST_CAPACITY).expect("tighter limits");
 
         assert_eq!(limits.max_key_bytes, 1024);
         assert_eq!(limits.max_value_bytes, 2048);
@@ -144,7 +151,7 @@ mod tests {
             (
                 "max_key_bytes",
                 StateStoreLimitOverrides {
-                    max_key_bytes: Some(MAX_KEY_BYTES + 1),
+                    max_key_bytes: Some(TEST_CAPACITY.max_key_bytes + 1),
                     ..Default::default()
                 },
             ),
@@ -158,7 +165,7 @@ mod tests {
             (
                 "max_value_bytes",
                 StateStoreLimitOverrides {
-                    max_value_bytes: Some(MAX_VALUE_BYTES + 1),
+                    max_value_bytes: Some(TEST_CAPACITY.max_value_bytes + 1),
                     ..Default::default()
                 },
             ),
@@ -186,7 +193,7 @@ mod tests {
             (
                 "max_transaction_operations",
                 StateStoreLimitOverrides {
-                    max_transaction_operations: Some(MAX_TRANSACTION_OPERATIONS + 1),
+                    max_transaction_operations: Some(TEST_CAPACITY.max_transaction_operations + 1),
                     ..Default::default()
                 },
             ),
@@ -200,7 +207,7 @@ mod tests {
             (
                 "max_transaction_bytes",
                 StateStoreLimitOverrides {
-                    max_transaction_bytes: Some(MAX_TRANSACTION_BYTES + 1),
+                    max_transaction_bytes: Some(TEST_CAPACITY.max_transaction_bytes + 1),
                     ..Default::default()
                 },
             ),
@@ -223,11 +230,21 @@ mod tests {
         ];
 
         for (field, overrides) in invalid {
-            let error = resolve_state_store_limits(&overrides, MAX_KEY_BYTES)
+            let error = resolve_state_store_limits(&overrides, TEST_CAPACITY)
                 .expect_err("zero or relaxed limits must fail closed");
             let message = error.to_string();
             assert!(message.contains("InvalidStateStoreConfig"), "{message}");
             assert!(message.contains(field), "{message}");
         }
+    }
+    #[test]
+    fn sqlite_defaults_come_from_its_complete_descriptor() {
+        let capacity = novarocks_state_store_sqlite::SQLITE_STATE_STORE_DESCRIPTOR.capacity;
+        let limits = resolve_state_store_limits(&StateStoreLimitOverrides::default(), capacity)
+            .expect("SQLite limits");
+        assert_eq!(limits, capacity.limits());
+        assert!(limits.max_value_bytes > 64 * 1024);
+        assert_eq!(limits.max_transaction_bytes, usize::MAX);
+        assert_eq!(limits.max_transaction_operations, usize::MAX);
     }
 }

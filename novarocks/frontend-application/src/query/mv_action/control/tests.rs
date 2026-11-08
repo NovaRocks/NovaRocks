@@ -76,7 +76,7 @@ async fn same_nonclone_drop_guard_uses_only_applied_finite_requests_after_root_c
     ))
     .open(StateStoreOpenRequest {
         cluster_id: "mv-control-original".into(),
-        limits: Default::default(),
+        limits: novarocks_state_store_sqlite::SQLITE_STATE_STORE_CAPACITY.limits(),
         deadline: Instant::now() + Duration::from_secs(10),
     })
     .await

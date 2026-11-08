@@ -1304,7 +1304,7 @@ async fn original_cap_one_runner_retires_real_conflict_before_reserving_its_retr
     let mut store = OriginalMemory::new(execution.clone());
     store.inner = InMemoryStateStore::with_limits_and_capacity(
         "actual-conflict-cap-one",
-        StateStoreLimits::default(),
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
         std::num::NonZeroUsize::new(1).unwrap(),
     );
     let receiving = crate::CatalogMutationReceipt::default();

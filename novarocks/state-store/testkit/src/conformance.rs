@@ -45,9 +45,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_state_store_api::{
     AttemptOutcome, AttemptSupervisor, CommitObservation, CommitOutcome, CommitReceipt, Direction,
-    Key, KeyRange, MAX_KEY_BYTES, Precondition, RangePage, RangeRequest, ReadTransaction,
-    StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
-    Value, WriteAttempt, WriteTransaction,
+    Key, KeyRange, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, Value, WriteAttempt,
+    WriteTransaction,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -595,7 +595,7 @@ pub async fn forward_reverse_pages(factory: &StateStoreFactory) {
 pub async fn limits_before_io(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let limits = store.limits().clone();
-    assert!(limits.max_key_bytes < MAX_KEY_BYTES);
+    assert!(limits.max_key_bytes > 0 && limits.max_key_bytes < usize::MAX);
     let oversized = key(vec![11; limits.max_key_bytes + 1]);
     let visible = key(b"c11/visible".to_vec());
     let mut reader = store.begin_read().await.expect("begin limited read");

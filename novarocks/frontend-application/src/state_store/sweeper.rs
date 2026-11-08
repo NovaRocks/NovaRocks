@@ -232,7 +232,7 @@ mod tests {
     async fn a_sweep_returns_an_abandoned_attempt_to_the_instance() {
         let store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::with_limits_and_capacity(
             "sweeper",
-            Default::default(),
+            novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
             NonZeroUsize::new(1).expect("capacity"),
         ));
         let (sweeper, owner, workers) = fixture(Arc::clone(&store));

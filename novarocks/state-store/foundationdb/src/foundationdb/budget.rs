@@ -204,7 +204,7 @@ mod tests {
         StateStoreLimits {
             max_transaction_bytes: bytes,
             max_transaction_operations: operations,
-            ..StateStoreLimits::default()
+            ..crate::FOUNDATIONDB_STATE_STORE_CAPACITY.limits()
         }
     }
 

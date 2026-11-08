@@ -17,9 +17,17 @@
 
 use bytes::Bytes;
 use novarocks_state_store_api::{
-    Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind, StateStoreLimits,
-    StoreRevision, Value, VersionToken,
+    Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind, StoreRevision, Value,
+    VersionToken,
 };
+
+const TEST_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        8 * 1024,
+        64 * 1024,
+        4 * 1024 * 1024,
+        10_000,
+    );
 
 #[allow(dead_code)]
 fn assert_object_safe(_: &dyn StateStore) {}
@@ -29,24 +37,9 @@ fn key(value: &'static [u8]) -> Key {
 }
 
 #[test]
-fn common_binary_limits_are_owned_by_spi() {
-    let limits = StateStoreLimits::default();
-    assert_eq!(limits.max_key_bytes, 8 * 1024);
-    assert_eq!(limits.max_value_bytes, 64 * 1024);
-    assert!(Key::try_from(Bytes::from(vec![0xff; limits.max_key_bytes])).is_ok());
-    assert_eq!(
-        Key::try_from(Bytes::from(vec![0; limits.max_key_bytes + 1]))
-            .expect_err("oversized key")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    assert!(Value::try_from(Bytes::from(vec![0xff; limits.max_value_bytes])).is_ok());
-    assert_eq!(
-        Value::try_from(Bytes::from(vec![0; limits.max_value_bytes + 1]))
-            .expect_err("oversized value")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
+fn binary_carriers_do_not_impose_provider_capacity() {
+    assert!(Key::try_from(Bytes::from(vec![0xff; 8 * 1024 + 1])).is_ok());
+    assert!(Value::try_from(Bytes::from(vec![0xff; 64 * 1024 + 1])).is_ok());
 }
 
 #[test]
@@ -65,7 +58,7 @@ fn continuation_is_bound_to_range_and_direction() {
     wrong.continuation = Some(token);
     assert_eq!(
         wrong
-            .validate(&StateStoreLimits::default())
+            .validate(&TEST_CAPACITY.limits())
             .expect_err("direction mismatch")
             .kind(),
         StateStoreErrorKind::InvalidRequest
@@ -83,7 +76,7 @@ fn continuation_is_bound_to_range_and_direction() {
     };
     assert_eq!(
         wrong_range
-            .validate(&StateStoreLimits::default())
+            .validate(&TEST_CAPACITY.limits())
             .expect_err("range mismatch")
             .kind(),
         StateStoreErrorKind::InvalidRequest
@@ -111,7 +104,7 @@ fn opaque_tokens_reject_empty_values() {
 #[test]
 fn range_page_size_enforces_zero_and_overflow_bounds() {
     let range = KeyRange::new(key(b"a"), key(b"z")).expect("valid range");
-    for page_size in [0, StateStoreLimits::default().max_page_size + 1] {
+    for page_size in [0, TEST_CAPACITY.limits().max_page_size + 1] {
         let request = RangeRequest {
             range: range.clone(),
             direction: Direction::Forward,
@@ -120,7 +113,7 @@ fn range_page_size_enforces_zero_and_overflow_bounds() {
         };
         assert_eq!(
             request
-                .validate(&StateStoreLimits::default())
+                .validate(&TEST_CAPACITY.limits())
                 .expect_err("invalid page size")
                 .kind(),
             StateStoreErrorKind::LimitExceeded
@@ -142,12 +135,40 @@ fn prefix_ranges_require_a_finite_successor() {
 }
 
 #[test]
-fn default_limits_cover_all_contract_fields() {
-    let limits = StateStoreLimits::default();
+fn explicit_capacity_fills_all_contract_fields() {
+    let limits = TEST_CAPACITY.limits();
     assert_eq!(limits.max_key_bytes, 8 * 1024);
     assert_eq!(limits.max_value_bytes, 64 * 1024);
     assert_eq!(limits.max_page_size, 1_000);
     assert_eq!(limits.max_transaction_operations, 10_000);
     assert_eq!(limits.max_transaction_bytes, 4 * 1024 * 1024);
     assert_eq!(limits.transaction_deadline.as_secs(), 4);
+}
+
+#[test]
+fn capacity_checks_every_opening_dimension_without_an_spi_quota() {
+    let capacity = novarocks_state_store_api::StateStoreCapacity::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    );
+    assert!(capacity.accepts(&capacity.limits()));
+    for field in 0..4 {
+        let mut limits = TEST_CAPACITY.limits();
+        match field {
+            0 => limits.max_key_bytes += 1,
+            1 => limits.max_value_bytes += 1,
+            2 => limits.max_transaction_bytes += 1,
+            _ => limits.max_transaction_operations += 1,
+        }
+        assert!(!TEST_CAPACITY.accepts(&limits));
+        match field {
+            0 => limits.max_key_bytes = 0,
+            1 => limits.max_value_bytes = 0,
+            2 => limits.max_transaction_bytes = 0,
+            _ => limits.max_transaction_operations = 0,
+        }
+        assert!(!TEST_CAPACITY.accepts(&limits));
+    }
 }

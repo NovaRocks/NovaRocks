@@ -111,7 +111,7 @@ impl ScriptedStateStore {
         Arc::new(Self {
             inner: Arc::new(InMemoryStateStore::with_limits_and_capacity(
                 cluster_id,
-                StateStoreLimits::default(),
+                novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
                 NonZeroUsize::new(outstanding_attempts).expect("positive attempt capacity"),
             )),
             state: Arc::new(ScriptedState {

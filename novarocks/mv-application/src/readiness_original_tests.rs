@@ -276,7 +276,7 @@ async fn original_service(
         format!("readiness-original-{}", Uuid::now_v7()),
         StateStoreLimits {
             max_page_size: 1,
-            ..StateStoreLimits::default()
+            ..novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits()
         },
     ));
     let trace = Arc::new(Trace::default());

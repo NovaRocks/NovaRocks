@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use super::json::ScanError;
 use super::minimal_view::{
-    MutationView, NamespaceView, PROPERTY_VALUE_LIMIT, PropertyValue, RefCheck, TableResponseView,
-    TableViewRequest, ViewMutationView, ViewRequestError,
+    MutationView, NamespaceView, PropertyValue, RefCheck, TableResponseView, TableViewRequest,
+    ViewMutationView, ViewRequestError,
 };
 use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
 use crate::catalog::transaction::CommitProof;
@@ -239,16 +239,12 @@ enum ExpectedIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpectationError {
     View(ViewRequestError),
-    PropertyValueTooLong,
 }
 
 impl fmt::Display for ExpectationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::View(error) => error.fmt(f),
-            Self::PropertyValueTooLong => {
-                f.write_str("expected property value exceeds the response value limit")
-            }
         }
     }
 }
@@ -290,17 +286,14 @@ impl AttributionExpectation {
         snapshot: Option<ExpectedSnapshot>,
         properties: Vec<(String, String)>,
     ) -> Result<Self, ExpectationError> {
-        if properties
-            .iter()
-            .any(|(_, value)| value.len() > PROPERTY_VALUE_LIMIT)
-        {
-            return Err(ExpectationError::PropertyValueTooLong);
-        }
         let view_request = match endpoint.response_shape() {
             Some(ResponseShape::Table) => Some(TableViewRequest::new(
                 snapshot.as_ref().map(ExpectedSnapshot::snapshot_id),
                 snapshot.as_ref().and_then(|s| s.target_ref.clone()),
-                properties.iter().map(|(key, _)| key.clone()).collect(),
+                properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.len()))
+                    .collect(),
             )?),
             _ => None,
         };
@@ -666,6 +659,7 @@ pub(crate) fn classify(
                 409 => rejected(ConnectorMutationFailureKind::Conflict),
                 401 | 419 => rejected(ConnectorMutationFailureKind::Unauthenticated),
                 403 => rejected(ConnectorMutationFailureKind::PermissionDenied),
+                413 => rejected(ConnectorMutationFailureKind::ResourceExhausted),
                 400 | 404 => unknown(
                     expect,
                     UnknownReason::PostPublishPossible,
@@ -1374,6 +1368,7 @@ mod tests {
                 (401, Kind::Unauthenticated),
                 (419, Kind::Unauthenticated),
                 (403, Kind::PermissionDenied),
+                (413, Kind::ResourceExhausted),
             ] {
                 // A body is never consulted for a non-success status.
                 let evidence = classify_body(&expect, code, Some("<html>"));
@@ -1381,6 +1376,10 @@ mod tests {
                     evidence,
                     RestEvidence::Rejected { status: code, kind },
                     "{endpoint:?} {code}"
+                );
+                assert_eq!(
+                    evidence.message(),
+                    format!("REST catalog rejected the request with HTTP {code}")
                 );
             }
         }
@@ -1404,7 +1403,7 @@ mod tests {
     #[test]
     fn every_other_status_is_unknown() {
         let others = [
-            500, 501, 502, 503, 504, 505, 408, 429, 201, 202, 301, 302, 303, 307, 308,
+            500, 501, 502, 503, 504, 505, 408, 415, 429, 201, 202, 301, 302, 303, 307, 308,
         ];
         for endpoint in E::ALL {
             let expect = expectation(endpoint);
@@ -1842,6 +1841,7 @@ mod tests {
             (401, Kind::Unauthenticated),
             (419, Kind::Unauthenticated),
             (403, Kind::PermissionDenied),
+            (413, Kind::ResourceExhausted),
         ] {
             assert!(matches!(
                 verdict(classify_body(&expect, code, None)),
@@ -1891,6 +1891,10 @@ mod tests {
         assert!(matches!(
             verdict(classify_body(&expect, 403, None)),
             CtasCommitVerdict::KnownUncommitted(failure) if failure.kind() == Kind::PermissionDenied
+        ));
+        assert!(matches!(
+            verdict(classify_body(&expect, 413, None)),
+            CtasCommitVerdict::KnownUncommitted(failure) if failure.kind() == Kind::ResourceExhausted
         ));
         for code in [400, 404, 502] {
             assert!(matches!(
@@ -1955,15 +1959,38 @@ mod tests {
     }
 
     #[test]
-    fn expectations_are_bounded_before_dispatch() {
-        assert_eq!(
-            AttributionExpectation::ctas_final_commit(
-                uuid(TABLE_UUID),
+    fn expectations_retain_long_values_and_keep_ref_validation() {
+        // This UTF8 value exceeds the former 64KiB quota; its bytes author
+        // response retention, without becoming a replacement product limit.
+        let expected = "原文".repeat(16 * 1024);
+        assert!(expected.len() > 64 * 1024);
+        let expect = AttributionExpectation::ctas_final_commit(
+            uuid(TABLE_UUID),
+            None,
+            vec![(MARKER.to_owned(), expected.clone())],
+        )
+        .unwrap();
+        for extra in [0, 1, 10_000] {
+            let value = format!("{expected}{}", "x".repeat(extra));
+            let body = table_body(
+                r#""metadata-location":"s3://warehouse/db/t/metadata/2.json","#,
+                TABLE_UUID,
+                &[],
                 None,
-                vec![(MARKER.to_owned(), "v".repeat(PROPERTY_VALUE_LIMIT + 1))],
-            ),
-            Err(ExpectationError::PropertyValueTooLong)
-        );
+            )
+            .replace("\"op-7\"", &serde_json::to_string(&value).unwrap());
+            let evidence = classify_body(&expect, 200, Some(&body));
+            if extra == 0 {
+                assert!(matches!(evidence, RestEvidence::Applied { .. }));
+            } else {
+                assert_eq!(
+                    unknown_reason(&evidence),
+                    &UnknownReason::Unattributable(UnattributableCause::PropertyMismatch {
+                        key: MARKER.to_owned(),
+                    })
+                );
+            }
+        }
         assert_eq!(
             AttributionExpectation::table_commit(
                 uuid(TABLE_UUID),

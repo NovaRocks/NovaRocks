@@ -410,7 +410,7 @@ impl Preparer for KeyedPublicationPreparer {
         view: &StagedView<'_>,
         intent: &OperationIntent,
     ) -> crate::iceberg::Result<PreparedChange> {
-        // Recompute closure and budget on this attempt's actual refs base.
+        // Recompute closure on this attempt's actual refs base.
         // A concurrent metadata-only marker write may increase its byte size
         // without advancing main; the admitted source is not that base.
         let prepared =
@@ -1750,7 +1750,7 @@ mod keyed_preparation_tests {
     }
 
     #[tokio::test]
-    async fn keyed_publication_uses_actual_attempt_properties_before_writing_any_manifest() {
+    async fn keyed_publication_accepts_large_attempt_properties_before_writing_any_manifest() {
         use crate::commit::staging::StagingEngine;
         let fixture = Fixture::new();
         let mut base = fixture.metadata(FormatVersion::V2);
@@ -1763,14 +1763,27 @@ mod keyed_preparation_tests {
                 )
             })
             .collect();
+        assert!(
+            properties
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                > 256 * 1024
+        );
         base = base
             .into_builder(None)
-            .set_properties(properties)
+            .set_properties(properties.clone())
             .unwrap()
             .build()
             .unwrap()
             .metadata;
         let documents = publication(document("new-binding", 1));
+        let version = &documents.versions[0];
+        let version_key = crate::document_storage::keyed::keys::version_key(version.identity());
+        let version_value =
+            crate::document_storage::keyed::envelope::encode_version(version).unwrap();
+        let root_key = crate::document_storage::keyed::keys::root_key("novarocks.test");
+        let root_value = version.identity().to_hex();
         let intent = intent(&fixture, &base, &documents);
         let attempt = fixture.operation.begin_attempt().unwrap();
         let mut engine = StagingEngine::begin(
@@ -1782,15 +1795,21 @@ mod keyed_preparation_tests {
             &attempt,
         )
         .unwrap();
-        let error = engine
+        engine
             .stage(&KeyedPublicationPreparer(documents))
             .await
-            .unwrap_err();
+            .expect("large existing private properties do not prevent keyed preparation");
+        for (key, value) in properties {
+            assert_eq!(engine.metadata().properties().get(&key), Some(&value));
+        }
         assert_eq!(
-            attempt::before_dispatch_failure(&error).kind(),
-            ConnectorMutationFailureKind::InvalidRequest
+            engine.metadata().properties().get(&version_key),
+            Some(&version_value)
         );
-        assert!(error.to_string().contains("private properties"));
+        assert_eq!(
+            engine.metadata().properties().get(&root_key),
+            Some(&root_value)
+        );
         assert!(fixture.operation.artifacts().unwrap().is_empty());
     }
 

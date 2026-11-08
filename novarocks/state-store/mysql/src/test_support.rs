@@ -1244,6 +1244,9 @@ impl MysqlHeldCommitLedgerLock {
 }
 
 impl MysqlTransactionTestApi {
+    /// Explicit reader capacity paired with the existing malformed-row injector.
+    pub const MALFORMED_ROW_VALUE_LIMIT: usize = super::txn::MALFORMED_ROW_TEST_VALUE_LIMIT;
+
     pub fn explicit_rollback_count() -> u64 {
         super::txn::explicit_rollback_count_for_test()
     }

@@ -61,7 +61,7 @@ use novarocks_spi::connector::{
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvSourceSchemaObservation,
     MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
-use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
+
 use novarocks_state_store_runtime::{
     StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
@@ -1141,7 +1141,10 @@ pub fn state_store_input(config: &NovaRocksConfig) -> anyhow::Result<Option<Stat
     let Some(state_store) = &config.state_store else {
         return Ok(None);
     };
-    let limits = resolve_state_store_limits(&state_store.store.limits, MAX_KEY_BYTES)?;
+    let limits = resolve_state_store_limits(
+        &state_store.store.limits,
+        novarocks_state_store_sqlite::SQLITE_STATE_STORE_DESCRIPTOR.capacity,
+    )?;
     // Two independently validated groups from two owners: what the provider
     // enforces, and what this application does about failures.
     let run_policy = config.application.state_store_policy.resolve()?;
@@ -1161,8 +1164,7 @@ pub fn state_store_provider_registry(
         return Ok(registry);
     };
     let contribution = SqliteStateStoreContribution::new(state_store.store.path.clone());
-    let descriptor =
-        StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID, MAX_KEY_BYTES);
+    let descriptor = novarocks_state_store_sqlite::SQLITE_STATE_STORE_DESCRIPTOR;
     registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {
         Ok(Box::new(contribution.clone().into_factory()))
     }))?;

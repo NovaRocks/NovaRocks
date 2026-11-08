@@ -19,7 +19,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreLimits};
+use super::{StateStore, StateStoreCapacity, StateStoreError, StateStoreLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateStoreProviderId(&'static str);
@@ -88,13 +88,18 @@ impl std::error::Error for StateStoreProviderIdError {}
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StateStoreProviderDescriptor {
     pub id: StateStoreProviderId,
-    pub max_key_bytes: usize,
+    pub capacity: StateStoreCapacity,
 }
 
 impl StateStoreProviderDescriptor {
-    pub const fn new(id: StateStoreProviderId, max_key_bytes: usize) -> Self {
-        assert!(max_key_bytes > 0 && max_key_bytes <= MAX_KEY_BYTES);
-        Self { id, max_key_bytes }
+    pub const fn new(id: StateStoreProviderId, capacity: StateStoreCapacity) -> Self {
+        assert!(
+            capacity.max_key_bytes > 0
+                && capacity.max_value_bytes > 0
+                && capacity.max_transaction_bytes > 0
+                && capacity.max_transaction_operations > 0
+        );
+        Self { id, capacity }
     }
 }
 

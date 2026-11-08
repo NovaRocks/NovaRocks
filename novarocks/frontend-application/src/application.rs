@@ -2804,7 +2804,7 @@ mod tests {
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
     );
 
     struct FailingFactory;

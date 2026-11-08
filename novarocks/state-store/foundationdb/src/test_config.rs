@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_state_store_api::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
-    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
-};
+use novarocks_state_store_api::{DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, StateStoreLimits};
 use uuid::Uuid;
 
 #[doc(hidden)]
@@ -62,14 +59,23 @@ pub(crate) fn resolve_test_limits(
     }
 
     Ok(StateStoreLimits {
-        max_key_bytes: tightened(overrides.max_key_bytes, MAX_KEY_BYTES)?,
-        max_value_bytes: tightened(overrides.max_value_bytes, MAX_VALUE_BYTES)?,
+        max_key_bytes: tightened(
+            overrides.max_key_bytes,
+            crate::FOUNDATIONDB_STATE_STORE_CAPACITY.max_key_bytes,
+        )?,
+        max_value_bytes: tightened(
+            overrides.max_value_bytes,
+            crate::FOUNDATIONDB_STATE_STORE_CAPACITY.max_value_bytes,
+        )?,
         max_page_size: tightened(overrides.max_page_size, MAX_PAGE_SIZE)?,
         max_transaction_operations: tightened(
             overrides.max_transaction_operations,
-            MAX_TRANSACTION_OPERATIONS,
+            crate::FOUNDATIONDB_STATE_STORE_CAPACITY.max_transaction_operations,
         )?,
-        max_transaction_bytes: tightened(overrides.max_transaction_bytes, MAX_TRANSACTION_BYTES)?,
+        max_transaction_bytes: tightened(
+            overrides.max_transaction_bytes,
+            crate::FOUNDATIONDB_STATE_STORE_CAPACITY.max_transaction_bytes,
+        )?,
         transaction_deadline: std::time::Duration::from_millis(tightened_ms(
             overrides.transaction_deadline_ms,
             DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,

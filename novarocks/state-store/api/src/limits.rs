@@ -17,11 +17,7 @@
 
 use std::time::Duration;
 
-pub const MAX_KEY_BYTES: usize = 8 * 1024;
-pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 1_000;
-pub const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
-pub const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_TRANSACTION_DEADLINE: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,15 +32,51 @@ pub struct StateStoreLimits {
     pub transaction_deadline: Duration,
 }
 
-impl Default for StateStoreLimits {
-    fn default() -> Self {
+/// Usable logical capacity of one provider's storage representation.
+/// `usize::MAX` means the backend has no bound for that dimension.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StateStoreCapacity {
+    pub max_key_bytes: usize,
+    pub max_value_bytes: usize,
+    pub max_transaction_bytes: usize,
+    pub max_transaction_operations: usize,
+}
+
+impl StateStoreCapacity {
+    pub const fn new(
+        key: usize,
+        value: usize,
+        transaction_bytes: usize,
+        operations: usize,
+    ) -> Self {
+        assert!(key > 0 && value > 0 && transaction_bytes > 0 && operations > 0);
         Self {
-            max_key_bytes: MAX_KEY_BYTES,
-            max_value_bytes: MAX_VALUE_BYTES,
+            max_key_bytes: key,
+            max_value_bytes: value,
+            max_transaction_bytes: transaction_bytes,
+            max_transaction_operations: operations,
+        }
+    }
+
+    pub fn limits(self) -> StateStoreLimits {
+        StateStoreLimits {
+            max_key_bytes: self.max_key_bytes,
+            max_value_bytes: self.max_value_bytes,
             max_page_size: MAX_PAGE_SIZE,
-            max_transaction_operations: MAX_TRANSACTION_OPERATIONS,
-            max_transaction_bytes: MAX_TRANSACTION_BYTES,
+            max_transaction_operations: self.max_transaction_operations,
+            max_transaction_bytes: self.max_transaction_bytes,
             transaction_deadline: DEFAULT_TRANSACTION_DEADLINE,
         }
+    }
+
+    pub fn accepts(self, limits: &StateStoreLimits) -> bool {
+        limits.max_key_bytes > 0
+            && limits.max_key_bytes <= self.max_key_bytes
+            && limits.max_value_bytes > 0
+            && limits.max_value_bytes <= self.max_value_bytes
+            && limits.max_transaction_bytes > 0
+            && limits.max_transaction_bytes <= self.max_transaction_bytes
+            && limits.max_transaction_operations > 0
+            && limits.max_transaction_operations <= self.max_transaction_operations
     }
 }

@@ -67,6 +67,26 @@ pub use provider::SqliteStateStoreProviderFactory;
 pub const SQLITE_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("sqlite");
 
+/// Bundled SQLite 3's SQLITE_MAX_LENGTH (libsqlite3-sys 0.30.1).
+const SQLITE_LENGTH_LIMIT: usize = 1_000_000_000;
+// state_store_kv has two BLOBs and one signed INTEGER. At this length each
+// BLOB serial type (2*N+12) takes at most five varint bytes. The record header
+// is 1+5+5+1=12 bytes (including its one-byte size), and INTEGER takes at most
+// eight payload bytes. The key/rowid index needs at most 15 overhead bytes.
+const ROW_RECORD_OVERHEAD: usize = 20;
+pub const SQLITE_STATE_STORE_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        SQLITE_LENGTH_LIMIT - ROW_RECORD_OVERHEAD,
+        SQLITE_LENGTH_LIMIT - ROW_RECORD_OVERHEAD,
+        usize::MAX,
+        usize::MAX,
+    );
+pub const SQLITE_STATE_STORE_DESCRIPTOR: novarocks_state_store_api::StateStoreProviderDescriptor =
+    novarocks_state_store_api::StateStoreProviderDescriptor::new(
+        SQLITE_STATE_STORE_PROVIDER_ID,
+        SQLITE_STATE_STORE_CAPACITY,
+    );
+
 /// Everything Server has to decide to bring this provider up.
 ///
 /// It is the database file and nothing else. History retention used to be
@@ -214,6 +234,12 @@ fn open_blocking(
     limits: StateStoreLimits,
     outstanding_attempts: NonZeroUsize,
 ) -> Result<SqliteStateStore, StateStoreError> {
+    if !SQLITE_STATE_STORE_CAPACITY.accepts(&limits) {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "SQLite opening limits exceed provider capacity",
+        ));
+    }
     let path = canonicalize_path(&path)?;
     let owner_lock = acquire_owner_lock(&path)?;
     let mut connection = open_connection_raw(&path)?;
@@ -278,7 +304,18 @@ fn open_connection_raw(path: &Path) -> Result<Connection, StateStoreError> {
             "failed to open SQLite state store database",
         )
     })?;
+    validate_connection_length(&connection)?;
     Ok(connection)
+}
+
+fn validate_connection_length(connection: &Connection) -> Result<(), StateStoreError> {
+    if connection.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH) < SQLITE_LENGTH_LIMIT as i32 {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::InvalidConfiguration,
+            "SQLite connection length limit is below declared provider capacity",
+        ));
+    }
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), StateStoreError> {
@@ -450,6 +487,143 @@ mod tests {
     use novarocks_state_store_api::{Key, Precondition, Value};
     use tempfile::{TempDir, tempdir};
 
+    #[test]
+    fn capacity_matches_bundled_connection_length_and_record_layout() {
+        let connection = Connection::open_in_memory().expect("connection");
+        assert_eq!(
+            connection.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH),
+            1_000_000_000
+        );
+        assert_eq!(SQLITE_STATE_STORE_CAPACITY.max_key_bytes, 999_999_980);
+        assert_eq!(SQLITE_STATE_STORE_CAPACITY.max_value_bytes, 999_999_980);
+        validate_connection_length(&connection).expect("declared capacity is available");
+        connection.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 999_999_999);
+        assert_eq!(
+            validate_connection_length(&connection).unwrap_err().kind(),
+            StateStoreErrorKind::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn sqlite_enforces_combined_record_length_with_individually_valid_blobs() {
+        let mut connection = Connection::open_in_memory().expect("connection");
+        // Build the actual provider schema before lowering the test connection's
+        // limit. This is a SQLite record-format proof, not a provider policy.
+        schema::initialize(&mut connection, b"row-length-proof").expect("provider schema");
+        connection.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 1024);
+        let key = vec![0x6b; 600];
+        let large_value = vec![0x76; 600];
+        assert!(key.len() < 1024 && large_value.len() < 1024);
+        let error = connection
+            .execute(
+                "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&key, &large_value, 1_i64],
+            )
+            .expect_err("combined record exceeds SQLite length limit");
+        assert_eq!(error.sqlite_error_code(), Some(SqliteErrorCode::TooBig));
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM state_store_kv", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let small_value = vec![0x76; 100];
+        connection
+            .execute(
+                "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&key, &small_value, 1_i64],
+            )
+            .expect("smaller combined record fits the same SQLite limit");
+        let stored: (Vec<u8>, Vec<u8>, i64) = connection
+            .query_row(
+                "SELECT key, value, version FROM state_store_kv",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (key, small_value, 1));
+        // The 600-byte value also fits when paired with a smaller key.
+        let small_key = vec![0x73; 100];
+        connection
+            .execute(
+                "INSERT INTO state_store_kv(key, value, version) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&small_key, &large_value, 2_i64],
+            )
+            .expect("individual large value fits with a smaller key");
+        let stored_value: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM state_store_kv WHERE key = ?1",
+                [&small_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_value, large_value);
+        connection.close().expect("close proof connection");
+    }
+
+    #[tokio::test]
+    async fn values_above_previous_common_quota_round_trip() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.sqlite");
+        let store = open_store(&path, "large-value").await;
+        let item = key(b"large");
+        let payload = Value::try_from(Bytes::from(vec![0x5a; 128 * 1024])).unwrap();
+        commit_one(&store, item.clone(), payload.clone()).await;
+        assert_eq!(read_one(&store, &item).await, Some(payload.clone()));
+
+        // Move the same store into its explicit provider close owner. Reopening
+        // follows shutdown completion, not a drop of the caller's store handle.
+        let lifetime = Arc::downgrade(&store.lifetime);
+        let mut instance = provider::instance_from_store(SQLITE_STATE_STORE_DESCRIPTOR, store);
+        instance
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("close original instance");
+        assert_eq!(
+            instance.lifecycle(),
+            novarocks_state_store_api::StateStoreProviderLifecycle::Stopped
+        );
+        assert!(lifetime.upgrade().is_none());
+
+        let reopened = open_store(&path, "large-value").await;
+        let actual = read_one(&reopened, &item)
+            .await
+            .expect("persisted large value");
+        assert_eq!(actual.as_bytes(), payload.as_bytes());
+        let mut reopened_instance =
+            provider::instance_from_store(SQLITE_STATE_STORE_DESCRIPTOR, reopened);
+        reopened_instance
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("close reopened instance");
+        assert_eq!(
+            reopened_instance.lifecycle(),
+            novarocks_state_store_api::StateStoreProviderLifecycle::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_limits_are_checked_before_creating_a_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rejected.sqlite");
+        for field in 0..4 {
+            let mut request = open_request("invalid-capacity");
+            match field {
+                0 => request.limits.max_key_bytes += 1,
+                1 => request.limits.max_value_bytes += 1,
+                2 => request.limits.max_transaction_bytes = 0,
+                _ => request.limits.max_transaction_operations = 0,
+            }
+            let error = SqliteStateStore::open(path.clone(), request)
+                .await
+                .err()
+                .expect("invalid opening");
+            assert_eq!(error.kind(), StateStoreErrorKind::InvalidConfiguration);
+            assert!(!path.exists());
+        }
+    }
+
     /// A v2 database exactly as the previous build left one: the change feed,
     /// the transaction-id keyed commit ledger, and the eleven metadata keys
     /// that supported history retention.
@@ -464,7 +638,7 @@ mod tests {
     fn open_request(cluster_id: &str) -> StateStoreOpenRequest {
         StateStoreOpenRequest {
             cluster_id: cluster_id.to_owned(),
-            limits: StateStoreLimits::default(),
+            limits: crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             deadline: Instant::now() + Duration::from_secs(5),
         }
     }
@@ -583,7 +757,7 @@ mod tests {
         let error = match open_blocking(
             path.clone(),
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         ) {
             Ok(_) => panic!("legacy schema unexpectedly opened"),
@@ -609,7 +783,7 @@ mod tests {
         let error = open_blocking(
             path.clone(),
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         )
         .map(|_| ())
@@ -676,7 +850,7 @@ mod tests {
         let error = open_blocking(
             path.clone(),
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         )
         .map(|_| ())
@@ -713,7 +887,7 @@ mod tests {
         let error = open_blocking(
             path.clone(),
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         )
         .map(|_| ())
@@ -739,7 +913,7 @@ mod tests {
         let error = open_blocking(
             path,
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         )
         .map(|_| ())
@@ -764,7 +938,7 @@ mod tests {
         let error = open_blocking(
             path.clone(),
             "test-cluster".to_owned(),
-            StateStoreLimits::default(),
+            crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             default_attempt_capacity(),
         )
         .map(|_| ())

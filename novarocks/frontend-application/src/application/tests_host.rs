@@ -690,7 +690,7 @@ async fn cancelled_bootstrap_borrow_retains_the_original_opening_until_host_clos
     use std::sync::atomic::{AtomicUsize, Ordering};
     let descriptor = StateStoreProviderDescriptor::new(
         StateStoreProviderId::new("held-pure-opening"),
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
     );
     let probe = Arc::new(HeldOpeningProbe {
         prepared: AtomicUsize::new(0),
