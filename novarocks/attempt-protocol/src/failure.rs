@@ -96,9 +96,9 @@ pub enum AttemptFailure {
     TaskProtocol(Box<crate::error::TaskExecutionError>),
     Host(HostProjectedFailure),
     SelectedTask(novarocks_coordination_contract::SelectedTaskTermination),
-    /// Emitted only by the original authorization author after its retained
-    /// exact Establish was transport-unknown and reauthorization returned the
-    /// typed exhausted-budget branch. Kind/class/text cannot infer this fact.
+    /// The original pure gate combines its same-operation transport-unknown
+    /// history with QA's independent typed exhausted-budget reply. The original
+    /// host error remains retained; kind/class/text cannot infer this fact.
     EstablishReplayExhausted {
         original: HostProjectedFailure,
         participation: ParticipationRef,

@@ -82,6 +82,9 @@ pub struct FrozenEstablish {
 #[derive(Clone, Debug)]
 pub struct FrozenAttemptPlan {
     pub graph: FrozenTaskGraph,
+    /// Same activation's original QA limit, used only to preprice/preallocate
+    /// retained authorization refs. It grants no authorization or retry right.
+    pub authorization_limits: novarocks_coordination_contract::AttemptAuthorizationLimits,
     pub writers: BTreeSet<TaskIdentity>,
     /// Independent obligations per summary kind; never collapse their union.
     pub summary_sources: PerKind<BTreeSet<TaskIdentity>>,

@@ -755,6 +755,14 @@ impl NativeAttemptDrive {
         self.authority.identity()
     }
 
+    /// Original activation-time configuration for metadata pricing. This
+    /// historical fact needs no actor query and grants no live/retry authority.
+    pub fn authorization_limits(
+        &self,
+    ) -> novarocks_coordination_contract::AttemptAuthorizationLimits {
+        self.authority.authorization_limits()
+    }
+
     /// Ask the current logical owner whether this exact refusal may wait for
     /// independent process-replacement evidence within its ORIGINAL horizon.
     /// A positive answer grants no retry, topology, terminal, or exit authority;

@@ -90,3 +90,5 @@ pub mod diagnostics;
 pub(crate) mod terminal;
 
 pub(crate) mod convergence;
+
+pub(crate) mod authorization;

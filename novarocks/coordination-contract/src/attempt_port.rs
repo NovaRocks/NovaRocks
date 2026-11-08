@@ -177,6 +177,8 @@ pub enum AttemptTerminal<F> {
 pub enum AttemptAuthorization {
     BeginAdmission(AcquireParticipationAdmissionTicket),
     SettleAdmission {
+        /// Resolve this same original QA receipt; identity grants no access.
+        issue: AttemptAuthorizationRef,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
         outcome: Option<OperationOutcome>,
@@ -190,6 +192,8 @@ pub enum AttemptAuthorization {
     },
     ReauthorizeEstablish {
         participation: ParticipationRef,
+        /// Expected original request, checked against the returned submission.
+        operation_id: TaskOperationId,
     },
 }
 
@@ -199,6 +203,25 @@ pub enum AttemptAuthorizationDecision {
     AdmissionGranted,
     AdmissionRetryable,
     EstablishAuthorized(AttemptAuthorizationRef),
+}
+
+/// Original QA configuration frozen for this activation's metadata pricing.
+/// This is neither capacity nor permission to issue or retry an authorization;
+/// QA remains the sole author of its budget and every authorization decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptAuthorizationLimits {
+    pub activation: AttemptActivationIdentity,
+    pub establish_per_participation: std::num::NonZeroUsize,
+}
+
+/// Independent typed facts from the original QA call. The host does not
+/// combine its budget error with protocol history or infer recovery policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptAuthorizationFailure<F> {
+    Rejected(F),
+    /// Only QA's actual EstablishIssueError::AuthorizationBudgetExhausted.
+    /// The pure gate still decides whether this same operation was unknown.
+    EstablishBudgetExhausted(F),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +244,14 @@ pub struct LogicalToAttempt<F> {
 pub enum LogicalToAttemptBody<F> {
     AuthorizationReply {
         token: AttemptRequestToken,
-        decision: Result<AttemptAuthorizationDecision, F>,
+        decision: Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<F>>,
+    },
+    /// The selected original guard method has actually returned. Handoff and
+    /// work/capture exit cannot replace its Result or authorize the next item.
+    EstablishSettlementReply {
+        token: AttemptRequestToken,
+        authorization: AttemptAuthorizationRef,
+        result: Result<(), F>,
     },
     PreReadyReplacementReply {
         token: AttemptRequestToken,
@@ -271,6 +301,9 @@ pub enum AttemptToLogicalBody<F> {
         refusal: F,
     },
     EstablishSettlement {
+        token: AttemptRequestToken,
+        /// AP selects current/oldest-late/all-late order, not the host lookup.
+        authorization: AttemptAuthorizationRef,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
         settlement: AttemptIssueSettlement,

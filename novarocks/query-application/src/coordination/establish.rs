@@ -678,6 +678,11 @@ impl EstablishIssueFence {
 }
 
 impl EstablishIssueLedger {
+    /// Passive original configuration; no permit is minted or budget changed.
+    pub(crate) const fn authorization_limit(&self) -> NonZeroUsize {
+        self.max_authorizations_per_participation
+    }
+
     pub(crate) fn new(
         required_participations: BTreeSet<ParticipationRef>,
         max_admission_issues_per_participation: NonZeroUsize,

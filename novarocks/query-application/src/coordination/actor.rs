@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, LogicalExecutionActorId, MonotonicClock,
+    AttemptActivationIdentity, AttemptAuthorizationLimits, LogicalExecutionActorId, MonotonicClock,
     ResultParticipationWithdrawal,
 };
 
@@ -354,6 +354,7 @@ pub struct RunningAttemptPermit {
     capability: Option<AttemptCapability>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
+    authorization_limits: AttemptAuthorizationLimits,
 }
 
 /// Non-terminal actor capability used by the Native attempt driver while the
@@ -366,6 +367,7 @@ pub struct RunningAttemptPermit {
 pub(crate) struct RunningAttemptDriveAuthority {
     activation: AttemptActivationIdentity,
     mailbox: mpsc::Sender<ActorCommand>,
+    authorization_limits: AttemptAuthorizationLimits,
 }
 
 impl fmt::Debug for RunningAttemptDriveAuthority {
@@ -380,6 +382,10 @@ impl fmt::Debug for RunningAttemptDriveAuthority {
 impl RunningAttemptDriveAuthority {
     pub(crate) const fn identity(&self) -> AttemptActivationIdentity {
         self.activation
+    }
+
+    pub(crate) const fn authorization_limits(&self) -> AttemptAuthorizationLimits {
+        self.authorization_limits
     }
 
     pub(crate) async fn may_observe_pre_ready_replacement(
@@ -476,11 +482,13 @@ impl RunningAttemptPermit {
         capability: AttemptCapability,
         lifetime: Arc<PermitLifetime>,
         mailbox_liveness: mpsc::Sender<ActorCommand>,
+        authorization_limits: AttemptAuthorizationLimits,
     ) -> Self {
         Self {
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(mailbox_liveness),
+            authorization_limits,
         }
     }
 
@@ -488,6 +496,7 @@ impl RunningAttemptPermit {
         RunningAttemptDriveAuthority {
             activation: self.identity(),
             mailbox: self.mailbox().clone(),
+            authorization_limits: self.authorization_limits,
         }
     }
 
@@ -4645,11 +4654,21 @@ fn handle_command(
         }
         ActorCommand::Activate { readiness, reply } => {
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
-            match validate_attempt_command(state, &capability)
-                .and_then(|()| state.mark_running(&capability).map_err(Into::into))
-            {
-                Ok(()) => {
-                    let running = RunningAttemptPermit::new(capability, lifetime, mailbox_liveness);
+            match validate_attempt_command(state, &capability).and_then(|()| {
+                let activation = identity_of(&capability);
+                let attempt = attempts
+                    .get(&activation.execution())
+                    .ok_or(LogicalExecutionActorError::WrongExecution)?;
+                let limits = AttemptAuthorizationLimits {
+                    activation,
+                    establish_per_participation: attempt.establish.authorization_limit(),
+                };
+                state.mark_running(&capability)?;
+                Ok(limits)
+            }) {
+                Ok(limits) => {
+                    let running =
+                        RunningAttemptPermit::new(capability, lifetime, mailbox_liveness, limits);
                     if let Err(response) = reply.send(Ok(running)) {
                         drop(response);
                     }
@@ -12492,6 +12511,17 @@ mod tests {
                 let actor = owner.actor().clone();
                 let running = actor.activate(initial.ready()).await.unwrap();
                 let drive = super::super::NativeAttemptDrive::new(&running);
+                let limits = drive.authorization_limits();
+                assert_eq!(limits.activation, drive.identity());
+                assert_eq!(limits.establish_per_participation.get(), 2);
+                assert_eq!(drive.authorization_limits(), limits);
+                assert!(
+                    actor
+                        .establish_snapshot(participation)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
                 let (unissued, _, _) =
                     crate::api::pre_ready_identity_refusal_test_fixture(participation);
                 assert!(
@@ -12729,6 +12759,9 @@ mod tests {
                 assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
                 let error = QueryExecutionError::from_execution(input.clone());
                 actor.fail_attempt_with_error(running, error).await.unwrap();
+                // This immutable historical fact grants no live authority;
+                // original commands still reject this consumed running permit.
+                assert_eq!(drive.authorization_limits(), limits);
                 assert!(
                     drive
                         .may_observe_pre_ready_replacement(&input)
@@ -12894,7 +12927,15 @@ mod tests {
             settled: AtomicBool::new(false),
         });
         let (mailbox, _receiver) = mpsc::channel(4);
-        let running = RunningAttemptPermit::new(capability, Arc::clone(&lifetime), mailbox);
+        let running = RunningAttemptPermit::new(
+            capability,
+            Arc::clone(&lifetime),
+            mailbox,
+            AttemptAuthorizationLimits {
+                activation,
+                establish_per_participation: config.max_establish_authorizations_per_participation,
+            },
+        );
         let mut establish_error = None;
         let mut stand_down_error = None;
         let mut replacement_runtime = None;
