@@ -34,7 +34,6 @@ use novarocks_execution_contract::{
 use novarocks_types::BackendProcessId;
 use std::time::Duration;
 
-const PRE_READY_RECHECK: Duration = Duration::from_millis(5);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreReadyObservation {
     Unknown(BackendProcessId),
@@ -144,10 +143,7 @@ pub(crate) enum ReplyDisposition {
 enum ObservationPhase {
     Permission,
     Process,
-    Waiting {
-        at: MonotonicInstant,
-        expires_at: Option<MonotonicInstant>,
-    },
+    Waiting { expires_at: MonotonicInstant },
     Dormant,
 }
 #[derive(Clone, Copy, Debug)]
@@ -183,6 +179,8 @@ pub(crate) struct TerminalController {
     // never an ever-failed gate on later legal receive turns.
     decision_turn: Option<PreReadyObservation>,
     permission: Option<Flight>,
+    permission_watch: Option<Flight>,
+    qualification_changed: bool,
     sample: Option<Flight>,
 }
 impl TerminalController {
@@ -197,6 +195,8 @@ impl TerminalController {
             phase: ObservationPhase::Dormant,
             decision_turn: None,
             permission: None,
+            permission_watch: None,
+            qualification_changed: false,
             sample: None,
         }
     }
@@ -342,6 +342,8 @@ impl TerminalController {
             None => ObservationPhase::Dormant,
         };
         self.decision_turn = None;
+        self.permission_watch = None;
+        self.qualification_changed = false;
         self.pending = Some(Pending {
             failure,
             observation,
@@ -368,6 +370,8 @@ impl TerminalController {
             pending.observation = None;
         }
         self.phase = ObservationPhase::Dormant;
+        self.permission_watch = None;
+        self.qualification_changed = false;
     }
     fn publish(&mut self, terminal: AttemptTerminal<AttemptFailure>) -> TerminalDirective {
         self.selected = Some(terminal.clone());
@@ -515,17 +519,19 @@ impl TerminalController {
                 return Ok(result);
             }
         }
-        if let (Some(observation), ObservationPhase::Waiting { at, .. }) =
+        if let (Some(observation), ObservationPhase::Waiting { expires_at }) =
             (self.observation(), self.phase)
         {
             let window = horizon.expect("checked original horizon");
             if facts.wake != TerminalWake::Round
-                && !now.has_reached(at)
+                && !now.has_reached(expires_at)
+                && !self.qualification_changed
                 && window.open()
                 && self.stop.is_none()
             {
                 return Ok(TerminalDirective::Wait);
             }
+            self.qualification_changed = false;
             self.phase = if observation.unknown() {
                 ObservationPhase::Process
             } else {
@@ -546,6 +552,7 @@ impl TerminalController {
                 issued_at: now,
                 observation,
             });
+            self.permission_watch = self.permission;
             return Ok(TerminalDirective::QueryPermission {
                 request,
                 refusal: self.pending.as_ref().unwrap().failure.clone(),
@@ -579,6 +586,7 @@ impl TerminalController {
                             issued_at: now,
                             observation,
                         });
+                        self.permission_watch = self.permission;
                         return Ok(TerminalDirective::QueryPermission {
                             request,
                             refusal: self.pending.as_ref().unwrap().failure.clone(),
@@ -614,6 +622,18 @@ impl TerminalController {
             return Ok(self.finish(self.stop_terminal(), facts.gate, false));
         }
         Ok(TerminalDirective::Wait)
+    }
+    pub(crate) fn permission_changed(&mut self, request: AttemptRequestToken) -> ReplyDisposition {
+        if self.selected.is_some()
+            || self.preparing_terminal.is_some()
+            || !self.permission_watch.is_some_and(|flight| {
+                flight.request == request && self.observation() == Some(flight.observation)
+            })
+        {
+            return ReplyDisposition::Stale;
+        }
+        self.qualification_changed = true;
+        ReplyDisposition::Applied
     }
     pub(crate) fn permission_reply(
         &mut self,
@@ -689,10 +709,8 @@ impl TerminalController {
                     self.close_observation();
                 } else {
                     self.phase = ObservationPhase::Waiting {
-                        at: now.saturating_add(PRE_READY_RECHECK),
-                        expires_at: window
-                            .remaining
-                            .map(|remaining| now.saturating_add(remaining)),
+                        expires_at: now
+                            .saturating_add(window.remaining.expect("open original horizon")),
                     };
                 }
             }
@@ -715,10 +733,8 @@ impl TerminalController {
                     self.close_observation();
                 } else {
                     self.phase = ObservationPhase::Waiting {
-                        at: now.saturating_add(PRE_READY_RECHECK),
-                        expires_at: window
-                            .remaining
-                            .map(|remaining| now.saturating_add(remaining)),
+                        expires_at: now
+                            .saturating_add(window.remaining.expect("open original horizon")),
                     };
                 }
             }
@@ -730,9 +746,7 @@ impl TerminalController {
             return None;
         }
         match self.phase {
-            ObservationPhase::Waiting { at, expires_at } => {
-                Some(expires_at.map_or(at, |expiry| expiry.min(at)))
-            }
+            ObservationPhase::Waiting { expires_at } => Some(expires_at),
             _ => None,
         }
     }
@@ -1409,8 +1423,8 @@ mod tests {
         );
     }
     #[test]
-    fn repeated_rejection_observation_rechecks_qa_and_does_not_spin_while_request_or_process_is_inflight()
-     {
+    fn rejection_waits_for_real_change_or_original_horizon_without_periodic_qa_or_process_polling()
+    {
         let mut controller = TerminalController::new();
         record_refusal(&mut controller, true, 100);
         poll(
@@ -1446,7 +1460,7 @@ mod tests {
                 current_window(&controller, Some(99)).unwrap(),
             )
             .unwrap();
-        assert_eq!(controller.next_deadline(), Some(now(6)));
+        assert_eq!(controller.next_deadline(), Some(now(100)));
         assert!(matches!(
             poll(
                 &mut controller,
@@ -1460,10 +1474,246 @@ mod tests {
             ),
             TerminalDirective::Wait
         ));
+        for at in [6, 11, 31, 99] {
+            assert!(matches!(
+                poll(
+                    &mut controller,
+                    at,
+                    false,
+                    None,
+                    NOT_READY,
+                    Some(100 - at),
+                    TerminalWake::Continuation,
+                    Some(3)
+                ),
+                TerminalDirective::Wait
+            ));
+            assert_eq!(controller.next_deadline(), Some(now(100)));
+        }
         assert!(
-            matches!(poll(&mut controller,6,false,None,NOT_READY,Some(94),TerminalWake::Continuation,Some(3)),TerminalDirective::QueryPermission {request,..} if request==token(3))
+            matches!(poll(&mut controller,99,false,None,NOT_READY,Some(1),TerminalWake::Round,Some(3)),TerminalDirective::QueryPermission {request,..} if request==token(3))
         );
         assert_eq!(controller.next_deadline(), None);
+    }
+    #[test]
+    fn real_qa_change_hint_reasks_original_policy_without_granting_permission_or_periodic_wakeup() {
+        let mut controller = TerminalController::new();
+        let original = record_refusal(&mut controller, true, 100);
+        poll(
+            &mut controller,
+            0,
+            false,
+            None,
+            NOT_READY,
+            Some(100),
+            TerminalWake::Round,
+            Some(1),
+        );
+        controller.permission_reply(token(1), true);
+        poll(
+            &mut controller,
+            0,
+            false,
+            None,
+            NOT_READY,
+            Some(100),
+            TerminalWake::Continuation,
+            Some(2),
+        );
+        controller
+            .process_reply(
+                now(1),
+                token(2),
+                backend(1),
+                now(1),
+                MembershipObservation::ExactOriginal,
+                current_window(&controller, Some(99)).unwrap(),
+            )
+            .unwrap();
+        poll(
+            &mut controller,
+            1,
+            false,
+            None,
+            NOT_READY,
+            Some(99),
+            TerminalWake::Continuation,
+            None,
+        );
+        assert_eq!(
+            controller.permission_changed(token(99)),
+            ReplyDisposition::Stale
+        );
+        assert!(matches!(
+            poll(
+                &mut controller,
+                6,
+                false,
+                None,
+                NOT_READY,
+                Some(94),
+                TerminalWake::Continuation,
+                None
+            ),
+            TerminalDirective::Wait
+        ));
+        assert_eq!(
+            controller.permission_changed(token(1)),
+            ReplyDisposition::Applied
+        );
+        assert!(
+            matches!(poll(&mut controller,6,false,None,NOT_READY,Some(94),TerminalWake::Continuation,Some(3)),TerminalDirective::QueryPermission { request,.. } if request==token(3))
+        );
+        // The hint is not a permission decision, process read or terminal.
+        assert!(controller.sample.is_none());
+        assert!(controller.terminal().is_none());
+        assert_eq!(controller.next_deadline(), None);
+        assert_eq!(
+            controller.permission_changed(token(1)),
+            ReplyDisposition::Stale
+        );
+        assert_eq!(
+            controller.permission_reply(token(3), false),
+            ReplyDisposition::Applied
+        );
+        assert_eq!(
+            selected_failure(poll(
+                &mut controller,
+                7,
+                false,
+                None,
+                NOT_READY,
+                None,
+                TerminalWake::Continuation,
+                None
+            )),
+            original
+        );
+        assert_eq!(
+            controller.permission_changed(token(3)),
+            ReplyDisposition::Stale
+        );
+    }
+    #[test]
+    fn original_qa_change_before_boolean_reply_is_retained_after_current_process_turn_without_self_polling()
+     {
+        let mut controller = TerminalController::new();
+        record_refusal(&mut controller, true, 100);
+        poll(
+            &mut controller,
+            0,
+            false,
+            None,
+            NOT_READY,
+            Some(100),
+            TerminalWake::Round,
+            Some(1),
+        );
+        assert_eq!(
+            controller.permission_changed(token(1)),
+            ReplyDisposition::Applied
+        );
+        assert!(matches!(
+            poll(
+                &mut controller,
+                1,
+                false,
+                None,
+                NOT_READY,
+                Some(99),
+                TerminalWake::Continuation,
+                Some(2)
+            ),
+            TerminalDirective::Wait
+        ));
+        controller.permission_reply(token(1), true);
+        assert!(matches!(
+            poll(
+                &mut controller,
+                1,
+                false,
+                None,
+                NOT_READY,
+                Some(99),
+                TerminalWake::Continuation,
+                Some(2)
+            ),
+            TerminalDirective::ObserveProcess { .. }
+        ));
+        controller
+            .process_reply(
+                now(2),
+                token(2),
+                backend(1),
+                now(2),
+                MembershipObservation::ExactOriginal,
+                current_window(&controller, Some(98)).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            poll(
+                &mut controller,
+                2,
+                false,
+                None,
+                NOT_READY,
+                Some(98),
+                TerminalWake::Continuation,
+                None
+            ),
+            TerminalDirective::Wait
+        ));
+        assert!(controller.permits_protocol_turn());
+        assert!(
+            matches!(poll(&mut controller,2,false,None,NOT_READY,Some(98),TerminalWake::Continuation,Some(3)),TerminalDirective::QueryPermission { request,.. } if request==token(3))
+        );
+        controller.permission_reply(token(3), true);
+        poll(
+            &mut controller,
+            2,
+            false,
+            None,
+            NOT_READY,
+            Some(98),
+            TerminalWake::Continuation,
+            Some(4),
+        );
+        controller
+            .process_reply(
+                now(3),
+                token(4),
+                backend(1),
+                now(3),
+                MembershipObservation::ExactOriginal,
+                current_window(&controller, Some(97)).unwrap(),
+            )
+            .unwrap();
+        poll(
+            &mut controller,
+            3,
+            false,
+            None,
+            NOT_READY,
+            Some(97),
+            TerminalWake::Continuation,
+            None,
+        );
+        for at in [4, 8, 40, 99] {
+            assert!(matches!(
+                poll(
+                    &mut controller,
+                    at,
+                    false,
+                    None,
+                    NOT_READY,
+                    Some(100 - at),
+                    TerminalWake::Continuation,
+                    Some(5)
+                ),
+                TerminalDirective::Wait
+            ));
+            assert_eq!(controller.next_deadline(), Some(now(100)));
+        }
     }
     #[test]
     fn forced_original_cut_survives_async_prepare_gap_but_never_claims_actual_exit() {
@@ -1831,7 +2081,7 @@ mod tests {
         );
     }
     #[test]
-    fn original_horizon_shorter_than_recheck_wakes_without_expired_timer_spin() {
+    fn original_horizon_wakes_waiting_without_expired_timer_spin() {
         for rejected in [false, true] {
             let mut controller = TerminalController::new();
             let original = if rejected {
@@ -2012,7 +2262,7 @@ mod tests {
                 current_window(&controller, Some(79)).unwrap(),
             )
             .unwrap();
-        assert_eq!(controller.next_deadline(), Some(now(26)));
+        assert_eq!(controller.next_deadline(), Some(now(100)));
     }
     #[test]
     fn cancellation_preserves_rejection_but_unknown_uses_original_typed_stop_even_when_gate_not_ready()

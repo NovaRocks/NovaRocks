@@ -769,6 +769,16 @@ impl NativeAttemptDrive {
             .await
     }
 
+    /// Atomically observe the same current QA policy and register its changes.
+    /// The receiver carries hints only; callers re-query before each continued
+    /// process observation. Only original predicate changes notify it.
+    pub async fn observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<super::PreReadyReplacementObservation, LogicalExecutionActorError> {
+        self.authority.observe_pre_ready_replacement(refusal).await
+    }
+
     pub async fn begin_admission_issue(
         &self,
         request: AcquireParticipationAdmissionTicket,

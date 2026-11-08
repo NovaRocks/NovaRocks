@@ -396,6 +396,20 @@ impl RunningAttemptDriveAuthority {
         .await
     }
 
+    pub(crate) async fn observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<PreReadyReplacementObservation, LogicalExecutionActorError> {
+        request(&self.mailbox, |reply| {
+            ActorCommand::ObservePreReadyReplacement {
+                activation: self.activation,
+                refusal: refusal.clone(),
+                reply,
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn begin_admission_issue(
         &self,
         request_to_issue: AcquireParticipationAdmissionTicket,
@@ -1349,6 +1363,30 @@ pub struct LogicalExecutionActorSnapshot {
     pub replacement_error: Option<ReplacementQualificationFailure>,
 }
 
+/// The original actor's current policy answer plus its change observation.
+/// A change is only a hint: the same owner must be queried again before a
+/// pending process observation continues. No clock, retry or successor right
+/// is granted. Registration and the answer share one serial actor command.
+/// The same attempt retains one original first-refusal observer; a different
+/// refusal cannot displace it while its receiver is live.
+#[derive(Debug)]
+pub struct PreReadyReplacementObservation {
+    allowed: bool,
+    changes: Option<watch::Receiver<bool>>,
+}
+impl PreReadyReplacementObservation {
+    pub fn allowed(&self) -> bool {
+        self.allowed
+    }
+    pub fn into_changes(self) -> Option<watch::Receiver<bool>> {
+        self.changes
+    }
+}
+struct PreReadyObservationSource {
+    refusal: crate::execution_error::ExecutionFailureInput,
+    allowed: watch::Sender<bool>,
+}
+
 struct AttemptLedgers {
     activation: AttemptActivationIdentity,
     establish: EstablishIssueLedger,
@@ -1360,6 +1398,7 @@ struct AttemptLedgers {
     abort_backpressured: bool,
     attempt_obligation: Option<Obligation>,
     active_resources: Option<ActiveReplacementResources>,
+    pre_ready_observation: Option<PreReadyObservationSource>,
 }
 
 impl AttemptLedgers {
@@ -1717,6 +1756,11 @@ enum ActorCommand {
         activation: AttemptActivationIdentity,
         refusal: crate::execution_error::ExecutionFailureInput,
         reply: ActorReply<bool>,
+    },
+    ObservePreReadyReplacement {
+        activation: AttemptActivationIdentity,
+        refusal: crate::execution_error::ExecutionFailureInput,
+        reply: ActorReply<PreReadyReplacementObservation>,
     },
     BeginAdmissionIssue {
         activation: AttemptActivationIdentity,
@@ -2475,6 +2519,7 @@ pub(crate) fn spawn_logical_execution_actor(
             abort_backpressured: false,
             attempt_obligation: Some(attempt_obligation),
             active_resources: None,
+            pre_ready_observation: None,
         },
     )]);
     let clock = Arc::clone(&config.clock);
@@ -2708,6 +2753,9 @@ async fn run_actor(
             // terminal outcome that authorizes independent local shutdown.
             revoke_all_establish_authority(&mut attempts);
         }
+        // Publish only a real change in the original predicate. Queries and
+        // registrations do not wake their own observers into another query.
+        refresh_pre_ready_observation_sources(state, &mut attempts, &work_cancellation);
         internal_ready::publish_outcome(state, result_runtime.as_ref());
         if registry_close_requested
             && actor_cleanup_complete(state, &attempts, replacement.as_ref())
@@ -5355,6 +5403,48 @@ fn handle_command(
             });
             let _ = reply.send(result);
         }
+        ActorCommand::ObservePreReadyReplacement {
+            activation,
+            refusal,
+            reply,
+        } => {
+            let result = verify_running_activation(state, activation).and_then(|()| {
+                let allowed = pre_ready_refusal_matches_establish(attempts, activation, &refusal)
+                    && work_cancellation.reason().is_none()
+                    && state.may_observe_pre_ready_replacement(false);
+                let attempt = attempts
+                    .get_mut(&activation.execution())
+                    .ok_or(LogicalExecutionActorError::WrongExecution)?;
+                if !allowed {
+                    return Ok(PreReadyReplacementObservation {
+                        allowed: false,
+                        changes: None,
+                    });
+                }
+                if attempt
+                    .pre_ready_observation
+                    .as_ref()
+                    .is_some_and(|source| source.allowed.receiver_count() == 0)
+                {
+                    attempt.pre_ready_observation = None;
+                }
+                let source = attempt.pre_ready_observation.get_or_insert_with(|| {
+                    let (sender, _) = watch::channel(allowed);
+                    PreReadyObservationSource {
+                        refusal: refusal.clone(),
+                        allowed: sender,
+                    }
+                });
+                if source.refusal != refusal {
+                    return Err(LogicalExecutionActorError::InvariantViolation);
+                }
+                Ok(PreReadyReplacementObservation {
+                    allowed,
+                    changes: Some(source.allowed.subscribe()),
+                })
+            });
+            let _ = reply.send(result);
+        }
         ActorCommand::BeginAdmissionIssue {
             activation,
             request,
@@ -5612,6 +5702,7 @@ fn new_attempt_ledgers(
         abort_backpressured: false,
         attempt_obligation: Some(attempt_obligation),
         active_resources,
+        pre_ready_observation: None,
     })
 }
 
@@ -5745,7 +5836,7 @@ fn pre_ready_refusal_matches_establish(
     activation: AttemptActivationIdentity,
     refusal: &crate::execution_error::ExecutionFailureInput,
 ) -> bool {
-    let Some((participation, operation_id, kind)) =
+    let Some((participation, _, _)) =
         crate::api::PreReadyProcessReplacementWitness::refusal_operation(refusal)
     else {
         return false;
@@ -5756,7 +5847,22 @@ fn pre_ready_refusal_matches_establish(
     let Some(attempt) = attempts.get(&activation.execution()) else {
         return false;
     };
-    attempt.establish.snapshot(participation).is_some_and(|snapshot| {
+    pre_ready_refusal_matches_ledger(&attempt.establish, activation, refusal)
+}
+fn pre_ready_refusal_matches_ledger(
+    establish: &EstablishIssueLedger,
+    activation: AttemptActivationIdentity,
+    refusal: &crate::execution_error::ExecutionFailureInput,
+) -> bool {
+    let Some((participation, operation_id, kind)) =
+        crate::api::PreReadyProcessReplacementWitness::refusal_operation(refusal)
+    else {
+        return false;
+    };
+    if participation.query_execution_id() != activation.execution() {
+        return false;
+    }
+    establish.snapshot(participation).is_some_and(|snapshot| {
         snapshot.identity().is_some_and(|identity| {
             identity.activation() == activation
                 && identity.participation() == participation
@@ -5779,6 +5885,41 @@ fn pre_ready_refusal_matches_establish(
                 }
         })
     })
+}
+
+fn refresh_pre_ready_observation_sources(
+    state: &LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    cancellation: &CancellationView,
+) {
+    let policy_open =
+        cancellation.reason().is_none() && state.may_observe_pre_ready_replacement(false);
+    for attempt in attempts.values_mut() {
+        if attempt
+            .pre_ready_observation
+            .as_ref()
+            .is_some_and(|source| source.allowed.receiver_count() == 0)
+        {
+            attempt.pre_ready_observation = None;
+        }
+        if let Some(source) = attempt.pre_ready_observation.as_ref() {
+            let allowed = policy_open
+                && verify_running_activation(state, attempt.activation).is_ok()
+                && pre_ready_refusal_matches_ledger(
+                    &attempt.establish,
+                    attempt.activation,
+                    &source.refusal,
+                );
+            source.allowed.send_if_modified(|held| {
+                if *held == allowed {
+                    false
+                } else {
+                    *held = allowed;
+                    true
+                }
+            });
+        }
+    }
 }
 
 fn verify_running_activation(
@@ -12024,6 +12165,7 @@ mod tests {
                 abort_backpressured: false,
                 attempt_obligation: None,
                 active_resources: None,
+                pre_ready_observation: None,
             }
         };
         let mut attempts = BTreeMap::from([
@@ -12343,6 +12485,10 @@ mod tests {
                     spawn_logical_execution_actor(&Handle::current(), config)
                         .unwrap()
                         .into_parts();
+                let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+                    panic!("the original attempt exposes its client row stream");
+                };
+                stream.begin_schema().unwrap().complete();
                 let actor = owner.actor().clone();
                 let running = actor.activate(initial.ready()).await.unwrap();
                 let drive = super::super::NativeAttemptDrive::new(&running);
@@ -12433,6 +12579,33 @@ mod tests {
                     recovery,
                     "the exact transport-owned parent preserves the pre-ready window",
                 );
+                let observation = drive
+                    .observe_pre_ready_replacement(&create_input)
+                    .await
+                    .unwrap();
+                assert_eq!(observation.allowed(), recovery);
+                let mut observation_changes = observation.into_changes();
+                assert_eq!(observation_changes.is_some(), recovery);
+                // A query/register is not a predicate change and must not
+                // create a self-sustaining query -> hint -> query cycle.
+                let same = drive
+                    .observe_pre_ready_replacement(&create_input)
+                    .await
+                    .unwrap();
+                assert_eq!(same.allowed(), recovery);
+                drop(same);
+                if let Some(changes) = observation_changes.as_mut() {
+                    assert!(!changes.has_changed().unwrap());
+                    assert!(*changes.borrow_and_update());
+                    assert!(
+                        matches!(
+                            drive.observe_pre_ready_replacement(&input).await,
+                            Err(LogicalExecutionActorError::InvariantViolation)
+                        ),
+                        "another refusal cannot displace the original first-failure observer"
+                    );
+                    assert!(!changes.has_changed().unwrap());
+                }
                 let late = submission.transport_unknown().unwrap();
                 assert_eq!(late.identity(), issued_identity);
                 assert_eq!(
@@ -12452,6 +12625,12 @@ mod tests {
                     recovery,
                     "the same unknown parent remains owned while its exact receipt is late",
                 );
+                if let Some(changes) = observation_changes.as_mut() {
+                    assert!(
+                        !changes.has_changed().unwrap(),
+                        "transport-unknown preserves the original Create opportunity"
+                    );
+                }
                 late.worker_settled(outcome).unwrap();
                 // The real actor retains the exact issued operation even after its
                 // rejection. QA tests eligibility; remote QUERY15 provenance and
@@ -12476,6 +12655,15 @@ mod tests {
                         .unwrap(),
                     recovery && (applied || outcome == OperationOutcome::IdentityMismatch),
                 );
+                if let Some(changes) = observation_changes.as_mut() {
+                    let still_allowed = applied || outcome == OperationOutcome::IdentityMismatch;
+                    assert_eq!(changes.has_changed().unwrap(), !still_allowed);
+                    assert_eq!(
+                        *changes.borrow_and_update(),
+                        still_allowed,
+                        "the SAME ledger publishes a real parent eligibility change without Root/Stop"
+                    );
+                }
                 let foreign_participation = ParticipationRef::new(
                     first,
                     FrontendProcessId::new_v7(),
@@ -12496,6 +12684,48 @@ mod tests {
                         .await
                         .unwrap()
                 );
+                if recovery && applied {
+                    let (control, window_owner, capacity, segment) = result_segment(first, 1);
+                    let writer = running.deliver_root_segment(
+                        ResultPacketSequence::new(0),
+                        segment,
+                        Some((result_profile(), ClientRowStreamCursor::default())),
+                        2,
+                        crate::api::RootRelayResidentWindow::default(),
+                    );
+                    let reader = async {
+                        let ResultDelivery::Segment(delivery) =
+                            stream.next().await.unwrap().unwrap()
+                        else {
+                            panic!("the original protocol consumer owns the data delivery");
+                        };
+                        let changes = observation_changes.as_mut().unwrap();
+                        tokio::time::timeout(Duration::from_secs(1), changes.changed())
+                            .await
+                            .expect("real output visibility wakes without Root/Stop or polling")
+                            .unwrap();
+                        assert!(!*changes.borrow_and_update());
+                        let snapshot = actor.snapshot().await.unwrap();
+                        assert!(snapshot.output_visible);
+                        assert_eq!(snapshot.conclusion, None);
+                        assert!(
+                            !drive
+                                .may_observe_pre_ready_replacement(&create_input)
+                                .await
+                                .unwrap()
+                        );
+                        assert!(
+                            !changes.has_changed().unwrap(),
+                            "the re-query does not self-notify"
+                        );
+                        delivery.complete();
+                    };
+                    let (delivered, ()) = tokio::join!(writer, reader);
+                    delivered.unwrap();
+                    assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+                    window_owner.complete();
+                    drop(control);
+                }
                 assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
                 let error = QueryExecutionError::from_execution(input.clone());
                 actor.fail_attempt_with_error(running, error).await.unwrap();
@@ -12505,7 +12735,13 @@ mod tests {
                         .await
                         .is_err()
                 );
-                drop((drive, actor, output));
+                if let Some(changes) = observation_changes.as_mut() {
+                    assert!(
+                        !*changes.borrow_and_update(),
+                        "logical conclusion closes the original opportunity"
+                    );
+                }
+                drop((drive, actor, stream));
                 let residual = owner.into_residual_stand_down_supervisor();
                 residual
                     .observe_worker_stopped_and_participation_fenced(participation)
@@ -12515,6 +12751,12 @@ mod tests {
                     .await
                     .expect("the actual actor and original participation converge")
                     .unwrap();
+                if let Some(changes) = observation_changes.as_ref() {
+                    assert!(
+                        changes.has_changed().is_err(),
+                        "the receiver cannot keep the original actor/Source alive after real join"
+                    );
+                }
             }
         }
     }
