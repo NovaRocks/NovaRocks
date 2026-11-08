@@ -273,6 +273,17 @@ impl TaskGraph {
     pub fn tasks(&self) -> impl ExactSizeIterator<Item = &TaskNode> {
         self.tasks.values()
     }
+    /// Ordered cursor over the original frozen table; never rescans a prefix.
+    pub(crate) fn task_after(&self, after: Option<TaskId>) -> Option<&TaskNode> {
+        match after {
+            Some(after) => self
+                .tasks
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => self.tasks.first_key_value(),
+        }
+        .map(|(_, task)| task)
+    }
     pub fn stage(&self, id: StageId) -> Option<&StageNode> {
         self.stages.get(&id)
     }

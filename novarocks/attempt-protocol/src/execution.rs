@@ -322,6 +322,18 @@ impl ReleasedRuntimeFilterContributions {
     }
 }
 
+#[derive(Debug)]
+struct NormalDrainCursor {
+    after: Option<TaskId>,
+}
+#[derive(Debug)]
+enum TerminalCleanupCursor {
+    Tasks(Option<TaskId>),
+    Owners(Option<ParticipationRef>),
+    Queued(Option<TaskOperationId>),
+    Reconciliations,
+}
+
 /// The task protocol of one query execution attempt.
 #[derive(Debug)]
 pub struct QueryTaskExecution {
@@ -352,11 +364,14 @@ pub struct QueryTaskExecution {
     released_native_inputs: VecDeque<QueuedInputGrantRef>,
     expired_actor_aborts: Vec<TaskOperationId>,
     status_reconciliations: BTreeSet<ParticipationRef>,
+    terminal_retired_reconciliations: BTreeSet<ParticipationRef>,
     covered_reconciliations: BTreeSet<ParticipationRef>,
     normal_drain_requested: bool,
     normal_drain_started: bool,
+    normal_drain_cursor: Option<NormalDrainCursor>,
     profile_release_deadline: Option<MonotonicInstant>,
     terminal_cleanup_started: bool,
+    terminal_cleanup_cursor: Option<TerminalCleanupCursor>,
     failure: TerminationLatch,
     accepted_protocol_revision: u64,
     // One ordinal per frozen Task, appended only on its first accepted terminal.
@@ -662,11 +677,14 @@ impl QueryTaskExecution {
             released_native_inputs: VecDeque::new(),
             expired_actor_aborts: Vec::new(),
             status_reconciliations: BTreeSet::new(),
+            terminal_retired_reconciliations: BTreeSet::new(),
             covered_reconciliations: BTreeSet::new(),
             normal_drain_requested: false,
             normal_drain_started: false,
+            normal_drain_cursor: None,
             profile_release_deadline: None,
             terminal_cleanup_started: false,
+            terminal_cleanup_cursor: None,
             failure: TerminationLatch::open(),
             accepted_protocol_revision: 0,
             accepted_terminal_tasks: Vec::new(),
@@ -1032,7 +1050,7 @@ impl QueryTaskExecution {
     /// Task terminals arrive; result demand cannot quiesce required work.
     pub(crate) fn begin_normal_drain(&mut self) {
         self.normal_drain_requested = true;
-        self.advance_normal_drain();
+        self.try_begin_normal_drain();
     }
 
     pub(crate) fn normal_drain_started(&self) -> bool {
@@ -1072,7 +1090,10 @@ impl QueryTaskExecution {
         }
     }
 
-    fn advance_normal_drain(&mut self) {
+    /// Logical no-more-input is immediate. Physical graph cleanup follows a
+    /// charged cursor; the core must check this gate before every candidate
+    /// and every queue-to-send handoff, including during a partial scan.
+    fn try_begin_normal_drain(&mut self) {
         if !self.normal_drain_requested
             || self.normal_drain_started
             || self.terminal_cleanup_started
@@ -1081,32 +1102,134 @@ impl QueryTaskExecution {
         {
             return;
         }
-        let destinations = self
-            .graph
-            .tasks()
-            .map(|task| task.identity())
-            .collect::<Vec<_>>();
-        for destination in destinations {
-            self.stand_down_task_normally(destination)
-                .expect("the frozen task graph owns every destination");
-        }
         self.normal_drain_started = true;
-        let unsent_inputs = self
-            .operation_targets
-            .iter()
-            .filter_map(|(&operation_id, &target)| {
-                let queued_kind = self.dispatcher.queued_operation_kind(operation_id);
-                (matches!(queued_kind, Some(OperationKind::CreateTask))
-                    || (queued_kind == Some(OperationKind::UpdateTask)
-                        && !self.dispatcher.queued_destination_close(operation_id)))
-                .then_some((operation_id, target))
-            })
-            .collect::<Vec<_>>();
-        for (operation_id, target) in unsent_inputs {
-            let _ = self.dispatcher.cancel_queued(operation_id);
-            self.operation_targets.remove(&operation_id);
-            self.rollback_unsent(target, operation_id);
+        self.normal_drain_cursor = Some(NormalDrainCursor { after: None });
+    }
+    pub(crate) fn advance_normal_drain(
+        &mut self,
+        context: &mut dyn crate::capacity::StepContext,
+    ) -> Result<bool, TaskExecutionError> {
+        self.try_begin_normal_drain();
+        let Some(cursor) = self.normal_drain_cursor.as_ref() else {
+            return Ok(false);
+        };
+        if !context.charge(1) {
+            return Ok(false);
         }
+        let next = self
+            .graph
+            .task_after(cursor.after)
+            .map(|task| task.identity());
+        match next {
+            Some(identity) => {
+                self.stand_down_task_normally(identity)?;
+                self.normal_drain_cursor
+                    .as_mut()
+                    .expect("same original scan")
+                    .after = Some(identity.task_id());
+            }
+            None => self.normal_drain_cursor = None,
+        }
+        Ok(true)
+    }
+    pub(crate) fn has_pending_normal_drain(&self) -> bool {
+        self.normal_drain_cursor.is_some()
+    }
+
+    /// The immediate admission/send gate does not depend on the physical
+    /// cleanup cursor reaching this Task. Exact destination-close controls
+    /// survive normal withdrawal; terminal cleanup suppresses all Task input.
+    fn task_input_allowed(
+        &self,
+        identity: TaskIdentity,
+        destination_close: bool,
+    ) -> Result<bool, TaskExecutionError> {
+        let task = self
+            .task_by_identity_ref(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        Ok(!self.terminal_cleanup_started
+            && (destination_close || (!self.normal_drain_started && !task.normally_stood_down())))
+    }
+    /// Checks the original immutable input, never a caller-supplied class.
+    /// The concrete driver uses this before both Native admission and dispatch.
+    pub(crate) fn task_operation_allowed(
+        &self,
+        operation: &OperationIntent,
+    ) -> Result<bool, TaskExecutionError> {
+        match operation {
+            OperationIntent::CreateTask { identity, .. } => {
+                self.task_input_allowed(*identity, false)
+            }
+            OperationIntent::UpdateTask { identity, .. } => {
+                self.task_input_allowed(*identity, operation.requires_control_progress())
+            }
+            _ => Err(TaskExecutionError::Schedule(
+                "Task input gate received a non-Task-input operation".into(),
+            )),
+        }
+    }
+    /// Original external split/filter entry. Drain rejects NEW updates; this
+    /// differs from an already admitted input's late grant disposition, and
+    /// from the original internal exact-close continuation kept during drain.
+    pub(crate) fn prepare_task_update(
+        &mut self,
+        identity: TaskIdentity,
+        update: TaskDomainUpdate,
+    ) -> Result<(UpdateAdmission, Option<OperationIntent>), TaskExecutionError> {
+        if self.normal_drain_started || self.terminal_cleanup_started {
+            return Err(TaskExecutionError::Schedule(
+                "attempt drain rejects new task updates".into(),
+            ));
+        }
+        let (stage_id, task_id) = self
+            .locate(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        self.stages
+            .get_mut(&stage_id)
+            .expect("located stage")
+            .task_mut(task_id)
+            .expect("located Task")
+            .begin_input_preparation(update, &mut self.ids)
+    }
+    /// A late original grant observes the logical cut even if the graph scan
+    /// has not reached its Task. The same grant is returned exactly once by
+    /// that Task's ordinary cleanup leg, never dropped as a passive reference.
+    pub(crate) fn complete_task_input_preparation(
+        &mut self,
+        identity: TaskIdentity,
+        operation: TaskOperationId,
+        grant: QueuedInputGrantRef,
+    ) -> Result<UpdateAdmission, TaskExecutionError> {
+        self.apply_prior_normal_drain(identity)?;
+        if self.terminal_cleanup_started {
+            self.task_by_identity(identity)
+                .ok_or(TaskExecutionError::UnknownOperation)?
+                .discard_creation_after_attempt_failure();
+        } else if self.normal_drain_started {
+            self.stand_down_task_normally(identity)?;
+        }
+        self.task_by_identity(identity)
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .complete_input_preparation(operation, grant)
+    }
+
+    /// Materialize an already accepted global normal cut on this exact
+    /// Task BEFORE accepting a later primary fact that could discard input.
+    /// This preserves the first disposition and the original ACK priority,
+    /// regardless of whether the background cursor has reached this row.
+    fn apply_prior_normal_drain(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        if self.normal_drain_started
+            && !self
+                .task_by_identity_ref(identity)
+                .ok_or(TaskExecutionError::UnknownOperation)?
+                .normally_stood_down()
+        {
+            self.stand_down_task_normally(identity)?;
+        }
+        Ok(())
     }
 
     /// Applies one exact local no-more-input authorization. An unknown Create
@@ -1131,31 +1254,35 @@ impl QueryTaskExecution {
         {
             self.close_destination_normally(identity);
         }
-        let queued_inputs = self
-            .operation_targets
-            .iter()
-            .filter_map(|(&operation_id, &target)| {
-                let OperationTarget::Task { stage, task } = target else {
-                    return None;
-                };
-                if stage != identity.stage_id() || task != identity.task_id() {
-                    return None;
-                }
-                let kind = self.dispatcher.queued_operation_kind(operation_id);
-                (kind == Some(OperationKind::CreateTask)
-                    || (kind == Some(OperationKind::UpdateTask)
-                        && !self.dispatcher.queued_destination_close(operation_id)))
-                .then_some((operation_id, target))
-            })
-            .collect::<Vec<_>>();
-        for (operation_id, target) in queued_inputs {
-            let _ = self.dispatcher.cancel_queued(operation_id)?;
+        let operations = self
+            .task_by_identity_ref(identity)
+            .expect("same original Task")
+            .withdrawal_operation_ids();
+        let expected = OperationTarget::Task {
+            stage: identity.stage_id(),
+            task: identity.task_id(),
+        };
+        for operation_id in operations.into_iter().flatten() {
+            let kind = self.dispatcher.queued_operation_kind(operation_id);
+            if kind != Some(OperationKind::CreateTask)
+                && (kind != Some(OperationKind::UpdateTask)
+                    || self.dispatcher.queued_destination_close(operation_id))
+            {
+                continue;
+            }
+            if self.operation_targets.get(&operation_id) != Some(&expected) {
+                return Err(TaskExecutionError::Schedule(
+                    "original Task withdrawal differs from its exact queued operation owner".into(),
+                ));
+            }
+            self.dispatcher.cancel_queued(operation_id)?;
             self.operation_targets.remove(&operation_id);
-            self.rollback_unsent(target, operation_id);
+            self.rollback_unsent(expected, operation_id);
         }
         self.task_by_identity(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?
             .begin_normal_stand_down();
+        self.settle_task_drain(identity.stage_id(), identity.task_id());
         Ok(())
     }
 
@@ -1169,31 +1296,98 @@ impl QueryTaskExecution {
             return;
         }
         self.terminal_cleanup_started = true;
-        self.deployment_window.clear();
-        for stage in self.stages.values_mut() {
-            for (_, mut task) in stage.tasks_mut() {
-                task.discard_creation_after_attempt_failure();
+        // Retire only debt present at this cut. A later in-flight ACK may
+        // create a new original reconciliation which must remain observable.
+        self.terminal_retired_reconciliations = std::mem::take(&mut self.status_reconciliations);
+        self.normal_drain_cursor = None;
+        self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Tasks(None));
+    }
+    pub(crate) fn has_pending_terminal_cleanup(&self) -> bool {
+        self.terminal_cleanup_cursor.is_some()
+    }
+    /// One original table row per charge. The terminal gate above already
+    /// prevents future business issuance; no large collection is cleared or
+    /// destroyed in the input that accepted the failure.
+    pub(crate) fn advance_terminal_cleanup(
+        &mut self,
+        context: &mut dyn crate::capacity::StepContext,
+    ) -> Result<bool, TaskExecutionError> {
+        let Some(cursor) = self.terminal_cleanup_cursor.as_ref() else {
+            return Ok(false);
+        };
+        if !context.charge(1) {
+            return Ok(false);
+        }
+        match *cursor {
+            TerminalCleanupCursor::Tasks(after) => {
+                if let Some(identity) = self.graph.task_after(after).map(|task| task.identity()) {
+                    self.apply_prior_normal_drain(identity)?;
+                    self.task_by_identity(identity)
+                        .expect("frozen Task")
+                        .discard_creation_after_attempt_failure();
+                    if let Some(positions) = self
+                        .deployment_window
+                        .get_mut(&identity.backend_process_id())
+                    {
+                        positions.remove(&identity);
+                        if positions.is_empty() {
+                            self.deployment_window
+                                .remove(&identity.backend_process_id());
+                        }
+                    }
+                    self.terminal_cleanup_cursor =
+                        Some(TerminalCleanupCursor::Tasks(Some(identity.task_id())));
+                } else {
+                    self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Owners(None));
+                }
+            }
+            TerminalCleanupCursor::Owners(after) => {
+                let next = match after {
+                    Some(after) => self
+                        .owners
+                        .range_mut((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                        .next(),
+                    None => self.owners.iter_mut().next(),
+                };
+                if let Some((&participation, owner)) = next {
+                    owner.begin_terminal_cleanup();
+                    self.terminal_cleanup_cursor =
+                        Some(TerminalCleanupCursor::Owners(Some(participation)));
+                } else {
+                    self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Queued(None));
+                }
+            }
+            TerminalCleanupCursor::Queued(after) => {
+                let next = match after {
+                    Some(after) => self
+                        .operation_targets
+                        .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                        .next(),
+                    None => self.operation_targets.first_key_value(),
+                }
+                .map(|(&operation, &target)| (operation, target));
+                if let Some((operation, target)) = next {
+                    if target != OperationTarget::ActorAbort
+                        && self.dispatcher.operation_state(operation)?
+                            == DispatchOperationState::Queued
+                    {
+                        self.dispatcher.cancel_queued(operation)?;
+                        self.operation_targets.remove(&operation);
+                        self.rollback_unsent(target, operation);
+                    }
+                    self.terminal_cleanup_cursor =
+                        Some(TerminalCleanupCursor::Queued(Some(operation)));
+                } else {
+                    self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Reconciliations);
+                }
+            }
+            TerminalCleanupCursor::Reconciliations => {
+                if self.terminal_retired_reconciliations.pop_first().is_none() {
+                    self.terminal_cleanup_cursor = None;
+                }
             }
         }
-        for owner in self.owners.values_mut() {
-            owner.begin_terminal_cleanup();
-        }
-        self.status_reconciliations.clear();
-        let normal_queued = self
-            .operation_targets
-            .iter()
-            .filter_map(|(&operation_id, &target)| {
-                (target != OperationTarget::ActorAbort
-                    && self.dispatcher.operation_state(operation_id).ok()
-                        == Some(DispatchOperationState::Queued))
-                .then_some((operation_id, target))
-            })
-            .collect::<Vec<_>>();
-        for (operation_id, target) in normal_queued {
-            let _ = self.dispatcher.cancel_queued(operation_id);
-            self.operation_targets.remove(&operation_id);
-            self.rollback_unsent(target, operation_id);
-        }
+        Ok(true)
     }
 
     /// Settles one released operation.
@@ -1226,6 +1420,13 @@ impl QueryTaskExecution {
         task_id: TaskId,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
+        let identity = self
+            .stages
+            .get(&stage_id)
+            .and_then(|stage| stage.task(task_id))
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .identity();
+        self.apply_prior_normal_drain(identity)?;
         let result = self.acknowledge_task_inner(stage_id, task_id, ack);
         // Local FailedClosed can become terminal without a TaskStatus or Task
         // failure latch. Count it even on Err before the outer failure policy
@@ -2028,6 +2229,7 @@ impl QueryTaskExecution {
         report: &mut StatusReport,
     ) -> Result<(), TaskExecutionError> {
         let identity = status.identity();
+        self.apply_prior_normal_drain(identity)?;
         let result = self.apply_published_inner(status, report);
         if self.locate(identity).is_some() {
             self.settle_task_drain(identity.stage_id(), identity.task_id());
@@ -2608,6 +2810,635 @@ mod diagnostic_release_tests {
             execution
                 .released_runtime_filter_contributions()
                 .is_complete()
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_drain_tests {
+    use super::*;
+    use crate::{
+        capacity::{QueueStage, StepContext},
+        config::DispatchLane,
+        effect::FrozenContentRef,
+        start::{FrozenCreation, FrozenExchangeEdge, FrozenTask, FrozenTaskGraph},
+    };
+    use novarocks_execution_contract::{
+        AbortCause, AbortParticipation, ContentFingerprint, DomainVersion,
+        ExchangeDeliveryRequirement, ExchangeEdgeId, PlanNodeId, TaskOutputFacts,
+        TaskStatusVersion,
+    };
+    use novarocks_types::UniqueId;
+    struct Turn(usize);
+    impl StepContext for Turn {
+        fn charge(&mut self, units: usize) -> bool {
+            if units > self.0 {
+                false
+            } else {
+                self.0 -= units;
+                true
+            }
+        }
+        fn reserve_queue_stage(
+            &mut self,
+            _: DispatchLane,
+            _: bool,
+            _: BackendProcessId,
+            _: usize,
+            _: usize,
+        ) -> QueueStage {
+            panic!("pure cleanup cannot mint transport capacity")
+        }
+    }
+    fn grant(value: u64) -> QueuedInputGrantRef {
+        QueuedInputGrantRef(NonZeroU64::new(value).unwrap())
+    }
+    fn many_tasks(count: u32) -> QueryTaskExecution {
+        let seed = crate::test_support::remote(1);
+        let mut tasks = BTreeMap::new();
+        let mut stages = BTreeMap::new();
+        let mut identities = Vec::new();
+        for n in 1..=count {
+            let id = TaskId::new(n).unwrap();
+            let stage = StageId::new(n).unwrap();
+            let identity = TaskIdentity::new(
+                seed.identity().query_execution_id(),
+                stage,
+                id,
+                seed.identity().backend_process_id(),
+            );
+            tasks.insert(
+                id,
+                FrozenTask {
+                    identity,
+                    participation: seed.participation(),
+                    task_key: UniqueId::new(i64::from(n), 1),
+                    fragment_id: n as i32,
+                    split_plan_nodes: Box::new([]),
+                    creation: FrozenCreation {
+                        resource: PayloadRef(NonZeroU64::new(u64::from(n)).unwrap()),
+                        queued_bytes: 256,
+                        plan_carrier_bytes: 0,
+                        descriptor_encoded_bytes: 0,
+                    },
+                },
+            );
+            stages.insert(stage, Box::from([identity]));
+            identities.push(identity);
+        }
+        let edges = if count >= 2 {
+            let edge = ExchangeEdgeId::new(1).unwrap();
+            BTreeMap::from([(
+                edge,
+                FrozenExchangeEdge {
+                    edge,
+                    producer_stage: identities[1].stage_id(),
+                    consumer_stage: identities[0].stage_id(),
+                    destination_node: PlanNodeId::new(1).unwrap(),
+                    delivery: ExchangeDeliveryRequirement::DemandDriven,
+                    producers: Box::from([identities[1]]),
+                    destinations: Box::from([identities[0]]),
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        crate::test_support::execution_with_graph(
+            TaskGraph::from_frozen(FrozenTaskGraph {
+                root: identities[0],
+                tasks,
+                stages,
+                edges,
+            })
+            .unwrap(),
+        )
+    }
+    fn identity(execution: &QueryTaskExecution, value: u32) -> TaskIdentity {
+        execution
+            .task(TaskId::new(value).unwrap())
+            .unwrap()
+            .identity()
+    }
+    fn enqueue_create(
+        execution: &mut QueryTaskExecution,
+        identity: TaskIdentity,
+        original_grant: QueuedInputGrantRef,
+    ) -> TaskOperationId {
+        let now = execution.now;
+        let intent = execution
+            .task_by_identity(identity)
+            .unwrap()
+            .release_create(now)
+            .unwrap();
+        let operation = intent.operation_id();
+        execution
+            .dispatcher
+            .enqueue_reserved(intent, now, original_grant)
+            .unwrap();
+        execution.operation_targets.insert(
+            operation,
+            OperationTarget::Task {
+                stage: identity.stage_id(),
+                task: identity.task_id(),
+            },
+        );
+        operation
+    }
+    fn finish(execution: &mut QueryTaskExecution, identity: TaskIdentity) {
+        let status = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap();
+        execution
+            .apply_published(&status, &mut StatusReport::default())
+            .unwrap();
+    }
+    #[test]
+    fn normal_drain_seals_input_immediately_and_visits_one_frozen_task_per_unit() {
+        let mut execution = many_tasks(257);
+        execution.begin_normal_drain();
+        assert!(execution.normal_drain_started());
+        for task in execution.graph.tasks() {
+            assert!(
+                !execution
+                    .task_input_allowed(task.identity(), false)
+                    .unwrap()
+            );
+            assert!(execution.task_input_allowed(task.identity(), true).unwrap());
+            assert!(
+                !execution
+                    .task(task.task_id())
+                    .unwrap()
+                    .normally_stood_down()
+            );
+        }
+        assert!(!execution.advance_normal_drain(&mut Turn(0)).unwrap());
+        let mut steps = 0;
+        while execution.has_pending_normal_drain() {
+            let mut turn = Turn(1);
+            assert!(execution.advance_normal_drain(&mut turn).unwrap());
+            assert_eq!(turn.0, 0);
+            steps += 1;
+            execution.begin_normal_drain(); // An identical request cannot restart the cursor.
+            assert!(steps <= 258);
+        }
+        assert_eq!(steps, 258);
+        assert!(execution.graph.tasks().all(|task| {
+            execution
+                .task(task.task_id())
+                .unwrap()
+                .normally_stood_down()
+        }));
+        let mut idle = Turn(1);
+        assert!(!execution.advance_normal_drain(&mut idle).unwrap());
+        assert_eq!(idle.0, 1);
+    }
+    #[test]
+    fn strict_live_gate_waits_for_actual_primary_terminals_without_empty_timer_continuation() {
+        let mut execution = crate::test_support::execution_with_strict_input();
+        execution.begin_normal_drain();
+        assert!(!execution.normal_drain_started());
+        assert!(!execution.has_pending_normal_drain());
+        let strict = identity(&execution, 2);
+        let create = enqueue_create(&mut execution, strict, grant(1));
+        execution.stand_down_task_normally(strict).unwrap();
+        assert!(
+            !execution
+                .task(strict.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+        assert_eq!(
+            execution.dispatcher.operation_state(create).unwrap(),
+            DispatchOperationState::Queued
+        );
+        let other = identity(&execution, 3);
+        finish(&mut execution, strict);
+        assert!(!execution.advance_normal_drain(&mut Turn(1)).unwrap());
+        finish(&mut execution, other);
+        assert!(execution.advance_normal_drain(&mut Turn(1)).unwrap());
+        assert!(execution.normal_drain_started());
+        while execution.has_pending_normal_drain() {
+            execution.advance_normal_drain(&mut Turn(1)).unwrap();
+        }
+        assert_eq!(
+            execution.dispatcher.operation_state(create).unwrap(),
+            DispatchOperationState::Absent
+        );
+        assert_eq!(execution.dispatcher.take_released_grant(), Some(grant(1)));
+    }
+    #[test]
+    fn exact_task_withdrawal_cancels_own_create_and_ordinary_update_but_preserves_close_and_sibling()
+     {
+        for destination_close in [false, true] {
+            let mut execution = many_tasks(3);
+            let task = identity(&execution, 2);
+            let root = identity(&execution, 1);
+            let sibling = identity(&execution, 3);
+            let own_create = enqueue_create(&mut execution, task, grant(1));
+            let sibling_create = enqueue_create(&mut execution, sibling, grant(2));
+            let running = TaskStatus::try_new(
+                task,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            execution
+                .apply_published(&running, &mut StatusReport::default())
+                .unwrap();
+            let update = if destination_close {
+                TaskDomainUpdate::CloseExchangeDestination {
+                    version: DomainVersion::FIRST,
+                    edge: ExchangeEdgeId::new(1).unwrap(),
+                    destination: root,
+                }
+            } else {
+                TaskDomainUpdate::TaskDynamicFilter {
+                    version: DomainVersion::new(1).unwrap(),
+                    payload: FrozenContentRef {
+                        resource: PayloadRef(NonZeroU64::new(90).unwrap()),
+                        fingerprint: ContentFingerprint::from_bytes([9; 16]),
+                        queued_bytes: 16,
+                    },
+                }
+            };
+            let operation = execution.ids.issue();
+            execution
+                .task_by_identity(task)
+                .unwrap()
+                .enqueue_update(operation, update, grant(3))
+                .unwrap();
+            let (intent, original_grant) = execution
+                .task_by_identity(task)
+                .unwrap()
+                .next_update_intent()
+                .unwrap()
+                .unwrap();
+            assert_eq!(intent.operation_id(), operation);
+            execution
+                .dispatcher
+                .enqueue_reserved(intent, execution.now, original_grant.unwrap())
+                .unwrap();
+            execution.operation_targets.insert(
+                operation,
+                OperationTarget::Task {
+                    stage: task.stage_id(),
+                    task: task.task_id(),
+                },
+            );
+            execution.stand_down_task_normally(task).unwrap();
+            assert!(
+                execution
+                    .task(task.task_id())
+                    .unwrap()
+                    .normally_stood_down()
+            );
+            assert_eq!(
+                execution.dispatcher.operation_state(own_create).unwrap(),
+                DispatchOperationState::Absent
+            );
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .operation_state(sibling_create)
+                    .unwrap(),
+                DispatchOperationState::Queued
+            );
+            assert_eq!(
+                execution.dispatcher.operation_state(operation).unwrap(),
+                if destination_close {
+                    DispatchOperationState::Queued
+                } else {
+                    DispatchOperationState::Absent
+                }
+            );
+            let mut returned = Vec::new();
+            while let Some(grant) = execution.dispatcher.take_released_grant() {
+                returned.push(grant);
+            }
+            returned.sort_by_key(|grant| grant.0);
+            assert_eq!(
+                returned,
+                if destination_close {
+                    vec![grant(1)]
+                } else {
+                    vec![grant(1), grant(3)]
+                }
+            );
+        }
+    }
+    #[test]
+    fn accepted_failure_does_not_traverse_other_tasks_before_bounded_cleanup() {
+        let mut execution = many_tasks(64);
+        let tasks = execution
+            .graph
+            .tasks()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>();
+        let operations = tasks
+            .iter()
+            .enumerate()
+            .map(|(index, &task)| enqueue_create(&mut execution, task, grant(index as u64 + 1)))
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            execution
+                .deployment_window
+                .entry(task.backend_process_id())
+                .or_default()
+                .insert(*task);
+        }
+        execution
+            .status_reconciliations
+            .insert(execution.task(tasks[0].task_id()).unwrap().participation());
+        let failed = TaskStatus::try_new(
+            tasks[0],
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Aborted,
+            Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        execution
+            .apply_published(&failed, &mut StatusReport::default())
+            .unwrap();
+        assert!(execution.terminal_cleanup_started);
+        assert!(execution.has_pending_terminal_cleanup());
+        assert!(
+            execution
+                .task(tasks[63].task_id())
+                .unwrap()
+                .create_pending()
+        );
+        assert_eq!(execution.dispatcher.queued_items(), 64);
+        for task in &tasks {
+            assert!(!execution.task_input_allowed(*task, false).unwrap());
+            assert!(!execution.task_input_allowed(*task, true).unwrap());
+        }
+        assert!(!execution.advance_terminal_cleanup(&mut Turn(0)).unwrap());
+        let mut steps = 0;
+        while execution.has_pending_terminal_cleanup() {
+            let mut turn = Turn(1);
+            assert!(execution.advance_terminal_cleanup(&mut turn).unwrap());
+            assert_eq!(turn.0, 0);
+            steps += 1;
+            execution.begin_terminal_cleanup(); // Same failure cannot reset progress.
+            assert!(steps <= 140);
+        }
+        assert!(steps >= 64 + 64);
+        for operation in operations {
+            assert_eq!(
+                execution.dispatcher.operation_state(operation).unwrap(),
+                DispatchOperationState::Absent
+            );
+        }
+        assert!(execution.deployment_window.is_empty());
+        assert!(execution.status_reconciliations.is_empty());
+        assert!(
+            !execution
+                .task(tasks[63].task_id())
+                .unwrap()
+                .create_pending()
+        );
+        let mut grants = Vec::new();
+        while let Some(grant) = execution.dispatcher.take_released_grant() {
+            grants.push(grant);
+        }
+        grants.sort_by_key(|grant| grant.0);
+        assert_eq!(grants, (1..=64).map(grant).collect::<Vec<_>>());
+        let mut idle = Turn(1);
+        assert!(!execution.advance_terminal_cleanup(&mut idle).unwrap());
+        assert_eq!(idle.0, 1);
+    }
+    #[test]
+    fn terminal_cleanup_keeps_original_in_flight_and_actor_abort_but_reclaims_only_unsent_grant() {
+        let mut execution = many_tasks(3);
+        let first = identity(&execution, 1);
+        let second = identity(&execution, 2);
+        let inflight = enqueue_create(&mut execution, first, grant(1));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        let unsent = enqueue_create(&mut execution, second, grant(2));
+        let participation = execution.task(first.task_id()).unwrap().participation();
+        let abort = execution.ids.issue();
+        let intent = OperationIntent::AbortParticipation(AbortParticipation::new(
+            abort,
+            participation,
+            AbortCause::QueryFailed,
+        ));
+        execution
+            .dispatcher
+            .enqueue_reserved(intent, execution.now, grant(3))
+            .unwrap();
+        execution
+            .operation_targets
+            .insert(abort, OperationTarget::ActorAbort);
+        execution.begin_terminal_cleanup();
+        while execution.has_pending_terminal_cleanup() {
+            execution.advance_terminal_cleanup(&mut Turn(1)).unwrap();
+        }
+        assert_eq!(
+            execution.dispatcher.operation_state(inflight).unwrap(),
+            DispatchOperationState::InFlight
+        );
+        assert_eq!(
+            execution.dispatcher.operation_state(unsent).unwrap(),
+            DispatchOperationState::Absent
+        );
+        assert_eq!(
+            execution.dispatcher.operation_state(abort).unwrap(),
+            DispatchOperationState::Queued
+        );
+        assert_eq!(execution.dispatcher.take_released_grant(), Some(grant(2)));
+        assert_eq!(execution.dispatcher.take_released_grant(), None);
+        assert_eq!(batch.queued_inputs.as_ref(), &[grant(1)]);
+    }
+    #[test]
+    fn original_late_native_grant_observes_failure_cut_before_cleanup_cursor_reaches_its_task() {
+        let mut execution = many_tasks(64);
+        let task = identity(&execution, 64);
+        let update = TaskDomainUpdate::TaskDynamicFilter {
+            version: DomainVersion::FIRST,
+            payload: FrozenContentRef {
+                resource: PayloadRef(NonZeroU64::new(100).unwrap()),
+                fingerprint: ContentFingerprint::from_bytes([1; 16]),
+                queued_bytes: 16,
+            },
+        };
+        let (admission, intent) = execution.prepare_task_update(task, update.clone()).unwrap();
+        assert_eq!(admission, UpdateAdmission::Preparing);
+        let operation = intent.unwrap().operation_id();
+        execution.begin_terminal_cleanup();
+        assert!(execution.task(task.task_id()).unwrap().create_pending());
+        assert_eq!(
+            execution
+                .complete_task_input_preparation(task, operation, grant(5))
+                .unwrap(),
+            UpdateAdmission::DiscardedTerminal
+        );
+        assert_eq!(
+            execution
+                .task_by_identity(task)
+                .unwrap()
+                .take_released_grant(),
+            Some(grant(5))
+        );
+        assert_eq!(
+            execution
+                .task_by_identity(task)
+                .unwrap()
+                .take_released_grant(),
+            None
+        );
+        assert!(
+            matches!(execution.prepare_task_update(task,update),Err(TaskExecutionError::Schedule(message)) if message=="attempt drain rejects new task updates")
+        );
+        assert!(execution.has_pending_terminal_cleanup());
+    }
+    #[test]
+    fn first_normal_cut_is_preserved_when_failure_and_late_grant_overtake_its_task_cursor() {
+        for same_task in [false, true] {
+            let mut execution = many_tasks(64);
+            let task = identity(&execution, 64);
+            let update = TaskDomainUpdate::TaskDynamicFilter {
+                version: DomainVersion::FIRST,
+                payload: FrozenContentRef {
+                    resource: PayloadRef(NonZeroU64::new(100).unwrap()),
+                    fingerprint: ContentFingerprint::from_bytes([1; 16]),
+                    queued_bytes: 16,
+                },
+            };
+            let (_, intent) = execution.prepare_task_update(task, update).unwrap();
+            let operation = intent.unwrap().operation_id();
+            execution.begin_normal_drain();
+            let failed_task = if same_task {
+                task
+            } else {
+                identity(&execution, 1)
+            };
+            let failed = TaskStatus::try_new(
+                failed_task,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Aborted,
+                Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            execution
+                .apply_published(&failed, &mut StatusReport::default())
+                .unwrap();
+            assert!(execution.terminal_cleanup_started);
+            assert_eq!(
+                execution
+                    .complete_task_input_preparation(task, operation, grant(8))
+                    .unwrap(),
+                UpdateAdmission::DiscardedNoLongerNeeded
+            );
+            assert_eq!(
+                execution
+                    .task_by_identity(task)
+                    .unwrap()
+                    .take_released_grant(),
+                Some(grant(8))
+            );
+            assert!(execution.failure_cause().is_some());
+        }
+    }
+    #[test]
+    fn late_create_refusal_observes_original_normal_cut_before_physical_task_cleanup() {
+        use crate::input::{LocalDispatchResult, OperationReply, OperationReplyResult};
+        let mut execution = many_tasks(64);
+        let task = identity(&execution, 64);
+        let intent = execution
+            .task_by_identity(task)
+            .unwrap()
+            .release_create(MonotonicInstant::ORIGIN)
+            .unwrap();
+        execution.begin_normal_drain();
+        let reply = OperationReply {
+            operation_id: intent.operation_id(),
+            kind: OperationKind::CreateTask,
+            result: OperationReplyResult::Local {
+                result: LocalDispatchResult::NonWorkerRejected,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            },
+        };
+        execution
+            .acknowledge_task(task.stage_id(), task.task_id(), &reply)
+            .unwrap();
+        assert!(!execution.task(task.task_id()).unwrap().create_pending());
+        assert!(
+            execution
+                .task(task.task_id())
+                .unwrap()
+                .normally_stood_down()
+        );
+    }
+    #[test]
+    fn terminal_cleanup_discards_only_pre_cut_reconciliation_not_later_inflight_ack_debt() {
+        use crate::input::{OperationReply, OperationReplyResult};
+        use novarocks_execution_contract::{OperationOutcome, operation::OperationResult};
+        let mut execution = many_tasks(3);
+        let task = identity(&execution, 2);
+        let running = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        execution
+            .apply_published(&running, &mut StatusReport::default())
+            .unwrap();
+        let update = TaskDomainUpdate::TaskDynamicFilter {
+            version: DomainVersion::FIRST,
+            payload: FrozenContentRef {
+                resource: PayloadRef(NonZeroU64::new(100).unwrap()),
+                fingerprint: ContentFingerprint::from_bytes([1; 16]),
+                queued_bytes: 16,
+            },
+        };
+        let operation = execution.ids.issue();
+        execution
+            .task_by_identity(task)
+            .unwrap()
+            .enqueue_update(operation, update, grant(4))
+            .unwrap();
+        execution
+            .task_by_identity(task)
+            .unwrap()
+            .next_update_intent()
+            .unwrap()
+            .unwrap();
+        let part = execution.task(task.task_id()).unwrap().participation();
+        execution.status_reconciliations.insert(part);
+        execution.begin_terminal_cleanup();
+        let reply = OperationReply {
+            operation_id: operation,
+            kind: OperationKind::UpdateTask,
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::TerminalRejected,
+                detail: None,
+                acknowledgement: None,
+            }),
+        };
+        execution
+            .acknowledge_task(task.stage_id(), task.task_id(), &reply)
+            .unwrap();
+        while execution.has_pending_terminal_cleanup() {
+            execution.advance_terminal_cleanup(&mut Turn(1)).unwrap();
+        }
+        assert_eq!(
+            execution.take_status_reconciliations(),
+            BTreeSet::from([part])
         );
     }
 }

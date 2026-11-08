@@ -656,7 +656,7 @@ mod tests {
     }
     #[test]
     fn original_actual_exit_gates_next_read_but_cannot_fabricate_result_completion() {
-        let (mut collector, sources, tasks, _, ready) = setup(2, false);
+        let (mut collector, _sources, tasks, _, ready) = setup(2, false);
         collector.begin(ready).unwrap();
         for task in &tasks {
             collector.observe_terminal(&status(*task, 1)).unwrap();

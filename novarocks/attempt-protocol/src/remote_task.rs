@@ -422,6 +422,17 @@ impl RemoteTask {
     pub(crate) const fn normally_stood_down(&self) -> bool {
         self.normal_stand_down
     }
+    /// This owner has exactly one original Create identity and at most one
+    /// released Update. Normal withdrawal inspects these fixed positions,
+    /// never searches every other Task's dispatcher entries.
+    pub(crate) fn withdrawal_operation_ids(&self) -> [Option<TaskOperationId>; 2] {
+        [
+            Some(self.create_envelope.operation_id()),
+            self.released_update
+                .as_ref()
+                .map(|update| update.operation_id),
+        ]
+    }
 
     /// Stops new Create and update work while preserving a possible in-flight
     /// Create receipt and the identity that the Participation fence must classify.

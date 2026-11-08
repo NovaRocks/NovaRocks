@@ -144,6 +144,9 @@ pub(crate) fn graph_with_strict_input(
 
 pub(crate) fn execution_with_strict_input() -> crate::execution::QueryTaskExecution {
     let (graph, _) = crate::test_support::graph_with_strict_input(false);
+    execution_with_graph(graph)
+}
+pub(crate) fn execution_with_graph(graph: TaskGraph) -> crate::execution::QueryTaskExecution {
     let epochs = graph
         .participations()
         .map(|p| {
