@@ -3169,6 +3169,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-attempt-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-coordination-contract",
+ "novarocks-execution-contract",
+ "novarocks-result-contract",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [

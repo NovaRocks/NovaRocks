@@ -16,3 +16,5 @@ pub(crate) use subscription_owner::NativeSubscriptionOwner;
 pub(crate) mod task_transport;
 pub(crate) mod transport;
 pub(crate) mod transport_supervisor;
+
+pub(crate) mod transport_capacity;
