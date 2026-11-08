@@ -1345,7 +1345,7 @@ mod tests {
         };
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([17; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             intent,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3963,7 +3963,7 @@ mod tests {
         let catalog = MergeCatalog;
         let functions = builtin_sql_function_catalog();
         let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             SqlCompileIntent::DmlInternalRead,
             request("SELECT 1", SqlCompileIntent::Query).session,
             SqlPlanningEnvironment::Distributed,
@@ -4104,7 +4104,9 @@ mod tests {
         let catalog = FrozenOrdersCatalog;
         let functions = builtin_sql_function_catalog();
         let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select order_key from orders"),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(
+                "select order_key from orders",
+            )),
             SqlCompileIntent::Query,
             request("select 1", SqlCompileIntent::Query).session,
             SqlPlanningEnvironment::Distributed,

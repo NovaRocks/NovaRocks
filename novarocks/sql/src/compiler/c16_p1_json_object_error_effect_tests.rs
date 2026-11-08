@@ -70,7 +70,7 @@ fn compile_with_id_type(sql: &str, id_type: DataType) -> SqlOptimizedOutput {
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
     let control = SqlCompileControl::unbounded();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),

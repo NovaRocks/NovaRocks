@@ -74,7 +74,7 @@ fn compile(score_type: DataType, predicate: &str) -> SqlOptimizedOutput {
         "SELECT l.payload, r.payload FROM residual_rng_l l JOIN residual_rng_r r ON l.k=r.k WHERE {predicate}"
     );
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::compiler::test_query(&sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: Default::default(),

@@ -4029,9 +4029,9 @@ mod tests {
                 }
                 let control = crate::compiler::SqlCompileControl::unbounded();
                 let mut request = SqlAnalyzeRequest::new(
-                    SqlStatementInput::sql(format!(
+                    SqlStatementInput::parsed_query(Box::new(test_query(&format!(
                         "SELECT k FROM iceberg.db.base WHERE k > {minimum}"
-                    )),
+                    )))),
                     crate::compiler::SqlCompileIntent::Query,
                     SqlSessionContext {
                         current_catalog: Some("iceberg".into()),

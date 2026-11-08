@@ -47,7 +47,7 @@ fn bitmap_sql_source_with_semantics(
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics,

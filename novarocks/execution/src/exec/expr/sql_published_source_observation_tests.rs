@@ -123,7 +123,7 @@ fn query(
 ) -> Result<SqlAuthoredPhysicalPlan, SqlCompileProgressError> {
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([97; 16]).unwrap(),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         session(),
         SqlPlanningEnvironment::Distributed,
@@ -157,7 +157,7 @@ fn dml(sql: &str, control: SqlCompileControl) -> Result<SqlAuthoredPhysicalPlan,
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
     let settings = settings();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::IcebergWrite {
             root_distribution: RootDistributionRequirement::Any,
         },

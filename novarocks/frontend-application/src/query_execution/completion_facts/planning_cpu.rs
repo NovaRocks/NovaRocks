@@ -1082,9 +1082,14 @@ mod map64_planning_worker_tests {
         for level in 0..63 {
             sql = format!("SELECT map_agg(1, m) AS m FROM ({sql}) q{level}");
         }
+        let mut statements = novarocks_parser::parse(&sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([43; 16]).unwrap(),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: Default::default(),

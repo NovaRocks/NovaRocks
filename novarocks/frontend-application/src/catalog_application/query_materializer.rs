@@ -1560,9 +1560,15 @@ mod tests {
                     }),
                 );
                 let control = SqlCompileControl::unbounded();
+                let mut statements = novarocks_parser::parse(sql).unwrap();
+                assert_eq!(statements.len(), 1);
+                let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap()
+                else {
+                    panic!("expected one query");
+                };
                 let request = SqlFinalPlanCompileRequest::new(
                     novarocks_physical_plan::PlanVersionId::try_new([71; 16]).unwrap(),
-                    SqlStatementInput::sql(sql),
+                    SqlStatementInput::parsed_query(Box::new(query)),
                     SqlCompileIntent::Query,
                     SqlSessionContext {
                         sql_semantics: Default::default(),

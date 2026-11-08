@@ -509,9 +509,14 @@ mod compile_control_tests {
         use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
         use novarocks_sql::compiler::*;
         let control = SqlCompileControl::unbounded();
+        let mut statements = novarocks_parser::parse("SELECT 1").unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([84; 16]).unwrap(),
-            SqlStatementInput::sql("SELECT 1"),
+            SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

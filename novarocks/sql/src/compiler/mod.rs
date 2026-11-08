@@ -782,7 +782,7 @@ pub fn noop_constant_evaluator() -> &'static dyn SqlConstantEvaluator {
 
 /// Statement material already owned by the SQL boundary.
 ///
-/// The public constructors accept only source syntax. SQL-internal logical
+/// The public constructors accept only parsed syntax. SQL-internal logical
 /// re-entry is intentionally represented by a private variant so application
 /// code cannot smuggle a mutable logical tree or column factory back across
 /// the compiler boundary.
@@ -797,7 +797,6 @@ pub struct SqlStatementInput {
     reason = "The inline SQL plan payload avoids an allocation at the compiler handoff boundary."
 )]
 enum SqlStatementInputKind {
-    Sql(String),
     ParsedQuery(Box<novarocks_parser::ast::Query>),
     MaterializedValuesQuery {
         query: Box<novarocks_parser::ast::Query>,
@@ -815,12 +814,6 @@ enum SqlStatementInputKind {
 }
 
 impl SqlStatementInput {
-    pub fn sql(sql: impl Into<String>) -> Self {
-        Self {
-            kind: SqlStatementInputKind::Sql(sql.into()),
-        }
-    }
-
     pub fn parsed_query(query: Box<novarocks_parser::ast::Query>) -> Self {
         Self {
             kind: SqlStatementInputKind::ParsedQuery(query),
@@ -2088,30 +2081,11 @@ impl SqlCompiler {
 fn parse_query(
     statement: &SqlStatementInput,
 ) -> Result<novarocks_parser::ast::Query, SqlCompileError> {
-    let sql = match &statement.kind {
-        SqlStatementInputKind::Sql(sql) => sql,
+    match &statement.kind {
         SqlStatementInputKind::ParsedQuery(query)
-        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => {
-            return Ok((**query).clone());
-        }
-        SqlStatementInputKind::LogicalPlan { .. } => {
-            return Err(SqlCompileError::InvalidRequest(
-                "logical SQL compiler input must bypass parsing".to_string(),
-            ));
-        }
-    };
-    match novarocks_parser::parse(sql)
-        .map_err(|error| SqlCompileError::Compilation(error.to_string()))?
-    {
-        mut statements if statements.len() == 1 => match statements.remove(0) {
-            novarocks_parser::ast::Statement::Query(query) => Ok(query),
-            _ => Err(SqlCompileError::InvalidRequest(
-                "SQL compiler requires a query statement after application preprocessing"
-                    .to_string(),
-            )),
-        },
-        _ => Err(SqlCompileError::InvalidRequest(
-            "SQL compiler requires a query statement after application preprocessing".to_string(),
+        | SqlStatementInputKind::MaterializedValuesQuery { query, .. } => Ok((**query).clone()),
+        SqlStatementInputKind::LogicalPlan { .. } => Err(SqlCompileError::InvalidRequest(
+            "logical SQL compiler input must bypass parsing".to_string(),
         )),
     }
 }
@@ -2253,6 +2227,16 @@ fn validate_planning_environment(
             "distributed SQL compilation requires a distributed planning environment".to_string(),
         )),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let mut statements = novarocks_parser::parse(sql).expect("test query parses");
+    assert_eq!(statements.len(), 1, "expected exactly one test statement");
+    let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
+        panic!("expected test query");
+    };
+    Box::new(query)
 }
 
 #[cfg(test)]
@@ -2511,7 +2495,7 @@ mod tests {
 
     fn request(control: SqlCompileControl) -> SqlAnalyzeRequest<'static> {
         SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select 1")),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -2542,7 +2526,7 @@ mod tests {
         control: SqlCompileControl,
     ) -> SqlAnalyzeRequest<'a> {
         SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select order_id from orders"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select order_id from orders")),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -2872,9 +2856,9 @@ mod tests {
                 let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
                 let mut input = table_request(&catalog, control(None, &cancellation));
                 input.functions = Some(&functions);
-                input.statement = SqlStatementInput::sql(
+                input.statement = SqlStatementInput::parsed_query(mv_analysis_query(
                     "SELECT order_id, COUNT(*) FROM orders GROUP BY order_id ORDER BY order_id LIMIT 10",
-                );
+                ));
                 if user_disabled {
                     input
                         .session
@@ -3056,7 +3040,7 @@ mod tests {
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
             let cancellation = Arc::new(Cancellation::default());
             let request = SqlAnalyzeRequest::new(
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(mv_analysis_query(sql)),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3175,7 +3159,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(mv_analysis_query(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3235,7 +3219,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select 1")),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3265,7 +3249,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select 1")),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3310,7 +3294,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1 as payload"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select 1 as payload")),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::ShuffleOutputName(
                     "missing".to_string(),
@@ -3342,7 +3326,7 @@ mod tests {
         let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let cancellation = Arc::new(Cancellation::default());
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1 as payload"),
+            SqlStatementInput::parsed_query(mv_analysis_query("select 1 as payload")),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::Any,
             },
@@ -3533,7 +3517,9 @@ mod tests {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
         let snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select field('01', '1', 1) as ordinal"),
+            SqlStatementInput::parsed_query(mv_analysis_query(
+                "select field('01', '1', 1) as ordinal",
+            )),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3595,7 +3581,7 @@ mod tests {
             let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
             let cancellation = Arc::new(Cancellation::default());
             let request = SqlAnalyzeRequest::new(
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(mv_analysis_query(sql)),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -3727,7 +3713,7 @@ mod tests {
         ] {
             let cancellation = Arc::new(Cancellation::default());
             let mut input = request(control(None, &cancellation));
-            input.statement = SqlStatementInput::sql(sql);
+            input.statement = SqlStatementInput::parsed_query(mv_analysis_query(sql));
             input.session.sql_semantics = input
                 .session
                 .sql_semantics
@@ -3771,7 +3757,7 @@ mod tests {
             let cancellation = Arc::new(Cancellation::default());
             let request_control = control(None, &cancellation);
             let mut input = request(request_control.clone());
-            input.statement = SqlStatementInput::sql(sql);
+            input.statement = SqlStatementInput::parsed_query(mv_analysis_query(sql));
             input.session.sql_semantics = input
                 .session
                 .sql_semantics
@@ -3818,9 +3804,9 @@ mod tests {
         let cancellation = Arc::new(Cancellation::default());
         let request_control = control(None, &cancellation);
         let mut input = request(request_control.clone());
-        input.statement = SqlStatementInput::sql(
+        input.statement = SqlStatementInput::parsed_query(mv_analysis_query(
             "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(1 AS DECIMAL(18,6)) AS x) s",
-        );
+        ));
         input.session.sql_semantics = input.session.sql_semantics.clone().with_sql_mode(
             crate::sql_mode::SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"),
         );
@@ -3881,7 +3867,7 @@ mod tests {
             let cancellation = Arc::new(Cancellation::default());
             let request_control = control(None, &cancellation);
             let mut input = request(request_control.clone());
-            input.statement = SqlStatementInput::sql(sql);
+            input.statement = SqlStatementInput::parsed_query(mv_analysis_query(sql));
             input.constant_evaluator = Some(&EVALUATOR);
             input.session.sql_semantics = input
                 .session

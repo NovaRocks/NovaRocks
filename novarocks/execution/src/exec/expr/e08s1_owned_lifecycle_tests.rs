@@ -42,7 +42,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let tables = SqlPlannerTableSnapshot::new(&catalog);
     let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         session(),
         SqlPlanningEnvironment::Distributed,

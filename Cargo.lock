@@ -3748,6 +3748,7 @@ dependencies = [
  "novarocks-memory",
  "novarocks-memory-failure",
  "novarocks-native-trust",
+ "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",

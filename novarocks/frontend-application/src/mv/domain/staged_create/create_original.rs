@@ -1616,21 +1616,23 @@ mod original_stage_tests {
         .unwrap();
         let fact = CatalogRelationFact::resolved(need, table.into_resolved_table()).unwrap();
         let captured = preparation.capture(&[fact]).unwrap();
-        let analysis = crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
-            Some(current_catalog),
-            &captured,
-            current_database,
-            &query,
-            novarocks_sql::compiler::builtin_sql_function_catalog(),
-            crate::application::test_constant_policy(),
-            control.clone(),
-        )
-        .unwrap();
+        let analysis =
+            crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
+                Some(current_catalog),
+                &captured,
+                current_database,
+                &query,
+                novarocks_sql::compiler::builtin_sql_function_catalog(),
+                crate::application::test_constant_policy(),
+                control.clone(),
+            )
+            .unwrap();
         let target =
             prepare_mv_create_target(Some(current_catalog), current_database, statement).unwrap();
         let shape = prepare_mv_create_shape(target, statement, query, analysis, &control).unwrap();
         let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
-        let object_id = ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
         let exact = novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
             &object_id,
@@ -1780,10 +1782,11 @@ mod original_stage_tests {
         .unwrap();
         // Exercise the exact author called by CreatePublicationInput::run. No
         // stage, publication, repository write, or native execution is claimed.
-        let documents = crate::mv::domain::iceberg_refresh::build_create_documents_for_prepared_target(
-            &plan, &seed, &target,
-        )
-        .unwrap();
+        let documents =
+            crate::mv::domain::iceberg_refresh::build_create_documents_for_prepared_target(
+                &plan, &seed, &target,
+            )
+            .unwrap();
         assert_eq!(
             documents.definition.query.effective_sql.as_bytes(),
             expected_source.as_bytes()

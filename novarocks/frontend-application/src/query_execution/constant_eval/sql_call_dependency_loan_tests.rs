@@ -29,7 +29,7 @@ fn exact(sql: &str) -> SqlAuthoredPhysicalPlan {
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([84; 16]).unwrap(),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(super::query_ast(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
