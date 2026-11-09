@@ -37,6 +37,7 @@ pub(super) struct EmittedBatch {
     members: Box<[EmittedMember]>,
     remaining: usize,
     started: bool,
+    control_progress: bool,
     withdrawal_requested: bool,
 }
 
@@ -75,6 +76,7 @@ impl OperationDispatcher {
                 remaining: members.len(),
                 members,
                 started: false,
+                control_progress: batch.control_progress,
                 withdrawal_requested: false,
             },
         );
@@ -90,6 +92,22 @@ impl OperationDispatcher {
         if batch.remaining == 0 {
             self.emitted.remove(&effect);
         }
+    }
+
+    /// Scan one original emitted record. Withdrawal asks the host to
+    /// arbitrate; it neither settles the operation nor returns its credit.
+    pub(crate) fn next_stop_withdrawal(
+        &mut self,
+        after: Option<AttemptEffectId>,
+    ) -> Option<(AttemptEffectId, bool)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (&effect, batch) = match after {
+            Some(after) => self.emitted.range_mut((Excluded(after), Unbounded)).next(),
+            None => self.emitted.iter_mut().next(),
+        }?;
+        let withdraw = !batch.control_progress && !batch.started && !batch.withdrawal_requested;
+        batch.withdrawal_requested |= withdraw;
+        Some((effect, withdraw))
     }
 
     pub(crate) fn observe_send_started(&mut self, effect: AttemptEffectId) {

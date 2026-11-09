@@ -333,6 +333,9 @@ pub enum ExecutorFact {
         operation: TaskOperationId,
         generation: SendGeneration,
     },
+    /// The original local convergence owner has consumed all its actual
+    /// work/capture exits. Individual effect completion cannot author this.
+    LocalConvergenceExited,
     ActualExit {
         effect: AttemptActionId,
     },

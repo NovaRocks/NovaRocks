@@ -17,11 +17,15 @@
 
 //! Select and consume the original mailbox claim at the protocol boundary.
 
-use super::{Core, RootControlApplication, SealedRootCut, round_tail::RoundTailStep, schedule};
+use super::{
+    Core, RootControlApplication, SealedRootCut, round_tail::RoundTailStep, schedule,
+    stop::StopProgress,
+};
 use crate::{
     AttemptCore,
     authorization::gate::QaReply,
     capacity::StepContext,
+    convergence::RemoteConvergenceDirective,
     effect::{AttemptEffect, EffectBody, EffectClass, Publication},
     error::TaskExecutionError,
     execution::CreateGrantProgress,
@@ -30,12 +34,12 @@ use crate::{
         AttemptInput, AttemptInputClaim, AttemptInputId, AttemptSourceId, ExecutorFact,
         PublicationApplied,
     },
-    root_control::SealSettlement,
+    root_control::{RootSealRefusal, SealSettlement},
     start::AttemptStart,
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptRequestToken, AttemptRootProjection, AttemptToLogical,
-    AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+    AttemptActionId, AttemptConvergenceMode, AttemptRequestToken, AttemptRootProjection,
+    AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
 };
 use novarocks_execution_contract::TaskOperationId;
 use std::num::NonZeroU64;
@@ -49,6 +53,7 @@ pub enum InputSelection {
 #[derive(Debug)]
 pub struct AttemptStep {
     pub selection: InputSelection,
+    pub stop_producing: bool,
     pub effect: Option<AttemptEffect>,
     pub root_control_processed: Option<AttemptInputId>,
     pub definitely_unsent_abort: Option<TaskOperationId>,
@@ -69,6 +74,7 @@ enum Phase {
     Root,
     AwaitRoot(AttemptActionId),
     Tail,
+    Converge,
 }
 
 #[derive(Debug)]
@@ -83,6 +89,11 @@ pub(super) struct Turn {
     phase: Phase,
     next: u64,
     root: Option<RootWork>,
+    local_exited: bool,
+    reported_local_exit: bool,
+    reported_remote_closure: bool,
+    membership_revision: Option<u64>,
+    convergence_changed: bool,
 }
 
 impl Turn {
@@ -115,6 +126,7 @@ impl AttemptCore for Core {
                 .maximum_send_members
                 .checked_mul(2)
                 .ok_or_else(|| schedule("withdrawal input work quote overflow"))?,
+            AttemptInput::Membership(view) => view.processes.len().max(1),
             _ => 1,
         };
         if !context.charge(units) {
@@ -124,6 +136,7 @@ impl AttemptCore for Core {
         }
         let mut result = AttemptStep {
             selection: self.input_selection(),
+            stop_producing: false,
             effect: None,
             root_control_processed: None,
             definitely_unsent_abort: None,
@@ -141,7 +154,24 @@ impl AttemptCore for Core {
             | Phase::Native
             | Phase::AwaitRoot(_)
             | Phase::Common { source_ready: true } => None,
-            Phase::Idle | Phase::Tail => self.next_round_deadline(),
+            Phase::Idle if self.stop.pending() && !self.authorizations.waiting_for_reply() => {
+                Some(self.execution.monotonic_now())
+            }
+            Phase::Idle if self.authorizations.waiting_for_reply() => None,
+            Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
+                Some(self.execution.monotonic_now())
+            }
+            Phase::Idle => [self.next_round_deadline(), self.convergence.next_deadline()]
+                .into_iter()
+                .flatten()
+                .min(),
+            Phase::Tail => self.next_round_deadline(),
+            Phase::Converge
+                if self.convergence.waiting_for_process() && !self.convergence_progress_ready() =>
+            {
+                None
+            }
+            Phase::Converge => Some(self.execution.monotonic_now()),
             Phase::Common {
                 source_ready: false,
             }
@@ -168,6 +198,9 @@ impl Core {
                 Only(self.sources.qa)
             }
             Phase::Tail => Only(self.sources.actor),
+            Phase::Converge if self.convergence.waiting_for_process() => Only(self.sources.process),
+            Phase::Converge => Only(self.sources.actor),
+            Phase::Idle if self.stop.pending() => Only(self.sources.actor),
             Phase::Idle => Prefer(self.sources.native),
         }
     }
@@ -180,6 +213,11 @@ impl Core {
         context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
+        if self.turn.phase != Phase::Bootstrap
+            && self.apply_owner_control(now, claim, &input, context, result)?
+        {
+            return Ok(());
+        }
         let own = claim.source == self.sources.actor;
         let timer = own && matches!(input, AttemptInput::Timer);
         match self.turn.phase {
@@ -195,6 +233,29 @@ impl Core {
                     && self.authorizations.waiting_for_reply()
                 {
                     return self.accept_qa(port.clone(), result);
+                }
+                if self.stop.pending() {
+                    if !timer {
+                        return Err(schedule(
+                            "new primary input crossed the original stop cleanup",
+                        ));
+                    }
+                    let (action, _) = self.turn.issue()?;
+                    match self.stop.advance(&mut self.execution, action, context) {
+                        StopProgress::Yield => return Ok(()),
+                        StopProgress::Effect(effect) => {
+                            result.effect = Some(effect);
+                            return Ok(());
+                        }
+                        StopProgress::Done => {}
+                    }
+                }
+                if timer
+                    && self.convergence_due(now)
+                    && (self.start_convergence_pass() || self.convergence_progress_ready())
+                {
+                    self.turn.phase = Phase::Converge;
+                    return self.drive_convergence(now, context, result);
                 }
                 let cut = claim
                     .native_cut
@@ -260,7 +321,214 @@ impl Core {
                 }
             }
             Phase::Tail => self.apply_tail(now, claim, input, context, result)?,
+            Phase::Converge if timer => self.drive_convergence(now, context, result)?,
+            Phase::Converge => {
+                self.verify_source(claim.source, self.sources.process)?;
+                let AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                    request,
+                    participation,
+                    sampled_at,
+                    observation,
+                }) = input
+                else {
+                    return Err(schedule(
+                        "convergence awaited its original process snapshot",
+                    ));
+                };
+                self.convergence.process_reply(
+                    now,
+                    request,
+                    participation,
+                    sampled_at,
+                    observation,
+                )?;
+                self.drive_convergence(now, context, result)?;
+            }
             _ => return Err(schedule("input crossed an unfinished Root phase")),
+        }
+        Ok(())
+    }
+
+    fn apply_owner_control(
+        &mut self,
+        now: MonotonicInstant,
+        claim: AttemptInputClaim,
+        input: &AttemptInput,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<bool, TaskExecutionError> {
+        match input {
+            AttemptInput::Port(port) => match &port.body {
+                LogicalToAttemptBody::Stop { reason, failure } => {
+                    self.verify_owner_port(claim.source, port.activation)?;
+                    self.terminal.observe_stop(*reason, failure.clone());
+                    self.diagnostics.stop_starting();
+                    self.request_stop(result);
+                }
+                LogicalToAttemptBody::BeginConvergence {
+                    mode,
+                    remote_deadline,
+                    computation_ready,
+                    retain_diagnostics,
+                } => {
+                    self.verify_owner_port(claim.source, port.activation)?;
+                    if let Some(ready) = computation_ready {
+                        if ready.activation != self.activation
+                            || ready.root != self.execution.graph().root_identity()
+                        {
+                            return Err(schedule(
+                                "convergence cut differs from its original attempt",
+                            ));
+                        }
+                        if *retain_diagnostics {
+                            self.diagnostics.begin(*ready)?;
+                            self.execution
+                                .retain_profile_diagnostics_until(ready.diagnostic_deadline);
+                        }
+                    } else {
+                        self.diagnostics.stop_starting();
+                    }
+                    self.convergence.begin(*mode, *remote_deadline);
+                    self.turn.convergence_changed = true;
+                    if *mode == AttemptConvergenceMode::Cleanup {
+                        self.request_stop(result);
+                    }
+                    if self.turn.phase == Phase::Idle
+                        && !self.stop.pending()
+                        && !self.authorizations.waiting_for_reply()
+                        && (self.start_convergence_pass() || self.convergence_progress_ready())
+                    {
+                        self.turn.phase = Phase::Converge;
+                    }
+                }
+                _ => return Ok(false),
+            },
+            AttemptInput::Executor(ExecutorFact::LocalConvergenceExited) => {
+                self.verify_source(claim.source, self.sources.actor)?;
+                self.turn.local_exited = true;
+                if self.turn.phase == Phase::Idle
+                    && !self.authorizations.waiting_for_reply()
+                    && self.convergence_progress_ready()
+                {
+                    self.turn.phase = Phase::Converge;
+                }
+                if self.turn.phase == Phase::Converge {
+                    self.drive_convergence(now, context, result)?;
+                }
+            }
+            AttemptInput::Membership(view) => {
+                if self
+                    .turn
+                    .membership_revision
+                    .is_some_and(|old| view.revision <= old)
+                {
+                    return Ok(true);
+                }
+                self.turn.membership_revision = Some(view.revision);
+                self.turn.convergence_changed = true;
+                return Ok(self.turn.phase != Phase::Idle);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn verify_owner_port(
+        &self,
+        source: AttemptSourceId,
+        activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        self.verify_source(source, self.sources.actor)?;
+        if activation != self.activation {
+            return Err(schedule(
+                "owner control differs from its original activation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn request_stop(&mut self, result: &mut AttemptStep) {
+        if self.stop.request() {
+            self.round_tail.suppress_dispatch();
+            result.stop_producing = true;
+        }
+    }
+
+    fn convergence_due(&self, now: MonotonicInstant) -> bool {
+        self.convergence_progress_ready()
+            || (self.convergence.mode().is_some()
+                && self.convergence.closure().is_none()
+                && (self.turn.convergence_changed
+                    || self
+                        .convergence
+                        .next_deadline()
+                        .is_some_and(|deadline| now.has_reached(deadline))))
+    }
+
+    fn start_convergence_pass(&mut self) -> bool {
+        if self.convergence.start_pass() {
+            self.turn.convergence_changed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn convergence_progress_ready(&self) -> bool {
+        self.convergence.mode().is_some()
+            && ((self.turn.local_exited && !self.turn.reported_local_exit)
+                || (self.convergence.closure().is_some() && !self.turn.reported_remote_closure))
+    }
+
+    fn drive_convergence(
+        &mut self,
+        now: MonotonicInstant,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        if self.convergence_progress_ready() {
+            if !context.charge(1) {
+                return Ok(());
+            }
+            let closure = (!self.turn.reported_remote_closure)
+                .then(|| self.convergence.closure().cloned())
+                .flatten();
+            self.turn.reported_remote_closure |= closure.is_some();
+            self.turn.reported_local_exit |= self.turn.local_exited;
+            result.effect = Some(self.port_effect(AttemptToLogicalBody::ConvergenceProgress {
+                local_exited: self.turn.local_exited,
+                closure,
+            })?);
+            return Ok(());
+        }
+        if self.convergence.waiting_for_process() || !context.charge(1) {
+            return Ok(());
+        }
+        let (id, token) = self.turn.issue()?;
+        match self
+            .convergence
+            .advance(now, &self.execution, context, Some(token))?
+        {
+            RemoteConvergenceDirective::ObserveProcess {
+                request,
+                participation,
+            } => {
+                result.effect = Some(AttemptEffect {
+                    id,
+                    class: EffectClass::Settlement,
+                    body: EffectBody::ObserveProcess {
+                        request,
+                        participation,
+                    },
+                });
+            }
+            RemoteConvergenceDirective::ClosureReady if self.convergence_progress_ready() => {}
+            RemoteConvergenceDirective::ClosureReady | RemoteConvergenceDirective::Inactive => {
+                self.turn.phase = Phase::Idle;
+            }
+            RemoteConvergenceDirective::Yield
+            | RemoteConvergenceDirective::Waiting
+            | RemoteConvergenceDirective::NeedRequestCredit => {}
         }
         Ok(())
     }
@@ -354,6 +622,7 @@ impl Core {
         match input {
             AttemptInput::Timer => self.verify_source(claim.source, self.sources.actor)?,
             AttemptInput::CapacityReleased => {}
+            AttemptInput::Membership(_) => {}
             AttemptInput::Executor(fact) => match fact {
                 ExecutorFact::SubscriptionProgress(_)
                 | ExecutorFact::ReadState(_)
@@ -400,10 +669,21 @@ impl Core {
     }
 
     fn select_root(&mut self, cut: Option<SealedRootCut>) {
+        let cut = cut.or_else(|| {
+            if !self.stop.business_closed() {
+                return None;
+            }
+            self.root
+                .refuse(RootSealRefusal::AttemptCleanup)
+                .map(|settlement| SealedRootCut {
+                    root_before_seal: None,
+                    settlement,
+                })
+        });
         let (projection, seal) = cut.map_or_else(
             || {
                 (
-                    (!self.root.sealed())
+                    (!self.root.sealed() && !self.stop.business_closed())
                         .then(|| self.root_projection())
                         .flatten(),
                     None,
@@ -411,9 +691,10 @@ impl Core {
             },
             |cut| {
                 let projection = cut.root_before_seal.or_else(|| {
-                    (self.acknowledgements.run_round_tail() == Ok(true))
-                        .then(|| self.root_projection())
-                        .flatten()
+                    (self.acknowledgements.run_round_tail() == Ok(true)
+                        && !self.stop.business_closed())
+                    .then(|| self.root_projection())
+                    .flatten()
                 });
                 (projection, Some(cut.settlement))
             },
@@ -500,7 +781,13 @@ impl Core {
                 result.retired_authorization = Some(operation)
             }
             RoundTailStep::Complete(round) => {
-                self.turn.phase = Phase::Idle;
+                self.turn.phase = if !self.stop.pending()
+                    && (self.start_convergence_pass() || self.convergence_progress_ready())
+                {
+                    Phase::Converge
+                } else {
+                    Phase::Idle
+                };
                 result.round_result = Some(round);
             }
         }

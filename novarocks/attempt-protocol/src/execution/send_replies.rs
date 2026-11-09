@@ -147,6 +147,13 @@ impl QueryTaskExecution {
         (action, self.apply_operation_reply(target, reply))
     }
 
+    pub(crate) fn next_stop_send_withdrawal(
+        &mut self,
+        after: Option<AttemptEffectId>,
+    ) -> Option<(AttemptEffectId, bool)> {
+        self.dispatcher.next_stop_withdrawal(after)
+    }
+
     pub(crate) fn dispatched_participation(
         &self,
         operation: novarocks_execution_contract::TaskOperationId,

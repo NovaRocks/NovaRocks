@@ -277,6 +277,21 @@ impl QueryTaskExecution {
         Some((withdrawal, result))
     }
 
+    pub(crate) fn next_stop_create_admission(
+        &mut self,
+        after: Option<TaskOperationId>,
+    ) -> Option<(TaskOperationId, Option<EffectBody>)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let (&operation, _) = match after {
+            Some(after) => self
+                .create_admissions
+                .range((Excluded(after), Unbounded))
+                .next(),
+            None => self.create_admissions.first_key_value(),
+        }?;
+        Some((operation, self.withdraw_create_admission(operation)))
+    }
+
     /// Withdraw only this generation. The Source must still report either the
     /// original admitted grant or a definite unsent result.
     pub(crate) fn withdraw_create_admission(

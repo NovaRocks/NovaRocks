@@ -18,6 +18,7 @@
 //! The serial owner of the frozen attempt's protocol components.
 
 mod round_tail;
+mod stop;
 mod subscriptions;
 mod turn;
 use round_tail::RoundTail;
@@ -78,6 +79,7 @@ pub struct Core {
     dispatch: BatchDispatchPass,
     round_failure: Option<AttemptFailure>,
     round_tail: RoundTail,
+    stop: stop::StopWithdrawals,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
@@ -144,11 +146,12 @@ impl Core {
             actor,
             publication: publication_source,
             qa,
+            process,
             native,
             observation,
             mailbox,
         } = sources;
-        let distinct = [actor, publication_source, qa, native, observation];
+        let distinct = [actor, publication_source, qa, process, native, observation];
         let graph = TaskGraph::from_frozen(graph)?;
         if distinct
             .iter()
@@ -228,6 +231,7 @@ impl Core {
             dispatch: BatchDispatchPass::new(),
             round_failure: None,
             round_tail: RoundTail::default(),
+            stop: stop::StopWithdrawals::default(),
             establish_material,
             retry,
             pumps,
@@ -307,6 +311,9 @@ impl Core {
         let progress =
             self.execution
                 .advance_send_batch(&mut self.dispatch, effect, context, |intent| {
+                    if self.stop.business_closed() && !intent.requires_control_progress() {
+                        return Err(schedule("ordinary Native send crossed the original stop"));
+                    }
                     self.authorizations.validate_send(intent)
                 })?;
         if let BatchDispatch::Ready(AttemptEffect {
@@ -649,6 +656,9 @@ impl Core {
         token: AttemptRequestToken,
         action: AttemptActionId,
     ) -> Result<AuthorizationStep, TaskExecutionError> {
+        if self.stop.business_closed() {
+            return Ok(AuthorizationStep::Retired);
+        }
         if !self.acknowledgements.is_idle() || self.publication.has_pending_apply() {
             return Ok(AuthorizationStep::Waiting);
         }
@@ -676,6 +686,15 @@ impl Core {
     }
 
     fn evaluate_pending_seal(&mut self) -> Option<SealedRootCut> {
+        if self.stop.business_closed() {
+            return self
+                .root
+                .refuse(crate::root_control::RootSealRefusal::AttemptCleanup)
+                .map(|settlement| SealedRootCut {
+                    root_before_seal: None,
+                    settlement,
+                });
+        }
         let settlement = self.root.evaluate(self.execution.root_seal_facts(false))?;
         let root_before_seal = if settlement.result.is_ok() {
             let projection = self.root_projection();
@@ -810,6 +829,7 @@ mod tests {
                 actor: AttemptSourceId(id(3)),
                 publication: AttemptSourceId(id(4)),
                 qa: AttemptSourceId(id(5)),
+                process: AttemptSourceId(id(6)),
                 native: AttemptSourceId(id(7)),
                 observation: AttemptSourceId(id(8)),
                 mailbox: [4; 4],
@@ -1774,6 +1794,265 @@ mod tests {
             matches!(settled.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
             if matches!(port.body, AttemptToLogicalBody::SealResult { token, result: Ok(_) } if token == seal_token))
         );
+    }
+
+    #[test]
+    fn stop_keeps_native_prefix_and_withdraws_only_unstarted_business() {
+        use crate::{
+            AttemptCore,
+            execution::ack_phase::{admission_intent, dispatch_admission},
+            input::{AttemptInput, AttemptInputClaim, WithdrawalOutcome},
+        };
+        use novarocks_coordination_contract::AttemptStopReason;
+        use novarocks_execution_contract::OperationOutcome;
+
+        let start = start();
+        let sources = start.sources;
+        let activation = start.activation.identity;
+        let now = start.initial_now;
+        let mut core = Core::new(start).unwrap();
+        let participants: Vec<_> = core
+            .execution
+            .graph()
+            .participations()
+            .take(2)
+            .copied()
+            .collect();
+        for (index, part) in participants.into_iter().enumerate() {
+            let request = admission_intent(&mut core.execution, part);
+            dispatch_admission(
+                &mut core.execution,
+                request,
+                index as u64 + 1,
+                OperationOutcome::Accepted,
+            );
+        }
+        let started = AttemptActionId::new(id(101));
+        let unstarted = AttemptActionId::new(id(102));
+        let cut = |source, tail| Some(AttemptSourceCut { source, tail });
+        let step = |core: &mut Core, source, n, input, native_tail, selected_cut| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: cut(sources.native, native_tail),
+                    selected_cut,
+                },
+                input,
+                &mut Units(32),
+            )
+            .unwrap()
+        };
+        step(
+            &mut core,
+            sources.actor,
+            1,
+            AttemptInput::Bootstrap,
+            None,
+            None,
+        );
+        let tail = AttemptInputId(id(7));
+        step(
+            &mut core,
+            sources.actor,
+            2,
+            AttemptInput::Timer,
+            Some(tail),
+            None,
+        );
+        let stop = AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::Stop {
+                reason: AttemptStopReason::LogicalExecutionFailed,
+                failure: AttemptFailure::TaskProtocol(Box::new(schedule("original stop"))),
+            },
+        });
+        let closed = step(&mut core, sources.actor, 3, stop.clone(), Some(tail), None);
+        assert!(closed.stop_producing);
+        assert_eq!(closed.selection, InputSelection::Only(sources.native));
+        assert!(closed.effect.is_none());
+        assert!(!step(&mut core, sources.actor, 4, stop, Some(tail), None).stop_producing);
+        assert!(core.terminal.requires_logical_failure_stand_down());
+        step(
+            &mut core,
+            sources.native,
+            7,
+            AttemptInput::Executor(ExecutorFact::SendStarted {
+                effect: started,
+                started_at: now,
+            }),
+            Some(tail),
+            None,
+        );
+        step(
+            &mut core,
+            sources.actor,
+            8,
+            AttemptInput::Timer,
+            None,
+            cut(sources.observation, None),
+        );
+        step(&mut core, sources.actor, 9, AttemptInput::Timer, None, None);
+        let publish = step(
+            &mut core,
+            sources.actor,
+            10,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+        let publication = publish.effect.unwrap().id;
+        let returned = step(
+            &mut core,
+            sources.publication,
+            11,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: publication,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+            None,
+            None,
+        );
+        assert!(matches!(returned.effect, Some(AttemptEffect {
+            body: EffectBody::Withdraw { effect }, class: crate::effect::EffectClass::Cleanup, ..
+        }) if effect == unstarted));
+        assert_eq!(core.execution.dispatcher().in_flight_operations(), 2);
+        let finished = step(
+            &mut core,
+            sources.actor,
+            12,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+        assert_eq!(finished.round_result, Some(Ok(())));
+        assert!(finished.effect.is_none());
+
+        step(
+            &mut core,
+            sources.actor,
+            13,
+            AttemptInput::Executor(ExecutorFact::Withdrawn {
+                effect: unstarted,
+                outcome: WithdrawalOutcome::DefinitelyUnsent,
+            }),
+            None,
+            None,
+        );
+        assert_eq!(core.execution.dispatcher().in_flight_operations(), 1);
+    }
+
+    #[test]
+    fn convergence_waits_for_exact_process_read_and_reports_local_exit_separately() {
+        use crate::{
+            AttemptCore,
+            execution::ack_phase::{admission_intent, dispatch_admission},
+            input::{AttemptInput, AttemptInputClaim, MembershipObservation},
+        };
+        use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptToLogicalBody};
+        use novarocks_execution_contract::OperationOutcome;
+
+        let start = start();
+        let now = start.initial_now;
+        let sources = start.sources;
+        let activation = start.activation.identity;
+        let mut core = Core::new(start).unwrap();
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let admission = admission_intent(&mut core.execution, participation);
+        let original = dispatch_admission(
+            &mut core.execution,
+            admission,
+            1,
+            OperationOutcome::Accepted,
+        );
+        core.execution.apply_dispatched_reply(&original).1.unwrap();
+        let step = |core: &mut Core, source, n, input| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: None,
+                },
+                input,
+                &mut Units(16),
+            )
+            .unwrap()
+        };
+        step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
+        let begun = step(
+            &mut core,
+            sources.actor,
+            2,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::BeginConvergence {
+                    mode: AttemptConvergenceMode::Normal,
+                    remote_deadline: now.saturating_add(Duration::from_secs(3)),
+                    computation_ready: None,
+                    retain_diagnostics: false,
+                },
+            }),
+        );
+        assert!(!begun.stop_producing);
+        let read = step(&mut core, sources.actor, 3, AttemptInput::Timer);
+        let Some(AttemptEffect {
+            body:
+                EffectBody::ObserveProcess {
+                    request,
+                    participation: original,
+                },
+            ..
+        }) = read.effect
+        else {
+            panic!("expected original exact process read");
+        };
+        assert_eq!(original, participation);
+        assert_eq!(read.selection, InputSelection::Only(sources.process));
+        assert_eq!(core.next_deadline(), None);
+        let sample = |token| {
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request: token,
+                participation,
+                sampled_at: now,
+                observation: MembershipObservation::ExactReplacement(crate::test_support::backend(
+                    99,
+                )),
+            })
+        };
+        let stale = step(
+            &mut core,
+            sources.process,
+            4,
+            sample(AttemptRequestToken::new(id(99))),
+        );
+        assert!(stale.effect.is_none());
+        assert_eq!(stale.selection, InputSelection::Only(sources.process));
+        assert_eq!(core.next_deadline(), None);
+        step(&mut core, sources.process, 5, sample(request));
+        let remote = step(&mut core, sources.actor, 6, AttemptInput::Timer);
+        assert!(
+            matches!(remote.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress { local_exited: false, closure: Some(_) }))
+        );
+        let local = step(
+            &mut core,
+            sources.actor,
+            7,
+            AttemptInput::Executor(ExecutorFact::LocalConvergenceExited),
+        );
+        assert!(
+            matches!(local.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress { local_exited: true, closure: None }))
+        );
+        let done = step(&mut core, sources.actor, 8, AttemptInput::Timer);
+        assert!(done.effect.is_none());
+        assert_eq!(core.next_deadline(), None);
     }
 
     struct Units(usize);

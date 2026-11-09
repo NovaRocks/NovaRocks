@@ -119,6 +119,7 @@ pub struct AttemptSources {
     pub actor: AttemptSourceId,
     pub publication: AttemptSourceId,
     pub qa: AttemptSourceId,
+    pub process: AttemptSourceId,
     pub native: AttemptSourceId,
     pub observation: AttemptSourceId,
     pub mailbox: [usize; 4],

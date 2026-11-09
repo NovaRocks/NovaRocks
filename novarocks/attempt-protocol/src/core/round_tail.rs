@@ -18,7 +18,9 @@
 //! Drive the original serial tail between the common Root cut and QA
 //! settlement. Each call may hand off one effect from the charged step.
 
-use super::{AckSettlementProgress, Core, schedule, subscriptions::SubscriptionStep};
+use super::{
+    AckSettlementProgress, Core, schedule, stop::StopProgress, subscriptions::SubscriptionStep,
+};
 use crate::{
     capacity::StepContext,
     dispatch::BatchDispatch,
@@ -53,6 +55,10 @@ pub(super) struct RoundTail {
 }
 
 impl RoundTail {
+    pub(super) fn suppress_dispatch(&mut self) {
+        self.dispatch = false;
+    }
+
     pub(super) fn waiting_for_publication(&self) -> bool {
         self.phase == Phase::AwaitPublication
     }
@@ -181,6 +187,11 @@ impl Core {
                 };
             }
             Phase::Cleanup => {
+                match self.stop.advance(&mut self.execution, action, context) {
+                    StopProgress::Yield => return Ok(Some(RoundTailStep::Yield)),
+                    StopProgress::Effect(effect) => return Ok(Some(RoundTailStep::Effect(effect))),
+                    StopProgress::Done => {}
+                }
                 if self.execution.has_released_native_input() {
                     if !context.charge(1) {
                         return Ok(Some(RoundTailStep::Yield));
@@ -235,6 +246,9 @@ impl Core {
                         self.round_tail.phase = Phase::Dispatch;
                     }
                 }
+            }
+            Phase::Dispatch if !self.round_tail.dispatch => {
+                self.round_tail.phase = Phase::Subscriptions;
             }
             Phase::Dispatch => {
                 if !context.charge(1) {

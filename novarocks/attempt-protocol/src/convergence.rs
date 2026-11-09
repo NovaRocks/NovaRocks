@@ -298,6 +298,12 @@ impl RemoteConvergence {
         }
         Ok(ProcessReplyDisposition::Applied)
     }
+    pub(crate) fn waiting_for_process(&self) -> bool {
+        self.pass
+            .and_then(|pass| pass.read)
+            .is_some_and(|read| read.flight.is_some())
+    }
+
     /// Source credit/read waits have their own real wakes. The deadline may
     /// not repeatedly wake an unfinished read, or manufacture its result.
     pub(crate) fn next_deadline(&self) -> Option<MonotonicInstant> {
