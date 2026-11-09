@@ -76,6 +76,23 @@ impl StepRegistration {
     pub fn scope(&self) -> &ScopeHandle {
         &self.scope
     }
+    /// Check the original live unbound guard's direct parent in its own
+    /// ledger. The result cannot authorize binding, execution or retirement.
+    pub fn is_direct_child_of(&self, scope: &ScopeHandle, parent: WorkId) -> bool {
+        self.active
+            && self.belongs_to(scope)
+            && self
+                .scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock")
+                .scopes
+                .get(&scope.id())
+                .and_then(|record| record.work(self.work))
+                .is_some_and(|work| work.unbound_guard && work.parent == Some(parent))
+    }
     pub(crate) fn belongs_to(&self, scope: &ScopeHandle) -> bool {
         self.scope.id() == scope.id()
             && crate::sync::Arc::ptr_eq(&self.scope.runtime.shared, &scope.runtime.shared)

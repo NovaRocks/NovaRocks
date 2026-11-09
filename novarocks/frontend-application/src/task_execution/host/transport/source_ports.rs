@@ -22,7 +22,10 @@ use super::{
     capacity::{EncodingWindow, ReturnedPhysical},
     queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey},
 };
-use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
+use crate::{
+    native::apply_send_owner::{RegistrationFailure, SharedApplyPreparation},
+    task_execution::intent::{OperationAcknowledgement, OperationIntent},
+};
 use novarocks_control_runtime::{exit_custody::ExitObligation, obligation::StepRegistration};
 use novarocks_control_runtime_core::scope::WorkKind;
 use novarocks_coordination_contract::MonotonicInstant;
@@ -47,36 +50,6 @@ pub(crate) enum BodyOutcome {
     /// final logical/error consumer, independently of Core input consumption.
     LocalFailure(WorkError),
     RawFailure(Box<dyn Any + Send>),
-}
-
-/// A loan of the same Native Apply row, already tied to this Source's
-/// unique original Join. Its implementation delegates only to that original
-/// row. Drop of this loan cannot mark the Source Join exited or retire the row.
-/// P10a retains the row's non-clone Join custody until actual Join observation.
-pub(crate) trait ApplyRowPreparation: Send {
-    fn accept_in(
-        &self,
-        offer: &mut novarocks_workload_control::joint_admission::JointLocalOffer<'_>,
-        physical: &mut Option<crate::native::task_transport::NativePhysicalOffer>,
-    ) -> Result<novarocks_workload_control::WorkloadProgressNotification, WorkError>;
-    fn prepare_in(
-        &self,
-        admission: &novarocks_workload_control::joint_admission::NativeAsyncActionAdmission,
-        items: usize,
-    ) -> Result<
-        (
-            crate::native::apply_send_owner::OriginalReplyPublisher,
-            novarocks_workload_control::WorkloadProgressNotification,
-            novarocks_workload_control::WorkloadProgressNotification,
-        ),
-        WorkError,
-    >;
-    /// Move the same original unbound guard exactly once after the start gate.
-    /// Until then the Native row retains it for real unused disposal.
-    fn take_encoding(&self) -> Result<StepRegistration, WorkError>;
-    fn take_physical(
-        &self,
-    ) -> Result<crate::native::task_transport::NativePhysicalOffer, WorkError>;
 }
 
 /// Per-job port bound by the original Source record. Implementations keep a
@@ -114,7 +87,7 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
         slot: crate::native::apply_send_owner::ApplySlot,
         inputs: Vec<SendInputLoan>,
         encoding: StepRegistration,
-    ) -> Result<Box<dyn ApplyRowPreparation>, crate::native::apply_send_owner::RegistrationFailure>;
+    ) -> Result<SharedApplyPreparation, RegistrationFailure>;
     /// No borrowed grant or numeric reference is accepted as a producer.
     /// This hook binds the same paid child guard, report/captures/consumer and
     /// real ExitCustody; it does not create another Work or capacity invoice.

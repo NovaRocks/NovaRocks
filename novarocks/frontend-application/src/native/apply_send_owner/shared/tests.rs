@@ -27,7 +27,7 @@ use crate::native::{
 use crate::task_execution::host::{
     custody::{
         self, OriginalDisposalObligation, OriginalTransportJoinObligation,
-        PhysicalInputRetirementObligation, TransportJoinRegistration,
+        PhysicalInputRetirementObligation,
     },
     transport::{self, ReturnedQuota, SourceLayouts},
 };
@@ -351,14 +351,9 @@ struct Captures {
 }
 fn transport_factory(
     exit: ExitObligation,
-    registration: TransportJoinRegistration,
-    join: SharedApplyJoinObligation,
     captures: Captures,
     panic: PanicSink,
 ) -> impl Future<Output = ()> {
-    registration
-        .install_shared(join)
-        .unwrap_or_else(|_| panic!("same original Source registration"));
     let handoff = Arc::new(HandoffCell::new());
     if matches!(captures.mode, Mode::Unused) {
         handoff.withdraw();
@@ -407,13 +402,7 @@ fn actual_gated_backing<F: Future<Output = ()>>(body: fn(Captures, ()) -> F) -> 
     GatedWork::<Captures>::backing_layouts::<std::future::Ready<()>, F>(body)
 }
 fn actual_future_layout<F: Future<Output = ()>>(
-    _: fn(
-        ExitObligation,
-        TransportJoinRegistration,
-        SharedApplyJoinObligation,
-        Captures,
-        PanicSink,
-    ) -> F,
+    _: fn(ExitObligation, Captures, PanicSink) -> F,
 ) -> Layout {
     Layout::new::<F>()
 }
@@ -523,8 +512,23 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
     };
     let encoding = roles.encoding(principal, backend, plan.protobuf_bytes());
     let slot = runtime.apply_send_port().reserve_original_slot(1).unwrap();
-    let (preparation, join) = slot
-        .prepare_shared(vec![input], encoding)
+    let panic = PanicSink::new();
+    let inner = panic.clone();
+    let (mut source, exit, launch) =
+        OriginalTransportJoinObligation::prepare(parent, observer(), panic)
+            .unwrap_or_else(|e| panic!("{}", e.error));
+    let registration = source.registration();
+    let encoding_id = encoding.reservation_id();
+    let (slot, encoding) = match registration.attach_shared(slot, Vec::new(), encoding) {
+        Err((RegistrationFailure::MissingOriginalCharge, slot, inputs, guard)) => {
+            assert!(inputs.is_empty());
+            assert_eq!(guard.reservation_id(), encoding_id);
+            (slot, guard)
+        }
+        _ => panic!("the actual attachment requires the original paid input"),
+    };
+    let preparation = registration
+        .attach_shared(slot, vec![input], encoding)
         .unwrap_or_else(|_| panic!("same original Shared preparation"));
     let endpoint =
         novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap());
@@ -559,18 +563,10 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
     drop(action);
     let encoded = Arc::new(Mutex::new(None));
     let cell = Arc::clone(&encoded);
-    let panic = PanicSink::new();
-    let inner = panic.clone();
-    let mut source = OriginalTransportJoinObligation::spawn(
-        &Handle::current(),
-        parent,
-        observer(),
-        panic,
-        move |exit, registration| {
+    launch
+        .spawn(&Handle::current(), exit, move |exit| {
             transport_factory(
                 exit,
-                registration,
-                join,
                 Captures {
                     preparation,
                     mode,
@@ -578,9 +574,8 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
                 },
                 inner,
             )
-        },
-    )
-    .unwrap_or_else(|e| panic!("{}", e.error));
+        })
+        .unwrap();
     let completion = poll_fn(|cx| source.poll_shared_completion(cx))
         .await
         .unwrap()

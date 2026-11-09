@@ -20,17 +20,22 @@
 //! after the same Join and original role observations, never a numeric hint.
 
 use crate::native::apply_send_owner::{
-    JoinFacts, NativeDisposalBody, NativeDisposalRequest, NativeDisposalReturn,
-    SharedApplyJoinObligation,
+    ApplySlot, JoinFacts, NativeDisposalBody, NativeDisposalRequest, NativeDisposalReturn,
+    RegistrationFailure, SharedApplyJoinObligation, SharedApplyPreparation,
 };
 use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
     exit_work::{ExitWorkError, PanicSink, run_blocking},
+    obligation::StepRegistration,
     reported_work::ReportedWork,
-    transaction::RuntimeError,
+    transaction::{RuntimeError, ScopeHandle},
 };
-use novarocks_control_runtime_core::{completion::ConsumerKind, identity::ConsumerId};
+use novarocks_control_runtime_core::{
+    completion::ConsumerKind,
+    identity::{ConsumerId, WorkId},
+};
+use novarocks_workload_control::joint_admission::NativeQueuedInputGrant;
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -55,6 +60,7 @@ pub(crate) enum CustodyError {
     OriginalWorkFailed,
     OriginalCapturesUnresolved,
     CompletionAlreadyIssued,
+    OriginalAttachmentUnresolved,
 }
 impl From<RuntimeError> for CustodyError {
     fn from(e: RuntimeError) -> Self {
@@ -416,11 +422,15 @@ impl Drop for OriginalDisposalObligation {
     }
 }
 
-struct TransportRegistrationState {
-    original: Option<SharedApplyJoinObligation>,
-    issued: bool,
+enum TransportRegistrationState {
+    Unattached,
+    Attaching,
+    Attached(SharedApplyJoinObligation),
+    Issued,
 }
 struct TransportRegistration {
+    scope: ScopeHandle,
+    parent: WorkId,
     state: Mutex<TransportRegistrationState>,
     retained: Mutex<Option<Arc<Self>>>,
 }
@@ -428,22 +438,59 @@ struct TransportRegistration {
 pub(crate) struct TransportJoinRegistration {
     original: Weak<TransportRegistration>,
 }
+pub(crate) type SharedApplyAttachRefusal = (
+    RegistrationFailure,
+    ApplySlot,
+    Vec<NativeQueuedInputGrant>,
+    StepRegistration,
+);
 impl TransportJoinRegistration {
-    /// Actual Source row registration only. It neither installs a Join nor
-    /// signs exit; the same spawn path below owns that one actual Join.
-    pub(crate) fn install_shared(
+    /// Move the same reserved Apply row and its original inputs and guard
+    /// under this job's Join owner before exposing any preparation authority.
+    /// An ordinary refusal gives every original object back to the Source.
+    pub(crate) fn attach_shared(
         &self,
-        original: SharedApplyJoinObligation,
-    ) -> Result<(), SharedApplyJoinObligation> {
+        slot: ApplySlot,
+        inputs: Vec<NativeQueuedInputGrant>,
+        encoding: StepRegistration,
+    ) -> Result<SharedApplyPreparation, SharedApplyAttachRefusal> {
         let Some(record) = self.original.upgrade() else {
-            return Err(original);
+            return Err((RegistrationFailure::Closed, slot, inputs, encoding));
         };
-        let mut state = record.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.original.is_some() || state.issued {
-            return Err(original);
+        if !encoding.is_direct_child_of(&record.scope, record.parent) {
+            return Err((
+                RegistrationFailure::BrokenOriginalBound,
+                slot,
+                inputs,
+                encoding,
+            ));
         }
-        state.original = Some(original);
-        Ok(())
+        {
+            let mut state = record.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*state, TransportRegistrationState::Unattached) {
+                return Err((
+                    RegistrationFailure::BrokenOriginalBound,
+                    slot,
+                    inputs,
+                    encoding,
+                ));
+            }
+            *state = TransportRegistrationState::Attaching;
+        }
+        // Native may wake its own owner here. An unwind leaves the original
+        // attachment unresolved, so an observed Join cannot clear the row.
+        let attached = slot.prepare_shared(inputs, encoding);
+        let mut state = record.state.lock().unwrap_or_else(|e| e.into_inner());
+        match attached {
+            Ok((preparation, join)) => {
+                *state = TransportRegistrationState::Attached(join);
+                Ok(preparation)
+            }
+            Err(refusal) => {
+                *state = TransportRegistrationState::Unattached;
+                Err(refusal)
+            }
+        }
     }
 }
 #[must_use = "consume only at the same original Shared Apply row"]
@@ -524,12 +571,13 @@ impl OriginalTransportJoinObligation {
         observer: ConsumerId,
         panic: PanicSink,
     ) -> Result<(Self, ExitObligation, TransportJoinHandoff), CustodyRefusal> {
+        let scope = original.work().scope().clone();
+        let parent = original.work().id();
         let (role, exit) = OriginalRole::new(original, observer, panic)?;
         let native = Arc::new(TransportRegistration {
-            state: Mutex::new(TransportRegistrationState {
-                original: None,
-                issued: false,
-            }),
+            scope,
+            parent,
+            state: Mutex::new(TransportRegistrationState::Unattached),
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
@@ -567,11 +615,20 @@ impl OriginalTransportJoinObligation {
             return Poll::Ready(Err(e));
         }
         let mut state = self.native.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.issued {
-            return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
+        match *state {
+            TransportRegistrationState::Issued => {
+                return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
+            }
+            TransportRegistrationState::Attaching => {
+                return Poll::Ready(Err(CustodyError::OriginalAttachmentUnresolved));
+            }
+            _ => {}
         }
-        let original = state.original.take();
-        state.issued = true;
+        let original = match std::mem::replace(&mut *state, TransportRegistrationState::Issued) {
+            TransportRegistrationState::Unattached => None,
+            TransportRegistrationState::Attached(original) => Some(original),
+            _ => unreachable!("qualified original attachment"),
+        };
         let facts = self
             .role
             .joined
@@ -593,15 +650,11 @@ impl OriginalTransportJoinObligation {
                 return Ok(false);
             }
         }
-        if self
-            .native
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .original
-            .is_some()
-            || self.role.report.publication_state()?
-                != novarocks_control_runtime_core::completion::SlotState::RevokedUnused
+        if !matches!(
+            *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
+            TransportRegistrationState::Unattached
+        ) || self.role.report.publication_state()?
+            != novarocks_control_runtime_core::completion::SlotState::RevokedUnused
             || !self.role.custody.actual_exit_ready()?
         {
             return Ok(false);
@@ -623,13 +676,10 @@ impl OriginalTransportJoinObligation {
     /// This later boundary checks the full admitted child tree and every
     /// report consumer. Local Join completion alone cannot retire the parent.
     pub(crate) fn try_retire(&self) -> Result<bool, CustodyError> {
-        let issued = self
-            .native
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .issued;
-        if !issued {
+        if !matches!(
+            *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
+            TransportRegistrationState::Issued
+        ) {
             return Ok(false);
         }
         if self.role.retire()? {

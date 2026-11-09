@@ -19,13 +19,11 @@
 //! The credentialed Source carrier polls this future before the GatedWork gate.
 
 use super::{
-    proposal_wait::ProposalWait,
-    queue_input::SendInputLoan,
-    release_wake::LedgerReleaseWake,
-    source_ports::{ApplyRowPreparation, TransportReports},
+    proposal_wait::ProposalWait, queue_input::SendInputLoan, release_wake::LedgerReleaseWake,
+    source_ports::TransportReports,
 };
 use crate::native::{
-    apply_send_owner::{ApplySendPort, RegistrationFailure},
+    apply_send_owner::{ApplySendPort, RegistrationFailure, SharedApplyPreparation},
     task_transport::{NativeCallSource, NativePhysicalOffer},
     transport::{Client, NativeChannelSource, NativeDialHandoff},
     transport_capacity::{NativeTransportCapacity, TransportCapacityLane},
@@ -72,7 +70,7 @@ pub(crate) enum PreparationFailure {
 pub(crate) struct ReadyAction {
     pub(crate) call: Option<NativeCallSource>,
     pub(crate) publisher: Option<crate::native::apply_send_owner::OriginalReplyPublisher>,
-    pub(crate) row: Box<dyn ApplyRowPreparation>,
+    pub(crate) row: SharedApplyPreparation,
 }
 impl Drop for ReadyAction {
     fn drop(&mut self) {
@@ -520,7 +518,7 @@ impl Future for PrepareSend {
                 return Poll::Ready(Err(PreparationFailure::Role(error)));
             }
         };
-        let accepted = match row.accept_in(&mut offer, &mut physical) {
+        let accepted = match row.accept_native_in(&mut offer, &mut physical) {
             Ok(notice) => notice,
             Err(error) => {
                 let notice = offer
@@ -535,14 +533,14 @@ impl Future for PrepareSend {
             }
         };
         drop(offer);
-        let (publisher, action, reply) = match row.prepare_in(&this.admission, this.items) {
+        let (publisher, action, reply) = match row.prepare_native_in(&this.admission, this.items) {
             Ok(value) => value,
             Err(error) => {
                 accepted.notify();
                 return Poll::Ready(Err(PreparationFailure::Governance(error)));
             }
         };
-        let mut physical = match row.take_physical() {
+        let mut physical = match row.take_native_physical() {
             Ok(value) => value,
             Err(error) => {
                 for notice in [accepted, action, reply] {
