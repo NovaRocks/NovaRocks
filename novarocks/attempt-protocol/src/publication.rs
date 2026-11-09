@@ -21,6 +21,15 @@ pub(crate) mod protocol_cursor;
 
 use novarocks_coordination_contract::{AttemptComputationCut, SelectedTaskTermination};
 use novarocks_execution_contract::{OperationOutcome, TaskIdentity, TaskStatus};
+use novarocks_result_contract::PerKind;
+use std::{collections::BTreeSet, sync::Arc};
+
+/// Frozen memberships from the original plan, separate from changing Task facts.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct ProtocolMembership {
+    pub writers: BTreeSet<TaskIdentity>,
+    pub summary_sources: PerKind<BTreeSet<TaskIdentity>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ProtocolTaskChange {
@@ -35,6 +44,8 @@ pub struct ProtocolTaskChange {
 #[derive(Clone, Debug)]
 pub struct ProtocolPublication {
     pub owner_revision: u64,
+    /// The first publication binds the same writer and per-kind summary obligations.
+    pub initial_membership: Option<Arc<ProtocolMembership>>,
     /// Move the charged assembly without a final shrink/copy on the poller.
     pub changes: Vec<ProtocolTaskChange>,
     pub selected_failure: Option<SelectedTaskTermination>,

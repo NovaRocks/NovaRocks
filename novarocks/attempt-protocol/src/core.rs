@@ -48,7 +48,7 @@ use crate::{
     lease::RequestedLeaseDurations,
     observation::controller::ObservationDisposition,
     publication::{
-        ProtocolPublication,
+        ProtocolMembership, ProtocolPublication,
         protocol_cursor::{
             ProtocolPublicationCursor, PublicationApplyDisposition, PublicationProgress,
         },
@@ -89,10 +89,6 @@ pub struct Core {
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
-    writers: std::collections::BTreeSet<novarocks_execution_contract::TaskIdentity>,
-    summary_sources: novarocks_result_contract::PerKind<
-        std::collections::BTreeSet<novarocks_execution_contract::TaskIdentity>,
-    >,
 }
 
 #[derive(Debug)]
@@ -204,7 +200,13 @@ impl Core {
             graph.participations().copied(),
         )?;
         let root = RootControl::new(activation.identity, &graph)?;
-        let publication = ProtocolPublicationCursor::new(&graph);
+        let publication = ProtocolPublicationCursor::new(
+            &graph,
+            ProtocolMembership {
+                writers,
+                summary_sources,
+            },
+        )?;
         let convergence = RemoteConvergence::new(&graph);
         let diagnostics = DiagnosticCollector::new(
             activation.identity,
@@ -266,8 +268,6 @@ impl Core {
             establish_material,
             retry,
             pumps,
-            writers,
-            summary_sources,
         })
     }
 

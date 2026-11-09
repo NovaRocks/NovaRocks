@@ -66,6 +66,7 @@ fn fixture() -> (
 fn batch(revision: u64, changes: Vec<ProtocolTaskChange>) -> Publication {
     Publication::ProtocolBatch(ProtocolPublication {
         owner_revision: revision,
+        initial_membership: (revision == 0).then(|| std::sync::Arc::new(Default::default())),
         changes,
         selected_failure: None,
         root_success_sealed: false,

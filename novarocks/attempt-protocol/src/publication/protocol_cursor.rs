@@ -24,7 +24,7 @@
 //! Failed/removed Core state (including an assembled batch) stays retained for
 //! credentialed host removal off the poller; it must not be reset or cloned.
 
-use super::{ProtocolPublication, ProtocolTaskChange};
+use super::{ProtocolMembership, ProtocolPublication, ProtocolTaskChange};
 use crate::{
     capacity::StepContext, error::TaskExecutionError, execution::QueryTaskExecution,
     failure::AttemptFailure, graph::TaskGraph,
@@ -32,7 +32,7 @@ use crate::{
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_types::TaskId;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicationProgress {
@@ -62,20 +62,38 @@ struct Flight {
 #[derive(Debug)]
 pub(crate) struct ProtocolPublicationCursor {
     root: TaskIdentity,
+    membership: Arc<ProtocolMembership>,
     last_applied: Option<(u64, bool)>,
     cut: Option<Cut>,
     flight: Option<Flight>,
     failed: bool,
 }
 impl ProtocolPublicationCursor {
-    pub(crate) fn new(graph: &TaskGraph) -> Self {
-        Self {
+    pub(crate) fn new(
+        graph: &TaskGraph,
+        membership: ProtocolMembership,
+    ) -> Result<Self, TaskExecutionError> {
+        let is_foreign = |identity: &TaskIdentity| {
+            graph.task(identity.task_id()).map(|task| task.identity()) != Some(*identity)
+        };
+        if membership.writers.iter().any(is_foreign)
+            || membership
+                .summary_sources
+                .iter()
+                .any(|(_, sources)| sources.is_empty() || sources.iter().any(is_foreign))
+        {
+            return Err(error(
+                "frozen protocol membership differs from the original Task graph",
+            ));
+        }
+        Ok(Self {
             root: graph.root_identity(),
+            membership: Arc::new(membership),
             last_applied: None,
             cut: None,
             flight: None,
             failed: false,
-        }
+        })
     }
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         !self.has_pending_apply() && !self.failed
@@ -122,6 +140,10 @@ impl ProtocolPublicationCursor {
             remaining: execution.take_accepted_protocol_task_changes(),
             publication: ProtocolPublication {
                 owner_revision: revision,
+                initial_membership: self
+                    .last_applied
+                    .is_none()
+                    .then(|| Arc::clone(&self.membership)),
                 changes,
                 selected_failure,
                 root_success_sealed: sealed,

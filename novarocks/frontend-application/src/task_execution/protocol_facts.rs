@@ -396,6 +396,18 @@ impl AttemptProtocolFactsPublisher {
         activation: AttemptActivationIdentity,
         batch: novarocks_attempt_protocol::publication::ProtocolPublication,
     ) -> Result<bool, TaskExecutionError> {
+        let frozen = &self.shared.frozen;
+        match &batch.initial_membership {
+            Some(membership)
+                if membership.writers == frozen.writers
+                    && membership.summary_sources == frozen.summary_sources => {}
+            None if self.last_owner_revision.is_some() => {}
+            _ => {
+                return Err(protocol_error(
+                    "core publication differs from the frozen writer or summary membership",
+                ));
+            }
+        }
         self.bind_identity(activation)?;
         let mut seen = BTreeSet::new();
         let mut updates = Vec::with_capacity(batch.changes.len());
@@ -1112,27 +1124,57 @@ mod tests {
 
     #[test]
     fn frozen_protocol_keeps_kind_specific_sources_through_delta_coalescing() {
+        use novarocks_attempt_protocol::publication::{
+            ProtocolMembership, ProtocolPublication, ProtocolTaskChange,
+        };
+        let sources = PerKind {
+            write_counts: Some([identity(2)].into()),
+            delete_verification: Some([identity(3)].into()),
+        };
         let (mut publisher, mut receiver) = AttemptProtocolFactsPublisher::pair(
             FrozenAttemptProtocol::from_tasks(
                 plan(),
                 identity(1),
                 [identity(1), identity(2), identity(3)].into(),
                 [identity(2)].into(),
-                PerKind {
-                    write_counts: Some([identity(2)].into()),
-                    delete_verification: Some([identity(3)].into()),
-                },
+                sources.clone(),
             )
             .unwrap(),
         );
-        publisher.bind_identity(activation(1)).unwrap();
+        let batch = |summary_sources| ProtocolPublication {
+            owner_revision: 1,
+            initial_membership: Some(Arc::new(ProtocolMembership {
+                writers: [identity(2)].into(),
+                summary_sources,
+            })),
+            changes: [identity(1), identity(2)]
+                .into_iter()
+                .map(|identity| ProtocolTaskChange {
+                    identity,
+                    status: Some(status(identity.task_id().get(), 2)),
+                    first_writer_witness: None,
+                })
+                .collect(),
+            selected_failure: None,
+            root_success_sealed: false,
+        };
+        let swapped = PerKind {
+            write_counts: sources.delete_verification.clone(),
+            delete_verification: sources.write_counts.clone(),
+        };
+        assert!(
+            publisher
+                .publish_core_batch(activation(1), batch(swapped))
+                .is_err()
+        );
+        assert!(
+            receiver
+                .take_changes(activation(1), identity(1), plan())
+                .unwrap()
+                .is_none()
+        );
         publisher
-            .publish_updates(
-                1,
-                vec![update(1, status(1, 2)), update(2, status(2, 2))],
-                None,
-                false,
-            )
+            .publish_core_batch(activation(1), batch(sources))
             .unwrap();
         let mut tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
         assert_eq!(
@@ -1182,10 +1224,13 @@ mod tests {
     }
     #[test]
     fn core_publication_rejects_duplicate_and_foreign_slots_before_atomic_transfer() {
-        use novarocks_attempt_protocol::publication::{ProtocolPublication, ProtocolTaskChange};
+        use novarocks_attempt_protocol::publication::{
+            ProtocolMembership, ProtocolPublication, ProtocolTaskChange,
+        };
         let (mut publisher, mut receiver) = pair(&[2]);
         let batch = |changes| ProtocolPublication {
             owner_revision: 1,
+            initial_membership: None,
             changes,
             selected_failure: None,
             root_success_sealed: false,
@@ -1195,6 +1240,10 @@ mod tests {
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 0,
+                    initial_membership: Some(Arc::new(ProtocolMembership {
+                        writers: [identity(2)].into(),
+                        ..Default::default()
+                    })),
                     changes: Vec::new(),
                     selected_failure: None,
                     root_success_sealed: false,
@@ -1258,13 +1307,19 @@ mod tests {
 
     #[test]
     fn core_publication_transfers_status_failure_witness_and_seal_in_one_revision() {
-        use novarocks_attempt_protocol::publication::{ProtocolPublication, ProtocolTaskChange};
+        use novarocks_attempt_protocol::publication::{
+            ProtocolMembership, ProtocolPublication, ProtocolTaskChange,
+        };
         let (mut publisher, mut receiver) = pair(&[2]);
         publisher
             .publish_core_batch(
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 0,
+                    initial_membership: Some(Arc::new(ProtocolMembership {
+                        writers: [identity(2)].into(),
+                        ..Default::default()
+                    })),
                     changes: Vec::new(),
                     selected_failure: None,
                     root_success_sealed: false,
@@ -1283,6 +1338,7 @@ mod tests {
                 activation(1),
                 ProtocolPublication {
                     owner_revision: 1,
+                    initial_membership: None,
                     changes: vec![
                         ProtocolTaskChange {
                             identity: identity(1),

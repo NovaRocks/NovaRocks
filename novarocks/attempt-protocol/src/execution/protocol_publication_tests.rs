@@ -62,7 +62,7 @@ impl StepContext for Units {
 }
 fn fixture() -> (QueryTaskExecution, ProtocolPublicationCursor) {
     let execution = crate::test_support::execution_with_strict_input();
-    let cursor = ProtocolPublicationCursor::new(execution.graph());
+    let cursor = ProtocolPublicationCursor::new(execution.graph(), Default::default()).unwrap();
     (execution, cursor)
 }
 fn effect(n: u64) -> AttemptActionId {
@@ -101,7 +101,20 @@ fn finish(cursor: &mut ProtocolPublicationCursor, execution: &QueryTaskExecution
 }
 #[test]
 fn initial_empty_binding_publishes_once_and_seal_only_change_still_publishes() {
-    let (mut execution, mut cursor) = fixture();
+    use crate::publication::ProtocolMembership;
+    use novarocks_result_contract::PerKind;
+
+    let (mut execution, _) = fixture();
+    let writer = status(&execution, 2, 1).identity();
+    let delete_source = status(&execution, 3, 1).identity();
+    let membership = ProtocolMembership {
+        writers: [writer].into(),
+        summary_sources: PerKind {
+            write_counts: Some([writer].into()),
+            delete_verification: Some([delete_source].into()),
+        },
+    };
+    let mut cursor = ProtocolPublicationCursor::new(execution.graph(), membership).unwrap();
     assert!(cursor.select(&mut execution, false).unwrap());
     assert!(!cursor.permits_protocol_turn());
     let mut units = Units::new(0);
@@ -113,6 +126,16 @@ fn initial_empty_binding_publishes_once_and_seal_only_change_still_publishes() {
     let batch = cursor.take_ready(effect(1)).unwrap();
     assert!(batch.changes.is_empty());
     assert_eq!(batch.owner_revision, 0);
+    let membership = batch.initial_membership.unwrap();
+    assert_eq!(membership.writers, [writer].into());
+    assert_eq!(
+        membership.summary_sources.write_counts,
+        Some([writer].into())
+    );
+    assert_eq!(
+        membership.summary_sources.delete_verification,
+        Some([delete_source].into())
+    );
     assert!(!cursor.permits_protocol_turn());
     assert_eq!(
         cursor.applied(effect(1), Ok(false)),
@@ -122,6 +145,7 @@ fn initial_empty_binding_publishes_once_and_seal_only_change_still_publishes() {
     assert!(!cursor.select(&mut execution, false).unwrap());
     assert!(cursor.select(&mut execution, true).unwrap());
     assert!(cursor.ready().unwrap().root_success_sealed);
+    assert!(cursor.ready().unwrap().initial_membership.is_none());
     finish(&mut cursor, &execution, 2);
     assert!(!cursor.select(&mut execution, true).unwrap());
 }
