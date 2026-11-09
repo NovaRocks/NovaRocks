@@ -138,6 +138,7 @@ impl Core {
             ids,
             initial_now,
             sources,
+            observe_dev_root,
         } = start;
         let FrozenAttemptPlan {
             graph,
@@ -244,7 +245,7 @@ impl Core {
         Ok(Self {
             activation: activation.identity,
             sources,
-            turn: turn::Turn::default(),
+            turn: turn::Turn::new(observe_dev_root),
             maximum_send_members: transport.max_batch_items,
             observation_source: observation,
             execution,
@@ -977,6 +978,7 @@ mod tests {
             },
             ids: IdSeed::new(1, 100),
             initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
+            observe_dev_root: false,
             sources: AttemptSources {
                 actor: AttemptSourceId(id(3)),
                 publication: AttemptSourceId(id(4)),
@@ -990,7 +992,10 @@ mod tests {
     }
 
     fn round() -> Core {
-        let start = start();
+        round_with_start(start())
+    }
+
+    fn round_with_start(start: AttemptStart) -> Core {
         let source = start.sources.native;
         let now = start.initial_now;
         let mut core = Core::new(start).unwrap();
@@ -2479,11 +2484,14 @@ mod tests {
     fn unified_step_emits_seal_only_after_matching_root_publication() {
         use crate::{
             AttemptCore,
+            effect::Publication,
             input::{AttemptInput, AttemptInputClaim},
         };
         use novarocks_coordination_contract::AttemptToLogicalBody;
 
-        let mut core = round();
+        let mut attempt = start();
+        attempt.observe_dev_root = true;
+        let mut core = round_with_start(attempt);
         let root = core.execution.graph().root_identity();
         let now = core.execution.monotonic_now();
         let root_finished = frame(&mut core, root, TaskState::Finished, None);
@@ -2529,6 +2537,46 @@ mod tests {
             };
             core.handle(now, claim, input, &mut Units(128)).unwrap()
         };
+        let observe_dev_root = |core: &mut Core| {
+            let observed = step(core, sources.actor, 201, AttemptInput::Timer);
+            let Some(AttemptEffect {
+                id: effect,
+                body: EffectBody::Publish(Publication::DevRootObservation { status, .. }),
+                ..
+            }) = observed.effect
+            else {
+                panic!("expected original development root observer effect");
+            };
+            assert_eq!(status.identity(), root);
+            assert_eq!(
+                observed.selection,
+                InputSelection::Only(sources.publication)
+            );
+            assert_eq!(core.next_deadline(), None);
+            for (index, kind) in [
+                PublicationApplied::RootStatus,
+                PublicationApplied::DevRootObservation,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let acknowledged = step(
+                    core,
+                    sources.publication,
+                    202 + index as u64,
+                    AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                        effect,
+                        result: Ok(kind),
+                    }),
+                );
+                let next = if index == 0 {
+                    sources.publication
+                } else {
+                    sources.actor
+                };
+                assert_eq!(acknowledged.selection, InputSelection::Only(next));
+            }
+        };
         step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
         let seal_token = AttemptRequestToken::new(id(22));
         let processed = step(
@@ -2545,6 +2593,7 @@ mod tests {
             Some(AttemptInputId(id(2)))
         );
         assert!(processed.effect.is_none());
+        observe_dev_root(&mut core);
         let root_work = step(&mut core, sources.actor, 3, AttemptInput::Timer);
         let Some(AttemptEffect {
             id: root_effect,
@@ -2643,6 +2692,7 @@ mod tests {
                 ObservationBatch::new(strict_finished).unwrap(),
             )),
         );
+        observe_dev_root(&mut core);
         step(&mut core, sources.actor, 12, AttemptInput::Timer);
         let published = step(&mut core, sources.actor, 13, AttemptInput::Timer);
         let second = published.effect.unwrap().id;

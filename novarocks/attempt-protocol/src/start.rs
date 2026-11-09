@@ -110,6 +110,8 @@ pub struct AttemptStart {
     pub ids: IdSeed,
     pub initial_now: MonotonicInstant,
     pub sources: AttemptSources,
+    /// Whether the original host registered a development root observer.
+    pub observe_dev_root: bool,
 }
 
 /// Fixed roles from the original actor registration. These identities and

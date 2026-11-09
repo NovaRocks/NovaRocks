@@ -42,7 +42,7 @@ use novarocks_coordination_contract::{
     AttemptActionId, AttemptConvergenceMode, AttemptRequestToken, AttemptRootProjection,
     AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
 };
-use novarocks_execution_contract::TaskOperationId;
+use novarocks_execution_contract::{TaskOperationId, TaskStatus};
 use std::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +78,7 @@ enum Phase {
         source_ready: bool,
     },
     Root,
-    AwaitRoot(AttemptActionId),
+    AwaitRoot(AttemptActionId, PublicationApplied),
     AwaitSeal {
         effect: AttemptActionId,
         success: bool,
@@ -92,6 +92,7 @@ enum Phase {
 
 #[derive(Debug)]
 struct RootWork {
+    dev_observation: Option<(TaskStatus, bool)>,
     projection: Option<AttemptRootProjection>,
     seal: Option<SealSettlement>,
     publication_failure: Option<AttemptFailure>,
@@ -100,6 +101,7 @@ struct RootWork {
 #[derive(Debug, Default)]
 pub(super) struct Turn {
     phase: Phase,
+    observe_dev_root: bool,
     next: u64,
     root: Option<RootWork>,
     observation: Option<super::ObservationPass>,
@@ -116,6 +118,13 @@ pub(super) struct Turn {
 }
 
 impl Turn {
+    pub(super) fn new(observe_dev_root: bool) -> Self {
+        Self {
+            observe_dev_root,
+            ..Self::default()
+        }
+    }
+
     fn issue(&mut self) -> Result<(AttemptActionId, AttemptRequestToken), TaskExecutionError> {
         self.next = self
             .next
@@ -220,7 +229,7 @@ impl AttemptCore for Core {
         match self.turn.phase {
             Phase::Bootstrap
             | Phase::Native
-            | Phase::AwaitRoot(_)
+            | Phase::AwaitRoot(..)
             | Phase::AwaitSeal { .. }
             | Phase::Common { source_ready: true } => None,
             Phase::Terminal(_)
@@ -314,7 +323,7 @@ impl Core {
             }
             Phase::Native => Only(self.sources.native),
             Phase::Common { .. } => Only(self.sources.observation),
-            Phase::AwaitRoot(_) | Phase::AwaitSeal { .. } => Only(self.sources.publication),
+            Phase::AwaitRoot(..) | Phase::AwaitSeal { .. } => Only(self.sources.publication),
             Phase::Terminal(_) if self.terminal.waiting_for_permission() => Only(self.sources.qa),
             Phase::Terminal(_) if self.terminal.waiting_for_process() => Only(self.sources.process),
             Phase::Terminal(_) => Only(self.sources.actor),
@@ -473,8 +482,8 @@ impl Core {
             }
             Phase::Common { .. } => self.consume_common(now, claim, input, context, result)?,
             Phase::Root if timer => self.drive_root(context, result)?,
-            Phase::AwaitRoot(_) if timer => {}
-            Phase::AwaitRoot(expected) => {
+            Phase::AwaitRoot(..) if timer => {}
+            Phase::AwaitRoot(expected, kind) => {
                 let AttemptInput::Executor(ExecutorFact::PublicationApplied {
                     effect,
                     result: applied,
@@ -483,13 +492,15 @@ impl Core {
                     return Err(schedule("root publication awaited its actual result"));
                 };
                 self.verify_source(claim.source, self.sources.publication)?;
-                if effect == expected
-                    && (applied.is_err() || matches!(applied, Ok(PublicationApplied::RootStatus)))
-                {
-                    let root = self.turn.root.as_mut().expect("original root publication");
+                if effect == expected && (applied.is_err() || applied == Ok(kind)) {
                     if let Err(failure) = applied {
-                        root.publication_failure = Some(failure.clone());
-                        self.round_failure.get_or_insert(failure);
+                        if kind == PublicationApplied::DevRootObservation {
+                            result.diagnostic_failure = Some(failure);
+                        } else {
+                            let root = self.turn.root.as_mut().expect("original root publication");
+                            root.publication_failure = Some(failure.clone());
+                            self.round_failure.get_or_insert(failure);
+                        }
                     }
                     self.turn.phase = Phase::Root;
                 }
@@ -1222,7 +1233,20 @@ impl Core {
                 (projection, Some(cut.settlement))
             },
         );
+        // The development observer follows the accepted Task even after the
+        // product result seal has consumed its root publisher.
+        let dev_observation = if self.turn.observe_dev_root {
+            let root = self.execution.graph().root_identity();
+            self.execution
+                .task(root.task_id())
+                .and_then(|task| task.status().map(|status| (status, task.installed())))
+                .filter(|(status, _)| status.identity() == root)
+                .map(|(status, installed)| (status.clone(), installed))
+        } else {
+            None
+        };
         self.turn.root = Some(RootWork {
+            dev_observation,
             projection,
             seal,
             publication_failure: None,
@@ -1236,6 +1260,20 @@ impl Core {
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         let root = self.turn.root.as_mut().expect("selected root work");
+        if root.dev_observation.is_some() {
+            if !context.charge(1) {
+                return Ok(());
+            }
+            let (status, installed) = root.dev_observation.take().expect("selected observation");
+            let (id, _) = self.turn.issue()?;
+            result.effect = Some(AttemptEffect {
+                id,
+                class: EffectClass::Publication,
+                body: EffectBody::Publish(Publication::DevRootObservation { status, installed }),
+            });
+            self.turn.phase = Phase::AwaitRoot(id, PublicationApplied::DevRootObservation);
+            return Ok(());
+        }
         if root.projection.is_some() {
             if !context.charge(1) {
                 return Ok(());
@@ -1247,7 +1285,7 @@ impl Core {
                 class: EffectClass::Publication,
                 body: EffectBody::Publish(Publication::RootStatus(Box::new(projection))),
             });
-            self.turn.phase = Phase::AwaitRoot(id);
+            self.turn.phase = Phase::AwaitRoot(id, PublicationApplied::RootStatus);
             return Ok(());
         }
         if root.seal.is_some() {
