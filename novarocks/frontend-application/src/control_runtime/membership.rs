@@ -64,7 +64,7 @@ pub(crate) struct FrozenMember {
 }
 pub(crate) struct MembershipTarget {
     pub(crate) registration: ActorRegistration,
-    pub(crate) members: Box<[FrozenMember]>,
+    pub(crate) members: Arc<[FrozenMember]>,
     pub(crate) input: CoalescingInput<FrontendActor, MembershipUpdate>,
     // Full original failures remain host-owned. They are never converted into
     // positive Current/Replacement evidence or reconstructed from error text.
@@ -73,7 +73,7 @@ pub(crate) struct MembershipTarget {
 impl MembershipTarget {
     pub(crate) fn new(
         registration: ActorRegistration,
-        members: Box<[FrozenMember]>,
+        members: Arc<[FrozenMember]>,
         input: CoalescingInput<FrontendActor, MembershipUpdate>,
     ) -> Self {
         Self {
@@ -186,7 +186,7 @@ impl MembershipRegistry {
         for (registration, members) in observations {
             let mut processes = BTreeMap::new();
             let mut errors = Vec::new();
-            for frozen in &members {
+            for frozen in members.iter() {
                 let observation = match port.observe_process_at_endpoint(
                     frozen.participation.backend_process_id(),
                     &frozen.endpoint,
@@ -396,11 +396,10 @@ mod tests {
         );
         let target = Arc::new(MembershipTarget::new(
             registration,
-            vec![FrozenMember {
+            Arc::from([FrozenMember {
                 participation,
                 endpoint: endpoint.clone(),
-            }]
-            .into_boxed_slice(),
+            }]),
             CoalescingInput::new(standing, membership_input),
         ));
         let registry = MembershipRegistry::new();

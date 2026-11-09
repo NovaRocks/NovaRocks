@@ -762,6 +762,7 @@ impl Core {
                 }
             }
             AttemptInput::Membership(view) => {
+                self.verify_source(claim.source, self.sources.membership)?;
                 if self
                     .turn
                     .membership_revision

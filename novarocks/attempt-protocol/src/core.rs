@@ -161,6 +161,7 @@ impl Core {
             native,
             observation,
             capacity,
+            membership,
             mailbox,
         } = sources;
         let distinct = [
@@ -171,6 +172,7 @@ impl Core {
             native,
             observation,
             capacity,
+            membership,
         ];
         let graph = TaskGraph::from_frozen(graph)?;
         if distinct
@@ -997,6 +999,7 @@ mod tests {
                 native: AttemptSourceId(id(7)),
                 observation: AttemptSourceId(id(8)),
                 capacity: AttemptSourceId(id(9)),
+                membership: AttemptSourceId(id(10)),
                 mailbox: [4; 4],
             },
         }
@@ -1716,6 +1719,53 @@ mod tests {
                     if operation_id == expiring.operation_id() && waited == Duration::from_secs(5))
         ));
         assert_eq!(core.next_round_deadline(), None);
+    }
+
+    #[test]
+    fn membership_accepts_only_its_frozen_source() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim, MembershipView},
+        };
+        let start = start();
+        let now = start.initial_now;
+        let sources = start.sources;
+        let mut core = <Core as AttemptCore>::new(start).unwrap();
+        let claim = |source, n| AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(n)),
+            native_cut: Some(AttemptSourceCut {
+                source: sources.native,
+                tail: None,
+            }),
+            selected_cut: None,
+        };
+        core.handle(
+            now,
+            claim(sources.actor, 1),
+            AttemptInput::Bootstrap,
+            &mut Units(32),
+        )
+        .unwrap();
+        let membership = || {
+            AttemptInput::Membership(MembershipView {
+                revision: 1,
+                processes: Default::default(),
+            })
+        };
+        assert!(
+            core.handle(now, claim(sources.process, 2), membership(), &mut Units(32))
+                .is_err()
+        );
+        assert!(
+            core.handle(
+                now,
+                claim(sources.membership, 3),
+                membership(),
+                &mut Units(32)
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -19,7 +19,9 @@
 //! variant; protocol state remains pure and rich objects stay in host Sources.
 
 use crate::task_execution::host::adapter::{AttemptActor, AttemptNotice, descriptor};
-use novarocks_attempt_protocol::{effect::AttemptEffect, input::AttemptInput};
+use novarocks_attempt_protocol::{
+    config::DispatchLane, effect::AttemptEffect, input::AttemptInput,
+};
 use novarocks_control_runtime::{
     actor::{Actor, ActorStep},
     actor_turn::Clock,
@@ -30,7 +32,9 @@ use novarocks_control_runtime_core::{
     mailbox::InputEnvelope,
 };
 use novarocks_coordination_contract::MonotonicClock;
-use std::sync::Arc;
+use novarocks_execution_contract::ParticipationRef;
+use novarocks_types::BackendProcessId;
+use std::{num::NonZeroU64, sync::Arc};
 
 pub(crate) struct FrontendClock(pub(crate) Arc<dyn MonotonicClock>);
 impl Clock for FrontendClock {
@@ -78,6 +82,16 @@ pub(crate) enum FrontendEffect {
 }
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FrontendLaneKey {
+    Send {
+        target: BackendProcessId,
+        lane: DispatchLane,
+        control_progress: bool,
+    },
+    Subscription {
+        participation: ParticipationRef,
+        generation: NonZeroU64,
+    },
+    Publication,
     #[cfg(test)]
     Test(u64),
 }

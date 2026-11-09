@@ -141,5 +141,6 @@ pub struct AttemptSources {
     pub native: AttemptSourceId,
     pub observation: AttemptSourceId,
     pub capacity: AttemptSourceId,
+    pub membership: AttemptSourceId,
     pub mailbox: [usize; 4],
 }

@@ -126,6 +126,50 @@ pub(crate) struct FrontendLanePolicy {
     pub(crate) lane: fn(&FrontendEffect) -> Option<FrontendLaneKey>,
     pub(crate) per_step_inventory: usize,
 }
+impl FrontendLanePolicy {
+    pub(crate) fn attempt(per_step_inventory: usize) -> Self {
+        use novarocks_attempt_protocol::effect::EffectBody;
+        Self {
+            per_step_inventory,
+            lane: |effect| {
+                let FrontendEffect::Attempt(effect) = effect else {
+                    return None;
+                };
+                match &effect.body {
+                    EffectBody::SendBatch { batch, .. } => Some(FrontendLaneKey::Send {
+                        target: batch.backend,
+                        lane: batch.lane,
+                        control_progress: batch.control_progress,
+                    }),
+                    EffectBody::OpenSubscription(request)
+                    | EffectBody::AdjustReadWindow(request) => {
+                        Some(FrontendLaneKey::Subscription {
+                            participation: request.participation,
+                            generation: request.generation,
+                        })
+                    }
+                    EffectBody::CloseSubscription {
+                        participation,
+                        generation,
+                    }
+                    | EffectBody::ConfirmReadState {
+                        participation,
+                        generation,
+                        ..
+                    } => Some(FrontendLaneKey::Subscription {
+                        participation: *participation,
+                        generation: *generation,
+                    }),
+                    EffectBody::Publish(_) => Some(FrontendLaneKey::Publication),
+                    // Independent effects keep their own ready marker. In
+                    // particular, Withdraw must be able to reach an original
+                    // send whose dispatch purpose has no available credit.
+                    _ => None,
+                }
+            },
+        }
+    }
+}
 impl EffectLanePolicy<FrontendActor> for FrontendLanePolicy {
     type LaneKey = FrontendLaneKey;
     fn classify(&self, effect: &FrontendEffect) -> Option<(FrontendLaneKey, EffectRelease)> {
@@ -760,6 +804,61 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::oneshot;
+
+    #[test]
+    fn attempt_lane_keeps_withdrawal_and_unrelated_sends_independent() {
+        use novarocks_attempt_protocol::{
+            capacity::ReservationToken,
+            config::DispatchLane,
+            effect::{AttemptEffect, DispatchBatch, EffectBody, EffectClass},
+        };
+        use novarocks_coordination_contract::AttemptActionId;
+        use novarocks_types::BackendProcessId;
+        use std::num::NonZeroU64;
+
+        let policy = FrontendLanePolicy::attempt(3);
+        let id = NonZeroU64::new(1).unwrap();
+        let effect = |body| {
+            FrontendEffect::Attempt(Arc::new(AttemptEffect {
+                id: AttemptActionId::new(id),
+                class: EffectClass::Business,
+                body,
+            }))
+        };
+        let send = |backend, lane, control_progress| {
+            effect(EffectBody::SendBatch {
+                batch: DispatchBatch {
+                    backend,
+                    lane,
+                    control_progress,
+                    operations: Box::new([]),
+                    queued_bytes: 0,
+                    queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                    queued_inputs: Box::new([]),
+                },
+                reservation: ReservationToken(id),
+            })
+        };
+        let first = BackendProcessId::new_v7();
+        let other = BackendProcessId::new_v7();
+        let classify = |target, lane, control| policy.classify(&send(target, lane, control));
+        let create = classify(first, DispatchLane::Create, false);
+        assert!(matches!(create, Some((_, EffectRelease::Completed))));
+        assert_eq!(create, classify(first, DispatchLane::Create, false));
+        assert_ne!(create, classify(other, DispatchLane::Create, false));
+        assert_ne!(create, classify(first, DispatchLane::Update, false));
+        assert_ne!(
+            classify(first, DispatchLane::Update, false),
+            classify(first, DispatchLane::Update, true)
+        );
+        assert!(
+            policy
+                .classify(&effect(EffectBody::Withdraw {
+                    effect: AttemptActionId::new(id),
+                }))
+                .is_none()
+        );
+    }
 
     #[derive(Debug)]
     struct TestClock(Instant);
@@ -1507,38 +1606,35 @@ mod tests {
         let held_captures = CaptureProbe(captures.clone());
         assert!(
             owner
-                .register(
-                    HostBinding {
-                        scope: scope.clone(),
-                        registration: registration.clone(),
-                        kind: FrontendActorKind::Test,
-                        config,
-                        policy: FrontendLanePolicy {
-                            lane: |_| None,
-                            per_step_inventory: 1
-                        },
-                        source: Box::new(RealSource {
-                            scope: scope.clone(),
-                            ledger: ledger.clone(),
-                            runtime: runtime.clone(),
-                            registration: registration.clone(),
-                            result: Some(role),
-                            exit: None,
-                            captures: None,
-                            custody: custody.clone(),
-                            report: report.clone(),
-                            returned: Arc::new(ReturnedResult {
-                                role: Mutex::new(None),
-                                indexed: Mutex::new(vec![])
-                            }),
-                            binds: Arc::new(AtomicUsize::new(0)),
-                            closing: false,
-                            report_consumed: false
-                        }),
-                        executor: Arc::new(NoExecutor)
+                .register(HostBinding {
+                    scope: scope.clone(),
+                    registration: registration.clone(),
+                    kind: FrontendActorKind::Test,
+                    config,
+                    policy: FrontendLanePolicy {
+                        lane: |_| None,
+                        per_step_inventory: 1
                     },
-                    None
-                )
+                    source: Box::new(RealSource {
+                        scope: scope.clone(),
+                        ledger: ledger.clone(),
+                        runtime: runtime.clone(),
+                        registration: registration.clone(),
+                        result: Some(role),
+                        exit: None,
+                        captures: None,
+                        custody: custody.clone(),
+                        report: report.clone(),
+                        returned: Arc::new(ReturnedResult {
+                            role: Mutex::new(None),
+                            indexed: Mutex::new(vec![])
+                        }),
+                        binds: Arc::new(AtomicUsize::new(0)),
+                        closing: false,
+                        report_consumed: false
+                    }),
+                    executor: Arc::new(NoExecutor)
+                })
                 .is_ok()
         );
         let metric_registry = prometheus::Registry::new();

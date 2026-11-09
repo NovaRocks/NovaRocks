@@ -138,6 +138,7 @@ fn start() -> AttemptStart {
             native: source(5),
             observation: source(6),
             capacity: source(7),
+            membership: source(8),
             mailbox: [8; 4],
         },
         observe_dev_root: false,
@@ -182,6 +183,16 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let (mut original_work, mut original_capacity) = reserve(WorkKind::Settlement);
     original_work.start().unwrap();
     let start = start();
+    let members: Arc<[FrozenMember]> = start
+        .plan
+        .establish_material
+        .keys()
+        .map(|participation| FrozenMember {
+            participation: *participation,
+            endpoint: novarocks_execution_contract::RuntimeEndpoint::new("127.0.0.1", 19091)
+                .unwrap(),
+        })
+        .collect();
     let activation = start.activation.identity;
     let root = start.plan.graph.root;
     let target = start.plan.graph.root.backend_process_id();
@@ -190,6 +201,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let mut registered = AttemptActor::register(
         &runtime,
         start,
+        &members,
         scope.clone(),
         layout.clone(),
         ActorConfig {
@@ -205,6 +217,24 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     .unwrap();
     let registration = registered.original.clone();
     let actor = registration.actor();
+    let membership = registered
+        .bind_membership(&runtime, &original_work)
+        .unwrap();
+    assert!(membership.registration.same_registration(&registration));
+    assert!(Arc::ptr_eq(&membership.members, &members));
+    assert!(matches!(
+        registered.bind_membership(&runtime, &original_work),
+        Err(AttemptRegistrationError::InvalidConfig(_))
+    ));
+    assert!(
+        runtime
+            .standing_input_inventory(actor, None, 8)
+            .unwrap()
+            .iter()
+            .any(|row| row.source == runtime_source(sources.membership)
+                && row.class == InputClass::Ordinary
+                && row.in_flight.is_none())
+    );
     let mut original = CausalInputObligation::reserve_admitted(
         &runtime,
         &registration,
@@ -297,6 +327,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
 
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
     let mut startup = AttemptStartup {
+        registration: registration.clone(),
         input: registered
             .reserve_standing(&runtime, actor, InputClass::Lifecycle, &original_work)
             .unwrap(),
@@ -309,6 +340,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         Err(ActorTurnError::StandingInputBusy)
     ));
     assert!(matches!(startup.next, Some(AttemptInput::StartProtocol)));
+    assert!(!startup.ready_for(&registration).unwrap());
     assert!(runtime.poll_one(Tick(1)).unwrap());
     for (_, input) in runtime.committed_batches(actor, None, 8).unwrap() {
         runtime.retire_input(actor, input).unwrap();
@@ -484,6 +516,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     original_work.body_exited().unwrap();
     original_work.captures_exited().unwrap();
     startup.close_after_exit().unwrap();
+    membership.close_after_exit().unwrap();
     observation_work.body_exited().unwrap();
     observation_work.captures_exited().unwrap();
     observations.close_after_exit().unwrap();

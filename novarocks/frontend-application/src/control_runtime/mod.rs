@@ -57,7 +57,7 @@ use membership::{
 };
 use metrics::{FrontendHostObservations, FrontendRuntimeMetrics};
 use novarocks_control_runtime::{
-    actor_turn::{ActorRuntime, Clock, PollerPool},
+    actor_turn::{ActorRuntime, ActorTurnError, Clock, PollerPool},
     history::HistoryCapture,
     observation::RuntimeObservation,
     transaction::{RuntimeError, RuntimeLedger},
@@ -84,10 +84,6 @@ pub(crate) enum FrontendControlStartError {
     Transport(String),
     Ledger(RuntimeError),
     Pollers(std::io::Error),
-}
-pub(crate) struct RegistrationRefusal {
-    pub(crate) host: HostRegistrationRefusal,
-    pub(crate) membership: Option<Arc<MembershipTarget>>,
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrontendShutdownSnapshot {
@@ -126,10 +122,25 @@ impl FrontendControlRuntime {
         prepared: PreparedAttemptHost,
     ) -> Result<AttemptStartup, (HostRegistrationRefusal, AttemptStartup)> {
         let PreparedAttemptHost { binding, startup } = prepared;
-        match self.register(binding, None) {
+        match self.register(binding) {
             Ok(()) => Ok(startup),
-            Err(refusal) => Err((refusal.host, startup)),
+            Err(refusal) => Err((refusal, startup)),
         }
+    }
+
+    fn register(&self, binding: HostBinding) -> Result<(), HostRegistrationRefusal> {
+        let open = self
+            .registration_open
+            .lock()
+            .expect("frontend registration gate");
+        if !*open {
+            return Err(HostRegistrationRefusal {
+                reason: "frontend registration is closed",
+                runtime_error: None,
+                binding,
+            });
+        }
+        self.host.register(binding)
     }
 
     pub(crate) fn start(
@@ -194,51 +205,41 @@ impl FrontendControlRuntime {
     pub(crate) fn memberships(&self) -> &Arc<MembershipRegistry> {
         &self.members
     }
-    /// The Source and both registrations already belong to the real admitted
-    /// attempt. This method indexes their originals; it allocates no Scope or
-    /// work credentials. Ordinary refusal returns every caller-owned object.
-    pub(crate) fn register(
+    /// The observer may deliver its initial snapshot immediately after
+    /// insertion. StartProtocol must have retired before opening the route.
+    pub(crate) fn open_attempt_membership(
         &self,
-        binding: HostBinding,
-        membership: Option<Arc<MembershipTarget>>,
-    ) -> Result<(), RegistrationRefusal> {
+        startup: &AttemptStartup,
+        target: Arc<MembershipTarget>,
+    ) -> Result<(), (ActorTurnError, Arc<MembershipTarget>)> {
         let open = self
             .registration_open
             .lock()
             .expect("frontend registration gate");
-        if !*open {
-            return Err(RegistrationRefusal {
-                host: HostRegistrationRefusal {
-                    reason: "frontend registration is closed",
-                    runtime_error: None,
-                    binding,
-                },
-                membership,
-            });
+        let admission = (|| {
+            if !*open {
+                return Err(ActorTurnError::Closed);
+            }
+            self.runtime.validate_registration(&target.registration)?;
+            if !startup.ready_for(&target.registration)? {
+                return Err(ActorTurnError::InputNotReserved);
+            }
+            let snapshot = self.runtime.snapshot(target.registration.actor())?;
+            if snapshot.failed {
+                return Err(ActorTurnError::ActorFailed);
+            }
+            if !snapshot.external_open || snapshot.sealed {
+                return Err(ActorTurnError::Closed);
+            }
+            Ok(())
+        })();
+        match admission {
+            Ok(()) => self
+                .members
+                .insert(target)
+                .map_err(|target| (ActorTurnError::InvalidConfig, target)),
+            Err(error) => Err((error, target)),
         }
-        if membership
-            .as_ref()
-            .is_some_and(|target| !target.registration.same_registration(&binding.registration))
-        {
-            return Err(RegistrationRefusal {
-                host: HostRegistrationRefusal {
-                    reason: "membership Source has another original registration",
-                    runtime_error: None,
-                    binding,
-                },
-                membership,
-            });
-        }
-        if let Err(host) = self.host.register(binding) {
-            return Err(RegistrationRefusal { host, membership });
-        }
-        if let Some(target) = membership {
-            self.members.insert(target).unwrap_or_else(|_| {
-                eprintln!("Frontend original membership routing installation failed");
-                std::process::abort()
-            });
-        }
-        Ok(())
     }
     pub(crate) fn metrics(&self, registry: &Registry) -> Result<FrontendRuntimeMetrics, String> {
         FrontendRuntimeMetrics::new(

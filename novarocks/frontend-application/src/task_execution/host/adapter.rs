@@ -24,6 +24,7 @@ use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding},
+        membership::{FrozenMember, MembershipTarget, membership_input},
     },
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
@@ -83,6 +84,8 @@ pub(crate) struct AttemptActorRegistration {
     scope: ScopeHandle,
     capacity_source: ActorId,
     observation_source: ActorId,
+    membership_source: ActorId,
+    members: Option<Arc<[FrozenMember]>>,
     root_control: RootControlBinding,
     ordered_bound: bool,
     startup_reserved: bool,
@@ -115,6 +118,7 @@ pub(crate) struct PreparedAttemptHost {
 /// retirement. The application opens external ingress after StartProtocol.
 #[must_use]
 pub(crate) struct AttemptStartup {
+    registration: ActorRegistration,
     input: StandingInputObligation<FrontendActor>,
     next: Option<AttemptInput>,
 }
@@ -143,6 +147,15 @@ impl AttemptStartup {
 
     pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
         self.input.close_after_exit()
+    }
+
+    pub(crate) fn ready_for(
+        &self,
+        registration: &ActorRegistration,
+    ) -> Result<bool, ActorTurnError> {
+        Ok(self.registration.same_registration(registration)
+            && self.next.is_none()
+            && self.input.in_flight()?.is_none())
     }
 }
 
@@ -220,7 +233,6 @@ impl AttemptActorRegistration {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         startup_work: &WorkObligation,
-        policy: FrontendLanePolicy,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
     ) -> Result<PreparedAttemptHost, (AttemptRegistrationError, Box<dyn EffectSource>)> {
@@ -252,11 +264,12 @@ impl AttemptActorRegistration {
                 registration: self.original.clone(),
                 kind: FrontendActorKind::Attempt,
                 config: self.config,
-                policy,
+                policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
                 source,
                 executor: executor.clone(),
             },
             startup: AttemptStartup {
+                registration: self.original.clone(),
                 input,
                 next: Some(AttemptInput::Bootstrap),
             },
@@ -265,6 +278,28 @@ impl AttemptActorRegistration {
 
     pub(crate) fn root_control_binding(&self) -> &RootControlBinding {
         &self.root_control
+    }
+
+    pub(crate) fn bind_membership(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+    ) -> Result<Arc<MembershipTarget>, AttemptRegistrationError> {
+        if self.members.is_none() || !self.scope.same_scope(work.scope()) {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "attempt membership requires its unused original roster and Work",
+            ));
+        }
+        let standing = self
+            .reserve_standing(runtime, self.membership_source, InputClass::Ordinary, work)
+            .map_err(AttemptRegistrationError::Runtime)?;
+        Ok(Arc::new(MembershipTarget::new(
+            self.original.clone(),
+            self.members
+                .take()
+                .expect("the original roster was checked"),
+            CoalescingInput::new(standing, membership_input),
+        )))
     }
 
     /// One original writer owns both mailbox classes for this registration.
@@ -431,6 +466,7 @@ impl AttemptActor {
     pub(crate) fn register(
         runtime: &ActorRuntime<FrontendActor>,
         start: AttemptStart,
+        members: &Arc<[FrozenMember]>,
         scope: ScopeHandle,
         capacity: NativeTransportCapacity,
         config: ActorConfig,
@@ -457,6 +493,16 @@ impl AttemptActor {
         let native = runtime_source(start.sources.native);
         let capacity_source = runtime_source(start.sources.capacity);
         let observation_source = runtime_source(start.sources.observation);
+        let membership_source = runtime_source(start.sources.membership);
+        if !members
+            .iter()
+            .map(|row| &row.participation)
+            .eq(start.plan.establish_material.keys())
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "attempt membership roster differs from the frozen participations",
+            ));
+        }
         let activation = start.activation.identity;
         let root = start.plan.graph.root;
         if activation.execution() != root.query_execution_id() {
@@ -490,6 +536,8 @@ impl AttemptActor {
             scope,
             capacity_source,
             observation_source,
+            membership_source,
+            members: Some(members.clone()),
             root_control,
             ordered_bound: false,
             startup_reserved: false,
