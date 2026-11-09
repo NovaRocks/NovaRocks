@@ -30,6 +30,7 @@ use novarocks_execution_contract::{
     TaskOperationId, TaskStatus, UpdateTaskReceipt,
 };
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -39,7 +40,7 @@ pub enum AckPayload {
     Create(Box<CreateTaskReceipt>),
     Update(UpdateTaskReceipt),
     Participation(ParticipationReceipt),
-    Quiesce(QuiesceParticipationReceipt),
+    Quiesce(Arc<QuiesceParticipationReceipt>),
     Release {
         receipt: ParticipationReceipt,
         outcome: ReleaseOutcome,
@@ -98,7 +99,7 @@ pub enum ObservationFact {
     Gone(TaskIdentity),
     ParticipationConvergence(ParticipationConvergenceReceipt),
     TaskConvergence(TaskConvergenceReceipt),
-    Quiesce(QuiesceParticipationReceipt),
+    Quiesce(Arc<QuiesceParticipationReceipt>),
     StatusUnchanged(TaskIdentity),
     TaskConvergenceUnchanged(TaskIdentity),
     Unknown(TaskIdentity),

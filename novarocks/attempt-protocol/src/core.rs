@@ -42,6 +42,7 @@ use crate::{
     input::{
         AttemptInputId, AttemptSourceCut, AttemptSourceId, ExecutorFact, ObservationBatch,
         ObservationEvent, ObservationFact, OperationObservation, PublicationApplied,
+        ReceivedObservation,
     },
     lease::RequestedLeaseDurations,
     observation::controller::ObservationDisposition,
@@ -108,6 +109,14 @@ pub(crate) enum AckSettlementProgress {
 pub(crate) struct SealedRootCut {
     pub(crate) root_before_seal: Option<AttemptRootProjection>,
     pub(crate) settlement: SealSettlement,
+}
+
+#[derive(Debug)]
+struct ObservationPass {
+    items: std::vec::IntoIter<ReceivedObservation>,
+    pending_quiesce: Option<ParticipationRef>,
+    sealed: Option<SealedRootCut>,
+    first_error: Option<TaskExecutionError>,
 }
 
 #[derive(Debug)]
@@ -429,62 +438,145 @@ impl Core {
         Ok(())
     }
 
-    /// The whole bounded primary claim has already been charged. Reconsider
-    /// the pending seal after each frame, before applying the next one.
+    /// Keep the bounded observation claim at its original position. Charge
+    /// each frame and derived membership row on the turn that applies it.
+    fn begin_observations(
+        &mut self,
+        now: MonotonicInstant,
+        source: AttemptSourceId,
+        batch: ObservationBatch,
+    ) -> Result<ObservationPass, TaskExecutionError> {
+        self.verify_common_observation_phase(source)?;
+        self.execution.set_now(now)?;
+        Ok(ObservationPass {
+            items: batch.into_items().into_vec().into_iter(),
+            pending_quiesce: None,
+            sealed: None,
+            first_error: None,
+        })
+    }
+
+    fn advance_observations(
+        &mut self,
+        now: MonotonicInstant,
+        pass: &mut ObservationPass,
+        context: &mut dyn StepContext,
+    ) -> Option<Option<SealedRootCut>> {
+        loop {
+            let result = if let Some(participation) = pass.pending_quiesce {
+                let completed = self.execution.advance_quiesce(context)?;
+                pass.pending_quiesce = None;
+                completed.and_then(|()| self.finish_observation(now, participation, true))
+            } else {
+                if pass.items.len() == 0 {
+                    break;
+                }
+                if !context.charge(1) {
+                    return None;
+                }
+                let observation = pass.items.next().expect("original observation frame");
+                let participation = observation.participation;
+                match self.apply_observation_item(now, observation) {
+                    Ok(()) if self.execution.has_pending_quiesce() => {
+                        pass.pending_quiesce = Some(participation);
+                        continue;
+                    }
+                    result => result,
+                }
+            };
+            if let Err(error) = result {
+                pass.first_error.get_or_insert(error);
+            }
+            if pass.first_error.is_none()
+                && let Some(seal) = self.evaluate_pending_seal()
+            {
+                pass.sealed = Some(seal);
+            }
+        }
+        if let Some(error) = pass.first_error.take() {
+            self.acknowledgements
+                .fail_round_tail(error)
+                .expect("an observation batch was admitted at the round tail");
+        }
+        Some(pass.sealed.take())
+    }
+
+    fn apply_observation_item(
+        &mut self,
+        now: MonotonicInstant,
+        observation: ReceivedObservation,
+    ) -> Result<(), TaskExecutionError> {
+        let participation = observation.participation;
+        let convergence_changed = matches!(
+            &observation.event,
+            ObservationEvent::Fact {
+                fact: ObservationFact::TaskConvergence(_)
+                    | ObservationFact::ParticipationConvergence(_),
+                ..
+            }
+        );
+        if let ObservationDisposition::ApplyEntity(accepted) =
+            self.subscriptions.observe(now, observation)?
+        {
+            let report = self.execution.apply_covered_observation(accepted)?;
+            if !self.execution.has_pending_quiesce() {
+                self.finish_observation(
+                    now,
+                    participation,
+                    report.accepted != 0 || convergence_changed,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_observation(
+        &mut self,
+        now: MonotonicInstant,
+        participation: ParticipationRef,
+        changed: bool,
+    ) -> Result<(), TaskExecutionError> {
+        if self.execution.needs_covered_subscription(participation) {
+            if changed {
+                self.subscriptions.applied(participation);
+            }
+        } else if self
+            .execution
+            .owner(participation)
+            .is_some_and(crate::participation_owner::ParticipationOwner::establish_acknowledged)
+        {
+            self.subscriptions.stop(now, participation)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_observations(
         &mut self,
         now: MonotonicInstant,
         source: AttemptSourceId,
         batch: ObservationBatch,
     ) -> Result<Option<SealedRootCut>, TaskExecutionError> {
-        self.verify_common_observation_phase(source)?;
-        self.execution.set_now(now)?;
-        let mut sealed = None;
-        let mut first_error = None;
-        for observation in batch.into_items() {
-            let participation = observation.participation;
-            let convergence_changed = matches!(
-                &observation.event,
-                ObservationEvent::Fact {
-                    fact: ObservationFact::TaskConvergence(_)
-                        | ObservationFact::ParticipationConvergence(_)
-                        | ObservationFact::Quiesce(_),
-                    ..
-                }
-            );
-            let result = self
-                .subscriptions
-                .observe(now, observation)
-                .and_then(|disposition| {
-                    if let ObservationDisposition::ApplyEntity(accepted) = disposition {
-                        let report = self.execution.apply_covered_observation(accepted)?;
-                        if self.execution.needs_covered_subscription(participation) {
-                            if report.accepted != 0 || convergence_changed {
-                                self.subscriptions.applied(participation);
-                            }
-                        } else if self.execution.owner(participation).is_some_and(
-                            crate::participation_owner::ParticipationOwner::establish_acknowledged,
-                        ) {
-                            self.subscriptions.stop(now, participation)?;
-                        }
-                    }
-                    Ok(())
-                });
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
+        struct Unlimited;
+        impl StepContext for Unlimited {
+            fn charge(&mut self, _: usize) -> bool {
+                true
             }
-            if first_error.is_none()
-                && let Some(seal) = self.evaluate_pending_seal()
-            {
-                sealed = Some(seal);
+            fn reserve_queue_stage(
+                &mut self,
+                _: crate::config::DispatchLane,
+                _: bool,
+                _: novarocks_types::BackendProcessId,
+                _: usize,
+                _: usize,
+            ) -> crate::capacity::QueueStage {
+                panic!("common observation cannot reserve transport")
             }
         }
-        if let Some(error) = first_error {
-            self.acknowledgements
-                .fail_round_tail(error)
-                .expect("an observation batch was admitted at the round tail");
-        }
-        Ok(sealed)
+        let mut pass = self.begin_observations(now, source, batch)?;
+        Ok(self
+            .advance_observations(now, &mut pass, &mut Unlimited)
+            .expect("unlimited observation fixture budget"))
     }
 
     /// Read confirmation has its own prepaid source, independent of the
@@ -1723,6 +1815,191 @@ mod tests {
             started(),
         );
         assert_eq!(next.selection, InputSelection::Only(sources.observation));
+    }
+
+    #[test]
+    fn quiesce_continuation_keeps_the_native_suffix_and_common_frames_behind_its_original_cut() {
+        use crate::{
+            AttemptCore,
+            execution::ack_phase::emit_quiesce,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_execution_contract::{ParticipationState, QuiesceParticipationReceipt};
+        use std::sync::Arc;
+
+        let start = start();
+        let now = start.initial_now;
+        let later = now.saturating_add(Duration::from_secs(1));
+        let sources = start.sources;
+        let mut core = Core::new(start).unwrap();
+        let root = core.execution.graph().root_identity();
+        let participation = core
+            .execution
+            .graph()
+            .task(root.task_id())
+            .unwrap()
+            .participation();
+        let receipt = Arc::new(QuiesceParticipationReceipt::new(
+            participation,
+            1,
+            vec![root],
+            ParticipationState::Quiescing,
+        ));
+        let ack = emit_quiesce(&mut core.execution, Arc::clone(&receipt));
+        let native_tail = AttemptInputId(id(4));
+        let claim = |source, value| AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(value)),
+            native_cut: Some(AttemptSourceCut {
+                source: sources.native,
+                tail: Some(native_tail),
+            }),
+            selected_cut: None,
+        };
+
+        core.handle(
+            now,
+            claim(sources.actor, 1),
+            AttemptInput::Bootstrap,
+            &mut Units(1),
+        )
+        .unwrap();
+        core.handle(
+            now,
+            claim(sources.actor, 2),
+            AttemptInput::Timer,
+            &mut Units(1),
+        )
+        .unwrap();
+        let primary = core
+            .handle(
+                now,
+                claim(sources.native, 3),
+                AttemptInput::Executor(ExecutorFact::Operation(ack)),
+                &mut Units(1),
+            )
+            .unwrap();
+        assert_eq!(primary.selection, InputSelection::Only(sources.actor));
+        assert!(core.execution.has_pending_quiesce());
+        assert!(
+            !core
+                .execution
+                .task(root.task_id())
+                .unwrap()
+                .create_ownership_proven()
+        );
+        let suffix = || {
+            AttemptInput::Executor(ExecutorFact::SendStarted {
+                effect: AttemptActionId::new(id(500)),
+                started_at: later,
+            })
+        };
+        assert!(
+            core.handle(later, claim(sources.native, 4), suffix(), &mut Units(1))
+                .is_err()
+        );
+
+        let mut selection = primary.selection;
+        for n in 10..32 {
+            if selection == InputSelection::Only(sources.native) {
+                break;
+            }
+            selection = core
+                .handle(
+                    later,
+                    claim(sources.actor, n),
+                    AttemptInput::Timer,
+                    &mut Units(2),
+                )
+                .unwrap()
+                .selection;
+        }
+        assert_eq!(selection, InputSelection::Only(sources.native));
+        assert_eq!(core.execution.monotonic_now(), now);
+        assert!(
+            core.execution
+                .task(root.task_id())
+                .unwrap()
+                .create_ownership_proven()
+        );
+        assert!(!core.execution.has_pending_quiesce());
+        let after_suffix = core
+            .handle(later, claim(sources.native, 4), suffix(), &mut Units(1))
+            .unwrap();
+        assert_eq!(
+            after_suffix.selection,
+            InputSelection::Only(sources.observation)
+        );
+
+        let trailing = frame(&mut core, root, TaskState::Running, None);
+        let mut quiesce = trailing.clone();
+        quiesce.event = ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Quiesce(receipt),
+        };
+        let batch = ObservationBatch::new(vec![quiesce, trailing]).unwrap();
+        let first = core
+            .handle(
+                later,
+                claim(sources.observation, 40),
+                AttemptInput::Executor(ExecutorFact::Observations(batch)),
+                &mut Units(2),
+            )
+            .unwrap();
+        assert!(core.execution.has_pending_quiesce());
+        assert_eq!(first.selection, InputSelection::Only(sources.actor));
+        assert!(
+            core.execution
+                .task(root.task_id())
+                .unwrap()
+                .status()
+                .is_none()
+        );
+        let seal = AttemptInput::Port(LogicalToAttempt {
+            activation: core.activation,
+            body: LogicalToAttemptBody::SealRequest {
+                token: AttemptRequestToken::new(id(700)),
+            },
+        });
+        assert!(
+            core.handle(later, claim(sources.observation, 41), seal, &mut Units(1))
+                .is_err()
+        );
+
+        let mut timers = 0;
+        for n in 42..64 {
+            if !core.execution.has_pending_quiesce() {
+                break;
+            }
+            core.handle(
+                later,
+                claim(sources.actor, n),
+                AttemptInput::Timer,
+                &mut Units(2),
+            )
+            .unwrap();
+            timers += 1;
+        }
+        assert!(timers > 1);
+        assert!(!core.execution.has_pending_quiesce());
+        assert!(
+            core.execution
+                .task(root.task_id())
+                .unwrap()
+                .status()
+                .is_none()
+        );
+        core.handle(
+            later,
+            claim(sources.actor, 64),
+            AttemptInput::Timer,
+            &mut Units(2),
+        )
+        .unwrap();
+        assert_eq!(
+            core.execution.task(root.task_id()).unwrap().task_state(),
+            TaskState::Running
+        );
     }
 
     #[test]

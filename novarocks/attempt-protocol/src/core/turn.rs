@@ -70,6 +70,8 @@ enum Phase {
     Bootstrap,
     Idle,
     Native,
+    NativeQuiesce,
+    Observations,
     Common {
         source_ready: bool,
     },
@@ -98,6 +100,8 @@ pub(super) struct Turn {
     phase: Phase,
     next: u64,
     root: Option<RootWork>,
+    observation: Option<super::ObservationPass>,
+    latest_input_time: Option<MonotonicInstant>,
     local_exited: bool,
     reported_local_exit: bool,
     reported_remote_closure: bool,
@@ -131,9 +135,24 @@ impl AttemptCore for Core {
         input: AttemptInput,
         context: &mut dyn StepContext,
     ) -> Result<AttemptStep, TaskExecutionError> {
-        self.execution.set_now(now)?;
+        if now
+            < self
+                .turn
+                .latest_input_time
+                .unwrap_or_else(|| self.execution.monotonic_now())
+        {
+            return Err(schedule("attempt time regressed"));
+        }
+        self.turn.latest_input_time = Some(now);
+        // A derived continuation keeps the time of its original primary
+        // input, including the following prepaid frames in the same batch.
+        let now = if matches!(self.turn.phase, Phase::NativeQuiesce | Phase::Observations) {
+            self.execution.monotonic_now()
+        } else {
+            self.execution.set_now(now)?;
+            now
+        };
         let units = match &input {
-            AttemptInput::Executor(ExecutorFact::Observations(batch)) => batch.items().len(),
             AttemptInput::Executor(ExecutorFact::Withdrawn { .. }) => self
                 .maximum_send_members
                 .checked_mul(2)
@@ -180,7 +199,9 @@ impl AttemptCore for Core {
             {
                 None
             }
-            Phase::Terminal(_) => Some(self.execution.monotonic_now()),
+            Phase::Terminal(_) | Phase::NativeQuiesce | Phase::Observations => {
+                Some(self.execution.monotonic_now())
+            }
             Phase::Idle if self.stop.pending() && !self.authorizations.waiting_for_reply() => {
                 Some(self.execution.monotonic_now())
             }
@@ -239,7 +260,9 @@ impl Core {
     fn input_selection(&self) -> InputSelection {
         use InputSelection::{Only, Prefer};
         match self.turn.phase {
-            Phase::Bootstrap | Phase::Root => Only(self.sources.actor),
+            Phase::Bootstrap | Phase::Root | Phase::NativeQuiesce | Phase::Observations => {
+                Only(self.sources.actor)
+            }
             Phase::Native => Only(self.sources.native),
             Phase::Common { .. } => Only(self.sources.observation),
             Phase::AwaitRoot(_) | Phase::AwaitSeal { .. } => Only(self.sources.publication),
@@ -330,7 +353,7 @@ impl Core {
                     self.begin_native_prefix(now, cut)?;
                     self.turn.phase = Phase::Native;
                     if !timer {
-                        self.consume_native(now, claim, input, result)?;
+                        self.consume_native(now, claim, input, context, result)?;
                     }
                     return Ok(());
                 }
@@ -358,13 +381,25 @@ impl Core {
                     return Ok(());
                 }
                 if claim.source == self.sources.observation {
-                    self.consume_common(now, claim, input, result)?;
+                    self.consume_common(now, claim, input, context, result)?;
                 } else {
                     self.consume_independent(now, claim, input, result)?;
                 }
             }
+            Phase::NativeQuiesce if timer => self.drive_native_quiesce(context)?,
+            Phase::Observations if timer => {
+                let pass = self
+                    .turn
+                    .observation
+                    .take()
+                    .expect("selected observation continuation");
+                self.drive_observation_pass(now, pass, context)?;
+            }
+            Phase::NativeQuiesce | Phase::Observations => {
+                return Err(schedule("input crossed its original Quiesce continuation"));
+            }
             Phase::Native if timer => {}
-            Phase::Native => self.consume_native(now, claim, input, result)?,
+            Phase::Native => self.consume_native(now, claim, input, context, result)?,
             Phase::Common { .. } if timer => {
                 let cut = claim
                     .selected_cut
@@ -377,7 +412,7 @@ impl Core {
                     self.select_root(seal);
                 }
             }
-            Phase::Common { .. } => self.consume_common(now, claim, input, result)?,
+            Phase::Common { .. } => self.consume_common(now, claim, input, context, result)?,
             Phase::Root if timer => self.drive_root(context, result)?,
             Phase::AwaitRoot(_) if timer => {}
             Phase::AwaitRoot(expected) => {
@@ -734,6 +769,7 @@ impl Core {
         now: MonotonicInstant,
         claim: AttemptInputClaim,
         input: AttemptInput,
+        context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         let AttemptInput::Executor(fact) = input else {
@@ -784,8 +820,28 @@ impl Core {
                 body,
             });
         }
-        if self.acknowledgements.selected_source().is_none() {
+        if self.execution.has_pending_quiesce() {
+            self.turn.phase = Phase::NativeQuiesce;
+            self.drive_native_quiesce(context)?;
+        } else if self.acknowledgements.selected_source().is_none() {
             self.enter_common_or_skip()?;
+        }
+        Ok(())
+    }
+
+    fn drive_native_quiesce(
+        &mut self,
+        context: &mut dyn StepContext,
+    ) -> Result<(), TaskExecutionError> {
+        if let Some(result) = self.execution.advance_quiesce(context) {
+            self.acknowledgements
+                .complete_deferred_ack(result)
+                .map_err(|_| schedule("Quiesce lost its original Native prefix"))?;
+            if self.acknowledgements.selected_source().is_some() {
+                self.turn.phase = Phase::Native;
+            } else {
+                self.enter_common_or_skip()?;
+            }
         }
         Ok(())
     }
@@ -807,11 +863,13 @@ impl Core {
         now: MonotonicInstant,
         claim: AttemptInputClaim,
         input: AttemptInput,
+        context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         let seal = match input {
             AttemptInput::Executor(ExecutorFact::Observations(batch)) => {
-                self.apply_observations(now, claim.source, batch)?
+                let pass = self.begin_observations(now, claim.source, batch)?;
+                return self.drive_observation_pass(now, pass, context);
             }
             AttemptInput::Port(port) => {
                 let RootControlApplication {
@@ -831,6 +889,28 @@ impl Core {
             }
             _ => return Err(schedule("observation Source supplied an unrelated input")),
         };
+        self.finish_common(seal)
+    }
+
+    fn drive_observation_pass(
+        &mut self,
+        now: MonotonicInstant,
+        mut pass: super::ObservationPass,
+        context: &mut dyn StepContext,
+    ) -> Result<(), TaskExecutionError> {
+        if let Some(seal) = self.advance_observations(now, &mut pass, context) {
+            self.finish_common(seal)
+        } else {
+            self.turn.observation = Some(pass);
+            self.turn.phase = Phase::Observations;
+            Ok(())
+        }
+    }
+
+    fn finish_common(
+        &mut self,
+        seal: Option<super::SealedRootCut>,
+    ) -> Result<(), TaskExecutionError> {
         if self.acknowledgements.run_round_tail() == Ok(true) || seal.is_some() {
             self.select_root(seal);
         } else {

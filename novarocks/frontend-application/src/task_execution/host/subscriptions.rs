@@ -773,7 +773,7 @@ fn project_event(event: CoveredStatusStreamEvent) -> ObservationEvent {
             ObservationFact::ParticipationConvergence(value)
         }
         CoveredStatusStreamFact::TaskConvergence(value) => ObservationFact::TaskConvergence(value),
-        CoveredStatusStreamFact::Quiesce(value) => ObservationFact::Quiesce(value),
+        CoveredStatusStreamFact::Quiesce(value) => ObservationFact::Quiesce(Arc::new(value)),
         CoveredStatusStreamFact::StatusUnchanged(value) => ObservationFact::StatusUnchanged(value),
         CoveredStatusStreamFact::TaskConvergenceUnchanged(value) => {
             ObservationFact::TaskConvergenceUnchanged(value)

@@ -125,7 +125,7 @@ fn failed_quiesce_and_release_do_not_publish_participation_convergence() {
     let quiesce = owner.quiesce_intent(&mut ids).unwrap();
     assert_owner_failure(
         owner
-            .on_quiesce_ack(&failed(quiesce.operation_id(), quiesce.kind()))
+            .take_quiesce_ack(&failed(quiesce.operation_id(), quiesce.kind()))
             .unwrap_err(),
     );
     assert_eq!(owner.state(), ParticipationState::Active);

@@ -1773,12 +1773,15 @@ fn observation_charge(event: &ObservationEvent, encoded: usize) -> usize {
         ObservationEvent::Fact {
             fact: ObservationFact::Quiesce(receipt),
             ..
-        } => receipt
-            .accepted_tasks()
-            .len()
-            .saturating_mul(std::mem::size_of::<
-                novarocks_execution_contract::TaskIdentity,
-            >()),
+        } => {
+            let receipt_layout = novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<novarocks_execution_contract::QuiesceParticipationReceipt>(
+                ),
+            );
+            receipt_layout
+                .map_or(usize::MAX, |layout| layout.size())
+                .saturating_add(std::mem::size_of_val(receipt.accepted_tasks()))
+        }
         _ => 0,
     };
     std::mem::size_of::<ReceivedObservation>().saturating_add(encoded.max(dynamic))

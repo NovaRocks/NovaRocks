@@ -27,6 +27,7 @@
 pub(crate) mod ack_phase;
 mod create_admission;
 mod lifecycle_admission;
+mod quiesce;
 mod task_update;
 pub(crate) use lifecycle_admission::{ReleaseCheck, ReleaseProgress};
 pub(crate) use task_update::EdgeAdmissionProgress;
@@ -112,7 +113,7 @@ struct CoveredParticipationObservation {
     source_cut: u64,
     actual_stopped: BTreeMap<TaskIdentity, TaskConvergenceReceipt>,
     participation_convergence: Option<ParticipationConvergenceReceipt>,
-    quiesce: Option<QuiesceParticipationReceipt>,
+    quiesce: Option<Arc<QuiesceParticipationReceipt>>,
     /// An accepted fact that could not establish its task's required terminal
     /// evidence. Only a later complete catch-up with positive facts clears it.
     missing_terminal: BTreeSet<TaskIdentity>,
@@ -402,6 +403,7 @@ pub struct QueryTaskExecution {
     pending_update_grants: BTreeMap<crate::input::SendGeneration, QueuedInputGrantRef>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_granted: BTreeSet<TaskOperationId>,
+    quiesce_pass: Option<quiesce::QuiescePass>,
     lifecycle_deadlines: lifecycle_admission::LifecycleDeadlines,
     lifecycle_unknown: BTreeMap<TaskOperationId, lifecycle_admission::UnknownLifecycleSend>,
     create_admissions: BTreeMap<TaskOperationId, create_admission::CreateAdmission>,
@@ -670,6 +672,7 @@ impl QueryTaskExecution {
             pending_update_grants: BTreeMap::new(),
             operation_targets: BTreeMap::new(),
             create_granted: BTreeSet::new(),
+            quiesce_pass: None,
             lifecycle_deadlines: Default::default(),
             lifecycle_unknown: BTreeMap::new(),
             create_admissions: BTreeMap::new(),
@@ -1864,9 +1867,8 @@ impl QueryTaskExecution {
                 owner.on_participation_ack(ack)
             }
             OperationKind::QuiesceParticipation => {
-                let receipt = owner.on_quiesce_ack(ack)?;
-                if let Some(receipt) = receipt {
-                    self.apply_quiesce_membership(participation, &receipt)?;
+                if let Some((receipt, install)) = owner.take_quiesce_ack(ack)? {
+                    self.begin_ack_quiesce(participation, receipt, install)?;
                 }
                 Ok(())
             }
@@ -1892,64 +1894,45 @@ impl QueryTaskExecution {
         }
     }
 
+    fn apply_quiesce_task(
+        &mut self,
+        participation: ParticipationRef,
+        identity: TaskIdentity,
+        accepted: bool,
+    ) -> Result<(), TaskExecutionError> {
+        self.apply_prior_withdrawal(identity)?;
+        let (result, was_fenced_out, fenced_out) = {
+            let mut task = self
+                .task_by_identity(identity)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            let was_fenced_out = task.fenced_out();
+            let result = task.on_quiesce_membership(accepted);
+            (result, was_fenced_out, task.fenced_out())
+        };
+        // The local terminal aggregate survives an early error; physical
+        // convergence and the outer business failure remain separate.
+        self.settle_task_drain(identity.stage_id(), identity.task_id());
+        let became_owned = result?;
+        let owner = self
+            .owners
+            .get_mut(&participation)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        if became_owned {
+            owner.note_create_owned();
+        } else if fenced_out && !was_fenced_out {
+            owner.note_create_fenced_out();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn apply_quiesce_membership(
         &mut self,
         participation: ParticipationRef,
-        receipt: &novarocks_execution_contract::QuiesceParticipationReceipt,
+        receipt: &QuiesceParticipationReceipt,
     ) -> Result<(), TaskExecutionError> {
-        let accepted = receipt
-            .accepted_tasks()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if accepted.len() != receipt.accepted_tasks().len() {
-            return Err(TaskExecutionError::DomainReceipt(
-                "quiesce membership contains duplicate task identities".to_owned(),
-            ));
-        }
-        for &identity in &accepted {
-            let Some(task) = self.task_by_identity(identity) else {
-                return Err(TaskExecutionError::DomainReceipt(format!(
-                    "quiesce membership names an unscheduled task {identity}"
-                )));
-            };
-            if task.participation() != participation {
-                return Err(TaskExecutionError::DomainReceipt(format!(
-                    "quiesce membership names task {identity} in another participation"
-                )));
-            }
-        }
-        let count = self
-            .tasks_by_participation
-            .get(&participation)
-            .ok_or(TaskExecutionError::UnknownOperation)?
-            .len();
-        for index in 0..count {
-            let identity = self.tasks_by_participation[&participation][index];
-            self.apply_prior_withdrawal(identity)?;
-            let (result, was_fenced_out, fenced_out) = {
-                let mut task = self
-                    .task_by_identity(identity)
-                    .ok_or(TaskExecutionError::UnknownOperation)?;
-                let was_fenced_out = task.fenced_out();
-                let result = task.on_quiesce_membership(accepted.contains(&identity));
-                (result, was_fenced_out, task.fenced_out())
-            };
-            // The local terminal aggregate survives an early error; physical
-            // convergence and the outer business failure remain separate.
-            self.settle_task_drain(identity.stage_id(), identity.task_id());
-            let became_owned = result?;
-            let owner = self
-                .owners
-                .get_mut(&participation)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            if became_owned {
-                owner.note_create_owned();
-            } else if fenced_out && !was_fenced_out {
-                owner.note_create_fenced_out();
-            }
-        }
-        Ok(())
+        self.begin_ack_quiesce(participation, Arc::new(receipt.clone()), false)?;
+        self.finish_quiesce_for_test()
     }
 
     /// Applies an exact transport send fact on the same serial owner as ACKs.
@@ -2234,29 +2217,9 @@ impl QueryTaskExecution {
                 report.ignored += 1;
             }
             CoveredStatusStreamFact::Quiesce(receipt) => {
-                if receipt.participation() != participation {
-                    return Err(TaskExecutionError::Schedule(
-                        "Quiesce observation names another participation".to_owned(),
-                    ));
-                }
-                if let Some(previous) = &self.covered_observation[&participation].quiesce
-                    && (previous.fence_version() != receipt.fence_version()
-                        || previous.accepted_tasks() != receipt.accepted_tasks())
-                {
-                    return Err(TaskExecutionError::Schedule(
-                        "Quiesce observation changed its accepted membership".to_owned(),
-                    ));
-                }
-                self.apply_quiesce_membership(participation, &receipt)?;
-                self.owners
-                    .get_mut(&participation)
-                    .expect("validated participation")
-                    .observe_quiesce(&receipt)?;
-                self.covered_observation
-                    .get_mut(&participation)
-                    .unwrap()
-                    .quiesce = Some(receipt);
+                self.begin_observed_quiesce(participation, receipt, gap_before, deadline_before)?;
                 report.ignored += 1;
+                return Ok(());
             }
             CoveredStatusStreamFact::StatusUnchanged(identity) => {
                 self.verify_covered_task(participation, identity)?;
@@ -2355,10 +2318,20 @@ impl QueryTaskExecution {
                 report.ignored += 1;
             }
         }
+        self.finish_covered_frame(participation, gap_before, deadline_before);
+        Ok(())
+    }
+
+    fn finish_covered_frame(
+        &mut self,
+        participation: ParticipationRef,
+        gap_before: bool,
+        deadline_before: Option<MonotonicInstant>,
+    ) {
         self.covered_observation
             .get_mut(&participation)
             .unwrap()
-            .update_coverage_debt(now);
+            .update_coverage_debt(self.now);
         let state = &self.covered_observation[&participation];
         if state.gap_pending() {
             self.covered_gaps.insert(participation);
@@ -2378,7 +2351,6 @@ impl QueryTaskExecution {
                 self.covered_gap_deadlines.insert((deadline, participation));
             }
         }
-        Ok(())
     }
 
     fn verify_covered_task(
@@ -3701,15 +3673,19 @@ mod bounded_drain_tests {
                     quiesce.operation_id(),
                     OperationKind::QuiesceParticipation,
                     OperationOutcome::Accepted,
-                    Some(AckPayload::Quiesce(QuiesceParticipationReceipt::new(
-                        receiver,
-                        1,
-                        vec![root],
-                        ParticipationState::Quiescing,
+                    Some(AckPayload::Quiesce(Arc::new(
+                        QuiesceParticipationReceipt::new(
+                            receiver,
+                            1,
+                            vec![root],
+                            ParticipationState::Quiescing,
+                        ),
                     ))),
                 ),
             )
             .unwrap();
+
+        execution.finish_quiesce_for_test().unwrap();
 
         let mut proof = ReleaseCheck::default();
         assert!(matches!(

@@ -25,7 +25,7 @@
 //! update, or one whose outcome is unknown, from silently stopping the
 //! liveness contract of a healthy backend.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::lease::{RenewSchedule, RequestedLeaseDurations};
 use crate::operation::{FrontendAction, OperationDispatchResult, frontend_action};
@@ -203,7 +203,7 @@ pub struct ParticipationOwner {
     released_outputs: usize,
     quiesce: Option<QuiesceParticipation>,
     quiesce_in_flight: bool,
-    quiesce_receipt: Option<QuiesceParticipationReceipt>,
+    quiesce_receipt: Option<Arc<QuiesceParticipationReceipt>>,
     release: Option<ReleaseParticipation>,
     release_in_flight: bool,
     release_blocked_at: Option<u64>,
@@ -615,10 +615,10 @@ impl ParticipationOwner {
 
     /// Settles the exact normal fence, retaining its complete cumulative
     /// membership until Release. No task is inferred absent from silence.
-    pub fn on_quiesce_ack(
+    pub(crate) fn take_quiesce_ack(
         &mut self,
         ack: &OperationAcknowledgement,
-    ) -> Result<Option<QuiesceParticipationReceipt>, TaskExecutionError> {
+    ) -> Result<Option<(Arc<QuiesceParticipationReceipt>, bool)>, TaskExecutionError> {
         if !self.quiesce_in_flight
             || self
                 .quiesce
@@ -637,22 +637,12 @@ impl ParticipationOwner {
                 ));
             };
             self.participation.verify_matches(receipt.participation())?;
-            if let Some(previous) = &self.quiesce_receipt
-                && (previous.fence_version() != receipt.fence_version()
-                    || previous.accepted_tasks() != receipt.accepted_tasks())
-            {
-                return Err(TaskExecutionError::DomainReceipt(
-                    "a replayed Quiesce changed its cumulative accepted set".to_owned(),
-                ));
-            }
-            self.state = receipt.state();
-            self.quiesce_receipt = Some(receipt.clone());
-            return Ok(Some(receipt.clone()));
+            return Ok(Some((Arc::clone(receipt), true)));
         }
         if let Some(receipt) = &self.quiesce_receipt {
             // A positive observation of this exact Worker fence is stronger
             // than a delayed negative result from an earlier send attempt.
-            return Ok(Some(receipt.clone()));
+            return Ok(Some((Arc::clone(receipt), false)));
         }
         if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
             return Ok(None);
@@ -679,31 +669,24 @@ impl ParticipationOwner {
         self.quiesce_receipt.is_some()
     }
 
-    /// Accepts the same complete Worker fence through the ordered observation
-    /// stream when the operation acknowledgement was lost. It does not retire
-    /// the transport's exact operation; a late acknowledgement still settles
-    /// that reservation against this immutable receipt.
-    pub(crate) fn observe_quiesce(
-        &mut self,
-        receipt: &QuiesceParticipationReceipt,
-    ) -> Result<(), TaskExecutionError> {
-        self.participation.verify_matches(receipt.participation())?;
+    pub(crate) fn quiesce_receipt(&self) -> Option<&Arc<QuiesceParticipationReceipt>> {
+        self.quiesce_receipt.as_ref()
+    }
+
+    /// The complete Worker fence from an ordered observation still belongs
+    /// to this exact original Quiesce, even if its unary receipt was lost.
+    pub(crate) fn verify_observed_quiesce(&self) -> Result<(), TaskExecutionError> {
         if self.quiesce.is_none() {
             return Err(TaskExecutionError::DomainReceipt(
                 "observed a Quiesce fence before this Participation issued one".to_owned(),
             ));
         }
-        if let Some(previous) = &self.quiesce_receipt
-            && (previous.fence_version() != receipt.fence_version()
-                || previous.accepted_tasks() != receipt.accepted_tasks())
-        {
-            return Err(TaskExecutionError::DomainReceipt(
-                "observed Quiesce conflicts with the settled fence".to_owned(),
-            ));
-        }
-        self.state = receipt.state();
-        self.quiesce_receipt = Some(receipt.clone());
         Ok(())
+    }
+
+    pub(crate) fn install_quiesce(&mut self, receipt: Arc<QuiesceParticipationReceipt>) {
+        self.state = receipt.state();
+        self.quiesce_receipt = Some(receipt);
     }
 
     /// The release request, once every local obligation has closed.

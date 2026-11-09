@@ -167,6 +167,17 @@ impl NativeAckPhase {
         Ok(action)
     }
 
+    pub(crate) fn complete_deferred_ack(
+        &mut self,
+        result: Result<(), TaskExecutionError>,
+    ) -> Result<(), AckPhaseError> {
+        if !matches!(self.phase, Phase::Prefix(_) | Phase::RoundTail) {
+            return Err(AckPhaseError::WrongPhase);
+        }
+        self.record_error(result);
+        Ok(())
+    }
+
     fn record_error(&mut self, result: Result<(), TaskExecutionError>) {
         if let Err(error) = result {
             self.first_error.get_or_insert(error);
@@ -243,7 +254,7 @@ impl NativeAckPhase {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{admission_intent, dispatch_admission, queue_establish};
+pub(crate) use tests::{admission_intent, dispatch_admission, emit_quiesce, queue_establish};
 
 #[cfg(test)]
 mod tests {
@@ -369,6 +380,46 @@ mod tests {
             OperationTarget::Participation(participation),
         );
         intent
+    }
+
+    pub(crate) fn emit_quiesce(
+        execution: &mut QueryTaskExecution,
+        receipt: std::sync::Arc<novarocks_execution_contract::QuiesceParticipationReceipt>,
+    ) -> OperationObservation {
+        let participation = receipt.participation();
+        let intent = execution
+            .owners
+            .get_mut(&participation)
+            .unwrap()
+            .quiesce_intent(&mut execution.ids)
+            .unwrap();
+        let operation = intent.operation_id();
+        let generation = SendGeneration::new(AttemptActionId::new(id(200)));
+        let grant = QueuedInputGrantRef::new(id(201), generation);
+        execution
+            .dispatcher
+            .enqueue_reserved(intent, execution.now, grant)
+            .unwrap();
+        execution
+            .operation_targets
+            .insert(operation, OperationTarget::Participation(participation));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution
+            .dispatcher
+            .accept_emitted(&batch, AttemptActionId::new(id(202)))
+            .unwrap();
+        OperationObservation {
+            generation,
+            reply: OperationReply {
+                operation_id: operation,
+                kind: OperationKind::QuiesceParticipation,
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: Some(AckPayload::Quiesce(receipt)),
+                }),
+            },
+        }
     }
 
     fn unexpected_abort(
