@@ -146,6 +146,14 @@ impl RemoteConvergence {
     pub(crate) fn mode(&self) -> Option<AttemptConvergenceMode> {
         self.mode
     }
+
+    pub(crate) fn upgrade_to_cleanup(&mut self) -> bool {
+        if self.mode == Some(AttemptConvergenceMode::Normal) && self.closure.is_none() {
+            self.mode = Some(AttemptConvergenceMode::Cleanup);
+            return true;
+        }
+        false
+    }
     pub(crate) fn closure(&self) -> Option<&Arc<AttemptConvergenceClosure>> {
         self.closure.as_ref()
     }

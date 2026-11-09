@@ -178,6 +178,7 @@ pub struct ParticipationOwner {
     requested_leases: RequestedLeaseDurations,
     admission: Option<ReleasedAdmission>,
     admission_remote_unknown: bool,
+    admission_cleanup_required: bool,
     admission_ticket: Option<GrantedAdmission>,
     admission_reissue_at: Option<MonotonicInstant>,
     admission_qualified: bool,
@@ -239,6 +240,7 @@ impl ParticipationOwner {
             requested_leases,
             admission: None,
             admission_remote_unknown: false,
+            admission_cleanup_required: false,
             admission_ticket: None,
             admission_reissue_at: None,
             admission_qualified: true,
@@ -342,6 +344,12 @@ impl ParticipationOwner {
             && self.establish.is_none()
             && !self.establish_acknowledged
             && self.admission_ticket.is_none()
+            && self
+                .admission
+                .as_ref()
+                .is_none_or(|row| !row.awaiting_outcome)
+            && !self.admission_remote_unknown
+            && !self.admission_cleanup_required
     }
 
     /// Whether this owner must keep renewing.
@@ -912,6 +920,12 @@ impl ParticipationOwner {
         let released = *released;
 
         if !self.admission_qualified {
+            // The normal lifecycle no longer adopts a grant, but a late
+            // grant or an unknown send can still own capacity on the Worker.
+            self.admission_cleanup_required |= ack.is_applied()
+                || ack.worker_outcome() == Some(OperationOutcome::OwnerFailed)
+                || ack.dispatch_result()
+                    == crate::operation::OperationDispatchResult::TransportUnknown;
             self.admission = None;
             return Ok(());
         }
@@ -928,6 +942,7 @@ impl ParticipationOwner {
                 // Stand down admission without manufacturing its release.
                 self.admission = None;
                 self.admission_qualified = false;
+                self.admission_cleanup_required = true;
                 return Err(self.owner_failure_error(ack));
             }
             self.fail_admission();
@@ -989,6 +1004,7 @@ impl ParticipationOwner {
     }
 
     fn defer_admission_reissue(&mut self, reissue_not_before: MonotonicInstant) {
+        self.admission_cleanup_required = true;
         self.admission = None;
         self.admission_ticket = None;
         self.admission_reissue_at = Some(reissue_not_before);
@@ -999,7 +1015,7 @@ impl ParticipationOwner {
         self.admission_ticket = None;
         self.admission_reissue_at = None;
         self.admission_qualified = false;
-        if !self.admission_remote_unknown {
+        if !self.admission_remote_unknown && !self.admission_cleanup_required {
             self.state = ParticipationState::TerminalRetained;
             self.released = true;
         }

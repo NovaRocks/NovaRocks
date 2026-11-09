@@ -285,6 +285,8 @@ impl AttemptCore for Core {
             Phase::Idle => [
                 self.next_round_deadline(),
                 self.next_observation_recovery_deadline(),
+                self.aborts
+                    .stand_down_deadline(self.execution.monotonic_now()),
                 self.candidates
                     .enabled
                     .then(|| self.execution.next_lifecycle_deadline())
@@ -409,6 +411,7 @@ impl Core {
                 }
                 if timer
                     && !self.aborts.has_pending()
+                    && !self.stand_down_due(now)
                     && !self.authorizations.close_needs_drive()
                     && self.convergence_due(now)
                     && (self.start_convergence_pass() || self.convergence_progress_ready())
@@ -642,17 +645,34 @@ impl Core {
                 LogicalToAttemptBody::Abort { action, request } => {
                     self.verify_owner_port(claim.source, port.activation)?;
                     let (admission, _) = self.turn.issue()?;
-                    self.aborts.begin(
-                        &self.execution,
-                        *action,
-                        *request,
-                        crate::input::SendGeneration::new(admission),
-                    )?;
+                    if self.aborts.taking_over() {
+                        result.abort_settlement = Some(self.abort_effect(
+                            AttemptToLogicalBody::AbortSettlement {
+                                abort_action: *action,
+                                generation: admission,
+                                receipt_generation: None,
+                                participation: request.participation(),
+                                operation_id: request.envelope().operation_id(),
+                                settlement: novarocks_coordination_contract::AbortIssueSettlement::DefinitelyUnsent,
+                            },
+                        )?);
+                    } else {
+                        self.aborts.begin(
+                            &self.execution,
+                            *action,
+                            *request,
+                            crate::input::SendGeneration::new(admission),
+                        )?;
+                    }
                 }
                 LogicalToAttemptBody::Stop { reason, failure } => {
                     self.verify_owner_port(claim.source, port.activation)?;
                     let first = self.terminal.stop_reason().is_none();
                     self.terminal.observe_stop(*reason, failure.clone());
+                    if self.terminal.requires_logical_failure_stand_down() {
+                        self.aborts.start_stand_down();
+                        self.turn.convergence_changed |= self.convergence.upgrade_to_cleanup();
+                    }
                     self.turn.cancellation_due |= first;
                     self.execution
                         .with_diagnostics(|collector, _| collector.stop_starting());
@@ -687,7 +707,7 @@ impl Core {
                         self.execution
                             .with_diagnostics(|collector, _| collector.stop_starting());
                     }
-                    let mode = if self.turn.split_failed {
+                    let mode = if self.turn.split_failed || self.aborts.taking_over() {
                         AttemptConvergenceMode::Cleanup
                     } else {
                         *mode
@@ -699,6 +719,7 @@ impl Core {
                     }
                     if self.turn.phase == Phase::Idle
                         && !self.stop.pending()
+                        && !self.stand_down_due(now)
                         && !self.authorizations.waiting_for_reply()
                         && (self.start_convergence_pass() || self.convergence_progress_ready())
                     {
@@ -802,6 +823,12 @@ impl Core {
                         .convergence
                         .next_deadline()
                         .is_some_and(|deadline| now.has_reached(deadline))))
+    }
+
+    fn stand_down_due(&self, now: MonotonicInstant) -> bool {
+        self.aborts
+            .stand_down_deadline(now)
+            .is_some_and(|deadline| now.has_reached(deadline))
     }
 
     fn start_convergence_pass(&mut self) -> bool {
@@ -1061,8 +1088,9 @@ impl Core {
                         }
                         Ok(())
                     })?;
-                    if let Some(operation) = abort {
-                        let body = self.aborts.unsent(operation)?;
+                    if let Some(operation) = abort
+                        && let Some(body) = self.aborts.unsent(operation, now)?
+                    {
                         result.abort_settlement = Some(self.abort_effect(body)?);
                     }
                 }
@@ -1100,8 +1128,10 @@ impl Core {
                     generation,
                     failure,
                 } => {
-                    if let Some(body) = self.aborts.admission_failed(operation, generation) {
-                        result.abort_settlement = Some(self.abort_effect(body)?);
+                    if let Some(settlement) = self.aborts.admission_failed(operation, generation) {
+                        if let Some(body) = settlement {
+                            result.abort_settlement = Some(self.abort_effect(body)?);
+                        }
                         self.request_stop(result);
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
@@ -1195,11 +1225,7 @@ impl Core {
     ) -> Result<(), TaskExecutionError> {
         if !self.turn.split_failed {
             self.turn.split_failed = true;
-            if let Some(deadline) = self.convergence.next_deadline() {
-                self.convergence
-                    .begin(AttemptConvergenceMode::Cleanup, deadline);
-                self.turn.convergence_changed = true;
-            }
+            self.turn.convergence_changed |= self.convergence.upgrade_to_cleanup();
             self.request_stop(result);
             self.round_failure.get_or_insert(failure);
             self.begin_round_tail(true)?;
@@ -1399,8 +1425,9 @@ impl Core {
             RoundTailStep::Effect(effect) => result.effect = Some(effect),
             RoundTailStep::ExpiredAbort { release, operation } => {
                 result.effect = Some(release);
-                let body = self.aborts.unsent(operation)?;
-                result.abort_settlement = Some(self.abort_effect(body)?);
+                if let Some(body) = self.aborts.unsent(operation, now)? {
+                    result.abort_settlement = Some(self.abort_effect(body)?);
+                }
                 result.definitely_unsent_abort = Some(operation);
             }
             RoundTailStep::RetiredAuthorization(operation) => {
@@ -1667,6 +1694,7 @@ impl Core {
         self.turn.phase = if !self.stop.pending() && self.authorizations.close_needs_drive() {
             Phase::ClosingGate
         } else if !self.stop.pending()
+            && !self.stand_down_due(self.execution.monotonic_now())
             && (self.start_convergence_pass() || self.convergence_progress_ready())
         {
             Phase::Converge

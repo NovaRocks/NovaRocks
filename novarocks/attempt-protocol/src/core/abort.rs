@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Route the logical owner's exact Abort through Native without taking its
-//! original submission, late settlement, or remote stand-down authority.
+//! Route the original Abort through Native. Only explicit logical-owner
+//! failure gives this attempt authority to issue stand-down operations.
 
 use crate::{
+    capacity::StepContext,
     effect::{EffectBody, OperationIntent, QueuedInputPayload},
     error::TaskExecutionError,
     execution::QueryTaskExecution,
@@ -26,13 +27,17 @@ use crate::{
     operation::OperationDispatchResult,
 };
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptActionId, AttemptToLogicalBody,
+    ABORT_RETRY_BACKOFF, AbortIssueSettlement, AttemptActionId, AttemptToLogicalBody,
+    MonotonicInstant,
 };
 use novarocks_execution_contract::{
-    AbortParticipation, OperationKind, OperationOutcome, ParticipationRef, ParticipationState,
-    TaskOperationId,
+    AbortCause, AbortParticipation, OperationKind, OperationOutcome, ParticipationRef,
+    ParticipationState, TaskOperationId,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use super::schedule;
 
@@ -46,7 +51,7 @@ enum Phase {
 
 #[derive(Clone, Copy, Debug)]
 struct Current {
-    action: AttemptActionId,
+    action: Option<AttemptActionId>,
     generation: SendGeneration,
     phase: Phase,
 }
@@ -56,12 +61,25 @@ struct Row {
     request: AbortParticipation,
     current: Option<Current>,
     unknown: Option<Current>,
+    actor_unknown: Option<Current>,
     closed: bool,
     failed_closed: bool,
+    generations: usize,
+    retry_at: Option<MonotonicInstant>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+enum StandDown {
+    Inactive,
+    Scanning(Option<ParticipationRef>),
+    Scanned,
+}
+
+#[derive(Debug)]
 pub(super) struct Aborts {
+    stand_down: StandDown,
+    limit: NonZeroUsize,
+    retries: BTreeSet<(MonotonicInstant, TaskOperationId)>,
     rows: BTreeMap<TaskOperationId, Row>,
     operations: BTreeMap<ParticipationRef, TaskOperationId>,
     granted: BTreeSet<TaskOperationId>,
@@ -76,6 +94,112 @@ pub(super) struct AbortResult<F> {
 }
 
 impl Aborts {
+    pub(super) fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            stand_down: StandDown::Inactive,
+            limit,
+            retries: BTreeSet::new(),
+            rows: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            granted: BTreeSet::new(),
+            pending: BTreeSet::new(),
+        }
+    }
+
+    pub(super) fn start_stand_down(&mut self) {
+        if matches!(self.stand_down, StandDown::Inactive) {
+            self.stand_down = StandDown::Scanning(None);
+        }
+    }
+
+    pub(super) fn taking_over(&self) -> bool {
+        !matches!(self.stand_down, StandDown::Inactive)
+    }
+
+    pub(super) fn stand_down_deadline(&self, now: MonotonicInstant) -> Option<MonotonicInstant> {
+        match self.stand_down {
+            StandDown::Inactive => None,
+            StandDown::Scanning(_) => Some(now),
+            StandDown::Scanned => self.retries.first().map(|&(at, _)| at),
+        }
+    }
+
+    /// Select at most one admission, preserving the charged frozen-row scan
+    /// and independent timed retries across yields.
+    pub(super) fn advance_stand_down(
+        &mut self,
+        execution: &mut QueryTaskExecution,
+        generation: SendGeneration,
+        context: &mut dyn StepContext,
+    ) -> Result<bool, TaskExecutionError> {
+        while let StandDown::Scanning(after) = self.stand_down {
+            let Some(participation) = execution.participation_after(after) else {
+                self.stand_down = StandDown::Scanned;
+                break;
+            };
+            if !context.charge(1) {
+                return Ok(false);
+            }
+            self.stand_down = StandDown::Scanning(Some(participation));
+            if !Self::still_requires_abort(execution, participation) {
+                continue;
+            }
+            if let Some(operation) = self.operations.get(&participation) {
+                let row = &self.rows[operation];
+                if row.retry_at.is_none() && self.can_issue(row) {
+                    self.begin_generation(row.request, None, generation)?;
+                    return Ok(true);
+                }
+                continue;
+            }
+            let operation = execution.issue_operation_id();
+            let request =
+                AbortParticipation::new(operation, participation, AbortCause::QueryFailed);
+            self.begin_generation(request, None, generation)?;
+            return Ok(true);
+        }
+        let now = execution.monotonic_now();
+        while let Some(&(at, operation)) = self.retries.first() {
+            if !self.taking_over() || !now.has_reached(at) {
+                break;
+            }
+            if !context.charge(1) {
+                return Ok(false);
+            }
+            self.retries.pop_first();
+            let row = self.rows.get_mut(&operation).expect("original retry row");
+            row.retry_at = None;
+            let request = row.request;
+            if self.can_issue(&self.rows[&operation])
+                && Self::still_requires_abort(execution, request.participation())
+            {
+                self.begin_generation(request, None, generation)?;
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    fn still_requires_abort(
+        execution: &QueryTaskExecution,
+        participation: ParticipationRef,
+    ) -> bool {
+        execution
+            .owner(participation)
+            .is_some_and(|owner| !owner.is_released())
+            && !execution.participation_never_established(participation)
+            && execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+    }
+
+    fn can_issue(&self, row: &Row) -> bool {
+        row.current.is_none()
+            && !row.closed
+            && !row.failed_closed
+            && row.generations < self.limit.get()
+    }
+
     pub(super) fn begin(
         &mut self,
         execution: &QueryTaskExecution,
@@ -83,10 +207,19 @@ impl Aborts {
         request: AbortParticipation,
         generation: SendGeneration,
     ) -> Result<(), TaskExecutionError> {
-        let participation = request.participation();
-        if execution.owner(participation).is_none() {
+        if execution.owner(request.participation()).is_none() {
             return Err(TaskExecutionError::UnknownOperation);
         }
+        self.begin_generation(request, Some(action), generation)
+    }
+
+    fn begin_generation(
+        &mut self,
+        request: AbortParticipation,
+        action: Option<AttemptActionId>,
+        generation: SendGeneration,
+    ) -> Result<(), TaskExecutionError> {
+        let participation = request.participation();
         let operation = request.envelope().operation_id();
         let original = self.operations.entry(participation).or_insert(operation);
         if *original != operation {
@@ -98,8 +231,11 @@ impl Aborts {
             request,
             current: None,
             unknown: None,
+            actor_unknown: None,
             closed: false,
             failed_closed: false,
+            generations: 0,
+            retry_at: None,
         });
         if row.request.participation() != participation
             || row.request.envelope() != request.envelope()
@@ -108,10 +244,12 @@ impl Aborts {
             || row.closed
             || row.failed_closed
         {
-            return Err(schedule(
-                "actor Abort cannot start another original generation",
-            ));
+            return Err(schedule("Abort cannot start another original generation"));
         }
+        if let Some(at) = row.retry_at.take() {
+            self.retries.remove(&(at, operation));
+        }
+        row.generations += 1;
         row.current = Some(Current {
             action,
             generation,
@@ -120,6 +258,15 @@ impl Aborts {
         self.pending
             .insert((generation.admission_effect(), operation));
         Ok(())
+    }
+
+    fn retry(&mut self, operation: TaskOperationId, at: MonotonicInstant) {
+        let row = self.rows.get_mut(&operation).expect("original Abort retry");
+        if !row.closed && !row.failed_closed && row.generations < self.limit.get() {
+            debug_assert!(row.retry_at.is_none());
+            row.retry_at = Some(at);
+            self.retries.insert((at, operation));
+        }
     }
 
     pub(super) fn has_pending(&self) -> bool {
@@ -215,7 +362,8 @@ impl Aborts {
     pub(super) fn unsent<F>(
         &mut self,
         operation: TaskOperationId,
-    ) -> Result<AttemptToLogicalBody<F>, TaskExecutionError> {
+        now: MonotonicInstant,
+    ) -> Result<Option<AttemptToLogicalBody<F>>, TaskExecutionError> {
         let row = self
             .rows
             .get_mut(&operation)
@@ -224,18 +372,16 @@ impl Aborts {
             .current
             .take()
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        Ok(settlement(
-            row.request,
-            current,
-            AbortIssueSettlement::DefinitelyUnsent,
-        ))
+        let settled = settlement(row.request, current, AbortIssueSettlement::DefinitelyUnsent);
+        self.retry(operation, now);
+        Ok(settled)
     }
 
     pub(super) fn admission_failed<F>(
         &mut self,
         operation: TaskOperationId,
         generation: SendGeneration,
-    ) -> Option<AttemptToLogicalBody<F>> {
+    ) -> Option<Option<AttemptToLogicalBody<F>>> {
         let row = self.rows.get_mut(&operation)?;
         let current = row
             .current
@@ -276,7 +422,8 @@ impl Aborts {
             }
             return result;
         }
-        if row.failed_closed {
+        let closing = closing_outcome(participation, reply);
+        if row.failed_closed && closing.is_none() {
             return result;
         }
 
@@ -295,11 +442,17 @@ impl Aborts {
             if current.is_some() {
                 row.current = None;
                 row.unknown = current;
-                result.settlement = Some(settlement(
-                    row.request,
-                    guard,
-                    AbortIssueSettlement::TransportUnknown,
-                ));
+                if guard.action.is_some() {
+                    row.actor_unknown = current;
+                }
+                result.settlement =
+                    settlement(row.request, guard, AbortIssueSettlement::TransportUnknown);
+                self.retry(
+                    operation,
+                    execution
+                        .monotonic_now()
+                        .saturating_add(ABORT_RETRY_BACKOFF),
+                );
             }
             return result;
         }
@@ -314,7 +467,9 @@ impl Aborts {
         }
 
         let held = row.current.take();
-        row.unknown = None;
+        if let Some(at) = row.retry_at.take() {
+            self.retries.remove(&(at, operation));
+        }
         if current.is_none()
             && let Some(held) = held
         {
@@ -335,24 +490,32 @@ impl Aborts {
                 Phase::Queued => None,
             };
         }
-        if let Some(outcome) = closing_outcome(participation, reply) {
+        if let Some(outcome) = closing {
             row.closed = true;
             result.domain = execution.observe_actor_abort_participation_closed(participation);
-            let mut settled = settlement(row.request, guard, AbortIssueSettlement::Worker(outcome));
-            if let AttemptToLogicalBody::AbortSettlement {
+            let settlement_guard = row
+                .actor_unknown
+                .filter(|actor| {
+                    guard.action.is_none() && observation.generation <= actor.generation
+                })
+                .unwrap_or(guard);
+            row.unknown = None;
+            row.actor_unknown = None;
+            let mut settled = settlement(
+                row.request,
+                settlement_guard,
+                AbortIssueSettlement::Worker(outcome),
+            );
+            if let Some(AttemptToLogicalBody::AbortSettlement {
                 receipt_generation, ..
-            } = &mut settled
+            }) = &mut settled
             {
                 *receipt_generation = Some(observation.generation.admission_effect());
             }
-            result.settlement = Some(settled);
+            result.settlement = settled;
         } else {
             row.failed_closed = true;
-            result.settlement = Some(settlement(
-                row.request,
-                guard,
-                AbortIssueSettlement::FailedClosed,
-            ));
+            result.settlement = settlement(row.request, guard, AbortIssueSettlement::FailedClosed);
             result.domain = Err(
                 if reply.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
                     TaskExecutionError::OperationFailed {
@@ -377,15 +540,15 @@ fn settlement<F>(
     request: AbortParticipation,
     current: Current,
     settlement: AbortIssueSettlement,
-) -> AttemptToLogicalBody<F> {
-    AttemptToLogicalBody::AbortSettlement {
-        abort_action: current.action,
+) -> Option<AttemptToLogicalBody<F>> {
+    Some(AttemptToLogicalBody::AbortSettlement {
+        abort_action: current.action?,
         generation: current.generation.admission_effect(),
         receipt_generation: None,
         participation: request.participation(),
         operation_id: request.envelope().operation_id(),
         settlement,
-    }
+    })
 }
 
 fn closing_outcome(
@@ -455,6 +618,154 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_received_after_production_stops_still_requires_abort() {
+        use crate::execution::ack_phase::{admission_intent, dispatch_admission};
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let participation = *execution.graph().participations().next().unwrap();
+        let admission = admission_intent(&mut execution, participation);
+        let late = dispatch_admission(&mut execution, admission, 1, OperationOutcome::Accepted);
+        execution.begin_terminal_cleanup();
+        while execution.has_pending_terminal_cleanup() {
+            execution.advance_terminal_cleanup(&mut Turn).unwrap();
+        }
+        execution.apply_dispatched_reply(&late).1.unwrap();
+        assert!(!execution.participation_never_established(participation));
+
+        let mut aborts = Aborts::new(NonZeroUsize::MIN);
+        aborts.start_stand_down();
+        let generation = SendGeneration::new(AttemptActionId::new(id(2)));
+        assert!(
+            aborts
+                .advance_stand_down(&mut execution, generation, &mut Turn)
+                .unwrap()
+        );
+        assert!(matches!(
+            aborts.admit_next().unwrap().body,
+            EffectBody::AdmitQueuedInput {
+                operation: OperationIntent::AbortParticipation(request),
+                ..
+            } if request.participation() == participation
+        ));
+        assert!(
+            aborts
+                .advance_stand_down(&mut execution, generation, &mut Turn)
+                .unwrap()
+        );
+        assert!(!aborts.has_pending());
+    }
+
+    #[test]
+    fn logical_owner_loss_retries_the_original_abort_under_a_new_grant() {
+        use crate::execution::ack_phase::{admission_intent, dispatch_admission};
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let participation = *execution.graph().participations().next().unwrap();
+        let admission = admission_intent(&mut execution, participation);
+        let accepted = dispatch_admission(&mut execution, admission, 1, OperationOutcome::Accepted);
+        execution.apply_dispatched_reply(&accepted).1.unwrap();
+
+        let operation = execution.issue_operation_id();
+        let request = AbortParticipation::new(operation, participation, AbortCause::QueryFailed);
+        let action = |n| AttemptActionId::new(id(n));
+        let generation = |n| SendGeneration::new(action(n));
+        let mut aborts = Aborts::new(NonZeroUsize::new(2).unwrap());
+        aborts
+            .begin(&execution, action(10), request, generation(2))
+            .unwrap();
+        aborts.admit_next().unwrap();
+        let grant = QueuedInputGrantRef::new(id(20), generation(2));
+        aborts.grant(&mut execution, operation, grant).unwrap();
+        assert!(matches!(
+            execution
+                .advance_send_batch(
+                    &mut BatchDispatchPass::new(),
+                    action(11),
+                    &mut Turn,
+                    |_| Ok(())
+                )
+                .unwrap(),
+            BatchDispatch::Ready(_)
+        ));
+        let unknown = OperationObservation {
+            generation: generation(2),
+            reply: OperationReply {
+                operation_id: operation,
+                kind: OperationKind::AbortParticipation,
+                result: OperationReplyResult::Local {
+                    result: LocalDispatchResult::TransportUnknown,
+                    failure: None,
+                    protocol_failure: None,
+                    detail: None,
+                },
+            },
+        };
+        let prior = aborts.observe::<AttemptFailure>(&mut execution, &unknown);
+        assert!(prior.settlement.is_some());
+        execution.apply_dispatched_reply(&unknown).1.unwrap();
+        aborts.start_stand_down();
+        assert!(
+            aborts
+                .advance_stand_down(&mut execution, generation(3), &mut Turn)
+                .unwrap()
+        );
+        assert!(!aborts.has_pending());
+        let now = execution.monotonic_now();
+        let retry = now.saturating_add(ABORT_RETRY_BACKOFF);
+        assert_eq!(aborts.stand_down_deadline(now), Some(retry));
+        execution.set_now(retry).unwrap();
+        assert!(
+            aborts
+                .advance_stand_down(&mut execution, generation(4), &mut Turn)
+                .unwrap()
+        );
+        assert!(matches!(
+            aborts.admit_next().unwrap().body,
+            EffectBody::AdmitQueuedInput {
+                operation: OperationIntent::AbortParticipation(replayed),
+                generation: physical,
+                payload: QueuedInputPayload::AlreadyRetained,
+                ..
+            } if replayed.envelope() == request.envelope() && physical == generation(4)
+        ));
+        assert!(
+            aborts
+                .observe::<AttemptFailure>(&mut execution, &unknown)
+                .settlement
+                .is_none()
+        );
+        let closing = OperationObservation {
+            generation: generation(2),
+            reply: OperationReply {
+                operation_id: operation,
+                kind: OperationKind::AbortParticipation,
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: Some(AckPayload::Participation(ParticipationReceipt::new(
+                        participation,
+                        ParticipationState::Aborting,
+                    ))),
+                }),
+            },
+        };
+        let resolved = aborts.observe::<AttemptFailure>(&mut execution, &closing);
+        resolved.domain.unwrap();
+        assert!(
+            matches!(resolved.cleanup, Some(EffectBody::Withdraw { effect }) if effect == action(4))
+        );
+        assert!(
+            matches!(resolved.settlement, Some(AttemptToLogicalBody::AbortSettlement {
+            abort_action, receipt_generation: Some(original), ..
+        }) if abort_action == action(10) && original == action(2))
+        );
+        assert!(
+            execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+        assert_eq!(aborts.stand_down_deadline(retry), None);
+    }
+
+    #[test]
     fn definitive_older_abort_withdraws_pending_replay_without_reusing_grant() {
         let mut execution = crate::test_support::execution_with_strict_input();
         let participation = *execution.graph().participations().next().unwrap();
@@ -462,7 +773,7 @@ mod tests {
         let request = AbortParticipation::new(operation, participation, AbortCause::QueryFailed);
         let action = |n| AttemptActionId::new(id(n));
         let generation = |n| SendGeneration::new(action(n));
-        let mut aborts = Aborts::default();
+        let mut aborts = Aborts::new(NonZeroUsize::new(3).unwrap());
         aborts
             .begin(&execution, action(10), request, generation(1))
             .unwrap();

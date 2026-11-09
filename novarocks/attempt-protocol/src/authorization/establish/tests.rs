@@ -33,6 +33,7 @@ fn gate(m: usize) -> EstablishAuthorization {
         AttemptAuthorizationLimits {
             activation,
             establish_per_participation: NonZeroUsize::new(m).unwrap(),
+            abort_per_participation: NonZeroUsize::new(m).unwrap(),
         },
         participation,
     )
@@ -473,6 +474,7 @@ fn registration_preallocates_before_original_operation_exists_and_binding_moves_
     let limits = AttemptAuthorizationLimits {
         activation,
         establish_per_participation: NonZeroUsize::new(3).unwrap(),
+        abort_per_participation: NonZeroUsize::new(3).unwrap(),
     };
     let storage = EstablishAuthorizationStorage::new(activation, limits, participation).unwrap();
     let capacity = storage.late.capacity();

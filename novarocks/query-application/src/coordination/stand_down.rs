@@ -35,9 +35,9 @@ use novarocks_execution_contract::{
 };
 use tokio::sync::{mpsc, watch};
 
-use novarocks_coordination_contract::{AttemptActivationIdentity, MonotonicInstant};
-
-const DEFAULT_ABORT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+use novarocks_coordination_contract::{
+    ABORT_RETRY_BACKOFF, AttemptActivationIdentity, MonotonicInstant,
+};
 
 /// Why the logical execution requires its remote participations to stand down.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -484,7 +484,7 @@ impl ParticipationStandDownLedger {
             started: false,
             cause: None,
             authorization_cursor: None,
-            retry_backoff: DEFAULT_ABORT_RETRY_BACKOFF,
+            retry_backoff: ABORT_RETRY_BACKOFF,
         })
     }
 
@@ -570,6 +570,10 @@ impl ParticipationStandDownLedger {
 
     pub(crate) const fn started(&self) -> bool {
         self.started
+    }
+
+    pub(crate) const fn authorization_limit(&self) -> NonZeroUsize {
+        self.max_authorizations_per_participation
     }
 
     pub(crate) fn is_successful_cleanup(&self) -> bool {
@@ -1550,7 +1554,7 @@ mod tests {
         ledger.drain_events_at(now).unwrap();
 
         assert!(ledger.authorize_next_at(now).unwrap().is_none());
-        let retry_at = now.saturating_add(DEFAULT_ABORT_RETRY_BACKOFF);
+        let retry_at = now.saturating_add(ABORT_RETRY_BACKOFF);
         assert_eq!(ledger.next_retry_at(), Some(retry_at));
         let before_retry = MonotonicInstant::from_origin(
             retry_at
@@ -1608,7 +1612,7 @@ mod tests {
         assert_eq!(clock_reads.get(), 1);
         assert_eq!(
             ledger.next_retry_at(),
-            Some(arrived_at.saturating_add(DEFAULT_ABORT_RETRY_BACKOFF))
+            Some(arrived_at.saturating_add(ABORT_RETRY_BACKOFF))
         );
     }
 

@@ -4662,6 +4662,7 @@ fn handle_command(
                 let limits = AttemptAuthorizationLimits {
                     activation,
                     establish_per_participation: attempt.establish.authorization_limit(),
+                    abort_per_participation: attempt.stand_down.authorization_limit(),
                 };
                 state.mark_running(&capability)?;
                 Ok(limits)
@@ -12934,6 +12935,7 @@ mod tests {
             AttemptAuthorizationLimits {
                 activation,
                 establish_per_participation: config.max_establish_authorizations_per_participation,
+                abort_per_participation: config.max_abort_authorizations_per_participation,
             },
         );
         let mut establish_error = None;

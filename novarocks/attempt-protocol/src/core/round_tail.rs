@@ -299,6 +299,17 @@ impl Core {
                 }
             }
             Phase::AbortGrants => {
+                if !self.round_tail.abort_admitted
+                    && !self.aborts.has_pending()
+                    && self.aborts.taking_over()
+                    && !self.aborts.advance_stand_down(
+                        &mut self.execution,
+                        crate::input::SendGeneration::new(action),
+                        context,
+                    )?
+                {
+                    return Ok(Some(RoundTailStep::Yield));
+                }
                 if !self.round_tail.abort_admitted && self.aborts.has_pending() {
                     if !context.charge(1) {
                         return Ok(Some(RoundTailStep::Yield));

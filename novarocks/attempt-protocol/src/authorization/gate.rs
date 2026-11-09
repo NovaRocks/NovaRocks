@@ -634,6 +634,7 @@ mod tests {
             AttemptAuthorizationLimits {
                 activation,
                 establish_per_participation: NonZeroUsize::new(2).unwrap(),
+                abort_per_participation: NonZeroUsize::new(2).unwrap(),
             },
             graph.participations().copied(),
         )
@@ -789,6 +790,7 @@ mod tests {
             AttemptAuthorizationLimits {
                 activation,
                 establish_per_participation: NonZeroUsize::new(2).unwrap(),
+                abort_per_participation: NonZeroUsize::new(2).unwrap(),
             },
             graph.participations().copied(),
         )

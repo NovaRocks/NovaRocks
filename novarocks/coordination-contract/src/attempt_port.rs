@@ -212,7 +212,10 @@ pub enum AttemptAuthorizationDecision {
 pub struct AttemptAuthorizationLimits {
     pub activation: AttemptActivationIdentity,
     pub establish_per_participation: std::num::NonZeroUsize,
+    pub abort_per_participation: std::num::NonZeroUsize,
 }
+
+pub const ABORT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Independent typed facts from the original QA call. The host does not
 /// combine its budget error with protocol history or infer recovery policy.

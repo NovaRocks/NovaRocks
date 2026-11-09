@@ -261,7 +261,7 @@ impl Core {
             round_failure: None,
             round_tail: RoundTail::default(),
             stop: stop::StopWithdrawals::default(),
-            aborts: abort::Aborts::default(),
+            aborts: abort::Aborts::new(authorization_limits.abort_per_participation),
             candidates: candidates::Candidates::default(),
             establish_material,
             retry,
@@ -950,6 +950,7 @@ mod tests {
                 authorization_limits: AttemptAuthorizationLimits {
                     activation: identity,
                     establish_per_participation: NonZeroUsize::new(3).unwrap(),
+                    abort_per_participation: NonZeroUsize::new(3).unwrap(),
                 },
                 writers: Default::default(),
                 summary_sources: Default::default(),
@@ -2894,7 +2895,7 @@ mod tests {
             .take(2)
             .copied()
             .collect();
-        for (index, part) in participants.into_iter().enumerate() {
+        for (index, &part) in participants.iter().enumerate() {
             let request = admission_intent(&mut core.execution, part);
             dispatch_admission(
                 &mut core.execution,
@@ -3002,18 +3003,35 @@ mod tests {
             None,
             None,
         );
-        for n in 121..125 {
-            if !matches!(
-                finished.effect,
+        let mut stand_down = None;
+        for n in 121..128 {
+            match &finished.effect {
                 Some(AttemptEffect {
                     body: EffectBody::ReleaseCreationPayload { .. },
                     ..
-                })
-            ) {
-                break;
+                }) => {}
+                Some(AttemptEffect {
+                    body:
+                        EffectBody::AdmitQueuedInput {
+                            operation: OperationIntent::AbortParticipation(request),
+                            ..
+                        },
+                    class: crate::effect::EffectClass::Settlement,
+                    ..
+                }) => {
+                    assert!(stand_down.replace(request.participation()).is_none());
+                    assert!(finished.abort_settlement.is_none());
+                }
+                _ => break,
             }
             finished = step(&mut core, sources.actor, n, AttemptInput::Timer, None, None);
         }
+        assert_eq!(stand_down, Some(participants[0]));
+        assert!(
+            core.execution
+                .participation_convergence_receipt(participants[0])
+                .is_none()
+        );
         assert_eq!(finished.round_result, Some(Ok(())));
         assert!(
             matches!(finished.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
