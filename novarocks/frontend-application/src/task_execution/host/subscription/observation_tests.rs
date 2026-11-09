@@ -41,7 +41,7 @@ use std::{
 };
 
 #[derive(Debug, Default)]
-struct ManualClock(Mutex<Duration>);
+pub(in crate::task_execution::host) struct ManualClock(Mutex<Duration>);
 impl MonotonicClock for ManualClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(*self.0.lock().unwrap())
@@ -174,7 +174,7 @@ struct BankState {
 }
 /// Test author uses the SAME existing Source byte window plus real bound CR
 /// positions. It adds NO ledger byte dimension or transport capacity claim.
-struct Bank {
+pub(in crate::task_execution::host) struct Bank {
     budget: ObservationBudget,
     state: Mutex<BankState>,
     original: Weak<Bank>,
@@ -189,7 +189,7 @@ struct Bank {
     progress_failed: std::sync::atomic::AtomicBool,
 }
 impl Bank {
-    fn make(
+    pub(in crate::task_execution::host) fn make(
         budget: ObservationBudget,
         mut slots: Vec<OwnedPositionObligation>,
         binding: RootControlBinding,
@@ -217,6 +217,29 @@ impl Bank {
                 claims: BTreeMap::new(),
             }),
         })
+    }
+
+    pub(in crate::task_execution::host) fn refuse_metadata_once(&self) {
+        self.metadata.lock().unwrap().refuse_acquisition_once = true;
+    }
+
+    pub(in crate::task_execution::host) fn retire_positions(&self) {
+        assert!(self.metadata.lock().unwrap().retired);
+        assert!(!self.metadata.lock().unwrap().unknown);
+        let mut bank = self.state.lock().unwrap();
+        assert_eq!(bank.used, 0);
+        assert_eq!(bank.control_used, 0);
+        assert!(bank.claims.is_empty());
+        assert_eq!(
+            bank.data.len() + bank.control.len(),
+            self.budget.total_positions
+        );
+        let mut slots = std::mem::take(&mut bank.data);
+        slots.extend(std::mem::take(&mut bank.control));
+        drop(bank);
+        for slot in slots {
+            slot.retire_after_exit().unwrap();
+        }
     }
     fn seal(&self) -> RootControlRef {
         let token = token(1);
@@ -343,6 +366,7 @@ impl Drop for Bytes {
 // metadata author for the real Entry/container/ActorInput backing.
 #[derive(Default)]
 struct TestMetadataRecord {
+    refuse_acquisition_once: bool,
     required: Option<ObservationMetadataLayout>,
     retired: bool,
     refuse_once: bool,
@@ -390,6 +414,9 @@ impl ObservationSourcePool for Bank {
         required: ObservationMetadataLayout,
     ) -> Result<Box<dyn ObservationMetadataObligation>, ObservationError> {
         let mut record = self.metadata.lock().unwrap();
+        if std::mem::take(&mut record.refuse_acquisition_once) {
+            return Err(ObservationError::Budget);
+        }
         assert!(record.required.replace(required).is_none());
         Ok(Box::new(TestMetadata {
             original: self.original.upgrade().unwrap(),
@@ -604,6 +631,7 @@ impl Fixture {
             standing(InputClass::Lifecycle),
             standing(InputClass::Control),
             bank.clone(),
+            bank.fixed_root_control_binding(),
             clock.clone(),
             |input| input,
             Waker::noop().clone(),
@@ -770,25 +798,7 @@ impl Fixture {
         self.close_progress();
         self.input.close_after_exit().unwrap();
         drop(self.input);
-        assert!(self.bank.metadata.lock().unwrap().retired);
-        assert!(!self.bank.metadata.lock().unwrap().unknown);
-        let mut bank = self.bank.state.lock().unwrap();
-        assert_eq!(bank.used, 0);
-        assert_eq!(bank.control_used, 0);
-        assert!(
-            bank.claims.is_empty(),
-            "all original Source return receipts actually consumed"
-        );
-        assert_eq!(
-            bank.data.len() + bank.control.len(),
-            self.bank.budget.total_positions
-        );
-        let mut slots = std::mem::take(&mut bank.data);
-        slots.extend(std::mem::take(&mut bank.control));
-        drop(bank);
-        for slot in slots {
-            slot.retire_after_exit().unwrap();
-        }
+        self.bank.retire_positions();
         self.work.body_exited().unwrap();
         self.work.captures_exited().unwrap();
         self.capacity.finish().unwrap();

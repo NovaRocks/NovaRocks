@@ -16,6 +16,10 @@
 // under the License.
 
 use super::*;
+use crate::task_execution::host::observations::{
+    ObservationBudget,
+    tests::{Bank, ManualClock},
+};
 use novarocks_attempt_protocol::{
     config::{CoordinationBudgets, FrozenTransportLimits},
     effect::Publication,
@@ -29,6 +33,7 @@ use novarocks_attempt_protocol::{
 use novarocks_control_runtime::{causal_input::CausalInputObligation, transaction::RuntimeLedger};
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
+    owned_storage::{OwnedSlotKind, OwnedSlotNeed},
     scope::WorkAdmission,
 };
 use novarocks_coordination_contract::{
@@ -177,6 +182,8 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let (mut original_work, mut original_capacity) = reserve(WorkKind::Settlement);
     original_work.start().unwrap();
     let start = start();
+    let activation = start.activation.identity;
+    let root = start.plan.graph.root;
     let target = start.plan.graph.root.backend_process_id();
     let sources = start.sources;
     let max_step_work = start.minimum_core_step_units().unwrap() + OUTPUT_UNITS;
@@ -222,10 +229,86 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         )
         .unwrap();
 
+    let budget = ObservationBudget {
+        queued_frames: 1,
+        total_positions: 3,
+        max_frame_bytes: 2048,
+        control_bytes: 512,
+        total_bytes: 2560,
+    };
+    let (mut observation_work, mut observation_capacity) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    observation_work.start().unwrap();
+    let positions = (0..budget.total_positions)
+        .map(|_| {
+            let mut slot = observation_capacity
+                .take_position(OwnedSlotKind::Input)
+                .unwrap();
+            slot.bind().unwrap();
+            slot
+        })
+        .collect();
+    let lookalike =
+        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
+    assert!(!registered.root_control_binding().same_original(&lookalike));
+    let pool = Bank::make(budget, positions, registered.root_control_binding().clone());
+    let clock = Arc::new(ManualClock::default());
+    let inventory = || runtime.standing_input_inventory(actor, None, 8).unwrap();
+    let before = inventory();
+    let mut bind = |source: Arc<dyn ObservationSourcePool>| {
+        registered.bind_observations(
+            &runtime,
+            &observation_work,
+            source,
+            clock.clone(),
+            Waker::noop().clone(),
+        )
+    };
+    pool.refuse_metadata_once();
+    assert!(matches!(bind(pool.clone()), Err(ObservationError::Budget)));
+    assert_eq!(inventory(), before);
+    let observations = bind(pool.clone()).unwrap();
+    assert!(matches!(bind(pool.clone()), Err(ObservationError::Busy)));
+    let [lifecycle, control] = observations.standing_ids().map(|id| {
+        inventory()
+            .into_iter()
+            .find(|row| row.standing_input_id == id)
+            .unwrap()
+    });
+    assert_eq!(lifecycle.source, runtime_source(sources.observation));
+    assert_eq!(control.source, lifecycle.source);
+    assert_eq!(lifecycle.class, InputClass::Lifecycle);
+    assert_eq!(control.class, InputClass::Control);
+
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
-    original
-        .fill_with_receipt(None, post(AttemptInput::Bootstrap))
-        .unwrap_or_else(|failure| panic!("original input fill: {:?}", failure.error));
+    let mut startup = AttemptStartup {
+        input: registered
+            .reserve_standing(&runtime, actor, InputClass::Lifecycle, &original_work)
+            .unwrap(),
+        next: Some(AttemptInput::Bootstrap),
+    };
+    let bootstrap = startup.advance().unwrap().unwrap();
+    assert_eq!(startup.input.in_flight().unwrap(), Some(bootstrap));
+    assert!(matches!(
+        startup.advance(),
+        Err(ActorTurnError::StandingInputBusy)
+    ));
+    assert!(matches!(startup.next, Some(AttemptInput::StartProtocol)));
     assert!(runtime.poll_one(Tick(1)).unwrap());
     for (_, input) in runtime.committed_batches(actor, None, 8).unwrap() {
         runtime.retire_input(actor, input).unwrap();
@@ -400,11 +483,17 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
 
     original_work.body_exited().unwrap();
     original_work.captures_exited().unwrap();
+    startup.close_after_exit().unwrap();
+    observation_work.body_exited().unwrap();
+    observation_work.captures_exited().unwrap();
+    observations.close_after_exit().unwrap();
+    pool.retire_positions();
     capacity_source.close_after_exit().unwrap();
     original.close_after_exit().unwrap();
     failure_work.body_exited().unwrap();
     failure_work.captures_exited().unwrap();
     original_capacity.finish().unwrap();
+    observation_capacity.finish().unwrap();
     failure_capacity.finish().unwrap();
     scope.close_external().unwrap();
     ledger.reap_scope_ready(scope.id(), 8).unwrap();

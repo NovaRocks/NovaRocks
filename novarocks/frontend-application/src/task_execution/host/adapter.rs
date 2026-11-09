@@ -17,8 +17,14 @@
 
 //! Bind the pure AttemptCore to the original FE actor turn and work authors.
 
+use super::observations::{
+    ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
+};
 use crate::{
-    control_runtime::actor::{FrontendActor, FrontendEffect, FrontendInput},
+    control_runtime::{
+        actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
+        host::{EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding},
+    },
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
     },
@@ -37,7 +43,9 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorStep, InputSourceCut},
-    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor},
+    actor_turn::{
+        ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, StandingInputObligation,
+    },
     capacity_notification::CapacityRegistrant,
     coalescing_input::{CoalescingInput, Merge},
     obligation::{ReservationObligation, StepRegistration, WorkObligation},
@@ -45,11 +53,11 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     effect::{EffectDescriptor, EffectKind},
-    identity::{ActionId, ActorId, Generation, ReservationId, ScopedWorkRef, Tick},
+    identity::{ActionId, ActorId, Generation, InputId, ReservationId, ScopedWorkRef, Tick},
     mailbox::{InputClass, InputEnvelope},
     scope::WorkKind,
 };
-use novarocks_coordination_contract::{LogicalToAttemptBody, MonotonicInstant};
+use novarocks_coordination_contract::{LogicalToAttemptBody, MonotonicClock, MonotonicInstant};
 use novarocks_execution_contract::TaskOperationId;
 use novarocks_types::BackendProcessId;
 use std::{
@@ -74,6 +82,11 @@ pub(crate) struct AttemptActorRegistration {
     pub(crate) original: ActorRegistration,
     scope: ScopeHandle,
     capacity_source: ActorId,
+    observation_source: ActorId,
+    root_control: RootControlBinding,
+    ordered_bound: bool,
+    startup_reserved: bool,
+    config: ActorConfig,
     binding: Arc<OnceLock<AttemptBinding>>,
 }
 
@@ -90,6 +103,47 @@ struct AttemptBinding {
     generation: Generation,
     queue_parent: ReservationId,
     capacity_registrant: Arc<CapacityRegistrant>,
+}
+
+#[must_use]
+pub(crate) struct PreparedAttemptHost {
+    pub(crate) binding: HostBinding,
+    pub(crate) startup: AttemptStartup,
+}
+
+/// One paid original Lifecycle position, reused only after actual input
+/// retirement. The application opens external ingress after StartProtocol.
+#[must_use]
+pub(crate) struct AttemptStartup {
+    input: StandingInputObligation<FrontendActor>,
+    next: Option<AttemptInput>,
+}
+impl AttemptStartup {
+    /// `Ok(None)` proves that the StartProtocol input has actually retired.
+    pub(crate) fn advance(&mut self) -> Result<Option<InputId>, ActorTurnError> {
+        if self.input.in_flight()?.is_some() {
+            return Err(ActorTurnError::StandingInputBusy);
+        }
+        let Some(next) = self.next.take() else {
+            return Ok(None);
+        };
+        let after = matches!(next, AttemptInput::Bootstrap).then_some(AttemptInput::StartProtocol);
+        match self.input.fill(FrontendInput::Attempt(Box::new(next))) {
+            Ok(input) => {
+                self.next = after;
+                Ok(Some(input))
+            }
+            Err((error, FrontendInput::Attempt(input))) => {
+                self.next = Some(*input);
+                Err(error)
+            }
+            Err(_) => unreachable!("failed startup returns its original input"),
+        }
+    }
+
+    pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
+        self.input.close_after_exit()
+    }
 }
 
 struct CapacityReleased;
@@ -162,6 +216,139 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    pub(crate) fn prepare_host(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        startup_work: &WorkObligation,
+        policy: FrontendLanePolicy,
+        source: Box<dyn EffectSource>,
+        executor: &Arc<dyn EffectExecutor>,
+    ) -> Result<PreparedAttemptHost, (AttemptRegistrationError, Box<dyn EffectSource>)> {
+        if self.startup_reserved
+            || !self.ordered_bound
+            || self.binding.get().is_none()
+            || !self.scope.same_scope(startup_work.scope())
+        {
+            return Err((
+                AttemptRegistrationError::InvalidConfig(
+                    "attempt startup requires its original bound Sources and Work",
+                ),
+                source,
+            ));
+        }
+        let input = match self.reserve_standing(
+            runtime,
+            self.original.actor(),
+            InputClass::Lifecycle,
+            startup_work,
+        ) {
+            Ok(input) => input,
+            Err(error) => return Err((AttemptRegistrationError::Runtime(error), source)),
+        };
+        self.startup_reserved = true;
+        Ok(PreparedAttemptHost {
+            binding: HostBinding {
+                scope: self.scope.clone(),
+                registration: self.original.clone(),
+                kind: FrontendActorKind::Attempt,
+                config: self.config,
+                policy,
+                source,
+                executor: executor.clone(),
+            },
+            startup: AttemptStartup {
+                input,
+                next: Some(AttemptInput::Bootstrap),
+            },
+        })
+    }
+
+    pub(crate) fn root_control_binding(&self) -> &RootControlBinding {
+        &self.root_control
+    }
+
+    /// One original writer owns both mailbox classes for this registration.
+    /// A later Control input therefore cannot overtake its Lifecycle prefix.
+    pub(crate) fn bind_observations(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        observation_work: &WorkObligation,
+        pool: Arc<dyn ObservationSourcePool>,
+        clock: Arc<dyn MonotonicClock>,
+        progress: Waker,
+    ) -> Result<OrderedObservationInput<FrontendActor>, ObservationError> {
+        if self.ordered_bound {
+            return Err(ObservationError::Busy);
+        }
+        if !self
+            .root_control
+            .same_original(&pool.fixed_root_control_binding())
+            || !self.scope.same_scope(observation_work.scope())
+        {
+            return Err(ObservationError::InvalidRootControl);
+        }
+        let mut observations = self
+            .reserve_standing(
+                runtime,
+                self.observation_source,
+                InputClass::Lifecycle,
+                observation_work,
+            )
+            .map_err(ObservationError::Runtime)?;
+        let controls = match self.reserve_standing(
+            runtime,
+            self.observation_source,
+            InputClass::Control,
+            observation_work,
+        ) {
+            Ok(controls) => controls,
+            Err(error) => {
+                observations
+                    .close_after_exit()
+                    .expect("unpublished observation position is unused");
+                return Err(ObservationError::Runtime(error));
+            }
+        };
+        let ingress = OrderedObservationInput::new(
+            observations,
+            controls,
+            pool,
+            self.root_control.clone(),
+            clock,
+            |input| FrontendInput::Attempt(Box::new(input)),
+            progress,
+        )
+        .map_err(|(error, mut observations, mut controls)| {
+            observations
+                .close_after_exit()
+                .expect("unpublished observation position is unused");
+            controls
+                .close_after_exit()
+                .expect("unpublished root-control position is unused");
+            error
+        })?;
+        self.ordered_bound = true;
+        Ok(ingress)
+    }
+
+    fn reserve_standing(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        source: ActorId,
+        class: InputClass,
+        work: &WorkObligation,
+    ) -> Result<StandingInputObligation<FrontendActor>, ActorTurnError> {
+        runtime
+            .reserve_admitted_input_for(&self.original, source, class, work)?
+            .into_standing_input()
+            .map_err(|(error, original)| {
+                original
+                    .revoke_unused()
+                    .expect("the unused input position can be revoked");
+                error
+            })
+    }
+
     /// Attach already admitted roles from this exact registration before
     /// opening protocol ingress. The caller continues to own their custody.
     pub(crate) fn bind(
@@ -210,22 +397,14 @@ impl AttemptActorRegistration {
                 .capacity_registrant(Waker::noop().clone())
                 .map_err(|error| Runtime(error.into()))?,
         );
-        let reserved = runtime
-            .reserve_admitted_input_for(
-                &self.original,
+        let standing = self
+            .reserve_standing(
+                runtime,
                 self.capacity_source,
                 InputClass::Ordinary,
                 capacity_work,
             )
             .map_err(Runtime)?;
-        let standing = reserved
-            .into_standing_input()
-            .map_err(|(error, original)| {
-                original
-                    .revoke_unused()
-                    .expect("the unused capacity position can be revoked");
-                Runtime(error)
-            })?;
         let input = CoalescingInput::new(standing, |_| FrontendInput::CapacityReleased);
         registrant.update_waker(&input.waker());
         assert!(
@@ -277,6 +456,14 @@ impl AttemptActor {
         let actor = runtime_source(start.sources.actor);
         let native = runtime_source(start.sources.native);
         let capacity_source = runtime_source(start.sources.capacity);
+        let observation_source = runtime_source(start.sources.observation);
+        let activation = start.activation.identity;
+        let root = start.plan.graph.root;
+        if activation.execution() != root.query_execution_id() {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "attempt root differs from its activation",
+            ));
+        }
         let binding = Arc::new(OnceLock::new());
         let core = Core::new(start).map_err(AttemptRegistrationError::Core)?;
         let adapter = Self {
@@ -295,10 +482,18 @@ impl AttemptActor {
                 native,
             )
             .map_err(|(error, _)| AttemptRegistrationError::Runtime(error))?;
+        let root_control =
+            RootControlBinding::for_registered_source(original.clone(), activation, root)
+                .expect("the registered root belongs to the same activation");
         Ok(AttemptActorRegistration {
             original,
             scope,
             capacity_source,
+            observation_source,
+            root_control,
+            ordered_bound: false,
+            startup_reserved: false,
+            config,
             binding,
         })
     }

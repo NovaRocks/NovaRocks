@@ -83,6 +83,9 @@ impl RootControlBinding {
     pub(crate) fn registration(&self) -> &ActorRegistration {
         &self.0.registration
     }
+    pub(crate) fn same_original(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     /// Only the original canonical owner issues this after installing the real
     /// request. The ref is passive; the owner must still validate its live row.
     pub(crate) fn reference(&self, token: AttemptRequestToken) -> RootControlRef {
@@ -604,40 +607,53 @@ impl<A: Actor> OrderedObservationInput<A> {
         observations: StandingInputObligation<A>,
         controls: StandingInputObligation<A>,
         source: Arc<dyn ObservationSourcePool>,
+        root_binding: RootControlBinding,
         clock: Arc<dyn MonotonicClock>,
         project: fn(AttemptInput) -> A::Input,
         progress: Waker,
-    ) -> Result<Self, ObservationError> {
+    ) -> Result<
+        Self,
+        (
+            ObservationError,
+            StandingInputObligation<A>,
+            StandingInputObligation<A>,
+        ),
+    > {
         let budget = source.budget();
-        budget.validate()?;
-        if observations
-            .in_flight()
-            .map_err(ObservationError::Runtime)?
-            .is_some()
-            || controls
+        let prepared = (|| {
+            budget.validate()?;
+            if observations
                 .in_flight()
                 .map_err(ObservationError::Runtime)?
                 .is_some()
-        {
-            return Err(ObservationError::Busy);
-        }
-        let root_binding = source.fixed_root_control_binding();
-        let metadata = source.retain_metadata(ObservationMetadataLayout {
-            entry: Layout::new::<Entry>(),
-            root_reference: Layout::new::<RootControlRef>(),
-            actor_input: Layout::new::<A::Input>(),
-            ap_projection: Layout::new::<AttemptInput>(),
-            logical_projection: Layout::new::<LogicalToAttempt<AttemptFailure>>(),
-            batch_item: Layout::new::<ReceivedObservation>(),
-            in_flight: Layout::new::<InFlight>(),
-            failed_fill: Layout::new::<FailedFill<A::Input>>(),
-            read_state: Layout::new::<ReadState>(),
-            read_confirmation: Layout::new::<ReadConfirmationFuture<'static, A>>(),
-            confirmation_waiter: Layout::new::<Notified<'static>>(),
-            read_progress: Layout::new::<ReadProgressSnapshot>(),
-            total_positions: budget.total_positions,
-            max_batch_items: ObservationBatch::MAX_ITEMS,
-        })?;
+                || controls
+                    .in_flight()
+                    .map_err(ObservationError::Runtime)?
+                    .is_some()
+            {
+                return Err(ObservationError::Busy);
+            }
+            source.retain_metadata(ObservationMetadataLayout {
+                entry: Layout::new::<Entry>(),
+                root_reference: Layout::new::<RootControlRef>(),
+                actor_input: Layout::new::<A::Input>(),
+                ap_projection: Layout::new::<AttemptInput>(),
+                logical_projection: Layout::new::<LogicalToAttempt<AttemptFailure>>(),
+                batch_item: Layout::new::<ReceivedObservation>(),
+                in_flight: Layout::new::<InFlight>(),
+                failed_fill: Layout::new::<FailedFill<A::Input>>(),
+                read_state: Layout::new::<ReadState>(),
+                read_confirmation: Layout::new::<ReadConfirmationFuture<'static, A>>(),
+                confirmation_waiter: Layout::new::<Notified<'static>>(),
+                read_progress: Layout::new::<ReadProgressSnapshot>(),
+                total_positions: budget.total_positions,
+                max_batch_items: ObservationBatch::MAX_ITEMS,
+            })
+        })();
+        let metadata = match prepared {
+            Ok(metadata) => metadata,
+            Err(error) => return Err((error, observations, controls)),
+        };
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
                 streams: BTreeMap::new(),
@@ -1789,4 +1805,4 @@ fn observation_charge(event: &ObservationEvent, encoded: usize) -> usize {
 
 #[cfg(test)]
 #[path = "subscription/observation_tests.rs"]
-mod tests;
+pub(super) mod tests;

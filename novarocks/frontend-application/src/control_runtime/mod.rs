@@ -49,6 +49,7 @@ pub(crate) mod metrics;
 use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
+use crate::task_execution::host::adapter::{AttemptStartup, PreparedAttemptHost};
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostRegistrationRefusal, HostRegistry};
 use membership::{
@@ -118,6 +119,19 @@ pub(crate) struct FrontendControlRuntime {
     host_observation: Arc<FrontendHostObservations>,
 }
 impl FrontendControlRuntime {
+    /// Install the real host route before the application can post Bootstrap.
+    /// Refusal returns the Source and its still-unpublished original position.
+    pub(crate) fn register_attempt(
+        &self,
+        prepared: PreparedAttemptHost,
+    ) -> Result<AttemptStartup, (HostRegistrationRefusal, AttemptStartup)> {
+        let PreparedAttemptHost { binding, startup } = prepared;
+        match self.register(binding, None) {
+            Ok(()) => Ok(startup),
+            Err(refusal) => Err((refusal.host, startup)),
+        }
+    }
+
     pub(crate) fn start(
         config: FrontendControlRuntimeConfig,
         data: &FrontendDataRuntime,
