@@ -185,6 +185,17 @@ impl Core {
         if split_sources.next().is_some() {
             return Err(schedule("more than one original split profile Source"));
         }
+        let mut dynamic_sources = pumps.iter().filter_map(|(source, kind)| {
+            matches!(kind, crate::effect::PumpKind::DynamicFilters).then_some(*source)
+        });
+        let dynamic_source = dynamic_sources.next();
+        if dynamic_sources.next().is_some()
+            || dynamic_source.is_some() && dynamic_source == split_source
+        {
+            return Err(schedule(
+                "dynamic filter feedback differs from its original Source",
+            ));
+        }
         let authorizations = AuthorizationGate::new(
             activation.identity,
             authorization_limits,
@@ -225,6 +236,7 @@ impl Core {
         }
         execution.activate_covered_observation();
         execution.bind_split_pump(split_source);
+        execution.bind_dynamic_feedback(dynamic_source);
         let acknowledgements = NativeAckPhase::new(native, mailbox)
             .map_err(|_| schedule("invalid Native acknowledgement mailbox geometry"))?;
         Ok(Self {
@@ -1830,6 +1842,103 @@ mod tests {
             started(),
         );
         assert_eq!(next.selection, InputSelection::Only(sources.observation));
+    }
+
+    #[test]
+    fn dynamic_feedback_waits_for_protocol_publication_and_does_not_park_the_round() {
+        use super::round_tail::RoundTailStep;
+        use crate::{effect::PumpKind, input::PublicationApplied};
+        use novarocks_execution_contract::{DomainVersion, DynamicFilterAdvertisement};
+
+        let mut core = round();
+        let now = core.execution.monotonic_now();
+        let root = core.execution.graph().root_identity();
+        let pump = PayloadRef(id(901));
+        core.execution.bind_dynamic_feedback(Some(pump));
+        core.candidates.enabled = true;
+        let mut advertised = frame(&mut core, root, TaskState::Running, None);
+        let ObservationEvent::Fact {
+            fact: ObservationFact::Status(status),
+            ..
+        } = &mut advertised.event
+        else {
+            panic!("original task status");
+        };
+        *status = status
+            .clone()
+            .with_dynamic_filters(DynamicFilterAdvertisement::new(DomainVersion::FIRST, 1));
+        core.apply_observations(
+            now,
+            core.observation_source,
+            ObservationBatch::new(vec![advertised]).unwrap(),
+        )
+        .unwrap();
+        core.begin_round_tail(true).unwrap();
+
+        let advance = |core: &mut Core, n| {
+            core.advance_round_tail(
+                now,
+                AttemptActionId::new(id(n)),
+                AttemptRequestToken::new(id(n)),
+                &mut Units(32),
+            )
+            .unwrap()
+        };
+        let RoundTailStep::Effect(AttemptEffect {
+            id: publication,
+            body: EffectBody::Publish(crate::effect::Publication::ProtocolBatch(_)),
+            ..
+        }) = advance(&mut core, 51)
+        else {
+            panic!("publication precedes feedback")
+        };
+        assert!(matches!(
+            advance(&mut core, 52),
+            RoundTailStep::AwaitPublication
+        ));
+        core.protocol_publication_applied(
+            publication,
+            Ok(PublicationApplied::ProtocolBatch { published: true }),
+        );
+        let mut n = 53;
+        loop {
+            match advance(&mut core, n) {
+                RoundTailStep::Effect(AttemptEffect {
+                    body:
+                        EffectBody::StartPump {
+                            pump: exact,
+                            kind: PumpKind::DynamicFilters,
+                        },
+                    ..
+                }) => {
+                    assert_eq!(exact, pump);
+                    break;
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    body:
+                        EffectBody::OpenSubscription(_)
+                        | EffectBody::AdjustReadWindow(_)
+                        | EffectBody::CloseSubscription { .. }
+                        | EffectBody::ReleaseCreationPayload { .. },
+                    ..
+                }) => {}
+                other => {
+                    panic!(
+                        "expected cleanup or subscription progress before the feedback pump: {other:?}"
+                    )
+                }
+            }
+            n += 1;
+            assert!(n < 60, "bounded cleanup and subscription progress");
+        }
+        assert!(matches!(advance(&mut core, n + 1),
+            RoundTailStep::Effect(AttemptEffect {
+                body: EffectBody::ReadDynamicFilters { request, task, acknowledged: None, advertised, .. }, ..
+            }) if request == AttemptRequestToken::new(id(n + 1)) && task == root && advertised == DomainVersion::FIRST));
+        assert!(matches!(
+            advance(&mut core, n + 2),
+            RoundTailStep::Complete(Ok(()))
+        ));
     }
 
     #[test]

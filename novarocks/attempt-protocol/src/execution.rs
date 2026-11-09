@@ -26,6 +26,7 @@
 
 pub(crate) mod ack_phase;
 mod create_admission;
+mod dynamic_feedback;
 mod lifecycle_admission;
 mod quiesce;
 mod split;
@@ -401,6 +402,7 @@ pub struct QueryTaskExecution {
     /// the edge tracker emits each close member and each open only once.
     edge_control_effects: BTreeMap<TaskIdentity, VecDeque<EdgeControlEffect>>,
     split: split::SplitDeliveries,
+    dynamic_feedback: dynamic_feedback::DynamicFeedback,
     task_input_cleanup: BTreeSet<TaskIdentity>,
     pending_update_grants:
         BTreeMap<crate::input::SendGeneration, (QueuedInputGrantRef, TaskOperationId)>,
@@ -672,6 +674,7 @@ impl QueryTaskExecution {
             deployment_window: BTreeMap::new(),
             edge_control_effects: BTreeMap::new(),
             split: Default::default(),
+            dynamic_feedback: Default::default(),
             task_input_cleanup: BTreeSet::new(),
             pending_update_grants: BTreeMap::new(),
             operation_targets: BTreeMap::new(),
@@ -911,6 +914,12 @@ impl QueryTaskExecution {
         identity: TaskIdentity,
     ) -> Result<(), TaskExecutionError> {
         let task_id = identity.task_id();
+        let advertised = self
+            .task(task_id)
+            .and_then(RemoteTask::status)
+            .and_then(TaskStatus::dynamic_filters)
+            .map(|advertisement| advertisement.version());
+        self.note_dynamic_advertisement(identity, advertised);
         if !self
             .accepted_protocol_writer_evidence
             .contains_key(&task_id)

@@ -182,7 +182,21 @@ impl AttemptCore for Core {
             retired_authorization: None,
             round_result: None,
         };
+        let dynamic_progress = matches!(
+            &input,
+            AttemptInput::Membership(_)
+                | AttemptInput::CapacityReleased
+                | AttemptInput::Executor(
+                    ExecutorFact::Operation(_)
+                        | ExecutorFact::Observations(_)
+                        | ExecutorFact::ReadProgress(_)
+                        | ExecutorFact::SubscriptionProgress(_)
+                )
+        );
         self.apply_claim(now, claim, input, context, &mut result)?;
+        if dynamic_progress {
+            self.execution.signal_dynamic_feedback_progress();
+        }
         result.selection = self.input_selection();
         Ok(result)
     }
@@ -225,6 +239,15 @@ impl AttemptCore for Core {
             Phase::Candidates if self.authorizations.waiting_for_reply() => None,
             Phase::Candidates => Some(self.execution.monotonic_now()),
             Phase::Idle if self.candidates.wake && !self.stop.business_closed() => {
+                Some(self.execution.monotonic_now())
+            }
+            Phase::Idle
+                if self.execution.has_dynamic_feedback_work(
+                    self.candidates.enabled
+                        && !self.stop.business_closed()
+                        && !self.execution.normal_drain_started(),
+                ) =>
+            {
                 Some(self.execution.monotonic_now())
             }
             Phase::Idle if self.aborts.has_pending() => Some(self.execution.monotonic_now()),
@@ -1007,6 +1030,33 @@ impl Core {
                         generation,
                         Some(&failure),
                     ) || self.execution.close_create_admission(operation, generation)
+                    {
+                        self.round_failure.get_or_insert(failure);
+                        self.begin_round_tail(true)?;
+                        self.turn.phase = Phase::Tail;
+                    }
+                }
+                ExecutorFact::DynamicFiltersRead {
+                    request,
+                    task,
+                    result,
+                } => {
+                    if let Some(failure) =
+                        self.execution.observe_dynamic_read(request, task, result)
+                    {
+                        self.round_failure.get_or_insert(failure);
+                        self.begin_round_tail(true)?;
+                        self.turn.phase = Phase::Tail;
+                    }
+                }
+                ExecutorFact::DynamicFilterFeedbackAdmitted {
+                    request,
+                    task,
+                    result,
+                } => {
+                    if let Some(failure) = self
+                        .execution
+                        .observe_dynamic_admission(request, task, result)
                     {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;

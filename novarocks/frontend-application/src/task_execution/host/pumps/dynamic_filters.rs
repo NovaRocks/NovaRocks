@@ -335,6 +335,7 @@ impl DynamicFilterRecords {
             .lock()
             .expect("dynamic read canonical records")
             .closing = true;
+        self.feedback.close();
     }
     /// The Source moves returned records to its existing disposal executor.
     /// No rich payload or original error is dropped while holding this lock.

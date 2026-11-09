@@ -47,6 +47,7 @@ enum Phase {
     QueueExpiry,
     Dispatch,
     Subscriptions,
+    DynamicFeedback,
     BeginSettlement,
     Settle,
 }
@@ -392,10 +393,26 @@ impl Core {
                 }
             }
             Phase::Subscriptions => match self.advance_subscription(now, action, token, context)? {
-                SubscriptionStep::Idle => self.round_tail.phase = Phase::BeginSettlement,
+                SubscriptionStep::Idle => self.round_tail.phase = Phase::DynamicFeedback,
                 SubscriptionStep::Yield => return Ok(Some(RoundTailStep::Yield)),
                 SubscriptionStep::Effect(effect) => return Ok(Some(RoundTailStep::Effect(effect))),
             },
+            Phase::DynamicFeedback => {
+                let running = self.candidates.enabled
+                    && !self.stop.business_closed()
+                    && !self.execution.normal_drain_started();
+                if self.execution.has_dynamic_feedback_work(running) {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    let effect = self
+                        .execution
+                        .advance_dynamic_feedback(running, action, token)
+                        .expect("selected original dynamic feedback");
+                    return Ok(Some(RoundTailStep::Effect(effect)));
+                }
+                self.round_tail.phase = Phase::BeginSettlement;
+            }
             Phase::BeginSettlement => {
                 self.begin_ack_settlement(None)?;
                 self.round_tail.phase = Phase::Settle;
