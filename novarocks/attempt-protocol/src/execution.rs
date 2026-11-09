@@ -3286,7 +3286,14 @@ mod bounded_drain_tests {
         }
     }
     fn grant(value: u64) -> QueuedInputGrantRef {
-        QueuedInputGrantRef(NonZeroU64::new(value).unwrap())
+        QueuedInputGrantRef::new(
+            NonZeroU64::new(value).unwrap(),
+            crate::input::SendGeneration::new(
+                novarocks_coordination_contract::AttemptActionId::new(
+                    NonZeroU64::new(value).unwrap(),
+                ),
+            ),
+        )
     }
     fn many_tasks(count: u32) -> QueryTaskExecution {
         let seed = crate::test_support::remote(1);
@@ -3996,7 +4003,7 @@ mod bounded_drain_tests {
             while let Some(grant) = execution.dispatcher.take_released_grant() {
                 returned.push(grant);
             }
-            returned.sort_by_key(|grant| grant.0);
+            returned.sort_by_key(|grant| grant.record());
             assert_eq!(
                 returned,
                 if destination_close {
@@ -4083,7 +4090,7 @@ mod bounded_drain_tests {
         while let Some(grant) = execution.dispatcher.take_released_grant() {
             grants.push(grant);
         }
-        grants.sort_by_key(|grant| grant.0);
+        grants.sort_by_key(|grant| grant.record());
         assert_eq!(grants, (1..=64).map(grant).collect::<Vec<_>>());
         let mut idle = Turn(1);
         assert!(!execution.advance_terminal_cleanup(&mut idle).unwrap());
@@ -4460,7 +4467,14 @@ mod stage_demand_cut_tests {
                 .complete_task_input_preparation(
                     task,
                     operation,
-                    QueuedInputGrantRef(NonZeroU64::new(8).unwrap())
+                    QueuedInputGrantRef::new(
+                        NonZeroU64::new(8).unwrap(),
+                        crate::input::SendGeneration::new(
+                            novarocks_coordination_contract::AttemptActionId::new(
+                                NonZeroU64::new(8).unwrap()
+                            )
+                        )
+                    )
                 )
                 .unwrap(),
             UpdateAdmission::DiscardedNoLongerNeeded
@@ -4552,7 +4566,14 @@ mod stage_demand_cut_tests {
             .enqueue_reserved(
                 intent,
                 execution.now,
-                QueuedInputGrantRef(NonZeroU64::new(9).unwrap()),
+                QueuedInputGrantRef::new(
+                    NonZeroU64::new(9).unwrap(),
+                    crate::input::SendGeneration::new(
+                        novarocks_coordination_contract::AttemptActionId::new(
+                            NonZeroU64::new(9).unwrap(),
+                        ),
+                    ),
+                ),
             )
             .unwrap();
         execution.operation_targets.insert(
@@ -4645,7 +4666,14 @@ mod stage_demand_cut_tests {
             .enqueue_reserved(
                 OperationIntent::CancelTask(request),
                 execution.now,
-                QueuedInputGrantRef(NonZeroU64::new(grant).unwrap()),
+                QueuedInputGrantRef::new(
+                    NonZeroU64::new(grant).unwrap(),
+                    crate::input::SendGeneration::new(
+                        novarocks_coordination_contract::AttemptActionId::new(
+                            NonZeroU64::new(grant).unwrap(),
+                        ),
+                    ),
+                ),
             )
             .unwrap();
         let identity = request.identity();

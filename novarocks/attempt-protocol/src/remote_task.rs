@@ -1572,7 +1572,14 @@ mod bounded_discard_tests {
     use std::num::NonZeroU64;
 
     fn grant(value: u64) -> QueuedInputGrantRef {
-        QueuedInputGrantRef(NonZeroU64::new(value).unwrap())
+        QueuedInputGrantRef::new(
+            NonZeroU64::new(value).unwrap(),
+            crate::input::SendGeneration::new(
+                novarocks_coordination_contract::AttemptActionId::new(
+                    NonZeroU64::new(value).unwrap(),
+                ),
+            ),
+        )
     }
     fn operation(value: u64) -> TaskOperationId {
         OperationIds::new(crate::ids::IdSeed::new(u128::from(value), 1)).issue()

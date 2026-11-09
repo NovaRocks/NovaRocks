@@ -167,6 +167,7 @@ pub enum EffectBody {
     },
     AdmitQueuedInput {
         operation: OperationIntent,
+        generation: crate::input::SendGeneration,
         lane: DispatchLane,
     },
     Withdraw {

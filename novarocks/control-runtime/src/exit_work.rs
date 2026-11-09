@@ -50,6 +50,12 @@ struct PanicSlots {
 #[derive(Clone, Default)]
 pub struct PanicSink(Arc<Mutex<PanicSlots>>);
 impl PanicSink {
+    /// The actual shared record's payload layout, excluding the Arc header.
+    /// Aliases share this allocation; observing it grants no work or capacity.
+    pub fn backing_payload_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Mutex<PanicSlots>>()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -414,6 +420,22 @@ pub struct GatedWork<C> {
     panic: PanicSink,
 }
 impl<C> GatedWork<C> {
+    /// Layouts of this wrapper's actual owned boxes for a caller using the
+    /// same function-pointer body type. No future, capture or work is created.
+    /// The caller accounts for its own pointees separately and may use these
+    /// requests as a conservative bound across pre-handoff and body phases.
+    pub fn backing_layouts<P: Future, F: Future>(
+        _body: fn(C, P::Output) -> F,
+    ) -> [std::alloc::Layout; 4] {
+        use std::alloc::Layout;
+        [
+            Layout::new::<P>(),
+            Layout::new::<GatedBody<C, P::Output, fn(C, P::Output) -> F, F>>(),
+            Layout::new::<(fn(C, P::Output) -> F, C, P::Output)>(),
+            Layout::new::<F>(),
+        ]
+    }
+
     pub fn new(
         obligation: ExitObligation,
         captures: C,

@@ -34,7 +34,7 @@ pub(super) struct NativeChannelKey {
 /// Frontend keeps per Backend process, endpoint and lane, and calls rotate
 /// over them.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub(super) struct NativeChannelSlot {
+pub(crate) struct NativeChannelSlot {
     pub(super) key: NativeChannelKey,
     pub(super) index: usize,
 }
@@ -42,7 +42,7 @@ pub(super) struct NativeChannelSlot {
 /// A cached connection and its identity travel together. Channel clones do
 /// not identify the cache entry that supplied an older request.
 #[derive(Clone)]
-pub(super) struct CachedNativeChannel {
+pub(crate) struct CachedNativeChannel {
     original: Arc<CachedNativeChannelBody>,
 }
 
@@ -55,11 +55,11 @@ struct CachedNativeChannelBody {
 }
 
 impl CachedNativeChannel {
-    pub(super) fn channel(&self) -> &NativeLaneChannel {
+    pub(crate) fn channel(&self) -> &NativeLaneChannel {
         &self.original.channel
     }
 
-    pub(super) fn slot(&self) -> &NativeChannelSlot {
+    pub(crate) fn slot(&self) -> &NativeChannelSlot {
         &self.original.slot
     }
 
@@ -67,7 +67,7 @@ impl CachedNativeChannel {
         &self.original.generation
     }
 
-    pub(super) fn is_retired(&self) -> bool {
+    pub(crate) fn is_retired(&self) -> bool {
         self.generation().retired.load(Ordering::Acquire)
     }
 
@@ -208,7 +208,7 @@ impl NativeDialReservation {
         self.slot.key.lane
     }
 
-    pub(super) fn is_retired(&self) -> bool {
+    pub(crate) fn is_retired(&self) -> bool {
         self.generation.retired.load(Ordering::Acquire)
     }
     pub(super) fn is_leader(&self) -> bool {
@@ -273,27 +273,48 @@ impl NativeDialReservation {
         // Escaped/cache aliases retain the one immutable publication template.
         drop(channels);
         drop(channel);
+        self.runtime.native_ready.notify_waiters();
         Ok(acquired)
     }
 }
 
 impl Drop for NativeDialReservation {
     fn drop(&mut self) {
-        if self.leader && !self.published {
+        if !self.leader || self.published {
+            return;
+        }
+        let changed = {
             let mut channels = self
                 .runtime
                 .channels
                 .lock()
                 .expect("frontend native channel cache lock");
             if let Some(row) = channels.row_mut(&self.slot)
-                && matches!(row, Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current, &self.generation))
+                && matches!(row,Some(NativeChannelCacheRow::Dialing(current)) if Arc::ptr_eq(current,&self.generation))
             {
-                // Every follower retains this same scope. It must not silently
-                // start a new generation after its elected leader exits.
                 self.generation.retired.store(true, Ordering::Release);
                 *row = None;
+                true
+            } else {
+                false
             }
+        };
+        if changed {
+            self.runtime.native_ready.notify_waiters();
         }
+    }
+}
+
+/// The existing lane mutex position, with notification only after its actual
+/// guard exits. This adds no mutex, capacity, pool, limit or lock-order edge.
+pub(crate) struct NativeDialLane {
+    original: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+impl Drop for NativeDialLane {
+    fn drop(&mut self) {
+        drop(self.original.take());
+        self.ready.notify_waiters();
     }
 }
 
@@ -309,6 +330,7 @@ pub(crate) struct FrontendDataRuntime {
     transport_admission: NativeTransportAdmission,
     channels: Arc<Mutex<ChannelPools>>,
     dial_gates: [Arc<tokio::sync::Mutex<()>>; 4],
+    native_ready: Arc<tokio::sync::Notify>,
     task_transport_supervisor: NativeTransportSupervisor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     apply_send_port: ApplySendPort,
@@ -327,6 +349,7 @@ impl Clone for FrontendDataRuntime {
             transport_admission: self.transport_admission.clone(),
             channels: Arc::clone(&self.channels),
             dial_gates: self.dial_gates.clone(),
+            native_ready: Arc::clone(&self.native_ready),
             task_transport_supervisor: self.task_transport_supervisor.clone(),
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
@@ -410,6 +433,7 @@ impl FrontendDataRuntime {
             transport_admission,
             channels,
             dial_gates,
+            native_ready: Arc::new(tokio::sync::Notify::new()),
             task_transport_supervisor,
             connector_blocking_io,
             apply_send_port,
@@ -483,6 +507,7 @@ impl FrontendDataRuntime {
         // Actual channel teardown and observer callbacks stay outside the lock.
         let close = self.transport_admission.close_frontend_outgoing();
         drop(retired);
+        self.native_ready.notify_waiters();
         close.map_err(|error| format!("close Frontend Native outgoing transport: {error}"))
     }
 
@@ -767,7 +792,10 @@ impl FrontendDataRuntime {
             return false;
         }
         acquired.generation().retired.store(true, Ordering::Release);
-        *row = None;
+        let retired = row.take();
+        drop(channels);
+        drop(retired);
+        self.native_ready.notify_waiters();
         true
     }
 
@@ -781,47 +809,87 @@ impl FrontendDataRuntime {
     }
 
     pub(crate) fn invalidate_peer(&self, peer: BackendProcessId) {
-        let mut channels = self
-            .channels
-            .lock()
-            .expect("frontend native channel cache lock");
-        channels.pools.retain(|key, pool| {
-            if key.peer != peer {
-                return true;
-            }
-            for row in pool.rows.iter().flatten() {
-                row.generation().retired.store(true, Ordering::Release);
-            }
-            false
-        });
+        let retired = {
+            let mut channels = self
+                .channels
+                .lock()
+                .expect("frontend native channel cache lock");
+            let keys = channels
+                .pools
+                .keys()
+                .filter(|key| key.peer == peer)
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| channels.pools.remove(&key))
+                .inspect(|pool| {
+                    for row in pool.rows.iter().flatten() {
+                        row.generation().retired.store(true, Ordering::Release);
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        drop(retired);
+        self.native_ready.notify_waiters();
+    }
+    /// Recheck the SAME physical authors after registering their notifications.
+    /// Class/handshake refusal takes no lane probe, so an observer cannot wake
+    /// itself by dropping a temporary lane while its actual blocker stays full.
+    /// A successful lane probe releases through the original notifying guard:
+    /// another source blocked on that real mutex must observe its actual exit.
+    pub(crate) fn native_physical_ready(&self, lane: FrontendNativeLane) -> Result<bool, String> {
+        let admission = &self.transport_admission;
+        if admission
+            .frontend_outgoing_snapshot()
+            .map_err(|error| error.to_string())?
+            .closed
+        {
+            return Ok(true);
+        }
+        let class = novarocks_native_adapter::native_lane::NativeLane::frontend(lane).class();
+        if admission.available_positions(class) == 0 || admission.available_handshakes(class) == 0 {
+            return Ok(false);
+        }
+        let Some(probe) = self.try_dial_lane(lane) else {
+            return Ok(false);
+        };
+        drop(probe);
+        Ok(true)
+    }
+    /// Original cache/dial-lane events only. A hint never grants a position.
+    pub(crate) fn native_ready_notified(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.native_ready).notified_owned()
     }
 
     /// Try the original lane's existing dial position. The owned guard can
     /// enter the original stable input without borrowing a movable runtime.
-    pub(super) fn try_dial_lane(
-        &self,
-        lane: FrontendNativeLane,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    pub(super) fn try_dial_lane(&self, lane: FrontendNativeLane) -> Option<NativeDialLane> {
         let index = match lane {
             FrontendNativeLane::ResultData => 0,
             FrontendNativeLane::Submission => 1,
             FrontendNativeLane::Observation => 2,
             FrontendNativeLane::LifecycleControl => 3,
         };
-        Arc::clone(&self.dial_gates[index]).try_lock_owned().ok()
+        Arc::clone(&self.dial_gates[index])
+            .try_lock_owned()
+            .ok()
+            .map(|original| NativeDialLane {
+                original: Some(original),
+                ready: Arc::clone(&self.native_ready),
+            })
     }
 
-    pub(super) async fn dial_lane(
-        &self,
-        lane: FrontendNativeLane,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
+    pub(super) async fn dial_lane(&self, lane: FrontendNativeLane) -> NativeDialLane {
         let index = match lane {
             FrontendNativeLane::ResultData => 0,
             FrontendNativeLane::Submission => 1,
             FrontendNativeLane::Observation => 2,
             FrontendNativeLane::LifecycleControl => 3,
         };
-        self.dial_gates[index].lock().await
+        NativeDialLane {
+            original: Some(Arc::clone(&self.dial_gates[index]).lock_owned().await),
+            ready: Arc::clone(&self.native_ready),
+        }
     }
 }
 

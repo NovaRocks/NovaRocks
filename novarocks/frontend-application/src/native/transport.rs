@@ -28,7 +28,7 @@ use novarocks_native_adapter::native_lane::{
 };
 
 mod cold_dial;
-pub(super) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
+pub(crate) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
 
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -93,17 +93,17 @@ pub(super) type AuthenticatedRootResultGrpc =
 /// that distinction: the latter has an unknown remote outcome, while the
 /// former cannot be repaired by resending an immutable request.
 #[derive(Debug)]
-pub(super) enum ChannelAcquisitionError {
+pub(crate) enum ChannelAcquisitionError {
     Fatal(String),
     RetryableNetwork(ChannelEstablishmentFailure),
 }
 
 impl ChannelAcquisitionError {
-    pub(super) fn fatal(detail: impl Into<String>) -> Self {
+    pub(crate) fn fatal(detail: impl Into<String>) -> Self {
         Self::Fatal(detail.into())
     }
 
-    pub(super) fn retryable_network(detail: impl Into<String>) -> Self {
+    pub(crate) fn retryable_network(detail: impl Into<String>) -> Self {
         Self::RetryableNetwork(ChannelEstablishmentFailure {
             detail: detail.into(),
             connection_lost: false,
@@ -125,12 +125,12 @@ impl std::error::Error for ChannelAcquisitionError {}
 /// Establishment may fail in a local admission/cache owner without observing a
 /// broken backend connection. Keep that distinction before rendering text.
 #[derive(Debug)]
-pub(super) struct ChannelEstablishmentFailure {
+pub(crate) struct ChannelEstablishmentFailure {
     detail: String,
     connection_lost: bool,
 }
 impl ChannelAcquisitionError {
-    pub(super) fn observed_connection_loss(&self) -> bool {
+    pub(crate) fn observed_connection_loss(&self) -> bool {
         matches!(self, Self::RetryableNetwork(error) if error.connection_lost)
     }
     fn failed_connection(error: tonic::transport::Error) -> Self {
@@ -233,13 +233,19 @@ enum FrozenClientEndpoints {
 }
 
 #[derive(Clone)]
-pub(super) struct Client {
+pub(crate) struct Client {
     endpoints: FrozenClientEndpoints,
     data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    pub(super) fn for_backend(
+    /// Read-only original cache/generation/dial-lane progress. This observes
+    /// no pool or authority other than the original selected role runtime.
+    pub(crate) fn original_ready_notified(&self) -> tokio::sync::futures::OwnedNotified {
+        self.data_runtime.native_ready_notified()
+    }
+
+    pub(crate) fn for_backend(
         descriptor: FrozenBackendDescriptor,
         data_runtime: FrontendDataRuntime,
     ) -> Self {
@@ -334,7 +340,7 @@ impl Client {
             .map(|(grpc, _)| grpc)
     }
 
-    pub(in crate::native) fn grpc_for_reserved_call(
+    pub(crate) fn grpc_for_reserved_call(
         &self,
         call: novarocks_native_adapter::native_lane::ReservedNativeCall,
     ) -> tonic::client::Grpc<
@@ -383,7 +389,7 @@ impl Client {
         Ok((grpc, acquired))
     }
 
-    pub(super) fn invalidate_channel_if_current(
+    pub(crate) fn invalidate_channel_if_current(
         &self,
         method: NativeRpcMethod,
         acquired: &CachedNativeChannel,

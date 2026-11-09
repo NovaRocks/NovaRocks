@@ -938,7 +938,14 @@ mod indexed_queue_tests {
         MonotonicInstant::from_origin(Duration::from_secs(seconds))
     }
     fn grant(value: u64) -> QueuedInputGrantRef {
-        QueuedInputGrantRef(NonZeroU64::new(value).unwrap())
+        QueuedInputGrantRef::new(
+            NonZeroU64::new(value).unwrap(),
+            crate::input::SendGeneration::new(
+                novarocks_coordination_contract::AttemptActionId::new(
+                    NonZeroU64::new(value).unwrap(),
+                ),
+            ),
+        )
     }
     fn operation(value: u64) -> OperationIntent {
         let task = crate::test_support::remote(1);

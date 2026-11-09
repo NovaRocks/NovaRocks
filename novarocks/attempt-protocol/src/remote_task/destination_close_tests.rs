@@ -68,7 +68,12 @@ fn enqueue(
     ids: &mut TestIds,
     update: TaskDomainUpdate,
 ) -> Result<UpdateAdmission, TaskExecutionError> {
-    let original = QueuedInputGrantRef(NonZeroU64::new(ids.grant).unwrap());
+    let original = QueuedInputGrantRef::new(
+        NonZeroU64::new(ids.grant).unwrap(),
+        crate::input::SendGeneration::new(novarocks_coordination_contract::AttemptActionId::new(
+            NonZeroU64::new(ids.grant).unwrap(),
+        )),
+    );
     ids.grant += 1;
     producer.enqueue_update(ids.operations.issue(), update, original)
 }

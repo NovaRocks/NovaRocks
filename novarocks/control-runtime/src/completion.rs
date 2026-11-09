@@ -249,6 +249,24 @@ impl ReportSlot {
             .consumer_kind(consumer)
             .ok_or(RuntimeError::Completion(CompletionError::UnknownConsumer))
     }
+    /// Read the original producer publication state without consuming any
+    /// declared leg. In particular RevokedUnused must not be projected as an
+    /// observer acknowledgement of a report that was never published.
+    pub fn publication_state(
+        &self,
+    ) -> Result<novarocks_control_runtime_core::completion::SlotState, RuntimeError> {
+        let state = self
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        Ok(state
+            .slots
+            .get(&self.id)
+            .ok_or(RuntimeError::UnknownSlot)?
+            .state())
+    }
     /// Observe this original report's consumer leg. Reading metadata grants
     /// no publication, consumption, producer exit or retirement authority.
     pub fn consumption(

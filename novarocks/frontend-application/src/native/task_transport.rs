@@ -109,8 +109,10 @@ use super::transport_supervisor::{
 };
 
 mod joint_action;
-use joint_action::NativeCallSource;
-pub(crate) use joint_action::{NativeBatchAdmission, NativePhysicalOffer};
+pub(crate) use joint_action::NativeCallSource;
+pub(crate) use joint_action::{
+    NativeBatchAdmission, NativePhysicalOffer, clone_input_backing, original_run_encoding,
+};
 mod queue_input;
 pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
 

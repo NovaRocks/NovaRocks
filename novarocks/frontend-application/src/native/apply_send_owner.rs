@@ -36,18 +36,48 @@ use tokio::{
 
 type RawValue = Box<dyn Any + Send>;
 
-pub(crate) struct ApplyReservations {
-    _queue: Vec<Box<dyn TaskOperationQueuePermit>>,
-    _encoding: NativeTransportEncodingPermit,
+mod shared;
+pub(crate) use shared::{
+    NativeDisposalBody, NativeDisposalRequest, NativeDisposalReturn, SharedApplyFunding,
+    SharedApplyJoinObligation, SharedApplyLayouts, SharedApplyPreparation, SharedApplyRetirement,
+    SharedPhysicalReturn, complete_shared_join, shared_apply_layouts,
+};
+
+pub(crate) enum ApplyReservations {
+    Legacy {
+        _queue: Vec<Box<dyn TaskOperationQueuePermit>>,
+        _encoding: NativeTransportEncodingPermit,
+    },
+    Shared(shared::SharedApplyReservations),
 }
 impl ApplyReservations {
     pub(crate) fn new(
         queue: Vec<Box<dyn TaskOperationQueuePermit>>,
         encoding: NativeTransportEncodingPermit,
     ) -> Self {
-        Self {
+        Self::Legacy {
             _queue: queue,
             _encoding: encoding,
+        }
+    }
+    fn capture_dispatch(
+        &self,
+        action: &novarocks_workload_control::joint_admission::NativeAsyncActionGrant,
+        reply: &novarocks_workload_control::joint_admission::NativeReplyGrant,
+    ) -> Result<
+        novarocks_workload_control::joint_admission::NativeDispatchSource,
+        novarocks_workload_control::WorkError,
+    > {
+        use novarocks_workload_control::joint_admission::NativeDispatchSource;
+        match self {
+            Self::Legacy { _queue, .. } => NativeDispatchSource::capture(
+                action,
+                reply,
+                _queue.iter().map(|permit| permit.native_dispatch_input()),
+            ),
+            Self::Shared(original) => {
+                NativeDispatchSource::capture(action, reply, original.inputs().iter().map(Some))
+            }
         }
     }
 }
@@ -182,6 +212,7 @@ impl Drop for OriginalInput {
     }
 }
 enum OriginalState {
+    Shared(shared::SharedRecord),
     Reserved,
     Loaned,
     UncommittedNative,
@@ -223,8 +254,16 @@ struct State {
 }
 struct Core {
     state: Mutex<State>,
-    changed: Notify,
+    changed: Arc<Notify>,
     handle: Handle,
+}
+impl Core {
+    fn notify_change(&self) {
+        // Source observes the SAME row and the original reaper may also wait.
+        // Wake registered observers and retain the reaper's original permit.
+        self.changed.notify_waiters();
+        self.changed.notify_one();
+    }
 }
 struct ReaperExitGuard {
     core: Arc<Core>,
@@ -236,7 +275,7 @@ impl Drop for ReaperExitGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .closed = true;
-        self.core.changed.notify_one();
+        self.core.notify_change();
     }
 }
 #[derive(Clone)]
@@ -319,7 +358,7 @@ impl ApplySendOwner {
                 cleanup_failures: 0,
                 spawn_panicked: false,
             }),
-            changed: Notify::new(),
+            changed: Arc::new(Notify::new()),
             handle: handle.clone(),
         });
         let port = ApplySendPort {
@@ -373,7 +412,7 @@ impl ApplySendOwner {
                 state.closed = true;
                 state.spawn_panicked = true;
                 drop(state);
-                self.core.changed.notify_one();
+                self.core.notify_change();
                 Err(RegistrationFailure::Closed)
             }
         }
@@ -387,7 +426,7 @@ impl ApplySendOwner {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .closed = true;
-        self.core.changed.notify_one();
+        self.core.notify_change();
     }
     pub(crate) fn request_abort(&self) {
         self.close();
@@ -548,7 +587,7 @@ impl ApplySendPort {
             active: true,
         };
         drop(state);
-        self.core.changed.notify_one();
+        self.core.notify_change();
         Ok(slot)
     }
 }
@@ -635,7 +674,7 @@ impl ApplySlot {
             }
         };
         drop(state);
-        self.core.changed.notify_one();
+        self.core.notify_change();
         disposition
     }
 }
@@ -658,7 +697,7 @@ impl Drop for ApplySlot {
             state.records[self.index] = None;
         }
         drop(state);
-        self.core.changed.notify_one();
+        self.core.notify_change();
     }
 }
 fn allocate_original_slots(
@@ -689,7 +728,8 @@ async fn reap_originals(core: Arc<Core>) {
                         .as_ref()
                         .is_none_or(|backing| Arc::strong_count(backing) == 1),
                     OriginalState::UncommittedNative => true,
-                    OriginalState::Reserved
+                    OriginalState::Shared(_)
+                    | OriginalState::Reserved
                     | OriginalState::Loaned
                     | OriginalState::Prepared(_)
                     | OriginalState::UnjoinableSpawn(_) => false,

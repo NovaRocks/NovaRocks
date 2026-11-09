@@ -93,6 +93,12 @@ impl std::fmt::Debug for ExitObligation {
     }
 }
 impl ExitCustody {
+    /// The actual shared record's payload layout, excluding the Arc header.
+    /// This observation allocates nothing and grants no exit or capacity.
+    pub fn backing_payload_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Custody>()
+    }
+
     /// Takes the carrier's original WorkObligation, capacity and reserved report.
     /// Its binding was validated before custody or unique authority exists.
     /// Old admitted roles remain valid after stop/failure; identity is not a

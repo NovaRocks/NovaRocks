@@ -242,8 +242,47 @@ pub struct ReadProgressSnapshot {
     pub resume_revision: NonZeroU64,
 }
 
+/// One physical-send generation, identified by its original AdmitQueuedInput
+/// effect. Exact replay retains the operation identity and creates a new
+/// generation. This is neither a Scope nor a subscription generation, and
+/// grants no capacity or right to reuse a prior WC input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct SendGeneration(AttemptActionId);
+impl SendGeneration {
+    pub const fn new(admission_effect: AttemptActionId) -> Self {
+        Self(admission_effect)
+    }
+    pub const fn admission_effect(self) -> AttemptActionId {
+        self.0
+    }
+}
+
+/// Original Source record correlation for exactly one physical-send input.
+/// The record and its generation travel together; neither creates a grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueuedInputGrantRef(pub NonZeroU64);
+pub struct QueuedInputGrantRef {
+    record: NonZeroU64,
+    generation: SendGeneration,
+}
+impl QueuedInputGrantRef {
+    pub const fn new(record: NonZeroU64, generation: SendGeneration) -> Self {
+        Self { record, generation }
+    }
+    pub const fn record(self) -> NonZeroU64 {
+        self.record
+    }
+    pub const fn generation(self) -> SendGeneration {
+        self.generation
+    }
+}
+
+/// The original physical send record supplies this correlation around the
+/// pure decoded reply. Receipt projection itself does not invent a generation.
+#[derive(Clone, Debug)]
+pub struct OperationObservation {
+    pub generation: SendGeneration,
+    pub reply: OperationReply,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WithdrawalOutcome {
@@ -264,7 +303,7 @@ pub enum PublicationApplied {
 
 #[derive(Clone, Debug)]
 pub enum ExecutorFact {
-    Operation(OperationReply),
+    Operation(OperationObservation),
     /// The selected original publisher has actually returned. Match both the
     /// effect and its original publication kind before releasing the phase.
     /// Handoff, result filling and actual job exit cannot supply this result.
@@ -298,6 +337,7 @@ pub enum ExecutorFact {
     },
     QueuedInputFailed {
         operation: TaskOperationId,
+        generation: SendGeneration,
         failure: AttemptFailure,
     },
     SubscriptionProgress(SubscriptionPhaseSnapshot),

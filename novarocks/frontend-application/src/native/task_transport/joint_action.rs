@@ -46,11 +46,10 @@ impl std::fmt::Debug for NativeBatchAdmission {
     }
 }
 pub(crate) struct NativePhysicalOffer {
-    pub(in crate::native) encoding:
-        Option<super::super::transport_supervisor::NativeTransportEncodingPermit>,
-    pub(in crate::native) call: Option<NativeCallSource>,
+    pub(crate) encoding: Option<super::super::transport_supervisor::NativeTransportEncodingPermit>,
+    pub(crate) call: Option<NativeCallSource>,
 }
-pub(in crate::native) enum NativeCallSource {
+pub(crate) enum NativeCallSource {
     Warm {
         acquired: CachedNativeChannel,
         call: ReservedNativeCall,
@@ -132,7 +131,7 @@ fn participation_domain(
         D::Credential(value) => credential(invoice, value.material().as_ref()),
     }
 }
-pub(super) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usize, WorkError> {
+pub(crate) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usize, WorkError> {
     let mut invoice = CloneInvoice { owned: 0 };
     for operation in operations {
         // Every operation envelope/target projection allocates at most four
@@ -261,7 +260,7 @@ fn make_quote(
 }
 /// Borrow the same original operation facts that the codec will encode. The
 /// codec owns protobuf field sizes, including the control method projection.
-pub(super) fn original_run_encoding(
+pub(crate) fn original_run_encoding(
     operations: &[OperationIntent],
     budget: TransportBudget,
 ) -> Result<novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan, WorkError> {
