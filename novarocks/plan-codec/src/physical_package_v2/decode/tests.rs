@@ -441,6 +441,30 @@ fn change_stream_receiver_preserves_each_interrupted_control_prefix() {
 }
 
 #[test]
+fn prior_plan_contract_revision_is_refused_by_the_original_package_constructor() {
+    let package = rich_package();
+    let prior_revision = p::PLAN_CONTRACT_REVISION
+        .checked_sub(1)
+        .filter(|revision| *revision != 0)
+        .expect("test requires a prior plan contract revision");
+    let bytes = mutated(&package, |dto| {
+        dto.required.as_mut().unwrap().plan_contract_revision = prior_revision;
+    });
+    let error = refused(&bytes);
+    match error {
+        PackageDecodeError::Package(p::FragmentPackageError::Structure(errors)) => {
+            assert!(errors.to_string().contains("package.required"));
+            assert!(
+                errors
+                    .to_string()
+                    .contains("plan contract revision differs")
+            );
+        }
+        other => panic!("prior contract must reach the original package validator: {other:?}"),
+    }
+}
+
+#[test]
 fn absent_required_components_are_refused_without_defaults() {
     let package = rich_package();
     type PackageMutation = fn(&mut wire::FragmentPackage);

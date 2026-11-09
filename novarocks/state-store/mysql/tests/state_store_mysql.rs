@@ -1054,7 +1054,9 @@ async fn mysql_range_decodes_extra_row_before_forward_and_reverse_pagination() {
     );
     let mut runtime =
         MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
-    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+    let mut config = store_config(&database.name, CLUSTER_ID, 4_000);
+    config.limits.max_value_bytes = Some(MysqlTransactionTestApi::MALFORMED_ROW_VALUE_LIMIT);
+    let store = open_mysql_store(&runtime, config)
         .await
         .expect("open MySQL transaction store");
     let forward_valid = key(Bytes::from_static(b"extra-forward-a"));
@@ -1370,7 +1372,9 @@ async fn mysql_read_rejects_malformed_persisted_rows_as_corruption() {
     );
     let mut runtime =
         MysqlProviderTestHarness::boot(fixture_client_config()).expect("construct MySQL runtime");
-    let store = open_store(&runtime, &database.name, CLUSTER_ID, 4_000)
+    let mut config = store_config(&database.name, CLUSTER_ID, 4_000);
+    config.limits.max_value_bytes = Some(MysqlTransactionTestApi::MALFORMED_ROW_VALUE_LIMIT);
+    let store = open_mysql_store(&runtime, config)
         .await
         .expect("open MySQL transaction store");
     let item = key(Bytes::from_static(b"malformed-row"));

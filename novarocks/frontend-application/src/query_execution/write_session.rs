@@ -2335,9 +2335,7 @@ pub(crate) mod tests {
             );
         let observed =
             novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents(
-                view,
-                catalog,
-                Default::default(),
+                view, catalog,
             )
             .unwrap();
         let mut p = observed.publication.unwrap();

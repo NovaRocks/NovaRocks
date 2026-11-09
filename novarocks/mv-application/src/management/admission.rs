@@ -538,7 +538,6 @@ impl ManagementEntrance {
         &self,
         lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
         (MvDropManagementObservation, SlotChangeConvergence),
         crate::persistence::documents::MvDocumentError,
@@ -558,8 +557,7 @@ impl ManagementEntrance {
                 "MV DROP Current management slot names another owner or incarnation",
             ));
         }
-        let mut documents =
-            decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+        let mut documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
         let convergence = self.resolve_pending_slot_changes(lease, request.clone())?;
         if convergence.reinstall_current_projection {
             view = lease
@@ -570,7 +568,7 @@ impl ManagementEntrance {
                     "MV DROP Current management slot names another owner or incarnation",
                 ));
             }
-            documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+            documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
         }
         self.finish_keyed_drop_observation(lease, &request, documents, convergence)
     }
@@ -581,7 +579,6 @@ impl ManagementEntrance {
         &self,
         lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
         (MvDropManagementObservation, SlotChangeConvergence),
         crate::persistence::documents::MvDocumentError,
@@ -602,8 +599,7 @@ impl ManagementEntrance {
                 "MV DROP Current management slot names another owner or incarnation",
             ));
         }
-        let mut documents =
-            decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+        let mut documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
         let convergence = self
             .resolve_pending_slot_changes_async(lease, request.clone())
             .await?;
@@ -617,7 +613,7 @@ impl ManagementEntrance {
                     "MV DROP Current management slot names another owner or incarnation",
                 ));
             }
-            documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone(), budget)?;
+            documents = decode_keyed_drop_documents(&view, request.catalog_handle.clone())?;
         }
         self.finish_keyed_drop_observation(lease, &request, documents, convergence)
     }
@@ -731,7 +727,6 @@ impl ManagementEntrance {
         &self,
         lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
         (
             crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
@@ -754,7 +749,7 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog, budget)?;
+        let documents = decode_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())
@@ -809,7 +804,6 @@ impl ManagementEntrance {
         &self,
         lease: &novarocks_spi::connector::ConnectorDocumentStorage,
         request: novarocks_spi::connector::KeyedDocumentObservationRequest,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<
         (
             crate::persistence::keyed_documents::MvKeyedObservedCurrentDocuments,
@@ -833,7 +827,7 @@ impl ManagementEntrance {
                 "keyed observation Current management names another owner or incarnation".into(),
             ));
         }
-        let documents = decode_current_keyed_documents(view, catalog, budget)?;
+        let documents = decode_current_keyed_documents(view, catalog)?;
         let mut states = lock(&self.inner.state);
         let current = states.get_mut(&documents.view.table).ok_or_else(|| {
             MvDocumentError::Contract("keyed observation target has not been admitted".into())

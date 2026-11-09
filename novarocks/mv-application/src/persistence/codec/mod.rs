@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Canonical, bounded conversion between runtime values and private generated
+//! Canonical conversion between runtime values and private generated
 //! persistence DTOs. No function in this module performs I/O.
 
 pub mod keyed;
@@ -36,8 +36,8 @@ use crate::persistence::identity::{
     SchemaVersion, StateSlotIdentity,
 };
 use crate::persistence::validation::{
-    PersistenceDecodeBudget, ValidationError, validate_configuration, validate_definition,
-    validate_interpretation, verify_computation_identity,
+    ValidationError, validate_configuration, validate_definition, validate_interpretation,
+    verify_computation_identity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,11 +62,6 @@ impl EncodedDocument {
 
 #[derive(Debug)]
 pub enum PersistenceCodecError {
-    ResourceBudget {
-        resource: &'static str,
-        maximum: usize,
-        actual: usize,
-    },
     MalformedWire(String),
     UnknownFormatVersion {
         document: &'static str,
@@ -85,7 +80,6 @@ pub enum PersistenceCodecError {
 /// These reasons belong to the persistence codec, not a repository or compiler.
 pub mod failure_reason {
     use std::num::NonZeroU16;
-    pub const RESOURCE_BUDGET: NonZeroU16 = NonZeroU16::new(930).unwrap();
     pub const MALFORMED_WIRE: NonZeroU16 = NonZeroU16::new(931).unwrap();
     pub const UNKNOWN_FORMAT: NonZeroU16 = NonZeroU16::new(932).unwrap();
     pub const MISSING_FIELD: NonZeroU16 = NonZeroU16::new(933).unwrap();
@@ -98,7 +92,6 @@ impl novarocks_failure_contract::FailureProjection for PersistenceCodecError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
         let (class, reason) = match self {
-            Self::ResourceBudget { .. } => (C::Resource, failure_reason::RESOURCE_BUDGET),
             Self::MalformedWire(_) => (C::Data, failure_reason::MALFORMED_WIRE),
             Self::UnknownFormatVersion { .. } => (C::Unsupported, failure_reason::UNKNOWN_FORMAT),
             Self::MissingField(_) => (C::Data, failure_reason::MISSING_FIELD),
@@ -114,14 +107,6 @@ impl novarocks_failure_contract::FailureProjection for PersistenceCodecError {
 impl std::fmt::Display for PersistenceCodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ResourceBudget {
-                resource,
-                maximum,
-                actual,
-            } => write!(
-                formatter,
-                "MV persistence {resource} uses {actual} bytes/items, exceeding the limit {maximum}"
-            ),
             Self::MalformedWire(message) => write!(formatter, "malformed MV protobuf: {message}"),
             Self::UnknownFormatVersion { document, version } => write!(
                 formatter,
@@ -175,7 +160,6 @@ pub fn build_definition(
         outputs,
         computation_identity: ComputationIdentity::from_canonical_bytes(&[]),
     };
-    preflight_definition_source(&document)?;
     canonicalize_definition(&mut document);
     validate_definition(&document)?;
     document.computation_identity = compute_definition_identity(&document);
@@ -185,7 +169,6 @@ pub fn build_definition(
 pub fn encode_definition(
     document: &DefinitionDocument,
 ) -> Result<EncodedDocument, PersistenceCodecError> {
-    preflight_definition_source(document)?;
     let mut canonical = document.clone();
     canonicalize_definition(&mut canonical);
     validate_definition(&canonical)?;
@@ -196,11 +179,8 @@ pub fn encode_definition(
     encode_message(definition_to_proto(&canonical))
 }
 
-pub fn decode_definition(
-    bytes: &[u8],
-    budget: PersistenceDecodeBudget,
-) -> Result<DefinitionDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::DefinitionDocument, budget)?;
+pub fn decode_definition(bytes: &[u8]) -> Result<DefinitionDocument, PersistenceCodecError> {
+    wire::preflight(bytes, wire::Schema::DefinitionDocument)?;
     let dto =
         proto::DefinitionDocument::decode(bytes).map_err(PersistenceCodecError::ProtobufDecode)?;
     require_version("definition", dto.format_version)?;
@@ -219,7 +199,6 @@ pub fn decode_definition(
 pub fn encode_interpretation(
     document: &InterpretationDocument,
 ) -> Result<EncodedDocument, PersistenceCodecError> {
-    preflight_interpretation_source(document)?;
     let mut canonical = document.clone();
     canonicalize_interpretation(&mut canonical);
     validate_interpretation(&canonical)?;
@@ -228,9 +207,8 @@ pub fn encode_interpretation(
 
 pub fn decode_interpretation(
     bytes: &[u8],
-    budget: PersistenceDecodeBudget,
 ) -> Result<InterpretationDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::InterpretationDocument, budget)?;
+    wire::preflight(bytes, wire::Schema::InterpretationDocument)?;
     let dto = proto::InterpretationDocument::decode(bytes)
         .map_err(PersistenceCodecError::ProtobufDecode)?;
     require_version("interpretation", dto.format_version)?;
@@ -245,16 +223,12 @@ pub fn decode_interpretation(
 pub fn encode_configuration(
     document: &ConfigurationDocument,
 ) -> Result<EncodedDocument, PersistenceCodecError> {
-    preflight_source(0, 5)?;
     validate_configuration(document)?;
     encode_message(configuration_to_proto(document))
 }
 
-pub fn decode_configuration(
-    bytes: &[u8],
-    budget: PersistenceDecodeBudget,
-) -> Result<ConfigurationDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::ConfigurationDocument, budget)?;
+pub fn decode_configuration(bytes: &[u8]) -> Result<ConfigurationDocument, PersistenceCodecError> {
+    wire::preflight(bytes, wire::Schema::ConfigurationDocument)?;
     let dto = proto::ConfigurationDocument::decode(bytes)
         .map_err(PersistenceCodecError::ProtobufDecode)?;
     require_version("configuration", dto.format_version)?;
@@ -266,14 +240,6 @@ pub fn decode_configuration(
 
 fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceCodecError> {
     let encoded_len = message.encoded_len();
-    let maximum = PersistenceDecodeBudget::default().max_document_bytes;
-    if encoded_len > maximum {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "encoded document",
-            maximum,
-            actual: encoded_len,
-        });
-    }
     let mut bytes = Vec::with_capacity(encoded_len);
     message
         .encode(&mut bytes)
@@ -355,136 +321,6 @@ fn compute_definition_identity(document: &DefinitionDocument) -> ComputationIden
     dto.computation_identity = None;
     dto.created_at_ms = None;
     ComputationIdentity::from_canonical_bytes(&dto.encode_to_vec())
-}
-
-fn preflight_definition_source(document: &DefinitionDocument) -> Result<(), PersistenceCodecError> {
-    let mut bytes = document.query.effective_sql.len()
-        + document.query.resolution.default_catalog.len()
-        + document.query.resolution.default_namespace.len();
-    let mut items = document.relation_occurrences.len() + document.outputs.len();
-    for relation in &document.relation_occurrences {
-        bytes = bytes
-            .saturating_add(relation.catalog_at_binding.len())
-            .saturating_add(relation.namespace_at_binding.len())
-            .saturating_add(relation.relation_at_binding.len())
-            .saturating_add(relation.qualifier_at_binding.len())
-            .saturating_add(relation.object_id.as_bytes().len())
-            .saturating_add(relation.schema_version.as_bytes().len());
-        items = items.saturating_add(relation.fields.len());
-        for field in &relation.fields {
-            bytes = bytes
-                .saturating_add(field.field_id.as_bytes().len())
-                .saturating_add(field.name_at_binding.len())
-                .saturating_add(field.type_signature.len());
-        }
-    }
-    for output in &document.outputs {
-        bytes = bytes
-            .saturating_add(output.output_id.as_bytes().len())
-            .saturating_add(output.name.len())
-            .saturating_add(output.type_signature.len())
-            .saturating_add(
-                output
-                    .expression
-                    .function_identity
-                    .as_ref()
-                    .map_or(0, String::len),
-            );
-        items = items.saturating_add(output.expression.source_fields.len());
-        for reference in &output.expression.source_fields {
-            bytes = bytes.saturating_add(reference.field_id.as_bytes().len());
-        }
-    }
-    preflight_source(bytes, items)
-}
-
-fn preflight_interpretation_source(
-    document: &InterpretationDocument,
-) -> Result<(), PersistenceCodecError> {
-    let mut bytes = document.target.object_id.as_bytes().len()
-        + document.target.schema_version.as_bytes().len()
-        + document.target.partition_spec_version.as_bytes().len();
-    let mut items = document.outputs.len()
-        + document.state_slots.len()
-        + document.aggregates.len()
-        + document.branches.len()
-        + document.target.fields.len()
-        + document.target.partition_fields.len()
-        + document.apply_key.components.len();
-    for output in &document.outputs {
-        bytes = bytes
-            .saturating_add(output.output_id.as_bytes().len())
-            .saturating_add(output.target_field_id.as_bytes().len())
-            .saturating_add(output.type_signature.len());
-    }
-    for slot in &document.state_slots {
-        bytes = bytes
-            .saturating_add(slot.slot_id.as_bytes().len())
-            .saturating_add(slot.target_field_id.as_bytes().len())
-            .saturating_add(slot.type_signature.len());
-    }
-    for component in &document.apply_key.components {
-        bytes = bytes
-            .saturating_add(component.logical_id.as_bytes().len())
-            .saturating_add(component.target_field_id.as_bytes().len());
-    }
-    for aggregate in &document.aggregates {
-        bytes = bytes
-            .saturating_add(aggregate.aggregate_id.as_bytes().len())
-            .saturating_add(aggregate.function_identity.len());
-        items = items
-            .saturating_add(aggregate.source_fields.len())
-            .saturating_add(aggregate.state_slot_ids.len());
-        for reference in &aggregate.source_fields {
-            bytes = bytes.saturating_add(reference.field_id.as_bytes().len());
-        }
-        for id in &aggregate.state_slot_ids {
-            bytes = bytes.saturating_add(id.as_bytes().len());
-        }
-    }
-    for branch in &document.branches {
-        bytes = bytes.saturating_add(branch.branch_id.as_bytes().len());
-        items = items
-            .saturating_add(branch.relation_occurrence_ids.len())
-            .saturating_add(branch.output_ids.len());
-        for id in &branch.output_ids {
-            bytes = bytes.saturating_add(id.as_bytes().len());
-        }
-    }
-    for field in &document.target.fields {
-        bytes = bytes
-            .saturating_add(field.logical_identity.as_bytes().len())
-            .saturating_add(field.target_field_id.as_bytes().len())
-            .saturating_add(field.type_signature.len());
-    }
-    for field in &document.target.partition_fields {
-        bytes = bytes
-            .saturating_add(field.partition_field_id.as_bytes().len())
-            .saturating_add(field.source_target_field_id.as_bytes().len());
-    }
-    preflight_source(bytes, items)
-}
-
-fn preflight_source(variable_bytes: usize, items: usize) -> Result<(), PersistenceCodecError> {
-    let budget = PersistenceDecodeBudget::default();
-    // Reject grossly oversized variable content before cloning it into the
-    // generated DTO. The exact encoded length, including tags and scalar
-    // overhead, is checked by `encode_message` before allocating output bytes.
-    if variable_bytes > budget.max_document_bytes {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "source document estimate",
-            maximum: budget.max_document_bytes,
-            actual: variable_bytes,
-        });
-    }
-    if items > budget.max_items {
-        return Err(PersistenceCodecError::ResourceBudget {
-            resource: "source document items",
-            maximum: budget.max_items,
-            actual: items,
-        });
-    }
-    Ok(())
 }
 
 fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocument {

@@ -101,7 +101,7 @@ fn conformance_limits(sample: &SqliteStateStore) -> StateStoreLimits {
         max_page_size: CONFORMANCE_MAX_PAGE_SIZE,
         max_transaction_operations: CONFORMANCE_MAX_OPERATIONS,
         max_transaction_bytes,
-        ..StateStoreLimits::default()
+        ..crate::SQLITE_STATE_STORE_CAPACITY.limits()
     }
 }
 
@@ -134,9 +134,12 @@ impl SuiteDirectory {
         if let Some(limits) = self.limits.borrow().clone() {
             return limits;
         }
-        let sample = SqliteStateStore::open(self.next_path(), request(StateStoreLimits::default()))
-            .await
-            .expect("open sizing instance");
+        let sample = SqliteStateStore::open(
+            self.next_path(),
+            request(crate::SQLITE_STATE_STORE_CAPACITY.limits()),
+        )
+        .await
+        .expect("open sizing instance");
         let limits = conformance_limits(&sample);
         *self.limits.borrow_mut() = Some(limits.clone());
         limits

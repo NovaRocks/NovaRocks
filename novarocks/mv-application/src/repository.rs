@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence::definition::MvDesiredRefreshPolicy;
 pub use crate::persistence::dependency::CreateMvDependencyRequest;
-use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::product::MvTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,13 +190,11 @@ impl MvProjectionVersion {
 pub struct MvProjectionInventoryBound {
     pub entries: usize,
     pub snapshot_bytes: usize,
-    pub raw_page_bytes: usize,
     pub single_name_bytes: usize,
     pub continuation_token_bytes: usize,
-    pub decode: PersistenceDecodeBudget,
 }
 
-/// Local dependency display reads share one raw/decode page promise with a
+/// Local dependency display reads share one exact page contract with a
 /// complete thin classification inventory and a separate finite collector.
 #[derive(Clone, Copy, Debug)]
 pub struct MvDependencyReadBound {
@@ -225,11 +222,8 @@ impl MvProjectionInventoryBuilder {
     pub(crate) fn new(bound: MvProjectionInventoryBound) -> Result<Self, MvRepositoryError> {
         if bound.entries == 0
             || bound.snapshot_bytes == 0
-            || bound.raw_page_bytes == 0
             || bound.single_name_bytes == 0
             || bound.continuation_token_bytes == 0
-            || bound.decode.max_working_set_bytes == 0
-            || bound.decode.max_document_bytes == 0
         {
             return Err(Self::refusal(
                 "MV inventory requires nonzero explicit bounds",

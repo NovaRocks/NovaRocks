@@ -292,7 +292,6 @@ pub(in crate::scenarios) struct Record {
     pub frame: String,
 }
 pub(in crate::scenarios) fn record(frame: &str) -> Result<Record> {
-    ensure!(frame.len() <= 4096, "record exceeds 4KiB");
     let parts: Vec<_> = frame.split('.').collect();
     let ["2", binding, payload] = parts.as_slice() else {
         bail!("invalid record frame")
@@ -361,11 +360,8 @@ impl Graph {
             if let Some(id) = key.strip_prefix(&format!("{PREFIX}rev.")) {
                 let version: Version = canonical(value).with_context(|| key.clone())?;
                 ensure!(
-                    value.len() <= 65536
-                        && version.v == 2
-                        && version.id == id
-                        && version.identity()? == id,
-                    "{key}: invalid document identity/envelope/size"
+                    version.v == 2 && version.id == id && version.identity()? == id,
+                    "{key}: invalid document identity/envelope"
                 );
                 graph.versions.insert(id.into(), version);
             } else if let Some(name) = key.strip_prefix(&format!("{PREFIX}slot.")) {
@@ -393,10 +389,6 @@ impl Graph {
                 bail!("{key}: unrecognized private property key")
             }
         }
-        ensure!(
-            graph.private_bytes <= 262144,
-            "private properties exceed 256KiB"
-        );
         for snapshot in metadata["snapshots"]
             .as_array()
             .context("metadata lacks snapshots")?
@@ -842,6 +834,64 @@ fn publication_payload_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_retained_version_crosses_former_inline_quotas_without_losing_identity() {
+        let content = vec![b'x'; 196_609];
+        let version = Version::new(
+            "novarocks.mv",
+            "definition",
+            Format {
+                owner: "novarocks.mv".into(),
+                name: "definition".into(),
+                version: 1,
+            },
+            vec![],
+            &content,
+        )
+        .unwrap();
+        let encoded = version.encoded().unwrap();
+        assert!(encoded.len() > 65_536);
+        let mut metadata = graph_fixture();
+        let key = format!("{PREFIX}rev.{}", version.id);
+        metadata["properties"][&key] = serde_json::json!(encoded);
+        let graph = Graph::from_metadata(&metadata).unwrap();
+        assert!(graph.private_bytes > 262_144);
+        assert_eq!(graph.versions[&version.id].bytes().unwrap(), content);
+
+        let encoded = metadata["properties"][&key].as_str().unwrap();
+        metadata["properties"][&key] = serde_json::json!(encoded.replacen("eHh4", "eHh5", 1));
+        assert!(Graph::from_metadata(&metadata).is_err());
+    }
+
+    #[test]
+    fn large_publication_keeps_all_declared_watermark_bounds() {
+        let mut payload = vec![1];
+        payload.extend_from_slice(&[0x11; 16]);
+        payload.extend_from_slice(&42i64.to_be_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&7u64.to_be_bytes());
+        payload.extend_from_slice(&370u16.to_be_bytes());
+        for _ in 0..370 {
+            payload.extend_from_slice(&9u16.to_be_bytes());
+            payload.push(1);
+            payload.extend_from_slice(&17i64.to_be_bytes());
+        }
+        assert!(payload.len() > 4_096);
+        let binding = "a".repeat(64);
+        let framed = record_frame(&binding, &payload);
+        let decoded = record(&framed).unwrap();
+        assert_eq!(decoded.binding.as_deref(), Some(binding.as_str()));
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(
+            validate_payload(&decoded.payload, 370, &[9; 370]).unwrap(),
+            Some(7)
+        );
+        let mut bounds = [9; 370];
+        bounds[0] = 8;
+        assert!(validate_payload(&decoded.payload, 370, &bounds).is_err());
+    }
+
     #[test]
     fn publication_snapshot_watermark_has_exact_tag_width_and_none() {
         assert_eq!(decode_snapshot_watermark(&[0]).unwrap(), None);

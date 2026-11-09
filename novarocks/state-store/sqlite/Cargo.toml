@@ -17,7 +17,7 @@ bytes.workspace = true
 fs2 = "0.4"
 log = "0.4"
 novarocks-state-store-api.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 

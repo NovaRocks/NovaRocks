@@ -48,14 +48,8 @@ fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjection
     MvProjectionInventoryBound {
         entries: novarocks_query_application::api::LocalResultBound::V1.rows,
         snapshot_bytes: 16 * 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: novarocks_mv_application::persistence::validation::PersistenceDecodeBudget {
-            max_document_bytes: 1024 * 1024,
-            max_working_set_bytes: 4 * 1024 * 1024,
-            ..Default::default()
-        },
     }
 }
 
@@ -500,7 +494,7 @@ impl MvCandidateReader {
             management,
             ..
         } = self;
-        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),Default::default(),management).await.map_err(document_application_error)?;
+        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),management).await.map_err(document_application_error)?;
         if observed.deployment_owner != *management.owner()
             || observed.process_incarnation != *management.incarnation()
         {
@@ -524,7 +518,6 @@ impl MvCandidateReader {
                 request.catalog_handle,
                 target,
                 request.context,
-                Default::default(),
             )
             .map_err(projection_application_error)?;
             let operation = Uuid::now_v7();
@@ -558,7 +551,7 @@ impl MvCandidateReader {
         }
         if convergence.reinstall_current_projection {
             let (fresh, admission, _) = management
-                .observe_keyed_admission_async(lease, request.clone(), Default::default())
+                .observe_keyed_admission_async(lease, request.clone())
                 .await
                 .map_err(document_application_error)?;
             observed = fresh;
@@ -578,7 +571,6 @@ impl MvCandidateReader {
                 request.catalog_handle,
                 target,
                 request.context,
-                Default::default(),
             )
             .map_err(projection_application_error)?;
             let operation = Uuid::now_v7();

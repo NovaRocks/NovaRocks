@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::attempt::{AttemptId, AttemptSupervisor, WriteAttempt};
 use super::error::{StateStoreError, StateStoreErrorKind};
-use super::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES, StateStoreLimits};
+use super::limits::StateStoreLimits;
 use super::range::{ContinuationToken, RangeRequest};
 
 macro_rules! opaque_bytes {
@@ -49,40 +49,15 @@ macro_rules! opaque_bytes {
     };
 }
 
-opaque_bytes!(Key, |bytes: &Bytes| {
-    validate_maximum(
-        bytes.len(),
-        MAX_KEY_BYTES,
-        "key exceeds the common byte limit",
-    )
-});
-opaque_bytes!(Value, |bytes: &Bytes| {
-    validate_maximum(
-        bytes.len(),
-        MAX_VALUE_BYTES,
-        "value exceeds the common byte limit",
-    )
-});
+// Size admission belongs to the opened provider's limits, not the carrier.
+opaque_bytes!(Key, |_: &Bytes| Ok::<(), StateStoreError>(()));
+opaque_bytes!(Value, |_: &Bytes| Ok::<(), StateStoreError>(()));
 opaque_bytes!(VersionToken, |bytes: &Bytes| {
     validate_non_empty(bytes, "version token must not be empty")
 });
 opaque_bytes!(StoreRevision, |bytes: &Bytes| {
     validate_non_empty(bytes, "store revision must not be empty")
 });
-
-fn validate_maximum(
-    actual: usize,
-    maximum: usize,
-    message: &'static str,
-) -> Result<(), StateStoreError> {
-    if actual > maximum {
-        return Err(StateStoreError::new(
-            StateStoreErrorKind::LimitExceeded,
-            message,
-        ));
-    }
-    Ok(())
-}
 
 fn validate_non_empty(bytes: &Bytes, message: &'static str) -> Result<(), StateStoreError> {
     if bytes.is_empty() {

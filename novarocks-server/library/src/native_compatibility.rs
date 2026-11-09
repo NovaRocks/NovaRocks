@@ -265,13 +265,14 @@ mod tests {
             novarocks_physical_plan::PLAN_CONTRACT_REVISION
         );
 
-        let next_plan_revision = novarocks_physical_plan::PLAN_CONTRACT_REVISION
-            .checked_add(1)
-            .expect("test requires a next plan contract revision");
+        let prior_plan_revision = novarocks_physical_plan::PLAN_CONTRACT_REVISION
+            .checked_sub(1)
+            .filter(|revision| *revision != 0)
+            .expect("test requires a prior plan contract revision");
         let plan_only_change = novarocks_version::derive_repository_native_compatibility_material(
             native_carrier_declarations(manifest.contracts()).unwrap(),
             [0x31; 32],
-            next_plan_revision,
+            prior_plan_revision,
             COMPILED,
         )
         .expect("plan-only compatibility material");
@@ -283,6 +284,16 @@ mod tests {
         assert_eq!(
             material.descriptor_digest(),
             plan_only_change.descriptor_digest()
+        );
+        assert_eq!(material.carriers(), plan_only_change.carriers());
+        assert_eq!(material.epoch(), plan_only_change.epoch());
+        assert_eq!(
+            material.function_catalog_digest(),
+            plan_only_change.function_catalog_digest()
+        );
+        assert_eq!(
+            material.static_plan_interpreter(),
+            plan_only_change.static_plan_interpreter()
         );
     }
 

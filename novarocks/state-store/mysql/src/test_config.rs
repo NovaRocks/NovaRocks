@@ -20,12 +20,11 @@
 use std::num::NonZeroUsize;
 
 use novarocks_state_store_api::{
-    DEFAULT_MAX_OUTSTANDING_ATTEMPTS, DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreError,
+    DEFAULT_MAX_OUTSTANDING_ATTEMPTS, DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, StateStoreError,
     StateStoreErrorKind, StateStoreLimits,
 };
 
-use crate::{MYSQL_MAX_KEY_BYTES, MysqlStateStoreOpenConfig};
+use crate::MysqlStateStoreOpenConfig;
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -93,23 +92,23 @@ fn resolve_limits(
         max_key_bytes: tightened_usize(
             "max_key_bytes",
             overrides.max_key_bytes,
-            MYSQL_MAX_KEY_BYTES,
+            crate::MYSQL_STATE_STORE_CAPACITY.max_key_bytes,
         )?,
         max_value_bytes: tightened_usize(
             "max_value_bytes",
             overrides.max_value_bytes,
-            MAX_VALUE_BYTES,
+            crate::MYSQL_STATE_STORE_CAPACITY.max_value_bytes,
         )?,
         max_page_size: tightened_usize("max_page_size", overrides.max_page_size, MAX_PAGE_SIZE)?,
         max_transaction_operations: tightened_usize(
             "max_transaction_operations",
             overrides.max_transaction_operations,
-            MAX_TRANSACTION_OPERATIONS,
+            crate::MYSQL_STATE_STORE_CAPACITY.max_transaction_operations,
         )?,
         max_transaction_bytes: tightened_usize(
             "max_transaction_bytes",
             overrides.max_transaction_bytes,
-            MAX_TRANSACTION_BYTES,
+            crate::MYSQL_STATE_STORE_CAPACITY.max_transaction_bytes,
         )?,
         transaction_deadline: std::time::Duration::from_millis(tightened_u64(
             "transaction_deadline_ms",

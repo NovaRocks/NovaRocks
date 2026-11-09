@@ -350,9 +350,7 @@ fn validate_open_instance(
 mod tests {
     use std::time::Duration;
 
-    use novarocks_state_store_api::{
-        StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderId,
-    };
+    use novarocks_state_store_api::{StateStoreProviderDescriptor, StateStoreProviderId};
     use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
 
     use super::*;
@@ -362,8 +360,10 @@ mod tests {
     };
 
     const PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("runtime-host-test");
-    const DESCRIPTOR: StateStoreProviderDescriptor =
-        StateStoreProviderDescriptor::new(PROVIDER_ID, novarocks_state_store_api::MAX_KEY_BYTES);
+    const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
+        PROVIDER_ID,
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
+    );
 
     fn registry() -> StateStoreProviderRegistry {
         let mut registry = StateStoreProviderRegistry::new();
@@ -379,7 +379,7 @@ mod tests {
         StateStoreHostInput {
             cluster_id: cluster_id.into(),
             provider_id: PROVIDER_ID,
-            limits: StateStoreLimits::default(),
+            limits: novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
             run_policy: StateStoreRunPolicy::default(),
         }
     }
@@ -417,5 +417,30 @@ mod tests {
         };
 
         assert_eq!(error.kind(), StateStoreHostErrorKind::InvalidConfiguration);
+    }
+    #[test]
+    fn registry_rejects_all_out_of_capacity_facts_before_binding() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let mut registry = StateStoreProviderRegistry::new();
+        registry
+            .register(StateStoreProviderRegistration::new(DESCRIPTOR, move |_| {
+                observed.store(true, Ordering::SeqCst);
+                panic!("invalid opening facts must not invoke the binder");
+            }))
+            .unwrap();
+        for field in 0..4 {
+            let mut request = input("capacity-before-bind");
+            match field {
+                0 => request.limits.max_key_bytes += 1,
+                1 => request.limits.max_value_bytes += 1,
+                2 => request.limits.max_transaction_bytes += 1,
+                _ => request.limits.max_transaction_operations += 1,
+            }
+            let error = registry.bind(&request).err().expect("out of capacity");
+            assert_eq!(error.kind(), StateStoreHostErrorKind::InvalidConfiguration);
+        }
+        assert!(!called.load(Ordering::SeqCst));
     }
 }

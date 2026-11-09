@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use novarocks_state_store_api::{
-    MAX_KEY_BYTES, StateStore, StateStoreBlockingOriginal, StateStoreError, StateStoreErrorKind,
+    StateStore, StateStoreBlockingOriginal, StateStoreError, StateStoreErrorKind,
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
@@ -38,7 +38,7 @@ impl SqliteStateStoreProviderFactory {
         Self {
             descriptor: StateStoreProviderDescriptor::new(
                 SQLITE_STATE_STORE_PROVIDER_ID,
-                MAX_KEY_BYTES,
+                crate::SQLITE_STATE_STORE_CAPACITY,
             ),
             path,
         }
@@ -248,7 +248,7 @@ mod tests {
     fn request(deadline: Instant) -> StateStoreOpenRequest {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
-            limits: novarocks_state_store_api::StateStoreLimits::default(),
+            limits: crate::SQLITE_STATE_STORE_CAPACITY.limits(),
             deadline,
         }
     }

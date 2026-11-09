@@ -2196,6 +2196,10 @@ pub(super) async fn hold_kv_lock_for_test(
     })
 }
 
+// Small explicit capacity used only by the persisted-row corruption fixtures.
+// Its payload+1 fits MEDIUMBLOB but exceeds the reader's configured capacity.
+pub(super) const MALFORMED_ROW_TEST_VALUE_LIMIT: usize = 64 * 1024;
+
 #[cfg_attr(not(feature = "state-store-test-hooks"), allow(dead_code))]
 pub(crate) async fn insert_malformed_kv_row_for_test(
     pool: Arc<dyn PoolLifecycle>,
@@ -2211,7 +2215,7 @@ pub(crate) async fn insert_malformed_kv_row_for_test(
         statement_in_flight: false,
     };
     let key = key.to_vec();
-    let oversized_value = vec![0x5a; novarocks_state_store_api::MAX_VALUE_BYTES + 1];
+    let oversized_value = vec![0x5a; MALFORMED_ROW_TEST_VALUE_LIMIT + 1];
     transaction
         .run(move |connection| {
             Box::pin(connection.exec_drop(

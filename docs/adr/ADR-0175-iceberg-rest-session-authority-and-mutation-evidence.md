@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0224
+    scope: "Ruling 23 retention of requested property values and the definite-rejection set in ruling 16; authentication, routing, complete JSON validation, attribution and redaction remain active"
+    link: "ADR-0224-mv-document-capacity-comes-from-real-boundaries.md"
   - id: ADR-0179
     scope: "SDK session and generic mutation facade ownership, caller deadline after dispatch and FE staged-result projection; authentication, header provenance, frozen routing and redaction rules remain active"
     link: "ADR-0179-iceberg-publication-lifecycle-and-evidence.md"

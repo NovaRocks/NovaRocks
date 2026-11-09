@@ -190,7 +190,6 @@ pub fn encode_limits() -> PackageEncodeLimits {
         },
         reads: ProviderReadProjectionLimits {
             max_definitions: 100_000,
-            max_input_version_bytes: 1024,
             max_allocation_requests: 1_000_000,
             max_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,

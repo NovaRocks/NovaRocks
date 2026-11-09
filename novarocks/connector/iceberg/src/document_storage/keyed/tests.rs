@@ -457,67 +457,53 @@ fn closure_retains_shared_links_and_rejects_missing() {
     assert!(reference_closure(&versions, [DocumentIdentity::from_bytes([1; 32])]).is_err());
 }
 #[test]
-fn limits_are_encoded_bytes_and_boundaries_are_inclusive() {
-    let v = version();
-    let version_size = GOLDEN_VERSION.len();
-    let mut limits = KeyedDocumentLimits {
-        version_value_bytes: version_size,
-        private_property_bytes: usize::MAX,
-        record_bytes: usize::MAX,
-    };
-    check_version(&v, limits).unwrap();
-    limits.version_value_bytes -= 1;
-    assert!(check_version(&v, limits).is_err());
+fn private_property_byte_observation_ignores_unrelated_properties() {
     let props = HashMap::from([
         ("novarocks.doc.v2.root.a".into(), GOLDEN_ID.into()),
         ("unrelated".into(), "large".repeat(100)),
     ]);
-    let size = "novarocks.doc.v2.root.a".len() + 64;
-    assert_eq!(private_property_bytes(&props), size);
-    limits.private_property_bytes = size;
-    check_private_properties(&props, Some(0), limits).unwrap();
-    limits.private_property_bytes -= 1;
-    let error = check_private_properties(&props, Some(77), limits).unwrap_err();
-    assert!(error.message().contains("77"));
-    let r = record(Some(v.identity()));
-    let size = record_bytes(&r).unwrap();
-    limits.record_bytes = size;
-    check_record(&r, limits).unwrap();
-    check_record_structure(&r.owner, &r.name, true, 3, limits).unwrap();
-    limits.record_bytes -= 1;
-    assert!(check_record(&r, limits).is_err());
-    assert!(check_record_structure(&r.owner, &r.name, true, 3, limits).is_err());
+    assert_eq!(
+        private_property_bytes(&props),
+        "novarocks.doc.v2.root.a".len() + 64
+    );
 }
 
 #[test]
-fn default_budgets_cover_real_boundary_sizes() {
-    let limits = KeyedDocumentLimits::default();
-    let key = root_key("owner");
-    let mut props = HashMap::from([(key.clone(), "x".repeat(256 * 1024 - key.len()))]);
-    check_private_properties(&props, Some(0), limits).unwrap();
-    props.get_mut(&key).unwrap().push('x');
-    assert!(check_private_properties(&props, Some(0), limits).is_err());
-    let overhead = encode_version(&version()).unwrap().len() - 4;
-    let largest_content = (64 * 1024 - overhead) / 4 * 3;
-    let make = |count| {
-        ConnectorDocumentVersion::try_new(
-            "novarocks.mv",
-            "definition",
-            format(),
-            vec![],
-            Bytes::from(vec![b'x'; count]),
-        )
-        .unwrap()
+fn keyed_create_keeps_versions_above_former_encoded_limits() {
+    // These sizes cross the former per-version and total-property quotas;
+    // they are test inputs, not replacement product limits.
+    let versions = (0..4)
+        .map(|index| {
+            ConnectorDocumentVersion::try_new(
+                "novarocks.mv",
+                format!("definition-{index}"),
+                format(),
+                vec![],
+                Bytes::from(vec![b'x'; 50_000]),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let documents = KeyedCreate {
+        versions: versions.clone(),
+        roots: BTreeMap::from([("novarocks.mv".into(), versions[0].identity())]),
+        ..Default::default()
     };
-    check_version(&make(largest_content), limits).unwrap();
-    assert!(check_version(&make(largest_content + 3), limits).is_err());
-    let mut r = record(None);
-    let overhead = record_bytes(&r).unwrap() - 4;
-    r.payload = Bytes::from(vec![b'x'; (4096 - overhead) / 4 * 3]);
-    check_record(&r, limits).unwrap();
-    r.payload = Bytes::from(vec![b'x'; r.payload.len() + 3]);
-    assert!(check_record(&r, limits).is_err());
-    assert!(check_record_structure("owner", "name", true, usize::MAX, limits).is_err());
+    let properties = super::write::create_properties(&documents).unwrap();
+    for version in &versions {
+        let value = &properties[&version_key(version.identity())];
+        assert!(value.len() > 64 * 1024);
+        assert_eq!(value, &encode_version(version).unwrap());
+    }
+    assert!(private_property_bytes(&properties) > 256 * 1024);
+    let observed = parse_properties(&properties).unwrap();
+    for version in versions {
+        assert_eq!(observed.versions[&version.identity()], version);
+    }
+    assert_eq!(
+        properties[&root_key("novarocks.mv")],
+        documents.roots["novarocks.mv"].to_hex()
+    );
 }
 
 #[test]
@@ -616,7 +602,7 @@ fn marker_writes_only_its_exact_key_and_replaying_it_is_identical() {
 }
 
 #[test]
-fn publication_rewrites_closure_but_ordinary_refresh_does_not_gate_on_history_growth() {
+fn publication_and_marker_writes_keep_closure_with_large_history() {
     let definition = version();
     let mut properties = HashMap::from([(
         version_key(definition.identity()),
@@ -636,7 +622,7 @@ fn publication_rewrites_closure_but_ordinary_refresh_does_not_gate_on_history_gr
             encode_version(&historical).unwrap(),
         );
     }
-    assert!(private_property_bytes(&properties) > KEYED_DOCUMENT_PRIVATE_BYTES);
+    assert!(private_property_bytes(&properties) > 256 * 1024);
     let base = metadata(properties);
     let documents = KeyedPublication {
         records: vec![record(Some(definition.identity()))],
@@ -658,16 +644,13 @@ fn publication_rewrites_closure_but_ordinary_refresh_does_not_gate_on_history_gr
             },
         )]),
     };
-    assert!(
-        super::write::marker_properties(&base, &marker)
-            .unwrap_err()
-            .message()
-            .contains("encoded size")
-    );
+    let writes = super::write::marker_properties(&base, &marker).unwrap();
+    let (key, value) = marker.markers.iter().next().unwrap();
+    assert_eq!(writes[&marker_key(key)], encode_marker(key, value).unwrap());
 }
 
 #[test]
-fn keyed_write_limits_fail_before_a_commit_request_can_be_constructed() {
+fn keyed_writes_keep_large_records_and_reject_dangling_roots() {
     let oversized = ConnectorDocumentVersion::try_new(
         "novarocks.mv",
         "large",
@@ -680,11 +663,12 @@ fn keyed_write_limits_fail_before_a_commit_request_can_be_constructed() {
         versions: vec![oversized],
         ..Default::default()
     };
-    assert!(
-        super::write::create_properties(&create)
-            .unwrap_err()
-            .message()
-            .contains("version large")
+    let properties = super::write::create_properties(&create).unwrap();
+    let version = &create.versions[0];
+    assert!(properties[&version_key(version.identity())].len() > 64 * 1024);
+    assert_eq!(
+        properties[&version_key(version.identity())],
+        encode_version(version).unwrap()
     );
     let documents = KeyedPublication {
         records: vec![ConnectorSnapshotRecord {
@@ -693,11 +677,15 @@ fn keyed_write_limits_fail_before_a_commit_request_can_be_constructed() {
         }],
         ..Default::default()
     };
-    assert!(
-        super::write::publication_updates(&metadata(HashMap::new()), &documents)
-            .unwrap_err()
-            .message()
-            .contains("snapshot record")
+    let result = super::write::publication_updates(&metadata(HashMap::new()), &documents).unwrap();
+    let record = &documents.records[0];
+    let key = record_key(&record.owner, &record.name);
+    assert!(key.len() + result.summary[&key].len() > 4 * 1024);
+    assert_eq!(result.summary[&key], encode_record(record).unwrap());
+    let summary = result.summary.into_iter().collect::<HashMap<_, _>>();
+    assert_eq!(
+        parse_snapshot_records(&summary, true).unwrap(),
+        documents.records
     );
     let dangling = KeyedCreate {
         roots: BTreeMap::from([("novarocks.mv".into(), DocumentIdentity::from_bytes([3; 32]))]),

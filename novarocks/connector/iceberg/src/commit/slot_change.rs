@@ -22,13 +22,12 @@ use super::{
     model::{Dependency, OperationIntent, RequestShape},
     staging::{PreparedChange, Preparer, StagedView},
 };
-use crate::document_storage::keyed::{envelope, keys, limits, record, view};
+use crate::document_storage::keyed::{envelope, keys, record, view};
 use crate::iceberg::spec::{Operation, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result, TableUpdate};
 use async_trait::async_trait;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, KeyedDocumentLimits, KeyedDocumentReadError,
-    KeyedSlotChange,
+    ConnectorError, ConnectorErrorKind, KeyedDocumentReadError, KeyedSlotChange,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -176,13 +175,6 @@ impl Preparer for SlotChangePreparer {
             .iter()
             .map(keys::marker_key)
             .collect();
-        let mut after = metadata.properties().clone();
-        after.extend(rewrites.clone());
-        for key in &removals {
-            after.remove(key);
-        }
-        limits::check_private_properties(&after, None, KeyedDocumentLimits::default())
-            .map_err(document_error)?;
         let operation = if parent.is_some() {
             Operation::Replace
         } else {

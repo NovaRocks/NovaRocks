@@ -155,6 +155,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留）
 - [ADR-0219](ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md) — Iceberg lineage 为何只认格式版本、MV为何观察所选快照范围、重复匹配为何按物理行与子句判重并由规划声明Trino错误（active；部分替代ADR-0055的属性准入历史，Provider策略与SQL谓词所有权保留）
 - [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor）
 - [ADR-0214](ADR-0214-iceberg-schema-depth-by-decoder-owner.md) — Iceberg schema 为何按解码作者区分逻辑深度、文法物理深度与 SDK manifest 能力边界，并在 DDL 发布前和实际 manifest 解码前准确拒绝（active；部分替代 ADR-0213 的经验深度推导，运行验证状态独立核对）
@@ -204,14 +205,14 @@ code-anchors:
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active；SDK transaction/action 准备复用许可由 ADR-0171 部分取代，catalog owner 与 operation admission 仍有效；统一 Transaction 与 late TableCommit carrier 由 ADR-0179 替代）
 - [ADR-0171](ADR-0171-commit-operation-model.md) — Iceberg 提交为何由不可变意图、依赖验证、attempt staging 与产物 owner 共同完成（active；部分取代 ADR-0118、ADR-0055，细化 lake publication ADR-0110；文档请求形状由 ADR-0180 部分替代，不可变操作、依赖验证与产物所有权保留；late SDK carrier、transaction outcome 与可复用 rewrite manifest 生命周期由 ADR-0179 部分替代；同步等待及 finalize/cleanup 完成边界、无条件年龄窗延续由 ADR-0198 部分替代，原有 Unknown 保护保留）
-- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
+- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；请求属性保留量与确定拒绝集由 ADR-0224 部分替代，认证、路由、其余状态码与脱敏规则仍有效）
 - [ADR-0176](ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md) — Iceberg REST 请求词汇为何归连接器、`add-schema` 为何不带 `last-column-id`（支持下限为 Iceberg Java 1.9 语义），view 替换为何总是新增带操作身份的版本并以 `-1` 选择、语义校验为何在派发之前（active；部分替代 ADR-0174 的 core U2/P8/View API 保留项与 ADR-0175 的 core REST 补丁妥协）
 - ADR-0169 — catalog owner 为何在零副作用点统一准入、HMS 永久只读，并让单写者作业留在提交语句生命周期内（active；延伸 ADR-0118）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；守卫形态与依赖边界检查由 ADR-0190 部分替代，契约/testkit 拆分保留；替换 ADR-0006 的统一物理 SPI 前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
 - ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active；其「同步 reader 占用扫描线程」的妥协已由 ADR-0159 兑现，Range 服务与 B/N 规则不变）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
-- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171）
+- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，内联存放、身份、写入形状、回收、证据与外部回滚边界保留）
 
 #### 历史
 
@@ -270,7 +271,7 @@ code-anchors:
 - [ADR-0124](ADR-0124-native-compatibility-islands-and-ingress-admission.md) — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active；兼容材料由 ADR-0185 部分替代，exact-island 与 ingress 规则保留）
 - [ADR-0201](ADR-0201-role-local-node-credential-sources.md) — 节点身份为何使用独立 NodeLocal 来源、各角色本地取得并复用原 authority 续期，而不冒充 Static 或 Vended（active；部分替代 ADR-0151 的 NodeLocal principal 含义）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149；取得路径的含义由 ADR-0175 部分替代：两条路径都携带 FE 冻结的公开路由上下文、执行节点不建会话、vended 读取准入要求 BE 首次取得；消费侧续期与材料不跨进程仍有效）
-- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
+- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；请求属性保留量与确定拒绝集由 ADR-0224 部分替代，认证、路由、其余状态码与脱敏规则仍有效）
 
 - [ADR-0161](ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md) — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；读取封口与逻辑业务结论边界由 ADR-0198 扩为通用计算就绪及独立语句结果，准确身份、Accepted/Installed、覆盖观察与真实收敛保留）
 
@@ -306,6 +307,7 @@ code-anchors:
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
+- [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — ProviderRead 命名空间为何保留版本累计事实而撤销独立字节配额，冻结策略变化为何沿既有 plan revision 隔离原生岛（active；其余资源门、单值表示与唯一 compiled 路径保留）
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0161 的一次激活与固定版本恢复替换，其余仍有效）
@@ -436,8 +438,10 @@ admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 
 
 领域哲学：Frontend durable record 的正确性以最终可持久化的完整表示为准，而不是以 wire payload 或字段的局部长度为准。
 不透明字节必须有界、使用单一 canonical 表示并在日志中脱敏；所有记录写入在外部副作用前经过实际编码预算校验。
-StateStore 的全局单值限制保持公共契约，record owner 负责自己的 schema、状态机与错误映射，索引和控制值保持独立小值路径。
+StateStore 的容量由各后端声明真实边界，record owner 负责自己的 schema、状态机与错误映射，索引和控制值保持独立小值路径。
+MV 文档与其 Accelerator 投影遵循 ADR-0224，上述记录预算不为它们另设文档或解码工作集上限。
 
+- [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留）
 - ADR-0074 — Frontend durable record 为何统一采用有界 canonical 编码与整记录预算（active）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并把提交结果收敛为不可翻转的三态（active）
 
@@ -473,13 +477,14 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
+- [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留）
 - [ADR-0223](ADR-0223-result-content-identity-and-deterministic-fingerprints.md) — 内容身份为何逐列显式选择、NaN 规范化与首次接纳代表为何分开、确定指纹为何只作证据并由原 owner 判定适用资格（active；补充 ADR-0205，限当前准入支持面）
 - [ADR-0219](ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md) — Iceberg lineage 为何只认格式版本、MV为何观察所选快照范围、重复匹配为何按物理行与子句判重并由规划声明Trino错误（active；部分替代ADR-0055的属性准入历史，Provider策略与SQL谓词所有权保留）
 - [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active；单次准备与执行观察已接线，验证范围与验收资格另核）
 - [ADR-0110](ADR-0110-lake-publication-crash-only-contract.md) — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active；本地期限推导外部效果上界及无条件年龄窗回收由 ADR-0198 部分替代，target OCC、autocommit 与无持久接管规则保留）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active；存放与附着条款由 ADR-0180 部分替代，湖上权威、领域分工与 Accelerator 边界保留）
-- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171）
+- [ADR-0180](ADR-0180-inline-keyed-documents-and-snapshot-records.md) — 应用文档为何按完整语义内联寻址、槽变更推进 main，且快照记录与生命周期回收分工（active；部分替代 ADR-0154、ADR-0171；裁决 1 的额度与首条重评条件由 ADR-0224 部分替代，内联存放、身份、写入形状、回收、证据与外部回滚边界保留）
 
 #### 历史
 
@@ -533,6 +538,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### crate-boundary
 
+- [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor）
 - [ADR-0215](ADR-0215-released-iceberg-package-provenance.md) — Iceberg 正式发布为何以 registry 原包为来源、无分歧包退出 vendor，并分离发布与验证 lock（active；部分替代 ADR-0174 来源、macro 保留与四 path 妥协；HMS 继续 vendor 的部分由 ADR-0216 部分替代，core 的保留规则仍有效）
@@ -561,7 +567,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0168 — CI 依赖守卫为何从 Cargo 权威派生版本与 checksum、同时保护来源身份和封闭依赖面（active；部分替代 ADR-0150；身份与测试权威守卫规则由 ADR-0190 部分替代，版本仅由根 manifest 与 Cargo.lock 表达的规则保留）
 - ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，Paimon 暂停期间的 allowlist 由 ADR-0204 部分替代，其余规则保留）
 - [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170；REST crate 补丁清单、裁决 4 的临时结果收窄与 SDK 认证妥协由 ADR-0175 部分替代，core U2/P8/View API 保留项由 ADR-0176 部分替代，U8 与 Variant 读取暂缓由 ADR-0178 部分替代，P2 退出和 U4 交接由 ADR-0179 部分替代，仅协议分歧限制由 ADR-0204 部分替代以允许有界上游依赖移植，基线可重建与其余 core 补丁的消费方退出仍有效）；正式发布来源、macro 保留与四 path 妥协由 ADR-0215 部分替代；HMS H3/H4 保留行及其删除条件由 ADR-0216 部分替代
-- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；认证、路由、状态码与脱敏规则仍有效）
+- [ADR-0175](ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md) — Iceberg REST 为何每个 generation 只有一份会话、认证头只由角色本地 owner 写、BE 按冻结路由上下文取得，并把 NovaRocks 发出的每个变更请求归为可归属的证据（active；部分替代 ADR-0151 的取得路径含义与 ADR-0174 的 REST 补丁清单、临时结果收窄和 SDK 认证妥协；「core 中只为 REST 服务的补丁仍在」这一妥协由 ADR-0176 部分替代，会话建立、SDK facade、派发后期限与 FE stage 结果投影由 ADR-0179 替代；请求属性保留量与确定拒绝集由 ADR-0224 部分替代，认证、路由、其余状态码与脱敏规则仍有效）
 - [ADR-0176](ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md) — Iceberg REST 请求词汇为何归连接器、`add-schema` 为何不带 `last-column-id`（支持下限为 Iceberg Java 1.9 语义），view 替换为何总是新增带操作身份的版本并以 `-1` 选择、语义校验为何在派发之前（active；部分替代 ADR-0174 的 core U2/P8/View API 保留项与 ADR-0175 的 core REST 补丁妥协）
 
 #### 历史

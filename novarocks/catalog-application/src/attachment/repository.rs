@@ -1300,7 +1300,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use futures::future::BoxFuture;
-    use novarocks_state_store_api::{StateStore, StateStoreLimits};
+    use novarocks_state_store_api::StateStore;
     use novarocks_state_store_testkit::conformance::{FaultGate, FaultInjectingStateStore};
     use novarocks_state_store_testkit::testing::InMemoryStateStore;
 
@@ -1349,7 +1349,8 @@ mod tests {
                 foundationdb_client,
             } = config;
             let _ = (path, mysql_client, foundationdb_client);
-            let mut resolved = StateStoreLimits::default();
+            let mut resolved =
+                novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits();
             if let Some(max_value_bytes) = limits.max_value_bytes {
                 resolved.max_value_bytes = max_value_bytes;
             }

@@ -28,7 +28,7 @@ use novarocks_state_store_api::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::runtime::MysqlRuntime;
-use crate::{MYSQL_MAX_KEY_BYTES, MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig};
+use crate::{MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig};
 
 trait MysqlProviderRuntime: Send + 'static {
     fn start_open_store(
@@ -336,7 +336,7 @@ impl MysqlStateStoreProviderFactory {
         Self {
             descriptor: StateStoreProviderDescriptor::new(
                 MYSQL_STATE_STORE_PROVIDER_ID,
-                MYSQL_MAX_KEY_BYTES,
+                crate::MYSQL_STATE_STORE_CAPACITY,
             ),
             database,
             client,
@@ -367,6 +367,12 @@ impl StateStoreProviderFactory for MysqlStateStoreProviderFactory {
     ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
         if Instant::now() >= request.deadline {
             return Err(mysql_provider_deadline_error());
+        }
+        if !crate::MYSQL_STATE_STORE_CAPACITY.accepts(&request.limits) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "mysql opening limits exceed provider capacity",
+            ));
         }
         validate_database(&self.database)?;
         let runtime = MysqlRuntime::boot(self.client)?;
@@ -503,7 +509,7 @@ mod tests {
     impl StateStore for FakeStore {
         fn limits(&self) -> &StateStoreLimits {
             static LIMITS: std::sync::LazyLock<StateStoreLimits> =
-                std::sync::LazyLock::new(StateStoreLimits::default);
+                std::sync::LazyLock::new(|| crate::MYSQL_STATE_STORE_CAPACITY.limits());
             &LIMITS
         }
 
@@ -679,7 +685,7 @@ mod tests {
     fn provider_open_request(deadline: Instant) -> StateStoreOpenRequest {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
-            limits: StateStoreLimits::default(),
+            limits: crate::MYSQL_STATE_STORE_CAPACITY.limits(),
             deadline,
         }
     }
@@ -804,7 +810,10 @@ mod tests {
             },
         );
         assert_eq!(factory.descriptor().id, MYSQL_STATE_STORE_PROVIDER_ID);
-        assert_eq!(factory.descriptor().max_key_bytes, MYSQL_MAX_KEY_BYTES);
+        assert_eq!(
+            factory.descriptor().capacity.max_key_bytes,
+            MYSQL_MAX_KEY_BYTES
+        );
         assert_mysql_instance_contract::<super::MysqlStateStoreProviderInstance>();
     }
 
@@ -820,7 +829,7 @@ mod tests {
         let mut instance = MysqlStateStoreProviderInstance {
             descriptor: StateStoreProviderDescriptor::new(
                 MYSQL_STATE_STORE_PROVIDER_ID,
-                MYSQL_MAX_KEY_BYTES,
+                crate::MYSQL_STATE_STORE_CAPACITY,
             ),
             lifecycle: StateStoreProviderLifecycle::Ready,
             state_store: Some(Arc::new(FakeStore)),

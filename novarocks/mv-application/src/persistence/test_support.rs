@@ -378,7 +378,7 @@ impl Default for MvDocumentFixture {
 mod pure_document_fixture_tests {
     use super::super::codec::keyed::{BindingDocument, DataVersionFormat};
     use super::super::keyed_documents::{build_keyed_versions, definition_revision};
-    use super::super::validation::{PersistenceDecodeBudget, validate_definition_interpretation};
+    use super::super::validation::validate_definition_interpretation;
     use super::*;
     use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorProviderId};
 
@@ -393,11 +393,8 @@ mod pure_document_fixture_tests {
         );
         let bytes =
             super::super::codec::keyed::encode_keyed_interpretation(&f.interpretation).unwrap();
-        let decoded = super::super::codec::keyed::decode_keyed_interpretation(
-            bytes.as_bytes(),
-            PersistenceDecodeBudget::default(),
-        )
-        .unwrap();
+        let decoded =
+            super::super::codec::keyed::decode_keyed_interpretation(bytes.as_bytes()).unwrap();
         assert_eq!(decoded, f.interpretation);
         assert_eq!(
             decoded.aggregates[0].state_slot_ids,
@@ -529,3 +526,232 @@ mod pure_document_fixture_tests {
 #[path = "keyed_fixture.rs"]
 mod keyed_fixture;
 pub use keyed_fixture::{KeyedProjectionFixture, observed_current_keyed, sample_keyed_projection};
+
+/// Coherent model fixture for a balanced UNION ALL over one source column.
+///
+/// Each branch has its own occurrence and shares the physical branch field.
+/// The first branch's final output concatenates an owned literal to `k`.
+/// These are real document/Current codec inputs, not a native CREATE execution.
+pub fn union_all_keyed_projection_fixture(
+    target: crate::product::MvTarget,
+    snapshot: Option<i64>,
+    branches: usize,
+    outputs: usize,
+    literal_bytes: usize,
+) -> KeyedProjectionFixture {
+    use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorProviderId};
+
+    // These assertions describe this fixture's shape, not product capacities.
+    assert!(branches >= 2);
+    assert!(outputs >= 2);
+    let source_object = ConnectorTableObjectId::try_new(Bytes::from_static(b"capacity-fact"))
+        .expect("fixture source object");
+    let source = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+        ConnectorProviderId::parse("iceberg").unwrap(),
+        &source_object,
+        Some(17),
+    )
+    .expect("fixture source revision");
+    let (source_object, source_version) =
+        super::exact_revision::persist_exact_connector_revision(&source).unwrap();
+    let source_field = FieldIdentity::try_new(vec![1]).unwrap();
+    let names = (0..outputs)
+        .map(|index| {
+            if index == 0 {
+                "k".into()
+            } else if index + 1 == outputs {
+                "wide_value".into()
+            } else {
+                format!("c{index:02}")
+            }
+        })
+        .collect::<Vec<String>>();
+    let output_ids = (0..outputs)
+        .map(|index| {
+            OutputIdentity::try_new(u32::try_from(index + 1).unwrap().to_be_bytes().to_vec())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let literal = "x".repeat(literal_bytes);
+    let selects = (0..branches)
+        .map(|branch| {
+            let projection = names
+                .iter()
+                .enumerate()
+                .map(|(output, name)| {
+                    if branch == 0 && output + 1 == outputs {
+                        format!("CONCAT(k, '{literal}') AS {name}")
+                    } else {
+                        format!("k AS {name}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("SELECT {projection} FROM fact")
+        })
+        .collect::<Vec<_>>();
+    fn balanced_union(selects: &[String]) -> String {
+        match selects {
+            [select] => select.clone(),
+            _ => {
+                let middle = selects.len() / 2;
+                format!(
+                    "({} UNION ALL {})",
+                    balanced_union(&selects[..middle]),
+                    balanced_union(&selects[middle..])
+                )
+            }
+        }
+    }
+    let occurrences = (0..branches)
+        .map(|index| RelationOccurrence {
+            occurrence_id: u32::try_from(index + 1).unwrap(),
+            catalog_at_binding: "ice".into(),
+            namespace_at_binding: "sales".into(),
+            relation_at_binding: "fact".into(),
+            qualifier_at_binding: "fact".into(),
+            object_id: source_object.clone(),
+            schema_version: schema_version(1),
+            fields: vec![SourceFieldBinding {
+                field_id: source_field.clone(),
+                name_at_binding: "k".into(),
+                type_signature: "varchar".into(),
+                nullable: true,
+            }],
+        })
+        .collect::<Vec<_>>();
+    let definition = build_definition(
+        1_700_000_000_000,
+        QuerySource {
+            effective_sql: balanced_union(&selects),
+            dialect: QueryDialect::StarRocks,
+            resolution: ResolutionContext {
+                default_catalog: "ice".into(),
+                default_namespace: "sales".into(),
+            },
+        },
+        occurrences.clone(),
+        names
+            .iter()
+            .zip(&output_ids)
+            .enumerate()
+            .map(|(index, (name, id))| OutputDefinition {
+                output_id: id.clone(),
+                name: name.clone(),
+                type_signature: "varchar".into(),
+                nullable: true,
+                expression: ExpressionShape {
+                    kind: if index + 1 == outputs {
+                        ExpressionKind::Mixed
+                    } else {
+                        ExpressionKind::Field
+                    },
+                    function_identity: (index + 1 == outputs)
+                        .then(|| "set-operation/union-all".into()),
+                    source_fields: occurrences
+                        .iter()
+                        .map(|occurrence| SourceFieldReference {
+                            occurrence_id: occurrence.occurrence_id,
+                            field_id: source_field.clone(),
+                        })
+                        .collect(),
+                },
+            })
+            .collect(),
+    )
+    .expect("coherent UNION definition");
+    let apply_id = apply_key_id(1);
+    let apply_field = FieldIdentity::try_new(vec![0xff, 1]).unwrap();
+    let branch_field = FieldIdentity::try_new(vec![0xff, 2]).unwrap();
+    let branch_ids = (0..branches)
+        .map(|index| {
+            BranchIdentity::try_new(u32::try_from(index + 1).unwrap().to_be_bytes().to_vec())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let physical_outputs = output_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| PhysicalFieldBinding {
+            logical_identity: PhysicalFieldLogicalIdentity::Output(id.clone()),
+            target_field_id: FieldIdentity::try_new(
+                u32::try_from(index + 1).unwrap().to_be_bytes().to_vec(),
+            )
+            .unwrap(),
+            type_signature: "varchar".into(),
+            nullable: true,
+        })
+        .collect::<Vec<_>>();
+    let mut fixture = KeyedProjectionFixture::new(target, snapshot);
+    let mut physical_fields = physical_outputs.clone();
+    physical_fields.push(PhysicalFieldBinding {
+        logical_identity: PhysicalFieldLogicalIdentity::ApplyKey(apply_id.clone()),
+        target_field_id: apply_field.clone(),
+        type_signature: "binary".into(),
+        nullable: false,
+    });
+    physical_fields.extend(branch_ids.iter().map(|id| PhysicalFieldBinding {
+        logical_identity: PhysicalFieldLogicalIdentity::Branch(id.clone()),
+        target_field_id: branch_field.clone(),
+        type_signature: "integer".into(),
+        nullable: false,
+    }));
+    fixture.interpretation = InterpretationDocument {
+        definition_revision: super::keyed_documents::definition_revision(&definition).unwrap(),
+        computation_identity: definition.computation_identity,
+        outputs: output_ids
+            .iter()
+            .zip(&physical_outputs)
+            .map(|(id, field)| OutputBinding {
+                output_id: id.clone(),
+                target_field_id: field.target_field_id.clone(),
+                type_signature: field.type_signature.clone(),
+                nullable: field.nullable,
+            })
+            .collect(),
+        state_slots: Vec::new(),
+        apply_key: ApplyKey {
+            kind: ApplyKeyKind::BaseRowId,
+            components: vec![ApplyKeyComponent {
+                logical_id: apply_id,
+                target_field_id: apply_field,
+            }],
+        },
+        aggregates: Vec::new(),
+        branches: branch_ids
+            .into_iter()
+            .zip(&occurrences)
+            .map(|(branch_id, occurrence)| BranchInterpretation {
+                branch_id,
+                relation_occurrence_ids: vec![occurrence.occurrence_id],
+                output_ids: output_ids.clone(),
+            })
+            .collect(),
+        target: TargetBinding {
+            object_id: ObjectIdentity::try_new(fixture.object_id.as_bytes().to_vec()).unwrap(),
+            schema_version: schema_version(3),
+            partition_spec_version: partition_spec_version(4),
+            fields: physical_fields,
+            partition_fields: Vec::new(),
+        },
+    };
+    fixture.definition = definition;
+    fixture.configuration = ConfigurationDocument {
+        refresh_policy: RefreshPolicy::Manual,
+        paused: false,
+        refresh_interval_ms: None,
+        max_staleness_ms: None,
+    };
+    if let Some(publication) = fixture.publication.as_mut() {
+        publication.inputs = occurrences
+            .into_iter()
+            .map(|occurrence| PublicationInput {
+                relation_occurrence_id: occurrence.occurrence_id,
+                object_id: occurrence.object_id,
+                native_data_version: source_version.clone(),
+            })
+            .collect();
+        publication.logical_result_rows = Some(u64::try_from(branches).unwrap() * 2);
+    }
+    fixture
+}

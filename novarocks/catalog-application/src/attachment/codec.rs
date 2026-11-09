@@ -21,10 +21,9 @@ use novarocks_state_store_runtime::{
     DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord,
 };
 
-/// Catalog attachments have no opaque payload fields. Their complete durable
-/// JSON record is capped at the global StateStore value budget before a write
-/// transaction is opened.
-const CATALOG_ATTACHMENT_ENCODED_LIMIT: usize = novarocks_state_store_api::MAX_VALUE_BYTES;
+/// Catalog attachments add no record-family size policy. The opened store
+/// admits the complete encoded JSON before a write transaction is opened.
+const CATALOG_ATTACHMENT_ENCODED_LIMIT: usize = usize::MAX;
 use super::CATALOG_DESIRED_STATE_FAMILY;
 
 /// Record version is owned by the Catalog application's frozen family
@@ -127,8 +126,9 @@ mod tests {
     #[test]
     fn codec_round_trips_v3_with_stable_bytes() {
         let value = stored_attachment();
-        let store =
-            DurableRecordStore::with_limits(novarocks_state_store_api::StateStoreLimits::default());
+        let store = DurableRecordStore::with_limits(
+            novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
+        );
         let encoded = encode(&store, &value).expect("encode");
         assert_eq!(decode(encoded.as_bytes()).expect("decode"), value);
         assert_eq!(
@@ -162,7 +162,7 @@ mod tests {
         value.display_name = "x".repeat(1_024);
         let limits = novarocks_state_store_api::StateStoreLimits {
             max_value_bytes: 256,
-            ..novarocks_state_store_api::StateStoreLimits::default()
+            ..novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits()
         };
         let error = encode(&DurableRecordStore::with_limits(limits), &value)
             .expect_err("record beyond the StateStore limit must fail before a write");

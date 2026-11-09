@@ -201,10 +201,9 @@ fn bound() -> MvProjectionInventoryBound {
     MvProjectionInventoryBound {
         entries: 4,
         snapshot_bytes: 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
+
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: crate::persistence::validation::PersistenceDecodeBudget::default(),
     }
 }
 
@@ -560,7 +559,7 @@ async fn original_write_view_preserves_guarded_cas_dependency_indexes_and_delete
         StateStoreErrorKind::PreconditionFailed
     );
     assert_eq!(
-        view.find_keyed_by_target(&replaced.projection.facts.target(), Default::default())
+        view.find_keyed_by_target(&replaced.projection.facts.target())
             .await
             .unwrap(),
         Some(replaced.clone())

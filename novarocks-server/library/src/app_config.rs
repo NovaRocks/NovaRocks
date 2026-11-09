@@ -4326,21 +4326,25 @@ database = "remote_state"
     #[test]
     fn state_store_config_rejects_relaxed_key_limit() -> anyhow::Result<()> {
         let temp = tempfile::NamedTempFile::new()?;
+        let max_key_bytes =
+            novarocks_state_store_sqlite::SQLITE_STATE_STORE_CAPACITY.max_key_bytes + 1;
         std::fs::write(
             temp.path(),
-            r#"
+            format!(
+                r#"
 [state_store]
 provider = "sqlite"
 path = "meta/state-store.sqlite"
 cluster_id = "cluster-a"
 
 [state_store.limits]
-max_key_bytes = 8193
-"#,
+max_key_bytes = {max_key_bytes}
+"#
+            ),
         )?;
 
         let error = match NovaRocksConfig::load_from_file(temp.path()) {
-            Ok(_) => panic!("provider limits may only tighten the common contract"),
+            Ok(_) => panic!("configured limits may only tighten provider capacity"),
             Err(error) => error,
         };
 

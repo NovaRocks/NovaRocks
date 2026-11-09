@@ -46,10 +46,6 @@ pub(crate) const METADATA_LOCATION_LIMIT: usize = 2 * 1024;
 pub(crate) const UUID_TEXT_LIMIT: usize = 64;
 /// Limit of the text of an integer such as a snapshot id.
 pub(crate) const INTEGER_TEXT_LIMIT: usize = 32;
-/// Limit of a retained table property value.
-pub(crate) const PROPERTY_VALUE_LIMIT: usize = 64 * 1024;
-/// Most table properties one request may name.
-pub(crate) const MAX_PROPERTY_KEYS: usize = 32;
 /// Limit of one namespace level.
 pub(crate) const NAMESPACE_LEVEL_LIMIT: usize = 1024;
 /// Most namespace levels retained.
@@ -146,7 +142,6 @@ pub(crate) enum ViewRequestError {
     RefNameTooLong,
     PropertyKeyTooLong,
     DuplicatePropertyKey,
-    TooManyPropertyKeys,
 }
 
 impl fmt::Display for ViewRequestError {
@@ -155,7 +150,6 @@ impl fmt::Display for ViewRequestError {
             Self::RefNameTooLong => "target ref name exceeds the response key limit",
             Self::PropertyKeyTooLong => "expected property key exceeds the response key limit",
             Self::DuplicatePropertyKey => "expected property key is named twice",
-            Self::TooManyPropertyKeys => "too many expected property keys",
         })
     }
 }
@@ -168,6 +162,7 @@ pub(crate) struct TableViewRequest {
     snapshot: Option<i64>,
     target_ref: Option<String>,
     property_keys: Vec<String>,
+    property_value_lengths: Vec<usize>,
     removed_snapshots: Vec<i64>,
     retention_refs: Vec<String>,
 }
@@ -175,12 +170,12 @@ pub(crate) struct TableViewRequest {
 impl TableViewRequest {
     /// `snapshot`: the snapshot whose presence in `metadata.snapshots` is
     /// recorded. `target_ref`: the ref whose `snapshot-id` is recorded for
-    /// diagnosis. `property_keys`: NovaRocks-named `metadata.properties` keys
-    /// whose values are retained.
+    /// diagnosis. `properties`: NovaRocks-named `metadata.properties` keys and
+    /// the UTF8 byte lengths of their expected values.
     pub(crate) fn new(
         snapshot: Option<i64>,
         target_ref: Option<String>,
-        property_keys: Vec<String>,
+        properties: Vec<(String, usize)>,
     ) -> Result<Self, ViewRequestError> {
         if target_ref
             .as_ref()
@@ -188,21 +183,23 @@ impl TableViewRequest {
         {
             return Err(ViewRequestError::RefNameTooLong);
         }
-        if property_keys.len() > MAX_PROPERTY_KEYS {
-            return Err(ViewRequestError::TooManyPropertyKeys);
-        }
-        for (index, key) in property_keys.iter().enumerate() {
+        for (index, (key, _)) in properties.iter().enumerate() {
             if key.len() > MAX_KEY_LEN {
                 return Err(ViewRequestError::PropertyKeyTooLong);
             }
-            if property_keys[..index].contains(key) {
+            if properties[..index]
+                .iter()
+                .any(|(previous, _)| previous == key)
+            {
                 return Err(ViewRequestError::DuplicatePropertyKey);
             }
         }
+        let (property_keys, property_value_lengths) = properties.into_iter().unzip();
         Ok(Self {
             snapshot,
             target_ref,
             property_keys,
+            property_value_lengths,
             removed_snapshots: Vec::new(),
             retention_refs: Vec::new(),
         })
@@ -269,7 +266,7 @@ impl fmt::Debug for RefCheck {
 pub(crate) enum PropertyValue {
     Absent,
     Text(String),
-    /// Longer than [`PROPERTY_VALUE_LIMIT`].
+    /// Longer than the request's expected property value.
     Overlong,
 }
 
@@ -406,11 +403,13 @@ impl ViewSink for TableResponseSink {
     type View = TableResponseView;
 
     fn retention_cap(&self) -> usize {
-        if self.request.property_keys.is_empty() {
-            METADATA_LOCATION_LIMIT
-        } else {
-            METADATA_LOCATION_LIMIT.max(PROPERTY_VALUE_LIMIT)
-        }
+        self.request
+            .property_value_lengths
+            .iter()
+            .map(|length| length.saturating_add(1))
+            .max()
+            .unwrap_or(0)
+            .max(METADATA_LOCATION_LIMIT)
     }
 
     fn root(&self) -> TableNode {
@@ -475,9 +474,9 @@ impl ViewSink for TableResponseSink {
                 self.log_entry_valid = false;
             }
             TableNode::Properties => expect_kind(kind, &[Object, Null], "metadata.properties")?,
-            TableNode::Property(_) => {
+            TableNode::Property(index) => {
                 expect_kind(kind, &[String], "metadata.properties")?;
-                return Ok(PROPERTY_VALUE_LIMIT);
+                return Ok(self.request.property_value_lengths[index].saturating_add(1));
             }
         }
         Ok(0)
@@ -656,7 +655,12 @@ impl ViewSink for TableResponseSink {
             }
             TableNode::Property(index) => {
                 self.properties[index] = match value {
-                    Scalar::Str(text) => PropertyValue::Text(text.to_owned()),
+                    Scalar::Str(text)
+                        if text.len() <= self.request.property_value_lengths[index] =>
+                    {
+                        PropertyValue::Text(text.to_owned())
+                    }
+                    Scalar::Str(_) => PropertyValue::Overlong,
                     Scalar::Overlong(_) => PropertyValue::Overlong,
                     _ => PropertyValue::Absent,
                 };
@@ -1516,8 +1520,8 @@ mod tests {
             Some(42),
             Some("main".to_owned()),
             vec![
-                "novarocks.ctas.operation-id".to_owned(),
-                "absent".to_owned(),
+                ("novarocks.ctas.operation-id".to_owned(), "op-7".len()),
+                ("absent".to_owned(), 0),
             ],
         )
         .unwrap()
@@ -1767,38 +1771,76 @@ mod tests {
         for (document, error) in cases {
             assert_eq!(scan_table(&document), Err(error), "{document}");
         }
-        let long = format!(
-            r#"{{"metadata":{{"properties":{{"absent":"{}"}}}}}}"#,
-            "p".repeat(PROPERTY_VALUE_LIMIT + 1)
-        );
+        let long = r#"{"metadata":{"properties":{"absent":"p"}}}"#;
         assert_eq!(
-            scan_table(&long).unwrap().properties[1].1,
+            scan_table(long).unwrap().properties[1].1,
             PropertyValue::Overlong
         );
     }
 
     #[test]
-    fn view_requests_are_bounded() {
+    fn view_requests_keep_key_and_ref_validation_without_property_quotas() {
         assert_eq!(
             TableViewRequest::new(None, Some("r".repeat(MAX_KEY_LEN + 1)), Vec::new()),
             Err(ViewRequestError::RefNameTooLong)
         );
         assert_eq!(
-            TableViewRequest::new(None, None, vec!["k".repeat(MAX_KEY_LEN + 1)]),
+            TableViewRequest::new(None, None, vec![("k".repeat(MAX_KEY_LEN + 1), 0)]),
             Err(ViewRequestError::PropertyKeyTooLong)
         );
         assert_eq!(
-            TableViewRequest::new(None, None, vec!["a".to_owned(), "a".to_owned()]),
+            TableViewRequest::new(None, None, vec![("a".to_owned(), 0), ("a".to_owned(), 0)]),
             Err(ViewRequestError::DuplicatePropertyKey)
         );
-        assert_eq!(
-            TableViewRequest::new(
-                None,
-                None,
-                (0..=MAX_PROPERTY_KEYS).map(|i| i.to_string()).collect()
-            ),
-            Err(ViewRequestError::TooManyPropertyKeys)
+        // More than the former 32-key quota; only requested keys are retained.
+        let properties = (0..40)
+            .map(|index| (format!("key-{index}"), "v".to_owned()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let request = TableViewRequest::new(
+            None,
+            None,
+            properties
+                .iter()
+                .map(|(key, value)| (key.clone(), value.len()))
+                .collect(),
+        )
+        .unwrap();
+        let document = serde_json::json!({"metadata": {"properties": properties}}).to_string();
+        let view = scan_complete(TableResponseSink::new(request), document.as_bytes()).unwrap();
+        assert_eq!(view.properties.len(), 40);
+        assert!(
+            view.properties
+                .iter()
+                .all(|(_, value)| value == &PropertyValue::Text("v".into()))
         );
+
+        for expected in [String::new(), "原文".repeat(32 * 1024)] {
+            // The UTF8 input crosses the former 64KiB quota. Empty expectations
+            // also distinguish a fully retained one-byte mismatch from equality.
+            let request =
+                TableViewRequest::new(None, None, vec![("payload".into(), expected.len())])
+                    .unwrap();
+            assert_eq!(
+                TableResponseSink::new(request.clone()).retention_cap(),
+                METADATA_LOCATION_LIMIT.max(expected.len() + 1)
+            );
+            for extra in [0, 1, 10_000] {
+                let value = format!("{expected}{}", "x".repeat(extra));
+                let document =
+                    serde_json::json!({"metadata": {"properties": {"payload": value}}}).to_string();
+                let mut scanner = JsonScanner::new(TableResponseSink::new(request.clone()));
+                for chunk in document.as_bytes().chunks(997) {
+                    scanner.feed(chunk).unwrap();
+                }
+                let view = scanner.finish().unwrap();
+                let observed = &view.properties[0].1;
+                if extra == 0 {
+                    assert_eq!(observed, &PropertyValue::Text(expected.clone()));
+                } else {
+                    assert_eq!(observed, &PropertyValue::Overlong);
+                }
+            }
+        }
     }
 
     /// Writes a commit response with `count` snapshots chunk by chunk, never
@@ -1848,10 +1890,11 @@ mod tests {
         assert_eq!(small, large);
         assert_eq!(small_retained, large_retained);
         assert!(small.snapshot.unwrap().present);
-        // Scratch for the property limit plus the fixed frame stack (a frame is a
-        // few words).
+        // Scratch is derived from this request, plus the fixed frame stack.
         assert!(
-            small_retained <= PROPERTY_VALUE_LIMIT + crate::rest_protocol::json::MAX_DEPTH * 64
+            small_retained
+                <= TableResponseSink::new(table_request()).retention_cap()
+                    + crate::rest_protocol::json::MAX_DEPTH * 64
         );
     }
 

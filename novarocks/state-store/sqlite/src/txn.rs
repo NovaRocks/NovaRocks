@@ -969,6 +969,20 @@ pub(super) fn validate_key_value(
     if value.is_some_and(|value| value.as_bytes().len() > limits.max_value_bytes) {
         return Err(limit_error("value exceeds the configured byte limit"));
     }
+    if let Some(value) = value {
+        validate_row_lengths(key.as_bytes().len(), value.as_bytes().len())?;
+    }
+    Ok(())
+}
+
+fn validate_row_lengths(key: usize, value: usize) -> Result<(), StateStoreError> {
+    if key
+        .checked_add(value)
+        .and_then(|bytes| bytes.checked_add(super::ROW_RECORD_OVERHEAD))
+        .is_none_or(|bytes| bytes > super::SQLITE_LENGTH_LIMIT)
+    {
+        return Err(limit_error("key and value exceed SQLite row length limit"));
+    }
     Ok(())
 }
 
@@ -1693,6 +1707,18 @@ mod tests {
         RangeRequest, StateRecord, StateStoreErrorKind, StateStoreOpenRequest, Value, VersionToken,
     };
 
+    #[test]
+    fn sqlite_row_pair_checks_record_overhead_and_arithmetic_overflow() {
+        let available = crate::SQLITE_STATE_STORE_CAPACITY.max_value_bytes;
+        validate_row_lengths(1, available - 1).expect("exact SQLite row limit");
+        for (key, value) in [(1, available), (available, available), (usize::MAX, 1)] {
+            assert_eq!(
+                validate_row_lengths(key, value).unwrap_err().kind(),
+                StateStoreErrorKind::LimitExceeded
+            );
+        }
+    }
+
     #[derive(Default)]
     struct StateStoreLimitOverrides {
         max_key_bytes: Option<usize>,
@@ -1702,7 +1728,7 @@ mod tests {
     }
 
     fn resolve_state_store_limits(limits: &StateStoreLimitOverrides) -> StateStoreLimits {
-        let mut resolved = StateStoreLimits::default();
+        let mut resolved = crate::SQLITE_STATE_STORE_CAPACITY.limits();
         if let Some(value) = limits.max_key_bytes {
             resolved.max_key_bytes = value;
         }

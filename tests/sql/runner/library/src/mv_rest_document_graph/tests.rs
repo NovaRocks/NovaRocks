@@ -106,6 +106,68 @@ fn manual_binding_and_compact_publication() {
     unknown.extend([0x18, 1]);
     assert!(wire::binding(&unknown).is_err());
 }
+
+#[test]
+fn large_inline_version_and_private_properties_keep_their_exact_content() {
+    use sha2::{Digest, Sha256};
+
+    // This size crosses the former document and private-property quotas;
+    // it is a test input, not a supported-size declaration.
+    let content = vec![b'x'; 196_609];
+    let mut identity = Sha256::new();
+    identity.update(b"novarocks-document-identity/v2\0");
+    for part in ["novarocks.mv", "definition", "novarocks.mv", "definition"] {
+        identity.update((part.len() as u32).to_be_bytes());
+        identity.update(part.as_bytes());
+    }
+    identity.update(1u32.to_be_bytes());
+    identity.update(0u32.to_be_bytes());
+    identity.update((content.len() as u64).to_be_bytes());
+    identity.update(&content);
+    let id = wire::hex(&identity.finalize());
+    let raw = GOLDEN_VERSION
+        .replace("YWJj", &wire::base64url(&content))
+        .replace(GOLDEN_ID, &id);
+    assert!(raw.len() > 65_536);
+    let key = format!("novarocks.doc.v2.rev.{id}");
+    let mut properties = json!({});
+    properties[&key] = json!(raw);
+    let decoded = wire::properties(&properties).unwrap();
+    assert!(decoded.private_bytes > 262_144);
+    assert_eq!(decoded.versions[&id].content, content);
+
+    let mut corrupt = properties;
+    let raw = corrupt[&key].as_str().unwrap().to_string();
+    corrupt[&key] = json!(raw.replacen("eHh4", "eHh5", 1));
+    assert!(wire::properties(&corrupt).is_err());
+}
+
+#[test]
+fn large_publication_keeps_the_binding_count_and_declared_value_bounds() {
+    let formats = vec![wire::binding(&bytes(B_HEX)).unwrap()[0].clone(); 370];
+    let mut payload = bytes(P_HEX)[..34].to_vec();
+    payload.extend_from_slice(&370u16.to_be_bytes());
+    for _ in &formats {
+        payload.extend_from_slice(&9u16.to_be_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&17i64.to_be_bytes());
+    }
+    assert!(payload.len() > 4_096);
+    let framed = format!("2.{GOLDEN_ID}.{}", wire::base64url(&payload));
+    let mut summary = json!({});
+    summary[wire::PUBLICATION_KEY] = json!(framed);
+    let records = wire::records(&summary).unwrap();
+    let decoded = wire::record(&records[wire::PUBLICATION_KEY]).unwrap();
+    assert_eq!(decoded.binding.as_deref(), Some(GOLDEN_ID));
+    assert_eq!(decoded.payload, payload);
+    assert_eq!(
+        wire::publication(&decoded.payload, &formats).unwrap().rows,
+        Some(7)
+    );
+    let mut narrower = formats;
+    narrower[0].maximum = 8;
+    assert!(wire::publication(&decoded.payload, &narrower).is_err());
+}
 #[test]
 fn two_publications_share_binding_and_current_properties() {
     let r = response(vec![

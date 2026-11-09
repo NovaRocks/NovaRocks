@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use novarocks_state_store_api::{AttemptId, StateStoreError, StateStoreErrorKind};
 
-const KEYSPACE_PREFIX: &[u8] = b"NRSS\x01";
+use crate::KEYSPACE_PREFIX;
 const META_TAG: u8 = 0x00;
 const RECORD_TAG: u8 = 0x01;
 // 0x02 was the change-feed key tag. The change feed is gone and nothing writes
@@ -40,7 +40,7 @@ const COMMITTED_TAG: u8 = 0x02;
 pub(super) const REVISION_BYTES: usize = 10;
 /// Physical width of one write attempt's identity: the opening instance's tag
 /// followed by the attempt sequence.
-pub(super) const ATTEMPT_TAG_BYTES: usize = 16 + 8;
+pub(super) const ATTEMPT_TAG_BYTES: usize = crate::ATTEMPT_TAG_BYTES;
 const KEYSPACE_HASH_HEX_BYTES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,6 +323,31 @@ mod tests {
 
     fn codec() -> KeyspaceCodec {
         KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]), Uuid::from_bytes([0x22; 16]))
+    }
+
+    #[test]
+    fn usable_capacity_accounts_for_actual_record_encoding() {
+        let codec = codec();
+        let capacity = crate::FOUNDATIONDB_STATE_STORE_CAPACITY;
+        assert_eq!(codec.record_key(&[]).len(), crate::RECORD_KEY_OVERHEAD);
+        assert_eq!(
+            codec.record_value([0; super::ATTEMPT_TAG_BYTES], &[]).len(),
+            crate::RECORD_VALUE_OVERHEAD
+        );
+        assert_eq!(
+            codec.record_key(&vec![0; capacity.max_key_bytes]).len(),
+            10_000
+        );
+        assert_eq!(
+            codec
+                .record_value(
+                    [0; super::ATTEMPT_TAG_BYTES],
+                    &vec![0; capacity.max_value_bytes]
+                )
+                .len(),
+            100_000
+        );
+        assert_eq!(capacity.max_transaction_bytes, 10_000_000);
     }
 
     #[test]

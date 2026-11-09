@@ -68,6 +68,21 @@ use novarocks_state_store_api::{
 
 pub const MYSQL_STATE_STORE_PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("mysql");
 pub const MYSQL_MAX_KEY_BYTES: usize = 3072;
+/// MEDIUMBLOB payload width in the existing state_store_kv schema.
+pub const MYSQL_MAX_VALUE_BYTES: usize = 16_777_215;
+pub const MYSQL_STATE_STORE_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        MYSQL_MAX_KEY_BYTES,
+        MYSQL_MAX_VALUE_BYTES,
+        usize::MAX,
+        usize::MAX,
+    );
+pub const MYSQL_STATE_STORE_DESCRIPTOR: novarocks_state_store_api::StateStoreProviderDescriptor =
+    novarocks_state_store_api::StateStoreProviderDescriptor::new(
+        MYSQL_STATE_STORE_PROVIDER_ID,
+        MYSQL_STATE_STORE_CAPACITY,
+    );
+
 /// Physical width of the commit ledger key.
 ///
 /// An attempt renders as `<instance scope uuid>:<sequence>`, so 36 + 1 + 20
@@ -111,7 +126,7 @@ pub enum MySqlTlsMode {
 }
 
 /// Provider input after Server has selected MySQL and resolved the shared
-/// StateStore limits against MySQL's physical key capability.
+/// StateStore limits against MySQL's complete storage capacity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MysqlStateStoreOpenConfig {
     pub cluster_id: String,
@@ -133,10 +148,8 @@ impl MysqlStateStoreOpenConfig {
         {
             bail!("InvalidStateStoreConfig: database must match ASCII [A-Za-z0-9_]{{1,64}}");
         }
-        if self.limits.max_key_bytes == 0 || self.limits.max_key_bytes > MYSQL_MAX_KEY_BYTES {
-            bail!(
-                "InvalidStateStoreConfig: max_key_bytes must be between 1 and {MYSQL_MAX_KEY_BYTES}"
-            );
+        if !MYSQL_STATE_STORE_CAPACITY.accepts(&self.limits) {
+            bail!("InvalidStateStoreConfig: opening limits exceed MySQL provider capacity");
         }
         Ok(())
     }
@@ -267,6 +280,12 @@ impl MysqlStateStore {
         deadline: Instant,
         cancellation: MysqlOpenCancellation,
     ) -> Result<Self, StateStoreError> {
+        if !MYSQL_STATE_STORE_CAPACITY.accepts(&limits) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "MySQL opening limits exceed provider capacity",
+            ));
+        }
         let (identity, _) = schema::validate_store_readiness(
             provider_permit.pool(),
             &database,

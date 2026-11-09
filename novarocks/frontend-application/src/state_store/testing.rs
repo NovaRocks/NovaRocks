@@ -45,7 +45,7 @@ pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
 pub const TEST_STATE_STORE_DESCRIPTOR: StateStoreProviderDescriptor =
     StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
     );
 
 pub fn registry() -> StateStoreProviderRegistry {
@@ -68,7 +68,7 @@ pub fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
     StateStoreHostInput {
         cluster_id: cluster_id.into(),
         provider_id: TEST_STATE_STORE_PROVIDER_ID,
-        limits: StateStoreLimits::default(),
+        limits: novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
         run_policy: StateStoreRunPolicy::default(),
     }
 }
@@ -82,7 +82,7 @@ pub const PERSISTENT_TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
 const PERSISTENT_TEST_STATE_STORE_DESCRIPTOR: StateStoreProviderDescriptor =
     StateStoreProviderDescriptor::new(
         PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
     );
 
 type PersistentStores = Arc<Mutex<HashMap<String, Arc<InMemoryStateStore>>>>;
@@ -263,7 +263,7 @@ pub(crate) fn persistent_input(cluster_id: impl Into<String>) -> StateStoreHostI
     StateStoreHostInput {
         cluster_id: cluster_id.into(),
         provider_id: PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
-        limits: StateStoreLimits::default(),
+        limits: novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
         run_policy: StateStoreRunPolicy::default(),
     }
 }

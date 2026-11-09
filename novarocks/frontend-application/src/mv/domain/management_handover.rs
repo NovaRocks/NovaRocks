@@ -101,7 +101,7 @@ pub(crate) fn hand_over_managed_target(
         binding.object_id.clone(),
         context.clone(),
     );
-    let (documents,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&document_storage_binding,request.clone(),novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),entrance).map_err(|e|e.to_string())?;
+    let (documents,_)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management(&document_storage_binding,request.clone(),entrance).map_err(|e|e.to_string())?;
     if phase != MvManagementPhase::NotObserved
         && (documents.deployment_owner != *entrance.owner()
             || documents.process_incarnation != *entrance.incarnation())

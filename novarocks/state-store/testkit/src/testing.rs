@@ -54,6 +54,16 @@ use novarocks_state_store_api::{
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
+/// Explicit capacity of this test-only reference store. Production providers
+/// declare their own capabilities; this fixture is deliberately small.
+pub const IN_MEMORY_STATE_STORE_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        8 * 1024,
+        64 * 1024,
+        4 * 1024 * 1024,
+        10_000,
+    );
+
 /// A deterministic, serializable reference implementation for consumer tests.
 pub struct InMemoryStateStore {
     limits: StateStoreLimits,
@@ -174,7 +184,7 @@ enum Mutation {
 
 impl InMemoryStateStore {
     pub fn new(cluster_id: impl Into<String>) -> Self {
-        Self::with_limits(cluster_id, StateStoreLimits::default())
+        Self::with_limits(cluster_id, IN_MEMORY_STATE_STORE_CAPACITY.limits())
     }
 
     pub fn with_limits(cluster_id: impl Into<String>, limits: StateStoreLimits) -> Self {
@@ -422,6 +432,12 @@ impl InMemoryStateStoreProviderFactory {
             return Err(StateStoreError::new(
                 StateStoreErrorKind::DeadlineExceeded,
                 "in-memory test provider deadline exceeded",
+            ));
+        }
+        if !self.descriptor.capacity.accepts(&request.limits) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "in-memory test opening limits exceed its declared capacity",
             ));
         }
         Ok(Box::new(InMemoryStateStoreProviderInstance {
@@ -1099,7 +1115,7 @@ mod tests {
             max_page_size: 10,
             max_transaction_operations: 8,
             max_transaction_bytes: 300,
-            ..StateStoreLimits::default()
+            ..IN_MEMORY_STATE_STORE_CAPACITY.limits()
         }
     }
 
@@ -1154,7 +1170,7 @@ mod tests {
     #[test]
     fn default_limits_are_not_relaxed() {
         let store = InMemoryStateStore::new("test-cluster");
-        assert_eq!(store.limits(), &StateStoreLimits::default());
+        assert_eq!(store.limits(), &IN_MEMORY_STATE_STORE_CAPACITY.limits());
         assert_eq!(
             store.attempts().capacity(),
             DEFAULT_MAX_OUTSTANDING_ATTEMPTS

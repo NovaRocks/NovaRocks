@@ -276,7 +276,7 @@ async fn original_service(
         format!("readiness-original-{}", Uuid::now_v7()),
         StateStoreLimits {
             max_page_size: 1,
-            ..StateStoreLimits::default()
+            ..novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits()
         },
     ));
     let trace = Arc::new(Trace::default());
@@ -300,10 +300,8 @@ fn bound() -> crate::repository::MvProjectionInventoryBound {
     crate::repository::MvProjectionInventoryBound {
         entries: 4,
         snapshot_bytes: 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
         single_name_bytes: 65_536,
         continuation_token_bytes: 4096,
-        decode: PersistenceDecodeBudget::default(),
     }
 }
 
