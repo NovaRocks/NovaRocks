@@ -276,6 +276,16 @@ impl Core {
         ) -> Result<(), TaskExecutionError>,
     ) -> Result<Option<EffectBody>, TaskExecutionError> {
         self.execution.set_now(now)?;
+        if self.acknowledgements.selected_source() == Some(source)
+            && let ExecutorFact::Operation(observation) = fact
+            && observation.reply.kind()
+                == novarocks_execution_contract::OperationKind::AcquireParticipationAdmissionTicket
+        {
+            self.authorizations.note_admission_physical_result(
+                observation.reply.operation_id(),
+                observation.generation,
+            );
+        }
         let participation = match fact {
             ExecutorFact::Operation(observation)
                 if observation.reply.kind()
@@ -359,6 +369,12 @@ impl Core {
         };
         let mut first_error = None;
         for member in members.iter().copied() {
+            if member.shape
+                == novarocks_execution_contract::OperationShape::AcquireParticipationAdmissionTicket
+            {
+                self.authorizations
+                    .note_admission_physical_result(member.operation, member.generation);
+            }
             let result =
                 self.execution
                     .settle_unsent_member(member)
@@ -2282,6 +2298,156 @@ mod tests {
         assert!(
             matches!(round.round_result, Some(Err(AttemptFailure::TaskProtocol(error)))
             if matches!(*error, TaskExecutionError::OperationFailed { operation_id, .. } if operation_id == operation))
+        );
+    }
+
+    #[test]
+    fn stop_waits_for_unused_establish_guard_before_finishing_gate_close() {
+        use crate::{
+            AttemptCore,
+            execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
+            input::{AttemptInput, AttemptInputClaim, QueuedInputGrantRef, SendGeneration},
+            terminal::GatePreparation,
+        };
+        use novarocks_coordination_contract::{
+            AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptIssueSettlement,
+            AttemptStopReason, AttemptToLogicalBody,
+        };
+        use novarocks_execution_contract::OperationOutcome;
+
+        let start = start();
+        let sources = start.sources;
+        let now = start.initial_now;
+        let activation = start.activation.identity;
+        let mut core = Core::new(start).unwrap();
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let request = admission_intent(&mut core.execution, participation);
+        let received =
+            dispatch_admission(&mut core.execution, request, 1, OperationOutcome::Accepted);
+        core.execution.apply_dispatched_reply(&received).1.unwrap();
+        let grant =
+            QueuedInputGrantRef::new(id(3), SendGeneration::new(AttemptActionId::new(id(3))));
+        let intent = queue_establish(&mut core.execution, participation, grant);
+        let request = AttemptRequestToken::new(id(60));
+        let guard = AttemptAuthorizationRef::new(id(61));
+        core.authorize_candidate(&intent, request, AttemptActionId::new(id(60)))
+            .unwrap();
+        core.apply_qa_reply(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token: request,
+                decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
+            },
+        })
+        .unwrap();
+
+        let step = |core: &mut Core, source, n, input, selected_cut| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut,
+                },
+                input,
+                &mut Units(32),
+            )
+            .unwrap()
+        };
+        step(&mut core, sources.actor, 1, AttemptInput::Bootstrap, None);
+        let stopped = step(
+            &mut core,
+            sources.actor,
+            2,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::Stop {
+                    reason: AttemptStopReason::Client,
+                    failure: AttemptFailure::TaskProtocol(Box::new(schedule(
+                        "original client stop",
+                    ))),
+                },
+            }),
+            None,
+        );
+        assert!(stopped.stop_producing);
+        let closing = step(&mut core, sources.actor, 3, AttemptInput::Timer, None);
+        assert_eq!(closing.selection, InputSelection::Only(sources.qa));
+        let Some(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = closing.effect
+        else {
+            panic!("expected unused Establish settlement");
+        };
+        let AttemptToLogicalBody::EstablishSettlement {
+            token,
+            authorization,
+            settlement,
+            ..
+        } = port.body
+        else {
+            panic!("expected exact guard settlement");
+        };
+        assert_eq!(authorization, guard);
+        assert_eq!(settlement, AttemptIssueSettlement::DefinitelyUnsent);
+        assert_eq!(core.next_deadline(), None);
+        let actual = |authorization| {
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::EstablishSettlementReply {
+                    token,
+                    authorization,
+                    result: Ok(()),
+                },
+            })
+        };
+        let stale = step(
+            &mut core,
+            sources.qa,
+            4,
+            actual(AttemptAuthorizationRef::new(id(62))),
+            None,
+        );
+        assert_eq!(stale.selection, InputSelection::Only(sources.qa));
+        assert_eq!(core.authorizations.preparation(), GatePreparation::Applying);
+        step(&mut core, sources.qa, 5, actual(guard), None);
+        assert_eq!(
+            core.authorizations.preparation(),
+            GatePreparation::Applied { ready: true }
+        );
+
+        // The unused authorization result is not return of the original WC grant.
+        assert_eq!(core.execution.dispatcher().queued_items(), 1);
+        step(&mut core, sources.actor, 6, AttemptInput::Timer, None);
+        step(
+            &mut core,
+            sources.actor,
+            7,
+            AttemptInput::Timer,
+            Some(AttemptSourceCut {
+                source: sources.observation,
+                tail: None,
+            }),
+        );
+        step(&mut core, sources.actor, 8, AttemptInput::Timer, None);
+        let published = step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
+        let release = step(
+            &mut core,
+            sources.publication,
+            10,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: published.effect.unwrap().id,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+            None,
+        );
+        assert!(
+            matches!(release.effect, Some(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant: returned }, .. }) if returned == grant)
         );
     }
 

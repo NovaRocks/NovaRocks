@@ -261,6 +261,12 @@ pub enum LogicalToAttemptBody<F> {
         authorization: AttemptAuthorizationRef,
         result: Result<(), F>,
     },
+    /// The credentialed owner actually disposed of this retained late guard.
+    EstablishDetachReply {
+        token: AttemptRequestToken,
+        authorization: AttemptAuthorizationRef,
+        result: Result<(), F>,
+    },
     PreReadyReplacementReply {
         token: AttemptRequestToken,
         may_observe: bool,
@@ -315,6 +321,12 @@ pub enum AttemptToLogicalBody<F> {
         participation: ParticipationRef,
         operation_id: TaskOperationId,
         settlement: AttemptIssueSettlement,
+    },
+    DetachEstablish {
+        token: AttemptRequestToken,
+        authorization: AttemptAuthorizationRef,
+        participation: ParticipationRef,
+        operation_id: TaskOperationId,
     },
     AbortSettlement {
         /// Original actor submission and its corresponding Native admission.

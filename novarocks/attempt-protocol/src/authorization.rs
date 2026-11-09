@@ -74,6 +74,7 @@ pub(crate) struct AdmissionAuthorization {
     request: AcquireParticipationAdmissionTicket,
     issue: Option<AttemptAuthorizationRef>,
     prior_unknown: bool,
+    emitted: Option<crate::input::SendGeneration>,
     flight: Option<AdmissionFlight>,
     retired: bool,
     closing: bool,
@@ -86,6 +87,7 @@ impl AdmissionAuthorization {
             request,
             issue: None,
             prior_unknown: false,
+            emitted: None,
             flight: None,
             retired: false,
             closing: false,
@@ -226,7 +228,7 @@ impl AdmissionAuthorization {
     /// The old convergence path forgets only its local Copy receipt. The QA
     /// ledger keeps every possibly granted participation and Abort obligation.
     pub(crate) fn forget_closed_receipt(&mut self) -> bool {
-        if !self.closing || self.flight.is_some() {
+        if !self.closing || self.flight.is_some() || self.emitted.is_some() {
             return false;
         }
         self.issue = None;

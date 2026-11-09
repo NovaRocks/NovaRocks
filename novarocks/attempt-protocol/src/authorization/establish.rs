@@ -323,6 +323,16 @@ impl EstablishAuthorization {
         });
         Ok(())
     }
+    /// Late guards remain reachable until the whole gate has finished
+    /// handling all still-emitted transports.
+    pub(crate) fn advance_closing_current(&mut self, token: AttemptRequestToken) -> Step {
+        if self.current.is_none() && self.pass.is_none() && self.permits_protocol_turn() {
+            Step::Ready
+        } else {
+            self.advance(token)
+        }
+    }
+
     /// One precharged selected original guard. Full retains this same flight;
     /// no next item can be selected until the actual guard result arrives.
     pub(crate) fn advance(&mut self, token: AttemptRequestToken) -> Step {

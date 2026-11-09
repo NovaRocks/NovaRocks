@@ -18,6 +18,10 @@
 //! Select the original admission or Establish row only when the ordered ACK
 //! journal reaches settlement. One actual QA reply may be outstanding.
 
+mod closing;
+pub(crate) use closing::CloseProgress;
+use closing::ClosingGate;
+
 use super::{
     AdmissionAuthorization, AdmissionGateDirective, AdmissionGateReply,
     AdmissionSettlementDirective,
@@ -77,6 +81,8 @@ pub(crate) enum QaReply {
         failure: AttemptFailure,
     },
     ObserverProgress,
+    ClosingProgress,
+    ClosingFailed(AttemptFailure),
     ObserverComplete {
         retire: Option<TaskOperationId>,
     },
@@ -92,6 +98,7 @@ pub(crate) struct AuthorizationGate {
     flight: Option<Flight>,
     selected_establish: Option<TaskOperationId>,
     first_observer_failure: Option<AttemptFailure>,
+    close: ClosingGate,
 }
 
 impl AuthorizationGate {
@@ -118,11 +125,12 @@ impl AuthorizationGate {
             flight: None,
             selected_establish: None,
             first_observer_failure: None,
+            close: ClosingGate::default(),
         })
     }
 
     pub(crate) fn waiting_for_reply(&self) -> bool {
-        self.flight.is_some()
+        self.flight.is_some() || self.close.waiting_for_reply()
     }
 
     /// The candidate has already been chosen at the old gate's authorization
@@ -133,6 +141,9 @@ impl AuthorizationGate {
         token: AttemptRequestToken,
         action: AttemptActionId,
     ) -> Result<AuthorizationStep, TaskExecutionError> {
+        if self.close.is_closed_to_business() {
+            return Ok(AuthorizationStep::Retired);
+        }
         if self.flight.is_some() || self.selected_establish.is_some() {
             return Ok(AuthorizationStep::Waiting);
         }
@@ -313,6 +324,9 @@ impl AuthorizationGate {
         &mut self,
         body: LogicalToAttemptBody<AttemptFailure>,
     ) -> Result<QaReply, TaskExecutionError> {
+        if self.close.waiting_for_reply() {
+            return self.close_replied(body);
+        }
         let Some(flight) = self.flight else {
             return Ok(QaReply::Stale);
         };
@@ -403,6 +417,7 @@ impl AuthorizationGate {
         else {
             return Err(schedule("Establish observer did not complete"));
         };
+        self.close.transport_changed();
         self.selected_establish = None;
         if let Some(failure) = failure {
             self.first_observer_failure.get_or_insert(failure);
@@ -413,11 +428,24 @@ impl AuthorizationGate {
     /// Called on the original queued prefix before taking its reservation or
     /// consuming a grant. The candidate driver queues only authorized rows.
     pub(crate) fn validate_send(&self, intent: &OperationIntent) -> Result<(), TaskExecutionError> {
+        if self.close.is_closed_to_business()
+            && matches!(
+                intent,
+                OperationIntent::AcquireParticipationAdmissionTicket(_)
+                    | OperationIntent::EstablishParticipation { .. }
+            )
+        {
+            return Err(schedule("Native send crossed the closed original QA gate"));
+        }
         let operation = intent.operation_id();
         let available = match intent {
             OperationIntent::AcquireParticipationAdmissionTicket(_) => {
                 self.admissions.get(&operation).is_some_and(|row| {
-                    row.issue.is_some() && !row.retired && !row.closing && row.flight.is_none()
+                    row.issue.is_some()
+                        && !row.retired
+                        && !row.closing
+                        && row.flight.is_none()
+                        && row.emitted.is_none()
                 })
             }
             OperationIntent::EstablishParticipation { participation, .. } => {
@@ -441,6 +469,15 @@ impl AuthorizationGate {
         intent: &OperationIntent,
         generation: crate::input::SendGeneration,
     ) {
+        if matches!(
+            intent,
+            OperationIntent::AcquireParticipationAdmissionTicket(_)
+        ) {
+            self.admissions
+                .get_mut(&intent.operation_id())
+                .expect("validated original Admission authorization")
+                .emitted = Some(generation);
+        }
         if matches!(intent, OperationIntent::EstablishParticipation { .. }) {
             let row = self
                 .establishments
@@ -451,6 +488,19 @@ impl AuthorizationGate {
                 .expect("validated original Establish guard");
             row.emitted(authorization, generation)
                 .expect("validated original Establish emission");
+        }
+    }
+
+    pub(crate) fn note_admission_physical_result(
+        &mut self,
+        operation: TaskOperationId,
+        generation: crate::input::SendGeneration,
+    ) {
+        if let Some(row) = self.admissions.get_mut(&operation)
+            && row.emitted == Some(generation)
+        {
+            row.emitted = None;
+            self.close.transport_changed();
         }
     }
 
@@ -472,6 +522,7 @@ impl AuthorizationGate {
                 "withdrawal differs from the emitted Establish generation",
             ));
         }
+        self.close.transport_changed();
         Ok(())
     }
 
@@ -696,5 +747,211 @@ mod tests {
             gate.authorize(&intent, token(6), action(6)).unwrap(),
             AuthorizationStep::Retired
         ));
+    }
+    #[test]
+    fn gate_closes_unused_guards_but_retains_late_guards_until_exact_transport_result() {
+        use crate::{
+            capacity::{QueueStage, StepContext},
+            config::DispatchLane,
+            terminal::GatePreparation,
+        };
+        use novarocks_types::BackendProcessId;
+
+        struct Units(usize);
+        impl StepContext for Units {
+            fn charge(&mut self, units: usize) -> bool {
+                if let Some(remaining) = self.0.checked_sub(units) {
+                    self.0 = remaining;
+                    true
+                } else {
+                    false
+                }
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                _: bool,
+                _: BackendProcessId,
+                _: usize,
+                _: usize,
+            ) -> QueueStage {
+                panic!("original QA gate does not reserve Native capacity")
+            }
+        }
+
+        let (graph, activation) = crate::test_support::graph_with_strict_input(false);
+        let mut participations = graph.participations().copied();
+        let first = participations.next().unwrap();
+        let second = participations.next().unwrap();
+        let mut ids = OperationIds::new(IdSeed::new(23, 200));
+        let mut gate = AuthorizationGate::new(
+            activation,
+            AttemptAuthorizationLimits {
+                activation,
+                establish_per_participation: NonZeroUsize::new(2).unwrap(),
+            },
+            graph.participations().copied(),
+        )
+        .unwrap();
+        let mut intent = |participation| OperationIntent::EstablishParticipation {
+            envelope: OperationEnvelope::with_default_wait(
+                ids.issue(),
+                OperationKind::UpdateParticipation,
+            ),
+            participation,
+            ticket: AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+            initial_lease_sequence: LeaseSequence::INITIAL,
+            initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+            material: PayloadRef(nz(4)),
+            queued_bytes: 256,
+        };
+        let older = intent(first);
+        let unused = intent(second);
+        let authorize = |gate: &mut AuthorizationGate, intent: &OperationIntent, n| {
+            assert!(matches!(
+                gate.authorize(intent, token(n), action(n)).unwrap(),
+                AuthorizationStep::Request(_)
+            ));
+            assert!(
+                matches!(gate.replied(LogicalToAttemptBody::AuthorizationReply {
+                token: token(n),
+                decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(issue(n))),
+            }).unwrap(), QaReply::Authorized(operation) if operation == intent.operation_id())
+            );
+        };
+        authorize(&mut gate, &older, 1);
+        gate.note_sent(&older, SendGeneration::new(action(1)));
+        let debt = ObserverDebt::Establish(EstablishObservation {
+            operation_id: older.operation_id(),
+            result: ObservedDispatch::Unknown,
+        });
+        assert_eq!(
+            settlement_effect(gate.settle_observation(debt, token(2), action(2)).unwrap()),
+            (token(2), issue(1), AttemptIssueSettlement::TransportUnknown)
+        );
+        let settled = |n, guard| LogicalToAttemptBody::EstablishSettlementReply {
+            token: token(n),
+            authorization: issue(guard),
+            result: Ok(()),
+        };
+        assert!(matches!(
+            gate.replied(settled(2, 1)).unwrap(),
+            QaReply::ObserverComplete { .. }
+        ));
+        authorize(&mut gate, &older, 3);
+        let emitted = SendGeneration::new(action(3));
+        gate.note_sent(&older, emitted);
+        authorize(&mut gate, &unused, 4);
+
+        gate.request_close();
+        assert!(matches!(
+            gate.authorize(&unused, token(10), action(10)).unwrap(),
+            AuthorizationStep::Retired
+        ));
+        assert!(matches!(
+            gate.advance_close(action(10), token(10), &mut Units(0))
+                .unwrap(),
+            CloseProgress::Yield
+        ));
+        let request = |progress| {
+            let CloseProgress::Request(effect) = progress else {
+                panic!("expected original close request");
+            };
+            settlement_effect(ObserverStep::Request(effect))
+        };
+        assert_eq!(
+            request(
+                gate.advance_close(action(10), token(10), &mut Units(32))
+                    .unwrap()
+            ),
+            (
+                token(10),
+                issue(4),
+                AttemptIssueSettlement::DefinitelyUnsent
+            )
+        );
+        assert!(matches!(
+            gate.replied(settled(10, 3)).unwrap(),
+            QaReply::Stale
+        ));
+        assert!(matches!(
+            gate.advance_close(action(11), token(11), &mut Units(0))
+                .unwrap(),
+            CloseProgress::AwaitReply
+        ));
+        assert!(matches!(
+            gate.replied(settled(10, 4)).unwrap(),
+            QaReply::ClosingProgress
+        ));
+        assert!(matches!(
+            gate.advance_close(action(11), token(11), &mut Units(32))
+                .unwrap(),
+            CloseProgress::WaitingTransport
+        ));
+        assert_eq!(
+            gate.preparation(),
+            GatePreparation::Applied { ready: false }
+        );
+        assert!(!gate.close_needs_drive());
+        assert!(
+            gate.note_establish_withdrawn(
+                older.operation_id(),
+                first,
+                SendGeneration::new(action(1))
+            )
+            .is_err()
+        );
+        assert!(!gate.close_needs_drive());
+        gate.note_establish_withdrawn(older.operation_id(), first, emitted)
+            .unwrap();
+        assert!(gate.close_needs_drive());
+        assert_eq!(
+            request(
+                gate.advance_close(action(12), token(12), &mut Units(32))
+                    .unwrap()
+            ),
+            (
+                token(12),
+                issue(3),
+                AttemptIssueSettlement::DefinitelyUnsent
+            )
+        );
+        assert!(matches!(
+            gate.replied(settled(12, 3)).unwrap(),
+            QaReply::ClosingProgress
+        ));
+        let CloseProgress::Request(AttemptEffect {
+            body: EffectBody::Port(port),
+            class: EffectClass::Cleanup,
+            ..
+        }) = gate
+            .advance_close(action(13), token(13), &mut Units(32))
+            .unwrap()
+        else {
+            panic!("expected actual original late guard disposal");
+        };
+        assert!(matches!(port.body, AttemptToLogicalBody::DetachEstablish {
+            token: request, authorization, operation_id, ..
+        } if request == token(13) && authorization == issue(1) && operation_id == older.operation_id()));
+        assert!(matches!(
+            gate.replied(settled(13, 1)).unwrap(),
+            QaReply::Stale
+        ));
+        assert_eq!(gate.preparation(), GatePreparation::Applying);
+        assert!(matches!(
+            gate.replied(LogicalToAttemptBody::EstablishDetachReply {
+                token: token(13),
+                authorization: issue(1),
+                result: Ok(()),
+            })
+            .unwrap(),
+            QaReply::ClosingProgress
+        ));
+        assert!(matches!(
+            gate.advance_close(action(14), token(14), &mut Units(32))
+                .unwrap(),
+            CloseProgress::Ready
+        ));
+        assert_eq!(gate.preparation(), GatePreparation::Applied { ready: true });
     }
 }

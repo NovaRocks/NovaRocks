@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     AttemptCore,
-    authorization::gate::QaReply,
+    authorization::gate::{CloseProgress, QaReply},
     capacity::StepContext,
     convergence::RemoteConvergenceDirective,
     effect::{AttemptEffect, EffectBody, EffectClass, Publication},
@@ -76,6 +76,7 @@ enum Phase {
     AwaitRoot(AttemptActionId),
     Tail,
     Converge,
+    ClosingGate,
 }
 
 #[derive(Debug)]
@@ -166,6 +167,14 @@ impl AttemptCore for Core {
                 Some(self.execution.monotonic_now())
             }
             Phase::Idle if self.authorizations.waiting_for_reply() => None,
+            Phase::Idle if self.authorizations.close_needs_drive() => {
+                Some(self.execution.monotonic_now())
+            }
+            Phase::ClosingGate if self.authorizations.waiting_for_reply() => None,
+            Phase::ClosingGate => Some(self.execution.monotonic_now()),
+            Phase::Idle if self.execution.has_pending_terminal_cleanup() => {
+                Some(self.execution.monotonic_now())
+            }
             Phase::Idle if self.aborts.has_pending() => Some(self.execution.monotonic_now()),
             Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
                 Some(self.execution.monotonic_now())
@@ -203,10 +212,12 @@ impl Core {
             {
                 Only(self.sources.publication)
             }
-            Phase::Tail | Phase::Idle if self.authorizations.waiting_for_reply() => {
+            Phase::Tail | Phase::Idle | Phase::ClosingGate
+                if self.authorizations.waiting_for_reply() =>
+            {
                 Only(self.sources.qa)
             }
-            Phase::Tail => Only(self.sources.actor),
+            Phase::Tail | Phase::ClosingGate => Only(self.sources.actor),
             Phase::Converge if self.convergence.waiting_for_process() => Only(self.sources.process),
             Phase::Converge => Only(self.sources.actor),
             Phase::Idle if self.stop.pending() => Only(self.sources.actor),
@@ -261,6 +272,7 @@ impl Core {
                 }
                 if timer
                     && !self.aborts.has_pending()
+                    && !self.authorizations.close_needs_drive()
                     && self.convergence_due(now)
                     && (self.start_convergence_pass() || self.convergence_progress_ready())
                 {
@@ -281,6 +293,10 @@ impl Core {
                         self.consume_native(now, claim, input, result)?;
                     }
                     return Ok(());
+                }
+                if timer && self.authorizations.close_needs_drive() {
+                    self.turn.phase = Phase::ClosingGate;
+                    return self.drive_gate_close(context, result);
                 }
                 self.begin_native_prefix(now, cut)?;
                 self.enter_common_or_skip()?;
@@ -331,6 +347,19 @@ impl Core {
                 }
             }
             Phase::Tail => self.apply_tail(now, claim, input, context, result)?,
+            Phase::ClosingGate if timer => self.drive_gate_close(context, result)?,
+            Phase::ClosingGate => {
+                self.verify_source(claim.source, self.sources.qa)?;
+                let AttemptInput::Port(port) = input else {
+                    return Err(schedule(
+                        "authorization close awaited its original QA reply",
+                    ));
+                };
+                self.accept_qa(port, result)?;
+                if self.turn.phase == Phase::ClosingGate {
+                    self.drive_gate_close(context, result)?;
+                }
+            }
             Phase::Converge if timer => self.drive_convergence(now, context, result)?,
             Phase::Converge => {
                 self.verify_source(claim.source, self.sources.process)?;
@@ -468,10 +497,32 @@ impl Core {
     }
 
     fn request_stop(&mut self, result: &mut AttemptStep) {
+        self.authorizations.request_close();
         if self.stop.request() {
             self.round_tail.suppress_dispatch();
             result.stop_producing = true;
         }
+    }
+
+    fn drive_gate_close(
+        &mut self,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        if !self.acknowledgements.is_idle() {
+            return Err(schedule(
+                "authorization close overtook observed acknowledgements",
+            ));
+        }
+        let (action, token) = self.turn.issue()?;
+        match self.authorizations.advance_close(action, token, context)? {
+            CloseProgress::Yield | CloseProgress::AwaitReply => {}
+            CloseProgress::Request(effect) => result.effect = Some(effect),
+            CloseProgress::WaitingTransport | CloseProgress::Ready => {
+                self.turn.phase = Phase::Idle;
+            }
+        }
+        Ok(())
     }
 
     fn convergence_due(&self, now: MonotonicInstant) -> bool {
@@ -860,7 +911,10 @@ impl Core {
                 result.retired_authorization = Some(operation)
             }
             RoundTailStep::Complete(round) => {
-                self.turn.phase = if !self.stop.pending()
+                self.turn.phase = if !self.stop.pending() && self.authorizations.close_needs_drive()
+                {
+                    Phase::ClosingGate
+                } else if !self.stop.pending()
                     && (self.start_convergence_pass() || self.convergence_progress_ready())
                 {
                     Phase::Converge
@@ -882,11 +936,16 @@ impl Core {
             &port.body,
             LogicalToAttemptBody::AuthorizationReply { .. }
                 | LogicalToAttemptBody::EstablishSettlementReply { .. }
+                | LogicalToAttemptBody::EstablishDetachReply { .. }
         ) {
             return Err(schedule("QA continuation received an unrelated port reply"));
         }
         match self.apply_qa_reply(port)? {
             QaReply::ObserverComplete { retire } => result.retired_authorization = retire,
+            QaReply::ClosingFailed(failure) => {
+                self.terminal.record_original_failure(failure)?;
+                self.turn.phase = Phase::Idle;
+            }
             QaReply::AuthorizationFailed { failure, .. } => {
                 self.terminal.record_original_failure(failure)?;
             }
