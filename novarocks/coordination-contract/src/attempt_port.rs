@@ -233,6 +233,14 @@ pub enum AttemptIssueSettlement {
     Worker(OperationOutcome),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbortIssueSettlement {
+    DefinitelyUnsent,
+    TransportUnknown,
+    Worker(OperationOutcome),
+    FailedClosed,
+}
+
 /// Each envelope is checked against the registered activation before application.
 #[derive(Clone, Debug)]
 pub struct LogicalToAttempt<F> {
@@ -309,9 +317,14 @@ pub enum AttemptToLogicalBody<F> {
         settlement: AttemptIssueSettlement,
     },
     AbortSettlement {
+        /// Original actor submission and its corresponding Native admission.
+        abort_action: AttemptActionId,
+        generation: AttemptActionId,
+        /// The canonical positive receipt can come from a different generation.
+        receipt_generation: Option<AttemptActionId>,
         participation: ParticipationRef,
         operation_id: TaskOperationId,
-        settlement: AttemptIssueSettlement,
+        settlement: AbortIssueSettlement,
     },
     RootStatus(Box<AttemptRootProjection>),
     SealResult {

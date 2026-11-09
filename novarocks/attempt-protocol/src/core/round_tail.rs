@@ -41,6 +41,7 @@ enum Phase {
     Publish,
     AwaitPublication,
     Cleanup,
+    AbortGrants,
     QueueExpiry,
     Dispatch,
     Subscriptions,
@@ -52,6 +53,8 @@ enum Phase {
 pub(super) struct RoundTail {
     phase: Phase,
     dispatch: bool,
+    abort_after: Option<TaskOperationId>,
+    abort_admitted: bool,
 }
 
 impl RoundTail {
@@ -104,6 +107,8 @@ impl Core {
                 Phase::BeginSettlement
             },
             dispatch,
+            abort_after: None,
+            abort_admitted: false,
         };
         Ok(())
     }
@@ -152,7 +157,10 @@ impl Core {
         match self.round_tail.phase {
             Phase::Idle => return Err(schedule("no original round tail is selected")),
             Phase::SelectPublication => {
-                self.round_tail.phase = if self.select_protocol_publication()? {
+                self.round_tail.phase = if self.stop.business_closed() && self.publication.failed()
+                {
+                    Phase::Cleanup
+                } else if self.select_protocol_publication()? {
                     Phase::Publish
                 } else {
                     Phase::Cleanup
@@ -211,16 +219,33 @@ impl Core {
                 } else if self.execution.has_pending_edge_derivation() {
                     self.execution.advance_edge_derivation(context)?
                 } else {
-                    if self.round_tail.dispatch {
-                        self.execution.begin_queue_expiry()?;
-                        self.round_tail.phase = Phase::QueueExpiry;
-                    } else {
-                        self.round_tail.phase = Phase::Subscriptions;
-                    }
+                    self.round_tail.phase = Phase::AbortGrants;
                     return Ok(None);
                 };
                 if !progressed {
                     return Ok(Some(RoundTailStep::Yield));
+                }
+            }
+            Phase::AbortGrants => {
+                if !self.round_tail.abort_admitted && self.aborts.has_pending() {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    self.round_tail.abort_admitted = true;
+                    let effect = self.aborts.admit_next().expect("original pending Abort");
+                    return Ok(Some(RoundTailStep::Effect(effect)));
+                }
+                if let Some(operation) = self.aborts.next_granted(self.round_tail.abort_after) {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    self.aborts.advance_grant(&mut self.execution, operation)?;
+                    self.round_tail.abort_after = Some(operation);
+                } else if self.round_tail.dispatch {
+                    self.execution.begin_queue_expiry()?;
+                    self.round_tail.phase = Phase::QueueExpiry;
+                } else {
+                    self.round_tail.phase = Phase::Subscriptions;
                 }
             }
             Phase::QueueExpiry => {

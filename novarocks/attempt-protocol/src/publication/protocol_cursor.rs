@@ -80,6 +80,9 @@ impl ProtocolPublicationCursor {
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         !self.has_pending_apply() && !self.failed
     }
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
     pub(crate) fn has_pending_apply(&self) -> bool {
         self.cut.is_some() || self.flight.is_some()
     }

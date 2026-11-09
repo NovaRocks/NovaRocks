@@ -1052,6 +1052,58 @@ impl QueryTaskExecution {
 
     /// Commits one actor-owned Abort after its exact adapter effect is taken.
 
+    pub(crate) fn actor_abort_in_flight(
+        &self,
+        operation: TaskOperationId,
+        generation: crate::input::SendGeneration,
+    ) -> bool {
+        self.operation_targets.get(&operation) == Some(&OperationTarget::ActorAbort)
+            && self.dispatcher.reply_has_pending_owner(
+                operation,
+                OperationKind::AbortParticipation,
+                generation,
+            )
+    }
+
+    pub(crate) fn actor_abort_tracks_input(
+        &self,
+        operation: TaskOperationId,
+        grant: QueuedInputGrantRef,
+    ) -> bool {
+        self.operation_targets.get(&operation) == Some(&OperationTarget::ActorAbort)
+            && self.dispatcher.tracks_input(operation, grant)
+    }
+
+    pub(crate) fn queue_actor_abort(
+        &mut self,
+        request: novarocks_execution_contract::AbortParticipation,
+        grant: QueuedInputGrantRef,
+    ) -> Result<bool, TaskExecutionError> {
+        if self.owner(request.participation()).is_none() {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        let intent = OperationIntent::AbortParticipation(request);
+        self.dispatcher.validate_operation_carrier(&intent)?;
+        let quote = TaskOperationQueueRequest {
+            backend: intent.backend_process_id(),
+            lane: intent.lane(),
+            control_progress: true,
+            queued_bytes: intent.queued_bytes(),
+        };
+        if self.dispatcher.local_capacity(quote) != LocalQueueCapacity::Fits {
+            return Ok(false);
+        }
+        let operation = intent.operation_id();
+        if self.operation_targets.contains_key(&operation) {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        self.dispatcher
+            .enqueue_priority_reserved(intent, self.now, grant)?;
+        self.operation_targets
+            .insert(operation, OperationTarget::ActorAbort);
+        Ok(true)
+    }
+
     pub(crate) fn actor_abort_dispatch_state(
         &self,
         operation_id: TaskOperationId,

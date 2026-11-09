@@ -55,6 +55,7 @@ pub struct AttemptStep {
     pub selection: InputSelection,
     pub stop_producing: bool,
     pub effect: Option<AttemptEffect>,
+    pub abort_settlement: Option<AttemptEffect>,
     pub root_control_processed: Option<AttemptInputId>,
     pub definitely_unsent_abort: Option<TaskOperationId>,
     pub retired_authorization: Option<TaskOperationId>,
@@ -126,6 +127,12 @@ impl AttemptCore for Core {
                 .maximum_send_members
                 .checked_mul(2)
                 .ok_or_else(|| schedule("withdrawal input work quote overflow"))?,
+            AttemptInput::Executor(ExecutorFact::Operation(observation))
+                if observation.reply.kind()
+                    == novarocks_execution_contract::OperationKind::AbortParticipation =>
+            {
+                3
+            }
             AttemptInput::Membership(view) => view.processes.len().max(1),
             _ => 1,
         };
@@ -138,6 +145,7 @@ impl AttemptCore for Core {
             selection: self.input_selection(),
             stop_producing: false,
             effect: None,
+            abort_settlement: None,
             root_control_processed: None,
             definitely_unsent_abort: None,
             retired_authorization: None,
@@ -158,6 +166,7 @@ impl AttemptCore for Core {
                 Some(self.execution.monotonic_now())
             }
             Phase::Idle if self.authorizations.waiting_for_reply() => None,
+            Phase::Idle if self.aborts.has_pending() => Some(self.execution.monotonic_now()),
             Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
                 Some(self.execution.monotonic_now())
             }
@@ -251,6 +260,7 @@ impl Core {
                     }
                 }
                 if timer
+                    && !self.aborts.has_pending()
                     && self.convergence_due(now)
                     && (self.start_convergence_pass() || self.convergence_progress_ready())
                 {
@@ -359,6 +369,16 @@ impl Core {
     ) -> Result<bool, TaskExecutionError> {
         match input {
             AttemptInput::Port(port) => match &port.body {
+                LogicalToAttemptBody::Abort { action, request } => {
+                    self.verify_owner_port(claim.source, port.activation)?;
+                    let (admission, _) = self.turn.issue()?;
+                    self.aborts.begin(
+                        &self.execution,
+                        *action,
+                        *request,
+                        crate::input::SendGeneration::new(admission),
+                    )?;
+                }
                 LogicalToAttemptBody::Stop { reason, failure } => {
                     self.verify_owner_port(claim.source, port.activation)?;
                     self.terminal.observe_stop(*reason, failure.clone());
@@ -544,11 +564,43 @@ impl Core {
             return Err(schedule("Native Source supplied an unrelated input"));
         };
         self.verify_source(claim.source, self.sources.native)?;
-        if let Some(body) = self.apply_native(now, claim.source, claim.input, &fact, |_, _| {
-            Err(schedule(
-                "actor Abort receipt requires its original Abort owner",
-            ))
-        })? {
+        let action = if matches!(&fact, ExecutorFact::Operation(observation)
+            if observation.reply.kind() == novarocks_execution_contract::OperationKind::AbortParticipation)
+        {
+            let mut settlement = None;
+            let mut cleanup = None;
+            let mut fail_closed = false;
+            let aborts = &mut self.aborts;
+            let dispatch_action = self
+                .acknowledgements
+                .apply(
+                    claim.source,
+                    claim.input,
+                    &fact,
+                    &mut self.execution,
+                    |execution, observation| {
+                        let resolved = aborts.observe(execution, observation);
+                        settlement = resolved.settlement;
+                        cleanup = resolved.cleanup;
+                        fail_closed = resolved.domain.is_err();
+                        resolved.domain
+                    },
+                )
+                .map_err(|_| schedule("invalid actor Abort fact in Native prefix"))?;
+            if let Some(body) = settlement {
+                result.abort_settlement = Some(self.abort_effect(body)?);
+            }
+            if fail_closed {
+                self.request_stop(result);
+            }
+            debug_assert!(cleanup.is_none() || dispatch_action.is_none());
+            cleanup.or(dispatch_action)
+        } else {
+            self.apply_native(now, claim.source, claim.input, &fact, |_, _| {
+                unreachable!("Abort is handled by its original Core owner")
+            })?
+        };
+        if let Some(body) = action {
             let (id, _) = self.turn.issue()?;
             result.effect = Some(AttemptEffect {
                 id,
@@ -630,23 +682,42 @@ impl Core {
                 | ExecutorFact::SubscriptionExited { .. } => {
                     self.apply_subscription_input(now, &fact)?
                 }
-                ExecutorFact::Withdrawn { .. } | ExecutorFact::QueuedInputWithdrawn { .. } => self
-                    .apply_transport_withdrawal(now, &fact, |_| {
-                        Err(schedule(
-                            "actor Abort withdrawal requires its original Abort owner",
-                        ))
-                    })?,
+                ExecutorFact::Withdrawn { .. } | ExecutorFact::QueuedInputWithdrawn { .. } => {
+                    let mut abort = None;
+                    self.apply_transport_withdrawal(now, &fact, |operation| {
+                        // An emitted batch targets one frozen backend, which
+                        // has at most one logical actor Abort owner.
+                        if abort.replace(operation).is_some() {
+                            return Err(schedule(
+                                "one Native batch contained multiple actor Aborts",
+                            ));
+                        }
+                        Ok(())
+                    })?;
+                    if let Some(operation) = abort {
+                        let body = self.aborts.unsent(operation)?;
+                        result.abort_settlement = Some(self.abort_effect(body)?);
+                    }
+                }
                 ExecutorFact::QueuedInputGranted {
                     operation, grant, ..
                 } => {
-                    if let CreateGrantProgress::Release(grant) =
-                        self.execution.observe_create_grant(operation, grant)?
-                    {
+                    let cleanup = if self.aborts.owns(operation) {
+                        self.aborts.grant(&mut self.execution, operation, grant)?
+                    } else {
+                        match self.execution.observe_create_grant(operation, grant)? {
+                            CreateGrantProgress::Release(grant) => {
+                                Some(EffectBody::ReleaseQueuedInput { grant })
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(body) = cleanup {
                         let (id, _) = self.turn.issue()?;
                         result.effect = Some(AttemptEffect {
                             id,
                             class: EffectClass::Cleanup,
-                            body: EffectBody::ReleaseQueuedInput { grant },
+                            body,
                         });
                     }
                 }
@@ -655,7 +726,13 @@ impl Core {
                     generation,
                     failure,
                 } => {
-                    if self.execution.close_create_admission(operation, generation) {
+                    if let Some(body) = self.aborts.admission_failed(operation, generation) {
+                        result.abort_settlement = Some(self.abort_effect(body)?);
+                        self.request_stop(result);
+                        self.round_failure.get_or_insert(failure);
+                        self.begin_round_tail(true)?;
+                        self.turn.phase = Phase::Tail;
+                    } else if self.execution.close_create_admission(operation, generation) {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
@@ -775,6 +852,8 @@ impl Core {
             RoundTailStep::Effect(effect) => result.effect = Some(effect),
             RoundTailStep::ExpiredAbort { release, operation } => {
                 result.effect = Some(release);
+                let body = self.aborts.unsent(operation)?;
+                result.abort_settlement = Some(self.abort_effect(body)?);
                 result.definitely_unsent_abort = Some(operation);
             }
             RoundTailStep::RetiredAuthorization(operation) => {
@@ -814,6 +893,15 @@ impl Core {
             _ => {}
         }
         Ok(())
+    }
+
+    fn abort_effect(
+        &mut self,
+        body: AttemptToLogicalBody<AttemptFailure>,
+    ) -> Result<AttemptEffect, TaskExecutionError> {
+        let mut effect = self.port_effect(body)?;
+        effect.class = EffectClass::Settlement;
+        Ok(effect)
     }
 
     fn port_effect(

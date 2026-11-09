@@ -17,6 +17,7 @@
 
 //! The serial owner of the frozen attempt's protocol components.
 
+mod abort;
 mod round_tail;
 mod stop;
 mod subscriptions;
@@ -80,6 +81,7 @@ pub struct Core {
     round_failure: Option<AttemptFailure>,
     round_tail: RoundTail,
     stop: stop::StopWithdrawals,
+    aborts: abort::Aborts,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
@@ -232,6 +234,7 @@ impl Core {
             round_failure: None,
             round_tail: RoundTail::default(),
             stop: stop::StopWithdrawals::default(),
+            aborts: abort::Aborts::default(),
             establish_material,
             retry,
             pumps,
@@ -303,7 +306,7 @@ impl Core {
         context: &mut dyn StepContext,
     ) -> Result<BatchDispatch, TaskExecutionError> {
         if self.acknowledgements.run_round_tail() != Ok(true)
-            || !self.publication.permits_protocol_turn()
+            || !self.permits_residual_protocol()
             || self.subscriptions.assembling()
         {
             return Err(schedule("dispatch crossed an unfinished round phase"));
@@ -377,6 +380,11 @@ impl Core {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn permits_residual_protocol(&self) -> bool {
+        self.publication.permits_protocol_turn()
+            || (self.stop.business_closed() && self.publication.failed())
+    }
+
     fn verify_common_observation_phase(
         &self,
         source: AttemptSourceId,
@@ -385,7 +393,7 @@ impl Core {
             return Err(schedule("ordered observation used a foreign Source"));
         }
         if self.acknowledgements.run_round_tail() != Ok(true)
-            || !self.publication.permits_protocol_turn()
+            || !self.permits_residual_protocol()
             || self.subscriptions.assembling()
             || !self.round_tail.is_idle()
         {
@@ -480,9 +488,7 @@ impl Core {
         token: AttemptRequestToken,
         context: &mut dyn StepContext,
     ) -> Result<SubscriptionStep, TaskExecutionError> {
-        if self.acknowledgements.run_round_tail() != Ok(true)
-            || !self.publication.permits_protocol_turn()
-        {
+        if self.acknowledgements.run_round_tail() != Ok(true) || !self.permits_residual_protocol() {
             return Err(schedule(
                 "subscription drive crossed an unfinished round phase",
             ));
@@ -2053,6 +2059,230 @@ mod tests {
         let done = step(&mut core, sources.actor, 8, AttemptInput::Timer);
         assert!(done.effect.is_none());
         assert_eq!(core.next_deadline(), None);
+    }
+
+    #[test]
+    fn actor_abort_gets_exact_control_grant_and_owner_failed_never_closes_participation() {
+        use crate::{
+            AttemptCore,
+            capacity::ReservationToken,
+            input::{
+                AttemptInput, AttemptInputClaim, OperationReply, OperationReplyResult,
+                QueuedInputGrantRef,
+            },
+        };
+        use novarocks_coordination_contract::{AbortIssueSettlement, AttemptToLogicalBody};
+        use novarocks_execution_contract::{
+            AbortCause, AbortParticipation, OperationKind, OperationOutcome,
+            operation::OperationResult,
+        };
+        struct Turn;
+        impl StepContext for Turn {
+            fn charge(&mut self, _: usize) -> bool {
+                true
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                lane: DispatchLane,
+                control: bool,
+                _: BackendProcessId,
+                records: usize,
+                _: usize,
+            ) -> QueueStage {
+                assert_eq!(lane, DispatchLane::Lifecycle);
+                assert!(control);
+                assert_eq!(records, 1);
+                QueueStage::Granted(ReservationToken(id(39)))
+            }
+        }
+
+        let start = start();
+        let sources = start.sources;
+        let now = start.initial_now;
+        let activation = start.activation.identity;
+        let mut core = Core::new(start).unwrap();
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let operation = core.execution.issue_operation_id();
+        let request = AbortParticipation::new(operation, participation, AbortCause::QueryFailed);
+        let actor_action = AttemptActionId::new(id(65));
+        let cut = |source, tail| Some(AttemptSourceCut { source, tail });
+        let step = |core: &mut Core, source, n, input, native_tail, selected_cut| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: cut(sources.native, native_tail),
+                    selected_cut,
+                },
+                input,
+                &mut Turn,
+            )
+            .unwrap()
+        };
+        step(
+            &mut core,
+            sources.actor,
+            1,
+            AttemptInput::Bootstrap,
+            None,
+            None,
+        );
+        let accepted = step(
+            &mut core,
+            sources.actor,
+            2,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::Abort {
+                    action: actor_action,
+                    request,
+                },
+            }),
+            None,
+            None,
+        );
+        assert!(accepted.effect.is_none());
+        assert_eq!(core.next_deadline(), Some(now));
+        step(&mut core, sources.actor, 3, AttemptInput::Timer, None, None);
+        step(
+            &mut core,
+            sources.actor,
+            4,
+            AttemptInput::Timer,
+            None,
+            cut(sources.observation, None),
+        );
+        step(&mut core, sources.actor, 5, AttemptInput::Timer, None, None);
+        let published = step(&mut core, sources.actor, 6, AttemptInput::Timer, None, None);
+        let publication = published.effect.unwrap().id;
+        let admitted = step(
+            &mut core,
+            sources.publication,
+            7,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: publication,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+            None,
+            None,
+        );
+        let Some(AttemptEffect {
+            id: admission,
+            class: crate::effect::EffectClass::Settlement,
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation: intent,
+                    generation,
+                    lane: DispatchLane::Lifecycle,
+                    ..
+                },
+        }) = admitted.effect
+        else {
+            panic!("expected exact Abort WC admission");
+        };
+        assert_eq!(intent.operation_id(), operation);
+        assert_eq!(admission, generation.admission_effect());
+        assert_eq!(core.execution.dispatcher().queued_items(), 0);
+        assert_eq!(
+            step(&mut core, sources.actor, 8, AttemptInput::Timer, None, None).round_result,
+            Some(Ok(()))
+        );
+
+        let grant = QueuedInputGrantRef::new(id(70), generation);
+        step(
+            &mut core,
+            sources.actor,
+            9,
+            AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                operation,
+                grant,
+                queued_bytes: intent.queued_bytes(),
+            }),
+            None,
+            None,
+        );
+        step(
+            &mut core,
+            sources.actor,
+            10,
+            AttemptInput::Timer,
+            None,
+            cut(sources.observation, None),
+        );
+        step(
+            &mut core,
+            sources.actor,
+            11,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+        let sent = step(
+            &mut core,
+            sources.actor,
+            12,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+        assert!(matches!(sent.effect, Some(AttemptEffect {
+            body: EffectBody::SendBatch { batch, .. }, class: crate::effect::EffectClass::Settlement, ..
+        }) if batch.queued_inputs.as_ref() == [grant]));
+        step(
+            &mut core,
+            sources.actor,
+            13,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+
+        let failed = step(
+            &mut core,
+            sources.native,
+            14,
+            AttemptInput::Executor(ExecutorFact::Operation(OperationObservation {
+                generation,
+                reply: OperationReply {
+                    operation_id: operation,
+                    kind: OperationKind::AbortParticipation,
+                    result: OperationReplyResult::Worker(OperationResult::Verdict {
+                        outcome: OperationOutcome::OwnerFailed,
+                        detail: None,
+                        acknowledgement: None,
+                    }),
+                },
+            })),
+            Some(AttemptInputId(id(14))),
+            None,
+        );
+        assert!(failed.stop_producing);
+        assert!(
+            matches!(failed.abort_settlement, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::AbortSettlement {
+                abort_action, generation: settled, receipt_generation: None, operation_id, settlement: AbortIssueSettlement::FailedClosed, ..
+            } if abort_action == actor_action && settled == admission && operation_id == operation))
+        );
+        assert_eq!(core.execution.dispatcher().in_flight_operations(), 0);
+        assert!(!core.execution.owner(participation).unwrap().is_released());
+        assert!(
+            core.execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+        let round = step(
+            &mut core,
+            sources.actor,
+            15,
+            AttemptInput::Timer,
+            None,
+            None,
+        );
+        assert!(
+            matches!(round.round_result, Some(Err(AttemptFailure::TaskProtocol(error)))
+            if matches!(*error, TaskExecutionError::OperationFailed { operation_id, .. } if operation_id == operation))
+        );
     }
 
     struct Units(usize);
