@@ -68,7 +68,6 @@ fn trace(c: &Control) -> Vec<(CompilePhase, u32)> {
 fn limits() -> ProviderReadProjectionLimits {
     ProviderReadProjectionLimits {
         max_definitions: 1024,
-        max_input_version_bytes: 1024 * 1024,
         max_allocation_requests: 8192,
         max_allocation_request_bytes: 4 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 8 * 1024 * 1024,
@@ -414,7 +413,6 @@ fn provider_read_namespace_neutral_purpose_and_binding_mismatch_are_preserved_fo
 fn constrained(f: &ProviderReadProjectionFacts) -> ProviderReadProjectionLimits {
     ProviderReadProjectionLimits {
         max_definitions: f.definition_count,
-        max_input_version_bytes: f.input_version_bytes,
         max_allocation_requests: f.allocation_requests_upper_bound,
         max_allocation_request_bytes: f.allocation_request_bytes_upper_bound,
         max_coexisting_source_and_request_bytes: f.coexisting_source_and_request_bytes_upper_bound,
@@ -424,16 +422,15 @@ fn constrained(f: &ProviderReadProjectionFacts) -> ProviderReadProjectionLimits 
 fn under(mut l: ProviderReadProjectionLimits, which: usize) -> ProviderReadProjectionLimits {
     match which {
         0 => l.max_definitions -= 1,
-        1 => l.max_input_version_bytes -= 1,
-        2 => l.max_allocation_requests -= 1,
-        3 => l.max_allocation_request_bytes -= 1,
-        4 => l.max_coexisting_source_and_request_bytes -= 1,
+        1 => l.max_allocation_requests -= 1,
+        2 => l.max_allocation_request_bytes -= 1,
+        3 => l.max_coexisting_source_and_request_bytes -= 1,
         _ => l.max_work -= 1,
     };
     l
 }
 #[test]
-fn provider_read_namespace_six_exact_caps_source_capacity_and_checked_arithmetic_precede_requests()
+fn provider_read_namespace_five_exact_caps_source_capacity_and_checked_arithmetic_precede_requests()
 {
     let source = read(ConnectorReadRelationKind::Table);
     let ctrl = Control::default();
@@ -449,7 +446,7 @@ fn provider_read_namespace_six_exact_caps_source_capacity_and_checked_arithmetic
     assert_eq!(encoded.facts().allocation_requests_upper_bound, 3);
     let exact = constrained(encoded.facts());
     encode_provider_reads(&inputs, &b, &p, SOURCE, exact).unwrap();
-    for which in 0..6 {
+    for which in 0..5 {
         assert!(matches!(
             encode_provider_reads(&inputs, &b, &p, SOURCE, under(exact, which)),
             Err(Error::InvalidShape(_))
@@ -462,7 +459,7 @@ fn provider_read_namespace_six_exact_caps_source_capacity_and_checked_arithmetic
     assert_eq!(decoded.facts().allocation_requests_upper_bound, 6);
     let exact = constrained(decoded.facts());
     decode_provider_reads(&raw, &db, &dp, SOURCE, exact).unwrap();
-    for which in 0..6 {
+    for which in 0..5 {
         assert!(matches!(
             decode_provider_reads(&raw, &db, &dp, SOURCE, under(exact, which)),
             Err(Error::InvalidShape(_))
@@ -490,6 +487,119 @@ fn provider_read_namespace_six_exact_caps_source_capacity_and_checked_arithmetic
     let empty_decoded = decode_provider_reads(&[], &db, &dp, SOURCE, limits()).unwrap();
     assert_eq!(empty_decoded.source_count(), 0);
 }
+
+#[test]
+fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_paths() {
+    let sources: Vec<_> = (0..370_u64)
+        .map(|ordinal| {
+            let mut source = read(ConnectorReadRelationKind::Table);
+            let mut version = [0x5a; 32];
+            version[..8].copy_from_slice(&ordinal.to_be_bytes());
+            source.input_version = ConnectorReadInputVersion::try_new(version.as_slice()).unwrap();
+            source
+        })
+        .collect();
+    let bindings: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(ordinal, source)| (ordinal as u32, &source.binding))
+        .collect();
+    let payloads: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(ordinal, source)| {
+            [
+                (ordinal as u32 * 2, source.relation.table()),
+                (ordinal as u32 * 2 + 1, source.relation.view()),
+            ]
+        })
+        .collect();
+    let inputs: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(ordinal, source)| (u32::MAX - ordinal as u32, source))
+        .collect();
+    let control = Control::default();
+    let bindings =
+        encode_provider_bindings(&bindings, PRIOR_SOURCE, binding_limits(), &control).unwrap();
+    let payloads =
+        encode_connector_payloads(&payloads, PRIOR_SOURCE, payload_limits(), &control).unwrap();
+    let limits = crate::physical_package_v2::PackageEncodeLimits::FROZEN.reads;
+    let receiver_limits = crate::physical_package_v2::PackageDecodeLimits::FROZEN.reads;
+    let total_version_bytes = sources
+        .iter()
+        .map(|source| source.input_version.as_bytes().len())
+        .sum::<usize>();
+    assert_eq!(total_version_bytes, 11_840);
+    assert!(total_version_bytes > 1024);
+
+    let encoded = encode_provider_reads(&inputs, &bindings, &payloads, SOURCE, limits).unwrap();
+    assert_eq!(encoded.facts().input_version_bytes, total_version_bytes);
+    assert_eq!(encoded.source_count(), sources.len());
+    for (id, original) in &inputs {
+        assert!(std::ptr::eq(encoded.read(*id).unwrap().unwrap(), *original));
+    }
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let mut snapshots = Vec::new();
+    let observed = encode_provider_reads_in(
+        &inputs,
+        &bindings,
+        &payloads,
+        SOURCE,
+        limits,
+        &mut |facts| {
+            snapshots.push(*facts);
+            Ok(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    assert_eq!(observed.as_wire(), encoded.as_wire());
+    assert_eq!(snapshots.last(), Some(observed.facts()));
+    assert_eq!(observed.facts().input_version_bytes, total_version_bytes);
+    work.finish().unwrap();
+
+    let decoded_bindings =
+        decode_provider_bindings(bindings.as_wire(), PRIOR_SOURCE, binding_limits(), &control)
+            .unwrap();
+    let decoded_payloads =
+        decode_connector_payloads(payloads.as_wire(), PRIOR_SOURCE, payload_limits(), &control)
+            .unwrap();
+    let decoded = decode_provider_reads(
+        encoded.as_wire(),
+        &decoded_bindings,
+        &decoded_payloads,
+        SOURCE,
+        receiver_limits,
+    )
+    .unwrap();
+    assert_eq!(decoded.facts().input_version_bytes, total_version_bytes);
+    for (id, original) in &inputs {
+        assert_eq!(decoded.read(*id).unwrap(), Some(*original));
+    }
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let mut snapshots = Vec::new();
+    let observed = decode_provider_reads_in(
+        encoded.as_wire(),
+        &decoded_bindings,
+        &decoded_payloads,
+        SOURCE,
+        receiver_limits,
+        &mut |facts| {
+            snapshots.push(*facts);
+            Ok(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    assert_eq!(snapshots.last(), Some(observed.facts()));
+    assert_eq!(observed.facts().input_version_bytes, total_version_bytes);
+    for (id, original) in &inputs {
+        assert_eq!(observed.read_in(*id, &mut work).unwrap(), Some(*original));
+    }
+    work.finish().unwrap();
+}
+
 fn run(
     control: &Control,
     stop: Option<(usize, CompileControlError)>,

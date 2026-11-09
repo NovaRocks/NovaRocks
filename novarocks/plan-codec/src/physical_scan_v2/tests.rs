@@ -136,7 +136,6 @@ fn payload_limits() -> ConnectorPayloadProjectionLimits {
 fn read_limits() -> ProviderReadProjectionLimits {
     ProviderReadProjectionLimits {
         max_definitions: 1024,
-        max_input_version_bytes: 1024 * 1024,
         max_allocation_requests: 8192,
         max_allocation_request_bytes: 4 * 1024 * 1024,
         max_coexisting_source_and_request_bytes: 8 * 1024 * 1024,
