@@ -78,7 +78,10 @@ impl ProtocolPublicationCursor {
         }
     }
     pub(crate) fn permits_protocol_turn(&self) -> bool {
-        self.cut.is_none() && self.flight.is_none() && !self.failed
+        !self.has_pending_apply() && !self.failed
+    }
+    pub(crate) fn has_pending_apply(&self) -> bool {
+        self.cut.is_some() || self.flight.is_some()
     }
     /// Only unfinished charged traversal can request an immediate continuation.
     /// A ready batch waits for real Source credit; an in-flight batch waits for

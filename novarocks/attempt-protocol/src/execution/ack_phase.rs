@@ -86,6 +86,10 @@ impl NativeAckPhase {
         Ok(())
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        self.phase == Phase::Idle
+    }
+
     pub(crate) fn selected_source(&self) -> Option<AttemptSourceId> {
         matches!(self.phase, Phase::Prefix(_)).then_some(self.source)
     }
@@ -237,6 +241,9 @@ impl NativeAckPhase {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{admission_intent, dispatch_admission};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -259,12 +266,10 @@ mod tests {
         NonZeroU64::new(value).unwrap()
     }
 
-    fn emit_admission(
+    pub(crate) fn admission_intent(
         execution: &mut QueryTaskExecution,
         participation: ParticipationRef,
-        sequence: u64,
-        outcome: OperationOutcome,
-    ) -> OperationObservation {
+    ) -> novarocks_execution_contract::AcquireParticipationAdmissionTicket {
         let OperationIntent::AcquireParticipationAdmissionTicket(request) = execution
             .owners
             .get_mut(&participation)
@@ -275,6 +280,26 @@ mod tests {
         else {
             panic!("expected original admission intent");
         };
+        request
+    }
+
+    fn emit_admission(
+        execution: &mut QueryTaskExecution,
+        participation: ParticipationRef,
+        sequence: u64,
+        outcome: OperationOutcome,
+    ) -> OperationObservation {
+        let request = admission_intent(execution, participation);
+        dispatch_admission(execution, request, sequence, outcome)
+    }
+
+    pub(crate) fn dispatch_admission(
+        execution: &mut QueryTaskExecution,
+        request: novarocks_execution_contract::AcquireParticipationAdmissionTicket,
+        sequence: u64,
+        outcome: OperationOutcome,
+    ) -> OperationObservation {
+        let participation = request.participation();
         let operation = request.envelope().operation_id();
         let generation = SendGeneration::new(AttemptActionId::new(id(sequence)));
         execution

@@ -21,6 +21,7 @@
 //! actual exit and original credit progress remain independently reachable.
 
 pub(crate) mod establish;
+pub(crate) mod gate;
 pub(crate) mod observations;
 
 #[cfg(test)]

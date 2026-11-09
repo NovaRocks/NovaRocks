@@ -164,6 +164,10 @@ impl EstablishAuthorizationStorage {
     }
 }
 impl EstablishAuthorization {
+    pub(crate) fn participation(&self) -> ParticipationRef {
+        self.participation
+    }
+
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.authorization_flight.is_none() && self.pass.is_none() && self.flight.is_none()
     }

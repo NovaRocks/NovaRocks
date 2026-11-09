@@ -18,10 +18,11 @@
 //! The serial owner of the frozen attempt's protocol components.
 
 use crate::{
+    authorization::gate::{AuthorizationGate, AuthorizationStep, ObserverStep, QaReply},
     capacity::StepContext,
     convergence::RemoteConvergence,
     diagnostics::controller::DiagnosticCollector,
-    effect::EffectBody,
+    effect::{AttemptEffect, EffectBody, OperationIntent},
     error::TaskExecutionError,
     execution::{QueryTaskExecution, ack_phase::NativeAckPhase},
     failure::AttemptFailure,
@@ -44,11 +45,10 @@ use crate::{
     terminal::TerminalController,
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptAuthorizationLimits, AttemptRequestToken,
-    AttemptRootFailure, AttemptRootProjection, LogicalToAttempt, LogicalToAttemptBody,
-    MonotonicInstant,
+    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptRootFailure,
+    AttemptRootProjection, LogicalToAttempt, LogicalToAttemptBody, MonotonicInstant,
 };
-use novarocks_execution_contract::ParticipationRef;
+use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -63,7 +63,8 @@ pub(crate) struct Core {
     terminal: TerminalController,
     convergence: RemoteConvergence,
     diagnostics: DiagnosticCollector,
-    authorization_limits: AttemptAuthorizationLimits,
+    authorizations: AuthorizationGate,
+    round_failure: Option<AttemptFailure>,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
@@ -71,6 +72,15 @@ pub(crate) struct Core {
     summary_sources: novarocks_result_contract::PerKind<
         std::collections::BTreeSet<novarocks_execution_contract::TaskIdentity>,
     >,
+}
+
+#[derive(Debug)]
+pub(crate) enum AckSettlementProgress {
+    Yield,
+    Waiting,
+    Request(AttemptEffect),
+    Consumed { retire: Option<TaskOperationId> },
+    Complete(Result<(), AttemptFailure>),
 }
 
 /// Preserve the business projection selected at the same serial cut as the
@@ -139,6 +149,11 @@ impl Core {
         if split_sources.next().is_some() {
             return Err(schedule("more than one original split profile Source"));
         }
+        let authorizations = AuthorizationGate::new(
+            activation.identity,
+            authorization_limits,
+            graph.participations().copied(),
+        )?;
         let root = RootControl::new(activation.identity, &graph)?;
         let publication = ProtocolPublicationCursor::new(&graph);
         let convergence = RemoteConvergence::new(&graph);
@@ -192,7 +207,8 @@ impl Core {
             terminal: TerminalController::new(),
             convergence,
             diagnostics,
-            authorization_limits,
+            authorizations,
+            round_failure: None,
             establish_material,
             retry,
             pumps,
@@ -207,6 +223,11 @@ impl Core {
         now: MonotonicInstant,
         cut: NativeSourceCut,
     ) -> Result<(), TaskExecutionError> {
+        if self.authorizations.waiting_for_reply() || self.publication.has_pending_apply() {
+            return Err(schedule(
+                "Native acknowledgement crossed an outstanding actual reply",
+            ));
+        }
         self.execution.set_now(now)?;
         self.acknowledgements
             .begin(cut)
@@ -362,13 +383,115 @@ impl Core {
         effect: AttemptActionId,
         result: Result<PublicationApplied, AttemptFailure>,
     ) -> PublicationApplyDisposition {
-        match result {
+        let disposition = match result {
             Ok(PublicationApplied::ProtocolBatch { published }) => {
                 self.publication.applied(effect, Ok(published))
             }
             Err(failure) => self.publication.applied(effect, Err(failure)),
             Ok(_) => PublicationApplyDisposition::Stale,
+        };
+        if let PublicationApplyDisposition::Failed(failure) = &disposition {
+            self.round_failure.get_or_insert_with(|| failure.clone());
         }
+        disposition
+    }
+
+    /// The caller has run the old round tail or reached its early-error path.
+    /// A selected publication still awaits its actual result, even if its
+    /// effect has already completed handoff and the original job has exited.
+    pub(crate) fn begin_ack_settlement(
+        &mut self,
+        round_failure: Option<AttemptFailure>,
+    ) -> Result<(), TaskExecutionError> {
+        if self.publication.has_pending_apply() || self.authorizations.waiting_for_reply() {
+            return Err(schedule(
+                "QA settlement crossed an outstanding actual reply",
+            ));
+        }
+        self.acknowledgements
+            .begin_settlement(Ok(()))
+            .map_err(|_| schedule("QA settlement crossed the original round tail"))?;
+        if self.round_failure.is_none() {
+            self.round_failure = round_failure;
+        }
+        Ok(())
+    }
+
+    /// Advance one charged journal row or one selected Establish guard. No
+    /// call is issued before the adapter can commit the outbound effect.
+    pub(crate) fn advance_ack_settlement(
+        &mut self,
+        token: AttemptRequestToken,
+        action: AttemptActionId,
+        context: &mut dyn StepContext,
+    ) -> Result<AckSettlementProgress, TaskExecutionError> {
+        let debt = self
+            .acknowledgements
+            .current()
+            .map_err(|_| schedule("QA settlement has no original acknowledgement cut"))?;
+        if self.authorizations.waiting_for_reply() {
+            return Ok(AckSettlementProgress::Waiting);
+        }
+        let Some(debt) = debt else {
+            let result = self
+                .acknowledgements
+                .finish()
+                .map_err(|_| schedule("QA settlement still has an observed acknowledgement"))?;
+            let failure = result
+                .err()
+                .map(|error| AttemptFailure::TaskProtocol(Box::new(error)))
+                .or(self.round_failure.take())
+                .or(self.authorizations.take_observer_failure());
+            return Ok(AckSettlementProgress::Complete(failure.map_or(Ok(()), Err)));
+        };
+        if !context.charge(1) {
+            return Ok(AckSettlementProgress::Yield);
+        }
+        match self
+            .authorizations
+            .settle_observation(debt, token, action)?
+        {
+            ObserverStep::Request(effect) => Ok(AckSettlementProgress::Request(effect)),
+            ObserverStep::Consumed { retire } => {
+                self.complete_observer_row()?;
+                Ok(AckSettlementProgress::Consumed { retire })
+            }
+            ObserverStep::Waiting => Ok(AckSettlementProgress::Waiting),
+        }
+    }
+
+    /// One candidate at the original authorization point after observer
+    /// settlement. The candidate driver retains the immutable intent.
+    pub(crate) fn authorize_candidate(
+        &mut self,
+        intent: &OperationIntent,
+        token: AttemptRequestToken,
+        action: AttemptActionId,
+    ) -> Result<AuthorizationStep, TaskExecutionError> {
+        if !self.acknowledgements.is_idle() || self.publication.has_pending_apply() {
+            return Ok(AuthorizationStep::Waiting);
+        }
+        self.authorizations.authorize(intent, token, action)
+    }
+
+    pub(crate) fn apply_qa_reply(
+        &mut self,
+        input: LogicalToAttempt<AttemptFailure>,
+    ) -> Result<QaReply, TaskExecutionError> {
+        if input.activation != self.activation {
+            return Ok(QaReply::Stale);
+        }
+        let reply = self.authorizations.replied(input.body)?;
+        if matches!(reply, QaReply::ObserverComplete { .. }) {
+            self.complete_observer_row()?;
+        }
+        Ok(reply)
+    }
+
+    fn complete_observer_row(&mut self) -> Result<(), TaskExecutionError> {
+        self.acknowledgements
+            .settled_current(Ok(()))
+            .map_err(|_| schedule("QA completed without a selected original acknowledgement"))
     }
 
     fn evaluate_pending_seal(&mut self) -> Option<SealedRootCut> {
@@ -422,7 +545,8 @@ mod tests {
         start::{FrozenEstablish, PayloadRef},
     };
     use novarocks_coordination_contract::{
-        AttemptActivation, AttemptCompletionPolicy, AttemptLifecyclePolicy,
+        AttemptActivation, AttemptAuthorizationLimits, AttemptCompletionPolicy,
+        AttemptLifecyclePolicy,
     };
     use novarocks_execution_contract::{
         AbortCause, AdmissionEpochCapability, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus,
@@ -633,6 +757,173 @@ mod tests {
                 assert!(!core.execution.normal_drain_started());
             }
         }
+    }
+
+    #[test]
+    fn actual_qa_replies_settle_all_original_debts_after_publication() {
+        use crate::{
+            effect::EffectClass,
+            execution::ack_phase::{admission_intent, dispatch_admission},
+            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        };
+        use novarocks_coordination_contract::{
+            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
+            AttemptAuthorizationRef, AttemptFailureClass, AttemptToLogicalBody,
+        };
+        use novarocks_execution_contract::OperationOutcome;
+        let start = start();
+        let native = start.sources.native;
+        let now = start.initial_now;
+        let mut core = Core::new(start).unwrap();
+        let participants: Vec<_> = core.execution.graph().participations().copied().collect();
+        let activation = core.activation;
+        let token = |value| AttemptRequestToken::new(id(value));
+        let action = |value| AttemptActionId::new(id(value));
+        let issue = |value| AttemptAuthorizationRef::new(id(value));
+        let reply = |value, decision| LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token: token(value),
+                decision,
+            },
+        };
+        let mut observations = Vec::new();
+        for (index, participation) in participants.into_iter().take(2).enumerate() {
+            let n = index as u64 + 1;
+            let request = admission_intent(&mut core.execution, participation);
+            let AuthorizationStep::Request(effect) = core
+                .authorize_candidate(
+                    &OperationIntent::AcquireParticipationAdmissionTicket(request),
+                    token(n),
+                    action(n),
+                )
+                .unwrap()
+            else {
+                panic!("expected one original admission authorization");
+            };
+            assert!(matches!(effect.body, EffectBody::Port(port)
+                if matches!(port.body, AttemptToLogicalBody::AuthorizationRequest {
+                    token: actual, request: AttemptAuthorization::BeginAdmission(request),
+                } if actual == token(n) && request.participation() == participation)));
+            assert!(matches!(
+                core.apply_qa_reply(reply(n, Ok(AttemptAuthorizationDecision::AdmissionStarted(issue(n))))).unwrap(),
+                QaReply::Authorized(operation) if operation == request.envelope().operation_id()
+            ));
+            observations.push(dispatch_admission(
+                &mut core.execution,
+                request,
+                n,
+                OperationOutcome::Accepted,
+            ));
+        }
+        let tail = AttemptInputId(id(2));
+        core.begin_native_prefix(
+            now,
+            NativeSourceCut {
+                source: native,
+                tail: Some(tail),
+            },
+        )
+        .unwrap();
+        for (index, observation) in observations.iter().enumerate() {
+            core.apply_native(
+                now,
+                native,
+                AttemptInputId(id(index as u64 + 1)),
+                &ExecutorFact::Operation(observation.clone()),
+                |_, _| panic!("not an Abort receipt"),
+            )
+            .unwrap();
+        }
+        assert!(core.select_protocol_publication().unwrap());
+        assert!(core.begin_ack_settlement(None).is_err());
+        assert_eq!(
+            core.advance_protocol_publication(&mut NoTraversal).unwrap(),
+            PublicationProgress::Ready
+        );
+        let publication = action(40);
+        assert!(core.take_protocol_publication(publication).is_some());
+        assert!(core.begin_ack_settlement(None).is_err());
+        core.protocol_publication_applied(
+            publication,
+            Ok(PublicationApplied::ProtocolBatch { published: true }),
+        );
+        core.begin_ack_settlement(None).unwrap();
+
+        struct Charge(bool);
+        impl StepContext for Charge {
+            fn charge(&mut self, units: usize) -> bool {
+                assert_eq!(units, 1);
+                self.0
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                _: bool,
+                _: BackendProcessId,
+                _: usize,
+                _: usize,
+            ) -> QueueStage {
+                panic!("QA settlement has no Native queue reservation")
+            }
+        }
+
+        let original_failure = AttemptFailure::Host(HostProjectedFailure {
+            original: HostFailureRef(id(55)),
+            kind: HostFailureKind::LogicalActor,
+            class: AttemptFailureClass::ExecutionFailure,
+            site: AttemptFailureSite::Attempt,
+        });
+        assert!(matches!(
+            core.advance_ack_settlement(token(10), action(10), &mut Charge(false))
+                .unwrap(),
+            AckSettlementProgress::Yield
+        ));
+        for (index, observation) in observations.iter().enumerate() {
+            let n = index as u64 + 10;
+            let expected_issue = issue(index as u64 + 1);
+            let operation = observation.reply.operation_id();
+            let AckSettlementProgress::Request(effect) = core
+                .advance_ack_settlement(token(n), action(n), &mut Charge(true))
+                .unwrap()
+            else {
+                panic!("expected original selected admission settlement");
+            };
+            assert_eq!(effect.class, EffectClass::Settlement);
+            assert!(matches!(effect.body, EffectBody::Port(port)
+                if matches!(port.body, AttemptToLogicalBody::AuthorizationRequest {
+                    token: actual,
+                    request: AttemptAuthorization::SettleAdmission {
+                        issue, operation_id, outcome: Some(OperationOutcome::Accepted), ..
+                    },
+                } if actual == token(n) && issue == expected_issue && operation_id == operation)));
+            assert!(matches!(
+                core.apply_qa_reply(reply(
+                    n + 100,
+                    Ok(AttemptAuthorizationDecision::AdmissionGranted)
+                ))
+                .unwrap(),
+                QaReply::Stale
+            ));
+            assert!(matches!(
+                core.advance_ack_settlement(token(n + 100), action(n + 100), &mut NoTraversal)
+                    .unwrap(),
+                AckSettlementProgress::Waiting
+            ));
+            let decision = if index == 0 {
+                Err(AttemptAuthorizationFailure::Rejected(
+                    original_failure.clone(),
+                ))
+            } else {
+                Ok(AttemptAuthorizationDecision::AdmissionGranted)
+            };
+            assert!(matches!(core.apply_qa_reply(reply(n, decision)).unwrap(),
+                QaReply::ObserverComplete { retire: Some(retired) } if retired == operation));
+        }
+        assert!(matches!(
+            core.advance_ack_settlement(token(12), action(12), &mut NoTraversal).unwrap(),
+            AckSettlementProgress::Complete(Err(failure)) if failure == original_failure
+        ));
     }
 
     struct NoTraversal;
