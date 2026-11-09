@@ -379,6 +379,7 @@ pub struct QueryTaskExecution {
     stages: BTreeMap<StageId, StageExecution>,
     stage_of_task: BTreeMap<TaskId, StageId>,
     owners: BTreeMap<ParticipationRef, ParticipationOwner>,
+    diagnostics: Option<crate::diagnostics::controller::DiagnosticCollector>,
     diagnostic_sources: crate::diagnostics::sources::DiagnosticSourcesState,
     dispatcher: OperationDispatcher,
     edges: EdgeOpenTracker,
@@ -430,8 +431,6 @@ pub struct QueryTaskExecution {
     accepted_protocol_revision: u64,
     // One ordinal per frozen Task, appended only on its first accepted terminal.
     // Diagnostic readers keep their own cursor; no idle graph scan is needed.
-    accepted_terminal_tasks: Vec<TaskIdentity>,
-    accepted_terminal_seen: BTreeSet<TaskIdentity>,
     accepted_protocol_dirty_tasks: BTreeSet<TaskId>,
     accepted_protocol_writer_evidence: BTreeMap<TaskId, Arc<TaskStatus>>,
     required_result_terminal_control_deadline: Option<MonotonicInstant>,
@@ -653,6 +652,7 @@ impl QueryTaskExecution {
             stages,
             stage_of_task,
             owners,
+            diagnostics: None,
             diagnostic_sources,
             dispatcher,
             edges,
@@ -699,8 +699,6 @@ impl QueryTaskExecution {
             terminal_cleanup_cursor: None,
             failure: TerminationLatch::open(),
             accepted_protocol_revision: 0,
-            accepted_terminal_tasks: Vec::new(),
-            accepted_terminal_seen: BTreeSet::new(),
             accepted_protocol_dirty_tasks: BTreeSet::new(),
             accepted_protocol_writer_evidence: BTreeMap::new(),
             required_result_terminal_control_deadline: None,
@@ -883,10 +881,6 @@ impl QueryTaskExecution {
         self.accepted_protocol_revision
     }
 
-    pub(crate) fn accepted_terminal_tasks(&self) -> &[TaskIdentity] {
-        &self.accepted_terminal_tasks
-    }
-
     pub(crate) fn accepted_protocol_task_changes(&self) -> &BTreeSet<TaskId> {
         &self.accepted_protocol_dirty_tasks
     }
@@ -934,13 +928,16 @@ impl QueryTaskExecution {
             self.accepted_protocol_writer_evidence
                 .insert(task_id, witness);
         }
-        if self
-            .task(task_id)
+        if let Some(status) = self
+            .stages
+            .get(&identity.stage_id())
+            .and_then(|stage| stage.task(task_id))
             .and_then(RemoteTask::status)
-            .is_some_and(|status| status.is_terminal())
-            && self.accepted_terminal_seen.insert(identity)
+            .filter(|status| status.is_terminal())
         {
-            self.accepted_terminal_tasks.push(identity);
+            if let Some(diagnostics) = &mut self.diagnostics {
+                diagnostics.observe_terminal(status)?;
+            }
         }
         self.accepted_protocol_dirty_tasks.insert(task_id);
         self.note_accepted_protocol_change()
@@ -1861,6 +1858,34 @@ impl QueryTaskExecution {
             participation,
             owner.is_released(),
             owner.runtime_filter_contribution().copied(),
+        )
+    }
+
+    pub(crate) fn bind_diagnostic_collector(
+        &mut self,
+        diagnostics: crate::diagnostics::controller::DiagnosticCollector,
+    ) {
+        self.diagnostics = Some(diagnostics);
+    }
+
+    pub(crate) fn diagnostics(&self) -> &crate::diagnostics::controller::DiagnosticCollector {
+        self.diagnostics
+            .as_ref()
+            .expect("registered original diagnostic collector")
+    }
+
+    pub(crate) fn with_diagnostics<T>(
+        &mut self,
+        apply: impl FnOnce(
+            &mut crate::diagnostics::controller::DiagnosticCollector,
+            &crate::diagnostics::sources::DiagnosticSourcesState,
+        ) -> T,
+    ) -> T {
+        apply(
+            self.diagnostics
+                .as_mut()
+                .expect("registered original diagnostic collector"),
+            &self.diagnostic_sources,
         )
     }
 

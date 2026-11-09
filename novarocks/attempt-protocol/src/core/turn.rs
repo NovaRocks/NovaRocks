@@ -60,6 +60,8 @@ pub struct AttemptStep {
     pub root_control_processed: Option<AttemptInputId>,
     pub definitely_unsent_abort: Option<TaskOperationId>,
     pub retired_authorization: Option<TaskOperationId>,
+    /// Original diagnostic protocol or publisher failure, separate from query settlement.
+    pub diagnostic_failure: Option<AttemptFailure>,
     /// The original round result goes to the terminal controller.
     pub round_result: Option<Result<(), AttemptFailure>>,
 }
@@ -180,6 +182,7 @@ impl AttemptCore for Core {
             root_control_processed: None,
             definitely_unsent_abort: None,
             retired_authorization: None,
+            diagnostic_failure: None,
             round_result: None,
         };
         let dynamic_progress = matches!(
@@ -193,15 +196,27 @@ impl AttemptCore for Core {
                         | ExecutorFact::SubscriptionProgress(_)
                 )
         );
+        let cancelling = self.terminal.stop_reason().is_some()
+            || (claim.source == self.sources.actor
+                && matches!(
+                    &input,
+                    AttemptInput::Port(port) if port.activation == self.activation
+                        && matches!(port.body, LogicalToAttemptBody::Stop { .. })
+                ));
+        self.diagnostic_before_input(now, cancelling);
         self.apply_claim(now, claim, input, context, &mut result)?;
         if dynamic_progress {
             self.execution.signal_dynamic_feedback_progress();
         }
+        self.diagnostic_after_input(now);
         result.selection = self.input_selection();
         Ok(result)
     }
 
     fn next_deadline(&self) -> Option<MonotonicInstant> {
+        if self.diagnostics_wait_for_publication() {
+            return None;
+        }
         match self.turn.phase {
             Phase::Bootstrap
             | Phase::Native
@@ -251,7 +266,10 @@ impl AttemptCore for Core {
                 Some(self.execution.monotonic_now())
             }
             Phase::Idle if self.aborts.has_pending() => Some(self.execution.monotonic_now()),
-            Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
+            Phase::Idle
+                if self.diagnostic_work_due()
+                    || self.convergence_due(self.execution.monotonic_now()) =>
+            {
                 Some(self.execution.monotonic_now())
             }
             Phase::Idle => [
@@ -262,15 +280,18 @@ impl AttemptCore for Core {
                     .flatten(),
                 self.convergence.next_deadline(),
                 self.terminal.next_deadline(),
+                self.execution.diagnostics().deadline(),
             ]
             .into_iter()
             .flatten()
             .min(),
             Phase::Tail => self.next_round_deadline(),
             Phase::Converge
-                if self.convergence.waiting_for_process() && !self.convergence_progress_ready() =>
+                if self.convergence.waiting_for_process()
+                    && !self.convergence_progress_ready()
+                    && !self.diagnostic_work_due() =>
             {
-                None
+                self.execution.diagnostics().deadline()
             }
             Phase::Converge => Some(self.execution.monotonic_now()),
             Phase::Common {
@@ -284,6 +305,9 @@ impl AttemptCore for Core {
 impl Core {
     fn input_selection(&self) -> InputSelection {
         use InputSelection::{Only, Prefer};
+        if self.diagnostics_wait_for_publication() {
+            return Only(self.sources.publication);
+        }
         match self.turn.phase {
             Phase::Bootstrap | Phase::Root | Phase::NativeQuiesce | Phase::Observations => {
                 Only(self.sources.actor)
@@ -328,6 +352,16 @@ impl Core {
         }
         let own = claim.source == self.sources.actor;
         let timer = own && matches!(input, AttemptInput::Timer);
+        if self.diagnostics_wait_for_publication() {
+            return if timer {
+                Ok(())
+            } else {
+                Err(schedule(
+                    "input crossed the original diagnostic publication",
+                ))
+            };
+        }
+
         match self.turn.phase {
             Phase::Bootstrap => {
                 if !own || !matches!(input, AttemptInput::Bootstrap) {
@@ -514,7 +548,18 @@ impl Core {
                     self.drive_gate_close(context, result)?;
                 }
             }
-            Phase::Converge if timer => self.drive_convergence(now, context, result)?,
+            Phase::Converge if timer => {
+                if self.diagnostic_work_due() {
+                    let (action, request) = self.turn.issue()?;
+                    if let super::diagnostic_drive::DiagnosticStep::Effect(effect) =
+                        self.advance_diagnostics(action, request, context)
+                    {
+                        result.effect = Some(effect);
+                    }
+                } else {
+                    self.drive_convergence(now, context, result)?;
+                }
+            }
             Phase::Converge => {
                 self.verify_source(claim.source, self.sources.process)?;
                 let AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
@@ -592,7 +637,8 @@ impl Core {
                     let first = self.terminal.stop_reason().is_none();
                     self.terminal.observe_stop(*reason, failure.clone());
                     self.turn.cancellation_due |= first;
-                    self.diagnostics.stop_starting();
+                    self.execution
+                        .with_diagnostics(|collector, _| collector.stop_starting());
                     self.request_stop(result);
                 }
                 LogicalToAttemptBody::BeginConvergence {
@@ -611,12 +657,18 @@ impl Core {
                             ));
                         }
                         if *retain_diagnostics {
-                            self.diagnostics.begin(*ready)?;
+                            self.execution
+                                .with_diagnostics(|collector, _| collector.begin(*ready))?;
+                            self.diagnostic_before_input(
+                                now,
+                                self.terminal.stop_reason().is_some(),
+                            );
                             self.execution
                                 .retain_profile_diagnostics_until(ready.diagnostic_deadline);
                         }
                     } else {
-                        self.diagnostics.stop_starting();
+                        self.execution
+                            .with_diagnostics(|collector, _| collector.stop_starting());
                     }
                     let mode = if self.turn.split_failed {
                         AttemptConvergenceMode::Cleanup
@@ -638,6 +690,15 @@ impl Core {
                 }
                 _ => return Ok(false),
             },
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect,
+                result: applied,
+            }) if self.diagnostics_wait_for_publication() => {
+                self.verify_source(claim.source, self.sources.publication)?;
+                self.observe_diagnostic_publication(*effect, applied, result);
+            }
+            AttemptInput::Executor(ExecutorFact::ActualExit { effect })
+                if self.observe_diagnostic_exit(*effect, result) => {}
             AttemptInput::Executor(ExecutorFact::LocalConvergenceExited) => {
                 self.verify_source(claim.source, self.sources.actor)?;
                 self.turn.local_exited = true;
@@ -737,7 +798,9 @@ impl Core {
 
     fn convergence_progress_ready(&self) -> bool {
         self.convergence.mode().is_some()
-            && ((self.turn.local_exited && !self.turn.reported_local_exit)
+            && ((self.turn.local_exited
+                && self.diagnostic_local_ready()
+                && !self.turn.reported_local_exit)
                 || (self.convergence.closure().is_some() && !self.turn.reported_remote_closure))
     }
 
@@ -754,10 +817,11 @@ impl Core {
             let closure = (!self.turn.reported_remote_closure)
                 .then(|| self.convergence.closure().cloned())
                 .flatten();
+            let local_exited = self.turn.local_exited && self.diagnostic_local_ready();
             self.turn.reported_remote_closure |= closure.is_some();
-            self.turn.reported_local_exit |= self.turn.local_exited;
+            self.turn.reported_local_exit |= local_exited;
             result.effect = Some(self.port_effect(AttemptToLogicalBody::ConvergenceProgress {
-                local_exited: self.turn.local_exited,
+                local_exited,
                 closure,
             })?);
             return Ok(());
@@ -1035,6 +1099,14 @@ impl Core {
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
                     }
+                }
+                ExecutorFact::DiagnosticsFinished {
+                    request,
+                    task,
+                    result: read,
+                } => {
+                    let (action, _) = self.turn.issue()?;
+                    self.observe_diagnostic_result(action, request, task, read, result);
                 }
                 ExecutorFact::DynamicFiltersRead {
                     request,

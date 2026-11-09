@@ -222,19 +222,38 @@ impl DiagnosticCollector {
         row.terminal = Some(status.clone());
         Ok(())
     }
+    pub(crate) fn read_ready(&self) -> bool {
+        self.enabled
+            && self.ready.is_some()
+            && !self.reads_closed
+            && self.pending.is_none()
+            && !self.candidates.is_empty()
+    }
+
+    pub(crate) fn deadline(&self) -> Option<MonotonicInstant> {
+        if self.selected {
+            return None;
+        }
+        self.ready.map(|ready| ready.diagnostic_deadline)
+    }
+
+    pub(crate) fn has_snapshot_pending(&self) -> bool {
+        self.frozen.is_some()
+    }
+
+    pub(crate) fn requires_snapshot(&self) -> bool {
+        self.ready.is_some()
+    }
+
     pub(crate) fn next_read(
         &mut self,
         request: AttemptRequestToken,
         context: &mut dyn StepContext,
     ) -> Option<DiagnosticReadRequest> {
-        if !self.enabled
-            || self.reads_closed
-            || self.pending.is_some()
-            || self.candidates.is_empty()
-        {
+        if !self.read_ready() {
             return None;
         }
-        let ready = self.ready?;
+        let ready = self.ready.expect("original diagnostic readiness");
         if !context.charge(1) {
             return None;
         }

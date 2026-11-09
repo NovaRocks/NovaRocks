@@ -19,6 +19,7 @@
 
 mod abort;
 mod candidates;
+mod diagnostic_drive;
 mod round_tail;
 mod stop;
 mod subscriptions;
@@ -77,7 +78,7 @@ pub struct Core {
     publication: ProtocolPublicationCursor,
     terminal: TerminalController,
     convergence: RemoteConvergence,
-    diagnostics: DiagnosticCollector,
+    diagnostics: diagnostic_drive::DiagnosticDrive,
     authorizations: AuthorizationGate,
     dispatch: BatchDispatchPass,
     round_failure: Option<AttemptFailure>,
@@ -235,6 +236,7 @@ impl Core {
             execution.adopt_replacement_admissions(&activation.inherited_admissions)?;
         }
         execution.activate_covered_observation();
+        execution.bind_diagnostic_collector(diagnostics);
         execution.bind_split_pump(split_source);
         execution.bind_dynamic_feedback(dynamic_source);
         let acknowledgements = NativeAckPhase::new(native, mailbox)
@@ -252,7 +254,7 @@ impl Core {
             publication,
             terminal: TerminalController::new(),
             convergence,
-            diagnostics,
+            diagnostics: diagnostic_drive::DiagnosticDrive::default(),
             authorizations,
             dispatch: BatchDispatchPass::new(),
             round_failure: None,
@@ -1842,6 +1844,278 @@ mod tests {
             started(),
         );
         assert_eq!(next.selection, InputSelection::Only(sources.observation));
+    }
+
+    #[test]
+    fn diagnostic_snapshot_keeps_early_data_and_excludes_late_data_until_actual_exit() {
+        use super::round_tail::RoundTailStep;
+        use crate::{
+            AttemptCore,
+            effect::Publication,
+            input::{
+                AttemptInput, AttemptInputClaim, DiagnosticRead, FinalTaskInfoProjection,
+                FinalTaskInfoRef,
+            },
+            publication::{DiagnosticClosure, DiagnosticMissing, DiagnosticTaskObservation},
+        };
+        use novarocks_coordination_contract::{
+            AttemptComputationCut, AttemptConvergenceMode, AttemptToLogicalBody,
+        };
+        use novarocks_execution_contract::root_result::RootResultEnd;
+
+        for at_deadline in [false, true] {
+            let mut core = round();
+            let sources = core.sources;
+            let now = core.execution.monotonic_now();
+            let deadline = now.saturating_add(Duration::from_secs(1));
+            let root = core.execution.graph().root_identity();
+            let ready = AttemptComputationCut {
+                activation: core.activation,
+                root,
+                cut: now,
+                diagnostic_deadline: deadline,
+                convergence_deadline: now.saturating_add(Duration::from_secs(10)),
+                end: RootResultEnd {
+                    sequence: id(1),
+                    output_rows: 1,
+                },
+            };
+            let finished = frame(&mut core, root, TaskState::Finished, None);
+            let ObservationEvent::Fact {
+                fact: ObservationFact::Status(status),
+                ..
+            } = &finished.event
+            else {
+                panic!("original terminal");
+            };
+            let final_status = status.clone();
+            core.apply_observations(
+                now,
+                sources.observation,
+                ObservationBatch::new(vec![finished]).unwrap(),
+            )
+            .unwrap();
+            core.execution
+                .with_diagnostics(|collector, _| collector.begin(ready))
+                .unwrap();
+            core.begin_round_tail(true).unwrap();
+            let advance = |core: &mut Core, n| {
+                core.advance_round_tail(
+                    now,
+                    AttemptActionId::new(id(n)),
+                    AttemptRequestToken::new(id(n)),
+                    &mut Units(32),
+                )
+                .unwrap()
+            };
+            let RoundTailStep::Effect(AttemptEffect {
+                id: publication,
+                body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+                ..
+            }) = advance(&mut core, 101)
+            else {
+                panic!("expected original protocol publication")
+            };
+            core.protocol_publication_applied(
+                publication,
+                Ok(PublicationApplied::ProtocolBatch { published: true }),
+            );
+            let mut sequence = 102;
+            let (read_effect, request) = loop {
+                match advance(&mut core, sequence) {
+                    RoundTailStep::Effect(AttemptEffect {
+                        id,
+                        body:
+                            EffectBody::CollectDiagnostics {
+                                request,
+                                task,
+                                deadline: exact,
+                            },
+                        ..
+                    }) => {
+                        assert_eq!((task, exact), (root, deadline));
+                        break (id, request);
+                    }
+                    RoundTailStep::Effect(AttemptEffect {
+                        body:
+                            EffectBody::ReleaseCreationPayload { .. }
+                            | EffectBody::CloseSubscription { .. }
+                            | EffectBody::AdjustReadWindow(_)
+                            | EffectBody::OpenSubscription(_),
+                        ..
+                    }) => {}
+                    other => panic!("unexpected original tail progress: {other:?}"),
+                }
+                sequence += 1;
+                assert!(sequence < 110);
+            };
+            assert!(matches!(
+                advance(&mut core, sequence + 1),
+                RoundTailStep::Complete(Ok(()))
+            ));
+
+            let handle = |core: &mut Core, at, source, n, input| {
+                core.handle(
+                    at,
+                    AttemptInputClaim {
+                        source,
+                        input: AttemptInputId(id(n)),
+                        native_cut: Some(AttemptSourceCut {
+                            source: sources.native,
+                            tail: None,
+                        }),
+                        selected_cut: Some(AttemptSourceCut {
+                            source: sources.observation,
+                            tail: None,
+                        }),
+                    },
+                    input,
+                    &mut Units(32),
+                )
+                .unwrap()
+            };
+            handle(&mut core, now, sources.actor, 120, AttemptInput::Bootstrap);
+            assert_eq!(core.next_deadline(), Some(deadline));
+            core.convergence
+                .begin(AttemptConvergenceMode::Normal, ready.convergence_deadline);
+            let local_first = handle(
+                &mut core,
+                now,
+                sources.actor,
+                121,
+                AttemptInput::Executor(ExecutorFact::LocalConvergenceExited),
+            );
+            assert!(local_first.effect.is_none());
+
+            let reference = FinalTaskInfoRef::new(request, root);
+            let observed = handle(
+                &mut core,
+                if at_deadline { deadline } else { now },
+                sources.actor,
+                122,
+                AttemptInput::Executor(ExecutorFact::DiagnosticsFinished {
+                    request,
+                    task: root,
+                    result: DiagnosticRead::Available(FinalTaskInfoProjection {
+                        reference,
+                        final_status,
+                    }),
+                }),
+            );
+            if at_deadline {
+                assert!(matches!(observed.effect,
+                Some(AttemptEffect { body: EffectBody::DisposeDiagnosticInfo {
+                    request: exact, task, information }, ..
+                }) if exact == request && task == root && information == reference));
+            } else {
+                assert!(observed.effect.is_none());
+            }
+            assert!(observed.diagnostic_failure.is_none());
+            assert!(!core.diagnostic_local_ready());
+
+            let applied = |effect, kind| {
+                AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                    effect,
+                    result: Ok(kind),
+                })
+            };
+            let mut n = 123;
+            let snapshot = loop {
+                let step = handle(&mut core, deadline, sources.actor, n, AttemptInput::Timer);
+                n += 1;
+                assert!(n < 143, "bounded diagnostic snapshot assembly");
+                match step.effect {
+                    Some(AttemptEffect {
+                        id,
+                        body: EffectBody::Publish(Publication::Diagnostics(cut)),
+                        ..
+                    }) => {
+                        assert_eq!(cut.closure, DiagnosticClosure::ObservationDeadline);
+                        assert_eq!(cut.sources.selected_at, deadline);
+                        let observation = if at_deadline {
+                            DiagnosticTaskObservation::Missing(DiagnosticMissing::ReadPending)
+                        } else {
+                            DiagnosticTaskObservation::Available(reference)
+                        };
+                        assert_eq!(cut.tasks[0], (root, observation));
+                        assert_eq!(step.selection, InputSelection::Only(sources.publication));
+                        break id;
+                    }
+                    Some(AttemptEffect {
+                        id,
+                        body: EffectBody::Publish(Publication::RootStatus(_)),
+                        ..
+                    }) => {
+                        handle(
+                            &mut core,
+                            deadline,
+                            sources.publication,
+                            n,
+                            applied(id, PublicationApplied::RootStatus),
+                        );
+                        n += 1;
+                    }
+                    None => {}
+                    other => panic!("unexpected effect during diagnostic snapshot: {other:?}"),
+                }
+            };
+            assert_eq!(core.next_deadline(), None);
+            let wrong = handle(
+                &mut core,
+                deadline,
+                sources.publication,
+                n,
+                applied(snapshot, PublicationApplied::FinalTaskInfo),
+            );
+            assert_eq!(wrong.selection, InputSelection::Only(sources.publication));
+            assert!(!core.diagnostic_local_ready());
+            handle(
+                &mut core,
+                deadline,
+                sources.publication,
+                n + 1,
+                applied(snapshot, PublicationApplied::Diagnostics),
+            );
+            assert!(!core.diagnostic_local_ready());
+            let done = handle(
+                &mut core,
+                deadline,
+                sources.actor,
+                n + 2,
+                AttemptInput::Timer,
+            );
+            assert_eq!(done.round_result, Some(Ok(())));
+            handle(
+                &mut core,
+                deadline,
+                sources.actor,
+                n + 3,
+                AttemptInput::Executor(ExecutorFact::ActualExit {
+                    effect: read_effect,
+                }),
+            );
+            assert!(core.diagnostic_local_ready());
+            let mut reported_local = false;
+            for step_id in n + 4..n + 15 {
+                let step = handle(
+                    &mut core,
+                    deadline,
+                    sources.actor,
+                    step_id,
+                    AttemptInput::Timer,
+                );
+                if matches!(step.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+                    if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress { local_exited: true, .. }))
+                {
+                    reported_local = true;
+                    break;
+                }
+            }
+            assert!(
+                reported_local,
+                "local convergence reports only after original diagnostic exit"
+            );
+        }
     }
 
     #[test]

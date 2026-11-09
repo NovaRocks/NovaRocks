@@ -50,6 +50,7 @@ enum Phase {
     DynamicFeedback,
     BeginSettlement,
     Settle,
+    Diagnostics,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +61,7 @@ pub(super) struct RoundTail {
     abort_admitted: bool,
     lifecycle_after: Option<TaskOperationId>,
     create_after: Option<TaskOperationId>,
+    settled: Option<Result<(), AttemptFailure>>,
 }
 
 impl RoundTail {
@@ -116,6 +118,7 @@ impl Core {
             abort_admitted: false,
             lifecycle_after: None,
             create_after: None,
+            settled: None,
         };
         Ok(())
     }
@@ -430,10 +433,31 @@ impl Core {
                 }
                 AckSettlementProgress::Consumed { retire: None } => {}
                 AckSettlementProgress::Complete(result) => {
-                    self.round_tail = RoundTail::default();
-                    return Ok(Some(RoundTailStep::Complete(result)));
+                    self.round_tail.settled = Some(result);
+                    self.round_tail.phase = Phase::Diagnostics;
                 }
             },
+            Phase::Diagnostics => {
+                use super::diagnostic_drive::DiagnosticStep;
+                match self.advance_diagnostics(action, token, context) {
+                    DiagnosticStep::Yield => return Ok(Some(RoundTailStep::Yield)),
+                    DiagnosticStep::AwaitPublication => {
+                        return Ok(Some(RoundTailStep::AwaitPublication));
+                    }
+                    DiagnosticStep::Effect(effect) => {
+                        return Ok(Some(RoundTailStep::Effect(effect)));
+                    }
+                    DiagnosticStep::Idle => {
+                        let result = self
+                            .round_tail
+                            .settled
+                            .take()
+                            .expect("original round settled");
+                        self.round_tail = RoundTail::default();
+                        return Ok(Some(RoundTailStep::Complete(result)));
+                    }
+                }
+            }
         }
         Ok(None)
     }
@@ -443,6 +467,7 @@ impl Core {
     pub(crate) fn next_round_deadline(&self) -> Option<MonotonicInstant> {
         match self.round_tail.phase {
             Phase::AwaitPublication if self.publication.has_pending_apply() => None,
+            Phase::Diagnostics if self.diagnostics_wait_for_publication() => None,
             Phase::Idle | Phase::Settle if self.authorizations.waiting_for_reply() => None,
             Phase::Idle if self.acknowledgements.selected_source().is_some() => None,
             Phase::Idle => [
