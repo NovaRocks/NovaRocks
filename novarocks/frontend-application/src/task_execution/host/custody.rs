@@ -37,7 +37,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{Arc, Mutex, Weak},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use tokio::{
     runtime::Handle,
@@ -77,6 +77,8 @@ pub(crate) struct CustodyRefusal {
     pub(crate) original: ReportedWork,
 }
 struct Joined<T> {
+    handoff_pending: bool,
+    handoff_waiter: Option<Waker>,
     join: Option<JoinHandle<T>>,
     outcome: Option<T>,
     error: Option<ManuallyDrop<JoinError>>,
@@ -118,6 +120,8 @@ impl<T> OriginalRole<T> {
             observer,
             panic,
             joined: Mutex::new(Joined {
+                handoff_pending: true,
+                handoff_waiter: None,
                 join: None,
                 outcome: None,
                 error: None,
@@ -133,10 +137,17 @@ impl<T> OriginalRole<T> {
         Ok((role, exit))
     }
     fn record_handoff_failure(&self, cause: Box<dyn std::any::Any + Send>) {
-        let mut state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!state.handoff_failed, "one original handoff failure");
-        state.handoff_failed = true;
-        state.handoff_failure = Some(ManuallyDrop::new(cause));
+        let wake = {
+            let mut state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.handoff_pending, "one original handoff failure");
+            state.handoff_pending = false;
+            state.handoff_failed = true;
+            state.handoff_failure = Some(ManuallyDrop::new(cause));
+            state.handoff_waiter.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
     }
     fn take_handoff_failure(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.joined
@@ -158,16 +169,32 @@ impl<T> OriginalRole<T> {
         self.panic.take()
     }
     fn install_join(&self, join: JoinHandle<T>) {
-        let mut state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            state.join.is_none() && state.facts.is_none(),
-            "one original Source Join"
-        );
-        state.join = Some(join);
+        let wake = {
+            let mut state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.handoff_pending, "one original Source Join");
+            state.handoff_pending = false;
+            state.join = Some(join);
+            state.handoff_waiter.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
     }
     fn poll_join(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<Result<(), CustodyError>> {
+        // Cloning and dropping an executor Waker may call its implementation.
+        let mut waiter = Some(cx.waker().clone());
         let join = {
             let mut state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
+            if state.handoff_pending {
+                if state
+                    .handoff_waiter
+                    .as_ref()
+                    .is_none_or(|w| !w.will_wake(cx.waker()))
+                {
+                    std::mem::swap(&mut state.handoff_waiter, &mut waiter);
+                }
+                return Poll::Pending;
+            }
             if state.handoff_failed {
                 return Poll::Ready(Err(CustodyError::OriginalHandoffFailed));
             }
@@ -440,6 +467,37 @@ pub(crate) struct OriginalTransportJoinObligation {
     role: Arc<OriginalRole<()>>,
     native: Arc<TransportRegistration>,
 }
+/// The only authority to install the original transport Join. It stays with
+/// the prepared job until the executor accepts that job for real.
+#[must_use]
+pub(crate) struct TransportJoinHandoff(Arc<OriginalRole<()>>);
+impl TransportJoinHandoff {
+    pub(crate) fn owns_exit(&self, exit: &ExitObligation) -> bool {
+        self.0.custody.owns_exit(exit)
+    }
+
+    pub(crate) fn spawn<F>(
+        self,
+        runtime: &Handle,
+        exit: ExitObligation,
+        make: impl FnOnce(ExitObligation) -> F,
+    ) -> Result<(), CustodyError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        assert!(self.owns_exit(&exit), "same prepared transport exit");
+        match catch_unwind(AssertUnwindSafe(|| runtime.spawn(make(exit)))) {
+            Ok(join) => {
+                self.0.install_join(join);
+                Ok(())
+            }
+            Err(cause) => {
+                self.0.record_handoff_failure(cause);
+                Err(CustodyError::OriginalHandoffFailed)
+            }
+        }
+    }
+}
 impl OriginalTransportJoinObligation {
     /// The factory receives the original role's unique exit and weak row port.
     /// It constructs its credentialed future before Tokio handoff. No method
@@ -455,6 +513,17 @@ impl OriginalTransportJoinObligation {
         F: Future<Output = ()> + Send + 'static,
         Make: FnOnce(ExitObligation, TransportJoinRegistration) -> F,
     {
+        let (owner, exit, handoff) = Self::prepare(original, observer, panic)?;
+        let registration = owner.registration();
+        let _ = handoff.spawn(runtime, exit, |exit| make(exit, registration));
+        Ok(owner)
+    }
+
+    pub(crate) fn prepare(
+        original: ReportedWork,
+        observer: ConsumerId,
+        panic: PanicSink,
+    ) -> Result<(Self, ExitObligation, TransportJoinHandoff), CustodyRefusal> {
         let (role, exit) = OriginalRole::new(original, observer, panic)?;
         let native = Arc::new(TransportRegistration {
             state: Mutex::new(TransportRegistrationState {
@@ -464,18 +533,14 @@ impl OriginalTransportJoinObligation {
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
-        let registration = TransportJoinRegistration {
-            original: Arc::downgrade(&native),
-        };
-        let owner = Self { role, native };
-        match catch_unwind(AssertUnwindSafe(|| {
-            let future = make(exit, registration);
-            runtime.spawn(future)
-        })) {
-            Ok(join) => owner.role.install_join(join),
-            Err(cause) => owner.role.record_handoff_failure(cause),
+        let handoff = TransportJoinHandoff(role.clone());
+        Ok((Self { role, native }, exit, handoff))
+    }
+
+    pub(crate) fn registration(&self) -> TransportJoinRegistration {
+        TransportJoinRegistration {
+            original: Arc::downgrade(&self.native),
         }
-        Ok(owner)
     }
     pub(crate) fn take_handoff_failure(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.role.take_handoff_failure()

@@ -41,7 +41,8 @@ mod source_ports;
 
 // Only these controlled original-object entry points are exposed to the host.
 pub(crate) use actor_adapter::{
-    ActorTransportResultPort, BoundActorQueue, BoundActorSend, bind_queue, bind_send,
+    ActorTransportHandoff, ActorTransportResultPort, ActorTransportWork, BoundActorTransport,
+    actor_transport_layouts, handoff_actor_transport,
 };
 pub(crate) use capacity::{
     EncodingWindow, QueueCustody, QueueWindow, QuotaLeg, ReturnedPhysical, ReturnedQuota,

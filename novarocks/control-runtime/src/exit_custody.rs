@@ -93,6 +93,12 @@ impl std::fmt::Debug for ExitObligation {
     }
 }
 impl ExitCustody {
+    /// Match the unique live exit authority to this same custody record.
+    /// This is an origin check and cannot start or retire the work.
+    pub fn owns_exit(&self, exit: &ExitObligation) -> bool {
+        exit.active && Arc::ptr_eq(&self.0, &exit.exit_custody.0)
+    }
+
     /// The actual shared record's payload layout, excluding the Arc header.
     /// This observation allocates nothing and grants no exit or capacity.
     pub fn backing_payload_layout() -> std::alloc::Layout {

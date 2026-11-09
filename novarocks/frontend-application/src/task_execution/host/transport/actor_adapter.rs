@@ -18,19 +18,24 @@
 //! Only this adapter knows Actor routing and its original paid causal result.
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
-    queued_job::{BoundQueue, QueueJob},
-    send::{BoundSend, SendJob},
+    queued_job::{BoundQueue, QueueJob, run as run_queue},
+    send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
 };
-use crate::control_runtime::{
-    actor::{FrontendActor, FrontendEffect},
-    host::PreparedEffectJob,
+use crate::{
+    control_runtime::{
+        actor::{FrontendActor, FrontendEffect},
+        host::PreparedEffectJob,
+    },
+    task_execution::host::custody::{CustodyError, TransportJoinHandoff},
 };
+use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
 use novarocks_control_runtime::{
     causal_input::CausalInputObligation,
     exit_work::{HandoffCell, PanicSink},
 };
-use std::sync::Arc;
+use std::{alloc::Layout, sync::Arc};
+use tokio::runtime::Handle;
 
 /// The same Source owns the original result store. This port holds only a
 /// Weak reference to its Join-owning record and is prepaid before dispatch.
@@ -57,93 +62,126 @@ impl TransportCompletionObligation for ActorResultObligation {
         port.body_finished(routing, outcome, original);
     }
 }
-/// Source builds this binding from the exact admitted job and its canonical
-/// original grants. No descriptor identity is accepted as an author.
-pub(crate) struct BoundActorSend {
-    pub(crate) send: Box<BoundSend>,
+/// The original Source binds the same admitted job, launch authority and
+/// canonical grants before returning it to the common host.
+pub(crate) struct BoundActorTransport {
+    pub(crate) effect: Arc<AttemptEffect>,
+    pub(crate) work: ActorTransportWork,
+    pub(crate) launch: TransportJoinHandoff,
     pub(crate) handoff: Arc<HandoffCell>,
     pub(crate) panic: PanicSink,
     pub(crate) result: Arc<dyn ActorTransportResultPort>,
 }
-pub(crate) struct BoundActorQueue {
-    pub(crate) queue: Box<BoundQueue>,
-    pub(crate) handoff: Arc<HandoffCell>,
-    pub(crate) panic: PanicSink,
-    pub(crate) result: Arc<dyn ActorTransportResultPort>,
+pub(crate) enum ActorTransportWork {
+    Send(Box<BoundSend>),
+    Admit(Box<BoundQueue>),
 }
-/// Ordinary refusal returns the entire original generic host job without
-/// destroying rich captures or issuing another Work/result obligation.
-pub(crate) fn bind_send(job: PreparedEffectJob) -> Result<SendJob, PreparedEffectJob> {
+impl ActorTransportWork {
+    fn matches(&self, body: &EffectBody) -> bool {
+        match (self, body) {
+            (Self::Send(bound), EffectBody::SendBatch { batch, .. }) => {
+                bound.backend == batch.backend
+                    && bound.control_progress == batch.control_progress
+                    && bound.resolved.keys.len() == batch.operations.len()
+                    && bound.resolved.keys.len() == batch.queued_inputs.len()
+            }
+            (
+                Self::Admit(bound),
+                EffectBody::AdmitQueuedInput {
+                    operation,
+                    generation,
+                    ..
+                },
+            ) => {
+                bound.key.operation == operation.operation_id()
+                    && bound.key.generation == *generation
+                    && bound.control == operation.requires_control_progress()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The Source quotes the actual allocations, including the selected boxed
+/// native binding and the distinct actor-result wrapper.
+pub(crate) fn actor_transport_layouts(send: bool) -> [Layout; 3] {
+    [
+        Layout::new::<BoundActorTransport>(),
+        Layout::new::<ActorResultObligation>(),
+        if send {
+            Layout::new::<BoundSend>()
+        } else {
+            Layout::new::<BoundQueue>()
+        },
+    ]
+}
+
+pub(crate) enum ActorTransportHandoff {
+    Spawned,
+    Failed(CustodyError),
+}
+
+/// Type/origin refusal retains the entire original job. Spawned proves only
+/// that the Source now has the actual Join. A factory failure is retained by
+/// that same Source for failure cleanup and is not successful handoff.
+pub(crate) fn handoff_actor_transport(
+    runtime: &Handle,
+    job: PreparedEffectJob,
+) -> Result<ActorTransportHandoff, PreparedEffectJob> {
+    let Some(bound) = job.captures.downcast_ref::<BoundActorTransport>() else {
+        return Err(job);
+    };
+    let FrontendEffect::Attempt(effect) = &job.effect else {
+        return Err(job);
+    };
+    if !Arc::ptr_eq(effect, &bound.effect)
+        || !bound.work.matches(&effect.body)
+        || !bound.launch.owns_exit(&job.exit)
+    {
+        return Err(job);
+    }
     let PreparedEffectJob {
         effect,
         exit,
         result,
         captures,
     } = job;
-    match captures.downcast::<BoundActorSend>() {
-        Ok(bound) => {
-            let BoundActorSend {
-                send,
-                handoff,
-                panic,
-                result: port,
-            } = *bound;
-            Ok(SendJob {
-                leg: TransportLeg {
-                    exit,
-                    handoff,
-                    panic,
-                    result: Box::new(ActorResultObligation {
-                        routing: effect,
-                        original: result,
-                        port,
-                    }),
-                },
-                bound: send,
-            })
-        }
-        Err(captures) => Err(PreparedEffectJob {
-            effect,
-            exit,
-            result,
-            captures,
-        }),
-    }
-}
-pub(crate) fn bind_queue(job: PreparedEffectJob) -> Result<QueueJob, PreparedEffectJob> {
-    let PreparedEffectJob {
-        effect,
+    let BoundActorTransport {
+        work,
+        launch,
+        handoff,
+        panic,
+        result: port,
+        effect: _,
+    } = *captures
+        .downcast::<BoundActorTransport>()
+        .expect("checked actor transport binding");
+    let leg = |exit| TransportLeg {
         exit,
-        result,
-        captures,
-    } = job;
-    match captures.downcast::<BoundActorQueue>() {
-        Ok(bound) => {
-            let BoundActorQueue {
-                queue,
-                handoff,
-                panic,
-                result: port,
-            } = *bound;
-            Ok(QueueJob {
-                leg: TransportLeg {
-                    exit,
-                    handoff,
-                    panic,
-                    result: Box::new(ActorResultObligation {
-                        routing: effect,
-                        original: result,
-                        port,
-                    }),
-                },
-                bound: queue,
-            })
-        }
-        Err(captures) => Err(PreparedEffectJob {
-            effect,
-            exit,
-            result,
-            captures,
+        handoff,
+        panic,
+        result: Box::new(ActorResultObligation {
+            routing: effect,
+            original: result,
+            port,
         }),
-    }
+    };
+    let spawned = match work {
+        ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit| {
+            run_send(SendJob {
+                leg: leg(exit),
+                bound,
+            })
+        }),
+        ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit| {
+            run_queue(QueueJob {
+                leg: leg(exit),
+                bound,
+            })
+        }),
+    };
+    Ok(match spawned {
+        Ok(()) => ActorTransportHandoff::Spawned,
+        Err(error) => ActorTransportHandoff::Failed(error),
+    })
 }

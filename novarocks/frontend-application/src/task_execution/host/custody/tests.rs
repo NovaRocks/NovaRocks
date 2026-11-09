@@ -84,6 +84,59 @@ fn observer() -> ConsumerId {
 }
 
 #[tokio::test]
+async fn prepared_transport_handoff_wakes_source_and_waits_for_actual_join() {
+    use std::task::Wake;
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let fixture = Fixture::new();
+    let original = fixture.reported(None);
+    let report = original.report().clone();
+    let panic = PanicSink::new();
+    let (mut role, exit, handoff) =
+        OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
+            .unwrap_or_else(|e| panic!("{}", e.error));
+    let (foreign, foreign_exit) = ExitCustody::from_admitted(fixture.reported(None));
+    assert!(handoff.owns_exit(&exit));
+    assert!(!handoff.owns_exit(&foreign_exit));
+    foreign_exit.revoke_unused_and_exit().unwrap();
+    assert!(foreign.try_retire().unwrap());
+
+    let counter = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(role.poll_shared_completion(&mut cx).is_pending());
+    assert!(!role.try_retire().unwrap());
+    let (ready, wait) = tokio::sync::oneshot::channel();
+    handoff
+        .spawn(&Handle::current(), exit, |exit| {
+            let future = run_future(exit, async { wait.await.unwrap() }, panic);
+            async { future.await.unwrap() }
+        })
+        .unwrap();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    assert!(role.poll_shared_completion(&mut cx).is_pending());
+    assert_eq!(report.publication_state().unwrap(), SlotState::Reserved);
+    assert!(!role.try_retire().unwrap());
+    ready.send(()).unwrap();
+    assert!(
+        poll_fn(|cx| role.poll_shared_completion(cx))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        report.consumption(observer()).unwrap(),
+        Consumption::Consumed
+    );
+    assert!(role.try_retire().unwrap());
+    fixture.finish();
+}
+
+#[tokio::test]
 async fn transport_local_join_precedes_full_child_tree_retirement() {
     let fixture = Fixture::new();
     let parent = fixture.reported(None);
