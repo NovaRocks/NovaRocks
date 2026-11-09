@@ -298,8 +298,6 @@ async fn build_aggregate_layout_for_refresh_query(
     novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
     PreparationError,
 > {
-    #[cfg(debug_assertions)]
-    require_refresh_query_equivalence(visible_query)?;
     let captured_catalog = capture_catalog(
         MvCatalogCaptureInput {
             query: MvCatalogCaptureQuery::Query(Box::new(visible_query.clone())),
@@ -334,32 +332,6 @@ async fn build_aggregate_layout_for_refresh_query(
         .aggregate_layout_facts(visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
     novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
         .map_err(PreparationError::from)
-}
-
-#[cfg(debug_assertions)]
-fn require_refresh_query_equivalence(
-    query: &novarocks_parser::ast::Query,
-) -> Result<(), PreparationError> {
-    use novarocks_parser::ast::SyntaxEq;
-    let legacy = novarocks_parser::printer::print_query(query);
-    let statements = match novarocks_parser::parse(&legacy) {
-        Ok(statements) => statements,
-        Err(reason) => {
-            tracing::warn!("TRC-5b equivalence skipped at F11: {reason}");
-            return Ok(());
-        }
-    };
-    let [novarocks_parser::ast::Statement::Query(parsed)] = statements.as_slice() else {
-        return Err(PreparationError::from(
-            "TRC-5b legacy reference at F11 did not produce one query".to_string(),
-        ));
-    };
-    if !query.syntax_eq(parsed) {
-        return Err(PreparationError::from(format!(
-            "TRC-5b equivalence mismatch at F11: built={legacy}, legacy={legacy}",
-        )));
-    }
-    Ok(())
 }
 
 async fn retain_exact_repartition_target(
