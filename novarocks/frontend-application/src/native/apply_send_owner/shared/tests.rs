@@ -62,7 +62,7 @@ use std::{
     alloc::Layout,
     collections::VecDeque,
     future::{Future, poll_fn, ready},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
@@ -968,4 +968,108 @@ async fn encoded_local_join_precedes_child_exit_and_foreign_disposal_keeps_same_
     assert!(oracles.into_iter().all(|value| value));
     assert_eq!(after.used, [0, 0]);
     assert!(wc_closed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
+    use crate::native::apply_send_owner::{ApplySendOwner, DrainObservation};
+    use novarocks_control_runtime::exit_work::{GatedNotStarted, GatedOutcome, Withdrawal};
+    let roles = Roles::new();
+    let mut wc = Governed::new();
+    let (mut apply, port) =
+        ApplySendOwner::new(Handle::current(), TransportBudget::DEFAULT).unwrap();
+    apply.start_reaper().unwrap();
+    let backend = BackendProcessId::new_v7();
+    let operation = cancel(backend);
+    let (parent, queue, principal) = roles.parent(backend, operation.queued_bytes());
+    let queue_id = queue.id();
+    let encoding = roles.encoding(principal, backend, 64);
+    let input = wc.admit(NativeQueuedInputQuote::for_original_native_input(
+        NonZeroU64::new(Layout::new::<NativeQueuedInputGrant>().size() as u64).unwrap(),
+        0,
+    ));
+    let slot = port.reserve_original_slot(1).unwrap();
+    apply.close();
+    let panic = PanicSink::new();
+    let inner = panic.clone();
+    let (mut source, exit, launch) =
+        OriginalTransportJoinObligation::prepare(parent, observer(), panic)
+            .unwrap_or_else(|error| panic!("{}", error.error));
+    let withdrawal = Arc::new(HandoffCell::new());
+    let arbitration = withdrawal.clone();
+    let (entered, refusal_observed) = tokio::sync::oneshot::channel();
+    launch
+        .spawn(
+            &Handle::current(),
+            exit,
+            move |exit, registration| async move {
+                let before_handoff = async move {
+                    assert!(matches!(
+                        registration.attach_send(slot, vec![input], encoding, queue_id),
+                        Err(RegistrationFailure::Closed)
+                    ));
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                };
+                let outcome = GatedWork::new(exit, (), arbitration, inner)
+                    .run(generation(), before_handoff, |(), ()| ready(()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    GatedOutcome::NotStarted(GatedNotStarted::Withdrawn)
+                );
+            },
+        )
+        .unwrap();
+    refusal_observed.await.unwrap();
+    let queue = match source.retire_refused_attachment(queue) {
+        Err(original) => original,
+        Ok(_) => panic!("a prepared refusal does not prove the original Join"),
+    };
+    assert!(!source.try_retire().unwrap());
+    assert_eq!(withdrawal.withdraw(), Withdrawal::Withdrawn);
+    assert!(
+        poll_fn(|cx| source.poll_shared_completion(cx))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!source.try_retire().unwrap());
+    let (error, mut retirement) = source
+        .retire_refused_attachment(queue)
+        .unwrap_or_else(|_| panic!("joined original refusal retains the same partition"));
+    assert_eq!(error, RegistrationFailure::Closed);
+    assert!(!source.try_retire().unwrap());
+    assert!(matches!(
+        apply
+            .drain_until(Instant::now() + Duration::from_secs(2))
+            .await,
+        DrainObservation::Complete
+    ));
+
+    drive(&mut wc.driver);
+    let wake = Arc::new(QueueExitWake {
+        ledger: roles.ledger.clone(),
+        expected: [0, 0],
+        wakes: AtomicUsize::new(0),
+        premature: AtomicBool::new(false),
+    });
+    let waker = Waker::from(wake.clone());
+    {
+        let wait = wc.control.wait_progress(wc.control.progress_revision());
+        let mut wait = std::pin::pin!(wait);
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(retirement.finish_one().unwrap());
+    }
+    assert!(wake.wakes.load(Ordering::SeqCst) > 0);
+    assert!(!wake.premature.load(Ordering::SeqCst));
+    roles.ledger.reap_scope_ready(roles.scope.id(), 8).unwrap();
+    assert!(source.try_retire().unwrap());
+    roles.finish();
+    assert!(wc.finish());
 }

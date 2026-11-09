@@ -22,16 +22,13 @@ use super::{
     capacity::{EncodingWindow, ReturnedPhysical},
     queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey},
 };
-use crate::{
-    task_execution::host::custody::SharedApplyAttachRefusal,
-    task_execution::intent::{OperationAcknowledgement, OperationIntent},
-};
+use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
 use novarocks_control_runtime::{exit_custody::ExitObligation, obligation::StepRegistration};
 use novarocks_control_runtime_core::scope::WorkKind;
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_workload_control::WorkError;
-use std::{any::Any, mem::ManuallyDrop, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 pub(crate) struct EncodingJob {
     /// Same reserve_child_next_or_wait guard, bound to one actual child Work.
@@ -50,20 +47,6 @@ pub(crate) enum BodyOutcome {
     /// final logical/error consumer, independently of Core input consumption.
     LocalFailure(WorkError),
     RawFailure(Box<dyn Any + Send>),
-}
-
-/// The original slot, inputs, and encoding guard remain live even when
-/// attachment is refused. Only the original Source can dispose them.
-#[must_use]
-pub(crate) struct FailedApplyAttachment(ManuallyDrop<SharedApplyAttachRefusal>);
-impl FailedApplyAttachment {
-    pub(super) fn new(original: SharedApplyAttachRefusal) -> Self {
-        Self(ManuallyDrop::new(original))
-    }
-
-    pub(crate) fn into_original(self) -> SharedApplyAttachRefusal {
-        ManuallyDrop::into_inner(self.0)
-    }
 }
 
 /// Per-job port bound by the original Source record. Implementations keep a
@@ -89,9 +72,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
     /// Consume the original WC input and bind its actual host record before
     /// exposing the passive reference. Ordinary refusal returns the full input.
     fn install_input(&self, input: OriginalQueuedInput) -> Result<(), OriginalQueuedInput>;
-    /// Move the original refused attachment into the prepaid cleanup cell
-    /// before any outer withdrawal can drop the preparation outcome.
-    fn retain_failed_attachment(&self, original: FailedApplyAttachment);
     /// No borrowed grant or numeric reference is accepted as a producer.
     /// This hook binds the same paid child guard, report/captures/consumer and
     /// real ExitCustody; it does not create another Work or capacity invoice.

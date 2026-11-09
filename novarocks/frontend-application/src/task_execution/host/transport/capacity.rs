@@ -223,6 +223,14 @@ impl QueueCustody {
     pub(crate) fn parent_reservation(&self) -> ReservationId {
         self.window.as_ref().unwrap().parent_reservation()
     }
+    pub(crate) fn partition(&self) -> ReservationId {
+        self.window
+            .as_ref()
+            .expect("original queue custody")
+            .quota
+            .original
+            .id()
+    }
     pub(crate) fn mark_in_flight(&mut self) -> Result<(), CapacityFailure> {
         self.window.as_mut().unwrap().mark_in_flight()
     }

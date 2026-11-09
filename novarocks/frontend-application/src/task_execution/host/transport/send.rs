@@ -167,7 +167,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
     assert_eq!(resolved.operations.len(), resolved.queued_inputs.len());
     assert_eq!(resolved.operations.len(), resolved.keys.len());
     let parent = queue.parent_reservation();
-    let reports_for_pre = reports.clone();
+    let queue_partition = queue.partition();
     let client_for_pre = client.clone();
     let pre = prepare_input(PreparationInput {
         authority,
@@ -185,7 +185,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         apply,
         inputs: resolved.queued_inputs,
         registration,
-        reports: reports_for_pre,
+        queue: queue_partition,
     });
     let captures = Captures {
         operations: resolved.operations,
@@ -348,7 +348,7 @@ struct PreparationInput {
     apply: ApplySendPort,
     inputs: Vec<super::queue_input::SendInputLoan>,
     registration: TransportJoinRegistration,
-    reports: Arc<dyn TransportReports>,
+    queue: novarocks_control_runtime_core::identity::ReservationId,
 }
 async fn prepare_input(
     input: PreparationInput,
@@ -369,7 +369,7 @@ async fn prepare_input(
         input.apply,
         input.inputs,
         input.registration,
-        input.reports,
+        input.queue,
     ) {
         Ok(preparation) => preparation.await,
         Err(error) => Err(error),

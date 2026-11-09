@@ -58,6 +58,6 @@ pub(crate) use quote::{
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(crate) use send::{BoundSend, SendJob, run as run_send};
 pub(crate) use source_ports::{
-    BodyOutcome, EncodingJob, FailedApplyAttachment, ResolvedBatch, TransportCompletionObligation,
-    TransportLeg, TransportReports,
+    BodyOutcome, EncodingJob, ResolvedBatch, TransportCompletionObligation, TransportLeg,
+    TransportReports,
 };

@@ -19,10 +19,7 @@
 //! The credentialed Source carrier polls this future before the GatedWork gate.
 
 use super::{
-    proposal_wait::ProposalWait,
-    queue_input::SendInputLoan,
-    release_wake::LedgerReleaseWake,
-    source_ports::{FailedApplyAttachment, TransportReports},
+    proposal_wait::ProposalWait, queue_input::SendInputLoan, release_wake::LedgerReleaseWake,
 };
 use crate::native::{
     apply_send_owner::{ApplySendPort, RegistrationFailure, SharedApplyPreparation},
@@ -110,7 +107,7 @@ pub(crate) struct PrepareSend {
     apply: ApplySendPort,
     inputs: Option<Vec<SendInputLoan>>,
     registration: TransportJoinRegistration,
-    reports: Arc<dyn TransportReports>,
+    queue: ReservationId,
     registrant: Option<CapacityRegistrant>,
     items: usize,
     channel_source: Option<NativeChannelSource>,
@@ -152,7 +149,7 @@ impl PrepareSend {
         apply: ApplySendPort,
         inputs: Vec<SendInputLoan>,
         registration: TransportJoinRegistration,
-        reports: Arc<dyn TransportReports>,
+        queue: ReservationId,
     ) -> Result<Self, PreparationFailure> {
         let admission = authority
             .action_source(
@@ -187,7 +184,7 @@ impl PrepareSend {
             apply,
             inputs: Some(inputs),
             registration,
-            reports,
+            queue,
             registrant: None,
             items,
             channel_source: None,
@@ -513,12 +510,12 @@ impl Future for PrepareSend {
             .into_iter()
             .map(SendInputLoan::into_original)
             .collect();
-        let row = match this.registration.attach_shared(slot, inputs, encoding) {
+        let row = match this
+            .registration
+            .attach_send(slot, inputs, encoding, this.queue)
+        {
             Ok(row) => row,
-            Err(original) => {
-                let error = original.0;
-                this.reports
-                    .retain_failed_attachment(FailedApplyAttachment::new(original));
+            Err(error) => {
                 let notification = offer
                     .reobserve_after_drop(&mut physical)
                     .map_err(PreparationFailure::Governance);

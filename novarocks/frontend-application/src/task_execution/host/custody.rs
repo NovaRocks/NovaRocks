@@ -27,13 +27,13 @@ use novarocks_control_runtime::{
     completion::ReportSlot,
     exit_custody::{ExitCustody, ExitCustodyError, ExitCustodyPhase, ExitObligation},
     exit_work::{ExitWorkError, PanicSink, run_blocking},
-    obligation::StepRegistration,
+    obligation::{ReservationObligation, StepRegistration},
     reported_work::ReportedWork,
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     completion::ConsumerKind,
-    identity::{ConsumerId, WorkId},
+    identity::{ConsumerId, ReservationId, WorkId},
 };
 use novarocks_workload_control::joint_admission::NativeQueuedInputGrant;
 use std::{
@@ -426,7 +426,14 @@ enum TransportRegistrationState {
     Unattached,
     Attaching,
     Attached(SharedApplyJoinObligation),
+    Refused(RefusedAttachment),
+    RefusedRetiring,
     Issued,
+}
+struct RefusedAttachment {
+    original: ManuallyDrop<SharedApplyAttachRefusal>,
+    queue: ReservationId,
+    join_observed: bool,
 }
 struct TransportRegistration {
     scope: ScopeHandle,
@@ -445,6 +452,38 @@ pub(crate) type SharedApplyAttachRefusal = (
     StepRegistration,
 );
 impl TransportJoinRegistration {
+    /// The actual send attempts attachment once. A refusal stays with the
+    /// original Join owner through the pre-handoff withdrawal boundary.
+    pub(crate) fn attach_send(
+        &self,
+        slot: ApplySlot,
+        inputs: Vec<NativeQueuedInputGrant>,
+        encoding: StepRegistration,
+        queue: ReservationId,
+    ) -> Result<SharedApplyPreparation, RegistrationFailure> {
+        let refused = match self.attach_shared(slot, inputs, encoding) {
+            Ok(preparation) => return Ok(preparation),
+            Err(original) => RefusedAttachment {
+                original: ManuallyDrop::new(original),
+                queue,
+                join_observed: false,
+            },
+        };
+        let error = refused.original.0;
+        if error != RegistrationFailure::BrokenOriginalBound
+            && let Some(record) = self.original.upgrade()
+        {
+            let mut state = record.state.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*state, TransportRegistrationState::Unattached) {
+                *state = TransportRegistrationState::Refused(refused);
+                return Err(error);
+            }
+        }
+        // An invalid second attachment must not drop an unretired grant,
+        // guard, or slot. The executor retains this exact panic payload.
+        std::panic::panic_any(refused)
+    }
+
     /// Move the same reserved Apply row and its original inputs and guard
     /// under this job's Join owner before exposing any preparation authority.
     /// An ordinary refusal gives every original object back to the Source.
@@ -623,8 +662,14 @@ impl OriginalTransportJoinObligation {
             return Poll::Ready(Err(e));
         }
         let mut state = self.native.state.lock().unwrap_or_else(|e| e.into_inner());
-        match *state {
-            TransportRegistrationState::Issued => {
+        match &mut *state {
+            TransportRegistrationState::Refused(refused) if !refused.join_observed => {
+                refused.join_observed = true;
+                return Poll::Ready(Ok(None));
+            }
+            TransportRegistrationState::Refused(_)
+            | TransportRegistrationState::RefusedRetiring
+            | TransportRegistrationState::Issued => {
                 return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
             }
             TransportRegistrationState::Attaching => {
@@ -648,6 +693,43 @@ impl OriginalTransportJoinObligation {
             original.map(|original| SharedApplyJoinCompletion { original, facts })
         ))
     }
+    /// The original job has joined without attaching a Native row. Release
+    /// the unused local slot and child guard and move the still-queued grants
+    /// into the original financial-first retirement continuation.
+    pub(crate) fn retire_refused_attachment(
+        &self,
+        queue: ReservationObligation,
+    ) -> Result<(RegistrationFailure, PhysicalInputRetirementObligation), ReservationObligation>
+    {
+        let original = {
+            let mut state = self.native.state.lock().unwrap_or_else(|e| e.into_inner());
+            let TransportRegistrationState::Refused(refused) = &*state else {
+                return Err(queue);
+            };
+            if !refused.join_observed
+                || queue.id() != refused.queue
+                || !queue.belongs_to(&self.native.scope)
+            {
+                return Err(queue);
+            }
+            let TransportRegistrationState::Refused(refused) =
+                std::mem::replace(&mut *state, TransportRegistrationState::RefusedRetiring)
+            else {
+                unreachable!("qualified original refusal");
+            };
+            ManuallyDrop::into_inner(refused.original)
+        };
+        let (error, slot, inputs, encoding) = original;
+        let retirement = PhysicalInputRetirementObligation::unused_queue(
+            queue,
+            inputs,
+            Arc::downgrade(&self.native),
+        );
+        drop(slot);
+        drop(encoding);
+        Ok((error, retirement))
+    }
+
     /// Retire only the original unused local role after factory/spawn failed
     /// without returning a Join. This emits no Native completion and releases
     /// no staged financial/input packet. Native rows, if any, remain UNKNOWN.
