@@ -3906,7 +3906,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([version_byte; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             intent,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),

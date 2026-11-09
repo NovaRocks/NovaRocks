@@ -96,6 +96,15 @@ fn scoped_builtin_functions(scope: &mut ()) -> &dyn SqlFunctionCatalog {
     builtin_sql_function_catalog()
 }
 
+fn test_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let mut statements = novarocks_parser::parse(sql).expect("test query parses");
+    assert_eq!(statements.len(), 1, "expected exactly one test statement");
+    let novarocks_parser::ast::Statement::Query(query) = statements.remove(0) else {
+        panic!("expected test query");
+    };
+    Box::new(query)
+}
+
 #[test]
 fn external_sql_contract_analyzes_and_optimizes_query() {
     let analyzed = {
@@ -103,7 +112,7 @@ fn external_sql_contract_analyzes_and_optimizes_query() {
         let mut function_scope = ();
         let functions = scoped_builtin_functions(&mut function_scope);
         let request = SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("SELECT 1"),
+            SqlStatementInput::parsed_query(test_query("SELECT 1")),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

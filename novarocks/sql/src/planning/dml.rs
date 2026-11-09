@@ -331,19 +331,6 @@ fn evidence_to_base_statistics(
     }
 }
 
-/// Parse exactly one DML statement through NovaRocks' native parser.
-///
-/// DML callers receive the parser-owned syntax tree directly.  There is no
-/// normalizer or secondary parser boundary on this path.
-pub fn parse_raw_statement(sql: &str) -> Result<novarocks_parser::ast::Statement, String> {
-    let mut statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
-    match statements.len() {
-        1 => Ok(statements.remove(0)),
-        0 => Err("DML admission requires exactly one statement".to_string()),
-        _ => Err("DML admission requires exactly one statement".to_string()),
-    }
-}
-
 /// The SQL-visible kind of terminal row-mutation writer.  This maps one
 /// provider-signed Arrow input shape to its immutable SQL write contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4679,7 +4666,7 @@ mod tests {
         ] {
             let request = |intent| {
                 let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                    SqlStatementInput::sql(sql),
+                    SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
                     intent,
                     SqlSessionContext {
                         sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
@@ -4727,7 +4714,7 @@ mod tests {
             let memory = crate::planning::catalog::PlannerMemoryCatalog::default();
             let catalog = SqlPlannerTableSnapshot::new(&memory);
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: Default::default(),
@@ -4785,7 +4772,7 @@ mod tests {
         let statistics = DmlStatisticsSnapshot::empty();
         let sources = ["32", "ALLOW_THROW_EXCEPTION"].map(|session_mode| {
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql("SELECT 1 AS x"),
+                SqlStatementInput::parsed_query(crate::compiler::test_query("SELECT 1 AS x")),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
@@ -4851,7 +4838,7 @@ mod tests {
             let snapshot = SqlPlannerTableSnapshot::new(&catalog);
             let control = SqlCompileControl::unbounded();
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
                 SqlCompileIntent::IcebergWrite {
                     root_distribution: RootDistributionRequirement::Any,
                 },
@@ -4925,7 +4912,9 @@ mod tests {
             let snapshot = SqlPlannerTableSnapshot::new(&catalog);
             let control = SqlCompileControl::unbounded();
             let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql("select state, 1 as plain from t"),
+                SqlStatementInput::parsed_query(crate::compiler::test_query(
+                    "select state, 1 as plain from t",
+                )),
                 SqlCompileIntent::IcebergWrite {
                     root_distribution: RootDistributionRequirement::Any,
                 },

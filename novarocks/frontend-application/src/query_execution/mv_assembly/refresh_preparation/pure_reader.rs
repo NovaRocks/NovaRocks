@@ -275,30 +275,29 @@ pub(crate) async fn frozen_refresh_aggregate_analysis(
         crate::mv::domain::rewrite::context::first_union_branch_query(query)?
     };
     let calls = extract_aggregate_sql_calls(&representative)?;
-    let layout = build_aggregate_layout_for_refresh_select_sql(
+    let layout = build_aggregate_layout_for_refresh_query(
         io,
         source,
         Some(resolution.default_catalog.as_str()),
         &resolution.default_namespace,
-        &novarocks_parser::printer::print_query(&representative),
+        &representative,
         connector_context,
     )
     .await?;
     Ok(Some((calls, layout)))
 }
 
-async fn build_aggregate_layout_for_refresh_select_sql(
+async fn build_aggregate_layout_for_refresh_query(
     io: &MvRefreshPreparationIo,
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
     current_database: &str,
-    select_sql: &str,
+    visible_query: &novarocks_parser::ast::Query,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<
     novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
     PreparationError,
 > {
-    let visible_query = parse_mv_select_query(select_sql)?;
     let captured_catalog = capture_catalog(
         MvCatalogCaptureInput {
             query: MvCatalogCaptureQuery::Query(Box::new(visible_query.clone())),
@@ -321,7 +320,7 @@ async fn build_aggregate_layout_for_refresh_select_sql(
         current_catalog,
         captured_catalog.catalog.provider(),
         current_database,
-        &visible_query,
+        visible_query,
         ports.function_catalog().as_ref(),
         ports.constant_policy(),
         crate::query_execution::planning::sql_compile_control_from_connector_request(
@@ -330,7 +329,7 @@ async fn build_aggregate_layout_for_refresh_select_sql(
     )?;
     let facts = visible_analysis
         .refresh_input
-        .aggregate_layout_facts(&visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
+        .aggregate_layout_facts(visible_query, SqlMvAggregateLayoutScope::WholeQuery)?;
     novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout(&facts)
         .map_err(PreparationError::from)
 }
@@ -813,17 +812,12 @@ async fn prepare_frontend_first_refresh_write(
         // The analyzer attaches aggregate input types to a SELECT body.  A
         // top-level branch UNION has no such body, while the first branch has
         // the validated representative aggregate layout.
-        let aggregate_layout_sql = if branch_count > 0 {
-            novarocks_parser::printer::print_query(&aggregate_query)
-        } else {
-            novarocks_parser::printer::print_query(&query)
-        };
-        let aggregate_layout = build_aggregate_layout_for_refresh_select_sql(
+        let aggregate_layout = build_aggregate_layout_for_refresh_query(
             io,
             source,
             source_catalog.as_deref(),
             &source_database,
-            &aggregate_layout_sql,
+            &aggregate_query,
             &connector_context,
         )
         .await?;

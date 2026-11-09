@@ -1538,12 +1538,34 @@ mod original_stage_tests {
     fn plan(
         context: &ConnectorRequestContext,
     ) -> (Arc<IcebergMvCreatePlan>, Arc<MvCreateProjectionSeed>) {
-        use crate::mv::domain::{
-            application::{MvCreateRefreshPolicy, MvCreateStatement},
-            iceberg_refresh::{
-                finish_mv_create_preparation, prepare_mv_create_properties,
-                prepare_mv_create_shape, prepare_mv_create_target,
-            },
+        let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query fixture");
+        };
+        let statement = crate::mv::domain::application::MvCreateStatement {
+            name_parts: vec!["new_mv".into()],
+            if_not_exists: false,
+            partition_by: None,
+            distribution: None,
+            refresh_policy: crate::mv::domain::application::MvCreateRefreshPolicy::Manual,
+            select_sql: sql.into(),
+            select_query: query.clone(),
+            properties: Vec::new(),
+            primary_key: None,
+        };
+        plan_from_statement(context, &statement, "iceberg", "db")
+    }
+
+    fn plan_from_statement(
+        context: &ConnectorRequestContext,
+        statement: &crate::mv::domain::application::MvCreateStatement,
+        current_catalog: &str,
+        current_database: &str,
+    ) -> (Arc<IcebergMvCreatePlan>, Arc<MvCreateProjectionSeed>) {
+        use crate::mv::domain::iceberg_refresh::{
+            finish_mv_create_preparation, prepare_mv_create_properties, prepare_mv_create_shape,
+            prepare_mv_create_target,
         };
         use novarocks_sql::compiler::{
             CatalogRelationFact, SqlCapturedCatalogPreparation, SqlCompileControl,
@@ -1551,24 +1573,16 @@ mod original_stage_tests {
         use novarocks_sql::planning::catalog::{
             ConnectorReadTableFacts, materialize_connector_read_table,
         };
-        let sql = "SELECT id, count(*) AS n FROM iceberg.db.orders GROUP BY id";
-        let query = crate::mv::domain::refresh::definition::parse_mv_select_query(sql).unwrap();
-        let statement = MvCreateStatement {
-            name_parts: vec!["new_mv".into()],
-            if_not_exists: false,
-            partition_by: None,
-            distribution: None,
-            refresh_policy: MvCreateRefreshPolicy::Manual,
-            select_sql: sql.into(),
-            select_query: query.clone(),
-            properties: Vec::new(),
-            primary_key: None,
-        };
+        let query = crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query(
+            &statement.select_query,
+            Some(current_catalog),
+            current_database,
+        );
         let control = SqlCompileControl::unbounded();
         let preparation = SqlCapturedCatalogPreparation::try_new(
             query.clone(),
-            Some("iceberg"),
-            "db",
+            Some(current_catalog),
+            current_database,
             control.clone(),
         )
         .unwrap();
@@ -1577,8 +1591,8 @@ mod original_stage_tests {
         };
         let mut bindings = novarocks_sql::binding::SqlTableBindingAllocator::new_unique().unwrap();
         let table = materialize_connector_read_table(ConnectorReadTableFacts {
-            catalog: "iceberg".into(),
-            namespace: "db".into(),
+            catalog: current_catalog.into(),
+            namespace: current_database.into(),
             table: "orders".into(),
             columns: vec![
                 novarocks_types::schema::ColumnDef::from_value_type(
@@ -1604,25 +1618,41 @@ mod original_stage_tests {
         let captured = preparation.capture(&[fact]).unwrap();
         let analysis =
             crate::mv::domain::analysis_adapter::analyze_mv_select_with_captured_catalog(
-                Some("iceberg"),
+                Some(current_catalog),
                 &captured,
-                "db",
+                current_database,
                 &query,
                 novarocks_sql::compiler::builtin_sql_function_catalog(),
                 crate::application::test_constant_policy(),
                 control.clone(),
             )
             .unwrap();
-        let target = prepare_mv_create_target(Some("iceberg"), "db", &statement).unwrap();
-        let shape = prepare_mv_create_shape(target, &statement, query, analysis, &control).unwrap();
+        let target =
+            prepare_mv_create_target(Some(current_catalog), current_database, statement).unwrap();
+        let shape = prepare_mv_create_shape(target, statement, query, analysis, &control).unwrap();
         let (property, persistence) = prepare_mv_create_properties(&shape, &control).unwrap();
         let object_id =
             ConnectorTableObjectId::try_new(Bytes::from_static(b"orders-object")).unwrap();
+        let exact = novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            &object_id,
+            Some(1),
+        ).unwrap();
+        let (persisted_object, _) =
+            novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision(
+                &exact,
+            )
+            .unwrap();
+        let data_format =
+            novarocks_mv_application::persistence::codec::keyed::DataVersionFormat::from_issued_fact(
+                exact.data_version(),
+            )
+            .unwrap();
         let observation = crate::mv::domain::storage_observation::source_schema_from_spi(
             novarocks_spi::connector::MvSourceSchemaObservation::try_new(
                 ConnectorTableIdentity {
-                    instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
-                    namespace: Arc::from("db"),
+                    instance_id: ConnectorInstanceId::parse(current_catalog).unwrap(),
+                    namespace: Arc::from(current_database),
                     table: Arc::from("orders"),
                 },
                 object_id,
@@ -1645,28 +1675,199 @@ mod original_stage_tests {
             context,
         )
         .unwrap();
-        // These are pure captured declaration facts, not Provider authority.
-        // The test stops at stage refusal and never manufactures a handle or a
-        // document-management admission. Both admissions come from real leases.
+        // Pure captured facts use the same CREATE authors as the active reader.
+        // These values grant neither Provider permission nor a management admission.
         let plan = finish_mv_create_preparation(
-            shape, &statement, property, persistence,
+            shape, statement, property, persistence,
             vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation {
-                occurrence_id: 0, provider_object_id: Bytes::from_static(b"orders-object"),
-                provider_schema_version: Bytes::from_static(b"schema-1"), fields: Vec::new(),
+                occurrence_id: 0, provider_object_id: Bytes::copy_from_slice(persisted_object.as_bytes()),
+                provider_schema_version: Bytes::from_static(b"schema-1"),
+                fields: vec![novarocks_mv_application::persistence::aggregate_bindings::MvCreateSourceFieldObservation {
+                    field_ordinal: 0, field_name: "id".into(), provider_field_id: Bytes::from_static(b"id-1"),
+                    type_signature: "long".into(), nullable: true,
+                }],
             }],
             novarocks_mv_application::persistence::codec::keyed::BindingDocument {
-                data_versions: vec![novarocks_mv_application::persistence::codec::keyed::DataVersionFormat {
-                    provider: "iceberg".into(), name: "fixture/stage-data-version".into(),
-                    version: 1, max_value_bytes: 8,
-                }],
+                data_versions: vec![data_format],
             },
-            BTreeMap::from([("iceberg.db.orders".into(), observation)]),
+            BTreeMap::from([(format!("{current_catalog}.{current_database}.orders"), observation)]),
         ).unwrap();
         let seed = Arc::new(
-            plan.projection_seed(&statement, Some("iceberg"), "db")
+            plan.projection_seed(statement, Some(current_catalog), current_database)
                 .unwrap(),
         );
         (plan, seed)
+    }
+
+    #[test]
+    fn create_definition_retains_source_and_session_resolution_through_persistence() {
+        use novarocks_mv_application::persistence::codec::{
+            QueryDialect, decode_definition, encode_definition,
+        };
+        use novarocks_parser::ast::SyntaxEq;
+        let expected_source = "select id /* 保留原文：多字节注释 */ ,\n\tcount(*) AS n -- 保留排版\n  from orders\n group by id";
+        let sql = format!(
+            "CREATE MATERIALIZED VIEW published.saved DISTRIBUTED BY HASH(id) BUCKETS 4 REFRESH MANUAL AS /* outside */ {expected_source} /* outside */;"
+        );
+        let statements = novarocks_parser::parse(&sql).unwrap();
+        let [
+            novarocks_parser::ast::Statement::MaterializedView(
+                novarocks_parser::ast::MaterializedViewStatement::Create(create),
+            ),
+        ] = statements.as_slice()
+        else {
+            panic!("CREATE fixture");
+        };
+        let statement = crate::mv::command::lower_typed_create_for_tests(create).unwrap();
+        assert_eq!(
+            create.raw_query_source.as_bytes(),
+            expected_source.as_bytes()
+        );
+        assert_eq!(statement.select_sql.as_bytes(), expected_source.as_bytes());
+        let stop = ConnectorStopOwner::new();
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            4096,
+            64 * 1024,
+        )
+        .unwrap();
+        let (plan, seed) = plan_from_statement(&context, &statement, "iceberg", "session_db");
+        assert_eq!(
+            seed.definition.query_definition.raw_query_source.as_bytes(),
+            expected_source.as_bytes()
+        );
+        assert_eq!(plan.target.namespace, "published");
+        assert_eq!(plan.base_refs[0].namespace, "session_db");
+        let instance_id = ConnectorInstanceId::parse("iceberg").unwrap();
+        let target = ConnectorPreparedCreateDocumentTarget::try_new(
+            ConnectorProviderBindingKey {
+                instance_id: instance_id.clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
+            },
+            CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([2; 32])),
+            ConnectorStagedCreateOperationId::new(),
+            ConnectorTableIdentity {
+                instance_id,
+                namespace: plan.target.namespace.clone().into(),
+                table: plan.target.table.clone().into(),
+            },
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"created-object")).unwrap(),
+            Bytes::from_static(b"created-schema"),
+            Bytes::from_static(b"created-partitions"),
+            plan.columns
+                .iter()
+                .enumerate()
+                .map(|(ordinal, column)| {
+                    let signature = match column.data_type {
+                        novarocks_types::schema::SqlType::String => "string",
+                        novarocks_types::schema::SqlType::BigInt => "long",
+                        novarocks_types::schema::SqlType::Binary => "binary",
+                        ref other => panic!("unexpected CREATE fixture type: {other:?}"),
+                    };
+                    ConnectorPreparedCreateFieldBinding::try_new(
+                        ordinal.try_into().unwrap(),
+                        Bytes::from(format!("created-field-{ordinal}")),
+                        column.name.clone(),
+                        signature.into(),
+                        column.nullable,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            Vec::new(),
+            Bytes::from_static(b"prepared-document-facts"),
+        )
+        .unwrap();
+        // Exercise the exact author called by CreatePublicationInput::run. No
+        // stage, publication, repository write, or native execution is claimed.
+        let documents =
+            crate::mv::domain::iceberg_refresh::build_create_documents_for_prepared_target(
+                &plan, &seed, &target,
+            )
+            .unwrap();
+        assert_eq!(
+            documents.definition.query.effective_sql.as_bytes(),
+            expected_source.as_bytes()
+        );
+        let encoded = encode_definition(&documents.definition).unwrap();
+        let reloaded = decode_definition(encoded.as_bytes()).unwrap();
+        assert_eq!(
+            reloaded.query.effective_sql.as_bytes(),
+            expected_source.as_bytes()
+        );
+        assert_eq!(reloaded.query.dialect, QueryDialect::StarRocks);
+        assert_eq!(reloaded.query.resolution.default_catalog, "iceberg");
+        assert_eq!(reloaded.query.resolution.default_namespace, "session_db");
+        assert_ne!(
+            reloaded.query.resolution.default_namespace,
+            plan.target.namespace
+        );
+        let identity = novarocks_types::naming::TableIdentity::new(
+            &plan.target.catalog,
+            &plan.target.namespace,
+            &plan.target.table,
+        );
+        let reread = crate::mv::domain::refresh::definition::read_stored_mv_query(
+            &reloaded.query.effective_sql,
+            &identity,
+        )
+        .unwrap();
+        assert!(reread.syntax_eq(&statement.select_query));
+        // Decode the actual CREATE documents as a keyed Current, then call the
+        // same stored-source author used by refresh preparation and EXPLAIN.
+        // This remains a component test, not Provider publication or a native
+        // REFRESH execution.
+        let mut fixture =
+            novarocks_mv_application::persistence::test_support::KeyedProjectionFixture::new(
+                MvTarget::from_parts(
+                    Some(&plan.target.catalog),
+                    &plan.target.namespace,
+                    &plan.target.table,
+                ),
+                None,
+            );
+        fixture.object_id = target.object_id().clone();
+        fixture.definition = reloaded.clone();
+        fixture.interpretation = documents.interpretation.clone();
+        fixture.configuration = documents.configuration.clone();
+        let projection =
+            novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection {
+                mv_id: 1,
+                facts: fixture.build().unwrap(),
+            };
+        assert_eq!(
+            projection.facts.definition().query.effective_sql.as_bytes(),
+            expected_source.as_bytes()
+        );
+        let refreshed =
+            crate::query_execution::mv_assembly::refresh_preparation::canonical_mv_select_query(
+                &projection,
+            )
+            .unwrap();
+        let novarocks_parser::ast::SetExpr::Select(select) = refreshed.body.as_ref() else {
+            panic!("stored aggregate SELECT");
+        };
+        let novarocks_parser::ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[1]
+        else {
+            panic!("stored aggregate expression");
+        };
+        let count_offset = expected_source.find("count(").unwrap();
+        assert!(expected_source[..count_offset].chars().count() < count_offset);
+        assert_eq!(expr.span().start(), count_offset);
+        let preparation = novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new(
+            refreshed,
+            Some(&reloaded.query.resolution.default_catalog),
+            &reloaded.query.resolution.default_namespace,
+            novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let [need] = preparation.needs() else {
+            panic!("one stored source dependency");
+        };
+        assert_eq!(need.relation().catalog, "iceberg");
+        assert_eq!(need.relation().namespace, "session_db");
+        assert_eq!(need.relation().table, "orders");
     }
 
     #[tokio::test(flavor = "current_thread")]

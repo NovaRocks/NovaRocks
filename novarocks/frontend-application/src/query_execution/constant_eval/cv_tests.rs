@@ -30,6 +30,15 @@ use novarocks_type_contract::{
 };
 use std::sync::Mutex;
 
+fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let mut statements = novarocks_parser::parse(sql).unwrap();
+    assert_eq!(statements.len(), 1);
+    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+        panic!("expected one query");
+    };
+    Box::new(query)
+}
+
 struct TestControl;
 impl PureCompileControl for TestControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -635,7 +644,7 @@ fn declines_unmapped_unary_shapes_without_a_fake_kernel() {
     let control = SqlCompileControl::unbounded();
     let result = SqlFinalPlanCompileRequest::new(
         novarocks_physical_plan::PlanVersionId::try_new([88; 16]).unwrap(),
-        SqlStatementInput::sql("SELECT no_such_novarocks_function(1)"),
+        SqlStatementInput::parsed_query(query_ast("SELECT no_such_novarocks_function(1)")),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: Default::default(),
@@ -1387,7 +1396,7 @@ fn regexp_count_real_sql_fold_author_attaches_existing_emitted_source_before_err
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([87; 16]).unwrap(),
-        SqlStatementInput::sql("SELECT regexp_count('test string','[0-9')"),
+        SqlStatementInput::parsed_query(query_ast("SELECT regexp_count('test string','[0-9')")),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: Default::default(),

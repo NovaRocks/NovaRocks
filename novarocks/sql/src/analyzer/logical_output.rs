@@ -1448,7 +1448,7 @@ mod scalar_domain_tests {
         ] {
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([17; 16]).unwrap(),
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(Box::new(query(sql))),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: Default::default(),
@@ -2249,7 +2249,7 @@ mod scalar_domain_tests {
         ] {
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([17; 16]).unwrap(),
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(Box::new(query(sql))),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: Default::default(),

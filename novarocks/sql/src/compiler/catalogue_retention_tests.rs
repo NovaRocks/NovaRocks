@@ -426,7 +426,9 @@ fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture()
     let catalog = CountingCatalog::new(builtin_sql_function_catalog().snapshot(), false);
     let control = SqlCompileControl::unbounded();
     let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-        SqlStatementInput::sql("SELECT MIN(order_key) FROM orders"),
+        SqlStatementInput::parsed_query(crate::compiler::test_query(
+            "SELECT MIN(order_key) FROM orders",
+        )),
         SqlCompileIntent::Query,
         request("SELECT 1", SqlCompileIntent::Query).session,
         SqlPlanningEnvironment::Distributed,

@@ -110,7 +110,7 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
         reset();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([88; 16]).unwrap(),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
             SqlCompileIntent::Query,
             session(),
             SqlPlanningEnvironment::Distributed,

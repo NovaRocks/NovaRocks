@@ -296,7 +296,7 @@ fn optimize(catalog: &TableParentCatalog) -> Result<(), SqlCompileError> {
     let tables = SqlPlannerTableSnapshot::new(&tables);
     let control = SqlCompileControl::unbounded();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql("SELECT u.value FROM (SELECT 1 AS seed) q CROSS JOIN LATERAL UNNEST([REVERSE('abc')]) AS u(value)"),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query("SELECT u.value FROM (SELECT 1 AS seed) q CROSS JOIN LATERAL UNNEST([REVERSE('abc')]) AS u(value)")),
         SqlCompileIntent::Query,
         session(),
         SqlPlanningEnvironment::Distributed,

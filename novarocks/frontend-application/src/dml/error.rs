@@ -62,6 +62,9 @@ pub enum DmlExecutionError {
     Application(novarocks_query_application::session_error::QueryServiceError),
     Execution(ExecutionFailureInput),
     Engine(String),
+    /// The original source-slice refusal, deferred until the provider selects COW.
+    /// No write session or publication has begun when this cause is authored.
+    DeferredLowering(String),
     Compilation(novarocks_failure_contract::SharedFailureCause),
     Analyze(AnalyzeError),
     Cow(crate::query_execution::dml::mutation_flow::CowFailure),
@@ -130,7 +133,7 @@ impl DmlExecutionError {
         match self {
             Self::Execution(input) => DmlError::from_execution(input),
             Self::Application(error) => DmlError::from_application(error),
-            Self::Engine(error) => DmlError::executor(error),
+            Self::Engine(error) | Self::DeferredLowering(error) => DmlError::executor(error),
             Self::Compilation(source) => DmlError::compile_control(
                 novarocks_type_contract::CompileControlError::Source(source),
             ),
@@ -198,7 +201,7 @@ impl std::fmt::Display for DmlExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
-            Self::Engine(error) => formatter.write_str(error),
+            Self::Engine(error) | Self::DeferredLowering(error) => formatter.write_str(error),
             Self::Application(error) => error.fmt(formatter),
             Self::Compilation(source) => source.fmt(formatter),
             Self::Analyze(error) => error.fmt(formatter),
@@ -506,9 +509,14 @@ mod compile_control_tests {
         use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
         use novarocks_sql::compiler::*;
         let control = SqlCompileControl::unbounded();
+        let mut statements = novarocks_parser::parse("SELECT 1").unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([84; 16]).unwrap(),
-            SqlStatementInput::sql("SELECT 1"),
+            SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

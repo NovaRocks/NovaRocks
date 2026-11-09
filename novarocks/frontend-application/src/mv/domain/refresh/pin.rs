@@ -236,24 +236,6 @@ fn validate_refresh_pin_table_object_ids_for_operation(
     Ok(())
 }
 
-#[cfg(test)]
-impl RefreshSnapshotPin {
-    /// Build a pin with explicit entries; for use from other modules' unit
-    /// tests that need to construct a `RefreshSnapshotPin` without going
-    /// through `capture`. Each tuple is `(fqn, snapshot_id, object_id_bytes)`.
-    pub(crate) fn from_entries_for_tests(entries: &[(&str, i64, &[u8])]) -> Self {
-        let entries = entries
-            .iter()
-            .enumerate()
-            .map(|(ordinal, (fqn, snapshot_id, object_id))| {
-                let occurrence_id = u32::try_from(ordinal).expect("test occurrence fits in u32");
-                test_occurrence(occurrence_id, fqn, *snapshot_id, object_id)
-            })
-            .collect::<Vec<_>>();
-        Self::try_from_occurrences(entries).expect("test refresh pin is valid")
-    }
-}
-
 /// Walk `query` in place. For each `TableFactor::Table` whose 3-part name
 /// resolves to the next persisted D occurrence, inject that occurrence's
 /// exact snapshot unless its occurrence ID is in `delta_bearing`. Returns the

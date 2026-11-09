@@ -430,17 +430,4 @@ mod tests {
             .is_err()
         );
     }
-
-    #[test]
-    fn rejects_unprepared_sql_instead_of_reparsing_an_application_statement() {
-        assert!(matches!(
-            SqlDmlCatalogPreparation::try_new(
-                SqlStatementInput::sql("SELECT 1"),
-                session(),
-                SqlCompileControl::unbounded(),
-                RootDistributionRequirement::Any,
-            ),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-    }
 }

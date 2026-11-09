@@ -34,8 +34,8 @@ type Target = crate::catalog_application::resolver::TargetBackend;
 /// Pure provider-signed preparation of the exact admitted UPDATE or MERGE.
 /// COW has not begun a write; its matching computation must run first.
 pub(crate) enum PreparedMutationFacts {
-    Update(PreparedUpdateMutation),
-    Merge(PreparedMergeMutation),
+    Update(Box<PreparedUpdateMutation>),
+    Merge(Box<PreparedMergeMutation>),
 }
 
 pub(crate) async fn prepare_mutation_facts_async(
@@ -92,6 +92,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Update),
         OwnedMutationStatement::Merge(statement) => finish_merge_mutation_preparation(
             statement,
@@ -103,6 +104,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Merge),
     }
 }
@@ -239,6 +241,20 @@ impl PreparedMutationFacts {
         if !self.is_copy_on_write() {
             return Err("COW selection requires its signed copy-on-write strategy".into());
         }
+        match self.as_ref() {
+            Self::Update(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
+            Self::Merge(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
+        }
         if let Self::Merge(prepared) = self.as_ref()
             && matches!(
                 prepared.stmt.matched.as_ref().map(|clause| &clause.action),
@@ -254,7 +270,7 @@ impl PreparedMutationFacts {
             Self::Update(p) => {
                 let source_sql = mutation_source_to_sql(
                     state,
-                    &p.stmt.source,
+                    &p.stmt.cow_text()?.source,
                     p.current_catalog.as_deref(),
                     &p.target,
                 )?;

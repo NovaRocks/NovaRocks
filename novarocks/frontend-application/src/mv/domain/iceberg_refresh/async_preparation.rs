@@ -148,7 +148,9 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
 
     let resolution = &mv_definition.facts.definition().query.resolution;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&refresh_query_source).map_err(RefreshError::from)?,
+        &read_stored_mv_query(&refresh_query_source, &stored_mv_identity(&mv_definition))
+            .map_err(novarocks_sql::compiler::SqlCompileError::Analyze)
+            .map_err(RefreshError::from)?,
         Some(resolution.default_catalog.as_str()),
         &resolution.default_namespace,
     );

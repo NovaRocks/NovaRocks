@@ -804,7 +804,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::completed_plan_fixture::parse_query(sql)),
             intent,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

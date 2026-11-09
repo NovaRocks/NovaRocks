@@ -53,7 +53,7 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
     ] {
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([29; 16]).unwrap(),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: Default::default(),
@@ -133,7 +133,7 @@ fn public_sql_empty_map_lookup_keeps_uninhabited_key_and_actual_probe() {
     {
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([31; 16]).unwrap(),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: Default::default(),
@@ -243,7 +243,7 @@ fn public_sql_map_float_probe_keeps_nullable_cast_before_optional_folding() {
         let before = OBSERVED.load(Ordering::SeqCst);
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([37; 16]).unwrap(),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: Default::default(),

@@ -77,9 +77,14 @@ pub(crate) async fn internal_profile_recovery_description(
         }
     }
     let version = PlanVersionId::try_new([151; 16]).unwrap();
+    let mut statements = novarocks_parser::parse("SELECT 1 AS a").unwrap();
+    assert_eq!(statements.len(), 1);
+    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+        panic!("expected one query");
+    };
     let request = SqlFinalPlanCompileRequest::new(
         version,
-        SqlStatementInput::sql("SELECT 1 AS a"),
+        SqlStatementInput::parsed_query(Box::new(query)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

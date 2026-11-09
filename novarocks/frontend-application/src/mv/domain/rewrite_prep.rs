@@ -24,7 +24,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use crate::mv::domain::readiness::MvCandidateReader;
-use crate::mv::domain::refresh::definition::parse_mv_select_query;
+use crate::mv::domain::refresh::definition::{read_stored_mv_query, stored_mv_identity};
 use novarocks_mv_application::persistence::{
     exact_revision::restore_exact_query_revision, keyed_documents::MvKeyedObservedCurrentDocuments,
     keyed_documents::StoredKeyedMvProjection,
@@ -80,27 +80,63 @@ pub(crate) async fn freeze_materialized_view_fact_with_ports_async(
     let mut accepted = Vec::new();
     for definition in relevant {
         let identity = definition.mv_id.to_string();
-        match freeze_mv_rewrite_definition_async(
-            candidate_reader,
-            connector_control,
-            definition,
-            context,
-        )
-        .await
-        {
-            Ok(facts) => accepted.push(facts),
-            Err(error) => {
-                let diagnostic =
-                    novarocks_mv_application::candidate::CandidateDiagnostic::new(identity, error);
-                tracing::debug!(
-                    candidate = diagnostic.identity(),
-                    error = diagnostic.message(),
-                    "skip unavailable MV rewrite candidate"
-                );
-            }
+        if let Some(facts) = accept_mv_rewrite_candidate(
+            &identity,
+            freeze_mv_rewrite_definition_async(
+                candidate_reader,
+                connector_control,
+                definition,
+                context,
+            )
+            .await,
+        ) {
+            accepted.push(facts);
         }
     }
     MaterializedViewFact::observed(need, accepted)
+}
+
+#[derive(Debug)]
+enum MvRewriteDefinitionError {
+    Unavailable(String),
+    StoredDefinition(novarocks_sql::analyze_error::AnalyzeError),
+}
+impl From<String> for MvRewriteDefinitionError {
+    fn from(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+impl From<&str> for MvRewriteDefinitionError {
+    fn from(message: &str) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+
+fn accept_mv_rewrite_candidate(
+    identity: &str,
+    result: Result<SqlMvRewriteDefinitionFacts, MvRewriteDefinitionError>,
+) -> Option<SqlMvRewriteDefinitionFacts> {
+    match result {
+        Ok(facts) => Some(facts),
+        Err(MvRewriteDefinitionError::StoredDefinition(error)) => {
+            let public = error.to_user_error(None);
+            tracing::warn!(candidate = identity,
+                mv = ?error.stored_definition().map(|definition| definition.name()),
+                error_code = public.code().as_str(), error = public.message(),
+                "skip invalid stored MV rewrite definition");
+            None
+        }
+        Err(MvRewriteDefinitionError::Unavailable(error)) => {
+            let diagnostic =
+                novarocks_mv_application::candidate::CandidateDiagnostic::new(identity, error);
+            tracing::debug!(
+                candidate = diagnostic.identity(),
+                error = diagnostic.message(),
+                "skip unavailable MV rewrite candidate"
+            );
+            None
+        }
+    }
 }
 
 fn candidate_base_tables_are_requested(
@@ -139,7 +175,7 @@ async fn freeze_mv_rewrite_definition_async(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     projection: StoredKeyedMvProjection,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<SqlMvRewriteDefinitionFacts, String> {
+) -> Result<SqlMvRewriteDefinitionFacts, MvRewriteDefinitionError> {
     use novarocks_spi::connector::{
         ConnectorReadSelector, ConnectorTableIdentity, ConnectorTableObjectRebindRequest,
         ConnectorTableObjectSelector, ConnectorTableResolution,
@@ -230,7 +266,11 @@ async fn freeze_mv_rewrite_definition_async(
     SqlMvRewriteDefinitionFacts::try_new(
         projection.mv_id,
         *frozen.versions.definition_revision().as_bytes(),
-        parse_mv_select_query(&definition.query.effective_sql)?,
+        read_stored_mv_query(
+            &definition.query.effective_sql,
+            &stored_mv_identity(&projection),
+        )
+        .map_err(MvRewriteDefinitionError::StoredDefinition)?,
         SqlMvDefinitionResolutionContext::try_new(
             definition.query.resolution.default_catalog.clone(),
             definition.query.resolution.default_namespace.clone(),
@@ -249,6 +289,7 @@ async fn freeze_mv_rewrite_definition_async(
         sources,
     )?
     .with_selection_facts(selection)
+    .map_err(MvRewriteDefinitionError::from)
 }
 
 fn freeze_mv_rewrite_selection(
@@ -347,9 +388,61 @@ async fn freeze_base_table_state_async(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::{Arc, Mutex},
+    };
 
-    use super::candidate_base_tables_are_requested;
+    use super::{
+        MvRewriteDefinitionError, accept_mv_rewrite_candidate, candidate_base_tables_are_requested,
+    };
+
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.insert(field.name().into(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(BTreeMap::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                fields: fields.0,
+            });
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     #[test]
     fn completion_need_filters_out_partial_mv_base_matches() {
@@ -373,5 +466,75 @@ mod tests {
             &requested,
         ));
         assert!(!candidate_base_tables_are_requested(&[], &requested));
+    }
+
+    #[test]
+    fn unreadable_stored_definition_is_skipped_with_a_typed_warn_event() {
+        let source = "SELECT\n  1 + )";
+        let target =
+            novarocks_types::naming::TableIdentity::new("iceberg", "published", "broken_mv");
+        let error = crate::mv::domain::refresh::definition::read_stored_mv_query(source, &target)
+            .expect_err("stored query must fail in the real parser");
+        let parser = novarocks_parser::parse(source)
+            .unwrap_err()
+            .to_user_error(source);
+        let location = parser.location().expect("parser source position");
+        assert_eq!((location.line(), location.column()), (2, 3));
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            assert!(
+                accept_mv_rewrite_candidate(
+                    "candidate-17",
+                    Err(MvRewriteDefinitionError::StoredDefinition(error)),
+                )
+                .is_none()
+            );
+        });
+        let events = capture.0.lock().unwrap();
+        let [event] = events.as_slice() else {
+            panic!("one diagnostic must describe the skipped candidate");
+        };
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.fields["candidate"], "candidate-17");
+        assert_eq!(event.fields["error_code"], "sql.analyze.invalid_view");
+        assert!(event.fields["mv"].contains(&target.fqn()));
+        assert!(event.fields["error"].contains(&target.fqn()));
+        assert!(event.fields["error"].contains(parser.code().as_str()));
+        assert!(event.fields["error"].contains(" at 2:3: "));
+        assert!(event.fields["error"].contains(parser.message()));
+    }
+
+    #[test]
+    fn unavailable_candidate_is_skipped_with_the_original_debug_diagnostic() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            assert!(
+                accept_mv_rewrite_candidate(
+                    "candidate-18",
+                    Err(MvRewriteDefinitionError::Unavailable(
+                        "catalog binding temporarily unavailable".into(),
+                    )),
+                )
+                .is_none()
+            );
+        });
+        let events = capture.0.lock().unwrap();
+        let [event] = events.as_slice() else {
+            panic!("one diagnostic must describe the skipped candidate");
+        };
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        assert_eq!(event.fields["candidate"], "candidate-18");
+        assert_eq!(
+            event.fields["error"],
+            "catalog binding temporarily unavailable"
+        );
+        assert!(!event.fields.contains_key("error_code"));
+        assert!(
+            event
+                .fields
+                .values()
+                .all(|value| !value.contains("sql.analyze.invalid_view")),
+        );
     }
 }

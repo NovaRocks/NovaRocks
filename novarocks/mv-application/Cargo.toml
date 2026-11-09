@@ -24,6 +24,7 @@ novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-table-maintenance.workspace = true
 novarocks-types.workspace = true
+novarocks-user-error.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_bytes.workspace = true

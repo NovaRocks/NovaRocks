@@ -71,7 +71,9 @@ fn source(
     };
     let control = SqlCompileControl::unbounded();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(format!("SELECT CAST(7 AS {sql_type}) AS order_id")),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(&format!(
+            "SELECT CAST(7 AS {sql_type}) AS order_id"
+        ))),
         SqlCompileIntent::IcebergWrite {
             root_distribution: RootDistributionRequirement::Any,
         },
@@ -382,7 +384,7 @@ fn wide_collect_true_source() -> (
     let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
     let decimal = semantics.sql_mode().decimal_overflow_policy();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(&sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(&sql)),
         SqlCompileIntent::IcebergWrite {
             root_distribution: RootDistributionRequirement::Any,
         },

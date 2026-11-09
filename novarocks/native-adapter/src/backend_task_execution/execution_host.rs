@@ -9434,9 +9434,17 @@ pub(crate) mod tests {
 
         fn sql_fragment(sql: &str, window: bool, receive: bool) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
+            let [novarocks_parser::ast::Statement::Query(query)]: [novarocks_parser::ast::Statement;
+                1] = novarocks_parser::parse(sql)
+                .expect("parse test query")
+                .try_into()
+                .expect("exactly one test statement")
+            else {
+                panic!("expected a test query");
+            };
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(Box::new(query)),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

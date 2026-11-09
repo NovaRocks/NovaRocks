@@ -394,16 +394,31 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_readiness(
                         .eq_ignore_ascii_case(&target.table)
             })
             .collect::<Vec<_>>();
+        if matching_occurrences.is_empty() {
+            continue;
+        }
+        let mv = super::refresh::definition::stored_mv_identity(&projection.projection);
+        let query = super::refresh::definition::read_stored_mv_query(
+            &definition.query.effective_sql,
+            &mv,
+        )
+        .map_err(|error| {
+            let public = error.to_user_error(None);
+            format!(
+                "DROP COLUMN `{}` is blocked because materialized view {} definition cannot be read: [{}] {}",
+                column_path.dotted(),
+                mv.fqn(),
+                public.code().as_str(),
+                public.message()
+            )
+        })?;
         let references_column = matching_occurrences.iter().any(|occurrence| {
             occurrence
                 .fields
                 .iter()
                 .any(|field| field.name_at_binding.eq_ignore_ascii_case(&leaf))
         });
-        if !matching_occurrences.is_empty()
-            && (references_column
-                || sql_projects_target_wildcard(&definition.query.effective_sql, &target))
-        {
+        if references_column || query_projects_target_wildcard(&query, &target) {
             return Err(format!(
                 "DROP COLUMN `{}` is blocked because a materialized view references it",
                 column_path.dotted()
@@ -428,16 +443,6 @@ impl MvDependencyTarget {
             table: normalize_identifier(&target.table)?,
         })
     }
-}
-
-fn sql_projects_target_wildcard(sql: &str, target: &MvDependencyTarget) -> bool {
-    let Ok(statements) = novarocks_parser::parse(sql) else {
-        return false;
-    };
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        return false;
-    };
-    query_projects_target_wildcard(query, target)
 }
 
 fn query_projects_target_wildcard(

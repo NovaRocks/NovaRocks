@@ -28,6 +28,7 @@ pub(crate) mod turn_custody;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use self::async_facts::PreparationError;
 use crate::mv::domain::analysis::refresh_property::derive_fragment_property;
 use crate::mv::domain::analysis::{
     canonicalize_iceberg_mv_select_query, validate_mv_partition_columns,
@@ -35,7 +36,9 @@ use crate::mv::domain::analysis::{
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::{IcebergMvCorePorts, join_base_refs_for_definition};
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
-use crate::mv::domain::refresh::definition::{mv_definition_fingerprint, parse_mv_select_query};
+use crate::mv::domain::refresh::definition::{
+    mv_definition_fingerprint, read_stored_mv_query, stored_mv_identity,
+};
 use crate::mv::domain::refresh::execution_policy::{
     non_join_incremental_write_mode, select_join_incremental_execution_mode,
 };
@@ -191,7 +194,7 @@ fn retained_target_field_id_by_name(
 /// The session that happens to issue the statement never resolves these names.
 pub(crate) fn canonical_mv_select_query(
     projection: &StoredKeyedMvProjection,
-) -> Result<novarocks_parser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, PreparationError> {
     let effective_sql = projection.facts.definition().query.effective_sql.clone();
     canonical_mv_select_query_from_source(projection, &effective_sql)
 }
@@ -201,10 +204,11 @@ pub(crate) fn canonical_mv_select_query(
 fn canonical_mv_select_query_from_source(
     projection: &StoredKeyedMvProjection,
     effective_sql: &str,
-) -> Result<novarocks_parser::ast::Query, String> {
+) -> Result<novarocks_parser::ast::Query, PreparationError> {
     let resolution = &projection.facts.definition().query.resolution;
     Ok(canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(effective_sql)?,
+        &read_stored_mv_query(effective_sql, &stored_mv_identity(projection))
+            .map_err(novarocks_sql::compiler::SqlCompileError::Analyze)?,
         Some(resolution.default_catalog.as_str()),
         &resolution.default_namespace,
     ))

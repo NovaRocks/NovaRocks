@@ -964,6 +964,15 @@ mod tests {
 
     use super::*;
 
+    fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
+        let mut statements = novarocks_parser::parse(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
+        Box::new(query)
+    }
+
     struct NoFacts;
 
     #[async_trait::async_trait]
@@ -1729,7 +1738,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([19; 16]).expect("plan version"),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -1961,7 +1970,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([23; 16]).unwrap(),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -2067,7 +2076,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([24; 16]).unwrap(),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -2278,7 +2287,7 @@ mod tests {
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let decimal = semantics.sql_mode().decimal_overflow_policy();
         let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::Any,
             },
@@ -2928,7 +2937,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(query_ast(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

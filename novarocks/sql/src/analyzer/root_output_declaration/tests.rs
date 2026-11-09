@@ -269,7 +269,7 @@ fn root_output_request_is_internal_only_and_applied_by_real_analyzer() {
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
     let request = |intent| {
         SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("SELECT 7 AS __nr_sel_0"),
+            SqlStatementInput::parsed_query(crate::compiler::test_query("SELECT 7 AS __nr_sel_0")),
             intent,
             SqlSessionContext {
                 sql_semantics: Default::default(),

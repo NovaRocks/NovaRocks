@@ -24,14 +24,42 @@ pub fn mv_definition_fingerprint(select_sql: &str) -> String {
     hex::encode(Sha256::digest(select_sql.as_bytes()))
 }
 
-/// Parses the raw stored MV SELECT SQL without invoking query compilation.
-pub fn parse_mv_select_query(sql: &str) -> Result<novarocks_parser::ast::Query, String> {
-    let statements =
-        novarocks_parser::parse(sql).map_err(|err| format!("sql parser error: {err}"))?;
-    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-        return Err("stored MV SQL must be a SELECT query".to_string());
-    };
-    Ok(query.clone())
+/// Project the exact catalog/namespace/table identity already retained by the lake view.
+pub(crate) fn stored_mv_identity(
+    projection: &novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection,
+) -> novarocks_types::naming::TableIdentity {
+    let target = &projection.facts.source_revision().target;
+    novarocks_types::naming::TableIdentity::new(
+        target.instance_id.as_str(),
+        &target.namespace,
+        &target.table,
+    )
+}
+
+/// Read the exact stored source. Resolution remains with the caller's frozen
+/// definition context; the statement issuing a refresh supplies no defaults.
+pub fn read_stored_mv_query(
+    sql: &str,
+    target: &novarocks_types::naming::TableIdentity,
+) -> Result<novarocks_parser::ast::Query, novarocks_sql::analyze_error::AnalyzeError> {
+    use novarocks_sql::analyze_error::{AnalyzeError, StoredDefinition};
+    let statements = novarocks_parser::parse(sql).map_err(|error| {
+        AnalyzeError::stored_definition_parse_failure(
+            StoredDefinition::materialized_view(target.fqn()),
+            std::sync::Arc::from(sql),
+            error,
+            None,
+        )
+    })?;
+    let mut statements = statements.into_iter();
+    match (statements.next(), statements.next()) {
+        (Some(novarocks_parser::ast::Statement::Query(query)), None) => Ok(query),
+        _ => Err(AnalyzeError::stored_definition_not_query(
+            StoredDefinition::materialized_view(target.fqn()),
+            std::sync::Arc::from(sql),
+            None,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -52,9 +80,47 @@ mod tests {
 
     #[test]
     fn parse_stored_select_rejects_non_query_statement() {
+        let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
+        let error = read_stored_mv_query("DELETE FROM ice.db.t", &target).unwrap_err();
+        assert_eq!(error.code().as_str(), "sql.analyze.invalid_view");
+        assert_eq!(error.stored_definition().unwrap().name(), "ice.db.mv");
         assert_eq!(
-            parse_mv_select_query("DELETE FROM ice.db.t").unwrap_err(),
-            "stored MV SQL must be a SELECT query"
+            error.stored_view_definition_source(),
+            Some("DELETE FROM ice.db.t")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn stored_parser_failure_keeps_its_identity_source_and_actual_cause() {
+        use novarocks_sql::analyze_error::StoredDefinitionKind;
+        let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
+        let sql = "SELECT\n (";
+        let parser_error = novarocks_parser::parse(sql).unwrap_err();
+        let parser_public = parser_error.to_user_error(sql);
+        let error = read_stored_mv_query(sql, &target).unwrap_err();
+        assert_eq!(error.code().as_str(), "sql.analyze.invalid_view");
+        assert_eq!(
+            error.stored_definition().unwrap().kind(),
+            StoredDefinitionKind::MaterializedView
+        );
+        assert_eq!(error.stored_definition().unwrap().name(), "ice.db.mv");
+        assert_eq!(error.stored_view_definition_source(), Some(sql));
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<novarocks_parser::ParserError>(),
+            Some(&parser_error)
+        );
+        let public = error.to_user_error(None);
+        assert!(public.location().is_none());
+        assert!(public.message().contains("ice.db.mv"));
+        assert!(public.message().contains(parser_public.code().as_str()));
+        let location = parser_public.location().unwrap();
+        assert!(
+            public
+                .message()
+                .contains(&format!("{}:{}", location.line(), location.column()))
         );
     }
 }

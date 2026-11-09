@@ -49,7 +49,7 @@ fn analyze_decimal_cast(
         .unwrap();
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
     SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: Default::default(),

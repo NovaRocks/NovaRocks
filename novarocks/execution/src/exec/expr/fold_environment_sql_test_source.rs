@@ -30,7 +30,7 @@ pub(super) fn optimize(sql: &str, max_len: Option<i64>) -> Result<(), SqlCompile
     }
     let control = SqlCompileControl::unbounded();
     let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         source_session,
         SqlPlanningEnvironment::Distributed,
