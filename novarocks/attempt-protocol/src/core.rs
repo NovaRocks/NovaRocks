@@ -1875,7 +1875,11 @@ mod tests {
                 result: Ok(PublicationApplied::ProtocolBatch { published: true }),
             })
         };
-        let done = step(&mut core, sources.publication, 10, applied(first));
+        let cleanup = step(&mut core, sources.publication, 10, applied(first));
+        assert!(matches!(cleanup.effect, Some(AttemptEffect {
+            body: EffectBody::ReleaseCreationPayload { task, .. }, ..
+        }) if task == core.execution.graph().root_identity()));
+        let done = step(&mut core, sources.actor, 101, AttemptInput::Timer);
         assert_eq!(done.round_result, Some(Ok(())));
         assert!(done.effect.is_none());
         assert!(!core.execution.normal_drain_started());
@@ -1895,8 +1899,13 @@ mod tests {
         let mut completed = step(&mut core, sources.publication, 14, applied(second));
         assert!(core.execution.normal_drain_started());
         for n in 15..22 {
-            if completed.effect.is_some() {
-                break;
+            match &completed.effect {
+                Some(AttemptEffect {
+                    body: EffectBody::ReleaseCreationPayload { .. },
+                    ..
+                })
+                | None => {}
+                Some(_) => break,
             }
             completed = step(&mut core, sources.actor, n, AttemptInput::Timer);
         }
@@ -2028,7 +2037,7 @@ mod tests {
             body: EffectBody::Withdraw { effect }, class: crate::effect::EffectClass::Cleanup, ..
         }) if effect == unstarted));
         assert_eq!(core.execution.dispatcher().in_flight_operations(), 2);
-        let finished = step(
+        let mut finished = step(
             &mut core,
             sources.actor,
             12,
@@ -2036,6 +2045,18 @@ mod tests {
             None,
             None,
         );
+        for n in 121..125 {
+            if !matches!(
+                finished.effect,
+                Some(AttemptEffect {
+                    body: EffectBody::ReleaseCreationPayload { .. },
+                    ..
+                })
+            ) {
+                break;
+            }
+            finished = step(&mut core, sources.actor, n, AttemptInput::Timer, None, None);
+        }
         assert_eq!(finished.round_result, Some(Ok(())));
         assert!(
             matches!(finished.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
@@ -2873,7 +2894,7 @@ mod tests {
         );
         step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
         let published = step(&mut core, sources.actor, 10, AttemptInput::Timer, None);
-        let release = step(
+        let mut release = step(
             &mut core,
             sources.publication,
             11,
@@ -2883,6 +2904,18 @@ mod tests {
             }),
             None,
         );
+        for n in 12..17 {
+            if !matches!(
+                release.effect,
+                Some(AttemptEffect {
+                    body: EffectBody::ReleaseCreationPayload { .. },
+                    ..
+                })
+            ) {
+                break;
+            }
+            release = step(&mut core, sources.actor, n, AttemptInput::Timer, None);
+        }
         assert!(
             matches!(release.effect, Some(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant: returned }, .. }) if returned == grant)
         );

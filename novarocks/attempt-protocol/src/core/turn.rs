@@ -193,7 +193,10 @@ impl AttemptCore for Core {
             Phase::Idle if self.turn.cancellation_due && self.terminal_needs_drive() => {
                 Some(self.execution.monotonic_now())
             }
-            Phase::Idle if self.execution.has_pending_terminal_cleanup() => {
+            Phase::Idle
+                if self.execution.has_pending_terminal_cleanup()
+                    || self.execution.has_task_input_cleanup() =>
+            {
                 Some(self.execution.monotonic_now())
             }
             Phase::Candidates if self.authorizations.waiting_for_reply() => None,
@@ -875,7 +878,9 @@ impl Core {
                 ExecutorFact::QueuedInputGranted {
                     operation, grant, ..
                 } => {
-                    let cleanup = if self.aborts.owns(operation) {
+                    let cleanup = if self.execution.tracks_pending_update_grant(grant) {
+                        None
+                    } else if self.aborts.owns(operation) {
                         self.aborts.grant(&mut self.execution, operation, grant)?
                     } else {
                         let progress = if self.execution.has_lifecycle_admission(operation) {
@@ -1081,8 +1086,8 @@ impl Core {
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         use super::AuthorizationStep;
-        use super::candidates::{Authorization, Maintenance};
-        use crate::execution::ReleaseProgress;
+        use super::candidates::{Authorization, Maintenance, TaskCandidate};
+        use crate::execution::{EdgeAdmissionProgress, ReleaseProgress};
         if self.authorizations.waiting_for_reply() {
             return Ok(());
         }
@@ -1108,6 +1113,27 @@ impl Core {
                 }
             }
             self.candidates.stage_cancels_done = true;
+        }
+        if !self.candidates.edges_done {
+            while let Some(producer) = self
+                .execution
+                .edge_producer_after(self.candidates.edge_after)
+            {
+                if !context.charge(1) {
+                    return Ok(());
+                }
+                let (id, _) = self.turn.issue()?;
+                match self.execution.advance_edge_admission(producer, id)? {
+                    EdgeAdmissionProgress::Admitting(effect) => {
+                        self.candidates.edge_after = Some(producer);
+                        result.effect = Some(effect);
+                        return Ok(());
+                    }
+                    EdgeAdmissionProgress::Blocked => self.candidates.edge_after = Some(producer),
+                    EdgeAdmissionProgress::Discarded => {}
+                }
+            }
+            self.candidates.edges_done = true;
         }
         if self.candidates.authorization.is_some() {
             if !context.charge(1) {
@@ -1215,19 +1241,28 @@ impl Core {
             if !context.charge(1) {
                 return Ok(());
             }
-            if !self.candidates.task_cancel_checked {
-                self.candidates.task_cancel_checked = true;
-                if let Some(intent) = self.execution.next_task_cancel_intent(task)? {
-                    let (id, _) = self.turn.issue()?;
-                    result.effect = Some(self.execution.begin_lifecycle_admission(intent, id)?);
-                    return Ok(());
-                }
-                continue;
-            }
-            self.candidates.task_cancel_checked = false;
-            self.candidates.task_after = Some(task.task_id());
             let (id, _) = self.turn.issue()?;
-            if let Some(effect) = self.execution.begin_create_admission(task, id)? {
+            let effect = match self.candidates.task_candidate {
+                TaskCandidate::Cancel => {
+                    self.candidates.task_candidate = TaskCandidate::Create;
+                    self.execution
+                        .next_task_cancel_intent(task)?
+                        .map(|intent| self.execution.begin_lifecycle_admission(intent, id))
+                        .transpose()?
+                }
+                TaskCandidate::Create => {
+                    self.candidates.task_candidate = TaskCandidate::Update;
+                    self.execution.begin_create_admission(task, id)?
+                }
+                TaskCandidate::Update => {
+                    self.candidates.task_candidate = TaskCandidate::Cancel;
+                    self.candidates.task_after = Some(task.task_id());
+                    let (queued, effect) = self.execution.advance_update_send(task, id)?;
+                    self.candidates.wake |= queued;
+                    effect
+                }
+            };
+            if let Some(effect) = effect {
                 result.effect = Some(effect);
                 return Ok(());
             }

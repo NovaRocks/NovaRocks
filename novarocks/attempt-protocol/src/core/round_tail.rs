@@ -206,6 +206,7 @@ impl Core {
                     StopProgress::Effect(effect) => return Ok(Some(RoundTailStep::Effect(effect))),
                     StopProgress::Done => {}
                 }
+                self.execution.try_begin_normal_drain();
                 if self.execution.has_released_native_input() {
                     if !context.charge(1) {
                         return Ok(Some(RoundTailStep::Yield));
@@ -216,7 +217,19 @@ impl Core {
                         .expect("original returned grant");
                     return Ok(Some(RoundTailStep::Effect(release(action, grant))));
                 }
-                self.execution.try_begin_normal_drain();
+                if self.execution.has_task_input_cleanup() {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    if let Some(body) = self.execution.advance_task_input_cleanup() {
+                        return Ok(Some(RoundTailStep::Effect(AttemptEffect {
+                            id: action,
+                            class: EffectClass::Cleanup,
+                            body,
+                        })));
+                    }
+                    return Ok(None);
+                }
                 let progressed = if self.execution.has_pending_terminal_cleanup() {
                     self.execution.advance_terminal_cleanup(context)?
                 } else if self.execution.has_pending_normal_drain() {

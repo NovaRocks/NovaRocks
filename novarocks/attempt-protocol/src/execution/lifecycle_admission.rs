@@ -42,6 +42,7 @@ pub(super) struct LifecycleAdmission {
     generation: SendGeneration,
     grant: Option<QueuedInputGrantRef>,
     withdrawing: bool,
+    initial_update: bool,
 }
 
 /// Passive identity for the original operation between physical sends.
@@ -255,6 +256,25 @@ impl QueryTaskExecution {
         intent: OperationIntent,
         effect: AttemptActionId,
     ) -> Result<AttemptEffect, TaskExecutionError> {
+        self.register_queued_admission(intent, effect, QueuedInputPayload::AlreadyRetained, false)
+    }
+
+    pub(super) fn begin_initial_update_admission(
+        &mut self,
+        intent: OperationIntent,
+        effect: AttemptActionId,
+        payload: QueuedInputPayload,
+    ) -> Result<AttemptEffect, TaskExecutionError> {
+        self.register_queued_admission(intent, effect, payload, true)
+    }
+
+    fn register_queued_admission(
+        &mut self,
+        intent: OperationIntent,
+        effect: AttemptActionId,
+        payload: QueuedInputPayload,
+        initial_update: bool,
+    ) -> Result<AttemptEffect, TaskExecutionError> {
         let target = match &intent {
             OperationIntent::AcquireParticipationAdmissionTicket(request) => {
                 OperationTarget::Participation(request.participation())
@@ -271,6 +291,10 @@ impl QueryTaskExecution {
             OperationIntent::ReleaseParticipation(request) => {
                 OperationTarget::Participation(request.participation())
             }
+            OperationIntent::UpdateTask { identity, .. } => OperationTarget::Task {
+                stage: identity.stage_id(),
+                task: identity.task_id(),
+            },
             OperationIntent::CancelTask(request) => OperationTarget::Task {
                 stage: request.identity().stage_id(),
                 task: request.identity().task_id(),
@@ -294,6 +318,7 @@ impl QueryTaskExecution {
                 generation,
                 grant: None,
                 withdrawing: false,
+                initial_update,
             },
         );
         Ok(AttemptEffect {
@@ -302,7 +327,7 @@ impl QueryTaskExecution {
             body: EffectBody::AdmitQueuedInput {
                 operation: intent,
                 generation,
-                payload: QueuedInputPayload::AlreadyRetained,
+                payload,
                 lane,
             },
         })
@@ -378,6 +403,13 @@ impl QueryTaskExecution {
             self.finish_lifecycle_admission(operation);
             return Ok(CreateGrantProgress::Release(grant));
         }
+        if row.initial_update {
+            let OperationIntent::UpdateTask { identity, .. } = row.intent else {
+                unreachable!("original initial Update");
+            };
+            self.lifecycle_admissions.remove(&operation);
+            return self.accept_initial_update_grant(identity, operation, grant);
+        }
         if let Some(original) = row.grant {
             return Ok(if original == grant {
                 CreateGrantProgress::Waiting
@@ -423,9 +455,14 @@ impl QueryTaskExecution {
                                 | OperationIntent::EstablishParticipation { .. }
                         ))
             }
-            OperationTarget::Task { stage, task } => self.stages[&stage]
-                .task(task)
-                .is_some_and(|task| task.cancel_send_is_live(operation)),
+            OperationTarget::Task { stage, task } => {
+                let task = self.stages[&stage].task(task).expect("frozen Task");
+                if row.intent.kind() == OperationKind::UpdateTask {
+                    self.task_operation_allowed(&row.intent)? && task.update_send_is_live(operation)
+                } else {
+                    task.cancel_send_is_live(operation)
+                }
+            }
             OperationTarget::ActorAbort => unreachable!("actor Abort owns separate admission"),
         };
         if row.withdrawing || self.terminal_cleanup_started || !live {
@@ -468,6 +505,15 @@ impl QueryTaskExecution {
     fn finish_lifecycle_admission(&mut self, operation: TaskOperationId) {
         if let Some(row) = self.lifecycle_admissions.remove(&operation) {
             self.lifecycle_granted.remove(&operation);
+            if row.initial_update {
+                let OperationIntent::UpdateTask { identity, .. } = row.intent else {
+                    unreachable!("original initial Update");
+                };
+                self.task_by_identity(identity)
+                    .expect("frozen Task")
+                    .abandon_input_preparation(operation);
+                return;
+            }
             if let Some(debt) = self.stage_cancel_debts.get(&operation) {
                 if !self.terminal_cleanup_started
                     && self
@@ -498,6 +544,10 @@ impl QueryTaskExecution {
                 .stages[&stage]
                 .task(task)
                 .is_some_and(|task| task.tracks_unknown_cancel(operation)),
+            OperationTarget::Task { stage, task } if kind == OperationKind::UpdateTask => self
+                .stages[&stage]
+                .task(task)
+                .is_some_and(|task| task.update_request_matches(operation)),
             _ => false,
         }
     }
@@ -569,7 +619,6 @@ impl QueryTaskExecution {
     ) -> (Option<EffectBody>, Result<(), TaskExecutionError>) {
         let operation = reply.operation_id();
         self.lifecycle_unknown.remove(&operation);
-        let withdraw = self.withdraw_lifecycle_admission(operation);
         match target {
             OperationTarget::Participation(participation) => {
                 let resumed = self
@@ -580,16 +629,22 @@ impl QueryTaskExecution {
                 debug_assert!(resumed);
             }
             OperationTarget::Task { stage, task } => {
-                self.stages
+                let mut owner = self
+                    .stages
                     .get_mut(&stage)
                     .expect("original stage")
                     .task_mut_observed(task, &self.stage_demand)
-                    .expect("original Task")
-                    .resume_cancel_receipt(operation);
+                    .expect("original Task");
+                if reply.kind() == OperationKind::UpdateTask {
+                    owner.resume_update_receipt(operation);
+                } else {
+                    owner.resume_cancel_receipt(operation);
+                }
             }
             OperationTarget::ActorAbort => unreachable!("actor Abort owns its prior receipts"),
         }
-        (withdraw, self.apply_operation_reply(target, reply))
+        let result = self.apply_operation_reply(target, reply);
+        (self.withdraw_lifecycle_admission(operation), result)
     }
 
     pub(crate) fn next_stop_lifecycle_admission(
@@ -606,7 +661,10 @@ impl QueryTaskExecution {
         Some((operation, self.withdraw_lifecycle_admission(operation)))
     }
 
-    fn withdraw_lifecycle_admission(&mut self, operation: TaskOperationId) -> Option<EffectBody> {
+    pub(super) fn withdraw_lifecycle_admission(
+        &mut self,
+        operation: TaskOperationId,
+    ) -> Option<EffectBody> {
         let row = self.lifecycle_admissions.get_mut(&operation)?;
         if let Some(grant) = row.grant {
             self.finish_lifecycle_admission(operation);

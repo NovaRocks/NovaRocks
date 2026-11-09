@@ -136,16 +136,14 @@ struct ReleasedUpdate {
 
 #[derive(Debug)]
 struct PendingUpdateInput {
-    operation: TaskOperationId,
-    update: TaskDomainUpdate,
+    request: UpdateTask,
     discarded: Option<UpdateAdmission>,
 }
 
 #[derive(Debug)]
 struct PendingUpdate {
-    operation: TaskOperationId,
     ordinal: u64,
-    update: TaskDomainUpdate,
+    request: UpdateTask,
     expected_receipt: TaskDomainReceiptExpectation,
     queue_permit: QueuedInputGrantRef,
 }
@@ -541,21 +539,20 @@ impl RemoteTask {
     }
 
     fn discard_pending_input(&mut self, include_destination_close: bool) {
-        if self
-            .pending_input
-            .as_ref()
-            .is_some_and(|input| include_destination_close || !is_destination_close(&input.update))
-        {
+        if self.pending_input.as_ref().is_some_and(|input| {
+            include_destination_close || !is_destination_close(&input.request.domains()[0])
+        }) {
             let disposition = self
                 .pending_input
                 .as_ref()
-                .and_then(|input| self.update_disposition(&input.update))
+                .and_then(|input| self.update_disposition(&input.request.domains()[0]))
                 .unwrap_or(UpdateAdmission::DiscardedTerminal);
             let input = self.pending_input.as_mut().expect("checked pending input");
             if input.discarded.is_none() {
                 self.discarded_updates += 1;
                 input.discarded = Some(disposition);
-                self.withdrawn_preparations.push(input.operation);
+                self.withdrawn_preparations
+                    .push(input.request.envelope().operation_id());
             }
         }
     }
@@ -637,12 +634,13 @@ impl RemoteTask {
     pub(super) fn preparing_update(&self) -> Option<&TaskDomainUpdate> {
         self.pending_input
             .as_ref()
-            .and_then(|input| Some(&input.update))
+            .map(|input| &input.request.domains()[0])
     }
 
     #[cfg(test)]
     pub(super) fn first_pending_update(&self) -> Option<&TaskDomainUpdate> {
-        self.pending_front().map(|input| &input.update)
+        self.pending_front()
+            .map(|input| &input.request.domains()[0])
     }
 
     #[cfg(test)]
@@ -731,11 +729,10 @@ impl RemoteTask {
             ));
         }
         let operation = ids.issue();
-        let request = UpdateTask::try_new(operation, self.identity, vec![update.clone()])?;
+        let request = UpdateTask::try_new(operation, self.identity, vec![update])?;
         let intent = request.intent();
         self.pending_input = Some(PendingUpdateInput {
-            operation,
-            update,
+            request,
             discarded: None,
         });
         Ok((UpdateAdmission::Preparing, Some(intent)))
@@ -749,7 +746,7 @@ impl RemoteTask {
         if self
             .pending_input
             .as_ref()
-            .is_none_or(|input| input.operation != operation)
+            .is_none_or(|input| input.request.envelope().operation_id() != operation)
         {
             self.released_grants.push(grant);
             return Err(TaskExecutionError::UnknownOperation);
@@ -759,7 +756,21 @@ impl RemoteTask {
             self.released_grants.push(grant);
             return Ok(disposition);
         }
-        self.enqueue_update(operation, input.update, grant)
+        self.enqueue_frozen_update(input.request, grant)
+    }
+
+    pub(crate) fn input_preparation_pending(&self) -> bool {
+        self.pending_input.is_some()
+    }
+
+    pub(crate) fn abandon_input_preparation(&mut self, operation: TaskOperationId) {
+        if self
+            .pending_input
+            .as_ref()
+            .is_some_and(|input| input.request.envelope().operation_id() == operation)
+        {
+            self.pending_input = None;
+        }
     }
 
     /// A definitely-unused withdrawal consumes only its original preparation.
@@ -767,11 +778,9 @@ impl RemoteTask {
         &mut self,
         operation: TaskOperationId,
     ) -> Option<UpdateAdmission> {
-        if self
-            .pending_input
-            .as_ref()
-            .is_none_or(|input| input.operation != operation || input.discarded.is_none())
-        {
+        if self.pending_input.as_ref().is_none_or(|input| {
+            input.request.envelope().operation_id() != operation || input.discarded.is_none()
+        }) {
             return None;
         }
         self.pending_input.take().and_then(|input| input.discarded)
@@ -843,11 +852,27 @@ impl RemoteTask {
         update: TaskDomainUpdate,
         queue_permit: QueuedInputGrantRef,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if let Some(disposition) = self.update_disposition(&update) {
+        let request = match UpdateTask::try_new(operation, self.identity, vec![update]) {
+            Ok(request) => request,
+            Err(error) => {
+                self.released_grants.push(queue_permit);
+                return Err(error.into());
+            }
+        };
+        self.enqueue_frozen_update(request, queue_permit)
+    }
+
+    fn enqueue_frozen_update(
+        &mut self,
+        request: UpdateTask,
+        queue_permit: QueuedInputGrantRef,
+    ) -> Result<UpdateAdmission, TaskExecutionError> {
+        let update = &request.domains()[0];
+        if let Some(disposition) = self.update_disposition(update) {
             self.released_grants.push(queue_permit);
             return Ok(disposition);
         }
-        let expected_receipt = match self.admit_domain(&update) {
+        let expected_receipt = match self.admit_domain(update) {
             Ok(expected) => expected,
             Err(error) => {
                 self.released_grants.push(queue_permit);
@@ -858,15 +883,14 @@ impl RemoteTask {
         self.next_pending_ordinal = ordinal
             .checked_add(1)
             .expect("Task pending ordinal exhausted");
-        let queue = if is_destination_close(&update) {
+        let queue = if is_destination_close(update) {
             &mut self.pending_control
         } else {
             &mut self.pending_ordinary
         };
         queue.push_back(PendingUpdate {
-            operation,
             ordinal,
-            update,
+            request,
             expected_receipt,
             queue_permit,
         });
@@ -1064,7 +1088,6 @@ impl RemoteTask {
         {
             return None;
         }
-        let backend = self.identity.backend_process_id();
         if let Some(released) = &self.released_update {
             if self.normal_stand_down
                 && !released.request.domains().iter().all(is_destination_close)
@@ -1081,7 +1104,7 @@ impl RemoteTask {
         }
         let pending = self.pending_front()?;
         Some(UpdateCandidate {
-            request: TaskOperationQueueRequest::task_update(backend, &pending.update),
+            request: pending.request.queue_request(),
             holds_queue_permit: true,
         })
     }
@@ -1113,12 +1136,8 @@ impl RemoteTask {
         let Some(pending) = self.pop_pending() else {
             return Ok(None);
         };
-        let operation_id = pending.operation;
-        let request = Arc::new(UpdateTask::try_new(
-            operation_id,
-            self.identity(),
-            vec![pending.update],
-        )?);
+        let operation_id = pending.request.envelope().operation_id();
+        let request = Arc::new(pending.request);
         self.released_update = Some(ReleasedUpdate {
             operation_id,
             request: Arc::clone(&request),
@@ -1489,6 +1508,30 @@ impl RemoteTask {
         Ok(UpdateSettlement::FailedClosed(outcome))
     }
 
+    pub(crate) fn update_request_matches(&self, operation: TaskOperationId) -> bool {
+        self.released_update
+            .as_ref()
+            .is_some_and(|row| row.operation_id == operation)
+    }
+
+    pub(crate) fn update_send_is_live(&self, operation: TaskOperationId) -> bool {
+        !self.is_terminal()
+            && !self.awaiting_terminal_status
+            && self
+                .released_update
+                .as_ref()
+                .is_some_and(|row| row.operation_id == operation && row.awaiting_outcome)
+    }
+
+    pub(crate) fn resume_update_receipt(&mut self, operation: TaskOperationId) {
+        let row = self
+            .released_update
+            .as_mut()
+            .expect("original unresolved Update");
+        debug_assert_eq!(row.operation_id, operation);
+        row.awaiting_outcome = true;
+    }
+
     /// Settles one cancel acknowledgement.
     ///
     /// A cancel is a request to stand down, not a terminal fact: the terminal
@@ -1675,6 +1718,12 @@ impl RemoteTask {
     pub(crate) fn has_released_grant(&self) -> bool {
         !self.released_grants.is_empty() || !self.discarded_pending.is_empty()
     }
+    pub(crate) fn has_input_cleanup(&self) -> bool {
+        self.has_released_grant()
+            || !self.released_payloads.is_empty()
+            || !self.withdrawn_preparations.is_empty()
+    }
+
     pub(crate) fn take_withdrawn_preparation(&mut self) -> Option<TaskOperationId> {
         self.withdrawn_preparations.pop()
     }

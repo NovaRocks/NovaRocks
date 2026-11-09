@@ -27,7 +27,9 @@
 pub(crate) mod ack_phase;
 mod create_admission;
 mod lifecycle_admission;
+mod task_update;
 pub(crate) use lifecycle_admission::{ReleaseCheck, ReleaseProgress};
+pub(crate) use task_update::EdgeAdmissionProgress;
 mod send_replies;
 mod subscription_request;
 pub(crate) use create_admission::CreateGrantProgress;
@@ -122,25 +124,6 @@ struct CoveredParticipationObservation {
 use crate::stage::derivation::{
     DerivedEdgeEffect as EdgeControlEffect, EdgeDerivationStep, EdgeDerivations,
 };
-
-/// The original graph row keeps its exact generated input and paid ticket
-/// through a capacity wait. No process physical position is held while Joint
-/// admission is waiting, and polling never removes this row from its owner.
-#[derive(Debug)]
-struct PendingEdgeControlEffect {
-    effect: EdgeControlEffect,
-    input: Option<TaskDomainUpdate>,
-    preparation: Option<TaskOperationId>,
-}
-impl From<EdgeControlEffect> for PendingEdgeControlEffect {
-    fn from(effect: EdgeControlEffect) -> Self {
-        Self {
-            effect,
-            input: None,
-            preparation: None,
-        }
-    }
-}
 
 impl CoveredParticipationObservation {
     fn begin_generation(&mut self, generation: u64) {
@@ -414,7 +397,9 @@ pub struct QueryTaskExecution {
     deployment_window: BTreeMap<BackendProcessId, BTreeSet<TaskIdentity>>,
     /// The frozen graph bounds this by sum(producers * (destinations + 1)):
     /// the edge tracker emits each close member and each open only once.
-    edge_control_effects: VecDeque<PendingEdgeControlEffect>,
+    edge_control_effects: BTreeMap<TaskIdentity, VecDeque<EdgeControlEffect>>,
+    task_input_cleanup: BTreeSet<TaskIdentity>,
+    pending_update_grants: BTreeMap<crate::input::SendGeneration, QueuedInputGrantRef>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_granted: BTreeSet<TaskOperationId>,
     lifecycle_deadlines: lifecycle_admission::LifecycleDeadlines,
@@ -680,7 +665,9 @@ impl QueryTaskExecution {
             tasks_by_participation,
             deployment_window_limits,
             deployment_window: BTreeMap::new(),
-            edge_control_effects: VecDeque::new(),
+            edge_control_effects: BTreeMap::new(),
+            task_input_cleanup: BTreeSet::new(),
+            pending_update_grants: BTreeMap::new(),
             operation_targets: BTreeMap::new(),
             create_granted: BTreeSet::new(),
             lifecycle_deadlines: Default::default(),
@@ -1542,6 +1529,7 @@ impl QueryTaskExecution {
                     self.task_by_identity(identity)
                         .expect("frozen Task")
                         .discard_creation_after_attempt_failure();
+                    self.mark_task_input_cleanup(identity);
                     if let Some(positions) = self
                         .deployment_window
                         .get_mut(&identity.backend_process_id())
@@ -2009,17 +1997,14 @@ impl QueryTaskExecution {
             EdgeDerivationStep::Idle | EdgeDerivationStep::BudgetExhausted => Ok(false),
             EdgeDerivationStep::Progress => Ok(true),
             EdgeDerivationStep::Effect(effect) => {
-                self.edge_control_effects.push_back(effect.into());
+                self.edge_control_effects
+                    .entry(effect.producer())
+                    .or_default()
+                    .push_back(effect);
                 Ok(true)
             }
         }
     }
-
-    /// Moves frozen edge effects to the original per-task domain owner only
-    /// after the process transport has reserved their bounded queue capacity.
-    /// Backpressure leaves the exact decision in this graph-bounded queue.
-    /// One full producer cannot block independent producer processes, while
-    /// every producer retains its own close-before-open order.
 
     fn reconcile_destination_input(
         &mut self,
@@ -2503,6 +2488,9 @@ impl QueryTaskExecution {
         let Some(task) = stage.task(task_id) else {
             return;
         };
+        if task.has_input_cleanup() {
+            self.task_input_cleanup.insert(task.identity());
+        }
         let participation = task.participation();
         let terminal = task.is_terminal();
         if !task.needs_deployment_window() {
@@ -3458,6 +3446,218 @@ mod bounded_drain_tests {
             ),
         }
     }
+    #[test]
+    fn original_edge_update_keeps_the_first_grant_and_replays_with_fresh_admission() {
+        use crate::{
+            effect::{AttemptEffect, EffectBody},
+            input::{AckPayload, LocalDispatchResult, OperationObservation, OperationReplyResult},
+        };
+        use novarocks_execution_contract::{
+            DomainProgression, OperationOutcome, TaskDomainReceipt, UpdateTaskReceipt,
+            operation::OperationResult,
+        };
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let root = execution.graph.root_identity();
+        let participation = execution
+            .task_by_identity_ref(root)
+            .unwrap()
+            .participation();
+        let producer = *execution.inbound_producers[&participation].first().unwrap();
+        let edge = ExchangeEdgeId::new(1).unwrap();
+        let status = TaskStatus::try_new(
+            producer,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        execution
+            .apply_published(&status, &mut StatusReport::default())
+            .unwrap();
+        execution
+            .edge_control_effects
+            .entry(producer)
+            .or_default()
+            .push_back(EdgeControlEffect::Close {
+                producer,
+                edge,
+                destination: root,
+            });
+
+        let first = grant(1);
+        let EdgeAdmissionProgress::Admitting(admit) = execution
+            .advance_edge_admission(producer, first.generation().admission_effect())
+            .unwrap()
+        else {
+            panic!("exact edge update must request original WC input")
+        };
+        let EffectBody::AdmitQueuedInput {
+            operation:
+                OperationIntent::UpdateTask {
+                    envelope,
+                    domains: frozen,
+                    ..
+                },
+            generation,
+            ..
+        } = admit.body
+        else {
+            panic!("expected original domain Update")
+        };
+        let operation = envelope.operation_id();
+        assert_eq!(generation, first.generation());
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, first).unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        assert!(execution.tracks_pending_update_grant(first));
+        assert_eq!(
+            execution
+                .advance_update_send(producer, grant(2).generation().admission_effect())
+                .unwrap()
+                .0,
+            true
+        );
+        assert!(!execution.tracks_pending_update_grant(first));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [first]);
+        assert!(
+            matches!(&batch.operations[0], OperationIntent::UpdateTask { domains, .. }
+            if Arc::ptr_eq(domains, &frozen))
+        );
+        execution
+            .dispatcher
+            .accept_emitted(&batch, grant(2).generation().admission_effect())
+            .unwrap();
+
+        let observation = |result| OperationObservation {
+            generation,
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::UpdateTask,
+                result,
+            },
+        };
+        let unknown = observation(OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        });
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+        let second = grant(3);
+        let (queued, effect) = execution
+            .advance_update_send(producer, second.generation().admission_effect())
+            .unwrap();
+        assert!(!queued);
+        let Some(AttemptEffect {
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation:
+                        OperationIntent::UpdateTask {
+                            envelope: replay,
+                            domains,
+                            ..
+                        },
+                    generation,
+                    ..
+                },
+            ..
+        }) = effect
+        else {
+            panic!("expected new WC generation for the original Update")
+        };
+        assert!(Arc::ptr_eq(&domains, &frozen));
+        assert_eq!(envelope, replay);
+        assert_eq!(generation, second.generation());
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+
+        let receipt = UpdateTaskReceipt::new(
+            producer,
+            vec![TaskDomainReceipt::CloseExchangeDestination {
+                accepted_version: DomainVersion::FIRST,
+                progression: DomainProgression::Apply,
+            }],
+        );
+        let accepted = observation(OperationReplyResult::Worker(OperationResult::Verdict {
+            outcome: OperationOutcome::Accepted,
+            detail: None,
+            acknowledgement: Some(AckPayload::Update(receipt)),
+        }));
+        assert!(matches!(
+            execution.apply_dispatched_reply(&accepted),
+            (Some(EffectBody::Withdraw { effect }), Ok(())) if effect == second.generation().admission_effect()
+        ));
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, second).unwrap(),
+            CreateGrantProgress::Release(grant) if grant == second
+        ));
+        assert!(matches!(
+            execution
+                .advance_update_send(producer, grant(4).generation().admission_effect())
+                .unwrap(),
+            (false, None)
+        ));
+    }
+
+    #[test]
+    fn normal_drain_withdraws_the_exact_unstarted_update_and_returns_its_late_grant() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let (_, intent) = execution
+            .prepare_task_update(
+                task,
+                TaskDomainUpdate::TaskDynamicFilter {
+                    version: DomainVersion::FIRST,
+                    payload: FrozenContentRef {
+                        resource: PayloadRef(NonZeroU64::new(100).unwrap()),
+                        fingerprint: ContentFingerprint::from_bytes([1; 16]),
+                        queued_bytes: 16,
+                    },
+                },
+            )
+            .unwrap();
+        let intent = intent.unwrap();
+        let operation = intent.operation_id();
+        let input = grant(5);
+        let action = input.generation().admission_effect();
+        execution
+            .begin_initial_update_admission(intent, action, QueuedInputPayload::AlreadyRetained)
+            .unwrap();
+
+        execution.begin_normal_drain();
+        assert!(execution.advance_normal_drain(&mut Turn(1)).unwrap());
+        assert!(matches!(
+            execution.advance_task_input_cleanup(),
+            Some(EffectBody::Withdraw { effect }) if effect == action
+        ));
+        assert!(execution.has_lifecycle_admission(operation));
+        assert!(
+            matches!(execution.observe_lifecycle_grant(operation, input).unwrap(),
+            CreateGrantProgress::Release(original) if original == input)
+        );
+        assert!(!execution.has_lifecycle_admission(operation));
+        assert!(!execution.tracks_pending_update_grant(input));
+        assert!(
+            !execution
+                .task_by_identity_ref(task)
+                .unwrap()
+                .input_preparation_pending()
+        );
+        assert!(execution.dispatcher.take_batch().is_none());
+        assert!(matches!(execution.advance_task_input_cleanup(),
+            Some(EffectBody::ReleaseCreationPayload { task: original, .. }) if original == task));
+        assert!(execution.advance_task_input_cleanup().is_none());
+    }
+
     #[test]
     fn release_waits_for_both_actual_stops_and_retries_only_at_the_original_deadline() {
         use crate::{
