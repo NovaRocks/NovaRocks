@@ -81,7 +81,7 @@ pub(crate) fn prune_catalogs(
 /// Every call takes one of its lane connection's stream positions before it
 /// reaches Tonic, and the response body holds it until the body ends or is
 /// dropped.
-pub(super) type AuthenticatedNovaRocksGrpcClient =
+pub(crate) type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 /// The Root-only client keeps the original authenticated ResultData channel.
@@ -184,7 +184,7 @@ fn observed_io_loss(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::NotConnected
     )
 }
-pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     for _ in 0..16 {
         let Some(error) = current else {
@@ -311,15 +311,27 @@ impl Client {
                 "method is not a Frontend Native lane",
             ));
         };
-        let peer = match &self.endpoints {
-            FrozenClientEndpoints::Backend(descriptor) => descriptor.process_id(),
-            FrozenClientEndpoints::Single { peer, .. } => *peer,
-        };
         Ok(NativeChannelKey {
             endpoint: self.endpoint_for(method)?.clone(),
-            peer,
+            peer: self.backend_process_id(),
             lane,
         })
+    }
+
+    pub(crate) fn backend_process_id(&self) -> BackendProcessId {
+        match &self.endpoints {
+            FrozenClientEndpoints::Backend(descriptor) => descriptor.process_id(),
+            FrozenClientEndpoints::Single { peer, .. } => *peer,
+        }
+    }
+
+    /// The admitted covered subscription uses the original authenticated
+    /// status lane. Its generation and lifetime stay with the caller.
+    pub(crate) async fn grpc_for_covered_subscription(
+        &self,
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
+        self.grpc_with_channel_error(NativeRpcMethod::SubscribeTaskStatus)
+            .await
     }
 
     async fn grpc(

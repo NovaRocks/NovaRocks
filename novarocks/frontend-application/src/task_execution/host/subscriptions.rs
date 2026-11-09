@@ -59,6 +59,13 @@ use std::{
 };
 use tokio::sync::watch;
 
+#[path = "subscription/native_io.rs"]
+mod native_io;
+
+pub(crate) use native_io::{
+    NativeSubscriptionFailure, NativeSubscriptionFailureCustody, native_subscription_io_layouts,
+};
+
 pub(crate) type SubscriptionIoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The native owner implements this thin port with its SAME cached channel,
 /// deployment authentication and exact typed connection-loss classifier. An
