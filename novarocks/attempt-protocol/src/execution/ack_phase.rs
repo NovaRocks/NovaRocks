@@ -180,6 +180,17 @@ impl NativeAckPhase {
         Ok(self.first_error.is_none())
     }
 
+    pub(crate) fn fail_round_tail(
+        &mut self,
+        error: TaskExecutionError,
+    ) -> Result<(), AckPhaseError> {
+        if self.phase != Phase::RoundTail {
+            return Err(AckPhaseError::WrongPhase);
+        }
+        self.record_error(Err(error));
+        Ok(())
+    }
+
     /// The parent calls this after the actual round tail, including its
     /// publication barrier, or immediately when a prefix error skips the tail.
     pub(crate) fn begin_settlement(

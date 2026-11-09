@@ -69,6 +69,13 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 pub(crate) fn graph_with_strict_input(
     extra_leaf_on_producer: bool,
 ) -> (TaskGraph, AttemptActivationIdentity) {
+    let (graph, activation) = frozen_graph_with_strict_input(extra_leaf_on_producer);
+    (TaskGraph::from_frozen(graph).unwrap(), activation)
+}
+
+pub(crate) fn frozen_graph_with_strict_input(
+    extra_leaf_on_producer: bool,
+) -> (FrozenTaskGraph, AttemptActivationIdentity) {
     let execution =
         QueryExecutionId::new(QueryId::new(71, 72), AttemptId::new(1).unwrap()).unwrap();
     let frontend =
@@ -129,13 +136,12 @@ pub(crate) fn graph_with_strict_input(
             },
         );
     }
-    let graph = TaskGraph::from_frozen(FrozenTaskGraph {
+    let graph = FrozenTaskGraph {
         root: identities[0],
         tasks,
         stages,
         edges,
-    })
-    .unwrap();
+    };
     (
         graph,
         AttemptActivationIdentity::from_parts(1, execution, 1),

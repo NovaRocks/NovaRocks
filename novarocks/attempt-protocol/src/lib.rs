@@ -37,6 +37,7 @@
 
 pub mod capacity;
 pub mod config;
+mod core;
 pub mod effect;
 pub mod failure;
 pub mod ids;

@@ -20,7 +20,8 @@
 
 use crate::config::{CoordinationBudgets, FrozenTransportLimits, TaskUpdateRetryPolicy};
 use crate::ids::IdSeed;
-use novarocks_coordination_contract::AttemptActivation;
+use crate::input::AttemptSourceId;
+use novarocks_coordination_contract::{AttemptActivation, MonotonicInstant};
 use novarocks_execution_contract::{
     AdmissionEpochCapability, ExchangeDeliveryRequirement, ExchangeEdgeId, ParticipationRef,
     PlanNodeId, TaskIdentity,
@@ -107,4 +108,15 @@ pub struct AttemptStart {
     pub activation: AttemptActivation,
     pub plan: FrozenAttemptPlan,
     pub ids: IdSeed,
+    pub initial_now: MonotonicInstant,
+    pub sources: AttemptSources,
+}
+
+/// Fixed roles from the original actor registration. These identities and
+/// mailbox geometry are metadata, with no admission or access authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptSources {
+    pub native: AttemptSourceId,
+    pub observation: AttemptSourceId,
+    pub mailbox: [usize; 4],
 }
