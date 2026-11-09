@@ -384,6 +384,14 @@ impl RemoteTask {
         !matches!(self.creation, CreationReplay::Unfrozen(_))
     }
 
+    pub(crate) const fn create_operation(&self) -> TaskOperationId {
+        self.create_envelope.operation_id()
+    }
+
+    pub(crate) const fn create_result_is_unresolved(&self) -> bool {
+        self.create_remote_unknown && !self.create_ownership_proven
+    }
+
     pub const fn state(&self) -> RemoteTaskState {
         self.state
     }

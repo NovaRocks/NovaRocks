@@ -22,7 +22,8 @@
 #[cfg(test)]
 mod tests;
 use crate::{
-    error::TaskExecutionError, failure::AttemptFailure, operation::OperationDispatchResult,
+    error::TaskExecutionError, failure::AttemptFailure, input::SendGeneration,
+    operation::OperationDispatchResult,
 };
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptAuthorization, AttemptAuthorizationDecision,
@@ -75,7 +76,7 @@ pub(crate) enum SettlementReply {
 #[derive(Clone, Copy, Debug)]
 struct Current {
     authorization: AttemptAuthorizationRef,
-    emitted: bool,
+    emitted: Option<SendGeneration>,
 }
 #[derive(Clone, Copy, Debug)]
 enum Selection {
@@ -210,7 +211,7 @@ impl EstablishAuthorization {
                 // Bridge validates freshness/identity against the actual guard.
                 self.current = Some(Current {
                     authorization,
-                    emitted: false,
+                    emitted: None,
                 });
                 AuthorizationReply::IssueRecorded(authorization)
             }
@@ -246,29 +247,32 @@ impl EstablishAuthorization {
     pub(crate) fn emitted(
         &mut self,
         authorization: AttemptAuthorizationRef,
+        generation: SendGeneration,
     ) -> Result<(), TaskExecutionError> {
         if self.closing || self.retired || !self.permits_protocol_turn() {
             return Err(invalid("Establish emission crossed its authorization gate"));
         }
-        self.current
+        let current = self
+            .current
             .as_mut()
-            .filter(|c| c.authorization == authorization)
-            .ok_or_else(|| invalid("Establish emission has no matching current guard"))?
-            .emitted = true;
+            .filter(|current| current.authorization == authorization && current.emitted.is_none())
+            .ok_or_else(|| invalid("Establish emission has no unused matching current guard"))?;
+        current.emitted = Some(generation);
         Ok(())
     }
-    /// Only the original handoff's actual successful withdrawal proves this.
-    /// TooLate, cancellation, timeout and job exit cannot call this method.
-    pub(crate) fn withdrawn(
-        &mut self,
-        authorization: AttemptAuthorizationRef,
-    ) -> Result<(), TaskExecutionError> {
-        self.current
+
+    /// Accept only the matching generation's actual definitely-unsent result.
+    /// Earlier transport-unknown guards stay in the original late FIFO.
+    pub(crate) fn withdrawn(&mut self, generation: SendGeneration) -> bool {
+        let Some(current) = self
+            .current
             .as_mut()
-            .filter(|c| c.authorization == authorization)
-            .ok_or_else(|| invalid("Establish withdrawal has no matching current guard"))?
-            .emitted = false;
-        Ok(())
+            .filter(|current| current.emitted == Some(generation))
+        else {
+            return false;
+        };
+        current.emitted = None;
+        true
     }
     /// Caller has already validated this exact op and filtered queued-replay
     /// old Unknown. Observer settlement follows the original round phases.
@@ -354,7 +358,7 @@ impl EstablishAuthorization {
             return Step::Ready;
         }
         if let Some(current) = self.current {
-            if current.emitted {
+            if current.emitted.is_some() {
                 return Step::WaitingTransport;
             }
             self.pass = Some(Pass {

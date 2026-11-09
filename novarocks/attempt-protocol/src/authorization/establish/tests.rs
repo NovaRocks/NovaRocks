@@ -88,8 +88,13 @@ fn selected(
     assert_eq!(g.advance(token(n + 1000)), Step::Waiting);
     assert!(!g.permits_protocol_turn());
 }
+fn send_generation(n: u64) -> SendGeneration {
+    SendGeneration::new(novarocks_coordination_contract::AttemptActionId::new(
+        std::num::NonZeroU64::new(n).unwrap(),
+    ))
+}
 fn unknown(g: &mut EstablishAuthorization, n: u64) {
-    g.emitted(issue(n)).unwrap();
+    g.emitted(issue(n), send_generation(n)).unwrap();
     g.begin_settlement(OperationDispatchResult::TransportUnknown)
         .unwrap();
     selected(g, n + 100, n, AttemptIssueSettlement::TransportUnknown);
@@ -135,7 +140,7 @@ fn full_and_late_success_do_not_create_another_call_or_reopen_closing() {
         AuthorizationReply::IssueRecorded(issue(1))
     );
     assert!(matches!(g.authorize(token(101)), Directive::Retired));
-    assert!(g.emitted(issue(1)).is_err());
+    assert!(g.emitted(issue(1), send_generation(1)).is_err());
     selected(&mut g, 102, 1, AttemptIssueSettlement::DefinitelyUnsent);
     // The original prepare path ignores this actual guard-method error only.
     assert_eq!(
@@ -309,12 +314,15 @@ fn closing_emitted_waits_for_real_withdrawal_then_detaches_each_original_late() 
     authorize(&mut g, 2, true);
     unknown(&mut g, 2);
     authorize(&mut g, 3, true);
-    g.emitted(issue(3)).unwrap();
+    g.emitted(issue(3), send_generation(3)).unwrap();
     g.close();
     for n in 10..100 {
         assert_eq!(g.advance(token(n)), Step::WaitingTransport);
     }
-    g.withdrawn(issue(3)).unwrap();
+    assert!(!g.withdrawn(send_generation(2)));
+    assert_eq!(g.advance(token(100)), Step::WaitingTransport);
+    assert!(g.withdrawn(send_generation(3)));
+    assert!(!g.withdrawn(send_generation(3)));
     selected(&mut g, 100, 3, AttemptIssueSettlement::DefinitelyUnsent);
     g.settled(token(100), issue(3), Ok(())).unwrap();
     for (n, guard) in [(101, 1), (102, 2)] {
@@ -348,7 +356,7 @@ fn invalid_reply_shapes_do_not_release_original_call_and_closed_ack_remains_reac
         Ok(AttemptAuthorizationDecision::EstablishAuthorized(issue(1))),
     )
     .unwrap();
-    g.emitted(issue(1)).unwrap();
+    g.emitted(issue(1), send_generation(1)).unwrap();
     g.close();
     g.begin_settlement(worker()).unwrap();
     selected(

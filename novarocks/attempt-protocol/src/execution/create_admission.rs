@@ -28,6 +28,15 @@ use crate::{
 };
 use novarocks_execution_contract::{OperationKind, TaskIdentity, TaskOperationId};
 
+/// One pre-registered row per original Create operation. Its passive result
+/// identity remains reachable after dispatcher credit retires and before a
+/// later generation obtains admission. It retains no physical history.
+#[derive(Debug)]
+pub(super) struct CreateReceiptRoute {
+    pub(super) task: TaskIdentity,
+    pub(super) unknown: Option<SendGeneration>,
+}
+
 #[derive(Debug)]
 pub(super) struct CreateAdmission {
     task: TaskIdentity,
@@ -190,6 +199,50 @@ impl QueryTaskExecution {
         Ok(CreateGrantProgress::Queued)
     }
 
+    pub(super) fn record_create_result(
+        &mut self,
+        reply: &crate::input::OperationReply,
+        generation: SendGeneration,
+    ) {
+        let Some(row) = self.create_receipts.get(&reply.operation_id()) else {
+            return;
+        };
+        let still_unknown = reply.dispatch_result() == OperationDispatchResult::TransportUnknown
+            && self
+                .task_by_identity_ref(row.task)
+                .is_some_and(crate::remote_task::RemoteTask::create_result_is_unresolved);
+        self.create_receipts
+            .get_mut(&reply.operation_id())
+            .expect("pre-registered Create")
+            .unknown = still_unknown.then_some(generation);
+    }
+
+    pub(super) fn observe_create_reply_between_sends(
+        &mut self,
+        observation: &OperationObservation,
+    ) -> Option<Result<(), TaskExecutionError>> {
+        let reply = &observation.reply;
+        let operation = reply.operation_id();
+        if reply.kind() != OperationKind::CreateTask
+            || self.dispatcher.operation_state(operation).ok()? != DispatchOperationState::Absent
+        {
+            return None;
+        }
+        let row = self.create_receipts.get_mut(&operation)?;
+        if observation.generation > row.unknown? {
+            return None;
+        }
+        if !matches!(
+            reply.dispatch_result(),
+            OperationDispatchResult::WorkerReceipt(_)
+        ) {
+            return Some(Ok(()));
+        }
+        row.unknown = None;
+        let task = row.task;
+        Some(self.acknowledge_task_reply(task.stage_id(), task.task_id(), reply, true))
+    }
+
     /// The Source only forwards exact operation/generation correlations from
     /// its original records. This handler covers a replay still awaiting a
     /// grant or dispatcher placement. A late definitive reply closes that
@@ -204,16 +257,22 @@ impl QueryTaskExecution {
         if reply.kind() != OperationKind::CreateTask || observation.generation >= row.generation {
             return None;
         }
+        if row.prior_settled {
+            return Some((None, Ok(())));
+        }
+        if observation.generation > self.create_receipts.get(&operation)?.unknown? {
+            return None;
+        }
         if !matches!(
             reply.dispatch_result(),
             OperationDispatchResult::WorkerReceipt(_)
-        ) || row.prior_settled
-        {
+        ) {
             return Some((None, Ok(())));
         }
         let task = row.task;
         row.prior_settled = true;
         let withdrawal = self.withdraw_create_admission(operation);
+        self.record_create_result(reply, observation.generation);
         let result = self.acknowledge_task_reply(task.stage_id(), task.task_id(), reply, true);
         Some((withdrawal, result))
     }

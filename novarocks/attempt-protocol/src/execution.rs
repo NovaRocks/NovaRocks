@@ -414,6 +414,7 @@ pub struct QueryTaskExecution {
     edge_control_effects: VecDeque<PendingEdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_admissions: BTreeMap<TaskOperationId, create_admission::CreateAdmission>,
+    create_receipts: BTreeMap<TaskOperationId, create_admission::CreateReceiptRoute>,
     pending_candidates: VecDeque<AdmissionCandidate>,
     queue_expiry: Option<QueueExpiryPass>,
     status_reconciliations: BTreeSet<ParticipationRef>,
@@ -623,6 +624,19 @@ impl QueryTaskExecution {
             stages.insert(stage_id, StageExecution::new(node.stage(), root, tasks)?);
         }
 
+        let create_receipts = stages
+            .values()
+            .flat_map(StageExecution::tasks)
+            .map(|(_, task)| {
+                (
+                    task.create_operation(),
+                    create_admission::CreateReceiptRoute {
+                        task: task.identity(),
+                        unknown: None,
+                    },
+                )
+            })
+            .collect();
         let strict_pending = graph
             .tasks()
             .map(|task| task.identity())
@@ -661,6 +675,7 @@ impl QueryTaskExecution {
             edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
             create_admissions: BTreeMap::new(),
+            create_receipts,
             pending_candidates: VecDeque::new(),
             queue_expiry: None,
             status_reconciliations: BTreeSet::new(),
@@ -1523,7 +1538,11 @@ impl QueryTaskExecution {
             .operation_targets
             .remove(&ack.operation_id())
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        self.apply_operation_reply(target, ack)?;
+        let applied = self.apply_operation_reply(target, ack);
+        if ack.kind() == OperationKind::CreateTask {
+            self.record_create_result(ack, generation);
+        }
+        applied?;
         Ok(true)
     }
 
@@ -3882,6 +3901,83 @@ mod bounded_drain_tests {
                 .create_ownership_proven()
         );
         assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+    }
+
+    #[test]
+    fn create_receipt_can_arrive_between_two_sends_in_the_same_ack_prefix() {
+        use crate::input::{
+            AckPayload, LocalDispatchResult, OperationObservation, OperationReplyResult,
+        };
+        use novarocks_execution_contract::{
+            CreateTaskReceipt, OperationOutcome, operation::OperationResult,
+        };
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let part = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, part);
+        let first = grant(1);
+        let operation = enqueue_create(&mut execution, task, first);
+        for n in 1..=2 {
+            let sent = grant(n);
+            if n == 2 {
+                assert_eq!(enqueue_create(&mut execution, task, sent), operation);
+            }
+            let batch = execution.dispatcher.take_batch().unwrap();
+            execution
+                .dispatcher
+                .accept_emitted(&batch, grant(n + 10).generation().admission_effect())
+                .unwrap();
+            let unknown = OperationObservation {
+                generation: sent.generation(),
+                reply: OperationAcknowledgement {
+                    operation_id: operation,
+                    kind: OperationKind::CreateTask,
+                    result: OperationReplyResult::Local {
+                        result: LocalDispatchResult::TransportUnknown,
+                        failure: None,
+                        protocol_failure: None,
+                        detail: None,
+                    },
+                },
+            };
+            assert!(matches!(
+                execution.apply_dispatched_reply(&unknown),
+                (None, Ok(()))
+            ));
+            assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        }
+        let earlier_receipt = OperationObservation {
+            generation: first.generation(),
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CreateTask,
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                        task,
+                        Vec::new(),
+                        TaskStatus::created(task).with_installed(),
+                    )))),
+                }),
+            },
+        };
+        assert!(matches!(
+            execution.apply_dispatched_reply(&earlier_receipt),
+            (None, Ok(()))
+        ));
+        assert!(
+            execution
+                .task(task.task_id())
+                .unwrap()
+                .create_ownership_proven()
+        );
+        assert!(
+            execution
+                .begin_create_admission(task, grant(3).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

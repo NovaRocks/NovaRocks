@@ -22,10 +22,12 @@ use crate::{
     dispatch::{EmittedMember, PriorReplyRoute},
     effect::{AttemptEffectId, EffectBody},
     error::TaskExecutionError,
-    input::{OperationObservation, WithdrawalOutcome},
-    operation::{FrontendAction, OperationDispatchResult, frontend_action},
+    input::{AckPayload, OperationObservation, OperationReply, WithdrawalOutcome},
+    operation::OperationDispatchResult,
 };
-use novarocks_execution_contract::{OperationShape, ParticipationRef};
+use novarocks_execution_contract::{
+    OperationKind, OperationOutcome, OperationShape, ParticipationRef, ReleaseOutcome,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum UnsentOwner {
@@ -37,8 +39,11 @@ pub(crate) enum UnsentOwner {
     Local,
 }
 
-fn prior_result_resolves(route: PriorReplyRoute, result: OperationDispatchResult) -> bool {
-    if !matches!(result, OperationDispatchResult::WorkerReceipt(_)) {
+fn prior_result_resolves(route: PriorReplyRoute, reply: &OperationReply) -> bool {
+    if !matches!(
+        reply.dispatch_result(),
+        OperationDispatchResult::WorkerReceipt(_)
+    ) {
         return false;
     }
     match route {
@@ -47,7 +52,24 @@ fn prior_result_resolves(route: PriorReplyRoute, result: OperationDispatchResult
         // The handoff may already have started even if its progress fact is
         // still on its way. A retryable earlier refusal cannot mask a later
         // successful dispatch. The current physical generation decides.
-        PriorReplyRoute::Emitted => frontend_action(result) != FrontendAction::RetryAfterProgress,
+        PriorReplyRoute::Emitted => match reply.kind() {
+            OperationKind::CreateTask => !matches!(
+                reply.worker_outcome(),
+                Some(OperationOutcome::NotReady | OperationOutcome::PreparationBusy)
+            ),
+            OperationKind::ReleaseParticipation => {
+                reply.worker_outcome() != Some(OperationOutcome::ReleaseNotReady)
+                    && !(reply.is_applied()
+                        && matches!(
+                            reply.payload(),
+                            AckPayload::Release {
+                                outcome: ReleaseOutcome::NotReady,
+                                ..
+                            }
+                        ))
+            }
+            _ => true,
+        },
     }
 }
 
@@ -64,7 +86,7 @@ impl QueryTaskExecution {
             reply.kind(),
             observation.generation,
         ) {
-            Some(route) => prior_result_resolves(route, reply.dispatch_result()),
+            Some(route) => prior_result_resolves(route, reply),
             None => self.dispatcher.reply_has_pending_owner(
                 reply.operation_id(),
                 reply.kind(),
@@ -84,6 +106,9 @@ impl QueryTaskExecution {
         if let Some(result) = self.observe_prior_create_reply_during_admission(observation) {
             return result;
         }
+        if let Some(result) = self.observe_create_reply_between_sends(observation) {
+            return (None, result);
+        }
         let reply = &observation.reply;
         let operation = reply.operation_id();
         let generation = observation.generation;
@@ -96,7 +121,7 @@ impl QueryTaskExecution {
                 self.acknowledge_current_send(generation, reply).map(|_| ()),
             );
         };
-        if !prior_result_resolves(route, reply.dispatch_result()) {
+        if !prior_result_resolves(route, reply) {
             return (None, Ok(()));
         }
         let Some(target) = self.operation_targets.get(&operation).copied() else {
@@ -116,6 +141,9 @@ impl QueryTaskExecution {
             PriorReplyRoute::AlreadySettled => unreachable!("ignored settled logical operation"),
         };
         self.operation_targets.remove(&operation);
+        if reply.kind() == OperationKind::CreateTask {
+            self.record_create_result(reply, generation);
+        }
         (action, self.apply_operation_reply(target, reply))
     }
 
