@@ -737,31 +737,59 @@ impl RemoteTask {
         self.pending_input.take().and_then(|input| input.discarded)
     }
 
-    /// Freeze the passive replay reference. Only the host freezes rich parts.
-    pub(crate) fn release_create(
+    /// Passive Create preview. Only a matching Source grant can confirm that
+    /// the original payload has actually entered retained custody.
+    pub(crate) fn create_admission_intent(
+        &self,
+    ) -> Option<(OperationIntent, crate::effect::QueuedInputPayload)> {
+        use crate::effect::QueuedInputPayload;
+        let (creation, payload) = match self.creation {
+            CreationReplay::Unfrozen(c) => (c, QueuedInputPayload::NewCreation(c.resource)),
+            CreationReplay::Frozen(c) => (c, QueuedInputPayload::AlreadyRetained),
+            CreationReplay::Settled | CreationReplay::Closed => return None,
+        };
+        Some((
+            OperationIntent::CreateTask {
+                envelope: self.create_envelope,
+                identity: self.identity,
+                creation: creation.resource,
+                queued_bytes: creation.queued_bytes,
+            },
+            payload,
+        ))
+    }
+
+    pub(crate) fn note_creation_retained(&mut self) {
+        if let CreationReplay::Unfrozen(creation) = self.creation {
+            self.creation = CreationReplay::Frozen(creation);
+        }
+    }
+
+    /// Release the already-retained passive Create request into the lane.
+    pub(crate) fn release_retained_create(
         &mut self,
         now: MonotonicInstant,
     ) -> Result<OperationIntent, TaskExecutionError> {
-        if !self.create_sendable(now) {
+        if !self.create_sendable(now) || !matches!(self.creation, CreationReplay::Frozen(_)) {
             return Err(TaskExecutionError::Schedule(format!(
                 "task {} has no create to release",
                 self.identity
             )));
         }
-        let creation = match self.creation {
-            CreationReplay::Unfrozen(c) | CreationReplay::Frozen(c) => c,
-            CreationReplay::Settled | CreationReplay::Closed => {
-                unreachable!("checked sendable create")
-            }
-        };
-        self.creation = CreationReplay::Frozen(creation);
+        let (intent, _) = self
+            .create_admission_intent()
+            .expect("checked sendable Create");
         self.create_in_flight = Some(self.create_envelope.operation_id());
-        Ok(OperationIntent::CreateTask {
-            envelope: self.create_envelope,
-            identity: self.identity,
-            creation: creation.resource,
-            queued_bytes: creation.queued_bytes,
-        })
+        Ok(intent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_create(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> Result<OperationIntent, TaskExecutionError> {
+        self.note_creation_retained();
+        self.release_retained_create(now)
     }
 
     /// Records one domain fact for this task.
@@ -1134,6 +1162,37 @@ impl RemoteTask {
         {
             return Err(TaskExecutionError::UnknownOperation);
         }
+        self.apply_create_ack(ack, now, participation_established, observation_horizon)
+    }
+
+    /// Fold a Source-correlated definitive reply while the newer replay is
+    /// still waiting for input admission. The original remote-unknown marker
+    /// belongs to the operation and survives the gap between sends.
+    pub(crate) fn on_prior_create_ack(
+        &mut self,
+        ack: &OperationAcknowledgement,
+        now: MonotonicInstant,
+        participation_established: bool,
+        observation_horizon: Option<CreateRefusalObservationHorizon>,
+    ) -> Result<CreateSettlement, TaskExecutionError> {
+        if ack.kind() != OperationKind::CreateTask
+            || ack.operation_id() != self.create_envelope.operation_id()
+            || ack.dispatch_result() == OperationDispatchResult::TransportUnknown
+            || !self.create_remote_unknown
+            || self.create_in_flight.is_some()
+        {
+            return Err(TaskExecutionError::UnknownOperation);
+        }
+        self.apply_create_ack(ack, now, participation_established, observation_horizon)
+    }
+
+    fn apply_create_ack(
+        &mut self,
+        ack: &OperationAcknowledgement,
+        now: MonotonicInstant,
+        participation_established: bool,
+        observation_horizon: Option<CreateRefusalObservationHorizon>,
+    ) -> Result<CreateSettlement, TaskExecutionError> {
         self.create_in_flight = None;
         if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
             self.stand_down_after_owner_failure();

@@ -159,6 +159,14 @@ pub enum Publication {
     DevRootObservation { status: TaskStatus, installed: bool },
 }
 
+/// Payload component of one queued-input quote. The Source prices its
+/// exact original allocation and verifies custody before publishing a grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueuedInputPayload {
+    NewCreation(PayloadRef),
+    AlreadyRetained,
+}
+
 #[derive(Clone, Debug)]
 pub enum EffectBody {
     SendBatch {
@@ -168,6 +176,7 @@ pub enum EffectBody {
     AdmitQueuedInput {
         operation: OperationIntent,
         generation: crate::input::SendGeneration,
+        payload: QueuedInputPayload,
         lane: DispatchLane,
     },
     Withdraw {

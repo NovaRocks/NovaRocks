@@ -24,6 +24,9 @@
 //! `acknowledge` settles one released operation, and `apply_status` applies
 //! what the intake queued. Nothing here opens a connection.
 
+mod create_admission;
+pub(crate) use create_admission::CreateGrantProgress;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -409,6 +412,7 @@ pub struct QueryTaskExecution {
     /// the edge tracker emits each close member and each open only once.
     edge_control_effects: VecDeque<PendingEdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
+    create_admissions: BTreeMap<TaskOperationId, create_admission::CreateAdmission>,
     pending_candidates: VecDeque<AdmissionCandidate>,
     queue_expiry: Option<QueueExpiryPass>,
     status_reconciliations: BTreeSet<ParticipationRef>,
@@ -735,6 +739,7 @@ impl QueryTaskExecution {
             deployment_window: BTreeMap::new(),
             edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
+            create_admissions: BTreeMap::new(),
             pending_candidates: VecDeque::new(),
             queue_expiry: None,
             status_reconciliations: BTreeSet::new(),
@@ -1301,7 +1306,7 @@ impl QueryTaskExecution {
         let now = self.now;
         self.task_by_identity(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?
-            .release_create(now)
+            .release_retained_create(now)
     }
 
     /// Original external split/filter entry. Drain rejects NEW updates; this
@@ -1636,6 +1641,16 @@ impl QueryTaskExecution {
         task_id: TaskId,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
+        self.acknowledge_task_reply(stage_id, task_id, ack, false)
+    }
+
+    fn acknowledge_task_reply(
+        &mut self,
+        stage_id: StageId,
+        task_id: TaskId,
+        ack: &OperationAcknowledgement,
+        prior_create: bool,
+    ) -> Result<(), TaskExecutionError> {
         let identity = self
             .stages
             .get(&stage_id)
@@ -1643,7 +1658,7 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?
             .identity();
         self.apply_prior_withdrawal(identity)?;
-        let result = self.acknowledge_task_inner(stage_id, task_id, ack);
+        let result = self.acknowledge_task_inner(stage_id, task_id, ack, prior_create);
         // Local FailedClosed can become terminal without a TaskStatus or Task
         // failure latch. Count it even on Err before the outer failure policy
         // selects its original cause or a sealed result's residual cleanup.
@@ -1656,6 +1671,7 @@ impl QueryTaskExecution {
         stage_id: StageId,
         task_id: TaskId,
         ack: &OperationAcknowledgement,
+        prior_create: bool,
     ) -> Result<(), TaskExecutionError> {
         let stage = self
             .stages
@@ -1679,12 +1695,21 @@ impl QueryTaskExecution {
                     .get(&participation)
                     .and_then(ParticipationOwner::create_refusal_observation_horizon);
                 let previous_status = task.status().map(TaskStatus::version);
-                let settlement = task.on_create_ack(
-                    ack,
-                    self.now,
-                    participation_established,
-                    observation_horizon,
-                )?;
+                let settlement = if prior_create {
+                    task.on_prior_create_ack(
+                        ack,
+                        self.now,
+                        participation_established,
+                        observation_horizon,
+                    )?
+                } else {
+                    task.on_create_ack(
+                        ack,
+                        self.now,
+                        participation_established,
+                        observation_horizon,
+                    )?
+                };
                 let accepted_status_changed =
                     previous_status != task.status().map(TaskStatus::version);
                 if !matches!(settlement, CreateSettlement::Created) {
@@ -3556,6 +3581,275 @@ mod bounded_drain_tests {
             Some(original.saturating_sub(Duration::from_millis(1)))
         );
     }
+    #[test]
+    fn exact_create_replay_waits_for_a_fresh_generation_and_reuses_retained_payload() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        use crate::input::{LocalDispatchResult, OperationReplyResult};
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+
+        let first = grant(1);
+        let EffectBody::AdmitQueuedInput {
+            operation: original,
+            generation,
+            payload: QueuedInputPayload::NewCreation(payload),
+            ..
+        } = execution
+            .begin_create_admission(task, first.generation().admission_effect())
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("the first admission must retain the actual original creation");
+        };
+        assert_eq!(generation, first.generation());
+        let operation = original.operation_id();
+        assert!(execution.dispatcher.take_batch().is_none());
+        assert!(
+            execution
+                .begin_create_admission(task, grant(2).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            execution.observe_create_grant(operation, first).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        assert!(matches!(
+            execution.observe_create_grant(operation, first).unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
+        let unknown = OperationAcknowledgement {
+            operation_id: operation,
+            kind: OperationKind::CreateTask,
+            result: OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            },
+        };
+        assert!(
+            execution
+                .acknowledge_current_send(first.generation(), &unknown)
+                .unwrap()
+        );
+
+        let second = grant(2);
+        let EffectBody::AdmitQueuedInput {
+            operation:
+                OperationIntent::CreateTask {
+                    envelope, creation, ..
+                },
+            generation,
+            payload: QueuedInputPayload::AlreadyRetained,
+            ..
+        } = execution
+            .begin_create_admission(task, second.generation().admission_effect())
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("replay must price only the new generation's queue custody");
+        };
+        assert_eq!(generation, second.generation());
+        assert_eq!(envelope, original.envelope());
+        assert_eq!(creation, payload);
+        let older = crate::input::OperationObservation {
+            generation: first.generation(),
+            reply: unknown,
+        };
+        assert!(matches!(
+            execution.observe_prior_create_reply_during_admission(&older),
+            Some((None, Ok(())))
+        ));
+        assert!(execution.dispatcher.take_batch().is_none());
+        assert!(matches!(
+            execution.observe_create_grant(operation, second).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        assert_eq!(
+            execution
+                .dispatcher
+                .take_batch()
+                .unwrap()
+                .queued_inputs
+                .as_ref(),
+            &[second]
+        );
+    }
+
+    #[test]
+    fn older_definitive_create_reply_withdraws_the_still_admitting_replay() {
+        use crate::effect::EffectBody;
+        use crate::input::{LocalDispatchResult, OperationObservation, OperationReplyResult};
+        use novarocks_execution_contract::OperationOutcome;
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let first = grant(1);
+        let operation = enqueue_create(&mut execution, task, first);
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
+        assert!(
+            execution
+                .acknowledge_current_send(
+                    first.generation(),
+                    &OperationAcknowledgement {
+                        operation_id: operation,
+                        kind: OperationKind::CreateTask,
+                        result: OperationReplyResult::Local {
+                            result: LocalDispatchResult::TransportUnknown,
+                            failure: None,
+                            protocol_failure: None,
+                            detail: None,
+                        },
+                    }
+                )
+                .unwrap()
+        );
+        let replay = grant(2);
+        let effect = replay.generation().admission_effect();
+        assert!(
+            execution
+                .begin_create_admission(task, effect)
+                .unwrap()
+                .is_some()
+        );
+        let definitive = OperationObservation {
+            generation: first.generation(),
+            reply: refusal_reply(operation, OperationOutcome::OwnerFailed),
+        };
+        assert!(matches!(
+            execution.observe_prior_create_reply_during_admission(&definitive),
+            Some((Some(EffectBody::Withdraw {effect: target}), Err(TaskExecutionError::OperationFailed {
+                operation_id, ..
+            }))) if target == effect && operation_id == operation
+        ));
+        assert!(matches!(
+            execution.observe_prior_create_reply_during_admission(&definitive),
+            Some((None, Ok(())))
+        ));
+        assert!(matches!(
+            execution.observe_create_grant(operation, replay).unwrap(),
+            CreateGrantProgress::Release(original) if original == replay
+        ));
+        assert!(!execution.task(task.task_id()).unwrap().is_terminal());
+        assert!(execution.create_candidate_for_task(task).unwrap().is_none());
+        assert!(execution.dispatcher.take_batch().is_none());
+    }
+
+    #[test]
+    fn create_grant_rechecks_deployment_window_and_starts_residence_only_at_enqueue() {
+        use crate::effect::EffectBody;
+        let window = DispatchBudget::DEFAULT.create_permits();
+        let mut execution = many_tasks(u32::try_from(window + 2).unwrap());
+        let first = identity(&execution, 1);
+        let participation = execution.task(first.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let mut pending = Vec::new();
+        for n in 1..=window + 1 {
+            let task = identity(&execution, u32::try_from(n).unwrap());
+            let grant = grant(u64::try_from(n).unwrap());
+            let EffectBody::AdmitQueuedInput { operation, .. } = execution
+                .begin_create_admission(task, grant.generation().admission_effect())
+                .unwrap()
+                .unwrap()
+                .body
+            else {
+                panic!("the original window is empty when the admissions are requested");
+            };
+            pending.push((operation.operation_id(), grant));
+        }
+        let queued_at = execution.now.saturating_add(Duration::from_secs(30));
+        execution.set_now(queued_at).unwrap();
+        let (waiting_operation, waiting_grant) = pending.pop().unwrap();
+        for (operation, grant) in pending {
+            assert!(matches!(
+                execution.observe_create_grant(operation, grant).unwrap(),
+                CreateGrantProgress::Queued
+            ));
+        }
+        assert!(matches!(
+            execution
+                .observe_create_grant(waiting_operation, waiting_grant)
+                .unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        let last = identity(&execution, u32::try_from(window + 2).unwrap());
+        assert!(
+            execution
+                .begin_create_admission(last, grant(100).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(execution.dispatcher.queued_items(), window);
+        assert_eq!(
+            execution.queue_deadline(),
+            Some(queued_at.saturating_add(Duration::from_secs(5)))
+        );
+
+        while let Some(batch) = execution.dispatcher.take_batch() {
+            execution.dispatcher.accept(&batch).unwrap();
+        }
+        finish(&mut execution, first);
+        assert!(matches!(
+            execution.advance_create_grant(waiting_operation).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        assert_eq!(execution.dispatcher.queued_items(), 1);
+        assert!(
+            execution
+                .dispatcher
+                .tracks_input(waiting_operation, waiting_grant)
+        );
+    }
+
+    #[test]
+    fn late_grant_after_create_withdrawal_returns_the_same_input_without_dispatch() {
+        use crate::effect::EffectBody;
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let original = grant(1);
+        let effect = original.generation().admission_effect();
+        let EffectBody::AdmitQueuedInput { operation, .. } = execution
+            .begin_create_admission(task, effect)
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("expected the exact Create admission");
+        };
+        execution.begin_normal_drain();
+        assert!(
+            matches!(execution.withdraw_create_admission(operation.operation_id()),
+            Some(EffectBody::Withdraw {effect: target}) if target == effect)
+        );
+        assert!(
+            execution
+                .withdraw_create_admission(operation.operation_id())
+                .is_none()
+        );
+        assert!(
+            matches!(execution.observe_create_grant(operation.operation_id(), original).unwrap(),
+            CreateGrantProgress::Release(grant) if grant == original)
+        );
+        assert!(execution.dispatcher.take_batch().is_none());
+        assert!(
+            execution
+                .begin_create_admission(task, grant(2).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn pipelined_not_ready_create_becomes_sendable_on_exact_owner_establish_at_its_own_access() {
         use crate::input::{AckPayload, OperationReplyResult};

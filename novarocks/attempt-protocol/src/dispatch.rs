@@ -255,7 +255,7 @@ impl BackendQueues {
 struct InFlightSlot {
     backend: BackendProcessId,
     lane: DispatchLane,
-    generation: SendGeneration,
+    input: QueuedInputGrantRef,
 }
 
 fn batch_allowance(
@@ -796,7 +796,7 @@ impl OperationDispatcher {
                 InFlightSlot {
                     backend,
                     lane: batch.lane(),
-                    generation: grant.generation(),
+                    input: *grant,
                 },
             );
         }
@@ -889,7 +889,7 @@ impl OperationDispatcher {
         let Some(slot) = self.in_flight.get(&operation).copied() else {
             return Ok(false);
         };
-        if slot.generation != generation {
+        if slot.input.generation() != generation {
             return Ok(false);
         }
         let queues = self
@@ -909,7 +909,22 @@ impl OperationDispatcher {
         &self,
         operation: TaskOperationId,
     ) -> Option<SendGeneration> {
-        self.in_flight.get(&operation).map(|slot| slot.generation)
+        self.in_flight
+            .get(&operation)
+            .map(|slot| slot.input.generation())
+    }
+
+    pub(super) fn tracks_input(
+        &self,
+        operation: TaskOperationId,
+        input: QueuedInputGrantRef,
+    ) -> bool {
+        self.queued_entry(operation)
+            .is_some_and(|row| row.queue_permit == input)
+            || self
+                .in_flight
+                .get(&operation)
+                .is_some_and(|row| row.input == input)
     }
 
     #[cfg(test)]
