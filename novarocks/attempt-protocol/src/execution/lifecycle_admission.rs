@@ -19,6 +19,7 @@
 
 use super::{CreateGrantProgress, OperationTarget, QueryTaskExecution};
 use crate::{
+    capacity::StepContext,
     dispatch::DispatchOperationState,
     effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
     error::TaskExecutionError,
@@ -27,8 +28,11 @@ use crate::{
     participation_owner::ParticipationEstablishFacts,
     start::FrozenEstablish,
 };
-use novarocks_coordination_contract::AttemptActionId;
-use novarocks_execution_contract::{OperationKind, ParticipationRef, TaskOperationId};
+use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+use novarocks_execution_contract::{
+    OperationKind, ParticipationRef, TaskIdentity, TaskOperationId,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 #[derive(Debug)]
@@ -48,6 +52,26 @@ pub(super) struct UnknownLifecycleSend {
     generation: SendGeneration,
 }
 
+#[derive(Debug, Default)]
+pub(crate) enum ReleaseCheck {
+    #[default]
+    Start,
+    Inbound(TaskIdentity),
+    Own(usize),
+}
+
+#[derive(Debug)]
+pub(crate) enum ReleaseProgress {
+    Yield,
+    Done(Option<OperationIntent>),
+}
+
+#[derive(Debug, Default)]
+pub(super) struct LifecycleDeadlines {
+    by_participation: BTreeMap<ParticipationRef, [Option<MonotonicInstant>; 3]>,
+    ordered: [BTreeSet<(MonotonicInstant, ParticipationRef)>; 3],
+}
+
 impl QueryTaskExecution {
     pub(crate) fn participation_after(
         &self,
@@ -63,6 +87,141 @@ impl QueryTaskExecution {
         }
     }
 
+    pub(super) fn refresh_lifecycle_deadlines(&mut self, participation: ParticipationRef) {
+        let next = self.owners[&participation].lifecycle_deadlines();
+        let index = &mut self.lifecycle_deadlines;
+        let old = index
+            .by_participation
+            .remove(&participation)
+            .unwrap_or_default();
+        for ((deadlines, old), next) in index.ordered.iter_mut().zip(old).zip(next) {
+            if let Some(at) = old {
+                deadlines.remove(&(at, participation));
+            }
+            if let Some(at) = next {
+                deadlines.insert((at, participation));
+            }
+        }
+        if next != [None; 3] {
+            index.by_participation.insert(participation, next);
+        }
+    }
+
+    pub(crate) fn next_lifecycle_deadline(&self) -> Option<MonotonicInstant> {
+        if self.terminal_cleanup_started {
+            return None;
+        }
+        let profile = self
+            .profile_release_deadline
+            .filter(|at| !self.now.has_reached(*at));
+        let [reissue, renew, release] = self
+            .lifecycle_deadlines
+            .ordered
+            .each_ref()
+            .map(|index| index.first().map(|&(at, _)| at));
+        let reissue = reissue.filter(|_| !self.normal_drain_started);
+        let release = release.map(|at| profile.map_or(at, |profile| at.max(profile)));
+        [reissue, renew, release, profile]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    pub(crate) fn next_quiesce_intent(
+        &mut self,
+        participation: ParticipationRef,
+    ) -> Option<OperationIntent> {
+        if !self.normal_drain_started || self.terminal_cleanup_started {
+            return None;
+        }
+        self.owners
+            .get_mut(&participation)
+            .expect("frozen participation")
+            .quiesce_intent(&mut self.ids)
+    }
+
+    pub(crate) fn next_renewal_intent(
+        &mut self,
+        participation: ParticipationRef,
+    ) -> Result<Option<OperationIntent>, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Ok(None);
+        }
+        let result = self
+            .owners
+            .get_mut(&participation)
+            .expect("frozen participation")
+            .renew_intent(self.now, &mut self.ids);
+        self.refresh_lifecycle_deadlines(participation);
+        result
+    }
+
+    /// Release requires both the Participation's own actual stopped facts
+    /// and those of the inbound senders it depends on. The serial candidate
+    /// phase holds this proof across yields before any later observation.
+    pub(crate) fn advance_release_candidate(
+        &mut self,
+        participation: ParticipationRef,
+        proof: &mut ReleaseCheck,
+        context: &mut dyn StepContext,
+    ) -> Result<ReleaseProgress, TaskExecutionError> {
+        if self.terminal_cleanup_started
+            || self
+                .profile_release_deadline
+                .is_some_and(|at| !self.now.has_reached(at))
+            || !self.owners[&participation].release_candidate_due(self.now)
+        {
+            return Ok(ReleaseProgress::Done(None));
+        }
+        if self.covered_observation_active {
+            loop {
+                if !context.charge(1) {
+                    return Ok(ReleaseProgress::Yield);
+                }
+                let task = match *proof {
+                    ReleaseCheck::Start | ReleaseCheck::Inbound(_) => {
+                        let next = self
+                            .inbound_producers
+                            .get(&participation)
+                            .and_then(|inputs| match *proof {
+                                ReleaseCheck::Inbound(after) => {
+                                    inputs.range((Excluded(after), Unbounded)).next()
+                                }
+                                _ => inputs.first(),
+                            })
+                            .copied();
+                        *proof = next.map_or(ReleaseCheck::Own(0), ReleaseCheck::Inbound);
+                        let Some(next) = next else { continue };
+                        next
+                    }
+                    ReleaseCheck::Own(index) => {
+                        let Some(&task) = self.tasks_by_participation[&participation].get(index)
+                        else {
+                            break;
+                        };
+                        *proof = ReleaseCheck::Own(index + 1);
+                        task
+                    }
+                };
+                let remote = self
+                    .task_by_identity_ref(task)
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                if !remote.fenced_out() && !self.task_actual_stopped(task) {
+                    return Ok(ReleaseProgress::Done(None));
+                }
+            }
+        } else if !context.charge(1) {
+            return Ok(ReleaseProgress::Yield);
+        }
+        let intent = self
+            .owners
+            .get_mut(&participation)
+            .expect("frozen participation")
+            .release_intent(self.now, &mut self.ids);
+        self.refresh_lifecycle_deadlines(participation);
+        Ok(ReleaseProgress::Done(intent))
+    }
+
     pub(crate) fn next_authorization_intent(
         &mut self,
         participation: ParticipationRef,
@@ -74,21 +233,21 @@ impl QueryTaskExecution {
         let owner = self
             .owners
             .get_mut(&participation)
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        if let Some(admission) = owner.admission_intent(self.now, &mut self.ids)? {
-            return Ok(Some(admission));
-        }
-        if owner.needs_establish() {
-            return owner.establish_intent(
+            .expect("frozen participation");
+        let intent = match owner.admission_intent(self.now, &mut self.ids)? {
+            Some(admission) => Some(admission),
+            None if owner.needs_establish() => owner.establish_intent(
                 ParticipationEstablishFacts {
                     material: material.material,
                     queued_bytes: material.queued_bytes,
                 },
                 self.now,
                 &mut self.ids,
-            );
-        }
-        Ok(None)
+            )?,
+            None => None,
+        };
+        self.refresh_lifecycle_deadlines(participation);
+        Ok(intent)
     }
 
     pub(crate) fn begin_lifecycle_admission(
@@ -101,6 +260,9 @@ impl QueryTaskExecution {
                 request.participation()
             }
             OperationIntent::EstablishParticipation { participation, .. } => *participation,
+            OperationIntent::RenewParticipationLease(request) => request.participation(),
+            OperationIntent::QuiesceParticipation(request) => request.participation(),
+            OperationIntent::ReleaseParticipation(request) => request.participation(),
             _ => return Err(TaskExecutionError::UnknownOperation),
         };
         self.dispatcher.validate_operation_carrier(&intent)?;
@@ -191,7 +353,16 @@ impl QueryTaskExecution {
             .get(&operation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let grant = row.grant.ok_or(TaskExecutionError::UnknownOperation)?;
-        if row.withdrawing || self.terminal_cleanup_started {
+        if row.withdrawing
+            || self.terminal_cleanup_started
+            || self.owners[&row.participation].is_released()
+            || (self.normal_drain_started
+                && matches!(
+                    row.intent,
+                    OperationIntent::AcquireParticipationAdmissionTicket(_)
+                        | OperationIntent::EstablishParticipation { .. }
+                ))
+        {
             self.finish_lifecycle_admission(operation);
             return Ok(CreateGrantProgress::Release(grant));
         }
@@ -241,6 +412,9 @@ impl QueryTaskExecution {
         applied: bool,
     ) {
         let operation = reply.operation_id();
+        if super::send_replies::release_reply_retryable(reply) {
+            return;
+        }
         let kind = reply.kind();
         if applied
             && reply.dispatch_result() == OperationDispatchResult::TransportUnknown
@@ -266,6 +440,9 @@ impl QueryTaskExecution {
         let reply = &observation.reply;
         let operation = reply.operation_id();
         let row = self.lifecycle_unknown.get(&operation)?;
+        if super::send_replies::release_reply_retryable(reply) {
+            return None;
+        }
         (row.kind == reply.kind()
             && observation.generation <= row.generation
             && matches!(

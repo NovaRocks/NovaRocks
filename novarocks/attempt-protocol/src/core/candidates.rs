@@ -17,7 +17,7 @@
 
 //! Resume the original participant and Task candidate scan after QA settles.
 
-use crate::effect::OperationIntent;
+use crate::{effect::OperationIntent, execution::ReleaseCheck};
 use novarocks_execution_contract::ParticipationRef;
 use novarocks_types::TaskId;
 
@@ -27,11 +27,19 @@ pub(super) enum Authorization {
     Ready(OperationIntent),
 }
 
+#[derive(Debug)]
+pub(super) enum Maintenance {
+    Quiesce,
+    Renew,
+    Release(ReleaseCheck),
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Candidates {
     pub(super) enabled: bool,
     pub(super) wake: bool,
     pub(super) participant_after: Option<ParticipationRef>,
+    pub(super) maintaining: Option<Maintenance>,
     pub(super) task_after: Option<TaskId>,
     pub(super) creates: bool,
     pub(super) authorization: Option<Authorization>,
@@ -41,6 +49,7 @@ impl Candidates {
     pub(super) fn begin_round(&mut self) {
         self.wake = false;
         self.participant_after = None;
+        self.maintaining = None;
         self.task_after = None;
         self.creates = false;
     }

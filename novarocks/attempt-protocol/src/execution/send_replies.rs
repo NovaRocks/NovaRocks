@@ -39,11 +39,26 @@ pub(crate) enum UnsentOwner {
     Local,
 }
 
+pub(super) fn release_reply_retryable(reply: &OperationReply) -> bool {
+    reply.kind() == OperationKind::ReleaseParticipation
+        && (reply.worker_outcome() == Some(OperationOutcome::ReleaseNotReady)
+            || (reply.is_applied()
+                && matches!(
+                    reply.payload(),
+                    AckPayload::Release {
+                        outcome: ReleaseOutcome::NotReady,
+                        ..
+                    }
+                )))
+}
+
 fn prior_result_resolves(route: PriorReplyRoute, reply: &OperationReply) -> bool {
-    if !matches!(
-        reply.dispatch_result(),
-        OperationDispatchResult::WorkerReceipt(_)
-    ) {
+    if release_reply_retryable(reply)
+        || !matches!(
+            reply.dispatch_result(),
+            OperationDispatchResult::WorkerReceipt(_)
+        )
+    {
         return false;
     }
     match route {
@@ -57,17 +72,6 @@ fn prior_result_resolves(route: PriorReplyRoute, reply: &OperationReply) -> bool
                 reply.worker_outcome(),
                 Some(OperationOutcome::NotReady | OperationOutcome::PreparationBusy)
             ),
-            OperationKind::ReleaseParticipation => {
-                reply.worker_outcome() != Some(OperationOutcome::ReleaseNotReady)
-                    && !(reply.is_applied()
-                        && matches!(
-                            reply.payload(),
-                            AckPayload::Release {
-                                outcome: ReleaseOutcome::NotReady,
-                                ..
-                            }
-                        ))
-            }
             _ => true,
         },
     }

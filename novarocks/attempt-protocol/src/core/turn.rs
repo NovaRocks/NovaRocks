@@ -207,6 +207,10 @@ impl AttemptCore for Core {
             }
             Phase::Idle => [
                 self.next_round_deadline(),
+                self.candidates
+                    .enabled
+                    .then(|| self.execution.next_lifecycle_deadline())
+                    .flatten(),
                 self.convergence.next_deadline(),
                 self.terminal.next_deadline(),
             ]
@@ -1055,19 +1059,20 @@ impl Core {
                     self.turn.phase = Phase::Terminal(TerminalWake::Round);
                     self.drive_terminal(now, TerminalWake::Round, context, result)?;
                 } else {
-                    if self.candidates.enabled
-                        && !self.stop.business_closed()
-                        && self.terminal.terminal().is_none()
-                    {
-                        self.candidates.begin_round();
-                        self.turn.phase = Phase::Candidates;
-                    } else {
-                        self.resume_after_terminal();
-                    }
+                    self.begin_candidates_or_resume();
                 }
             }
         }
         Ok(())
+    }
+
+    fn begin_candidates_or_resume(&mut self) {
+        if self.candidates.enabled && !self.stop.business_closed() {
+            self.candidates.begin_round();
+            self.turn.phase = Phase::Candidates;
+        } else {
+            self.resume_after_terminal();
+        }
     }
 
     fn drive_candidates(
@@ -1076,7 +1081,8 @@ impl Core {
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
         use super::AuthorizationStep;
-        use super::candidates::Authorization;
+        use super::candidates::{Authorization, Maintenance};
+        use crate::execution::ReleaseProgress;
         if self.authorizations.waiting_for_reply() {
             return Ok(());
         }
@@ -1103,6 +1109,44 @@ impl Core {
             return Ok(());
         }
         while !self.candidates.creates {
+            if let Some(phase) = &mut self.candidates.maintaining {
+                let participation = self
+                    .candidates
+                    .participant_after
+                    .expect("active lifecycle candidate");
+                let intent = match phase {
+                    Maintenance::Quiesce => {
+                        if !context.charge(1) {
+                            return Ok(());
+                        }
+                        *phase = Maintenance::Renew;
+                        self.execution.next_quiesce_intent(participation)
+                    }
+                    Maintenance::Renew => {
+                        if !context.charge(1) {
+                            return Ok(());
+                        }
+                        *phase = Maintenance::Release(Default::default());
+                        self.execution.next_renewal_intent(participation)?
+                    }
+                    Maintenance::Release(proof) => {
+                        let ReleaseProgress::Done(intent) = self
+                            .execution
+                            .advance_release_candidate(participation, proof, context)?
+                        else {
+                            return Ok(());
+                        };
+                        self.candidates.maintaining = None;
+                        intent
+                    }
+                };
+                if let Some(intent) = intent {
+                    let (id, _) = self.turn.issue()?;
+                    result.effect = Some(self.execution.begin_lifecycle_admission(intent, id)?);
+                    return Ok(());
+                }
+                continue;
+            }
             let Some(participation) = self
                 .execution
                 .participation_after(self.candidates.participant_after)
@@ -1119,6 +1163,7 @@ impl Core {
                 self.establish_material[&participation],
             )?
             else {
+                self.candidates.maintaining = Some(Maintenance::Quiesce);
                 continue;
             };
             let (id, token) = self.turn.issue()?;
@@ -1328,9 +1373,17 @@ impl Core {
                 ) {
                     self.request_stop(result);
                 }
+                let normal = matches!(
+                    terminal,
+                    novarocks_coordination_contract::AttemptTerminal::Completed
+                );
                 result.effect =
                     Some(self.port_effect(AttemptToLogicalBody::AttemptTerminal(terminal))?);
-                self.resume_after_terminal();
+                if normal {
+                    self.begin_candidates_or_resume();
+                } else {
+                    self.resume_after_terminal();
+                }
             }
             TerminalDirective::Wait => self.resume_after_terminal(),
             TerminalDirective::NeedRequestCredit => {

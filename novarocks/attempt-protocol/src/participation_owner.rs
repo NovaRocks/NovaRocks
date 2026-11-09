@@ -712,23 +712,11 @@ impl ParticipationOwner {
         now: MonotonicInstant,
         ids: &mut OperationIds,
     ) -> Option<OperationIntent> {
-        if self.released || self.release_in_flight {
+        if !self.release_candidate_due(now) {
             return None;
         }
-        if !matches!(self.state, ParticipationState::Quiescing) || self.quiesce_receipt.is_none() {
-            return None;
-        }
-        if !self.creates_closed() || !self.locally_drained() {
-            return None;
-        }
-        if self.release_blocked_at == Some(self.progress) {
-            if self.release_retry_at.is_none_or(|retry_at| now < retry_at) {
-                return None;
-            }
-        } else {
-            // Frontend-visible progress is stronger than the timer: retry
-            // immediately, and begin again at the initial delay if the
-            // backend still has a local operation settling.
+        if self.release_blocked_at != Some(self.progress) {
+            // Local progress resets the original backoff.
             self.release_retry_at = None;
             self.release_retry_delay = RELEASE_RETRY_INITIAL;
         }
@@ -737,6 +725,32 @@ impl ParticipationOwner {
             .get_or_insert_with(|| ReleaseParticipation::new(ids.issue(), self.participation));
         self.release_in_flight = true;
         Some(OperationIntent::ReleaseParticipation(request))
+    }
+
+    pub(crate) fn release_candidate_due(&self, now: MonotonicInstant) -> bool {
+        !self.terminal_cleanup_started
+            && !self.released
+            && !self.release_in_flight
+            && self.state == ParticipationState::Quiescing
+            && self.quiesce_receipt.is_some()
+            && self.creates_closed()
+            && self.locally_drained()
+            && (self.release_blocked_at != Some(self.progress)
+                || self.release_retry_at.is_some_and(|at| now.has_reached(at)))
+    }
+
+    pub(crate) fn lifecycle_deadlines(&self) -> [Option<MonotonicInstant>; 3] {
+        let reissue = self
+            .admission_reissue_at
+            .filter(|_| self.needs_admission_ticket());
+        let renew = self
+            .renew_schedule
+            .filter(|_| self.must_keep_renewing() && self.renewal.is_none())
+            .map(RenewSchedule::next_renew_at);
+        let release = self.release_retry_at.filter(|_| {
+            !self.terminal_cleanup_started && !self.released && !self.release_in_flight
+        });
+        [reissue, renew, release]
     }
 
     /// Closes future normal lifecycle issuance while retaining any immutable
@@ -761,10 +775,21 @@ impl ParticipationOwner {
                 .admission
                 .as_ref()
                 .is_some_and(|row| row.request.envelope().operation_id() == operation),
-            OperationKind::UpdateParticipation => self
-                .establish
-                .as_ref()
-                .is_some_and(|row| row.request.envelope().operation_id() == operation),
+            OperationKind::UpdateParticipation => {
+                self.establish
+                    .as_ref()
+                    .is_some_and(|row| row.request.envelope().operation_id() == operation)
+                    || self
+                        .renewal
+                        .as_ref()
+                        .is_some_and(|row| Self::request_id(&row.request) == operation)
+            }
+            OperationKind::QuiesceParticipation => self
+                .quiesce
+                .is_some_and(|row| row.envelope().operation_id() == operation),
+            OperationKind::ReleaseParticipation => self
+                .release
+                .is_some_and(|row| row.envelope().operation_id() == operation),
             _ => false,
         }
     }
@@ -785,11 +810,21 @@ impl ParticipationOwner {
                     .awaiting_outcome = true
             }
             OperationKind::UpdateParticipation => {
-                self.establish
+                if let Some(row) = self
+                    .establish
                     .as_mut()
-                    .expect("matched Establish")
-                    .awaiting_outcome = true
+                    .filter(|row| row.request.envelope().operation_id() == operation)
+                {
+                    row.awaiting_outcome = true;
+                } else {
+                    self.renewal
+                        .as_mut()
+                        .expect("matched renewal")
+                        .awaiting_outcome = true;
+                }
             }
+            OperationKind::QuiesceParticipation => self.quiesce_in_flight = true,
+            OperationKind::ReleaseParticipation => self.release_in_flight = true,
             _ => unreachable!("matched lifecycle request"),
         }
         true

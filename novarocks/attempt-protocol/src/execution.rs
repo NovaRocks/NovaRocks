@@ -27,6 +27,7 @@
 pub(crate) mod ack_phase;
 mod create_admission;
 mod lifecycle_admission;
+pub(crate) use lifecycle_admission::{ReleaseCheck, ReleaseProgress};
 mod send_replies;
 mod subscription_request;
 pub(crate) use create_admission::CreateGrantProgress;
@@ -415,6 +416,7 @@ pub struct QueryTaskExecution {
     edge_control_effects: VecDeque<PendingEdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_granted: BTreeSet<TaskOperationId>,
+    lifecycle_deadlines: lifecycle_admission::LifecycleDeadlines,
     lifecycle_unknown: BTreeMap<TaskOperationId, lifecycle_admission::UnknownLifecycleSend>,
     create_admissions: BTreeMap<TaskOperationId, create_admission::CreateAdmission>,
     lifecycle_admissions: BTreeMap<TaskOperationId, lifecycle_admission::LifecycleAdmission>,
@@ -680,6 +682,7 @@ impl QueryTaskExecution {
             edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
             create_granted: BTreeSet::new(),
+            lifecycle_deadlines: Default::default(),
             lifecycle_unknown: BTreeMap::new(),
             create_admissions: BTreeMap::new(),
             lifecycle_admissions: BTreeMap::new(),
@@ -1159,6 +1162,7 @@ impl QueryTaskExecution {
             .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         owner.observe_actor_abort_closure();
+        self.refresh_lifecycle_deadlines(participation);
         self.refresh_release_diagnostic(participation)
     }
 
@@ -1802,6 +1806,7 @@ impl QueryTaskExecution {
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
         let outcome = self.acknowledge_participation_inner(participation, ack);
+        self.refresh_lifecycle_deadlines(participation);
         let diagnostic = self.refresh_release_diagnostic(participation);
         // FailedClosed is still an accepted closure observation. Preserve the
         // original protocol error if both validations reject the same input.
@@ -2080,58 +2085,6 @@ impl QueryTaskExecution {
         self.task_by_identity_ref(identity)
             .and_then(|task| self.covered_observation.get(&task.participation()))
             .is_some_and(|state| state.actual_stopped.contains_key(&identity))
-    }
-
-    /// A receiver Participation may release only after every frozen inbound sender
-    /// that the Worker actually accepted has stopped. A Task fenced out by
-    /// its own complete Quiesce receipt has no remote sender to wait for.
-    fn receiver_inputs_stopped(
-        &self,
-        participation: ParticipationRef,
-    ) -> Result<bool, TaskExecutionError> {
-        if !self.covered_observation_active {
-            return Ok(true);
-        }
-        for &producer in self
-            .inbound_producers
-            .get(&participation)
-            .into_iter()
-            .flatten()
-        {
-            let task = self
-                .task_by_identity_ref(producer)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            if !task.fenced_out() && !self.task_actual_stopped(producer) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Keep this Participation's own stopped facts until dependent receivers have
-    /// used them. A terminal status describes the Task's result, not the end
-    /// of its local exchange and resource responsibilities.
-    fn participation_tasks_stopped(
-        &self,
-        participation: ParticipationRef,
-    ) -> Result<bool, TaskExecutionError> {
-        if !self.covered_observation_active {
-            return Ok(true);
-        }
-        for &identity in self
-            .tasks_by_participation
-            .get(&participation)
-            .into_iter()
-            .flatten()
-        {
-            let remote = self
-                .task_by_identity_ref(identity)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            if !remote.fenced_out() && !self.task_actual_stopped(identity) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Applies frames that the new intake registered before a success seal in
@@ -3051,6 +3004,7 @@ impl QueryTaskExecution {
             OperationTarget::Participation(participation) => {
                 if let Some(owner) = self.owners.get_mut(&participation) {
                     owner.rollback_unsent(operation_id);
+                    self.refresh_lifecycle_deadlines(participation);
                 }
             }
             OperationTarget::ActorAbort => {}
@@ -3489,6 +3443,233 @@ mod bounded_drain_tests {
             ),
         }
     }
+    #[test]
+    fn release_waits_for_both_actual_stops_and_retries_only_at_the_original_deadline() {
+        use crate::{
+            effect::EffectBody,
+            input::{AckPayload, OperationReplyResult},
+        };
+        use novarocks_execution_contract::{
+            OperationOutcome, ParticipationState, QuiesceParticipationReceipt,
+            TaskConvergenceVersion, operation::OperationResult,
+        };
+        let mut execution = crate::test_support::execution_with_strict_input();
+        let root = execution.graph.root_identity();
+        let receiver = execution
+            .task_by_identity_ref(root)
+            .unwrap()
+            .participation();
+        let producer = *execution.inbound_producers[&receiver].first().unwrap();
+        let sender = execution
+            .task_by_identity_ref(producer)
+            .unwrap()
+            .participation();
+        begin_test_establish(&mut execution, receiver);
+        let created = enqueue_create(&mut execution, root, grant(1));
+        finish(&mut execution, root);
+        execution.activate_covered_observation();
+        execution.normal_drain_started = true;
+        let quiesce = execution.next_quiesce_intent(receiver).unwrap();
+        let worker = |operation_id, kind, outcome, acknowledgement| OperationAcknowledgement {
+            operation_id,
+            kind,
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome,
+                detail: None,
+                acknowledgement,
+            }),
+        };
+        execution
+            .acknowledge_participation(
+                receiver,
+                &worker(
+                    quiesce.operation_id(),
+                    OperationKind::QuiesceParticipation,
+                    OperationOutcome::Accepted,
+                    Some(AckPayload::Quiesce(QuiesceParticipationReceipt::new(
+                        receiver,
+                        1,
+                        vec![root],
+                        ParticipationState::Quiescing,
+                    ))),
+                ),
+            )
+            .unwrap();
+
+        let mut proof = ReleaseCheck::default();
+        assert!(matches!(
+            execution
+                .advance_release_candidate(receiver, &mut proof, &mut Turn(16))
+                .unwrap(),
+            ReleaseProgress::Done(None)
+        ));
+        let stopped =
+            |task| TaskConvergenceReceipt::actual_stopped(task, TaskConvergenceVersion::FIRST);
+        execution
+            .covered_observation
+            .get_mut(&sender)
+            .unwrap()
+            .actual_stopped
+            .insert(producer, stopped(producer));
+
+        let mut proof = ReleaseCheck::default();
+        assert!(matches!(
+            execution
+                .advance_release_candidate(receiver, &mut proof, &mut Turn(1))
+                .unwrap(),
+            ReleaseProgress::Yield
+        ));
+        assert!(matches!(proof, ReleaseCheck::Inbound(task) if task == producer));
+        assert!(matches!(
+            execution
+                .advance_release_candidate(receiver, &mut proof, &mut Turn(16))
+                .unwrap(),
+            ReleaseProgress::Done(None)
+        ));
+        execution
+            .covered_observation
+            .get_mut(&receiver)
+            .unwrap()
+            .actual_stopped
+            .insert(root, stopped(root));
+
+        let mut proof = ReleaseCheck::default();
+        let ReleaseProgress::Done(Some(intent)) = execution
+            .advance_release_candidate(receiver, &mut proof, &mut Turn(16))
+            .unwrap()
+        else {
+            panic!("exact inbound and own exit must admit Release");
+        };
+        let operation = intent.operation_id();
+        let first = grant(2);
+        execution
+            .begin_lifecycle_admission(intent, first.generation().admission_effect())
+            .unwrap();
+        assert_eq!(
+            execution.dispatcher.operation_state(created).unwrap(),
+            DispatchOperationState::Absent
+        );
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, first).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [first]);
+        execution
+            .dispatcher
+            .accept_emitted(&batch, grant(20).generation().admission_effect())
+            .unwrap();
+        let reply = worker(
+            operation,
+            OperationKind::ReleaseParticipation,
+            OperationOutcome::ReleaseNotReady,
+            None,
+        );
+        assert!(
+            execution
+                .acknowledge_current_send(first.generation(), &reply)
+                .unwrap()
+        );
+
+        let deadline = execution.now.saturating_add(Duration::from_millis(50));
+        assert_eq!(execution.next_lifecycle_deadline(), Some(deadline));
+        assert!(matches!(
+            execution
+                .advance_release_candidate(receiver, &mut ReleaseCheck::default(), &mut Turn(16))
+                .unwrap(),
+            ReleaseProgress::Done(None)
+        ));
+        execution.set_now(deadline).unwrap();
+        let ReleaseProgress::Done(Some(replay)) = execution
+            .advance_release_candidate(receiver, &mut ReleaseCheck::default(), &mut Turn(16))
+            .unwrap()
+        else {
+            panic!("exact Release retry is due");
+        };
+        assert_eq!(replay.operation_id(), operation);
+        let second = grant(3);
+        assert!(matches!(
+            execution.begin_lifecycle_admission(replay, second.generation().admission_effect()).unwrap().body,
+            EffectBody::AdmitQueuedInput { generation, .. } if generation == second.generation()
+        ));
+        assert_eq!(execution.next_lifecycle_deadline(), None);
+    }
+
+    #[test]
+    fn lease_deadline_is_armed_from_the_effective_worker_lease_until_renewal_is_pending() {
+        use crate::{
+            effect::EffectBody,
+            input::{AckPayload, OperationReplyResult},
+        };
+        use novarocks_execution_contract::{
+            LeaseReceipt, OperationOutcome, ParticipationReceipt, ParticipationState,
+            operation::OperationResult,
+        };
+        let mut execution = many_tasks(1);
+        let participation = *execution.graph.participations().next().unwrap();
+        let establish = begin_test_establish(&mut execution, participation);
+        let OperationIntent::EstablishParticipation {
+            initial_lease_sequence,
+            initial_lease_valid_for,
+            ..
+        } = establish
+        else {
+            panic!("original Establish request");
+        };
+        let effective = Duration::from_secs(9);
+        execution
+            .acknowledge_participation(
+                participation,
+                &OperationAcknowledgement {
+                    operation_id: establish.operation_id(),
+                    kind: OperationKind::UpdateParticipation,
+                    result: OperationReplyResult::Worker(OperationResult::Verdict {
+                        outcome: OperationOutcome::Accepted,
+                        detail: None,
+                        acknowledgement: Some(AckPayload::Participation(
+                            ParticipationReceipt::new(participation, ParticipationState::Active)
+                                .with_lease(LeaseReceipt::new(
+                                    initial_lease_sequence,
+                                    initial_lease_valid_for,
+                                    effective,
+                                )),
+                        )),
+                    }),
+                },
+            )
+            .unwrap();
+        let deadline = execution.now.saturating_add(Duration::from_secs(3));
+        assert_eq!(execution.next_lifecycle_deadline(), Some(deadline));
+        assert!(
+            execution
+                .next_renewal_intent(participation)
+                .unwrap()
+                .is_none()
+        );
+        execution.set_now(deadline).unwrap();
+        let original = execution
+            .next_renewal_intent(participation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.next_lifecycle_deadline(), None);
+        let first = grant(1);
+        let operation = original.operation_id();
+        execution
+            .begin_lifecycle_admission(original, first.generation().admission_effect())
+            .unwrap();
+        assert!(execution.close_lifecycle_admission(operation, first.generation()));
+        let replay = execution
+            .next_renewal_intent(participation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.operation_id(), operation);
+        let second = grant(2);
+        assert!(matches!(
+            execution.begin_lifecycle_admission(replay, second.generation().admission_effect()).unwrap().body,
+            EffectBody::AdmitQueuedInput { generation, .. } if generation == second.generation()
+        ));
+    }
+
     #[test]
     fn exact_task_refusal_keeps_its_original_horizon_without_finding_a_sibling() {
         use novarocks_execution_contract::OperationOutcome;

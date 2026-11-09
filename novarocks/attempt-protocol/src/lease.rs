@@ -71,8 +71,7 @@ impl RenewSchedule {
     pub(crate) const fn conservative_expiry(self) -> MonotonicInstant {
         self.conservative_expiry
     }
-    #[cfg(test)]
-    pub const fn next_renew_at(self) -> MonotonicInstant {
+    pub(crate) const fn next_renew_at(self) -> MonotonicInstant {
         self.next_renew_at
     }
     pub fn must_renew_at(self, now: MonotonicInstant) -> bool {
