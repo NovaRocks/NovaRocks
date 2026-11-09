@@ -34,6 +34,7 @@ mod proposal_wait;
 mod queue_input;
 mod queued_job;
 mod quote;
+mod receipt_input;
 mod release_wake;
 mod send;
 mod settlement;
@@ -54,6 +55,7 @@ pub(crate) use queued_job::{BoundQueue, QueueJob, run as run_queue};
 pub(crate) use quote::{
     SourceLayouts, original_run, original_run_for_factory, queued_input as queued_input_quote,
 };
+pub(crate) use receipt_input::NativeReceiptInput;
 pub(crate) use send::{BoundSend, SendJob, run as run_send};
 pub(crate) use source_ports::{
     ApplyRowPreparation, BodyOutcome, EncodingJob, ResolvedBatch, TransportCompletionObligation,

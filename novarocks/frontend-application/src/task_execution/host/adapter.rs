@@ -20,6 +20,7 @@
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
+use super::transport::{NativeReceiptInput, SendKey};
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
@@ -82,6 +83,7 @@ pub(crate) struct AttemptActor {
 pub(crate) struct AttemptActorRegistration {
     pub(crate) original: ActorRegistration,
     scope: ScopeHandle,
+    native_source: ActorId,
     capacity_source: ActorId,
     observation_source: ActorId,
     membership_source: ActorId,
@@ -366,6 +368,21 @@ impl AttemptActorRegistration {
         Ok(ingress)
     }
 
+    pub(crate) fn reserve_native_receipt(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+        key: SendKey,
+        kind: novarocks_execution_contract::OperationKind,
+    ) -> Result<NativeReceiptInput, ActorTurnError> {
+        if !self.scope.same_scope(work.scope()) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        let position =
+            self.reserve_standing(runtime, self.native_source, InputClass::Lifecycle, work)?;
+        Ok(NativeReceiptInput::new(key, kind, position))
+    }
+
     fn reserve_standing(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -534,6 +551,7 @@ impl AttemptActor {
         Ok(AttemptActorRegistration {
             original,
             scope,
+            native_source: native,
             capacity_source,
             observation_source,
             membership_source,

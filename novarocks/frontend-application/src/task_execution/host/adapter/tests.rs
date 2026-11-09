@@ -20,11 +20,12 @@ use crate::task_execution::host::observations::{
     ObservationBudget,
     tests::{Bank, ManualClock},
 };
+use crate::task_execution::intent::OperationAcknowledgement;
 use novarocks_attempt_protocol::{
     config::{CoordinationBudgets, FrozenTransportLimits},
     effect::Publication,
     ids::IdSeed,
-    input::PublicationApplied,
+    input::{PublicationApplied, SendGeneration},
     start::{
         AttemptSources, FrozenAttemptPlan, FrozenCreation, FrozenEstablish, FrozenTask,
         FrozenTaskGraph, PayloadRef,
@@ -37,10 +38,10 @@ use novarocks_control_runtime_core::{
     scope::WorkAdmission,
 };
 use novarocks_coordination_contract::{
-    AttemptActivation, AttemptActivationIdentity, AttemptAuthorizationLimits,
+    AttemptActionId, AttemptActivation, AttemptActivationIdentity, AttemptAuthorizationLimits,
     AttemptCompletionPolicy, AttemptLifecyclePolicy,
 };
-use novarocks_execution_contract::AdmissionEpochCapability;
+use novarocks_execution_contract::{AdmissionEpochCapability, OperationKind};
 use novarocks_types::NativeCompatibilityId;
 use std::num::NonZeroUsize;
 
@@ -470,8 +471,32 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         .unwrap()
         .fill(post(AttemptInput::StartProtocol))
         .unwrap();
+    let key = SendKey {
+        operation: TaskOperationId::new_v7(),
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+    };
+    let mut receipt = registered
+        .reserve_native_receipt(&runtime, &original_work, key, OperationKind::CreateTask)
+        .unwrap();
+    let original_ack =
+        OperationAcknowledgement::transport_unknown(key.operation, OperationKind::CreateTask);
+    receipt
+        .record(key, original_ack.clone(), None, None)
+        .unwrap();
+    assert!(
+        runtime
+            .standing_input_inventory(actor, None, 16)
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row.source == runtime_source(sources.native)
+                    && row.class == InputClass::Lifecycle
+                    && row.in_flight.is_none()
+            })
+    );
     assert!(runtime.poll_one(Tick(1)).unwrap());
     assert!(runtime.snapshot(actor).unwrap().failed);
+    assert!(matches!(receipt.submit(), Err(ActorTurnError::ActorFailed)));
     let failed = runtime.take_failure_payload(actor).unwrap();
     assert!(failed.is_some());
     let actions: Vec<_> = runtime
@@ -515,6 +540,16 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
 
     original_work.body_exited().unwrap();
     original_work.captures_exited().unwrap();
+    let retained = receipt
+        .retire_after_exit()
+        .unwrap_or_else(|(error, _)| panic!("{error}"))
+        .expect("the failure owner retains the raw acknowledgement");
+    assert_eq!(retained.original, original_ack);
+    assert!(
+        matches!(retained.unpublished, Some(FrontendInput::Attempt(input))
+        if matches!(&*input, AttemptInput::Executor(ExecutorFact::Operation(observation))
+            if observation.generation == key.generation))
+    );
     startup.close_after_exit().unwrap();
     membership.close_after_exit().unwrap();
     observation_work.body_exited().unwrap();
