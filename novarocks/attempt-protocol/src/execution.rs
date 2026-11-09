@@ -26,6 +26,7 @@
 
 pub(crate) mod ack_phase;
 mod create_admission;
+mod lifecycle_admission;
 mod send_replies;
 mod subscription_request;
 pub(crate) use create_admission::CreateGrantProgress;
@@ -413,7 +414,11 @@ pub struct QueryTaskExecution {
     /// the edge tracker emits each close member and each open only once.
     edge_control_effects: VecDeque<PendingEdgeControlEffect>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
+    create_granted: BTreeSet<TaskOperationId>,
+    lifecycle_unknown: BTreeMap<TaskOperationId, lifecycle_admission::UnknownLifecycleSend>,
     create_admissions: BTreeMap<TaskOperationId, create_admission::CreateAdmission>,
+    lifecycle_admissions: BTreeMap<TaskOperationId, lifecycle_admission::LifecycleAdmission>,
+    lifecycle_granted: BTreeSet<TaskOperationId>,
     create_receipts: BTreeMap<TaskOperationId, create_admission::CreateReceiptRoute>,
     pending_candidates: VecDeque<AdmissionCandidate>,
     queue_expiry: Option<QueueExpiryPass>,
@@ -674,7 +679,11 @@ impl QueryTaskExecution {
             deployment_window: BTreeMap::new(),
             edge_control_effects: VecDeque::new(),
             operation_targets: BTreeMap::new(),
+            create_granted: BTreeSet::new(),
+            lifecycle_unknown: BTreeMap::new(),
             create_admissions: BTreeMap::new(),
+            lifecycle_admissions: BTreeMap::new(),
+            lifecycle_granted: BTreeSet::new(),
             create_receipts,
             pending_candidates: VecDeque::new(),
             queue_expiry: None,
@@ -1617,6 +1626,8 @@ impl QueryTaskExecution {
         let applied = self.apply_operation_reply(target, ack);
         if ack.kind() == OperationKind::CreateTask {
             self.record_create_result(ack, generation);
+        } else if let OperationTarget::Participation(participation) = target {
+            self.record_lifecycle_result(participation, ack, generation, applied.is_ok());
         }
         applied?;
         Ok(true)

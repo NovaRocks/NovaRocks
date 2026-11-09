@@ -31,6 +31,7 @@ pub(super) enum StopWithdrawals {
     Open,
     Requested,
     Admissions(Option<TaskOperationId>),
+    Lifecycle(Option<TaskOperationId>),
     Sends(Option<AttemptActionId>),
     Closed,
 }
@@ -56,7 +57,10 @@ impl StopWithdrawals {
     }
 
     pub(super) fn pending(&self) -> bool {
-        matches!(self, Self::Requested | Self::Admissions(_) | Self::Sends(_))
+        matches!(
+            self,
+            Self::Requested | Self::Admissions(_) | Self::Lifecycle(_) | Self::Sends(_)
+        )
     }
 
     pub(super) fn advance(
@@ -80,6 +84,21 @@ impl StopWithdrawals {
                     match execution.next_stop_create_admission(after) {
                         Some((operation, body)) => {
                             *self = Self::Admissions(Some(operation));
+                            body
+                        }
+                        None => {
+                            *self = Self::Lifecycle(None);
+                            continue;
+                        }
+                    }
+                }
+                Self::Lifecycle(after) => {
+                    if !context.charge(1) {
+                        return StopProgress::Yield;
+                    }
+                    match execution.next_stop_lifecycle_admission(after) {
+                        Some((operation, body)) => {
+                            *self = Self::Lifecycle(Some(operation));
                             body
                         }
                         None => {

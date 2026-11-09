@@ -81,6 +81,9 @@ impl QueryTaskExecution {
         observation: &OperationObservation,
     ) -> bool {
         let reply = &observation.reply;
+        if self.prior_lifecycle_receipt(observation).is_some() {
+            return true;
+        }
         match self.dispatcher.prior_reply_route(
             reply.operation_id(),
             reply.kind(),
@@ -110,6 +113,9 @@ impl QueryTaskExecution {
             return (None, result);
         }
         let reply = &observation.reply;
+        if let Some(participation) = self.prior_lifecycle_receipt(observation) {
+            return self.settle_prior_lifecycle_receipt(participation, reply);
+        }
         let operation = reply.operation_id();
         let generation = observation.generation;
         let Some(route) = self
@@ -141,10 +147,13 @@ impl QueryTaskExecution {
             PriorReplyRoute::AlreadySettled => unreachable!("ignored settled logical operation"),
         };
         self.operation_targets.remove(&operation);
+        let applied = self.apply_operation_reply(target, reply);
         if reply.kind() == OperationKind::CreateTask {
             self.record_create_result(reply, generation);
+        } else if let OperationTarget::Participation(participation) = target {
+            self.record_lifecycle_result(participation, reply, generation, applied.is_ok());
         }
-        (action, self.apply_operation_reply(target, reply))
+        (action, applied)
     }
 
     pub(crate) fn next_stop_send_withdrawal(

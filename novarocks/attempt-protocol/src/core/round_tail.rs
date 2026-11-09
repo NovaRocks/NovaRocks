@@ -42,6 +42,8 @@ enum Phase {
     AwaitPublication,
     Cleanup,
     AbortGrants,
+    LifecycleGrants,
+    CreateGrants,
     QueueExpiry,
     Dispatch,
     Subscriptions,
@@ -55,6 +57,8 @@ pub(super) struct RoundTail {
     dispatch: bool,
     abort_after: Option<TaskOperationId>,
     abort_admitted: bool,
+    lifecycle_after: Option<TaskOperationId>,
+    create_after: Option<TaskOperationId>,
 }
 
 impl RoundTail {
@@ -109,6 +113,8 @@ impl Core {
             dispatch,
             abort_after: None,
             abort_admitted: false,
+            lifecycle_after: None,
+            create_after: None,
         };
         Ok(())
     }
@@ -242,6 +248,42 @@ impl Core {
                     }
                     self.aborts.advance_grant(&mut self.execution, operation)?;
                     self.round_tail.abort_after = Some(operation);
+                } else {
+                    self.round_tail.phase = Phase::LifecycleGrants;
+                }
+            }
+            Phase::LifecycleGrants => {
+                if let Some(operation) = self
+                    .execution
+                    .next_lifecycle_grant(self.round_tail.lifecycle_after)
+                {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    self.round_tail.lifecycle_after = Some(operation);
+                    if let crate::execution::CreateGrantProgress::Release(grant) =
+                        self.execution.advance_lifecycle_grant(operation)?
+                    {
+                        return Ok(Some(RoundTailStep::Effect(release(action, grant))));
+                    }
+                } else {
+                    self.round_tail.phase = Phase::CreateGrants;
+                }
+            }
+            Phase::CreateGrants => {
+                if let Some(operation) = self
+                    .execution
+                    .next_create_grant(self.round_tail.create_after)
+                {
+                    if !context.charge(1) {
+                        return Ok(Some(RoundTailStep::Yield));
+                    }
+                    self.round_tail.create_after = Some(operation);
+                    if let crate::execution::CreateGrantProgress::Release(grant) =
+                        self.execution.advance_create_grant(operation)?
+                    {
+                        return Ok(Some(RoundTailStep::Effect(release(action, grant))));
+                    }
                 } else if self.round_tail.dispatch {
                     self.execution.begin_queue_expiry()?;
                     self.round_tail.phase = Phase::QueueExpiry;

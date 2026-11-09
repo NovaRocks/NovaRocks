@@ -749,6 +749,52 @@ impl ParticipationOwner {
         self.admission_reissue_at = None;
     }
 
+    /// Find the original request even when its last generation already
+    /// returned TransportUnknown and no replay has been placed yet.
+    pub(crate) fn tracks_lifecycle_request(
+        &self,
+        kind: OperationKind,
+        operation: TaskOperationId,
+    ) -> bool {
+        match kind {
+            OperationKind::AcquireParticipationAdmissionTicket => self
+                .admission
+                .as_ref()
+                .is_some_and(|row| row.request.envelope().operation_id() == operation),
+            OperationKind::UpdateParticipation => self
+                .establish
+                .as_ref()
+                .is_some_and(|row| row.request.envelope().operation_id() == operation),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn resume_lifecycle_receipt(
+        &mut self,
+        kind: OperationKind,
+        operation: TaskOperationId,
+    ) -> bool {
+        if !self.tracks_lifecycle_request(kind, operation) {
+            return false;
+        }
+        match kind {
+            OperationKind::AcquireParticipationAdmissionTicket => {
+                self.admission
+                    .as_mut()
+                    .expect("matched Admission")
+                    .awaiting_outcome = true
+            }
+            OperationKind::UpdateParticipation => {
+                self.establish
+                    .as_mut()
+                    .expect("matched Establish")
+                    .awaiting_outcome = true
+            }
+            _ => unreachable!("matched lifecycle request"),
+        }
+        true
+    }
+
     /// Rolls back a lifecycle request that never crossed process queue
     /// admission.
     ///

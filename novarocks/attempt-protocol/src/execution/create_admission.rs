@@ -27,6 +27,7 @@ use crate::{
     operation::OperationDispatchResult,
 };
 use novarocks_execution_contract::{OperationKind, TaskIdentity, TaskOperationId};
+use std::ops::Bound::{Excluded, Unbounded};
 
 /// One pre-registered row per original Create operation. Its passive result
 /// identity remains reachable after dispatcher credit retires and before a
@@ -156,7 +157,22 @@ impl QueryTaskExecution {
             self.create_admissions.remove(&operation);
             return Ok(CreateGrantProgress::Release(grant));
         }
+        self.create_granted.insert(operation);
         self.advance_create_grant(operation)
+    }
+
+    pub(crate) fn next_create_grant(
+        &self,
+        after: Option<TaskOperationId>,
+    ) -> Option<TaskOperationId> {
+        match after {
+            Some(after) => self
+                .create_granted
+                .range((Excluded(after), Unbounded))
+                .next()
+                .copied(),
+            None => self.create_granted.first().copied(),
+        }
     }
 
     /// Called after charging this exact row. A full local queue or deployment
@@ -174,6 +190,7 @@ impl QueryTaskExecution {
         };
         let task = row.task;
         let Some(candidate) = self.create_candidate_for_task(task)? else {
+            self.create_granted.remove(&operation);
             self.create_admissions.remove(&operation);
             return Ok(CreateGrantProgress::Release(grant));
         };
@@ -195,6 +212,7 @@ impl QueryTaskExecution {
             .entry(task.backend_process_id())
             .or_default()
             .insert(task);
+        self.create_granted.remove(&operation);
         self.create_admissions.remove(&operation);
         Ok(CreateGrantProgress::Queued)
     }
@@ -281,7 +299,6 @@ impl QueryTaskExecution {
         &mut self,
         after: Option<TaskOperationId>,
     ) -> Option<(TaskOperationId, Option<EffectBody>)> {
-        use std::ops::Bound::{Excluded, Unbounded};
         let (&operation, _) = match after {
             Some(after) => self
                 .create_admissions
@@ -307,6 +324,7 @@ impl QueryTaskExecution {
                 })
             }
             Phase::Granted(grant) => {
+                self.create_granted.remove(&operation);
                 self.create_admissions.remove(&operation);
                 Some(EffectBody::ReleaseQueuedInput { grant })
             }

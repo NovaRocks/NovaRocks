@@ -451,6 +451,8 @@ pub struct AttemptInputClaim {
 pub enum AttemptInput {
     /// The original paid first step installs the initial Native preference.
     Bootstrap,
+    /// The original drive is bound and all permanent Sources are installed.
+    StartProtocol,
     Executor(ExecutorFact),
     Port(LogicalToAttempt<AttemptFailure>),
     Membership(MembershipView),

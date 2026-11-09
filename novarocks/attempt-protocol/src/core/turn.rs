@@ -83,6 +83,7 @@ enum Phase {
     Tail,
     Converge,
     ClosingGate,
+    Candidates,
 }
 
 #[derive(Debug)]
@@ -195,6 +196,11 @@ impl AttemptCore for Core {
             Phase::Idle if self.execution.has_pending_terminal_cleanup() => {
                 Some(self.execution.monotonic_now())
             }
+            Phase::Candidates if self.authorizations.waiting_for_reply() => None,
+            Phase::Candidates => Some(self.execution.monotonic_now()),
+            Phase::Idle if self.candidates.wake && !self.stop.business_closed() => {
+                Some(self.execution.monotonic_now())
+            }
             Phase::Idle if self.aborts.has_pending() => Some(self.execution.monotonic_now()),
             Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
                 Some(self.execution.monotonic_now())
@@ -239,12 +245,12 @@ impl Core {
             {
                 Only(self.sources.publication)
             }
-            Phase::Tail | Phase::Idle | Phase::ClosingGate
+            Phase::Tail | Phase::Idle | Phase::ClosingGate | Phase::Candidates
                 if self.authorizations.waiting_for_reply() =>
             {
                 Only(self.sources.qa)
             }
-            Phase::Tail | Phase::ClosingGate => Only(self.sources.actor),
+            Phase::Tail | Phase::ClosingGate | Phase::Candidates => Only(self.sources.actor),
             Phase::Converge if self.convergence.waiting_for_process() => Only(self.sources.process),
             Phase::Converge => Only(self.sources.actor),
             Phase::Idle if self.stop.pending() => Only(self.sources.actor),
@@ -417,6 +423,17 @@ impl Core {
                 self.apply_terminal(now, claim, input, wake, context, result)?
             }
             Phase::Tail => self.apply_tail(now, claim, input, context, result)?,
+            Phase::Candidates if timer => self.drive_candidates(context, result)?,
+            Phase::Candidates => {
+                self.verify_source(claim.source, self.sources.qa)?;
+                let AttemptInput::Port(port) = input else {
+                    return Err(schedule("candidate awaited its original QA reply"));
+                };
+                self.accept_qa(port, result)?;
+                if self.turn.phase == Phase::Candidates {
+                    self.drive_candidates(context, result)?;
+                }
+            }
             Phase::ClosingGate if timer => self.drive_gate_close(context, result)?,
             Phase::ClosingGate => {
                 self.verify_source(claim.source, self.sources.qa)?;
@@ -467,6 +484,20 @@ impl Core {
         result: &mut AttemptStep,
     ) -> Result<bool, TaskExecutionError> {
         match input {
+            AttemptInput::StartProtocol => {
+                self.verify_source(claim.source, self.sources.actor)?;
+                if self.candidates.enabled
+                    || self.turn.phase != Phase::Idle
+                    || self.stop.business_closed()
+                {
+                    return Err(schedule(
+                        "attempt protocol drive was already started or closed",
+                    ));
+                }
+                self.candidates.enabled = true;
+                self.candidates.wake = true;
+            }
+
             AttemptInput::Port(port) => match &port.body {
                 LogicalToAttemptBody::PreReadyReplacementChanged { token } => {
                     self.verify_source(claim.source, self.sources.qa)?;
@@ -843,7 +874,12 @@ impl Core {
                     let cleanup = if self.aborts.owns(operation) {
                         self.aborts.grant(&mut self.execution, operation, grant)?
                     } else {
-                        match self.execution.observe_create_grant(operation, grant)? {
+                        let progress = if self.execution.has_lifecycle_admission(operation) {
+                            self.execution.observe_lifecycle_grant(operation, grant)?
+                        } else {
+                            self.execution.observe_create_grant(operation, grant)?
+                        };
+                        match progress {
                             CreateGrantProgress::Release(grant) => {
                                 Some(EffectBody::ReleaseQueuedInput { grant })
                             }
@@ -870,7 +906,11 @@ impl Core {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
-                    } else if self.execution.close_create_admission(operation, generation) {
+                    } else if self
+                        .execution
+                        .close_lifecycle_admission(operation, generation)
+                        || self.execution.close_create_admission(operation, generation)
+                    {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
@@ -1015,10 +1055,112 @@ impl Core {
                     self.turn.phase = Phase::Terminal(TerminalWake::Round);
                     self.drive_terminal(now, TerminalWake::Round, context, result)?;
                 } else {
-                    self.resume_after_terminal();
+                    if self.candidates.enabled
+                        && !self.stop.business_closed()
+                        && self.terminal.terminal().is_none()
+                    {
+                        self.candidates.begin_round();
+                        self.turn.phase = Phase::Candidates;
+                    } else {
+                        self.resume_after_terminal();
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn drive_candidates(
+        &mut self,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        use super::AuthorizationStep;
+        use super::candidates::Authorization;
+        if self.authorizations.waiting_for_reply() {
+            return Ok(());
+        }
+        if self.stop.business_closed() {
+            self.candidates.authorization = None;
+            self.candidates.wake = false;
+            self.resume_after_terminal();
+            return Ok(());
+        }
+        if self.candidates.authorization.is_some() {
+            if !context.charge(1) {
+                return Ok(());
+            }
+            let Some(Authorization::Ready(intent)) = self.candidates.authorization.take() else {
+                return Err(schedule("candidate lost its original authorization result"));
+            };
+            let (id, _) = self.turn.issue()?;
+            result.effect = Some(self.execution.begin_lifecycle_admission(intent, id)?);
+            self.candidates.creates = true;
+            self.candidates.wake = self
+                .execution
+                .participation_after(self.candidates.participant_after)
+                .is_some();
+            return Ok(());
+        }
+        while !self.candidates.creates {
+            let Some(participation) = self
+                .execution
+                .participation_after(self.candidates.participant_after)
+            else {
+                self.candidates.creates = true;
+                break;
+            };
+            if !context.charge(1) {
+                return Ok(());
+            }
+            self.candidates.participant_after = Some(participation);
+            let Some(intent) = self.execution.next_authorization_intent(
+                participation,
+                self.establish_material[&participation],
+            )?
+            else {
+                continue;
+            };
+            let (id, token) = self.turn.issue()?;
+            match self.authorize_candidate(&intent, token, id)? {
+                AuthorizationStep::Request(effect) => {
+                    self.candidates.authorization = Some(Authorization::Waiting(intent));
+                    result.effect = Some(effect);
+                    return Ok(());
+                }
+                AuthorizationStep::Ready => {
+                    result.effect = Some(self.execution.begin_lifecycle_admission(intent, id)?);
+                    self.candidates.creates = true;
+                    self.candidates.wake = self
+                        .execution
+                        .participation_after(self.candidates.participant_after)
+                        .is_some();
+                    return Ok(());
+                }
+                AuthorizationStep::Waiting | AuthorizationStep::Retired => {
+                    return Err(schedule(
+                        "candidate crossed its original QA authorization phase",
+                    ));
+                }
+            }
+        }
+        while let Some(task) = self
+            .execution
+            .graph()
+            .task_after(self.candidates.task_after)
+            .map(|task| task.identity())
+        {
+            if !context.charge(1) {
+                return Ok(());
+            }
+            self.candidates.task_after = Some(task.task_id());
+            let (id, _) = self.turn.issue()?;
+            if let Some(effect) = self.execution.begin_create_admission(task, id)? {
+                result.effect = Some(effect);
+                return Ok(());
+            }
+        }
+        self.resume_after_terminal();
         Ok(())
     }
 
@@ -1213,6 +1355,19 @@ impl Core {
         }
         match self.apply_qa_reply(port)? {
             QaReply::ObserverComplete { retire } => result.retired_authorization = retire,
+            QaReply::Authorized(operation) if self.turn.phase == Phase::Candidates => {
+                use super::candidates::Authorization;
+                let Some(Authorization::Waiting(intent)) = self.candidates.authorization.take()
+                else {
+                    return Err(schedule("QA reply lacks its original candidate"));
+                };
+                if intent.operation_id() != operation {
+                    return Err(schedule(
+                        "QA reply authorized a different original candidate",
+                    ));
+                }
+                self.candidates.authorization = Some(Authorization::Ready(intent));
+            }
             QaReply::ClosingFailed(failure) => {
                 self.record_terminal_failure(failure)?;
                 self.turn.phase = Phase::Terminal(
@@ -1224,7 +1379,8 @@ impl Core {
             }
             QaReply::AuthorizationFailed { failure, .. } => {
                 self.record_terminal_failure(failure)?;
-                if self.turn.phase == Phase::Idle {
+                if matches!(self.turn.phase, Phase::Idle | Phase::Candidates) {
+                    self.candidates.authorization = None;
                     self.turn.phase = Phase::Terminal(TerminalWake::Round);
                 }
             }

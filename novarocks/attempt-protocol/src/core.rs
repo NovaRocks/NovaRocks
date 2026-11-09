@@ -18,6 +18,7 @@
 //! The serial owner of the frozen attempt's protocol components.
 
 mod abort;
+mod candidates;
 mod round_tail;
 mod stop;
 mod subscriptions;
@@ -82,6 +83,7 @@ pub struct Core {
     round_tail: RoundTail,
     stop: stop::StopWithdrawals,
     aborts: abort::Aborts,
+    candidates: candidates::Candidates,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
@@ -235,6 +237,7 @@ impl Core {
             round_tail: RoundTail::default(),
             stop: stop::StopWithdrawals::default(),
             aborts: abort::Aborts::default(),
+            candidates: candidates::Candidates::default(),
             establish_material,
             retry,
             pumps,
@@ -293,6 +296,7 @@ impl Core {
             {
                 self.execution
                     .dispatched_participation(observation.reply.operation_id())
+                    .or_else(|| self.execution.prior_lifecycle_receipt(observation))
             }
             _ => None,
         };
@@ -356,7 +360,12 @@ impl Core {
                 operation,
                 generation,
             } => {
-                self.execution.close_create_admission(operation, generation);
+                if !self
+                    .execution
+                    .close_lifecycle_admission(operation, generation)
+                {
+                    self.execution.close_create_admission(operation, generation);
+                }
                 return Ok(());
             }
             _ => return Err(schedule("transport withdrawal received an unrelated fact")),
@@ -2159,6 +2168,345 @@ mod tests {
         let done = step(&mut core, sources.actor, 8, AttemptInput::Timer);
         assert!(done.effect.is_none());
         assert_eq!(core.next_deadline(), None);
+    }
+
+    #[test]
+    fn original_drive_replays_admission_before_establish_and_create() {
+        use crate::{
+            AttemptCore,
+            capacity::ReservationToken,
+            effect::{OperationIntent, Publication},
+            input::{
+                AckPayload, AttemptInput, AttemptInputClaim, LocalDispatchResult,
+                OperationObservation, OperationReply, OperationReplyResult, QueuedInputGrantRef,
+            },
+        };
+        use novarocks_coordination_contract::{
+            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
+            AttemptToLogicalBody,
+        };
+        use novarocks_execution_contract::{
+            AdmissionTicketId, OperationKind, OperationOutcome,
+            ParticipationAdmissionTicketReceipt, operation::OperationResult,
+        };
+        use std::cell::Cell;
+
+        struct Turn;
+        impl StepContext for Turn {
+            fn charge(&mut self, _: usize) -> bool {
+                true
+            }
+
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                control: bool,
+                _: BackendProcessId,
+                records: usize,
+                _: usize,
+            ) -> QueueStage {
+                assert!(!control);
+                assert_eq!(records, 1);
+                QueueStage::Granted(ReservationToken(id(39)))
+            }
+        }
+
+        let mut start = start();
+        let root = start.plan.graph.root;
+        start.plan.graph.tasks.retain(|id, _| *id == root.task_id());
+        start
+            .plan
+            .graph
+            .stages
+            .retain(|id, _| *id == root.stage_id());
+        start.plan.graph.edges.clear();
+        let participation = start.plan.graph.tasks[&root.task_id()].participation;
+        start
+            .plan
+            .establish_material
+            .retain(|key, _| *key == participation);
+        start
+            .plan
+            .admission_epochs
+            .retain(|key, _| *key == root.backend_process_id());
+        start
+            .plan
+            .preparation_positions
+            .retain(|key, _| *key == root.backend_process_id());
+        let sources = start.sources;
+        let now = start.initial_now;
+        let activation = start.activation.identity;
+        let mut core = Core::new(start).unwrap();
+        let sequence = Cell::new(0);
+        let step = |core: &mut Core, source, input| {
+            sequence.set(sequence.get() + 1);
+            let input_id = AttemptInputId(id(sequence.get()));
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: input_id,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: (source == sources.native).then_some(input_id),
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: None,
+                    }),
+                },
+                input,
+                &mut Turn,
+            )
+            .unwrap()
+        };
+        let drive = |core: &mut Core| {
+            let mut next = None;
+            for _ in 0..16 {
+                let current = next.take().unwrap_or_else(|| {
+                    assert_eq!(core.next_deadline(), Some(now));
+                    step(core, sources.actor, AttemptInput::Timer)
+                });
+                match current.effect {
+                    Some(AttemptEffect {
+                        id: effect,
+                        body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+                        ..
+                    }) => {
+                        next = Some(step(
+                            core,
+                            sources.publication,
+                            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                effect,
+                                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+                            }),
+                        ));
+                    }
+                    Some(effect) => return effect,
+                    None => {}
+                }
+            }
+            panic!("the original candidate produced no effect");
+        };
+        let idle = |core: &mut Core| {
+            for _ in 0..16 {
+                let turn = step(core, sources.actor, AttemptInput::Timer);
+                assert!(turn.effect.is_none(), "{turn:?}");
+                if turn.selection == InputSelection::Prefer(sources.native) {
+                    return;
+                }
+            }
+            panic!("the original round did not return to its Native input");
+        };
+        let qa_reply = |core: &mut Core, token, decision| {
+            step(
+                core,
+                sources.qa,
+                AttemptInput::Port(LogicalToAttempt {
+                    activation,
+                    body: LogicalToAttemptBody::AuthorizationReply {
+                        token,
+                        decision: Ok(decision),
+                    },
+                }),
+            )
+        };
+        let accept_grant = |core: &mut Core, intent: &OperationIntent, grant| {
+            step(
+                core,
+                sources.actor,
+                AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                    operation: intent.operation_id(),
+                    grant,
+                    queued_bytes: intent.queued_bytes(),
+                }),
+            )
+        };
+
+        step(&mut core, sources.actor, AttemptInput::Bootstrap);
+        assert_eq!(core.next_deadline(), None);
+        step(&mut core, sources.actor, AttemptInput::StartProtocol);
+        let EffectBody::Port(port) = drive(&mut core).body else {
+            panic!("the original participant did not request QA admission");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request: AttemptAuthorization::BeginAdmission(request),
+        } = port.body
+        else {
+            panic!("expected the original admission request");
+        };
+        assert_eq!(request.participation(), participation);
+        let issue = AttemptAuthorizationRef::new(id(70));
+        let Some(AttemptEffect {
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation,
+                    generation,
+                    ..
+                },
+            ..
+        }) = qa_reply(
+            &mut core,
+            token,
+            AttemptAuthorizationDecision::AdmissionStarted(issue),
+        )
+        .effect
+        else {
+            panic!("expected a fresh WC generation after actual QA permission");
+        };
+        let first = QueuedInputGrantRef::new(id(71), generation);
+        idle(&mut core);
+        assert!(accept_grant(&mut core, &operation, first).effect.is_none());
+        assert!(matches!(drive(&mut core).body,
+            EffectBody::SendBatch { batch, .. } if batch.queued_inputs.as_ref() == [first]));
+        idle(&mut core);
+
+        let operation_id = request.envelope().operation_id();
+        let observation = |result| {
+            AttemptInput::Executor(ExecutorFact::Operation(OperationObservation {
+                generation,
+                reply: OperationReply {
+                    operation_id,
+                    kind: OperationKind::AcquireParticipationAdmissionTicket,
+                    result,
+                },
+            }))
+        };
+        let unknown = || {
+            observation(OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            })
+        };
+        step(&mut core, sources.native, unknown());
+        let AttemptEffect {
+            id: replay_admission,
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation: replay,
+                    generation: replay_generation,
+                    ..
+                },
+            ..
+        } = drive(&mut core)
+        else {
+            panic!("the replay did not request its own WC generation");
+        };
+        assert_eq!(replay.operation_id(), operation_id);
+        assert!(replay_generation > generation);
+        idle(&mut core);
+
+        assert!(step(&mut core, sources.native, unknown()).effect.is_none());
+        idle(&mut core);
+        let ticket = ParticipationAdmissionTicketReceipt::new(
+            AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+            participation,
+            request.valid_for(),
+        );
+        assert!(
+            matches!(step(&mut core, sources.native, observation(OperationReplyResult::Worker(
+            OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: Some(AckPayload::AdmissionTicket(ticket)),
+            },
+        ))).effect, Some(AttemptEffect {
+            body: EffectBody::Withdraw { effect }, ..
+        }) if effect == replay_admission)
+        );
+        let EffectBody::Port(port) = drive(&mut core).body else {
+            panic!("late receipt did not settle the original QA issue");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request:
+                AttemptAuthorization::SettleAdmission {
+                    issue: original,
+                    operation_id: actual,
+                    ..
+                },
+        } = port.body
+        else {
+            panic!("expected settlement of the original Admission operation");
+        };
+        assert_eq!(actual, operation_id);
+        assert_eq!(original, issue);
+        assert!(
+            qa_reply(
+                &mut core,
+                token,
+                AttemptAuthorizationDecision::AdmissionGranted
+            )
+            .effect
+            .is_none()
+        );
+
+        let EffectBody::EstablishAuthorization { operation, request } = drive(&mut core).body
+        else {
+            panic!("the original participant did not request Establish permission");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest { token, .. } = request.body else {
+            panic!("expected the exact Establish QA request");
+        };
+        let Some(AttemptEffect {
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation: admitted,
+                    generation,
+                    ..
+                },
+            ..
+        }) = qa_reply(
+            &mut core,
+            token,
+            AttemptAuthorizationDecision::EstablishAuthorized(AttemptAuthorizationRef::new(id(72))),
+        )
+        .effect
+        else {
+            panic!("expected separate WC admission for Establish");
+        };
+        assert_eq!(admitted.operation_id(), operation.operation_id());
+        let establish = QueuedInputGrantRef::new(id(73), generation);
+        idle(&mut core);
+        assert!(
+            accept_grant(&mut core, &operation, establish)
+                .effect
+                .is_none()
+        );
+        let AttemptEffect {
+            id: send,
+            body: EffectBody::SendBatch { batch, .. },
+            ..
+        } = drive(&mut core)
+        else {
+            panic!("expected exact Establish dispatch");
+        };
+        assert_eq!(batch.queued_inputs.as_ref(), [establish]);
+        idle(&mut core);
+
+        let late_grant = QueuedInputGrantRef::new(id(74), replay_generation);
+        assert!(matches!(
+            accept_grant(&mut core, &replay, late_grant).effect,
+            Some(AttemptEffect {
+                body: EffectBody::ReleaseQueuedInput { grant }, ..
+            }) if grant == late_grant
+        ));
+        idle(&mut core);
+        step(
+            &mut core,
+            sources.native,
+            AttemptInput::Executor(ExecutorFact::EstablishRpcStarted {
+                effect: send,
+                operation: operation.operation_id(),
+                participation,
+                started_at: now,
+            }),
+        );
+        assert!(matches!(drive(&mut core).body,
+            EffectBody::AdmitQueuedInput { operation: create, .. } if create.kind() == OperationKind::CreateTask));
     }
 
     #[test]
