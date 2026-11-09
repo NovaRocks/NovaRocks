@@ -1029,6 +1029,10 @@ impl QueryTaskExecution {
     pub(crate) fn queue_deadline(&self) -> Option<MonotonicInstant> {
         self.dispatcher.queue_deadline()
     }
+    pub(crate) fn has_released_native_input(&self) -> bool {
+        self.dispatcher.has_released_grant()
+    }
+
     pub(crate) fn take_released_native_input(&mut self) -> Option<QueuedInputGrantRef> {
         self.dispatcher.take_released_grant()
     }

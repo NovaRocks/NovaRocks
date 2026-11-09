@@ -17,7 +17,9 @@
 
 //! The serial owner of the frozen attempt's protocol components.
 
+mod round_tail;
 mod subscriptions;
+use round_tail::RoundTail;
 use subscriptions::{SubscriptionStep, Subscriptions};
 
 use crate::{
@@ -70,6 +72,7 @@ pub(crate) struct Core {
     authorizations: AuthorizationGate,
     dispatch: BatchDispatchPass,
     round_failure: Option<AttemptFailure>,
+    round_tail: RoundTail,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
     pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
@@ -209,6 +212,7 @@ impl Core {
             authorizations,
             dispatch: BatchDispatchPass::new(),
             round_failure: None,
+            round_tail: RoundTail::default(),
             establish_material,
             retry,
             pumps,
@@ -226,6 +230,7 @@ impl Core {
         if self.authorizations.waiting_for_reply()
             || self.publication.has_pending_apply()
             || self.subscriptions.assembling()
+            || !self.round_tail.is_idle()
         {
             return Err(schedule(
                 "Native acknowledgement crossed an outstanding actual reply",
@@ -360,6 +365,7 @@ impl Core {
         if self.acknowledgements.run_round_tail() != Ok(true)
             || !self.publication.permits_protocol_turn()
             || self.subscriptions.assembling()
+            || !self.round_tail.is_idle()
         {
             return Err(schedule(
                 "ordered observation crossed an unfinished round phase",
@@ -1349,6 +1355,161 @@ mod tests {
             SubscriptionStep::Effect(AttemptEffect { body: EffectBody::OpenSubscription(request), .. })
                 if request.generation.get() == generation.get() + 1
         ));
+    }
+
+    #[test]
+    fn round_tail_waits_for_publication_then_releases_expired_grant_before_qa() {
+        use super::round_tail::RoundTailStep;
+        use crate::{
+            execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
+            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+            input::{QueuedInputGrantRef, SendGeneration},
+        };
+        use novarocks_coordination_contract::{
+            AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
+            AttemptAuthorizationRef, AttemptFailureClass, AttemptToLogicalBody,
+        };
+        use novarocks_execution_contract::OperationOutcome;
+
+        let start = start();
+        let native = start.sources.native;
+        let now = start.initial_now;
+        let expiry = now.saturating_add(Duration::from_secs(5));
+        let mut core = Core::new(start).unwrap();
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let action = |n| AttemptActionId::new(id(n));
+        let token = |n| AttemptRequestToken::new(id(n));
+        let activation = core.activation;
+        let qa_reply = |n, decision| LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token: token(n),
+                decision,
+            },
+        };
+        let request = admission_intent(&mut core.execution, participation);
+        core.authorize_candidate(
+            &OperationIntent::AcquireParticipationAdmissionTicket(request),
+            token(1),
+            action(1),
+        )
+        .unwrap();
+        let issue = AttemptAuthorizationRef::new(id(9));
+        core.apply_qa_reply(qa_reply(
+            1,
+            Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
+        ))
+        .unwrap();
+        let original =
+            dispatch_admission(&mut core.execution, request, 1, OperationOutcome::Accepted);
+        let tail = AttemptInputId(id(2));
+        core.begin_native_prefix(
+            now,
+            NativeSourceCut {
+                source: native,
+                tail: Some(tail),
+            },
+        )
+        .unwrap();
+        assert_eq!(core.next_round_deadline(), None);
+        assert!(core.begin_round_tail(true).is_err());
+        core.apply_native(
+            now,
+            native,
+            tail,
+            &ExecutorFact::Operation(original.clone()),
+            |_, _| panic!("no Abort in the original prefix"),
+        )
+        .unwrap();
+
+        let grant = QueuedInputGrantRef::new(id(5), SendGeneration::new(action(5)));
+        let expiring = queue_establish(&mut core.execution, participation, grant);
+        assert_eq!(core.next_round_deadline(), Some(expiry));
+        core.begin_round_tail(true).unwrap();
+        assert!(matches!(
+            core.advance_round_tail(expiry, action(10), token(10), &mut Units(0))
+                .unwrap(),
+            RoundTailStep::Yield
+        ));
+        assert!(seal(&mut core).is_err());
+        let RoundTailStep::Effect(AttemptEffect {
+            body: EffectBody::Publish(crate::effect::Publication::ProtocolBatch(_)),
+            id: publication,
+            ..
+        }) = core
+            .advance_round_tail(expiry, action(10), token(10), &mut Units(1))
+            .unwrap()
+        else {
+            panic!("original protocol publisher runs before the expired queue cut");
+        };
+        assert_eq!(core.next_round_deadline(), None);
+        assert_eq!(
+            core.protocol_publication_applied(publication, Ok(PublicationApplied::RootStatus)),
+            PublicationApplyDisposition::Stale
+        );
+        assert!(matches!(
+            core.advance_round_tail(expiry, action(11), token(11), &mut NoTraversal)
+                .unwrap(),
+            RoundTailStep::AwaitPublication
+        ));
+        core.protocol_publication_applied(
+            publication,
+            Ok(PublicationApplied::ProtocolBatch { published: true }),
+        );
+        assert_eq!(core.next_round_deadline(), Some(expiry));
+        assert!(matches!(
+            core.advance_round_tail(expiry, action(11), token(11), &mut Units(1))
+                .unwrap(),
+            RoundTailStep::Yield
+        ));
+        assert_eq!(core.execution.dispatcher().queued_items(), 1);
+
+        let later = expiry.saturating_add(Duration::from_secs(3));
+        assert!(matches!(
+            core.advance_round_tail(later, action(12), token(12), &mut Units(16)).unwrap(),
+            RoundTailStep::Effect(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant: returned }, .. })
+                if returned == grant
+        ));
+        let RoundTailStep::Effect(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = core
+            .advance_round_tail(later, action(13), token(13), &mut Units(4))
+            .unwrap()
+        else {
+            panic!("expected exact Admission QA settlement after expiry");
+        };
+        assert!(
+            matches!(port.body, AttemptToLogicalBody::AuthorizationRequest {
+            token: request_token,
+            request: AttemptAuthorization::SettleAdmission { issue: original_issue, operation_id, .. },
+        } if request_token == token(13) && original_issue == issue && operation_id == original.reply.operation_id())
+        );
+        assert_eq!(core.next_round_deadline(), None);
+        assert!(matches!(
+            core.advance_round_tail(later, action(14), token(14), &mut NoTraversal)
+                .unwrap(),
+            RoundTailStep::AwaitQa
+        ));
+
+        let later_error = AttemptFailure::Host(HostProjectedFailure {
+            original: HostFailureRef(id(40)),
+            kind: HostFailureKind::LogicalActor,
+            class: AttemptFailureClass::ExecutionFailure,
+            site: AttemptFailureSite::Attempt,
+        });
+        core.apply_qa_reply(qa_reply(
+            13,
+            Err(AttemptAuthorizationFailure::Rejected(later_error)),
+        ))
+        .unwrap();
+        assert!(matches!(
+            core.advance_round_tail(later, action(14), token(14), &mut NoTraversal).unwrap(),
+            RoundTailStep::Complete(Err(AttemptFailure::TaskProtocol(error)))
+                if matches!(*error, TaskExecutionError::QueueResidenceExpired { operation_id, waited, .. }
+                    if operation_id == expiring.operation_id() && waited == Duration::from_secs(5))
+        ));
+        assert_eq!(core.next_round_deadline(), None);
     }
 
     struct Units(usize);

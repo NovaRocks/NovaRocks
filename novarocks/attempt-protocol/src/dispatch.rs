@@ -606,6 +606,10 @@ impl OperationDispatcher {
         Ok(intent)
     }
 
+    pub(crate) fn has_released_grant(&self) -> bool {
+        !self.released_grants.is_empty()
+    }
+
     pub(crate) fn take_released_grant(&mut self) -> Option<QueuedInputGrantRef> {
         self.released_grants.pop()
     }
