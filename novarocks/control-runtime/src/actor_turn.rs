@@ -3143,11 +3143,18 @@ impl<A: Actor> ActorRuntime<A> {
                                 source,
                                 tail: inbox.mailbox.tail_from(source),
                             });
+                            let selected_cut =
+                                inbox.input_source.contending_source().map(|source| {
+                                    InputSourceCut {
+                                        source,
+                                        tail: inbox.mailbox.tail_from(source),
+                                    }
+                                });
                             inbox
                                 .pop_selected(node.id, class)
-                                .map(|input| (input, source_cut))
+                                .map(|input| (input, source_cut, selected_cut))
                         })
-                        .map(|(input, source_cut)| {
+                        .map(|(input, source_cut, selected_cut)| {
                             let original =
                                 inbox.inputs.get_mut(&input.input).expect("filled input");
                             original.phase = InputPhase::Consuming;
@@ -3156,11 +3163,11 @@ impl<A: Actor> ActorRuntime<A> {
                                 .payloads
                                 .remove(&input.input)
                                 .expect("filled input owns its neutral payload");
-                            (input, value, handoff_at, source_cut)
+                            (input, value, handoff_at, source_cut, selected_cut)
                         })
                 }
             };
-            let Some((input, value, handoff_at, source_cut)) = next else {
+            let Some((input, value, handoff_at, source_cut, selected_cut)) = next else {
                 break;
             };
             let observed = clock.map_or(observed, Clock::now);
@@ -3183,6 +3190,7 @@ impl<A: Actor> ActorRuntime<A> {
                 node.config.max_step_work,
             );
             step.set_input_source_cut(source_cut);
+            step.set_selected_source_cut(selected_cut);
             step.set_failure_work(node.scope.failure_work());
             let input_author = node
                 .inbox

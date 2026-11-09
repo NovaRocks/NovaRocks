@@ -51,6 +51,7 @@ fn quota(value: u64) -> ResourceVector {
 struct Record {
     input: InputEnvelope,
     cut: Option<InputSourceCut>,
+    selected: Option<InputSourceCut>,
 }
 struct Recorder {
     seen: Arc<Mutex<Vec<Record>>>,
@@ -71,6 +72,7 @@ impl Actor for Recorder {
         self.seen.lock().unwrap().push(Record {
             input,
             cut: step.input_source_cut(),
+            selected: step.selected_source_cut(),
         });
         if input.class == InputClass::Timer {
             self.deadline = None;
@@ -469,6 +471,22 @@ fn frozen_tail_and_source_selection_complete_the_original_prefix_before_a_late_i
     assert_eq!(after_tail[1].input.class, InputClass::Control);
     assert_eq!(
         after_tail[1].cut,
+        Some(InputSourceCut {
+            source: watched(),
+            tail: Some(late)
+        })
+    );
+    assert_eq!(first_claim[0].selected, None);
+    assert_eq!(after_tail[1].selected, after_tail[1].cut);
+    assert_eq!(
+        after_phase[2].selected,
+        Some(InputSourceCut {
+            source: other(),
+            tail: Some(phase_input)
+        })
+    );
+    assert_eq!(
+        after_phase[2].cut,
         Some(InputSourceCut {
             source: watched(),
             tail: Some(late)

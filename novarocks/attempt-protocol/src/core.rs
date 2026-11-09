@@ -19,8 +19,10 @@
 
 mod round_tail;
 mod subscriptions;
+mod turn;
 use round_tail::RoundTail;
 use subscriptions::{SubscriptionStep, Subscriptions};
+pub use turn::{AttemptStep, InputSelection};
 
 use crate::{
     authorization::gate::{AuthorizationGate, AuthorizationStep, ObserverStep, QaReply},
@@ -35,7 +37,7 @@ use crate::{
     graph::TaskGraph,
     ids::OperationIds,
     input::{
-        AttemptInputId, AttemptSourceId, ExecutorFact, NativeSourceCut, ObservationBatch,
+        AttemptInputId, AttemptSourceCut, AttemptSourceId, ExecutorFact, ObservationBatch,
         ObservationEvent, ObservationFact, OperationObservation, PublicationApplied,
     },
     lease::RequestedLeaseDurations,
@@ -58,8 +60,11 @@ use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
-pub(crate) struct Core {
+pub struct Core {
     activation: AttemptActivationIdentity,
+    sources: AttemptSources,
+    turn: turn::Turn,
+    maximum_send_members: usize,
     observation_source: AttemptSourceId,
     execution: QueryTaskExecution,
     acknowledgements: NativeAckPhase,
@@ -116,12 +121,7 @@ impl Core {
             plan,
             ids,
             initial_now,
-            sources:
-                AttemptSources {
-                    native,
-                    observation,
-                    mailbox,
-                },
+            sources,
         } = start;
         let FrozenAttemptPlan {
             graph,
@@ -140,8 +140,20 @@ impl Core {
             initial_lease,
             steady_lease,
         } = plan;
+        let AttemptSources {
+            actor,
+            publication: publication_source,
+            qa,
+            native,
+            observation,
+            mailbox,
+        } = sources;
+        let distinct = [actor, publication_source, qa, native, observation];
         let graph = TaskGraph::from_frozen(graph)?;
-        if native == observation
+        if distinct
+            .iter()
+            .enumerate()
+            .any(|(index, source)| distinct[..index].contains(source))
             || authorization_limits.activation != activation.identity
             || deployment_window.get() != coordination.dispatch.create_permits()
             || !establish_material.keys().eq(graph.participations())
@@ -200,6 +212,9 @@ impl Core {
             .map_err(|_| schedule("invalid Native acknowledgement mailbox geometry"))?;
         Ok(Self {
             activation: activation.identity,
+            sources,
+            turn: turn::Turn::default(),
+            maximum_send_members: transport.max_batch_items,
             observation_source: observation,
             execution,
             acknowledgements,
@@ -225,7 +240,7 @@ impl Core {
     pub(crate) fn begin_native_prefix(
         &mut self,
         now: MonotonicInstant,
-        cut: NativeSourceCut,
+        cut: AttemptSourceCut,
     ) -> Result<(), TaskExecutionError> {
         if self.authorizations.waiting_for_reply()
             || self.publication.has_pending_apply()
@@ -792,6 +807,9 @@ mod tests {
             ids: IdSeed::new(1, 100),
             initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
             sources: AttemptSources {
+                actor: AttemptSourceId(id(3)),
+                publication: AttemptSourceId(id(4)),
+                qa: AttemptSourceId(id(5)),
                 native: AttemptSourceId(id(7)),
                 observation: AttemptSourceId(id(8)),
                 mailbox: [4; 4],
@@ -805,7 +823,7 @@ mod tests {
         let now = start.initial_now;
         let mut core = Core::new(start).unwrap();
         assert_eq!(core.execution.monotonic_now(), now);
-        core.begin_native_prefix(now, NativeSourceCut { source, tail: None })
+        core.begin_native_prefix(now, AttemptSourceCut { source, tail: None })
             .unwrap();
         core
     }
@@ -993,7 +1011,7 @@ mod tests {
         let tail = AttemptInputId(id(2));
         core.begin_native_prefix(
             now,
-            NativeSourceCut {
+            AttemptSourceCut {
                 source: native,
                 tail: Some(tail),
             },
@@ -1147,7 +1165,7 @@ mod tests {
         ));
         core.begin_native_prefix(
             now,
-            NativeSourceCut {
+            AttemptSourceCut {
                 source: native,
                 tail: None,
             },
@@ -1405,7 +1423,7 @@ mod tests {
         let tail = AttemptInputId(id(2));
         core.begin_native_prefix(
             now,
-            NativeSourceCut {
+            AttemptSourceCut {
                 source: native,
                 tail: Some(tail),
             },
@@ -1510,6 +1528,252 @@ mod tests {
                     if operation_id == expiring.operation_id() && waited == Duration::from_secs(5))
         ));
         assert_eq!(core.next_round_deadline(), None);
+    }
+
+    #[test]
+    fn unified_step_keeps_frozen_native_prefix_and_observation_claim_order() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        let start = start();
+        let now = start.initial_now;
+        let sources = start.sources;
+        let activation = start.activation.identity;
+        let mut core = <Core as AttemptCore>::new(start).unwrap();
+        let input_id = |n| AttemptInputId(id(n));
+        let cut = |source, tail| Some(AttemptSourceCut { source, tail });
+        let claim = |source, n, native_tail, selected_cut| AttemptInputClaim {
+            source,
+            input: input_id(n),
+            native_cut: cut(sources.native, native_tail),
+            selected_cut,
+        };
+        let step =
+            |core: &mut Core, claim, input| core.handle(now, claim, input, &mut Units(32)).unwrap();
+        let bootstrap = step(
+            &mut core,
+            claim(sources.actor, 1, None, None),
+            AttemptInput::Bootstrap,
+        );
+        assert_eq!(bootstrap.selection, InputSelection::Prefer(sources.native));
+
+        // Timer is allowed to win the actor's own FIFO but cannot widen the
+        // original two-member Native cut, or drive a later phase early.
+        let tail = input_id(12);
+        let late = input_id(100);
+        let first = step(
+            &mut core,
+            claim(sources.actor, 2, Some(tail), None),
+            AttemptInput::Timer,
+        );
+        assert_eq!(first.selection, InputSelection::Only(sources.native));
+        assert_eq!(core.next_deadline(), None);
+        let started = || {
+            AttemptInput::Executor(ExecutorFact::SendStarted {
+                effect: AttemptActionId::new(id(50)),
+                started_at: now,
+            })
+        };
+        assert_eq!(
+            step(
+                &mut core,
+                claim(sources.native, 49, Some(late), None),
+                started()
+            )
+            .selection,
+            InputSelection::Only(sources.native)
+        );
+        assert_eq!(
+            step(
+                &mut core,
+                claim(sources.native, 12, Some(late), None),
+                started()
+            )
+            .selection,
+            InputSelection::Only(sources.observation)
+        );
+        let control = input_id(18);
+        let selected = cut(sources.observation, Some(control));
+        let wait = step(
+            &mut core,
+            claim(sources.actor, 3, Some(late), selected),
+            AttemptInput::Timer,
+        );
+        assert_eq!(wait.selection, InputSelection::Only(sources.observation));
+        assert!(wait.effect.is_none());
+        assert_eq!(core.next_deadline(), None);
+
+        let seal = AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::SealRequest {
+                token: AttemptRequestToken::new(id(19)),
+            },
+        });
+        let processed = step(
+            &mut core,
+            claim(sources.observation, 18, Some(late), selected),
+            seal,
+        );
+        assert_eq!(processed.root_control_processed, Some(control));
+        assert!(processed.effect.is_none());
+        assert!(core.root.pending());
+        assert_eq!(processed.selection, InputSelection::Only(sources.actor));
+        assert_eq!(core.next_deadline(), Some(now));
+
+        step(
+            &mut core,
+            claim(sources.actor, 4, Some(late), None),
+            AttemptInput::Timer,
+        );
+        let published = step(
+            &mut core,
+            claim(sources.actor, 5, Some(late), None),
+            AttemptInput::Timer,
+        );
+        let Some(AttemptEffect {
+            id: publication,
+            body: EffectBody::Publish(crate::effect::Publication::ProtocolBatch(_)),
+            ..
+        }) = published.effect
+        else {
+            panic!("original round must publish protocol facts");
+        };
+        assert_eq!(
+            published.selection,
+            InputSelection::Only(sources.publication)
+        );
+        assert_eq!(core.next_deadline(), None);
+        let actual = |kind| {
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: publication,
+                result: Ok(kind),
+            })
+        };
+        let wrong = step(
+            &mut core,
+            claim(sources.publication, 6, Some(late), None),
+            actual(PublicationApplied::RootStatus),
+        );
+        assert_eq!(wrong.selection, InputSelection::Only(sources.publication));
+        assert!(wrong.round_result.is_none());
+        let completed = step(
+            &mut core,
+            claim(sources.publication, 7, Some(late), None),
+            actual(PublicationApplied::ProtocolBatch { published: true }),
+        );
+        assert_eq!(completed.selection, InputSelection::Prefer(sources.native));
+        assert_eq!(completed.round_result, Some(Ok(())));
+        assert_eq!(core.next_deadline(), None);
+        // The later paid Native input can only open a new prefix now.
+        let next = step(
+            &mut core,
+            claim(sources.native, 100, Some(late), None),
+            started(),
+        );
+        assert_eq!(next.selection, InputSelection::Only(sources.observation));
+    }
+
+    #[test]
+    fn unified_step_emits_seal_only_after_matching_root_publication() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::AttemptToLogicalBody;
+
+        let mut core = round();
+        let root = core.execution.graph().root_identity();
+        let now = core.execution.monotonic_now();
+        let root_finished = frame(&mut core, root, TaskState::Finished, None);
+        core.apply_observations(
+            now,
+            core.observation_source,
+            ObservationBatch::new(vec![root_finished]).unwrap(),
+        )
+        .unwrap();
+        core.begin_ack_settlement(None).unwrap();
+        assert!(matches!(
+            core.advance_ack_settlement(
+                AttemptRequestToken::new(id(60)),
+                AttemptActionId::new(id(60)),
+                &mut NoTraversal
+            )
+            .unwrap(),
+            AckSettlementProgress::Complete(Ok(()))
+        ));
+
+        let sources = core.sources;
+        let activation = core.activation;
+        let step = |core: &mut Core, source, n, input| {
+            let claim = AttemptInputClaim {
+                source,
+                input: AttemptInputId(id(n)),
+                native_cut: Some(AttemptSourceCut {
+                    source: sources.native,
+                    tail: None,
+                }),
+                selected_cut: None,
+            };
+            core.handle(now, claim, input, &mut Units(12)).unwrap()
+        };
+        step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
+        let seal_token = AttemptRequestToken::new(id(22));
+        let processed = step(
+            &mut core,
+            sources.observation,
+            2,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::SealRequest { token: seal_token },
+            }),
+        );
+        assert_eq!(
+            processed.root_control_processed,
+            Some(AttemptInputId(id(2)))
+        );
+        assert!(processed.effect.is_none());
+        let root_work = step(&mut core, sources.actor, 3, AttemptInput::Timer);
+        let Some(AttemptEffect {
+            id: root_effect,
+            body: EffectBody::Publish(crate::effect::Publication::RootStatus(projection)),
+            ..
+        }) = root_work.effect
+        else {
+            panic!("expected original Root publisher effect");
+        };
+        assert_eq!(projection.status.identity(), root);
+        assert_eq!(
+            root_work.selection,
+            InputSelection::Only(sources.publication)
+        );
+
+        let publication = |kind| {
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: root_effect,
+                result: Ok(kind),
+            })
+        };
+        let wrong = step(
+            &mut core,
+            sources.publication,
+            4,
+            publication(PublicationApplied::ProtocolBatch { published: true }),
+        );
+        assert!(wrong.effect.is_none());
+        assert_eq!(wrong.selection, InputSelection::Only(sources.publication));
+        let applied = step(
+            &mut core,
+            sources.publication,
+            5,
+            publication(PublicationApplied::RootStatus),
+        );
+        assert_eq!(applied.selection, InputSelection::Only(sources.actor));
+        let settled = step(&mut core, sources.actor, 6, AttemptInput::Timer);
+        assert!(
+            matches!(settled.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::SealResult { token, result: Ok(_) } if token == seal_token))
+        );
     }
 
     struct Units(usize);

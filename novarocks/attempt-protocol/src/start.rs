@@ -116,6 +116,9 @@ pub struct AttemptStart {
 /// mailbox geometry are metadata, with no admission or access authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptSources {
+    pub actor: AttemptSourceId,
+    pub publication: AttemptSourceId,
+    pub qa: AttemptSourceId,
     pub native: AttemptSourceId,
     pub observation: AttemptSourceId,
     pub mailbox: [usize; 4],

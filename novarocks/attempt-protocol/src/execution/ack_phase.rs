@@ -24,7 +24,9 @@ use crate::{
     authorization::observations::{JournalError, ObserverDebt, ObserverJournal},
     effect::EffectBody,
     error::TaskExecutionError,
-    input::{AttemptInputId, AttemptSourceId, ExecutorFact, NativeSourceCut, OperationObservation},
+    input::{
+        AttemptInputId, AttemptSourceCut, AttemptSourceId, ExecutorFact, OperationObservation,
+    },
 };
 use novarocks_execution_contract::OperationKind;
 
@@ -70,7 +72,7 @@ impl NativeAckPhase {
 
     /// Called once at the Native drain boundary with the original pre-pop
     /// sample. Further samples while processing this prefix cannot extend it.
-    pub(crate) fn begin(&mut self, cut: NativeSourceCut) -> Result<(), AckPhaseError> {
+    pub(crate) fn begin(&mut self, cut: AttemptSourceCut) -> Result<(), AckPhaseError> {
         if cut.source != self.source {
             return Err(AckPhaseError::WrongSource);
         }
@@ -406,7 +408,7 @@ mod tests {
         let mut phase = NativeAckPhase::new(source, [1, 1, 2, 1]).unwrap();
 
         phase
-            .begin(NativeSourceCut {
+            .begin(AttemptSourceCut {
                 source,
                 tail: Some(tail),
             })
@@ -426,7 +428,7 @@ mod tests {
         );
         assert_eq!(phase.run_round_tail(), Err(AckPhaseError::WrongPhase));
         assert_eq!(
-            phase.begin(NativeSourceCut {
+            phase.begin(AttemptSourceCut {
                 source,
                 tail: Some(later)
             }),
@@ -514,7 +516,7 @@ mod tests {
         );
 
         phase
-            .begin(NativeSourceCut {
+            .begin(AttemptSourceCut {
                 source,
                 tail: Some(later),
             })
@@ -579,7 +581,7 @@ mod tests {
         let tail = AttemptInputId(id(3));
         let mut phase = NativeAckPhase::new(source, [1, 1, 1, 1]).unwrap();
         phase
-            .begin(NativeSourceCut {
+            .begin(AttemptSourceCut {
                 source,
                 tail: Some(tail),
             })
@@ -633,13 +635,15 @@ mod tests {
         let source = AttemptSourceId(id(7));
         let mut phase = NativeAckPhase::new(source, [1, 1, 1, 1]).unwrap();
         assert_eq!(
-            phase.begin(NativeSourceCut {
+            phase.begin(AttemptSourceCut {
                 source: AttemptSourceId(id(8)),
                 tail: None
             }),
             Err(AckPhaseError::WrongSource)
         );
-        phase.begin(NativeSourceCut { source, tail: None }).unwrap();
+        phase
+            .begin(AttemptSourceCut { source, tail: None })
+            .unwrap();
         assert_eq!(phase.selected_source(), None);
         assert_eq!(phase.run_round_tail(), Ok(true));
         assert_eq!(phase.current(), Err(AckPhaseError::WrongPhase));

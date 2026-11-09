@@ -428,14 +428,25 @@ pub struct AttemptSourceId(pub NonZeroU64);
 pub struct AttemptInputId(pub NonZeroU64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeSourceCut {
+pub struct AttemptSourceCut {
     pub source: AttemptSourceId,
-    /// None means the registered source was empty at the original cut.
+    /// None means this source was empty at the original cut.
     pub tail: Option<AttemptInputId>,
+}
+
+/// Original mailbox identities and pre-pop facts for this same claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptInputClaim {
+    pub source: AttemptSourceId,
+    pub input: AttemptInputId,
+    pub native_cut: Option<AttemptSourceCut>,
+    pub selected_cut: Option<AttemptSourceCut>,
 }
 
 #[derive(Clone, Debug)]
 pub enum AttemptInput {
+    /// The original paid first step installs the initial Native preference.
+    Bootstrap,
     Executor(ExecutorFact),
     Port(LogicalToAttempt<AttemptFailure>),
     Membership(MembershipView),

@@ -53,6 +53,10 @@ pub(super) struct RoundTail {
 }
 
 impl RoundTail {
+    pub(super) fn waiting_for_publication(&self) -> bool {
+        self.phase == Phase::AwaitPublication
+    }
+
     pub(super) fn is_idle(&self) -> bool {
         self.phase == Phase::Idle
     }
@@ -88,7 +92,7 @@ impl Core {
             .run_round_tail()
             .map_err(|_| schedule("round tail began before the original ACK prefix completed"))?;
         self.round_tail = RoundTail {
-            phase: if can_run {
+            phase: if can_run && self.round_failure.is_none() {
                 Phase::SelectPublication
             } else {
                 Phase::BeginSettlement

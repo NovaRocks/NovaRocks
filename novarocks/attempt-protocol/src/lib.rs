@@ -38,6 +38,7 @@
 pub mod capacity;
 pub mod config;
 mod core;
+pub use core::{AttemptStep, Core, InputSelection};
 pub mod effect;
 pub mod failure;
 pub mod ids;
@@ -57,9 +58,10 @@ pub trait AttemptCore: Sized {
     fn handle(
         &mut self,
         now: novarocks_coordination_contract::MonotonicInstant,
+        claim: input::AttemptInputClaim,
         input: input::AttemptInput,
         context: &mut dyn capacity::StepContext,
-    ) -> Vec<effect::AttemptEffect>;
+    ) -> Result<AttemptStep, error::TaskExecutionError>;
     fn next_deadline(&self) -> Option<novarocks_coordination_contract::MonotonicInstant>;
 }
 

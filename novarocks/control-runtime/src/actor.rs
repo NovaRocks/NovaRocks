@@ -105,6 +105,7 @@ pub struct ActorStep<'a, E> {
     stop_producing: bool,
     input_source: Option<InputSourceMode>,
     input_source_cut: Option<InputSourceCut>,
+    selected_source_cut: Option<InputSourceCut>,
 }
 impl<'a, E> ActorStep<'a, E> {
     pub(crate) fn new(
@@ -132,6 +133,7 @@ impl<'a, E> ActorStep<'a, E> {
             stop_producing: false,
             input_source: None,
             input_source_cut: None,
+            selected_source_cut: None,
             batch: EffectBatchState::new(
                 scope.id(),
                 generation,
@@ -149,6 +151,15 @@ impl<'a, E> ActorStep<'a, E> {
     }
     pub(crate) fn set_input_source_cut(&mut self, cut: Option<InputSourceCut>) {
         self.input_source_cut = cut;
+    }
+    /// The selected continuation Source sampled before the claim was popped.
+    /// An empty selected Source allows the owner's timer to advance a phase;
+    /// a ready continuation remains owned by the original mailbox.
+    pub fn selected_source_cut(&self) -> Option<InputSourceCut> {
+        self.selected_source_cut
+    }
+    pub(crate) fn set_selected_source_cut(&mut self, cut: Option<InputSourceCut>) {
+        self.selected_source_cut = cut;
     }
     pub(crate) fn set_input_author(&mut self, author: Option<crate::actor_turn::InputAuthor>) {
         self.input_author = author;
