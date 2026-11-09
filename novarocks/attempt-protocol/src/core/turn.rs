@@ -36,6 +36,7 @@ use crate::{
     },
     root_control::{RootSealRefusal, SealSettlement},
     start::AttemptStart,
+    terminal::{OriginalHorizon, TerminalDirective, TerminalFacts, TerminalWake},
 };
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptConvergenceMode, AttemptRequestToken, AttemptRootProjection,
@@ -74,6 +75,11 @@ enum Phase {
     },
     Root,
     AwaitRoot(AttemptActionId),
+    AwaitSeal {
+        effect: AttemptActionId,
+        success: bool,
+    },
+    Terminal(TerminalWake),
     Tail,
     Converge,
     ClosingGate,
@@ -96,6 +102,9 @@ pub(super) struct Turn {
     reported_remote_closure: bool,
     membership_revision: Option<u64>,
     convergence_changed: bool,
+    seal_delivered: bool,
+    terminal_after_close: Option<TerminalWake>,
+    cancellation_due: bool,
 }
 
 impl Turn {
@@ -162,7 +171,15 @@ impl AttemptCore for Core {
             Phase::Bootstrap
             | Phase::Native
             | Phase::AwaitRoot(_)
+            | Phase::AwaitSeal { .. }
             | Phase::Common { source_ready: true } => None,
+            Phase::Terminal(_)
+                if self.terminal.waiting_for_permission()
+                    || self.terminal.waiting_for_process() =>
+            {
+                None
+            }
+            Phase::Terminal(_) => Some(self.execution.monotonic_now()),
             Phase::Idle if self.stop.pending() && !self.authorizations.waiting_for_reply() => {
                 Some(self.execution.monotonic_now())
             }
@@ -172,6 +189,9 @@ impl AttemptCore for Core {
             }
             Phase::ClosingGate if self.authorizations.waiting_for_reply() => None,
             Phase::ClosingGate => Some(self.execution.monotonic_now()),
+            Phase::Idle if self.turn.cancellation_due && self.terminal_needs_drive() => {
+                Some(self.execution.monotonic_now())
+            }
             Phase::Idle if self.execution.has_pending_terminal_cleanup() => {
                 Some(self.execution.monotonic_now())
             }
@@ -179,10 +199,14 @@ impl AttemptCore for Core {
             Phase::Idle if self.convergence_due(self.execution.monotonic_now()) => {
                 Some(self.execution.monotonic_now())
             }
-            Phase::Idle => [self.next_round_deadline(), self.convergence.next_deadline()]
-                .into_iter()
-                .flatten()
-                .min(),
+            Phase::Idle => [
+                self.next_round_deadline(),
+                self.convergence.next_deadline(),
+                self.terminal.next_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
             Phase::Tail => self.next_round_deadline(),
             Phase::Converge
                 if self.convergence.waiting_for_process() && !self.convergence_progress_ready() =>
@@ -205,7 +229,10 @@ impl Core {
             Phase::Bootstrap | Phase::Root => Only(self.sources.actor),
             Phase::Native => Only(self.sources.native),
             Phase::Common { .. } => Only(self.sources.observation),
-            Phase::AwaitRoot(_) => Only(self.sources.publication),
+            Phase::AwaitRoot(_) | Phase::AwaitSeal { .. } => Only(self.sources.publication),
+            Phase::Terminal(_) if self.terminal.waiting_for_permission() => Only(self.sources.qa),
+            Phase::Terminal(_) if self.terminal.waiting_for_process() => Only(self.sources.process),
+            Phase::Terminal(_) => Only(self.sources.actor),
             Phase::Tail
                 if self.round_tail.waiting_for_publication()
                     && self.publication.has_pending_apply() =>
@@ -298,6 +325,20 @@ impl Core {
                     self.turn.phase = Phase::ClosingGate;
                     return self.drive_gate_close(context, result);
                 }
+                if timer
+                    && self
+                        .terminal
+                        .next_deadline()
+                        .is_some_and(|deadline| now.has_reached(deadline))
+                {
+                    self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
+                    return self.drive_terminal(now, TerminalWake::Continuation, context, result);
+                }
+                if timer && self.turn.cancellation_due && self.terminal_needs_drive() {
+                    self.turn.cancellation_due = false;
+                    self.turn.phase = Phase::Terminal(TerminalWake::Cancellation);
+                    return self.drive_terminal(now, TerminalWake::Cancellation, context, result);
+                }
                 self.begin_native_prefix(now, cut)?;
                 self.enter_common_or_skip()?;
                 if self.turn.phase == Phase::Tail {
@@ -345,6 +386,35 @@ impl Core {
                     }
                     self.turn.phase = Phase::Root;
                 }
+            }
+            Phase::AwaitSeal { .. } if timer => {}
+            Phase::AwaitSeal {
+                effect: expected,
+                success,
+            } => {
+                self.verify_source(claim.source, self.sources.publication)?;
+                let AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                    effect,
+                    result: applied,
+                }) = input
+                else {
+                    return Err(schedule("seal awaited its original delivery result"));
+                };
+                if effect == expected
+                    && (applied.is_err() || matches!(applied, Ok(PublicationApplied::SealResult)))
+                {
+                    match applied {
+                        Ok(_) => self.turn.seal_delivered |= success,
+                        Err(failure) => {
+                            self.round_failure.get_or_insert(failure);
+                        }
+                    }
+                    self.begin_round_tail(true)?;
+                    self.turn.phase = Phase::Tail;
+                }
+            }
+            Phase::Terminal(wake) => {
+                self.apply_terminal(now, claim, input, wake, context, result)?
             }
             Phase::Tail => self.apply_tail(now, claim, input, context, result)?,
             Phase::ClosingGate if timer => self.drive_gate_close(context, result)?,
@@ -398,6 +468,17 @@ impl Core {
     ) -> Result<bool, TaskExecutionError> {
         match input {
             AttemptInput::Port(port) => match &port.body {
+                LogicalToAttemptBody::PreReadyReplacementChanged { token } => {
+                    self.verify_source(claim.source, self.sources.qa)?;
+                    if port.activation == self.activation
+                        && self.terminal.permission_changed(*token)
+                            == crate::terminal::ReplyDisposition::Applied
+                        && self.turn.phase == Phase::Idle
+                        && !self.authorizations.waiting_for_reply()
+                    {
+                        self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
+                    }
+                }
                 LogicalToAttemptBody::Abort { action, request } => {
                     self.verify_owner_port(claim.source, port.activation)?;
                     let (admission, _) = self.turn.issue()?;
@@ -410,7 +491,9 @@ impl Core {
                 }
                 LogicalToAttemptBody::Stop { reason, failure } => {
                     self.verify_owner_port(claim.source, port.activation)?;
+                    let first = self.terminal.stop_reason().is_none();
                     self.terminal.observe_stop(*reason, failure.clone());
+                    self.turn.cancellation_due |= first;
                     self.diagnostics.stop_starting();
                     self.request_stop(result);
                 }
@@ -519,7 +602,11 @@ impl Core {
             CloseProgress::Yield | CloseProgress::AwaitReply => {}
             CloseProgress::Request(effect) => result.effect = Some(effect),
             CloseProgress::WaitingTransport | CloseProgress::Ready => {
-                self.turn.phase = Phase::Idle;
+                self.turn.phase = self
+                    .turn
+                    .terminal_after_close
+                    .take()
+                    .map_or(Phase::Idle, Phase::Terminal);
             }
         }
         Ok(())
@@ -866,10 +953,18 @@ impl Core {
                 seal.result
                     .map_err(|refusal| protocol_failure(schedule(refusal.message())))
             };
-            result.effect = Some(self.port_effect(AttemptToLogicalBody::SealResult {
+            let success = settled.is_ok();
+            let effect = self.port_effect(AttemptToLogicalBody::SealResult {
                 token: seal.token,
                 result: settled,
-            })?);
+            })?;
+            self.turn.phase = Phase::AwaitSeal {
+                effect: effect.id,
+                success,
+            };
+            self.turn.root = None;
+            result.effect = Some(effect);
+            return Ok(());
         }
         self.turn.root = None;
         self.begin_round_tail(true)?;
@@ -911,17 +1006,193 @@ impl Core {
                 result.retired_authorization = Some(operation)
             }
             RoundTailStep::Complete(round) => {
-                self.turn.phase = if !self.stop.pending() && self.authorizations.close_needs_drive()
-                {
-                    Phase::ClosingGate
-                } else if !self.stop.pending()
-                    && (self.start_convergence_pass() || self.convergence_progress_ready())
-                {
-                    Phase::Converge
-                } else {
-                    Phase::Idle
-                };
+                if let Err(failure) = &round {
+                    self.record_terminal_failure(failure.clone())?;
+                }
                 result.round_result = Some(round);
+                if self.terminal_needs_drive() {
+                    self.turn.cancellation_due = false;
+                    self.turn.phase = Phase::Terminal(TerminalWake::Round);
+                    self.drive_terminal(now, TerminalWake::Round, context, result)?;
+                } else {
+                    self.resume_after_terminal();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_terminal_failure(
+        &mut self,
+        failure: AttemptFailure,
+    ) -> Result<(), TaskExecutionError> {
+        match failure {
+            AttemptFailure::TaskProtocol(error) => {
+                self.terminal
+                    .record_execution_failure(*error, &self.execution)?;
+            }
+            failure => {
+                self.terminal.record_original_failure(failure)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn terminal_needs_drive(&self) -> bool {
+        self.terminal.terminal().is_none()
+            && (self.turn.seal_delivered && self.execution.normal_drain_started()
+                || self.terminal.has_pending_decision()
+                || self.execution.selected_task_failure().is_some())
+    }
+
+    fn resume_after_terminal(&mut self) {
+        self.turn.phase = if !self.stop.pending() && self.authorizations.close_needs_drive() {
+            Phase::ClosingGate
+        } else if !self.stop.pending()
+            && (self.start_convergence_pass() || self.convergence_progress_ready())
+        {
+            Phase::Converge
+        } else {
+            Phase::Idle
+        };
+    }
+
+    fn apply_terminal(
+        &mut self,
+        now: MonotonicInstant,
+        claim: AttemptInputClaim,
+        input: AttemptInput,
+        wake: TerminalWake,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        let wake = match input {
+            AttemptInput::Timer => {
+                self.verify_source(claim.source, self.sources.actor)?;
+                wake
+            }
+            AttemptInput::Port(port) => {
+                self.verify_source(claim.source, self.sources.qa)?;
+                let LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe } =
+                    port.body
+                else {
+                    return Err(schedule("terminal decision awaited original permission"));
+                };
+                if port.activation == self.activation {
+                    self.terminal.permission_reply(token, may_observe);
+                }
+                TerminalWake::Continuation
+            }
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request,
+                participation,
+                sampled_at,
+                observation,
+            }) => {
+                self.verify_source(claim.source, self.sources.process)?;
+                if self
+                    .execution
+                    .graph()
+                    .participation_on_backend(participation.backend_process_id())
+                    != Some(participation)
+                {
+                    return Err(schedule(
+                        "terminal process sample belongs to a foreign participation",
+                    ));
+                }
+                if let Some(original) = self.terminal.observation() {
+                    let horizon = OriginalHorizon::from_execution(&self.execution, original);
+                    self.terminal.process_reply(
+                        now,
+                        request,
+                        participation.backend_process_id(),
+                        sampled_at,
+                        observation,
+                        horizon,
+                    )?;
+                }
+                TerminalWake::Continuation
+            }
+            _ => return Err(schedule("input crossed the original terminal decision")),
+        };
+        self.drive_terminal(now, wake, context, result)
+    }
+
+    fn drive_terminal(
+        &mut self,
+        now: MonotonicInstant,
+        wake: TerminalWake,
+        context: &mut dyn StepContext,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        if self.terminal.waiting_for_permission() || self.terminal.waiting_for_process() {
+            return Ok(());
+        }
+        if !context.charge(1) {
+            self.turn.phase = Phase::Terminal(wake);
+            return Ok(());
+        }
+        let (_, token) = self.turn.issue()?;
+        let horizon = self
+            .terminal
+            .observation()
+            .map(|observation| OriginalHorizon::from_execution(&self.execution, observation));
+        let facts = TerminalFacts {
+            success_ready: self.turn.seal_delivered && self.execution.normal_drain_started(),
+            selected_task: self.execution.selected_task_failure(),
+            gate: self.authorizations.preparation(),
+            horizon,
+            wake,
+        };
+        match self.terminal.poll(now, facts, Some(token))? {
+            TerminalDirective::PrepareConvergence => {
+                self.authorizations.request_close();
+                self.turn.terminal_after_close = Some(wake);
+                self.turn.phase = Phase::ClosingGate;
+            }
+            TerminalDirective::QueryPermission { request, refusal } => {
+                let mut effect =
+                    self.port_effect(AttemptToLogicalBody::PreReadyReplacementQuery {
+                        token: request,
+                        refusal,
+                    })?;
+                effect.class = EffectClass::Settlement;
+                result.effect = Some(effect);
+                self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
+            }
+            TerminalDirective::ObserveProcess { request, original } => {
+                let participation = self
+                    .execution
+                    .graph()
+                    .participation_on_backend(original)
+                    .ok_or_else(|| {
+                        schedule("terminal observation has no original participation")
+                    })?;
+                let (id, _) = self.turn.issue()?;
+                result.effect = Some(AttemptEffect {
+                    id,
+                    class: EffectClass::Settlement,
+                    body: EffectBody::ObserveProcess {
+                        request,
+                        participation,
+                    },
+                });
+                self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
+            }
+            TerminalDirective::Selected(terminal) => {
+                if matches!(
+                    terminal,
+                    novarocks_coordination_contract::AttemptTerminal::Failed(_)
+                ) {
+                    self.request_stop(result);
+                }
+                result.effect =
+                    Some(self.port_effect(AttemptToLogicalBody::AttemptTerminal(terminal))?);
+                self.resume_after_terminal();
+            }
+            TerminalDirective::Wait => self.resume_after_terminal(),
+            TerminalDirective::NeedRequestCredit => {
+                return Err(schedule("charged terminal request lost its identity"));
             }
         }
         Ok(())
@@ -943,11 +1214,19 @@ impl Core {
         match self.apply_qa_reply(port)? {
             QaReply::ObserverComplete { retire } => result.retired_authorization = retire,
             QaReply::ClosingFailed(failure) => {
-                self.terminal.record_original_failure(failure)?;
-                self.turn.phase = Phase::Idle;
+                self.record_terminal_failure(failure)?;
+                self.turn.phase = Phase::Terminal(
+                    self.turn
+                        .terminal_after_close
+                        .take()
+                        .unwrap_or(TerminalWake::Round),
+                );
             }
             QaReply::AuthorizationFailed { failure, .. } => {
-                self.terminal.record_original_failure(failure)?;
+                self.record_terminal_failure(failure)?;
+                if self.turn.phase == Phase::Idle {
+                    self.turn.phase = Phase::Terminal(TerminalWake::Round);
+                }
             }
             _ => {}
         }

@@ -295,6 +295,7 @@ pub enum WithdrawalOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationApplied {
     RootStatus,
+    SealResult,
     ProtocolBatch { published: bool },
     FinalTaskInfo,
     Diagnostics,

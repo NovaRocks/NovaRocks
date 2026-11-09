@@ -1201,7 +1201,7 @@ impl QueryTaskExecution {
     /// Logical no-more-input is immediate. Physical graph cleanup follows a
     /// charged cursor; the core must check this gate before every candidate
     /// and every queue-to-send handoff, including during a partial scan.
-    fn try_begin_normal_drain(&mut self) {
+    pub(crate) fn try_begin_normal_drain(&mut self) {
         if !self.normal_drain_requested
             || self.normal_drain_started
             || self.terminal_cleanup_started

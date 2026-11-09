@@ -210,6 +210,7 @@ impl Core {
                         .expect("original returned grant");
                     return Ok(Some(RoundTailStep::Effect(release(action, grant))));
                 }
+                self.execution.try_begin_normal_drain();
                 let progressed = if self.execution.has_pending_terminal_cleanup() {
                     self.execution.advance_terminal_cleanup(context)?
                 } else if self.execution.has_pending_normal_drain() {

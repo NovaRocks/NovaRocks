@@ -205,6 +205,18 @@ impl TerminalController {
             sample: None,
         }
     }
+    pub(crate) fn has_pending_decision(&self) -> bool {
+        self.pending.is_some() || self.stop.is_some() || self.preparing_terminal.is_some()
+    }
+
+    pub(crate) fn waiting_for_permission(&self) -> bool {
+        self.permission.is_some()
+    }
+
+    pub(crate) fn waiting_for_process(&self) -> bool {
+        self.sample.is_some()
+    }
+
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.decision_turn.is_none() && self.preparing_terminal.is_none() && self.selected.is_none()
     }

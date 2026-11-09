@@ -114,7 +114,7 @@ impl AuthorizationGate {
     pub(crate) fn preparation(&self) -> GatePreparation {
         match self.close.phase {
             Phase::Open => GatePreparation::Open,
-            Phase::WaitingTransport => GatePreparation::Applied { ready: false },
+            Phase::WaitingTransport | Phase::Failed => GatePreparation::Applied { ready: false },
             Phase::Ready => GatePreparation::Applied { ready: true },
             _ => GatePreparation::Applying,
         }

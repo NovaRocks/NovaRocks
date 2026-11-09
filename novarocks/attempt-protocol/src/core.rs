@@ -1728,6 +1728,17 @@ mod tests {
         let root = core.execution.graph().root_identity();
         let now = core.execution.monotonic_now();
         let root_finished = frame(&mut core, root, TaskState::Finished, None);
+        let strict: Vec<_> = core
+            .execution
+            .graph()
+            .tasks()
+            .map(|task| task.identity())
+            .filter(|&task| task != root)
+            .collect();
+        let strict_finished: Vec<_> = strict
+            .into_iter()
+            .map(|task| frame(&mut core, task, TaskState::Finished, None))
+            .collect();
         core.apply_observations(
             now,
             core.observation_source,
@@ -1757,7 +1768,7 @@ mod tests {
                 }),
                 selected_cut: None,
             };
-            core.handle(now, claim, input, &mut Units(12)).unwrap()
+            core.handle(now, claim, input, &mut Units(128)).unwrap()
         };
         step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
         let seal_token = AttemptRequestToken::new(id(22));
@@ -1812,9 +1823,77 @@ mod tests {
         );
         assert_eq!(applied.selection, InputSelection::Only(sources.actor));
         let settled = step(&mut core, sources.actor, 6, AttemptInput::Timer);
+        let Some(AttemptEffect {
+            id: seal_effect,
+            body: EffectBody::Port(port),
+            ..
+        }) = settled.effect
+        else {
+            panic!("expected original seal delivery");
+        };
         assert!(
-            matches!(settled.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, AttemptToLogicalBody::SealResult { token, result: Ok(_) } if token == seal_token))
+            matches!(port.body, AttemptToLogicalBody::SealResult { token, result: Ok(_) } if token == seal_token)
+        );
+        assert_eq!(settled.selection, InputSelection::Only(sources.publication));
+        assert_eq!(core.next_deadline(), None);
+
+        let seal_ack = |result| {
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: seal_effect,
+                result: Ok(result),
+            })
+        };
+        let wrong = step(
+            &mut core,
+            sources.publication,
+            7,
+            seal_ack(PublicationApplied::RootStatus),
+        );
+        assert_eq!(wrong.selection, InputSelection::Only(sources.publication));
+        assert!(wrong.effect.is_none());
+        assert!(core.terminal.terminal().is_none());
+        step(
+            &mut core,
+            sources.publication,
+            8,
+            seal_ack(PublicationApplied::SealResult),
+        );
+        let published = step(&mut core, sources.actor, 9, AttemptInput::Timer);
+        let first = published.effect.unwrap().id;
+        let applied = |effect| {
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            })
+        };
+        let done = step(&mut core, sources.publication, 10, applied(first));
+        assert_eq!(done.round_result, Some(Ok(())));
+        assert!(done.effect.is_none());
+        assert!(!core.execution.normal_drain_started());
+        assert!(core.terminal.terminal().is_none());
+
+        step(
+            &mut core,
+            sources.observation,
+            11,
+            AttemptInput::Executor(ExecutorFact::Observations(
+                ObservationBatch::new(strict_finished).unwrap(),
+            )),
+        );
+        step(&mut core, sources.actor, 12, AttemptInput::Timer);
+        let published = step(&mut core, sources.actor, 13, AttemptInput::Timer);
+        let second = published.effect.unwrap().id;
+        let mut completed = step(&mut core, sources.publication, 14, applied(second));
+        assert!(core.execution.normal_drain_started());
+        for n in 15..22 {
+            if completed.effect.is_some() {
+                break;
+            }
+            completed = step(&mut core, sources.actor, n, AttemptInput::Timer);
+        }
+        assert!(
+            matches!(completed.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(novarocks_coordination_contract::AttemptTerminal::Completed)))
         );
     }
 
@@ -1949,7 +2028,12 @@ mod tests {
             None,
         );
         assert_eq!(finished.round_result, Some(Ok(())));
-        assert!(finished.effect.is_none());
+        assert!(
+            matches!(finished.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, novarocks_coordination_contract::AttemptToLogicalBody::AttemptTerminal(
+                novarocks_coordination_contract::AttemptTerminal::Failed(AttemptFailure::TaskProtocol(ref error))
+            ) if **error == schedule("original stop")))
+        );
 
         step(
             &mut core,
@@ -2423,23 +2507,28 @@ mod tests {
 
         // The unused authorization result is not return of the original WC grant.
         assert_eq!(core.execution.dispatcher().queued_items(), 1);
-        step(&mut core, sources.actor, 6, AttemptInput::Timer, None);
+        let stopped = step(&mut core, sources.actor, 6, AttemptInput::Timer, None);
+        assert!(
+            matches!(stopped.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(novarocks_coordination_contract::AttemptTerminal::Failed(_))))
+        );
+        step(&mut core, sources.actor, 7, AttemptInput::Timer, None);
         step(
             &mut core,
             sources.actor,
-            7,
+            8,
             AttemptInput::Timer,
             Some(AttemptSourceCut {
                 source: sources.observation,
                 tail: None,
             }),
         );
-        step(&mut core, sources.actor, 8, AttemptInput::Timer, None);
-        let published = step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
+        step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
+        let published = step(&mut core, sources.actor, 10, AttemptInput::Timer, None);
         let release = step(
             &mut core,
             sources.publication,
-            10,
+            11,
             AttemptInput::Executor(ExecutorFact::PublicationApplied {
                 effect: published.effect.unwrap().id,
                 result: Ok(PublicationApplied::ProtocolBatch { published: true }),
@@ -2448,6 +2537,110 @@ mod tests {
         );
         assert!(
             matches!(release.effect, Some(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant: returned }, .. }) if returned == grant)
+        );
+    }
+
+    #[test]
+    fn terminal_replacement_waits_for_the_original_process_token() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim, MembershipObservation},
+        };
+        use novarocks_coordination_contract::{AttemptTerminal, AttemptToLogicalBody};
+
+        let start = start();
+        let sources = start.sources;
+        let now = start.initial_now;
+        let mut core = Core::new(start).unwrap();
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let original = participation.backend_process_id();
+        let replacement = crate::test_support::backend(80);
+        core.terminal
+            .record_execution_failure(
+                TaskExecutionError::PreReadyEstablishTransportUnknown { backend: original },
+                &core.execution,
+            )
+            .unwrap();
+        let step = |core: &mut Core, source, n, input, selected_cut| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut,
+                },
+                input,
+                &mut Units(64),
+            )
+            .unwrap()
+        };
+        step(&mut core, sources.actor, 1, AttemptInput::Bootstrap, None);
+        step(&mut core, sources.actor, 2, AttemptInput::Timer, None);
+        step(
+            &mut core,
+            sources.actor,
+            3,
+            AttemptInput::Timer,
+            Some(AttemptSourceCut {
+                source: sources.observation,
+                tail: None,
+            }),
+        );
+        step(&mut core, sources.actor, 4, AttemptInput::Timer, None);
+        let published = step(&mut core, sources.actor, 5, AttemptInput::Timer, None);
+        let read = step(
+            &mut core,
+            sources.publication,
+            6,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: published.effect.unwrap().id,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+            None,
+        );
+        let Some(AttemptEffect {
+            body:
+                EffectBody::ObserveProcess {
+                    request,
+                    participation: exact,
+                },
+            ..
+        }) = read.effect
+        else {
+            panic!("expected original pre-ready process sample");
+        };
+        assert_eq!(exact, participation);
+        assert_eq!(read.selection, InputSelection::Only(sources.process));
+        assert_eq!(core.next_deadline(), None);
+        let sample = |token| {
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request: token,
+                participation,
+                sampled_at: now,
+                observation: MembershipObservation::ExactReplacement(replacement),
+            })
+        };
+        let stale = step(
+            &mut core,
+            sources.process,
+            7,
+            sample(AttemptRequestToken::new(id(70))),
+            None,
+        );
+        assert!(stale.effect.is_none());
+        assert_eq!(stale.selection, InputSelection::Only(sources.process));
+        step(&mut core, sources.process, 8, sample(request), None);
+        step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
+        let terminal = step(&mut core, sources.actor, 10, AttemptInput::Timer, None);
+        assert!(
+            matches!(terminal.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(AttemptFailure::BackendReplaced {
+                original: observed_original, replacement: observed_replacement,
+            })) if observed_original == original && observed_replacement == replacement))
         );
     }
 
