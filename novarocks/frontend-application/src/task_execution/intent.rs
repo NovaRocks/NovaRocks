@@ -23,6 +23,8 @@
 //! transport outcome, so a retry can never be a different request wearing the
 //! same operation id. Nothing here touches a wire.
 
+pub(super) mod attempt_receipt;
+
 use std::sync::Arc;
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};

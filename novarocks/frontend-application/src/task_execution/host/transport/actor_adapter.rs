@@ -79,11 +79,16 @@ pub(crate) enum ActorTransportWork {
 impl ActorTransportWork {
     fn matches(&self, body: &EffectBody) -> bool {
         match (self, body) {
-            (Self::Send(bound), EffectBody::SendBatch { batch, .. }) => {
-                bound.backend == batch.backend
+            (Self::Send(bound), EffectBody::SendBatch { batch, reservation }) => {
+                let items = batch.operations.len();
+                items != 0
+                    && bound.queue.parent_reservation().get() == reservation.0.get()
+                    && bound.backend == batch.backend
                     && bound.control_progress == batch.control_progress
-                    && bound.resolved.keys.len() == batch.operations.len()
-                    && bound.resolved.keys.len() == batch.queued_inputs.len()
+                    && items == batch.queued_inputs.len()
+                    && items == bound.resolved.keys.len()
+                    && items == bound.resolved.operations.len()
+                    && items == bound.resolved.queued_inputs.len()
             }
             (
                 Self::Admit(bound),

@@ -27,13 +27,12 @@ pub(crate) use dynamic_filters::{
     DynamicFilterFailureSource, DynamicFilterRecords, DynamicReadRegistration,
 };
 
-use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::{error::TaskExecutionError, intent::attempt_receipt::failure_site};
 use novarocks_attempt_protocol::failure::{
-    AttemptFailure, AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure,
+    AttemptFailure, HostFailureKind, HostFailureRef, HostProjectedFailure,
 };
 use novarocks_control_runtime::exit_custody::{ExitCustody, ExitCustodyPhase};
 use novarocks_control_runtime_core::identity::InputId;
-use novarocks_query_application::execution_error::ExecutionFailureSite;
 use std::collections::BTreeSet;
 
 #[derive(Debug)]
@@ -93,30 +92,10 @@ impl OriginalJobRecord {
 /// Projection uses its existing typed author, preserving the original site.
 fn project_task_error(original: HostFailureRef, error: &TaskExecutionError) -> AttemptFailure {
     let input = error.preparation_input();
-    let site = match input.site() {
-        ExecutionFailureSite::Task { identity, phase } => {
-            AttemptFailureSite::Task { identity, phase }
-        }
-        ExecutionFailureSite::TaskControl { identity } => {
-            AttemptFailureSite::TaskControl { identity }
-        }
-        ExecutionFailureSite::Operation {
-            participation,
-            operation_id,
-            kind,
-        } => AttemptFailureSite::Operation {
-            participation,
-            operation_id,
-            kind,
-        },
-        ExecutionFailureSite::RootRead { root } => AttemptFailureSite::RootRead { root },
-        ExecutionFailureSite::Backend { process } => AttemptFailureSite::Backend { process },
-        ExecutionFailureSite::Coordinator => AttemptFailureSite::Attempt,
-    };
     AttemptFailure::Host(HostProjectedFailure {
         original,
         kind: HostFailureKind::Execution,
         class: input.attempt_class(),
-        site,
+        site: failure_site(input.site()),
     })
 }
