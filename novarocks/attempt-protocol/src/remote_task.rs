@@ -763,14 +763,18 @@ impl RemoteTask {
         self.pending_input.is_some()
     }
 
-    pub(crate) fn abandon_input_preparation(&mut self, operation: TaskOperationId) {
+    pub(crate) fn abandon_input_preparation(
+        &mut self,
+        operation: TaskOperationId,
+    ) -> Option<UpdateAdmission> {
         if self
             .pending_input
             .as_ref()
             .is_some_and(|input| input.request.envelope().operation_id() == operation)
         {
-            self.pending_input = None;
+            return self.pending_input.take().and_then(|input| input.discarded);
         }
+        None
     }
 
     /// A definitely-unused withdrawal consumes only its original preparation.
@@ -1506,6 +1510,10 @@ impl RemoteTask {
         };
         self.enter_terminal();
         Ok(UpdateSettlement::FailedClosed(outcome))
+    }
+
+    pub(crate) fn released_update_operation(&self) -> Option<TaskOperationId> {
+        self.released_update.as_ref().map(|row| row.operation_id)
     }
 
     pub(crate) fn update_request_matches(&self, operation: TaskOperationId) -> bool {

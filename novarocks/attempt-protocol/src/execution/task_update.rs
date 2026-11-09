@@ -20,7 +20,7 @@
 use super::{CreateGrantProgress, EdgeControlEffect, OperationTarget, QueryTaskExecution};
 use crate::{
     dispatch::LocalQueueCapacity,
-    effect::{AttemptEffect, AttemptEffectId, EffectBody, OperationIntent, QueuedInputPayload},
+    effect::{AttemptEffect, AttemptEffectId, EffectBody, QueuedInputPayload},
     error::TaskExecutionError,
     input::{QueuedInputGrantRef, UpdateAdmission},
     intent::TaskOperationQueueRequest,
@@ -147,6 +147,7 @@ impl QueryTaskExecution {
             self.rollback_unsent(target, operation);
             if let Some(grant) = grant {
                 self.pending_update_grants.remove(&grant.generation());
+                self.note_split_admission(operation, Ok(UpdateAdmission::DiscardedNoLongerNeeded));
                 return Ok((
                     false,
                     Some(AttemptEffect {
@@ -183,14 +184,23 @@ impl QueryTaskExecution {
     ) -> Result<CreateGrantProgress, TaskExecutionError> {
         let result = self.complete_task_input_preparation(identity, operation, grant);
         self.mark_task_input_cleanup(identity);
+        let split = self.note_split_admission(operation, result.as_ref().copied());
+        if split && matches!(result, Err(TaskExecutionError::DomainRegression { .. })) {
+            // The split producer receives its original typed local rejection
+            // and owns the resulting PumpFailed, after its own processing.
+            return Ok(CreateGrantProgress::Waiting);
+        }
         if result? == UpdateAdmission::Queued {
-            self.pending_update_grants.insert(grant.generation(), grant);
+            self.pending_update_grants
+                .insert(grant.generation(), (grant, operation));
         }
         Ok(CreateGrantProgress::Waiting)
     }
 
     pub(crate) fn tracks_pending_update_grant(&self, grant: QueuedInputGrantRef) -> bool {
-        self.pending_update_grants.get(&grant.generation()) == Some(&grant)
+        self.pending_update_grants
+            .get(&grant.generation())
+            .is_some_and(|(held, _)| *held == grant)
     }
 
     pub(super) fn mark_task_input_cleanup(&mut self, identity: TaskIdentity) {
@@ -209,6 +219,10 @@ impl QueryTaskExecution {
     pub(crate) fn advance_task_input_cleanup(&mut self) -> Option<EffectBody> {
         let identity = self.task_input_cleanup.pop_first()?;
         let mut task = self.task_by_identity(identity).expect("original Task");
+        let normal = task.normally_stood_down()
+            || task.status().is_some_and(
+                novarocks_execution_contract::TaskStatus::is_success_compatible_terminal,
+            );
         let preparation = task.take_withdrawn_preparation();
         let body = if preparation.is_some() {
             None
@@ -226,8 +240,19 @@ impl QueryTaskExecution {
         if let Some(operation) = preparation {
             return self.withdraw_lifecycle_admission(operation);
         }
-        if let Some(EffectBody::ReleaseQueuedInput { grant }) = body {
-            self.pending_update_grants.remove(&grant.generation());
+        if let Some(EffectBody::ReleaseQueuedInput { grant }) = body
+            && let Some((_, operation)) = self.pending_update_grants.remove(&grant.generation())
+        {
+            if normal {
+                self.note_split_admission(operation, Ok(UpdateAdmission::DiscardedNoLongerNeeded));
+            } else {
+                self.discard_unsent_split(
+                    operation,
+                    crate::split_delivery::SplitDeliverySettlement::Unknown(
+                        "split assignment stopped before Native dispatch".to_owned(),
+                    ),
+                );
+            }
         }
         body
     }

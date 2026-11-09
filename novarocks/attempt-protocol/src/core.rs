@@ -224,6 +224,7 @@ impl Core {
             execution.adopt_replacement_admissions(&activation.inherited_admissions)?;
         }
         execution.activate_covered_observation();
+        execution.bind_split_pump(split_source);
         let acknowledgements = NativeAckPhase::new(native, mailbox)
             .map_err(|_| schedule("invalid Native acknowledgement mailbox geometry"))?;
         Ok(Self {
@@ -309,10 +310,23 @@ impl Core {
             }
             _ => None,
         };
+        let split_reply = match fact {
+            ExecutorFact::Operation(observation)
+                if observation.reply.kind()
+                    == novarocks_execution_contract::OperationKind::UpdateTask
+                    && self.execution.dispatched_reply_needs_observer(observation) =>
+            {
+                Some(&observation.reply)
+            }
+            _ => None,
+        };
         let action = self
             .acknowledgements
             .apply(source, input, fact, &mut self.execution, observe_abort)
             .map_err(|_| schedule("invalid fact in the Native acknowledgement prefix"))?;
+        if let Some(reply) = split_reply {
+            self.execution.note_split_reply(reply);
+        }
         if let Some(participation) = participation
             && self.execution.needs_covered_subscription(participation)
         {
@@ -349,6 +363,7 @@ impl Core {
         {
             for (intent, grant) in batch.operations.iter().zip(&batch.queued_inputs) {
                 self.authorizations.note_sent(intent, grant.generation());
+                self.execution.note_split_released(intent.operation_id());
             }
         }
         Ok(progress)
@@ -1815,6 +1830,81 @@ mod tests {
             started(),
         );
         assert_eq!(next.selection, InputSelection::Only(sources.observation));
+    }
+
+    #[test]
+    fn first_split_pump_failure_keeps_its_typed_cause_and_upgrades_later_convergence() {
+        use crate::{
+            AttemptCore,
+            effect::PumpKind,
+            failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptFailureClass};
+
+        let mut start = start();
+        let pump = PayloadRef(id(701));
+        start.plan.pumps = Box::new([(pump, PumpKind::SplitAssignment)]);
+        let sources = start.sources;
+        let now = start.initial_now;
+        let activation = start.activation.identity;
+        let mut core = Core::new(start).unwrap();
+        let handle = |core: &mut Core, input, n| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source: sources.actor,
+                    input: AttemptInputId(id(n)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: None,
+                },
+                input,
+                &mut Units(32),
+            )
+            .unwrap()
+        };
+        handle(&mut core, AttemptInput::Bootstrap, 1);
+        assert!(matches!(core.execution.split_pump_lifecycle(true),
+            Some(EffectBody::StartPump { pump: original, .. }) if original == pump));
+        let failure = AttemptFailure::Host(HostProjectedFailure {
+            original: HostFailureRef(id(702)),
+            kind: HostFailureKind::SplitAssignment,
+            class: AttemptFailureClass::ExecutionFailure,
+            site: AttemptFailureSite::Attempt,
+        });
+        let failed = handle(
+            &mut core,
+            AttemptInput::Executor(ExecutorFact::PumpFailed {
+                pump,
+                failure: failure.clone(),
+            }),
+            2,
+        );
+        assert!(failed.stop_producing);
+        let deadline = now.saturating_add(Duration::from_secs(2));
+        handle(
+            &mut core,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::BeginConvergence {
+                    mode: AttemptConvergenceMode::Normal,
+                    remote_deadline: deadline,
+                    computation_ready: None,
+                    retain_diagnostics: false,
+                },
+            }),
+            3,
+        );
+        assert_eq!(
+            core.convergence.mode(),
+            Some(AttemptConvergenceMode::Cleanup)
+        );
+        assert_eq!(core.convergence.next_deadline(), Some(deadline));
+        let settled = handle(&mut core, AttemptInput::Timer, 4);
+        assert_eq!(settled.round_result, Some(Err(failure)));
     }
 
     #[test]

@@ -400,7 +400,7 @@ impl QueryTaskExecution {
             return Ok(CreateGrantProgress::Release(grant));
         }
         if row.withdrawing || self.terminal_cleanup_started {
-            self.finish_lifecycle_admission(operation);
+            self.finish_lifecycle_admission(operation, None);
             return Ok(CreateGrantProgress::Release(grant));
         }
         if row.initial_update {
@@ -466,7 +466,7 @@ impl QueryTaskExecution {
             OperationTarget::ActorAbort => unreachable!("actor Abort owns separate admission"),
         };
         if row.withdrawing || self.terminal_cleanup_started || !live {
-            self.finish_lifecycle_admission(operation);
+            self.finish_lifecycle_admission(operation, None);
             return Ok(CreateGrantProgress::Release(grant));
         }
         if self.dispatcher.local_capacity(row.intent.queue_request())
@@ -491,6 +491,15 @@ impl QueryTaskExecution {
         operation: TaskOperationId,
         generation: SendGeneration,
     ) -> bool {
+        self.complete_lifecycle_admission(operation, generation, None)
+    }
+
+    pub(crate) fn complete_lifecycle_admission(
+        &mut self,
+        operation: TaskOperationId,
+        generation: SendGeneration,
+        failure: Option<&crate::failure::AttemptFailure>,
+    ) -> bool {
         if !self
             .lifecycle_admissions
             .get(&operation)
@@ -498,20 +507,42 @@ impl QueryTaskExecution {
         {
             return false;
         }
-        self.finish_lifecycle_admission(operation);
+        self.finish_lifecycle_admission(operation, failure);
         true
     }
 
-    fn finish_lifecycle_admission(&mut self, operation: TaskOperationId) {
+    fn finish_lifecycle_admission(
+        &mut self,
+        operation: TaskOperationId,
+        failure: Option<&crate::failure::AttemptFailure>,
+    ) {
         if let Some(row) = self.lifecycle_admissions.remove(&operation) {
             self.lifecycle_granted.remove(&operation);
             if row.initial_update {
                 let OperationIntent::UpdateTask { identity, .. } = row.intent else {
                     unreachable!("original initial Update");
                 };
-                self.task_by_identity(identity)
+                let disposition = self
+                    .task_by_identity(identity)
                     .expect("frozen Task")
                     .abandon_input_preparation(operation);
+                if let Some(disposition) = disposition {
+                    self.note_split_admission(operation, Ok(disposition));
+                } else if let Some(failure) = failure {
+                    self.discard_unsent_split(
+                        operation,
+                        crate::split_delivery::SplitDeliverySettlement::Local(format!(
+                            "Native admission failed: {failure:?}"
+                        )),
+                    );
+                } else {
+                    self.discard_unsent_split(
+                        operation,
+                        crate::split_delivery::SplitDeliverySettlement::Unknown(
+                            "split assignment stopped before Native admission".to_owned(),
+                        ),
+                    );
+                }
                 return;
             }
             if let Some(debt) = self.stage_cancel_debts.get(&operation) {
@@ -667,7 +698,7 @@ impl QueryTaskExecution {
     ) -> Option<EffectBody> {
         let row = self.lifecycle_admissions.get_mut(&operation)?;
         if let Some(grant) = row.grant {
-            self.finish_lifecycle_admission(operation);
+            self.finish_lifecycle_admission(operation, None);
             Some(EffectBody::ReleaseQueuedInput { grant })
         } else if row.withdrawing {
             None

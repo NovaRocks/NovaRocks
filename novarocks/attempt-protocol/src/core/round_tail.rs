@@ -160,6 +160,24 @@ impl Core {
         token: AttemptRequestToken,
         context: &mut dyn StepContext,
     ) -> Result<Option<RoundTailStep>, TaskExecutionError> {
+        if matches!(
+            self.round_tail.phase,
+            Phase::Cleanup | Phase::Dispatch | Phase::BeginSettlement
+        ) && self.execution.has_split_notices()
+        {
+            if !context.charge(1) {
+                return Ok(Some(RoundTailStep::Yield));
+            }
+            let body = self
+                .execution
+                .take_split_notice()
+                .expect("original split notice");
+            return Ok(Some(RoundTailStep::Effect(AttemptEffect {
+                id: action,
+                class: EffectClass::Settlement,
+                body,
+            })));
+        }
         match self.round_tail.phase {
             Phase::Idle => return Err(schedule("no original round tail is selected")),
             Phase::SelectPublication => {
@@ -207,6 +225,36 @@ impl Core {
                     StopProgress::Done => {}
                 }
                 self.execution.try_begin_normal_drain();
+                if self.candidates.enabled {
+                    let running =
+                        !self.stop.business_closed() && !self.execution.normal_drain_started();
+                    if self.execution.split_pump_lifecycle_due(running) {
+                        if !context.charge(1) {
+                            return Ok(Some(RoundTailStep::Yield));
+                        }
+                        let body = self
+                            .execution
+                            .split_pump_lifecycle(running)
+                            .expect("original split pump");
+                        return Ok(Some(RoundTailStep::Effect(AttemptEffect {
+                            id: action,
+                            class: if running {
+                                EffectClass::Business
+                            } else {
+                                EffectClass::Cleanup
+                            },
+                            body,
+                        })));
+                    }
+                    if !running && let Some(task) = self.execution.split_task_after(None) {
+                        if !context.charge(1) {
+                            return Ok(Some(RoundTailStep::Yield));
+                        }
+                        let effect = self.execution.prepare_split_delivery(task, action)?;
+                        debug_assert!(effect.is_none());
+                        return Ok(None);
+                    }
+                }
                 if self.execution.has_released_native_input() {
                     if !context.charge(1) {
                         return Ok(Some(RoundTailStep::Yield));

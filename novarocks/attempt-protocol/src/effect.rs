@@ -164,6 +164,7 @@ pub enum Publication {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueuedInputPayload {
     NewCreation(PayloadRef),
+    NewTaskUpdate(PayloadRef),
     AlreadyRetained,
 }
 
@@ -266,6 +267,7 @@ pub enum EffectBody {
     PumpOperationSettled {
         pump: PayloadRef,
         delivery: crate::input::SplitDeliveryRef,
+        operation: TaskOperationId,
         settlement: crate::split_delivery::SplitDeliverySettlement,
     },
 }

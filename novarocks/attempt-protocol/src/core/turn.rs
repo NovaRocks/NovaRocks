@@ -110,6 +110,7 @@ pub(super) struct Turn {
     seal_delivered: bool,
     terminal_after_close: Option<TerminalWake>,
     cancellation_due: bool,
+    split_failed: bool,
 }
 
 impl Turn {
@@ -216,7 +217,8 @@ impl AttemptCore for Core {
             }
             Phase::Idle
                 if self.execution.has_pending_terminal_cleanup()
-                    || self.execution.has_task_input_cleanup() =>
+                    || self.execution.has_task_input_cleanup()
+                    || self.execution.has_split_notices() =>
             {
                 Some(self.execution.monotonic_now())
             }
@@ -593,9 +595,14 @@ impl Core {
                     } else {
                         self.diagnostics.stop_starting();
                     }
-                    self.convergence.begin(*mode, *remote_deadline);
+                    let mode = if self.turn.split_failed {
+                        AttemptConvergenceMode::Cleanup
+                    } else {
+                        *mode
+                    };
+                    self.convergence.begin(mode, *remote_deadline);
                     self.turn.convergence_changed = true;
-                    if *mode == AttemptConvergenceMode::Cleanup {
+                    if mode == AttemptConvergenceMode::Cleanup {
                         self.request_stop(result);
                     }
                     if self.turn.phase == Phase::Idle
@@ -995,19 +1002,69 @@ impl Core {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
-                    } else if self
-                        .execution
-                        .close_lifecycle_admission(operation, generation)
-                        || self.execution.close_create_admission(operation, generation)
+                    } else if self.execution.complete_lifecycle_admission(
+                        operation,
+                        generation,
+                        Some(&failure),
+                    ) || self.execution.close_create_admission(operation, generation)
                     {
                         self.round_failure.get_or_insert(failure);
                         self.begin_round_tail(true)?;
                         self.turn.phase = Phase::Tail;
                     }
                 }
+                ExecutorFact::PumpTaskUpdate {
+                    pump,
+                    delivery,
+                    task,
+                    domains,
+                } => {
+                    self.execution
+                        .accept_split_delivery(pump, delivery, task, domains)?;
+                }
+                ExecutorFact::PumpFailed { pump, failure }
+                    if self.execution.is_split_pump(pump) =>
+                {
+                    self.record_split_failure(failure, result)?;
+                }
+                ExecutorFact::PumpFinished {
+                    pump,
+                    result: finished,
+                } if self.execution.is_split_pump(pump) => {
+                    if self.execution.finish_split_pump(pump)
+                        && let Err(failure) = finished
+                    {
+                        self.record_split_failure(failure, result)?;
+                    }
+                }
+                ExecutorFact::SplitProfile { pump, observation }
+                    if self.execution.is_split_pump(pump) =>
+                {
+                    self.execution.observe_split_diagnostic(pump, observation)?;
+                }
                 _ => return Err(schedule("executor input has no active protocol owner")),
             },
             _ => return Err(schedule("input has no active protocol owner")),
+        }
+        Ok(())
+    }
+
+    fn record_split_failure(
+        &mut self,
+        failure: AttemptFailure,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        if !self.turn.split_failed {
+            self.turn.split_failed = true;
+            if let Some(deadline) = self.convergence.next_deadline() {
+                self.convergence
+                    .begin(AttemptConvergenceMode::Cleanup, deadline);
+                self.turn.convergence_changed = true;
+            }
+            self.request_stop(result);
+            self.round_failure.get_or_insert(failure);
+            self.begin_round_tail(true)?;
+            self.turn.phase = Phase::Tail;
         }
         Ok(())
     }
@@ -1193,6 +1250,20 @@ impl Core {
                 }
             }
             self.candidates.stage_cancels_done = true;
+        }
+        if !self.candidates.splits_done {
+            while let Some(task) = self.execution.split_task_after(self.candidates.split_after) {
+                if !context.charge(1) {
+                    return Ok(());
+                }
+                self.candidates.split_after = Some(task);
+                let (id, _) = self.turn.issue()?;
+                if let Some(effect) = self.execution.prepare_split_delivery(task, id)? {
+                    result.effect = Some(effect);
+                    return Ok(());
+                }
+            }
+            self.candidates.splits_done = true;
         }
         if !self.candidates.edges_done {
             while let Some(producer) = self

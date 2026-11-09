@@ -46,6 +46,8 @@ pub(super) enum TaskCandidate {
 pub(super) struct Candidates {
     pub(super) enabled: bool,
     pub(super) wake: bool,
+    pub(super) split_after: Option<TaskIdentity>,
+    pub(super) splits_done: bool,
     pub(super) edge_after: Option<TaskIdentity>,
     pub(super) edges_done: bool,
     pub(super) stage_cancel_after: Option<TaskOperationId>,
@@ -61,6 +63,8 @@ pub(super) struct Candidates {
 impl Candidates {
     pub(super) fn begin_round(&mut self) {
         self.wake = false;
+        self.split_after = None;
+        self.splits_done = false;
         self.edge_after = None;
         self.edges_done = false;
         self.stage_cancel_after = None;

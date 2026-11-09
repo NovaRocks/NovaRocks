@@ -28,6 +28,7 @@ pub(crate) mod ack_phase;
 mod create_admission;
 mod lifecycle_admission;
 mod quiesce;
+mod split;
 mod task_update;
 pub(crate) use lifecycle_admission::{ReleaseCheck, ReleaseProgress};
 pub(crate) use task_update::EdgeAdmissionProgress;
@@ -399,8 +400,10 @@ pub struct QueryTaskExecution {
     /// The frozen graph bounds this by sum(producers * (destinations + 1)):
     /// the edge tracker emits each close member and each open only once.
     edge_control_effects: BTreeMap<TaskIdentity, VecDeque<EdgeControlEffect>>,
+    split: split::SplitDeliveries,
     task_input_cleanup: BTreeSet<TaskIdentity>,
-    pending_update_grants: BTreeMap<crate::input::SendGeneration, QueuedInputGrantRef>,
+    pending_update_grants:
+        BTreeMap<crate::input::SendGeneration, (QueuedInputGrantRef, TaskOperationId)>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_granted: BTreeSet<TaskOperationId>,
     quiesce_pass: Option<quiesce::QuiescePass>,
@@ -668,6 +671,7 @@ impl QueryTaskExecution {
             deployment_window_limits,
             deployment_window: BTreeMap::new(),
             edge_control_effects: BTreeMap::new(),
+            split: Default::default(),
             task_input_cleanup: BTreeSet::new(),
             pending_update_grants: BTreeMap::new(),
             operation_targets: BTreeMap::new(),
@@ -1011,12 +1015,13 @@ impl QueryTaskExecution {
                     if definitely_unsent_abort.is_none() {
                         self.rollback_unsent(target, operation_id);
                     }
-                    pass.first_error
-                        .get_or_insert(TaskExecutionError::QueueResidenceExpired {
-                            operation_id,
-                            kind,
-                            waited,
-                        });
+                    let failure = TaskExecutionError::QueueResidenceExpired {
+                        operation_id,
+                        kind,
+                        waited,
+                    };
+                    self.note_split_admission(operation_id, Err(&failure));
+                    pass.first_error.get_or_insert(failure);
                     // Return this SAME ref before consuming another row; no
                     // amortized-growth return buffer on a poller step. The
                     // Core retains the pending effect through Source Full.
@@ -1440,6 +1445,7 @@ impl QueryTaskExecution {
         if self.edges.requires_drain(identity) && !task.is_terminal() {
             return Ok(());
         }
+        let original_update = task.released_update_operation();
         if task
             .status()
             .and_then(TaskStatus::termination)
@@ -1469,12 +1475,21 @@ impl QueryTaskExecution {
                 ));
             }
             self.dispatcher.cancel_queued(operation_id)?;
+            self.note_split_admission(operation_id, Ok(UpdateAdmission::DiscardedNoLongerNeeded));
             self.operation_targets.remove(&operation_id);
             self.rollback_unsent(expected, operation_id);
         }
         self.task_by_identity(identity)
             .ok_or(TaskExecutionError::UnknownOperation)?
             .begin_normal_stand_down();
+        if let Some(operation) = original_update
+            && !self
+                .task_by_identity_ref(identity)
+                .expect("original Task")
+                .update_request_matches(operation)
+        {
+            self.finish_split_no_more_input(operation);
+        }
         self.settle_task_drain(identity.stage_id(), identity.task_id());
         self.withdrawal_materialized.insert(identity.task_id());
         Ok(())
@@ -1580,6 +1595,12 @@ impl QueryTaskExecution {
                             == DispatchOperationState::Queued
                     {
                         self.dispatcher.cancel_queued(operation)?;
+                        self.discard_unsent_split(
+                            operation,
+                            crate::split_delivery::SplitDeliverySettlement::Unknown(
+                                "split assignment stopped before Native dispatch".to_owned(),
+                            ),
+                        );
                         self.operation_targets.remove(&operation);
                         self.rollback_unsent(target, operation);
                     }
@@ -3244,6 +3265,10 @@ mod bounded_drain_tests {
         )
     }
     fn many_tasks(count: u32) -> QueryTaskExecution {
+        many_tasks_with_split_node(count, None)
+    }
+
+    fn many_tasks_with_split_node(count: u32, node: Option<PlanNodeId>) -> QueryTaskExecution {
         let seed = crate::test_support::remote(1);
         let mut tasks = BTreeMap::new();
         let mut stages = BTreeMap::new();
@@ -3264,7 +3289,7 @@ mod bounded_drain_tests {
                     participation: seed.participation(),
                     task_key: UniqueId::new(i64::from(n), 1),
                     fragment_id: n as i32,
-                    split_plan_nodes: Box::new([]),
+                    split_plan_nodes: node.into_iter().collect(),
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(n)).unwrap()),
                         queued_bytes: 256,
@@ -3418,6 +3443,186 @@ mod bounded_drain_tests {
             ),
         }
     }
+    #[test]
+    fn split_delivery_keeps_one_original_operation_across_fresh_admission_and_a_late_receipt() {
+        use crate::{
+            effect::{AttemptEffect, EffectBody, PumpKind, QueuedInputPayload},
+            input::{
+                AckPayload, LocalDispatchResult, OperationObservation, OperationReplyResult,
+                SplitDeliveryRef,
+            },
+            split_delivery::{AcceptedPlanNode, SplitDeliverySettlement},
+        };
+        use novarocks_execution_contract::{
+            DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitSequence,
+            SplitWatermark, TaskDomainReceipt, UpdateTaskReceipt, operation::OperationResult,
+        };
+        let node = PlanNodeId::new(7).unwrap();
+        let mut execution = many_tasks_with_split_node(1, Some(node));
+        let task = identity(&execution, 1);
+        let pump = PayloadRef(NonZeroU64::new(101).unwrap());
+        let payload = PayloadRef(NonZeroU64::new(102).unwrap());
+        let delivery = SplitDeliveryRef(NonZeroU64::new(103).unwrap());
+        execution.bind_split_pump(Some(pump));
+        assert!(matches!(execution.split_pump_lifecycle(true),
+            Some(EffectBody::StartPump { pump: original, kind: PumpKind::SplitAssignment }) if original == pump));
+        let first_sequence = SplitSequence::new(1).unwrap();
+        let assignment = || {
+            Box::new([TaskDomainUpdate::SplitAssignment {
+                node,
+                offer: SplitOffer::batch(first_sequence, first_sequence, true).unwrap(),
+                payload,
+                queued_bytes: 16,
+            }])
+        };
+        execution
+            .accept_split_delivery(pump, delivery, task, assignment())
+            .unwrap();
+        execution
+            .accept_split_delivery(pump, delivery, task, assignment())
+            .unwrap();
+        let first = grant(1);
+        let effect = execution
+            .prepare_split_delivery(task, first.generation().admission_effect())
+            .unwrap()
+            .unwrap();
+        let EffectBody::AdmitQueuedInput {
+            operation: intent,
+            generation,
+            payload: QueuedInputPayload::NewTaskUpdate(original),
+            ..
+        } = effect.body
+        else {
+            panic!("expected the original split payload quote");
+        };
+        assert_eq!(original, payload);
+        assert_eq!(generation, first.generation());
+        let operation = intent.operation_id();
+        assert!(execution.take_split_notice().is_none());
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, first).unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        assert!(matches!(execution.take_split_notice(),
+            Some(EffectBody::PumpUpdateAdmitted { pump: original, delivery: same, settlement: None })
+                if original == pump && same == delivery));
+        assert!(matches!(
+            execution
+                .advance_update_send(task, grant(2).generation().admission_effect())
+                .unwrap(),
+            (false, None)
+        ));
+        let status = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        execution
+            .apply_published(&status, &mut StatusReport::default())
+            .unwrap();
+        assert!(matches!(
+            execution
+                .advance_update_send(task, grant(2).generation().admission_effect())
+                .unwrap(),
+            (true, None)
+        ));
+        assert!(execution.take_split_notice().is_none());
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [first]);
+        execution
+            .dispatcher
+            .accept_emitted(&batch, grant(2).generation().admission_effect())
+            .unwrap();
+        execution.note_split_released(operation);
+        assert!(matches!(execution.take_split_notice(),
+            Some(EffectBody::PumpOperationReleased { operation: exact, delivery: same, .. })
+                if exact == operation && same == delivery));
+
+        let observation = |result| OperationObservation {
+            generation,
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::UpdateTask,
+                result,
+            },
+        };
+        let unknown = observation(OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        });
+        let settle = |execution: &mut QueryTaskExecution, observation: &OperationObservation| {
+            let matched = execution.dispatched_reply_needs_observer(observation);
+            let (action, result) = execution.apply_dispatched_reply(observation);
+            result.unwrap();
+            if matched {
+                execution.note_split_reply(&observation.reply);
+            }
+            action
+        };
+        assert!(settle(&mut execution, &unknown).is_none());
+        assert!(matches!(execution.take_split_notice(),
+            Some(EffectBody::PumpOperationSettled { operation: exact, delivery: same, settlement: SplitDeliverySettlement::Unknown(_), .. })
+                if exact == operation && same == delivery));
+        let second = grant(3);
+        let (_, effect) = execution
+            .advance_update_send(task, second.generation().admission_effect())
+            .unwrap();
+        let Some(AttemptEffect {
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation: replay,
+                    generation: new_generation,
+                    payload: QueuedInputPayload::AlreadyRetained,
+                    ..
+                },
+            ..
+        }) = effect
+        else {
+            panic!("expected header-only admission for the replay")
+        };
+        assert_eq!(replay.operation_id(), operation);
+        assert!(new_generation > generation);
+        assert!(settle(&mut execution, &unknown).is_none());
+        assert!(execution.take_split_notice().is_none());
+
+        let receipt = UpdateTaskReceipt::new(
+            task,
+            vec![TaskDomainReceipt::SplitAssignment {
+                nodes: vec![
+                    PlanNodeSplitReceipt::new(
+                        node,
+                        SplitWatermark::empty().apply_batch(first_sequence, true),
+                    )
+                    .with_queued_splits(19),
+                ],
+                progression: DomainProgression::Apply,
+            }],
+        );
+        let accepted = observation(OperationReplyResult::Worker(OperationResult::Verdict {
+            outcome: OperationOutcome::Accepted,
+            detail: None,
+            acknowledgement: Some(AckPayload::Update(receipt)),
+        }));
+        assert!(
+            matches!(settle(&mut execution, &accepted), Some(EffectBody::Withdraw { effect })
+            if effect == new_generation.admission_effect())
+        );
+        assert!(matches!(execution.take_split_notice(),
+        Some(EffectBody::PumpOperationSettled { operation: exact, delivery: same, settlement: SplitDeliverySettlement::Accepted(nodes), .. })
+            if exact == operation && same == delivery && nodes.as_ref() == [AcceptedPlanNode {
+                plan_node_id: 7, accepted_through_sequence: 1, no_more_splits: true, queued_splits: 19,
+            }]));
+        assert!(
+            matches!(execution.observe_lifecycle_grant(operation, second).unwrap(), CreateGrantProgress::Release(held) if held == second)
+        );
+        assert!(execution.take_split_notice().is_none());
+    }
+
     #[test]
     fn original_edge_update_keeps_the_first_grant_and_replays_with_fresh_admission() {
         use crate::{
