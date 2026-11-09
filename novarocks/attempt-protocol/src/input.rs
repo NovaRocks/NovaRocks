@@ -347,6 +347,13 @@ pub enum ExecutorFact {
         failure: AttemptFailure,
     },
     SubscriptionProgress(SubscriptionPhaseSnapshot),
+    /// Authored by the original open job's actual exit, independently of
+    /// stream closure and CloseSubscription's effect completion.
+    SubscriptionExited {
+        effect: AttemptActionId,
+        participation: ParticipationRef,
+        generation: NonZeroU64,
+    },
     Observations(ObservationBatch),
     ReadState(ReadStateSnapshot),
     ReadProgress(ReadProgressSnapshot),

@@ -147,6 +147,16 @@ impl QueryTaskExecution {
         (action, self.apply_operation_reply(target, reply))
     }
 
+    pub(crate) fn dispatched_participation(
+        &self,
+        operation: novarocks_execution_contract::TaskOperationId,
+    ) -> Option<ParticipationRef> {
+        match self.operation_targets.get(&operation) {
+            Some(OperationTarget::Participation(participation)) => Some(*participation),
+            _ => None,
+        }
+    }
+
     pub(crate) fn advance_send_batch(
         &mut self,
         pass: &mut crate::dispatch::BatchDispatchPass,

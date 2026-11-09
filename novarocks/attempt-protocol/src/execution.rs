@@ -27,8 +27,10 @@
 pub(crate) mod ack_phase;
 mod create_admission;
 mod send_replies;
+mod subscription_request;
 pub(crate) use create_admission::CreateGrantProgress;
 pub(crate) use send_replies::UnsentOwner;
+pub(crate) use subscription_request::SubscriptionRequestBuild;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
@@ -49,9 +51,6 @@ use crate::input::{
 };
 use crate::intent::TaskOperationQueueRequest;
 use crate::lease::RequestedLeaseDurations;
-use crate::observation::{
-    QuiesceCursor as QuiesceObservationCursor, SubscriptionRequest as DecodedCoveredSubscription,
-};
 use crate::operation::OperationDispatchResult;
 use crate::status_validation::GoneObservation;
 use novarocks_coordination_contract::AttemptInheritedAdmission as ReplacementWorkerAdmissionEvidence;
@@ -61,8 +60,7 @@ use novarocks_execution_contract::{
     TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
 };
 use novarocks_execution_contract::{
-    ParticipationConvergenceCursor, ParticipationConvergenceReceipt, QuiesceParticipationReceipt,
-    TaskConvergenceCursor, TaskConvergenceReceipt,
+    ParticipationConvergenceReceipt, QuiesceParticipationReceipt, TaskConvergenceReceipt,
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
@@ -821,6 +819,26 @@ impl QueryTaskExecution {
 
     pub(crate) fn take_covered_reconciliations(&mut self) -> BTreeSet<ParticipationRef> {
         std::mem::take(&mut self.covered_reconciliations)
+    }
+
+    pub(crate) fn has_subscription_reconciliation(&self) -> bool {
+        !self.status_reconciliations.is_empty() || !self.covered_reconciliations.is_empty()
+    }
+
+    pub(crate) fn pop_subscription_reconciliation(&mut self) -> Option<ParticipationRef> {
+        self.status_reconciliations
+            .pop_first()
+            .or_else(|| self.covered_reconciliations.pop_first())
+    }
+
+    pub(crate) fn needs_covered_subscription(&self, participation: ParticipationRef) -> bool {
+        self.owner(participation)
+            .is_some_and(ParticipationOwner::establish_acknowledged)
+            && (!self.terminal_cleanup_started
+                || (!self.participation_never_established(participation)
+                    && self
+                        .participation_convergence_receipt(participation)
+                        .is_none()))
     }
 
     /// Every backend's sealed runtime-filter observation, as its release
@@ -1945,53 +1963,6 @@ impl QueryTaskExecution {
             self.open_ready_edges(destination)?;
         }
         Ok(())
-    }
-
-    /// Builds a reconnect request only from facts the serial owner has
-    /// applied, never from transport receipt or an unconsumed intake slot.
-    pub(crate) fn covered_subscription_request(
-        &self,
-        participation: ParticipationRef,
-        generation: NonZeroU64,
-    ) -> Result<DecodedCoveredSubscription, TaskExecutionError> {
-        let state = self
-            .covered_observation
-            .get(&participation)
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        let request = DecodedCoveredSubscription {
-            participation,
-            generation,
-            status_cursors: self.status_cursors(participation).into_boxed_slice(),
-            task_convergence_cursors: self
-                .graph
-                .tasks()
-                .filter(|task| task.participation() == participation)
-                .map(|task| {
-                    let identity = task.identity();
-                    state.actual_stopped.get(&identity).map_or_else(
-                        || TaskConvergenceCursor::unobserved(identity),
-                        |receipt| TaskConvergenceCursor::at(identity, receipt.version()),
-                    )
-                })
-                .collect(),
-            participation_cursor: state.participation_convergence.map(|receipt| {
-                ParticipationConvergenceCursor::at(participation, receipt.version())
-            }),
-            quiesce_cursor: state
-                .quiesce
-                .as_ref()
-                .map(|receipt| QuiesceObservationCursor {
-                    participation,
-                    fence_version: NonZeroU64::new(receipt.fence_version()),
-                }),
-            required_identities: self
-                .graph
-                .tasks()
-                .filter(|task| task.participation() == participation)
-                .map(|task| task.identity())
-                .collect(),
-        };
-        Ok(request)
     }
 
     pub(crate) fn next_covered_generation(

@@ -17,6 +17,9 @@
 
 //! The serial owner of the frozen attempt's protocol components.
 
+mod subscriptions;
+use subscriptions::{SubscriptionStep, Subscriptions};
+
 use crate::{
     authorization::gate::{AuthorizationGate, AuthorizationStep, ObserverStep, QaReply},
     capacity::StepContext,
@@ -31,10 +34,10 @@ use crate::{
     ids::OperationIds,
     input::{
         AttemptInputId, AttemptSourceId, ExecutorFact, NativeSourceCut, ObservationBatch,
-        OperationObservation, PublicationApplied,
+        ObservationEvent, ObservationFact, OperationObservation, PublicationApplied,
     },
     lease::RequestedLeaseDurations,
-    observation::controller::{CoveredSubscription, ObservationDisposition, SubscriptionStatus},
+    observation::controller::ObservationDisposition,
     publication::{
         ProtocolPublication,
         protocol_cursor::{
@@ -58,7 +61,7 @@ pub(crate) struct Core {
     observation_source: AttemptSourceId,
     execution: QueryTaskExecution,
     acknowledgements: NativeAckPhase,
-    subscriptions: BTreeMap<ParticipationRef, CoveredSubscription>,
+    subscriptions: Subscriptions,
     root: RootControl,
     publication: ProtocolPublicationCursor,
     terminal: TerminalController,
@@ -165,17 +168,11 @@ impl Core {
             activation.policy.retain_diagnostics,
             graph.tasks().map(|task| task.identity()),
         );
-        let subscriptions = graph
-            .participations()
-            .map(|&participation| {
-                CoveredSubscription::new(
-                    participation,
-                    ids,
-                    coordination.status_subscription_error_budget,
-                )
-                .map(|subscription| (participation, subscription))
-            })
-            .collect::<Result<_, _>>()?;
+        let subscriptions = Subscriptions::new(
+            graph.participations().copied(),
+            ids,
+            coordination.status_subscription_error_budget,
+        )?;
         let preparing_positions = preparation_positions
             .into_iter()
             .map(|(process, positions)| (process, positions.get()))
@@ -226,7 +223,10 @@ impl Core {
         now: MonotonicInstant,
         cut: NativeSourceCut,
     ) -> Result<(), TaskExecutionError> {
-        if self.authorizations.waiting_for_reply() || self.publication.has_pending_apply() {
+        if self.authorizations.waiting_for_reply()
+            || self.publication.has_pending_apply()
+            || self.subscriptions.assembling()
+        {
             return Err(schedule(
                 "Native acknowledgement crossed an outstanding actual reply",
             ));
@@ -249,9 +249,26 @@ impl Core {
         ) -> Result<(), TaskExecutionError>,
     ) -> Result<Option<EffectBody>, TaskExecutionError> {
         self.execution.set_now(now)?;
-        self.acknowledgements
+        let participation = match fact {
+            ExecutorFact::Operation(observation)
+                if observation.reply.kind()
+                    == novarocks_execution_contract::OperationKind::UpdateParticipation =>
+            {
+                self.execution
+                    .dispatched_participation(observation.reply.operation_id())
+            }
+            _ => None,
+        };
+        let action = self
+            .acknowledgements
             .apply(source, input, fact, &mut self.execution, observe_abort)
-            .map_err(|_| schedule("invalid fact in the Native acknowledgement prefix"))
+            .map_err(|_| schedule("invalid fact in the Native acknowledgement prefix"))?;
+        if let Some(participation) = participation
+            && self.execution.needs_covered_subscription(participation)
+        {
+            self.subscriptions.activate(now, participation)?;
+        }
+        Ok(action)
     }
 
     /// Called at the original dispatch point. All members are priced before
@@ -263,6 +280,7 @@ impl Core {
     ) -> Result<BatchDispatch, TaskExecutionError> {
         if self.acknowledgements.run_round_tail() != Ok(true)
             || !self.publication.permits_protocol_turn()
+            || self.subscriptions.assembling()
         {
             return Err(schedule("dispatch crossed an unfinished round phase"));
         }
@@ -341,6 +359,7 @@ impl Core {
         }
         if self.acknowledgements.run_round_tail() != Ok(true)
             || !self.publication.permits_protocol_turn()
+            || self.subscriptions.assembling()
         {
             return Err(schedule(
                 "ordered observation crossed an unfinished round phase",
@@ -362,26 +381,33 @@ impl Core {
         let mut sealed = None;
         let mut first_error = None;
         for observation in batch.into_items() {
+            let participation = observation.participation;
+            let convergence_changed = matches!(
+                &observation.event,
+                ObservationEvent::Fact {
+                    fact: ObservationFact::TaskConvergence(_)
+                        | ObservationFact::ParticipationConvergence(_)
+                        | ObservationFact::Quiesce(_),
+                    ..
+                }
+            );
             let result = self
                 .subscriptions
-                .get_mut(&observation.participation)
-                .ok_or(TaskExecutionError::UnknownOperation)
-                .and_then(|subscription| {
-                    let previous = subscription.status();
-                    let disposition = subscription.observe(observation)?;
-                    if let SubscriptionStatus::Fatal(failure) = subscription.status()
-                        && previous != SubscriptionStatus::Fatal(failure)
-                    {
-                        return Err(TaskExecutionError::NativeTransport(failure.cause));
+                .observe(now, observation)
+                .and_then(|disposition| {
+                    if let ObservationDisposition::ApplyEntity(accepted) = disposition {
+                        let report = self.execution.apply_covered_observation(accepted)?;
+                        if self.execution.needs_covered_subscription(participation) {
+                            if report.accepted != 0 || convergence_changed {
+                                self.subscriptions.applied(participation);
+                            }
+                        } else if self.execution.owner(participation).is_some_and(
+                            crate::participation_owner::ParticipationOwner::establish_acknowledged,
+                        ) {
+                            self.subscriptions.stop(now, participation)?;
+                        }
                     }
-                    Ok(disposition)
-                })
-                .and_then(|disposition| match disposition {
-                    ObservationDisposition::ApplyEntity(accepted) => self
-                        .execution
-                        .apply_covered_observation(accepted)
-                        .map(|_| ()),
-                    ObservationDisposition::Ignore => Ok(()),
+                    Ok(())
                 });
             if let Err(error) = result {
                 first_error.get_or_insert(error);
@@ -398,6 +424,56 @@ impl Core {
                 .expect("an observation batch was admitted at the round tail");
         }
         Ok(sealed)
+    }
+
+    /// Read confirmation has its own prepaid source, independent of the
+    /// ordered frame and root-control intake.
+    pub(crate) fn apply_subscription_input(
+        &mut self,
+        now: MonotonicInstant,
+        fact: &ExecutorFact,
+    ) -> Result<(), TaskExecutionError> {
+        self.execution.set_now(now)?;
+        self.subscriptions.apply_independent(now, fact)
+    }
+
+    pub(crate) fn next_subscription_deadline(&self) -> Option<MonotonicInstant> {
+        let now = self.execution.monotonic_now();
+        if self.execution.has_subscription_reconciliation() {
+            return Some(now);
+        }
+        self.subscriptions.next_deadline(now)
+    }
+
+    pub(crate) fn advance_subscription(
+        &mut self,
+        now: MonotonicInstant,
+        effect: AttemptActionId,
+        token: AttemptRequestToken,
+        context: &mut dyn StepContext,
+    ) -> Result<SubscriptionStep, TaskExecutionError> {
+        if self.acknowledgements.run_round_tail() != Ok(true)
+            || !self.publication.permits_protocol_turn()
+        {
+            return Err(schedule(
+                "subscription drive crossed an unfinished round phase",
+            ));
+        }
+        self.execution.set_now(now)?;
+        while !self.subscriptions.assembling() && self.execution.has_subscription_reconciliation() {
+            if !context.charge(1) {
+                return Ok(SubscriptionStep::Yield);
+            }
+            let participation = self
+                .execution
+                .pop_subscription_reconciliation()
+                .expect("original reconciliation row");
+            if self.execution.needs_covered_subscription(participation) {
+                self.subscriptions.reconcile(now, participation)?;
+            }
+        }
+        self.subscriptions
+            .advance(&self.execution, now, effect, token, context)
     }
 
     /// A host may acknowledge the original root-control claim only after
@@ -435,7 +511,7 @@ impl Core {
 
     /// Called at the old round's publication point after the Root effects.
     pub(crate) fn select_protocol_publication(&mut self) -> Result<bool, TaskExecutionError> {
-        if self.acknowledgements.run_round_tail() != Ok(true) {
+        if self.acknowledgements.run_round_tail() != Ok(true) || self.subscriptions.assembling() {
             return Err(schedule(
                 "protocol publication crossed an unfinished round phase",
             ));
@@ -484,7 +560,10 @@ impl Core {
         &mut self,
         round_failure: Option<AttemptFailure>,
     ) -> Result<(), TaskExecutionError> {
-        if self.publication.has_pending_apply() || self.authorizations.waiting_for_reply() {
+        if self.publication.has_pending_apply()
+            || self.authorizations.waiting_for_reply()
+            || self.subscriptions.assembling()
+        {
             return Err(schedule(
                 "QA settlement crossed an outstanding actual reply",
             ));
@@ -620,8 +699,7 @@ mod tests {
         capacity::QueueStage,
         config::{CoordinationBudgets, DispatchLane, FrozenTransportLimits},
         ids::IdSeed,
-        input::{ObservationEvent, ObservationFact, ObservationOpening, ReceivedObservation},
-        observation::controller::SubscriptionDirective,
+        input::{ObservationOpening, ReceivedObservation},
         root_control::RootSealRefusal,
         start::{FrozenEstablish, PayloadRef},
     };
@@ -752,13 +830,22 @@ mod tests {
             .unwrap()
             .participation();
         let now = core.execution.monotonic_now();
-        let subscription = core.subscriptions.get_mut(&participation).unwrap();
-        subscription.activate();
-        let Some(SubscriptionDirective::Open { generation }) =
-            subscription.drive(now, id(1), None).unwrap()
+        core.subscriptions.activate(now, participation).unwrap();
+        let SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::OpenSubscription(request),
+            ..
+        }) = core
+            .advance_subscription(
+                now,
+                AttemptActionId::new(id(51)),
+                AttemptRequestToken::new(id(52)),
+                &mut Units(10),
+            )
+            .unwrap()
         else {
             panic!("expected the exact original subscription opening");
         };
+        let generation = request.generation;
         ReceivedObservation {
             participation,
             generation,
@@ -1120,6 +1207,171 @@ mod tests {
         .unwrap();
         assert_eq!(core.execution.dispatcher().in_flight_operations(), 0);
         core.authorizations.validate_send(&intent).unwrap();
+    }
+
+    #[test]
+    fn subscription_uses_same_snapshot_and_waits_for_exact_actual_exit() {
+        use crate::input::{
+            ReadPauseCoverage, ReadStateSnapshot, ReceptionCoverage, SubscriptionPhaseSnapshot,
+        };
+        let mut core = round();
+        let opened = core.execution.monotonic_now();
+        let at = |seconds| opened.saturating_add(Duration::from_secs(seconds));
+        let participation = *core.execution.graph().participations().next().unwrap();
+        let effect = |n| AttemptActionId::new(id(n));
+        let token = |n| AttemptRequestToken::new(id(n));
+        core.subscriptions.activate(opened, participation).unwrap();
+
+        assert!(matches!(
+            core.advance_subscription(opened, effect(10), token(10), &mut Units(1))
+                .unwrap(),
+            SubscriptionStep::Yield
+        ));
+        assert!(seal(&mut core).is_err());
+        assert_eq!(core.next_subscription_deadline(), Some(opened));
+        let SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::OpenSubscription(request),
+            ..
+        }) = core
+            .advance_subscription(opened, effect(10), token(10), &mut Units(1))
+            .unwrap()
+        else {
+            panic!("expected original open after the charged cursor resumes");
+        };
+        assert_eq!(request.required_identities.len(), 1);
+        assert_eq!(
+            request.required_identities[0],
+            request.status_cursors[0].identity()
+        );
+        let generation = request.generation;
+        core.apply_subscription_input(
+            opened,
+            &ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                participation,
+                generation,
+                opening_started_at: opened,
+                opened_at: Some(opened),
+            }),
+        )
+        .unwrap();
+        assert_eq!(core.next_subscription_deadline(), Some(at(5)));
+
+        for received in [at(2), at(3)] {
+            let bookmark = ReceivedObservation {
+                participation,
+                generation,
+                received_at: received,
+                opening: ObservationOpening {
+                    started_at: opened,
+                    opened_at: Some(opened),
+                },
+                event: ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Bookmark {
+                        generation: generation.get(),
+                        sequence: 1,
+                        covered_prefix: 0,
+                        source_cut: 0,
+                    },
+                },
+            };
+            core.apply_observations(
+                received,
+                core.observation_source,
+                ObservationBatch::new(vec![bookmark]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(core.next_subscription_deadline(), Some(at(7)));
+        }
+
+        let first = core
+            .advance_subscription(at(7), effect(11), token(11), &mut Units(1))
+            .unwrap();
+        assert!(matches!(first, SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::ConfirmReadState { requested_at, token: request, .. }, ..
+        }) if requested_at == at(7) && request == token(11)));
+        assert_eq!(core.next_subscription_deadline(), None);
+        let snapshot = |n, sampled_at| {
+            ExecutorFact::ReadState(ReadStateSnapshot {
+                request: token(n),
+                participation,
+                generation,
+                snapshot_at: sampled_at,
+                opening_started_at: Some(opened),
+                opened_at: Some(opened),
+                had_liveness: true,
+                last_liveness_at: at(2),
+                pauses: ReadPauseCoverage {
+                    from: at(2),
+                    through: sampled_at,
+                    paused: Duration::from_secs(1),
+                },
+                reading_paused: false,
+                resume_revision: 1,
+                closed: false,
+                received_through_snapshot: ReceptionCoverage::Complete,
+            })
+        };
+        core.apply_subscription_input(at(9), &snapshot(11, at(7)))
+            .unwrap();
+        assert_eq!(core.next_subscription_deadline(), Some(at(8)));
+        assert!(matches!(
+            core.advance_subscription(at(9), effect(12), token(12), &mut Units(1))
+                .unwrap(),
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::ConfirmReadState { .. },
+                ..
+            })
+        ));
+        core.apply_subscription_input(at(9), &snapshot(12, at(9)))
+            .unwrap();
+        assert!(matches!(
+            core.advance_subscription(at(9), effect(13), token(13), &mut Units(1)).unwrap(),
+            SubscriptionStep::Effect(AttemptEffect { body: EffectBody::CloseSubscription { generation: closing, .. }, .. }) if closing == generation
+        ));
+        assert_eq!(core.next_subscription_deadline(), None);
+        let exited = |effect| ExecutorFact::SubscriptionExited {
+            effect,
+            participation,
+            generation,
+        };
+        core.apply_subscription_input(at(15), &exited(effect(13)))
+            .unwrap();
+        assert_eq!(core.next_subscription_deadline(), None);
+        core.apply_subscription_input(at(15), &exited(effect(10)))
+            .unwrap();
+        assert!(
+            core.next_subscription_deadline()
+                .is_some_and(|deadline| deadline <= at(15))
+        );
+        assert!(matches!(
+            core.advance_subscription(at(15), effect(14), token(14), &mut Units(2)).unwrap(),
+            SubscriptionStep::Effect(AttemptEffect { body: EffectBody::OpenSubscription(request), .. })
+                if request.generation.get() == generation.get() + 1
+        ));
+    }
+
+    struct Units(usize);
+    impl StepContext for Units {
+        fn charge(&mut self, units: usize) -> bool {
+            if let Some(left) = self.0.checked_sub(units) {
+                self.0 = left;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn reserve_queue_stage(
+            &mut self,
+            _: DispatchLane,
+            _: bool,
+            _: BackendProcessId,
+            _: usize,
+            _: usize,
+        ) -> QueueStage {
+            panic!("subscription drive has no Native queue reservation")
+        }
     }
 
     struct NoTraversal;
