@@ -1288,7 +1288,8 @@ mod indexed_queue_tests {
             pass.advance(
                 &mut dispatcher,
                 grant(17).generation().admission_effect(),
-                &mut turn
+                &mut turn,
+                |_| Ok(()),
             )
             .unwrap(),
             BatchDispatch::Yield
@@ -1296,12 +1297,13 @@ mod indexed_queue_tests {
         assert!(turn.requests.is_empty());
         assert_eq!(dispatcher.queued_items(), 2);
 
-        turn.left = 10;
+        turn.left = 14;
         assert!(matches!(
             pass.advance(
                 &mut dispatcher,
                 grant(17).generation().admission_effect(),
-                &mut turn
+                &mut turn,
+                |_| Ok(()),
             )
             .unwrap(),
             BatchDispatch::Blocked
@@ -1315,13 +1317,14 @@ mod indexed_queue_tests {
         assert_eq!(dispatcher.queued_entry(second_id).unwrap().queued_at, at(2));
 
         let token = ReservationToken(NonZeroU64::new(17).unwrap());
-        turn.left = 12;
+        turn.left = 16;
         turn.reservation = QueueStage::Granted(token);
         let BatchDispatch::Ready(effect) = pass
             .advance(
                 &mut dispatcher,
                 grant(17).generation().admission_effect(),
                 &mut turn,
+                |_| Ok(()),
             )
             .unwrap()
         else {
@@ -1341,7 +1344,8 @@ mod indexed_queue_tests {
             pass.advance(
                 &mut dispatcher,
                 grant(17).generation().admission_effect(),
-                &mut turn
+                &mut turn,
+                |_| Ok(()),
             )
             .unwrap(),
             BatchDispatch::Empty
@@ -1371,6 +1375,7 @@ mod indexed_queue_tests {
                 &mut dispatcher,
                 grant(17).generation().admission_effect(),
                 &mut turn,
+                |_| Ok(()),
             )
             .unwrap()
         else {
@@ -1384,7 +1389,8 @@ mod indexed_queue_tests {
             pass.advance(
                 &mut dispatcher,
                 grant(18).generation().admission_effect(),
-                &mut turn
+                &mut turn,
+                |_| Ok(()),
             )
             .unwrap(),
             BatchDispatch::Blocked

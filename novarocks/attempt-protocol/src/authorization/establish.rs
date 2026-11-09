@@ -247,6 +247,15 @@ impl EstablishAuthorization {
         self.authorization_flight = None;
         Ok(reply)
     }
+    pub(crate) fn available_for_emission(&self) -> Option<AttemptAuthorizationRef> {
+        if self.closing || self.retired || !self.permits_protocol_turn() {
+            return None;
+        }
+        self.current
+            .filter(|current| current.emitted.is_none())
+            .map(|current| current.authorization)
+    }
+
     /// Original SendBatch emission, distinct from RPC first poll and exit.
     pub(crate) fn emitted(
         &mut self,

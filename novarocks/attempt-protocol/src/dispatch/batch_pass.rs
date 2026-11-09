@@ -20,7 +20,7 @@
 use super::{LANES, OperationDispatcher, batch_allowance, lane_index};
 use crate::capacity::{QueueStage, StepContext};
 use crate::config::DispatchLane;
-use crate::effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass};
+use crate::effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass, OperationIntent};
 use crate::error::TaskExecutionError;
 
 #[derive(Debug)]
@@ -55,12 +55,13 @@ impl BatchDispatchPass {
         }
     }
 
-    /// One unit per scanned backend, then up to five visits to the same
-    /// members: preview, dequeue with index updates, validate the acceptance,
-    /// install the in-flight entries, and record exact batch membership.
+    /// One unit per scanned backend, then up to seven visits to the same
+    /// members: preview, validate authorization, dequeue with index updates,
+    /// validate acceptance, install in-flight entries, record membership and
+    /// mark the original authorization's exact emitted generation.
     /// The host includes this atomic batch cost in its original step budget.
     pub(crate) fn max_batch_units(max_batch_items: usize) -> Option<usize> {
-        max_batch_items.checked_mul(5)?.checked_add(1)
+        max_batch_items.checked_mul(7)?.checked_add(1)
     }
 
     pub(crate) fn advance(
@@ -68,6 +69,7 @@ impl BatchDispatchPass {
         dispatcher: &mut OperationDispatcher,
         effect: AttemptEffectId,
         context: &mut dyn StepContext,
+        mut validate_send: impl FnMut(&OperationIntent) -> Result<(), TaskExecutionError>,
     ) -> Result<BatchDispatch, TaskExecutionError> {
         let backends = dispatcher.rotation.len();
         if dispatcher.queued_items == 0 {
@@ -155,6 +157,9 @@ impl BatchDispatchPass {
             let prefix = queue
                 .batch_prefix(allowance, dispatcher.transport.max_batch_encoded_bytes())
                 .expect("enqueue validated the original head carrier");
+            for entry in queue.entries.values().take(prefix.items) {
+                validate_send(&entry.intent)?;
+            }
             let reservation = match context.reserve_queue_stage(
                 LANES[lane],
                 prefix.control_progress,

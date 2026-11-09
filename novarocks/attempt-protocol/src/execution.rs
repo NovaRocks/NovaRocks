@@ -28,6 +28,7 @@ pub(crate) mod ack_phase;
 mod create_admission;
 mod send_replies;
 pub(crate) use create_admission::CreateGrantProgress;
+pub(crate) use send_replies::UnsentOwner;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;

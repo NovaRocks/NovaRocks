@@ -410,7 +410,73 @@ impl AuthorizationGate {
         Ok(retire_queued_authorization.then_some(operation))
     }
 
-    pub(crate) fn establish_emitted(
+    /// Called on the original queued prefix before taking its reservation or
+    /// consuming a grant. The candidate driver queues only authorized rows.
+    pub(crate) fn validate_send(&self, intent: &OperationIntent) -> Result<(), TaskExecutionError> {
+        let operation = intent.operation_id();
+        let available = match intent {
+            OperationIntent::AcquireParticipationAdmissionTicket(_) => {
+                self.admissions.get(&operation).is_some_and(|row| {
+                    row.issue.is_some() && !row.retired && !row.closing && row.flight.is_none()
+                })
+            }
+            OperationIntent::EstablishParticipation { participation, .. } => {
+                self.establishments.get(&operation).is_some_and(|row| {
+                    row.participation() == *participation && row.available_for_emission().is_some()
+                })
+            }
+            _ => true,
+        };
+        if !available {
+            return Err(schedule(
+                "Native send has no matching original QA authorization",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Call only after validate_send accepted the entire immutable prefix.
+    pub(crate) fn note_sent(
+        &mut self,
+        intent: &OperationIntent,
+        generation: crate::input::SendGeneration,
+    ) {
+        if matches!(intent, OperationIntent::EstablishParticipation { .. }) {
+            let row = self
+                .establishments
+                .get_mut(&intent.operation_id())
+                .expect("validated original Establish authorization");
+            let authorization = row
+                .available_for_emission()
+                .expect("validated original Establish guard");
+            row.emitted(authorization, generation)
+                .expect("validated original Establish emission");
+        }
+    }
+
+    pub(crate) fn note_establish_withdrawn(
+        &mut self,
+        operation: TaskOperationId,
+        participation: ParticipationRef,
+        generation: crate::input::SendGeneration,
+    ) -> Result<(), TaskExecutionError> {
+        let Some(row) = self
+            .establishments
+            .get_mut(&operation)
+            .filter(|row| row.participation() == participation)
+        else {
+            return Err(TaskExecutionError::UnknownOperation);
+        };
+        if !row.withdrawn(generation) {
+            return Err(schedule(
+                "withdrawal differs from the emitted Establish generation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn establish_emitted(
         &mut self,
         operation: TaskOperationId,
         authorization: AttemptAuthorizationRef,

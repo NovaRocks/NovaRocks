@@ -241,7 +241,7 @@ impl NativeAckPhase {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{admission_intent, dispatch_admission};
+pub(crate) use tests::{admission_intent, dispatch_admission, queue_establish};
 
 #[cfg(test)]
 mod tests {
@@ -337,6 +337,36 @@ mod tests {
                 }),
             },
         }
+    }
+
+    pub(crate) fn queue_establish(
+        execution: &mut QueryTaskExecution,
+        participation: ParticipationRef,
+        grant: QueuedInputGrantRef,
+    ) -> OperationIntent {
+        let intent = execution
+            .owners
+            .get_mut(&participation)
+            .unwrap()
+            .establish_intent(
+                ParticipationEstablishFacts {
+                    material: PayloadRef(id(90)),
+                    queued_bytes: 256,
+                },
+                execution.now,
+                &mut execution.ids,
+            )
+            .unwrap()
+            .unwrap();
+        execution
+            .dispatcher
+            .enqueue_reserved(intent.clone(), execution.now, grant)
+            .unwrap();
+        execution.operation_targets.insert(
+            intent.operation_id(),
+            OperationTarget::Participation(participation),
+        );
+        intent
     }
 
     fn unexpected_abort(

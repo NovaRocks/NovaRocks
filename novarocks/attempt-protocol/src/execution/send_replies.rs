@@ -147,6 +147,16 @@ impl QueryTaskExecution {
         (action, self.apply_operation_reply(target, reply))
     }
 
+    pub(crate) fn advance_send_batch(
+        &mut self,
+        pass: &mut crate::dispatch::BatchDispatchPass,
+        effect: AttemptEffectId,
+        context: &mut dyn crate::capacity::StepContext,
+        validate_send: impl FnMut(&crate::effect::OperationIntent) -> Result<(), TaskExecutionError>,
+    ) -> Result<crate::dispatch::BatchDispatch, TaskExecutionError> {
+        pass.advance(&mut self.dispatcher, effect, context, validate_send)
+    }
+
     pub(crate) fn observe_send_started(&mut self, effect: AttemptEffectId) {
         self.dispatcher.observe_send_started(effect);
     }

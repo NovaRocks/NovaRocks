@@ -22,9 +22,10 @@ use crate::{
     capacity::StepContext,
     convergence::RemoteConvergence,
     diagnostics::controller::DiagnosticCollector,
+    dispatch::{BatchDispatch, BatchDispatchPass},
     effect::{AttemptEffect, EffectBody, OperationIntent},
     error::TaskExecutionError,
-    execution::{QueryTaskExecution, ack_phase::NativeAckPhase},
+    execution::{QueryTaskExecution, UnsentOwner, ack_phase::NativeAckPhase},
     failure::AttemptFailure,
     graph::TaskGraph,
     ids::OperationIds,
@@ -64,6 +65,7 @@ pub(crate) struct Core {
     convergence: RemoteConvergence,
     diagnostics: DiagnosticCollector,
     authorizations: AuthorizationGate,
+    dispatch: BatchDispatchPass,
     round_failure: Option<AttemptFailure>,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
     retry: crate::config::TaskUpdateRetryPolicy,
@@ -208,6 +210,7 @@ impl Core {
             convergence,
             diagnostics,
             authorizations,
+            dispatch: BatchDispatchPass::new(),
             round_failure: None,
             establish_material,
             retry,
@@ -249,6 +252,84 @@ impl Core {
         self.acknowledgements
             .apply(source, input, fact, &mut self.execution, observe_abort)
             .map_err(|_| schedule("invalid fact in the Native acknowledgement prefix"))
+    }
+
+    /// Called at the original dispatch point. All members are priced before
+    /// reservation; the queued batch keeps its grants if authorization fails.
+    pub(crate) fn advance_dispatch(
+        &mut self,
+        effect: AttemptActionId,
+        context: &mut dyn StepContext,
+    ) -> Result<BatchDispatch, TaskExecutionError> {
+        if self.acknowledgements.run_round_tail() != Ok(true)
+            || !self.publication.permits_protocol_turn()
+        {
+            return Err(schedule("dispatch crossed an unfinished round phase"));
+        }
+        let progress =
+            self.execution
+                .advance_send_batch(&mut self.dispatch, effect, context, |intent| {
+                    self.authorizations.validate_send(intent)
+                })?;
+        if let BatchDispatch::Ready(AttemptEffect {
+            body: EffectBody::SendBatch { batch, .. },
+            ..
+        }) = &progress
+        {
+            for (intent, grant) in batch.operations.iter().zip(&batch.queued_inputs) {
+                self.authorizations.note_sent(intent, grant.generation());
+            }
+        }
+        Ok(progress)
+    }
+
+    /// The adapter charged the full bounded primary withdrawal before
+    /// calling. Keep folding the original members after the first error.
+    pub(crate) fn apply_transport_withdrawal(
+        &mut self,
+        now: MonotonicInstant,
+        fact: &ExecutorFact,
+        mut settle_abort: impl FnMut(TaskOperationId) -> Result<(), TaskExecutionError>,
+    ) -> Result<(), TaskExecutionError> {
+        self.execution.set_now(now)?;
+        let (effect, outcome) = match *fact {
+            ExecutorFact::Withdrawn { effect, outcome } => (effect, outcome),
+            ExecutorFact::QueuedInputWithdrawn {
+                operation,
+                generation,
+            } => {
+                self.execution.close_create_admission(operation, generation);
+                return Ok(());
+            }
+            _ => return Err(schedule("transport withdrawal received an unrelated fact")),
+        };
+        let Some(members) = self
+            .execution
+            .begin_send_withdrawal_result(effect, outcome)?
+        else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for member in members.iter().copied() {
+            let result =
+                self.execution
+                    .settle_unsent_member(member)
+                    .and_then(|owner| match owner {
+                        UnsentOwner::ActorAbort => settle_abort(member.operation),
+                        UnsentOwner::Establish(participation) => {
+                            self.authorizations.note_establish_withdrawn(
+                                member.operation,
+                                participation,
+                                member.generation,
+                            )
+                        }
+                        UnsentOwner::Local => Ok(()),
+                    });
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn verify_common_observation_phase(
@@ -924,6 +1005,121 @@ mod tests {
             core.advance_ack_settlement(token(12), action(12), &mut NoTraversal).unwrap(),
             AckSettlementProgress::Complete(Err(failure)) if failure == original_failure
         ));
+    }
+
+    #[test]
+    fn only_same_send_withdrawal_releases_the_current_establish_generation() {
+        use crate::{
+            capacity::ReservationToken,
+            execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
+            input::{QueuedInputGrantRef, SendGeneration, WithdrawalOutcome},
+        };
+        use novarocks_coordination_contract::{
+            AttemptAuthorizationDecision, AttemptAuthorizationRef,
+        };
+        use novarocks_execution_contract::OperationOutcome;
+        let start = start();
+        let native = start.sources.native;
+        let now = start.initial_now;
+        let mut core = Core::new(start).unwrap();
+        let participant = *core.execution.graph().participations().next().unwrap();
+        let request = admission_intent(&mut core.execution, participant);
+        let admission =
+            dispatch_admission(&mut core.execution, request, 1, OperationOutcome::Accepted);
+        core.execution.apply_dispatched_reply(&admission).1.unwrap();
+        let action = |value| AttemptActionId::new(id(value));
+        let token = AttemptRequestToken::new(id(10));
+        let grant = QueuedInputGrantRef::new(id(2), SendGeneration::new(action(2)));
+        let intent = queue_establish(&mut core.execution, participant, grant);
+        assert!(matches!(
+            core.authorize_candidate(&intent, token, action(10))
+                .unwrap(),
+            AuthorizationStep::Request(AttemptEffect {
+                body: EffectBody::EstablishAuthorization { .. },
+                ..
+            })
+        ));
+        let reply = LogicalToAttempt {
+            activation: core.activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(
+                    AttemptAuthorizationRef::new(id(15)),
+                )),
+            },
+        };
+        assert!(matches!(
+            core.apply_qa_reply(reply).unwrap(),
+            QaReply::Authorized(_)
+        ));
+        core.begin_native_prefix(
+            now,
+            NativeSourceCut {
+                source: native,
+                tail: None,
+            },
+        )
+        .unwrap();
+
+        struct SendTurn(Option<QueueStage>);
+        impl StepContext for SendTurn {
+            fn charge(&mut self, _: usize) -> bool {
+                true
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                _: bool,
+                _: BackendProcessId,
+                records: usize,
+                _: usize,
+            ) -> QueueStage {
+                assert_eq!(records, 1);
+                self.0.take().expect("one original reservation")
+            }
+        }
+
+        // Process capacity refusal leaves both the queued grant and the unused
+        // current guard in place for the next real capacity wake.
+        assert!(matches!(
+            core.advance_dispatch(action(12), &mut SendTurn(Some(QueueStage::ProcessFull)))
+                .unwrap(),
+            BatchDispatch::Blocked
+        ));
+        core.authorizations.validate_send(&intent).unwrap();
+        let BatchDispatch::Ready(effect) = core
+            .advance_dispatch(
+                action(13),
+                &mut SendTurn(Some(QueueStage::Granted(ReservationToken(id(33))))),
+            )
+            .unwrap()
+        else {
+            panic!("expected original grant and current Establish guard");
+        };
+        assert!(matches!(effect.body, EffectBody::SendBatch { batch, .. }
+            if batch.queued_inputs.as_ref() == [grant]));
+        assert!(core.authorizations.validate_send(&intent).is_err());
+        let mut apply = |effect, outcome| {
+            core.apply_transport_withdrawal(
+                now,
+                &ExecutorFact::Withdrawn { effect, outcome },
+                |_| panic!("Establish is not Abort"),
+            )
+        };
+        apply(action(12), WithdrawalOutcome::DefinitelyUnsent).unwrap();
+        apply(action(13), WithdrawalOutcome::TooLate).unwrap();
+        assert!(core.authorizations.validate_send(&intent).is_err());
+        core.apply_transport_withdrawal(
+            now,
+            &ExecutorFact::Withdrawn {
+                effect: action(13),
+                outcome: WithdrawalOutcome::DefinitelyUnsent,
+            },
+            |_| panic!("Establish is not Abort"),
+        )
+        .unwrap();
+        assert_eq!(core.execution.dispatcher().in_flight_operations(), 0);
+        core.authorizations.validate_send(&intent).unwrap();
     }
 
     struct NoTraversal;

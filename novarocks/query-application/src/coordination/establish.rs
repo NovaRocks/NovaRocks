@@ -561,16 +561,26 @@ struct EstablishIssueRecord {
     identity: Option<EstablishIssueIdentity>,
     request: Option<Arc<EstablishParticipation>>,
     authorization_generation: u64,
+    // Retain remote uncertainty from a previous transport generation when a
+    // later authorization is withdrawn before its final I/O boundary.
+    prior_transport_unknown: bool,
     state: EstablishIssueState,
 }
 
 impl EstablishIssueRecord {
+    fn operation_state(&self) -> EstablishIssueState {
+        if self.prior_transport_unknown && self.state == EstablishIssueState::DefinitelyUnsent {
+            return EstablishIssueState::TransportUnknown;
+        }
+        self.state
+    }
+
     fn snapshot(&self) -> EstablishIssueSnapshot {
         EstablishIssueSnapshot {
             ticket: self.ticket,
             conservative_expiry: self.conservative_expiry,
             identity: self.identity,
-            state: self.state,
+            state: self.operation_state(),
         }
     }
 }
@@ -801,7 +811,7 @@ impl EstablishIssueLedger {
     pub(crate) fn revoke_issue_authority(&mut self) {
         self.fence.revoke();
         for record in self.records.values_mut() {
-            if record.state == EstablishIssueState::DefinitelyUnsent {
+            if record.operation_state() == EstablishIssueState::DefinitelyUnsent {
                 record.request = None;
             }
         }
@@ -886,6 +896,7 @@ impl EstablishIssueLedger {
                         identity: None,
                         request: None,
                         authorization_generation: 0,
+                        prior_transport_unknown: false,
                         state: EstablishIssueState::TicketHeld,
                     },
                 );
@@ -998,7 +1009,7 @@ impl EstablishIssueLedger {
         if record.activation != activation {
             return Err(EstablishIssueError::IdentityMismatch);
         }
-        match record.state {
+        match record.operation_state() {
             EstablishIssueState::DefinitelyUnsent => {
                 if now.has_reached(record.conservative_expiry) {
                     return Err(EstablishIssueError::TicketExpired);
@@ -1235,7 +1246,8 @@ impl EstablishIssueLedger {
         };
         record.state = next;
         if next == EstablishIssueState::PreWorkerRejected
-            || (next == EstablishIssueState::DefinitelyUnsent && !issue_authority_open)
+            || (record.operation_state() == EstablishIssueState::DefinitelyUnsent
+                && !issue_authority_open)
         {
             record.request = None;
         }
@@ -1308,6 +1320,7 @@ fn mint_issue_permit(
         .authorization_generation
         .checked_add(1)
         .ok_or(EstablishIssueError::AuthorizationGenerationExhausted)?;
+    record.prior_transport_unknown |= record.state == EstablishIssueState::TransportUnknown;
     record.state = EstablishIssueState::IssueAuthorized;
     Ok(EstablishIssuePermit {
         identity,
@@ -1329,6 +1342,7 @@ fn settle_worker(
         }
         _ => {
             record.state = EstablishIssueState::WorkerSettled(settlement);
+            record.prior_transport_unknown = false;
             record.request = None;
             Ok(true)
         }
@@ -2808,6 +2822,66 @@ mod tests {
             }),
             Err(EstablishIssueError::FutureAuthorization)
         );
+    }
+
+    #[tokio::test]
+    async fn withdrawn_replay_preserves_prior_unknown_after_ticket_expiry_and_revocation() {
+        let execution = execution(8);
+        let activation = activation(execution);
+        let participation = participation(execution);
+        let ticket = ticket(participation, 8);
+        let request = establish_request(participation, ticket, 8);
+        let request_ref = Arc::downgrade(&request);
+        let (now, expiry) = times();
+        let mut ledger = issue_ledger(participation, 3);
+        hold_ticket(&mut ledger, activation, ticket, 8, now, now);
+        let first = submit(
+            ledger
+                .authorize_issue(
+                    activation,
+                    request,
+                    NativeCompatibilityId::new([8; 32]),
+                    now,
+                )
+                .unwrap(),
+        );
+        let late = first.transport_unknown().unwrap();
+        let replay = submit(
+            ledger
+                .reauthorize_issue(activation, participation, now)
+                .unwrap(),
+        );
+        replay.definitely_unsent().unwrap();
+        ledger.drain_events().unwrap();
+        assert_eq!(
+            ledger.snapshot(participation).unwrap().state(),
+            EstablishIssueState::TransportUnknown
+        );
+
+        // The old attempt could already have redeemed the original ticket.
+        let last = ledger
+            .reauthorize_issue(activation, participation, expiry)
+            .unwrap();
+        drop(last);
+        ledger.drain_events().unwrap();
+        ledger.revoke_issue_authority();
+        assert_eq!(
+            ledger.snapshot(participation).unwrap().state(),
+            EstablishIssueState::TransportUnknown
+        );
+        assert!(request_ref.upgrade().is_some());
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(participation, EstablishStandDownFact::AbortRequired)],
+        );
+
+        late.worker_settled(OperationOutcome::Accepted).unwrap();
+        ledger.drain_events().unwrap();
+        assert_eq!(
+            ledger.snapshot(participation).unwrap().state(),
+            EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied),
+        );
+        assert!(request_ref.upgrade().is_none());
     }
 
     #[tokio::test]

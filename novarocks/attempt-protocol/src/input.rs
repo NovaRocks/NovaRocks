@@ -327,6 +327,12 @@ pub enum ExecutorFact {
         effect: AttemptActionId,
         outcome: WithdrawalOutcome,
     },
+    /// Positive result from the same original AdmitQueuedInput job, after
+    /// unused exit. This carries no grant and settles only this generation.
+    QueuedInputWithdrawn {
+        operation: TaskOperationId,
+        generation: SendGeneration,
+    },
     ActualExit {
         effect: AttemptActionId,
     },
