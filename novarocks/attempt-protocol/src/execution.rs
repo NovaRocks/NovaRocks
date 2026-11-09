@@ -352,6 +352,7 @@ enum TerminalCleanupCursor {
     Tasks(Option<TaskId>),
     Owners(Option<ParticipationRef>),
     Queued(Option<TaskOperationId>),
+    StageCancels(Option<TaskOperationId>),
     Reconciliations,
 }
 
@@ -1594,6 +1595,20 @@ impl QueryTaskExecution {
                     self.terminal_cleanup_cursor =
                         Some(TerminalCleanupCursor::Queued(Some(operation)));
                 } else {
+                    self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::StageCancels(None));
+                }
+            }
+            TerminalCleanupCursor::StageCancels(after) => {
+                if let Some((operation, _)) = self.next_stage_cancel_withdrawal(after) {
+                    if !self.has_lifecycle_admission(operation) {
+                        self.stage_cancel_unused(
+                            operation,
+                            crate::input::WithdrawalOutcome::DefinitelyUnsent,
+                        )?;
+                    }
+                    self.terminal_cleanup_cursor =
+                        Some(TerminalCleanupCursor::StageCancels(Some(operation)));
+                } else {
                     self.terminal_cleanup_cursor = Some(TerminalCleanupCursor::Reconciliations);
                 }
             }
@@ -1630,8 +1645,8 @@ impl QueryTaskExecution {
         let applied = self.apply_operation_reply(target, ack);
         if ack.kind() == OperationKind::CreateTask {
             self.record_create_result(ack, generation);
-        } else if let OperationTarget::Participation(participation) = target {
-            self.record_lifecycle_result(participation, ack, generation, applied.is_ok());
+        } else {
+            self.record_lifecycle_result(target, ack, generation, applied.is_ok());
         }
         applied?;
         Ok(true)
@@ -5467,6 +5482,171 @@ mod stage_demand_cut_tests {
         );
         execution.stage_cancel_queued(operation).unwrap();
     }
+    #[test]
+    fn stage_cancel_uses_fresh_admission_and_an_older_receipt_retracts_its_replay() {
+        use crate::{
+            effect::EffectBody,
+            input::{LocalDispatchResult, OperationObservation, OperationReplyResult},
+        };
+        use novarocks_coordination_contract::AttemptActionId;
+        use novarocks_execution_contract::{OperationOutcome, operation::OperationResult};
+
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let producer = identity(&execution, 4);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (operation, request) = execution.next_stage_cancel_admission(None).unwrap();
+        assert_eq!(request.identity(), producer);
+
+        let key = |n| NonZeroU64::new(n).unwrap();
+        let action = |n| AttemptActionId::new(key(n));
+        let first = execution
+            .begin_stage_cancel_admission(request, action(1))
+            .unwrap()
+            .unwrap();
+        let EffectBody::AdmitQueuedInput {
+            operation: OperationIntent::CancelTask(frozen),
+            generation,
+            ..
+        } = first.body
+        else {
+            panic!("expected original Cancel admission")
+        };
+        assert_eq!(frozen.envelope().operation_id(), operation);
+        assert!(
+            execution
+                .begin_stage_cancel_admission(request, action(2))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            execution.next_stage_cancel_admission(None).unwrap().0,
+            operation
+        );
+        let first_grant = QueuedInputGrantRef::new(key(1), generation);
+        assert!(matches!(
+            execution
+                .observe_lifecycle_grant(operation, first_grant)
+                .unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        assert!(execution.next_stage_cancel_admission(None).is_none());
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [first_grant]);
+        execution
+            .dispatcher
+            .accept_emitted(&batch, action(3))
+            .unwrap();
+
+        let observation = |result| OperationObservation {
+            generation,
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CancelTask,
+                result,
+            },
+        };
+        let unknown = observation(OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        });
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+        let replay = execution
+            .next_task_cancel_intent(producer)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&replay, OperationIntent::CancelTask(exact)
+            if exact.envelope() == request.envelope()
+                && exact.identity() == request.identity()
+                && exact.reason() == request.reason()));
+        let effect = execution
+            .begin_lifecycle_admission(replay, action(4))
+            .unwrap();
+        let EffectBody::AdmitQueuedInput {
+            generation: replay_generation,
+            ..
+        } = effect.body
+        else {
+            panic!("replay must wait for independent WC admission");
+        };
+        assert!(replay_generation > generation);
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+        assert!(execution.has_lifecycle_admission(operation));
+        let accepted = observation(OperationReplyResult::Worker(OperationResult::Verdict {
+            outcome: OperationOutcome::Accepted,
+            detail: None,
+            acknowledgement: None,
+        }));
+        assert!(matches!(execution.apply_dispatched_reply(&accepted),
+            (Some(EffectBody::Withdraw { effect }), Ok(())) if effect == action(4)));
+        let late_grant = QueuedInputGrantRef::new(key(4), replay_generation);
+        assert!(
+            matches!(execution.observe_lifecycle_grant(operation, late_grant).unwrap(),
+            CreateGrantProgress::Release(grant) if grant == late_grant)
+        );
+        assert!(
+            execution
+                .next_task_cancel_intent(producer)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            execution.task(producer.task_id()).unwrap().task_state(),
+            TaskState::Running
+        );
+        assert!(!execution.task_actual_stopped(producer));
+    }
+
+    #[test]
+    fn stop_waits_for_the_original_stage_cancel_admission_result_before_releasing_its_debt() {
+        use crate::effect::EffectBody;
+        use novarocks_coordination_contract::AttemptActionId;
+
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let producer = identity(&execution, 4);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (operation, request) = execution.next_stage_cancel_admission(None).unwrap();
+        let effect = AttemptActionId::new(NonZeroU64::new(1).unwrap());
+        let emitted = execution
+            .begin_stage_cancel_admission(request, effect)
+            .unwrap()
+            .unwrap();
+        let EffectBody::AdmitQueuedInput { generation, .. } = emitted.body else {
+            panic!("expected exact Cancel admission");
+        };
+
+        execution.begin_terminal_cleanup();
+        assert!(matches!(execution.next_stop_lifecycle_admission(None),
+            Some((exact, Some(EffectBody::Withdraw { effect: original })))
+                if exact == operation && original == effect));
+        while execution.has_pending_terminal_cleanup() {
+            assert!(execution.advance_terminal_cleanup(&mut Turn(1)).unwrap());
+        }
+        assert_eq!(
+            execution.next_stage_cancel_withdrawal(None).unwrap().0,
+            operation
+        );
+        assert!(execution.close_lifecycle_admission(operation, generation));
+        assert!(execution.next_stage_cancel_withdrawal(None).is_none());
+        assert!(!execution.close_lifecycle_admission(operation, generation));
+        assert!(!execution.task_actual_stopped(producer));
+    }
+
     #[test]
     fn false_producer_proof_yields_to_sibling_and_parent_waits_for_original_cancel_admission() {
         let mut execution =

@@ -1092,6 +1092,23 @@ impl Core {
             self.resume_after_terminal();
             return Ok(());
         }
+        if !self.candidates.stage_cancels_done {
+            while let Some((operation, request)) = self
+                .execution
+                .next_stage_cancel_admission(self.candidates.stage_cancel_after)
+            {
+                if !context.charge(1) {
+                    return Ok(());
+                }
+                self.candidates.stage_cancel_after = Some(operation);
+                let (id, _) = self.turn.issue()?;
+                if let Some(effect) = self.execution.begin_stage_cancel_admission(request, id)? {
+                    result.effect = Some(effect);
+                    return Ok(());
+                }
+            }
+            self.candidates.stage_cancels_done = true;
+        }
         if self.candidates.authorization.is_some() {
             if !context.charge(1) {
                 return Ok(());
@@ -1198,6 +1215,16 @@ impl Core {
             if !context.charge(1) {
                 return Ok(());
             }
+            if !self.candidates.task_cancel_checked {
+                self.candidates.task_cancel_checked = true;
+                if let Some(intent) = self.execution.next_task_cancel_intent(task)? {
+                    let (id, _) = self.turn.issue()?;
+                    result.effect = Some(self.execution.begin_lifecycle_admission(intent, id)?);
+                    return Ok(());
+                }
+                continue;
+            }
+            self.candidates.task_cancel_checked = false;
             self.candidates.task_after = Some(task.task_id());
             let (id, _) = self.turn.issue()?;
             if let Some(effect) = self.execution.begin_create_admission(task, id)? {

@@ -117,8 +117,8 @@ impl QueryTaskExecution {
             return (None, result);
         }
         let reply = &observation.reply;
-        if let Some(participation) = self.prior_lifecycle_receipt(observation) {
-            return self.settle_prior_lifecycle_receipt(participation, reply);
+        if let Some(target) = self.prior_lifecycle_receipt(observation) {
+            return self.settle_prior_lifecycle_receipt(target, reply);
         }
         let operation = reply.operation_id();
         let generation = observation.generation;
@@ -154,8 +154,8 @@ impl QueryTaskExecution {
         let applied = self.apply_operation_reply(target, reply);
         if reply.kind() == OperationKind::CreateTask {
             self.record_create_result(reply, generation);
-        } else if let OperationTarget::Participation(participation) = target {
-            self.record_lifecycle_result(participation, reply, generation, applied.is_ok());
+        } else {
+            self.record_lifecycle_result(target, reply, generation, applied.is_ok());
         }
         (action, applied)
     }

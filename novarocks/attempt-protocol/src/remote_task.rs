@@ -204,6 +204,40 @@ impl UpdateCandidate {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CancelProgress {
+    Unrequested,
+    Replay(CancelTask),
+    Awaiting {
+        request: CancelTask,
+        prior_unknown: bool,
+    },
+    Settled,
+}
+
+impl CancelProgress {
+    fn unknown_request(self) -> Option<CancelTask> {
+        match self {
+            Self::Replay(request)
+            | Self::Awaiting {
+                request,
+                prior_unknown: true,
+            } => Some(request),
+            _ => None,
+        }
+    }
+
+    fn awaiting(self, operation: TaskOperationId) -> Option<(CancelTask, bool)> {
+        match self {
+            Self::Awaiting {
+                request,
+                prior_unknown,
+            } if request.envelope().operation_id() == operation => Some((request, prior_unknown)),
+            _ => None,
+        }
+    }
+}
+
 /// The frontend's owner of one remote task.
 #[derive(Debug)]
 pub struct RemoteTask {
@@ -234,8 +268,7 @@ pub struct RemoteTask {
     /// separately by charged cleanup, without delaying the accepted terminal.
     discarded_pending: VecDeque<VecDeque<PendingUpdate>>,
     released_update: Option<ReleasedUpdate>,
-    cancel_in_flight: Option<TaskOperationId>,
-    cancel_requested: bool,
+    cancel: CancelProgress,
     status: Option<TaskStatus>,
     cursor: TaskStatusCursor,
     domains: TaskDomainIntentTracker,
@@ -338,8 +371,7 @@ impl RemoteTask {
             next_pending_ordinal: 0,
             discarded_pending: VecDeque::new(),
             released_update: None,
-            cancel_in_flight: None,
-            cancel_requested: false,
+            cancel: CancelProgress::Unrequested,
             status: None,
             cursor: TaskStatusCursor::unobserved(identity),
             domains,
@@ -627,7 +659,7 @@ impl RemoteTask {
     #[cfg(test)]
     pub const fn has_released_operation(&self) -> bool {
         self.create_in_flight.is_some()
-            || self.cancel_in_flight.is_some()
+            || matches!(self.cancel, CancelProgress::Awaiting { .. })
             || matches!(
                 &self.released_update,
                 Some(released) if released.awaiting_outcome
@@ -1098,9 +1130,8 @@ impl RemoteTask {
 
     /// Rolls back a request that never crossed process queue admission.
     ///
-    /// The immutable request remains retained for exact re-release. The only
-    /// exception is cancellation: an unsent cancellation has no remote effect,
-    /// so clearing its local marker lets the stage mint a fresh request later.
+    /// An unresolved original request survives a definitely-unsent replay.
+    /// A Cancel with no prior send can clear its local marker.
     pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
         if self.create_in_flight == Some(operation_id) {
             self.create_in_flight = None;
@@ -1117,38 +1148,72 @@ impl RemoteTask {
             }
             return;
         }
-        if self.cancel_in_flight == Some(operation_id) {
-            self.cancel_in_flight = None;
-            self.cancel_requested = false;
+        if let Some((request, prior_unknown)) = self.cancel.awaiting(operation_id) {
+            self.cancel = if prior_unknown {
+                CancelProgress::Replay(request)
+            } else {
+                CancelProgress::Unrequested
+            };
         }
     }
 
-    /// Stands this task down normally, once.
+    /// Stands this task down normally, replaying the exact unresolved request.
     pub fn cancel_intent(
         &mut self,
         reason: CancelReason,
         ids: &mut OperationIds,
     ) -> Option<OperationIntent> {
-        if self.cancel_requested
-            || (self.normal_stand_down && !self.create_ownership_proven)
-            || matches!(self.state, RemoteTaskState::Terminal)
+        if (self.normal_stand_down && !self.create_ownership_proven)
+            || self.is_terminal()
             || self.awaiting_terminal_status
         {
             return None;
         }
-        let operation_id = ids.issue();
-        self.cancel_requested = true;
-        self.cancel_in_flight = Some(operation_id);
-        Some(OperationIntent::CancelTask(CancelTask::new(
-            operation_id,
-            self.identity(),
-            reason,
-        )))
+        let (request, prior_unknown) = match self.cancel {
+            CancelProgress::Unrequested => {
+                (CancelTask::new(ids.issue(), self.identity(), reason), false)
+            }
+            CancelProgress::Replay(request) => (request, true),
+            CancelProgress::Awaiting { .. } | CancelProgress::Settled => return None,
+        };
+        self.cancel = CancelProgress::Awaiting {
+            request,
+            prior_unknown,
+        };
+        Some(OperationIntent::CancelTask(request))
+    }
+
+    pub(crate) fn cancel_send_is_live(&self, operation: TaskOperationId) -> bool {
+        !self.is_terminal()
+            && !self.awaiting_terminal_status
+            && self.cancel.awaiting(operation).is_some()
+    }
+
+    pub(crate) fn has_unknown_cancel(&self) -> bool {
+        self.cancel.unknown_request().is_some()
+    }
+
+    pub(crate) fn tracks_unknown_cancel(&self, operation: TaskOperationId) -> bool {
+        self.cancel
+            .unknown_request()
+            .is_some_and(|request| request.envelope().operation_id() == operation)
+    }
+
+    pub(crate) fn resume_cancel_receipt(&mut self, operation: TaskOperationId) {
+        let request = self
+            .cancel
+            .unknown_request()
+            .expect("original unresolved Cancel");
+        debug_assert_eq!(request.envelope().operation_id(), operation);
+        self.cancel = CancelProgress::Awaiting {
+            request,
+            prior_unknown: true,
+        };
     }
 
     #[cfg(test)]
     pub const fn cancel_requested(&self) -> bool {
-        self.cancel_requested
+        !matches!(self.cancel, CancelProgress::Unrequested)
     }
 
     /// Settles the create acknowledgement.
@@ -1432,10 +1497,15 @@ impl RemoteTask {
         &mut self,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        if self.cancel_in_flight != Some(ack.operation_id()) {
-            return Err(TaskExecutionError::UnknownOperation);
-        }
-        self.cancel_in_flight = None;
+        let (request, _) = self
+            .cancel
+            .awaiting(ack.operation_id())
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        self.cancel = if ack.dispatch_result() == OperationDispatchResult::TransportUnknown {
+            CancelProgress::Replay(request)
+        } else {
+            CancelProgress::Settled
+        };
         if ack.worker_outcome() == Some(OperationOutcome::OwnerFailed) {
             self.stand_down_after_owner_failure();
             return Err(TaskExecutionError::OperationFailed {

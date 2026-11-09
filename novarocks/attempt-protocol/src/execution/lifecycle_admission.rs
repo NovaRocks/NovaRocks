@@ -38,7 +38,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 #[derive(Debug)]
 pub(super) struct LifecycleAdmission {
     intent: OperationIntent,
-    participation: ParticipationRef,
+    target: OperationTarget,
     generation: SendGeneration,
     grant: Option<QueuedInputGrantRef>,
     withdrawing: bool,
@@ -47,7 +47,7 @@ pub(super) struct LifecycleAdmission {
 /// Passive identity for the original operation between physical sends.
 #[derive(Debug)]
 pub(super) struct UnknownLifecycleSend {
-    participation: ParticipationRef,
+    target: OperationTarget,
     kind: OperationKind,
     generation: SendGeneration,
 }
@@ -255,14 +255,26 @@ impl QueryTaskExecution {
         intent: OperationIntent,
         effect: AttemptActionId,
     ) -> Result<AttemptEffect, TaskExecutionError> {
-        let participation = match &intent {
+        let target = match &intent {
             OperationIntent::AcquireParticipationAdmissionTicket(request) => {
-                request.participation()
+                OperationTarget::Participation(request.participation())
             }
-            OperationIntent::EstablishParticipation { participation, .. } => *participation,
-            OperationIntent::RenewParticipationLease(request) => request.participation(),
-            OperationIntent::QuiesceParticipation(request) => request.participation(),
-            OperationIntent::ReleaseParticipation(request) => request.participation(),
+            OperationIntent::EstablishParticipation { participation, .. } => {
+                OperationTarget::Participation(*participation)
+            }
+            OperationIntent::RenewParticipationLease(request) => {
+                OperationTarget::Participation(request.participation())
+            }
+            OperationIntent::QuiesceParticipation(request) => {
+                OperationTarget::Participation(request.participation())
+            }
+            OperationIntent::ReleaseParticipation(request) => {
+                OperationTarget::Participation(request.participation())
+            }
+            OperationIntent::CancelTask(request) => OperationTarget::Task {
+                stage: request.identity().stage_id(),
+                task: request.identity().task_id(),
+            },
             _ => return Err(TaskExecutionError::UnknownOperation),
         };
         self.dispatcher.validate_operation_carrier(&intent)?;
@@ -278,7 +290,7 @@ impl QueryTaskExecution {
             operation,
             LifecycleAdmission {
                 intent: intent.clone(),
-                participation,
+                target,
                 generation,
                 grant: None,
                 withdrawing: false,
@@ -294,6 +306,54 @@ impl QueryTaskExecution {
                 lane,
             },
         })
+    }
+
+    pub(crate) fn begin_stage_cancel_admission(
+        &mut self,
+        request: novarocks_execution_contract::CancelTask,
+        effect: AttemptActionId,
+    ) -> Result<Option<AttemptEffect>, TaskExecutionError> {
+        let operation = request.envelope().operation_id();
+        if self.terminal_cleanup_started || self.has_lifecycle_admission(operation) {
+            return Ok(None);
+        }
+        if !self
+            .task_by_identity_ref(request.identity())
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .cancel_send_is_live(operation)
+        {
+            self.settle_stage_cancel_debt(operation)?;
+            return Ok(None);
+        }
+        self.begin_lifecycle_admission(OperationIntent::CancelTask(request), effect)
+            .map(Some)
+    }
+
+    pub(crate) fn next_task_cancel_intent(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<Option<OperationIntent>, TaskExecutionError> {
+        if self.terminal_cleanup_started {
+            return Ok(None);
+        }
+        self.apply_prior_withdrawal(identity)?;
+        let stage = self
+            .stages
+            .get_mut(&identity.stage_id())
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let mut task = stage
+            .task_mut_observed(identity.task_id(), &self.stage_demand)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let allowed =
+            task.normally_stood_down() && (!self.normal_drain_started || task.has_unknown_cancel());
+        Ok(allowed
+            .then(|| {
+                task.cancel_intent(
+                    novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
+                    &mut self.ids,
+                )
+            })
+            .flatten())
     }
 
     pub(crate) fn has_lifecycle_admission(&self, operation: TaskOperationId) -> bool {
@@ -353,16 +413,22 @@ impl QueryTaskExecution {
             .get(&operation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let grant = row.grant.ok_or(TaskExecutionError::UnknownOperation)?;
-        if row.withdrawing
-            || self.terminal_cleanup_started
-            || self.owners[&row.participation].is_released()
-            || (self.normal_drain_started
-                && matches!(
-                    row.intent,
-                    OperationIntent::AcquireParticipationAdmissionTicket(_)
-                        | OperationIntent::EstablishParticipation { .. }
-                ))
-        {
+        let live = match row.target {
+            OperationTarget::Participation(participation) => {
+                !self.owners[&participation].is_released()
+                    && !(self.normal_drain_started
+                        && matches!(
+                            row.intent,
+                            OperationIntent::AcquireParticipationAdmissionTicket(_)
+                                | OperationIntent::EstablishParticipation { .. }
+                        ))
+            }
+            OperationTarget::Task { stage, task } => self.stages[&stage]
+                .task(task)
+                .is_some_and(|task| task.cancel_send_is_live(operation)),
+            OperationTarget::ActorAbort => unreachable!("actor Abort owns separate admission"),
+        };
+        if row.withdrawing || self.terminal_cleanup_started || !live {
             self.finish_lifecycle_admission(operation);
             return Ok(CreateGrantProgress::Release(grant));
         }
@@ -371,13 +437,15 @@ impl QueryTaskExecution {
         {
             return Ok(CreateGrantProgress::Waiting);
         }
-        let participation = row.participation;
+        let target = row.target;
         self.dispatcher
             .enqueue_reserved(row.intent.clone(), self.now, grant)?;
         self.lifecycle_admissions.remove(&operation);
         self.lifecycle_granted.remove(&operation);
-        self.operation_targets
-            .insert(operation, OperationTarget::Participation(participation));
+        self.operation_targets.insert(operation, target);
+        if self.stage_cancel_debts.contains_key(&operation) {
+            self.stage_cancel_queued(operation)?;
+        }
         Ok(CreateGrantProgress::Queued)
     }
 
@@ -400,13 +468,43 @@ impl QueryTaskExecution {
     fn finish_lifecycle_admission(&mut self, operation: TaskOperationId) {
         if let Some(row) = self.lifecycle_admissions.remove(&operation) {
             self.lifecycle_granted.remove(&operation);
-            self.rollback_unsent(OperationTarget::Participation(row.participation), operation);
+            if let Some(debt) = self.stage_cancel_debts.get(&operation) {
+                if !self.terminal_cleanup_started
+                    && self
+                        .task_by_identity_ref(debt.request.identity())
+                        .is_some_and(|task| task.cancel_send_is_live(operation))
+                {
+                    // The stage still owes this exact original candidate.
+                    return;
+                }
+                self.settle_stage_cancel_debt(operation)
+                    .expect("registered stage Cancel debt");
+            }
+            self.rollback_unsent(row.target, operation);
+        }
+    }
+
+    fn lifecycle_owner_tracks(
+        &self,
+        target: OperationTarget,
+        kind: OperationKind,
+        operation: TaskOperationId,
+    ) -> bool {
+        match target {
+            OperationTarget::Participation(participation) => {
+                self.owners[&participation].tracks_lifecycle_request(kind, operation)
+            }
+            OperationTarget::Task { stage, task } if kind == OperationKind::CancelTask => self
+                .stages[&stage]
+                .task(task)
+                .is_some_and(|task| task.tracks_unknown_cancel(operation)),
+            _ => false,
         }
     }
 
     pub(super) fn record_lifecycle_result(
         &mut self,
-        participation: ParticipationRef,
+        target: OperationTarget,
         reply: &OperationReply,
         generation: SendGeneration,
         applied: bool,
@@ -418,12 +516,12 @@ impl QueryTaskExecution {
         let kind = reply.kind();
         if applied
             && reply.dispatch_result() == OperationDispatchResult::TransportUnknown
-            && self.owners[&participation].tracks_lifecycle_request(kind, operation)
+            && self.lifecycle_owner_tracks(target, kind, operation)
         {
             self.lifecycle_unknown.insert(
                 operation,
                 UnknownLifecycleSend {
-                    participation,
+                    target,
                     kind,
                     generation,
                 },
@@ -433,10 +531,20 @@ impl QueryTaskExecution {
         }
     }
 
-    pub(crate) fn prior_lifecycle_receipt(
+    pub(crate) fn prior_lifecycle_participation(
         &self,
         observation: &OperationObservation,
     ) -> Option<ParticipationRef> {
+        match self.prior_lifecycle_receipt(observation)? {
+            OperationTarget::Participation(participation) => Some(participation),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prior_lifecycle_receipt(
+        &self,
+        observation: &OperationObservation,
+    ) -> Option<OperationTarget> {
         let reply = &observation.reply;
         let operation = reply.operation_id();
         let row = self.lifecycle_unknown.get(&operation)?;
@@ -450,28 +558,38 @@ impl QueryTaskExecution {
                 OperationDispatchResult::WorkerReceipt(_)
             )
             && self.dispatcher.operation_state(operation).ok()? == DispatchOperationState::Absent
-            && self.owners[&row.participation].tracks_lifecycle_request(row.kind, operation))
-        .then_some(row.participation)
+            && self.lifecycle_owner_tracks(row.target, row.kind, operation))
+        .then_some(row.target)
     }
 
     pub(super) fn settle_prior_lifecycle_receipt(
         &mut self,
-        participation: ParticipationRef,
+        target: OperationTarget,
         reply: &OperationReply,
     ) -> (Option<EffectBody>, Result<(), TaskExecutionError>) {
         let operation = reply.operation_id();
         self.lifecycle_unknown.remove(&operation);
         let withdraw = self.withdraw_lifecycle_admission(operation);
-        let resumed = self
-            .owners
-            .get_mut(&participation)
-            .expect("original participation")
-            .resume_lifecycle_receipt(reply.kind(), operation);
-        debug_assert!(resumed);
-        (
-            withdraw,
-            self.acknowledge_participation(participation, reply),
-        )
+        match target {
+            OperationTarget::Participation(participation) => {
+                let resumed = self
+                    .owners
+                    .get_mut(&participation)
+                    .expect("original participation")
+                    .resume_lifecycle_receipt(reply.kind(), operation);
+                debug_assert!(resumed);
+            }
+            OperationTarget::Task { stage, task } => {
+                self.stages
+                    .get_mut(&stage)
+                    .expect("original stage")
+                    .task_mut_observed(task, &self.stage_demand)
+                    .expect("original Task")
+                    .resume_cancel_receipt(operation);
+            }
+            OperationTarget::ActorAbort => unreachable!("actor Abort owns its prior receipts"),
+        }
+        (withdraw, self.apply_operation_reply(target, reply))
     }
 
     pub(crate) fn next_stop_lifecycle_admission(

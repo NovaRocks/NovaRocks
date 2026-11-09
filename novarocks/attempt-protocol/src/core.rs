@@ -296,7 +296,7 @@ impl Core {
             {
                 self.execution
                     .dispatched_participation(observation.reply.operation_id())
-                    .or_else(|| self.execution.prior_lifecycle_receipt(observation))
+                    .or_else(|| self.execution.prior_lifecycle_participation(observation))
             }
             _ => None,
         };
