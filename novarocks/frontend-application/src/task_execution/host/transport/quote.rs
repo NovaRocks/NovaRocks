@@ -86,8 +86,15 @@ pub(crate) fn original_run(
     // allocations also cover the exclusive warm generation/stream wait pair.
     let native =
         layout_sum(&crate::native::transport::NativeChannelSource::owned_source_layouts())?;
+    // The original Apply row moves the grants out of their distinct loan
+    // records; both buffers can coexist during attachment.
+    let attached_inputs = array::<
+        novarocks_workload_control::joint_admission::NativeQueuedInputGrant,
+    >(operations.len())?
+    .size();
     let owned_peak = native
         .checked_add(preparation.max(transition).max(encoded))
+        .and_then(|peak| peak.checked_add(attached_inputs))
         .ok_or(WorkError::ArithmeticOverflow)?;
     original_run_inventory(
         operations,

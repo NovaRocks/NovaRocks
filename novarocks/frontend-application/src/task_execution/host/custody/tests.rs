@@ -111,8 +111,13 @@ async fn prepared_transport_handoff_wakes_source_and_waits_for_actual_join() {
     assert!(role.poll_shared_completion(&mut cx).is_pending());
     assert!(!role.try_retire().unwrap());
     let (ready, wait) = tokio::sync::oneshot::channel();
+    let original_registration = role.registration();
     handoff
-        .spawn(&Handle::current(), exit, |exit| {
+        .spawn(&Handle::current(), exit, |exit, registration| {
+            assert!(Weak::ptr_eq(
+                &original_registration.original,
+                &registration.original
+            ));
             let future = run_future(exit, async { wait.await.unwrap() }, panic);
             async { future.await.unwrap() }
         })

@@ -30,7 +30,10 @@ use crate::{
         transport::Client,
         transport_capacity::{NativeTransportCapacity, TransportCapacityLane},
     },
-    task_execution::{intent::OperationAcknowledgement, operation::OperationDispatchResult},
+    task_execution::{
+        host::custody::TransportJoinRegistration, intent::OperationAcknowledgement,
+        operation::OperationDispatchResult,
+    },
 };
 use novarocks_control_runtime::{
     exit_work::{GatedOutcome, GatedWork, run_future},
@@ -70,6 +73,7 @@ pub(crate) struct BoundSend {
 }
 pub(crate) struct SendJob {
     pub(crate) leg: TransportLeg,
+    pub(crate) registration: TransportJoinRegistration,
     pub(crate) bound: Box<BoundSend>,
 }
 struct Captures {
@@ -119,7 +123,11 @@ pub(crate) fn future_layout() -> std::alloc::Layout {
     of(run)
 }
 pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
-    let SendJob { leg, bound } = job;
+    let SendJob {
+        leg,
+        registration,
+        bound,
+    } = job;
     let TransportLeg {
         exit,
         handoff,
@@ -176,6 +184,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         client: client_for_pre,
         apply,
         inputs: resolved.queued_inputs,
+        registration,
         reports: reports_for_pre,
     });
     let captures = Captures {
@@ -338,6 +347,7 @@ struct PreparationInput {
     client: Client,
     apply: ApplySendPort,
     inputs: Vec<super::queue_input::SendInputLoan>,
+    registration: TransportJoinRegistration,
     reports: Arc<dyn TransportReports>,
 }
 async fn prepare_input(
@@ -358,6 +368,7 @@ async fn prepare_input(
         input.client,
         input.apply,
         input.inputs,
+        input.registration,
         input.reports,
     ) {
         Ok(preparation) => preparation.await,

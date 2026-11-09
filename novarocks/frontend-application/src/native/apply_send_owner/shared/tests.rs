@@ -564,7 +564,7 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
     let encoded = Arc::new(Mutex::new(None));
     let cell = Arc::clone(&encoded);
     launch
-        .spawn(&Handle::current(), exit, move |exit| {
+        .spawn(&Handle::current(), exit, move |exit, _| {
             transport_factory(
                 exit,
                 Captures {

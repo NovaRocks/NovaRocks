@@ -517,29 +517,33 @@ pub(crate) struct OriginalTransportJoinObligation {
 /// The only authority to install the original transport Join. It stays with
 /// the prepared job until the executor accepts that job for real.
 #[must_use]
-pub(crate) struct TransportJoinHandoff(Arc<OriginalRole<()>>);
+pub(crate) struct TransportJoinHandoff {
+    role: Arc<OriginalRole<()>>,
+    registration: TransportJoinRegistration,
+}
 impl TransportJoinHandoff {
     pub(crate) fn owns_exit(&self, exit: &ExitObligation) -> bool {
-        self.0.custody.owns_exit(exit)
+        self.role.custody.owns_exit(exit)
     }
 
     pub(crate) fn spawn<F>(
         self,
         runtime: &Handle,
         exit: ExitObligation,
-        make: impl FnOnce(ExitObligation) -> F,
+        make: impl FnOnce(ExitObligation, TransportJoinRegistration) -> F,
     ) -> Result<(), CustodyError>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         assert!(self.owns_exit(&exit), "same prepared transport exit");
-        match catch_unwind(AssertUnwindSafe(|| runtime.spawn(make(exit)))) {
+        let Self { role, registration } = self;
+        match catch_unwind(AssertUnwindSafe(|| runtime.spawn(make(exit, registration)))) {
             Ok(join) => {
-                self.0.install_join(join);
+                role.install_join(join);
                 Ok(())
             }
             Err(cause) => {
-                self.0.record_handoff_failure(cause);
+                role.record_handoff_failure(cause);
                 Err(CustodyError::OriginalHandoffFailed)
             }
         }
@@ -561,8 +565,7 @@ impl OriginalTransportJoinObligation {
         Make: FnOnce(ExitObligation, TransportJoinRegistration) -> F,
     {
         let (owner, exit, handoff) = Self::prepare(original, observer, panic)?;
-        let registration = owner.registration();
-        let _ = handoff.spawn(runtime, exit, |exit| make(exit, registration));
+        let _ = handoff.spawn(runtime, exit, make);
         Ok(owner)
     }
 
@@ -581,7 +584,12 @@ impl OriginalTransportJoinObligation {
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
-        let handoff = TransportJoinHandoff(role.clone());
+        let handoff = TransportJoinHandoff {
+            role: role.clone(),
+            registration: TransportJoinRegistration {
+                original: Arc::downgrade(&native),
+            },
+        };
         Ok((Self { role, native }, exit, handoff))
     }
 

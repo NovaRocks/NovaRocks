@@ -1415,17 +1415,18 @@ mod tests {
             .fill(FrontendInput::Test(1))
             .unwrap();
         await_attempts(&executor, 1).await;
-        let sample = loop {
-            let changed = host.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(sample) = host.try_effect_observation().unwrap() {
-                break sample;
+        let sample = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(sample) = host.try_effect_observation().unwrap() {
+                    break sample;
+                }
+                // Busy can come from a runtime lock after the host released
+                // its machine. That lock's release need not run another turn.
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::time::timeout(Duration::from_secs(5), changed)
-                .await
-                .expect("original host machine released");
-        };
+        })
+        .await
+        .expect("original host observation became readable");
         assert_eq!(sample.claimed_not_handed_off, 1);
         assert_eq!(binds.load(Ordering::SeqCst), 1);
         assert_eq!(captures.load(Ordering::SeqCst), 0);

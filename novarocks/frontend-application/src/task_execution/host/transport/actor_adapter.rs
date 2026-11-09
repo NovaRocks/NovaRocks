@@ -172,13 +172,14 @@ pub(crate) fn handoff_actor_transport(
         }),
     };
     let spawned = match work {
-        ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit| {
+        ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_send(SendJob {
                 leg: leg(exit),
+                registration,
                 bound,
             })
         }),
-        ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit| {
+        ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit, _| {
             run_queue(QueueJob {
                 leg: leg(exit),
                 bound,

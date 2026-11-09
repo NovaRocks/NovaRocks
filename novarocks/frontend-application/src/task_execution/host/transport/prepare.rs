@@ -19,8 +19,10 @@
 //! The credentialed Source carrier polls this future before the GatedWork gate.
 
 use super::{
-    proposal_wait::ProposalWait, queue_input::SendInputLoan, release_wake::LedgerReleaseWake,
-    source_ports::TransportReports,
+    proposal_wait::ProposalWait,
+    queue_input::SendInputLoan,
+    release_wake::LedgerReleaseWake,
+    source_ports::{FailedApplyAttachment, TransportReports},
 };
 use crate::native::{
     apply_send_owner::{ApplySendPort, RegistrationFailure, SharedApplyPreparation},
@@ -28,6 +30,7 @@ use crate::native::{
     transport::{Client, NativeChannelSource, NativeDialHandoff},
     transport_capacity::{NativeTransportCapacity, TransportCapacityLane},
 };
+use crate::task_execution::host::custody::TransportJoinRegistration;
 use novarocks_control_runtime::{
     capacity_notification::CapacityRegistrant,
     obligation::StepRegistration,
@@ -106,6 +109,7 @@ pub(crate) struct PrepareSend {
     client: Client,
     apply: ApplySendPort,
     inputs: Option<Vec<SendInputLoan>>,
+    registration: TransportJoinRegistration,
     reports: Arc<dyn TransportReports>,
     registrant: Option<CapacityRegistrant>,
     items: usize,
@@ -147,6 +151,7 @@ impl PrepareSend {
         client: Client,
         apply: ApplySendPort,
         inputs: Vec<SendInputLoan>,
+        registration: TransportJoinRegistration,
         reports: Arc<dyn TransportReports>,
     ) -> Result<Self, PreparationFailure> {
         let admission = authority
@@ -181,6 +186,7 @@ impl PrepareSend {
             client,
             apply,
             inputs: Some(inputs),
+            registration,
             reports,
             registrant: None,
             items,
@@ -500,13 +506,19 @@ impl Future for PrepareSend {
         };
         // Register the exact original row with the already-running Source Join
         // before an accepted physical object can require deferred retirement.
-        let row = match this.reports.attach_apply_row(
-            slot,
-            this.inputs.take().expect("same original queued grants"),
-            encoding,
-        ) {
+        let inputs = this
+            .inputs
+            .take()
+            .expect("same original queued grants")
+            .into_iter()
+            .map(SendInputLoan::into_original)
+            .collect();
+        let row = match this.registration.attach_shared(slot, inputs, encoding) {
             Ok(row) => row,
-            Err(error) => {
+            Err(original) => {
+                let error = original.0;
+                this.reports
+                    .retain_failed_attachment(FailedApplyAttachment::new(original));
                 let notification = offer
                     .reobserve_after_drop(&mut physical)
                     .map_err(PreparationFailure::Governance);
