@@ -46,6 +46,8 @@ pub(crate) use actor_adapter::{
 pub(crate) use capacity::{
     EncodingWindow, QueueCustody, QueueWindow, QuotaLeg, ReturnedPhysical, ReturnedQuota,
 };
+#[cfg(test)]
+pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;
 pub(crate) use queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey};
 pub(crate) use queued_job::{BoundQueue, QueueJob, run as run_queue};
 pub(crate) use quote::{

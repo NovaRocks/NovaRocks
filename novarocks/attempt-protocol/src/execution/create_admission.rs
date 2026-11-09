@@ -20,7 +20,7 @@
 
 use super::{OperationTarget, QueryTaskExecution};
 use crate::{
-    dispatch::LocalQueueCapacity,
+    dispatch::{DispatchOperationState, LocalQueueCapacity},
     effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass},
     error::TaskExecutionError,
     input::{OperationObservation, QueuedInputGrantRef, SendGeneration},
@@ -73,7 +73,10 @@ impl QueryTaskExecution {
             return Ok(None);
         };
         let operation = candidate.operation_id();
-        if self.create_admissions.contains_key(&operation) || !self.create_window_available(task) {
+        if self.create_admissions.contains_key(&operation)
+            || self.dispatcher.operation_state(operation)? != DispatchOperationState::Absent
+            || !self.create_window_available(task)
+        {
             return Ok(None);
         }
         self.dispatcher
@@ -201,7 +204,10 @@ impl QueryTaskExecution {
         if reply.kind() != OperationKind::CreateTask || observation.generation >= row.generation {
             return None;
         }
-        if reply.dispatch_result() == OperationDispatchResult::TransportUnknown || row.prior_settled
+        if !matches!(
+            reply.dispatch_result(),
+            OperationDispatchResult::WorkerReceipt(_)
+        ) || row.prior_settled
         {
             return Some((None, Ok(())));
         }

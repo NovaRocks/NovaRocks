@@ -36,7 +36,7 @@ fn drive(driver: &mut JointProgressDriver) {
     }
     panic!("original finite WC proposal did not settle");
 }
-struct Governed {
+pub(crate) struct Governed {
     control: WorkloadControl,
     driver: JointProgressDriver,
     root: novarocks_workload_control::RootWork,
@@ -44,7 +44,7 @@ struct Governed {
     listener: std::net::TcpListener,
 }
 impl Governed {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // Use the existing Native author's actual proposal-observer geometry;
         // this fixture creates no alternate WC grant or process quota wallet.
         let source =
@@ -130,7 +130,7 @@ impl Governed {
             .native_action_authority()
             .unwrap()
     }
-    fn admit(&mut self, key: SendKey, new_backing: usize) -> OriginalQueuedInput {
+    pub(crate) fn admit(&mut self, key: SendKey, new_backing: usize) -> OriginalQueuedInput {
         let quote = crate::task_execution::host::transport::queued_input_quote(
             new_backing,
             crate::task_execution::host::transport::SourceLayouts { original: &[] },
@@ -146,7 +146,7 @@ impl Governed {
         }
         panic!("original queued input did not grant");
     }
-    fn finish(self) -> bool {
+    pub(crate) fn finish(self) -> bool {
         let Self {
             control,
             mut driver,

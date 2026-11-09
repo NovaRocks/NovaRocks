@@ -20,12 +20,12 @@
 use super::{LANES, OperationDispatcher, batch_allowance, lane_index};
 use crate::capacity::{QueueStage, StepContext};
 use crate::config::DispatchLane;
-use crate::effect::EffectBody;
+use crate::effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass};
 use crate::error::TaskExecutionError;
 
 #[derive(Debug)]
 pub(crate) enum BatchDispatch {
-    Ready(EffectBody),
+    Ready(AttemptEffect),
     /// The original ledger installed the capacity wake. No immediate retry.
     Blocked,
     Yield,
@@ -40,6 +40,8 @@ pub(crate) struct BatchDispatchPass {
     control: bool,
     offset: usize,
     selected_lane: Option<usize>,
+    serial: Option<u64>,
+    skipped_target: bool,
 }
 
 impl BatchDispatchPass {
@@ -48,30 +50,53 @@ impl BatchDispatchPass {
             control: true,
             offset: 0,
             selected_lane: None,
+            serial: None,
+            skipped_target: false,
         }
     }
 
-    /// One unit per scanned backend, then up to four visits to the same
+    /// One unit per scanned backend, then up to five visits to the same
     /// members: preview, dequeue with index updates, validate the acceptance,
-    /// and install the in-flight entries.
+    /// install the in-flight entries, and record exact batch membership.
     /// The host includes this atomic batch cost in its original step budget.
     pub(crate) fn max_batch_units(max_batch_items: usize) -> Option<usize> {
-        max_batch_items.checked_mul(4)?.checked_add(1)
+        max_batch_items.checked_mul(5)?.checked_add(1)
     }
 
     pub(crate) fn advance(
         &mut self,
         dispatcher: &mut OperationDispatcher,
+        effect: AttemptEffectId,
         context: &mut dyn StepContext,
     ) -> Result<BatchDispatch, TaskExecutionError> {
         let backends = dispatcher.rotation.len();
         if dispatcher.queued_items == 0 {
+            *self = Self::new();
             return Ok(BatchDispatch::Empty);
         }
+        let serial = if let Some(serial) = self.serial {
+            serial
+        } else {
+            let serial = dispatcher
+                .dispatch_pass_serial
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule("dispatch pass identity exhausted".into())
+                })?;
+            dispatcher.dispatch_pass_serial = serial;
+            self.serial = Some(serial);
+            serial
+        };
         loop {
             if self.offset == backends {
                 if !self.control {
-                    return Ok(BatchDispatch::Empty);
+                    let blocked = self.skipped_target;
+                    *self = Self::new();
+                    return Ok(if blocked {
+                        BatchDispatch::Blocked
+                    } else {
+                        BatchDispatch::Empty
+                    });
                 }
                 self.control = false;
                 self.offset = 0;
@@ -88,6 +113,10 @@ impl BatchDispatchPass {
                     .backends
                     .get_mut(&backend)
                     .expect("original backend");
+                if queues.blocked_dispatch_pass == serial {
+                    self.offset += 1;
+                    continue;
+                }
                 let lane = if self.control {
                     Some(lane_index(DispatchLane::Control))
                 } else if queues.is_empty() {
@@ -134,18 +163,42 @@ impl BatchDispatchPass {
                 prefix.bytes,
             ) {
                 QueueStage::Granted(reservation) => reservation,
-                QueueStage::TargetFull(_) | QueueStage::ProcessFull => {
+                QueueStage::TargetFull(target) if target == backend => {
+                    dispatcher
+                        .backends
+                        .get_mut(&backend)
+                        .expect("quoted backend")
+                        .blocked_dispatch_pass = serial;
+                    self.skipped_target = true;
+                    self.selected_lane = None;
+                    self.offset += 1;
+                    continue;
+                }
+                QueueStage::TargetFull(_) => {
+                    return Err(TaskExecutionError::Schedule(
+                        "capacity refusal differs from its original backend".into(),
+                    ));
+                }
+                QueueStage::ProcessFull => {
                     *self = Self::new();
                     return Ok(BatchDispatch::Blocked);
                 }
             };
             let batch = dispatcher.take_batch_prefix(backend, lane, prefix);
-            dispatcher.accept(&batch)?;
+            dispatcher.accept_emitted(&batch, effect)?;
             dispatcher.rotation_cursor = (index + 1) % backends;
-            *self = Self::new();
-            return Ok(BatchDispatch::Ready(EffectBody::SendBatch {
-                batch,
-                reservation,
+            self.control = true;
+            self.offset = 0;
+            self.selected_lane = None;
+            let class = if batch.control_progress {
+                EffectClass::Settlement
+            } else {
+                EffectClass::Business
+            };
+            return Ok(BatchDispatch::Ready(AttemptEffect {
+                id: effect,
+                class,
+                body: EffectBody::SendBatch { batch, reservation },
             }));
         }
     }

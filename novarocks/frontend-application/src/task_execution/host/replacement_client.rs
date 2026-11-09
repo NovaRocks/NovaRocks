@@ -113,3 +113,6 @@ pub(crate) async fn reserve_replacement_send(
     })
     .await
 }
+
+#[cfg(test)]
+mod tests;

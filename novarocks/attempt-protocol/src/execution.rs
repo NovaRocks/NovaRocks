@@ -25,6 +25,7 @@
 //! what the intake queued. Nothing here opens a connection.
 
 mod create_admission;
+mod send_replies;
 pub(crate) use create_admission::CreateGrantProgress;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -457,87 +458,7 @@ pub(crate) enum ActorAbortDispatchState {
     InFlight,
 }
 
-/// How an acknowledgement relates to an exact participation operation replay which
-/// has not crossed the current generation's transport boundary yet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QueuedParticipationAcknowledgement {
-    NotQueued,
-    IgnoreOlderTransportUnknown,
-    ApplyDefinitive,
-}
-
 impl QueryTaskExecution {
-    /// Classifies a participation acknowledgement against the dispatch owner before
-    /// acknowledgement observers consume it.
-    ///
-    /// After an unknown outcome, an exact replay may already be queued when an
-    /// older generation answers. Another unknown fact says nothing about the
-    /// queued generation and is ignored. A definitive Worker answer closes the
-    /// exact operation and must cancel that definitely-unsent replay before the
-    /// domain owner applies the answer.
-    pub(crate) fn classify_queued_participation_acknowledgement(
-        &self,
-        acknowledgement: &OperationAcknowledgement,
-    ) -> Result<QueuedParticipationAcknowledgement, TaskExecutionError> {
-        if !matches!(
-            acknowledgement.kind(),
-            OperationKind::AcquireParticipationAdmissionTicket | OperationKind::UpdateParticipation
-        ) || !matches!(
-            self.operation_targets.get(&acknowledgement.operation_id()),
-            Some(OperationTarget::Participation(_))
-        ) {
-            return Ok(QueuedParticipationAcknowledgement::NotQueued);
-        }
-        if self
-            .dispatcher
-            .operation_state(acknowledgement.operation_id())?
-            != DispatchOperationState::Queued
-        {
-            return Ok(QueuedParticipationAcknowledgement::NotQueued);
-        }
-        Ok(
-            if acknowledgement.dispatch_result() != OperationDispatchResult::TransportUnknown {
-                QueuedParticipationAcknowledgement::ApplyDefinitive
-            } else {
-                QueuedParticipationAcknowledgement::IgnoreOlderTransportUnknown
-            },
-        )
-    }
-
-    /// Cancels the current definitely-unsent replay and applies the definitive
-    /// settled acknowledgement which arrived from an older transport generation.
-    pub(crate) fn acknowledge_queued_participation_replay(
-        &mut self,
-        acknowledgement: &OperationAcknowledgement,
-    ) -> Result<(), TaskExecutionError> {
-        if acknowledgement.dispatch_result() == OperationDispatchResult::TransportUnknown {
-            return Err(TaskExecutionError::Schedule(
-                "a queued participation replay can be closed only by a definitive acknowledgement"
-                    .to_owned(),
-            ));
-        }
-        let operation_id = acknowledgement.operation_id();
-        let target = *self
-            .operation_targets
-            .get(&operation_id)
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        let OperationTarget::Participation(participation) = target else {
-            return Err(TaskExecutionError::UnknownOperation);
-        };
-        let intent = self.dispatcher.cancel_queued(operation_id)?;
-        if intent.operation_id() != operation_id
-            || intent.kind() != acknowledgement.kind()
-            || intent.backend_process_id() != participation.backend_process_id()
-        {
-            return Err(TaskExecutionError::Schedule(
-                "queued participation replay differs from its definitive acknowledgement address"
-                    .to_owned(),
-            ));
-        }
-        self.operation_targets.remove(&operation_id);
-        self.acknowledge_participation(participation, acknowledgement)
-    }
-
     /// Builds the attempt's owners from its frozen graph.
     pub fn new(
         graph: TaskGraph,
@@ -1589,11 +1510,14 @@ impl QueryTaskExecution {
         generation: crate::input::SendGeneration,
         ack: &OperationAcknowledgement,
     ) -> Result<bool, TaskExecutionError> {
-        if !self
-            .dispatcher
-            .settle_generation(ack.operation_id(), generation)?
-        {
+        let Some(logical_pending) =
+            self.dispatcher
+                .retire_generation(ack.operation_id(), generation, Some(ack.kind()))?
+        else {
             return Ok(false);
+        };
+        if !logical_pending {
+            return Ok(true);
         }
         let target = self
             .operation_targets
@@ -3054,25 +2978,6 @@ impl QueryTaskExecution {
         });
     }
 
-    /// Releases a batch which a pre-transport gate proved definitely unsent.
-    ///
-    /// `take_batch` already removed its queue counters. Dropping the attached
-    /// process permits releases capacity; rolling back each owner marker lets
-    /// attempt convergence mint only the cleanup work it still owes.
-    fn rollback_rejected_batch(&mut self, batch: DispatchBatch) -> Result<(), TaskExecutionError> {
-        let (operations, queue_permits) = batch.into_queue_parts();
-        drop(queue_permits);
-        for operation in operations {
-            let operation_id = operation.operation_id();
-            let target = self
-                .operation_targets
-                .remove(&operation_id)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            self.rollback_unsent(target, operation_id);
-        }
-        Ok(())
-    }
-
     fn rollback_unsent(&mut self, target: OperationTarget, operation_id: TaskOperationId) {
         match target {
             OperationTarget::Task { stage, task } => {
@@ -3742,6 +3647,241 @@ mod bounded_drain_tests {
         assert!(!execution.task(task.task_id()).unwrap().is_terminal());
         assert!(execution.create_candidate_for_task(task).unwrap().is_none());
         assert!(execution.dispatcher.take_batch().is_none());
+    }
+
+    #[test]
+    fn older_create_receipt_preserves_each_emitted_batch_members_own_outcome() {
+        use crate::effect::EffectBody;
+        use crate::input::{
+            LocalDispatchResult, OperationObservation, OperationReplyResult, WithdrawalOutcome,
+        };
+        use novarocks_execution_contract::OperationOutcome;
+
+        for emitted in [None, Some(false), Some(true)] {
+            let mut execution = many_tasks(2);
+            let task = identity(&execution, 1);
+            let sibling = identity(&execution, 2);
+            let participation = execution.task(task.task_id()).unwrap().participation();
+            begin_test_establish(&mut execution, participation);
+            let first = grant(1);
+            let operation = enqueue_create(&mut execution, task, first);
+            let batch = execution.dispatcher.take_batch().unwrap();
+            execution.dispatcher.accept(&batch).unwrap();
+            let older_unknown = OperationObservation {
+                generation: first.generation(),
+                reply: OperationAcknowledgement {
+                    operation_id: operation,
+                    kind: OperationKind::CreateTask,
+                    result: OperationReplyResult::Local {
+                        result: LocalDispatchResult::TransportUnknown,
+                        failure: None,
+                        protocol_failure: None,
+                        detail: None,
+                    },
+                },
+            };
+            assert!(execution.apply_dispatched_reply(&older_unknown).1.is_ok());
+            let replay = grant(2);
+            assert_eq!(enqueue_create(&mut execution, task, replay), operation);
+            let effect = grant(17).generation().admission_effect();
+            let other = if let Some(started) = emitted {
+                let other = enqueue_create(&mut execution, sibling, grant(3));
+                let batch = execution.dispatcher.take_batch().unwrap();
+                execution.dispatcher.accept_emitted(&batch, effect).unwrap();
+                if started {
+                    execution.observe_send_started(effect);
+                }
+                Some(other)
+            } else {
+                None
+            };
+
+            assert!(!execution.dispatched_reply_needs_observer(&older_unknown));
+            assert!(matches!(
+                execution.apply_dispatched_reply(&older_unknown),
+                (None, Ok(()))
+            ));
+            assert!(execution.dispatcher.tracks_input(operation, replay));
+            let definitive = OperationObservation {
+                generation: first.generation(),
+                reply: refusal_reply(operation, OperationOutcome::OwnerFailed),
+            };
+            assert!(execution.dispatched_reply_needs_observer(&definitive));
+            let (action, result) = execution.apply_dispatched_reply(&definitive);
+            assert!(
+                matches!(result, Err(TaskExecutionError::OperationFailed { operation_id, .. }) if operation_id == operation)
+            );
+            assert!(!execution.dispatched_reply_needs_observer(&definitive));
+            assert!(matches!(
+                execution.apply_dispatched_reply(&definitive),
+                (None, Ok(()))
+            ));
+
+            match emitted {
+                None => {
+                    assert!(
+                        matches!(action, Some(EffectBody::ReleaseQueuedInput {grant}) if grant == replay)
+                    );
+                    assert!(!execution.dispatcher.tracks_input(operation, replay));
+                }
+                Some(false) => {
+                    assert!(
+                        matches!(action, Some(EffectBody::Withdraw {effect: target}) if target == effect)
+                    );
+                    assert!(
+                        execution
+                            .begin_send_withdrawal_result(effect, WithdrawalOutcome::TooLate)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(execution.dispatcher.in_flight_operations(), 2);
+                    let members = execution
+                        .begin_send_withdrawal_result(effect, WithdrawalOutcome::DefinitelyUnsent)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(members[0].operation, operation);
+                    assert_eq!(members[0].generation, replay.generation());
+                    assert_eq!(Some(members[1].operation), other);
+                    for member in members.iter().copied() {
+                        execution.settle_unsent_member(member).unwrap();
+                    }
+                    assert!(
+                        execution
+                            .create_candidate_for_task(sibling)
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                Some(true) => {
+                    assert!(action.is_none());
+                    assert!(
+                        execution
+                            .begin_send_withdrawal_result(
+                                effect,
+                                WithdrawalOutcome::DefinitelyUnsent
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(execution.dispatcher.in_flight_operations(), 2);
+                    let current = OperationObservation {
+                        generation: replay.generation(),
+                        reply: older_unknown.reply,
+                    };
+                    assert!(!execution.dispatched_reply_needs_observer(&current));
+                    assert!(matches!(
+                        execution.apply_dispatched_reply(&current),
+                        (None, Ok(()))
+                    ));
+                    assert_eq!(execution.dispatcher.in_flight_operations(), 1);
+                    let sibling_reply = OperationObservation {
+                        generation: grant(3).generation(),
+                        reply: refusal_reply(other.unwrap(), OperationOutcome::NotReady),
+                    };
+                    assert!(execution.dispatched_reply_needs_observer(&sibling_reply));
+                    assert!(matches!(
+                        execution.apply_dispatched_reply(&sibling_reply),
+                        (None, Ok(()))
+                    ));
+                }
+            }
+            assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+            assert!(execution.create_candidate_for_task(task).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn older_refusal_cannot_hide_a_newer_started_create_ownership_receipt() {
+        use crate::input::{
+            AckPayload, LocalDispatchResult, OperationObservation, OperationReplyResult,
+        };
+        use novarocks_execution_contract::{
+            CreateTaskReceipt, OperationOutcome, operation::OperationResult,
+        };
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let part = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, part);
+        let first = grant(1);
+        let operation = enqueue_create(&mut execution, task, first);
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
+        let first_reply = OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        };
+        assert!(
+            execution
+                .apply_dispatched_reply(&OperationObservation {
+                    generation: first.generation(),
+                    reply: OperationAcknowledgement {
+                        operation_id: operation,
+                        kind: OperationKind::CreateTask,
+                        result: first_reply
+                    },
+                })
+                .1
+                .is_ok()
+        );
+        let replay = grant(2);
+        assert_eq!(enqueue_create(&mut execution, task, replay), operation);
+        let batch = execution.dispatcher.take_batch().unwrap();
+        let effect = grant(17).generation().admission_effect();
+        execution.dispatcher.accept_emitted(&batch, effect).unwrap();
+        execution.observe_send_started(effect);
+        for reply in [
+            refusal_reply(operation, OperationOutcome::PreparationBusy),
+            OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CreateTask,
+                result: OperationReplyResult::Local {
+                    result: LocalDispatchResult::NonWorkerRejected,
+                    failure: None,
+                    protocol_failure: None,
+                    detail: None,
+                },
+            },
+        ] {
+            let old = OperationObservation {
+                generation: first.generation(),
+                reply,
+            };
+            assert!(!execution.dispatched_reply_needs_observer(&old));
+            assert!(matches!(
+                execution.apply_dispatched_reply(&old),
+                (None, Ok(()))
+            ));
+        }
+        assert_eq!(execution.dispatcher.in_flight_operations(), 1);
+        let accepted = OperationObservation {
+            generation: replay.generation(),
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CreateTask,
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                        task,
+                        Vec::new(),
+                        TaskStatus::created(task).with_installed(),
+                    )))),
+                }),
+            },
+        };
+        assert!(execution.dispatched_reply_needs_observer(&accepted));
+        assert!(matches!(
+            execution.apply_dispatched_reply(&accepted),
+            (None, Ok(()))
+        ));
+        assert!(
+            execution
+                .task(task.task_id())
+                .unwrap()
+                .create_ownership_proven()
+        );
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
     }
 
     #[test]

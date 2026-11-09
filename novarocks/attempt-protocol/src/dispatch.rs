@@ -31,7 +31,9 @@
 //! already on its way keeps its position and converges on its own receipt.
 
 mod batch_pass;
+mod emitted;
 pub(crate) use batch_pass::{BatchDispatch, BatchDispatchPass};
+pub(crate) use emitted::{EmittedMember, PriorReplyRoute};
 
 mod expiry;
 pub(crate) use expiry::{ExpiryProgress, QueueExpiryCursor};
@@ -45,7 +47,7 @@ use novarocks_execution_contract::{OperationKind, TaskOperationId};
 use novarocks_types::identity::BackendProcessId;
 
 use super::error::{CapacityBound, TaskExecutionError};
-use crate::effect::{DispatchBatch, OperationIntent};
+use crate::effect::{AttemptEffectId, DispatchBatch, OperationIntent};
 use crate::input::{QueuedInputGrantRef, SendGeneration};
 use crate::intent::TaskOperationQueueRequest;
 
@@ -219,6 +221,7 @@ struct BackendQueues {
     queued_items: usize,
     queued_bytes: usize,
     active_tasks: usize,
+    blocked_dispatch_pass: u64,
 }
 
 impl BackendQueues {
@@ -241,6 +244,7 @@ impl BackendQueues {
             queued_items: 0,
             queued_bytes: 0,
             active_tasks: 0,
+            blocked_dispatch_pass: 0,
         }
     }
 
@@ -256,6 +260,9 @@ struct InFlightSlot {
     backend: BackendProcessId,
     lane: DispatchLane,
     input: QueuedInputGrantRef,
+    kind: OperationKind,
+    batch: Option<AttemptEffectId>,
+    logical_pending: bool,
 }
 
 fn batch_allowance(
@@ -302,9 +309,11 @@ pub struct OperationDispatcher {
     backends: BTreeMap<BackendProcessId, BackendQueues>,
     rotation: Vec<BackendProcessId>,
     rotation_cursor: usize,
+    dispatch_pass_serial: u64,
     queued_items: usize,
     queued_bytes: usize,
     in_flight: BTreeMap<TaskOperationId, InFlightSlot>,
+    emitted: BTreeMap<AttemptEffectId, emitted::EmittedBatch>,
     released_grants: Vec<QueuedInputGrantRef>,
     queued_routes: BTreeMap<TaskOperationId, (BackendProcessId, usize, MonotonicInstant)>,
     queued_times: BTreeSet<(MonotonicInstant, TaskOperationId)>,
@@ -318,9 +327,11 @@ impl OperationDispatcher {
             backends: BTreeMap::new(),
             rotation: Vec::new(),
             rotation_cursor: 0,
+            dispatch_pass_serial: 0,
             queued_items: 0,
             queued_bytes: 0,
             in_flight: BTreeMap::new(),
+            emitted: BTreeMap::new(),
             released_grants: Vec::new(),
             queued_routes: BTreeMap::new(),
             queued_times: BTreeSet::new(),
@@ -766,7 +777,16 @@ impl OperationDispatcher {
 
     /// Records the exact grant generation beside each occupied lane credit.
     /// Only the receipt or withdrawal of that generation can free it.
+    #[cfg(test)]
     pub(crate) fn accept(&mut self, batch: &DispatchBatch) -> Result<(), TaskExecutionError> {
+        self.accept_batch(batch, None)
+    }
+
+    fn accept_batch(
+        &mut self,
+        batch: &DispatchBatch,
+        effect: Option<AttemptEffectId>,
+    ) -> Result<(), TaskExecutionError> {
         let backend = batch.backend();
         let lane = lane_index(batch.lane());
         let queues = self
@@ -797,6 +817,9 @@ impl OperationDispatcher {
                     backend,
                     lane: batch.lane(),
                     input: *grant,
+                    kind: intent.kind(),
+                    batch: effect,
+                    logical_pending: true,
                 },
             );
         }
@@ -881,27 +904,49 @@ impl OperationDispatcher {
 
     /// Retires the dispatcher credit of this physical send. The independent
     /// WC grant and physical reservations remain with the original Source.
+    #[cfg(test)]
     pub(crate) fn settle_generation(
         &mut self,
         operation: TaskOperationId,
         generation: SendGeneration,
     ) -> Result<bool, TaskExecutionError> {
+        Ok(self
+            .retire_generation(operation, generation, None)?
+            .is_some())
+    }
+
+    /// Returns the original row's logical ownership flag only after releasing
+    /// its own credit. Physical exits are independently retained by Source.
+    pub(super) fn retire_generation(
+        &mut self,
+        operation: TaskOperationId,
+        generation: SendGeneration,
+        kind: Option<OperationKind>,
+    ) -> Result<Option<bool>, TaskExecutionError> {
         let Some(slot) = self.in_flight.get(&operation).copied() else {
-            return Ok(false);
+            return Ok(None);
         };
         if slot.input.generation() != generation {
-            return Ok(false);
+            return Ok(None);
+        }
+        if kind.is_some_and(|kind| kind != slot.kind) {
+            return Err(TaskExecutionError::Schedule(
+                "reply kind differs from its original dispatch".into(),
+            ));
         }
         let queues = self
             .backends
             .get_mut(&slot.backend)
-            .ok_or(TaskExecutionError::UnknownOperation)?;
+            .expect("original in-flight backend");
         let lane = lane_index(slot.lane);
         queues.in_flight[lane] = queues.in_flight[lane]
             .checked_sub(1)
             .expect("the original in-flight row owns its lane credit");
         self.in_flight.remove(&operation);
-        Ok(true)
+        if let Some(effect) = slot.batch {
+            self.retire_emitted_member(effect);
+        }
+        Ok(Some(slot.logical_pending))
     }
 
     #[cfg(test)]
@@ -1193,6 +1238,7 @@ mod indexed_queue_tests {
         struct Turn {
             left: usize,
             reservation: QueueStage,
+            blocked: Option<BackendProcessId>,
             requests: Vec<(DispatchLane, bool, BackendProcessId, usize, usize)>,
         }
         impl StepContext for Turn {
@@ -1212,7 +1258,11 @@ mod indexed_queue_tests {
                 bytes: usize,
             ) -> QueueStage {
                 self.requests.push((lane, control, backend, items, bytes));
-                self.reservation
+                if self.blocked == Some(backend) {
+                    QueueStage::TargetFull(backend)
+                } else {
+                    self.reservation
+                }
             }
         }
 
@@ -1231,18 +1281,29 @@ mod indexed_queue_tests {
         let mut turn = Turn {
             left: 2,
             reservation: QueueStage::TargetFull(backend),
+            blocked: None,
             requests: Vec::new(),
         };
         assert!(matches!(
-            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            pass.advance(
+                &mut dispatcher,
+                grant(17).generation().admission_effect(),
+                &mut turn
+            )
+            .unwrap(),
             BatchDispatch::Yield
         ));
         assert!(turn.requests.is_empty());
         assert_eq!(dispatcher.queued_items(), 2);
 
-        turn.left = 8;
+        turn.left = 10;
         assert!(matches!(
-            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            pass.advance(
+                &mut dispatcher,
+                grant(17).generation().admission_effect(),
+                &mut turn
+            )
+            .unwrap(),
             BatchDispatch::Blocked
         ));
         assert_eq!(
@@ -1254,12 +1315,21 @@ mod indexed_queue_tests {
         assert_eq!(dispatcher.queued_entry(second_id).unwrap().queued_at, at(2));
 
         let token = ReservationToken(NonZeroU64::new(17).unwrap());
-        turn.left = 10;
+        turn.left = 12;
         turn.reservation = QueueStage::Granted(token);
-        let BatchDispatch::Ready(crate::effect::EffectBody::SendBatch { batch, reservation }) =
-            pass.advance(&mut dispatcher, &mut turn).unwrap()
+        let BatchDispatch::Ready(effect) = pass
+            .advance(
+                &mut dispatcher,
+                grant(17).generation().admission_effect(),
+                &mut turn,
+            )
+            .unwrap()
         else {
             panic!("the original grant and exact FIFO should be released");
+        };
+        assert_eq!(effect.id, grant(17).generation().admission_effect());
+        let crate::effect::EffectBody::SendBatch { batch, reservation } = effect.body else {
+            panic!("the reserved batch must keep its original effect");
         };
         assert_eq!(reservation, token);
         assert_eq!(batch.operations[0].operation_id(), first_id);
@@ -1268,9 +1338,61 @@ mod indexed_queue_tests {
         assert_eq!(dispatcher.queued_items(), 0);
         assert_eq!(dispatcher.in_flight_operations(), 2);
         assert!(matches!(
-            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            pass.advance(
+                &mut dispatcher,
+                grant(17).generation().admission_effect(),
+                &mut turn
+            )
+            .unwrap(),
             BatchDispatch::Empty
         ));
         assert_eq!(turn.requests.len(), 2);
+
+        // A refused target stays parked through a successful batch for a
+        // different target. It does not consume another reservation call.
+        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, limits());
+        dispatcher
+            .enqueue_reserved(operation(1), at(1), grant(1))
+            .unwrap();
+        let mut healthy = operation(2);
+        let OperationIntent::CreateTask { identity, .. } = &mut healthy else {
+            unreachable!()
+        };
+        *identity = crate::test_support::remote(2).identity();
+        let healthy_backend = healthy.backend_process_id();
+        dispatcher
+            .enqueue_reserved(healthy, at(2), grant(2))
+            .unwrap();
+        turn.left = 32;
+        turn.requests.clear();
+        turn.blocked = Some(backend);
+        let BatchDispatch::Ready(effect) = pass
+            .advance(
+                &mut dispatcher,
+                grant(17).generation().admission_effect(),
+                &mut turn,
+            )
+            .unwrap()
+        else {
+            panic!("the healthy target advances in the same pass");
+        };
+        let crate::effect::EffectBody::SendBatch { batch, .. } = effect.body else {
+            unreachable!()
+        };
+        assert_eq!(batch.backend(), healthy_backend);
+        assert!(matches!(
+            pass.advance(
+                &mut dispatcher,
+                grant(18).generation().admission_effect(),
+                &mut turn
+            )
+            .unwrap(),
+            BatchDispatch::Blocked
+        ));
+        assert_eq!(
+            turn.requests.iter().map(|r| r.2).collect::<Vec<_>>(),
+            [backend, healthy_backend]
+        );
+        assert!(dispatcher.tracks_input(first_id, grant(1)));
     }
 }

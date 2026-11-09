@@ -270,4 +270,4 @@ impl Drop for AdmitQueuedInput {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
