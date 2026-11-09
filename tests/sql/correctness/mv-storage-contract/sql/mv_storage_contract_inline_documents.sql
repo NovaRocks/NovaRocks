@@ -324,7 +324,8 @@ SELECT 1;
 
 -- query 20
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW mvside_${uuid0}.ns_${uuid0}.oversized_mv FULL WITH SYNC MODE;
+USE mvside_${uuid0}.ns_${uuid0};
+REFRESH MATERIALIZED VIEW oversized_mv FULL WITH SYNC MODE;
 
 -- query 21
 -- @skip_result_check=true
@@ -346,6 +347,11 @@ SELECT CASE WHEN COUNT(*) = 740
 FROM mvside_${uuid0}.ns_${uuid0}.oversized_mv;
 
 -- query 22
+-- @skip_result_check=true
+-- @mv_resume_management=mv_wide,catalog=mvside_${uuid0},database=ns_${uuid0}
+SELECT 1;
+
+-- query 23
 -- @cleanup=true
 -- @skip_result_check=true
 USE mvside_${uuid0}.ns_${uuid0};

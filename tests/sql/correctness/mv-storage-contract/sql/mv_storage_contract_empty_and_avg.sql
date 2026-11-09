@@ -140,12 +140,17 @@ REFRESH MATERIALIZED VIEW readings_avg WITH SYNC MODE;
 SELECT sensor, mean FROM readings_avg ORDER BY sensor;
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
-DROP MATERIALIZED VIEW readings_avg;
-DROP MATERIALIZED VIEW readings_total;
+DROP MATERIALIZED VIEW IF EXISTS readings_avg;
+DROP MATERIALIZED VIEW IF EXISTS readings_total;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.readings FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
+
+-- query 20
+-- @cleanup=true
+-- @skip_result_check=true
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's
