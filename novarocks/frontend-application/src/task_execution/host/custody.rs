@@ -427,7 +427,7 @@ enum TransportRegistrationState {
     Attaching,
     Attached(SharedApplyJoinObligation),
     Refused(RefusedAttachment),
-    RefusedRetiring,
+    PhysicalRetiring,
     Issued,
 }
 struct RefusedAttachment {
@@ -532,17 +532,39 @@ impl TransportJoinRegistration {
         }
     }
 }
+/// Follows the exact financial partitions and queued grants to their
+/// actual final return. Dropping it leaves the parent retirement closed.
+#[must_use]
+pub(crate) struct TransportPhysicalRetirement(Weak<TransportRegistration>);
+impl TransportPhysicalRetirement {
+    fn finish(self) {
+        let original = self
+            .0
+            .upgrade()
+            .expect("Source retains its original Join record");
+        let mut state = original
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(matches!(
+            *state,
+            TransportRegistrationState::PhysicalRetiring
+        ));
+        *state = TransportRegistrationState::Issued;
+    }
+}
 #[must_use = "consume only at the same original Shared Apply row"]
 pub(crate) struct SharedApplyJoinCompletion {
     original: SharedApplyJoinObligation,
+    physical_retirement: TransportPhysicalRetirement,
     facts: JoinFacts,
 }
 impl SharedApplyJoinCompletion {
     pub(crate) fn original(&self) -> &SharedApplyJoinObligation {
         &self.original
     }
-    pub(crate) fn into_original(self) -> SharedApplyJoinObligation {
-        self.original
+    pub(crate) fn into_original(self) -> (SharedApplyJoinObligation, TransportPhysicalRetirement) {
+        (self.original, self.physical_retirement)
     }
     pub(crate) fn join_facts(&self) -> JoinFacts {
         self.facts
@@ -668,7 +690,7 @@ impl OriginalTransportJoinObligation {
                 return Poll::Ready(Ok(None));
             }
             TransportRegistrationState::Refused(_)
-            | TransportRegistrationState::RefusedRetiring
+            | TransportRegistrationState::PhysicalRetiring
             | TransportRegistrationState::Issued => {
                 return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
             }
@@ -677,7 +699,12 @@ impl OriginalTransportJoinObligation {
             }
             _ => {}
         }
-        let original = match std::mem::replace(&mut *state, TransportRegistrationState::Issued) {
+        let next = if matches!(*state, TransportRegistrationState::Attached(_)) {
+            TransportRegistrationState::PhysicalRetiring
+        } else {
+            TransportRegistrationState::Issued
+        };
+        let original = match std::mem::replace(&mut *state, next) {
             TransportRegistrationState::Unattached => None,
             TransportRegistrationState::Attached(original) => Some(original),
             _ => unreachable!("qualified original attachment"),
@@ -689,9 +716,11 @@ impl OriginalTransportJoinObligation {
             .unwrap_or_else(|e| e.into_inner())
             .facts
             .unwrap();
-        Poll::Ready(Ok(
-            original.map(|original| SharedApplyJoinCompletion { original, facts })
-        ))
+        Poll::Ready(Ok(original.map(|original| SharedApplyJoinCompletion {
+            original,
+            physical_retirement: TransportPhysicalRetirement(Arc::downgrade(&self.native)),
+            facts,
+        })))
     }
     /// The original job has joined without attaching a Native row. Release
     /// the unused local slot and child guard and move the still-queued grants
@@ -713,7 +742,7 @@ impl OriginalTransportJoinObligation {
                 return Err(queue);
             }
             let TransportRegistrationState::Refused(refused) =
-                std::mem::replace(&mut *state, TransportRegistrationState::RefusedRetiring)
+                std::mem::replace(&mut *state, TransportRegistrationState::PhysicalRetiring)
             else {
                 unreachable!("qualified original refusal");
             };
@@ -723,7 +752,7 @@ impl OriginalTransportJoinObligation {
         let retirement = PhysicalInputRetirementObligation::unused_queue(
             queue,
             inputs,
-            Arc::downgrade(&self.native),
+            TransportPhysicalRetirement(Arc::downgrade(&self.native)),
         );
         drop(slot);
         drop(encoding);

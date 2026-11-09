@@ -18,11 +18,11 @@
 //! Final Source consumption of an actual Native return packet. The same
 //! queue and encoding partitions finish before any WC input leaves its queue.
 
-use super::{TransportRegistration, TransportRegistrationState};
+use super::TransportPhysicalRetirement;
 use crate::native::apply_send_owner::{SharedApplyFunding, SharedPhysicalReturn};
 use novarocks_control_runtime::{obligation::ReservationObligation, transaction::RuntimeError};
 use novarocks_workload_control::{WorkError, joint_admission::NativeQueuedInputGrant};
-use std::{mem::ManuallyDrop, sync::Weak};
+use std::mem::ManuallyDrop;
 
 #[derive(Debug)]
 pub(crate) enum PhysicalReturnError {
@@ -68,13 +68,13 @@ impl Funding {
 pub(crate) struct PhysicalInputRetirementObligation {
     funding: Option<Funding>,
     inputs: ManuallyDrop<Vec<NativeQueuedInputGrant>>,
-    refused_owner: Option<Weak<TransportRegistration>>,
+    physical_retirement: Option<TransportPhysicalRetirement>,
 }
 impl PhysicalInputRetirementObligation {
     /// Only Native's private actual-disposal path can create this packet.
     /// Moving its existing Vec and original partitions allocates no new record.
     pub(crate) fn new(original: SharedPhysicalReturn) -> Self {
-        let (funding, inputs) = original.into_original();
+        let (funding, inputs, physical_retirement) = original.into_original();
         let funding = match funding {
             SharedApplyFunding::Encoded(original) => Funding::Encoded {
                 queue: Some(original.queue),
@@ -85,18 +85,18 @@ impl PhysicalInputRetirementObligation {
         Self {
             funding: Some(funding),
             inputs: ManuallyDrop::new(inputs),
-            refused_owner: None,
+            physical_retirement: Some(physical_retirement),
         }
     }
     pub(super) fn unused_queue(
         queue: ReservationObligation,
         inputs: Vec<NativeQueuedInputGrant>,
-        refused_owner: Weak<TransportRegistration>,
+        physical_retirement: TransportPhysicalRetirement,
     ) -> Self {
         Self {
             funding: Some(Funding::UnusedQueue(Some(queue))),
             inputs: ManuallyDrop::new(inputs),
-            refused_owner: Some(refused_owner),
+            physical_retirement: Some(physical_retirement),
         }
     }
     /// One bounded Source continuation: at most two actual financial finishes
@@ -127,19 +127,8 @@ impl PhysicalInputRetirementObligation {
             None
         };
         let done = self.inputs.is_empty();
-        if done && let Some(owner) = self.refused_owner.take() {
-            let original = owner
-                .upgrade()
-                .expect("refused Source retains its Join record");
-            let mut state = original
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            assert!(matches!(
-                *state,
-                TransportRegistrationState::RefusedRetiring
-            ));
-            *state = TransportRegistrationState::Issued;
+        if done && let Some(retirement) = self.physical_retirement.take() {
+            retirement.finish();
         }
         if let Some(notification) = notification {
             notification.notify();

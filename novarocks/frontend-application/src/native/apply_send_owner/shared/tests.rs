@@ -763,6 +763,26 @@ async fn finish_row(
         oracles.push(child.try_retire().unwrap());
         oracles.push(!row.source.try_retire().unwrap());
     }
+    drop(row.publisher.take());
+    let reply = row
+        .retirement
+        .take_disposal_request()
+        .expect("last real reply alias exited");
+    oracles.push(reply.original.phase == DisposalPhase::Reply);
+    let completion = dispose(&mut row, reply).await;
+    row.retirement
+        .complete_disposal(completion)
+        .unwrap_or_else(|_| panic!("same original reply completion"));
+    row.retirement
+        .try_retire()
+        .unwrap_or_else(|_| panic!("actual Native row retired"));
+    roles
+        .ledger
+        .reap_scope_ready(roles.scope.id(), 128)
+        .unwrap();
+    // All local cleanup roles and the Native row have exited, but the
+    // original queue grants and their funding still belong to the Source.
+    oracles.push(!row.source.try_retire().unwrap());
     drive(&mut wc.driver);
     let before = roles
         .ledger
@@ -790,23 +810,6 @@ async fn finish_row(
         armed && wake.wakes.load(Ordering::SeqCst) > 0 && !wake.premature.load(Ordering::SeqCst),
     );
     drop(wait);
-    drop(row.publisher.take());
-    let reply = row
-        .retirement
-        .take_disposal_request()
-        .expect("last real reply alias exited");
-    oracles.push(reply.original.phase == DisposalPhase::Reply);
-    let completion = dispose(&mut row, reply).await;
-    row.retirement
-        .complete_disposal(completion)
-        .unwrap_or_else(|_| panic!("same original reply completion"));
-    row.retirement
-        .try_retire()
-        .unwrap_or_else(|_| panic!("actual Native row retired"));
-    roles
-        .ledger
-        .reap_scope_ready(roles.scope.id(), 128)
-        .unwrap();
     oracles.push(row.source.try_retire().unwrap());
     drop(row.source);
     drop(row.completed);

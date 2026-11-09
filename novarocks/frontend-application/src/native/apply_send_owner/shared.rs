@@ -21,7 +21,7 @@
 //! backing locks; no callback or opaque destructor runs under either lock.
 
 use super::*;
-use crate::task_execution::host::transport::ReturnedQuota;
+use crate::task_execution::host::{custody::TransportPhysicalRetirement, transport::ReturnedQuota};
 use novarocks_control_runtime::obligation::{ReservationObligation, StepRegistration};
 use novarocks_workload_control::joint_admission::NativeQueuedInputGrant;
 use std::mem::ManuallyDrop;
@@ -166,6 +166,7 @@ impl SharedApplyReservations {
 #[must_use = "return every original quota before exiting these send queue grants"]
 pub(crate) struct SharedPhysicalReturn {
     original: ManuallyDrop<SharedApplyReservations>,
+    retirement: TransportPhysicalRetirement,
 }
 /// Funding is a real object transfer, not an exit proof. Only the private
 /// SharedPhysicalReturn constructor below certifies the Native return boundary.
@@ -174,22 +175,29 @@ pub(crate) enum SharedApplyFunding {
     UnusedQueue(ReservationObligation),
 }
 impl SharedPhysicalReturn {
-    pub(crate) fn into_original(self) -> (SharedApplyFunding, Vec<NativeQueuedInputGrant>) {
+    pub(crate) fn into_original(
+        self,
+    ) -> (
+        SharedApplyFunding,
+        Vec<NativeQueuedInputGrant>,
+        TransportPhysicalRetirement,
+    ) {
         let mut original = ManuallyDrop::into_inner(self.original);
         let financial = original
             .financial
             .take()
             .expect("same actual transport return installed");
         let inputs = ManuallyDrop::into_inner(original.inputs);
-        (financial, inputs)
+        (financial, inputs, self.retirement)
     }
 }
 
 /// Protected physical disposal transfers these SAME objects into the original
 /// row's return cell. It does not release quota or finish WC queue custody.
+type SharedReturnCell = Mutex<Option<ManuallyDrop<SharedApplyReservations>>>;
 struct PhysicalReturnCarrier {
     original: Option<SharedApplyReservations>,
-    returned: Arc<Mutex<Option<SharedPhysicalReturn>>>,
+    returned: Arc<SharedReturnCell>,
 }
 impl Drop for PhysicalReturnCarrier {
     fn drop(&mut self) {
@@ -199,9 +207,7 @@ impl Drop for PhysicalReturnCarrier {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         assert!(returned.is_none(), "one original physical return cell");
-        *returned = Some(SharedPhysicalReturn {
-            original: ManuallyDrop::new(original),
-        });
+        *returned = Some(ManuallyDrop::new(original));
     }
 }
 
@@ -218,7 +224,7 @@ pub(super) struct SharedRecord {
     origin: Arc<SharedOrigin>,
     encoding: EncodingCustody,
     stage: SharedStage,
-    returned: Arc<Mutex<Option<SharedPhysicalReturn>>>,
+    returned: Arc<SharedReturnCell>,
 }
 impl SharedRecord {
     pub(super) fn permits_preparation(&self) -> bool {
@@ -244,6 +250,7 @@ pub(crate) struct SharedApplyRetirement {
     core: Arc<Core>,
     index: usize,
     origin: Arc<SharedOrigin>,
+    physical_retirement: Option<TransportPhysicalRetirement>,
 }
 
 impl ApplySlot {
@@ -497,11 +504,12 @@ pub(crate) fn complete_shared_join(
     }
     drop(state);
     original.core.notify_change();
-    let original = completion.into_original();
+    let (original, physical_retirement) = completion.into_original();
     Ok(SharedApplyRetirement {
         core: original.core,
         index: original.index,
         origin: original.origin,
+        physical_retirement: Some(physical_retirement),
     })
 }
 
@@ -677,11 +685,18 @@ impl SharedApplyRetirement {
         {
             return None;
         }
-        shared
+        let original = shared
             .returned
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
+            .take()?;
+        Some(SharedPhysicalReturn {
+            original,
+            retirement: self
+                .physical_retirement
+                .take()
+                .expect("one original physical retirement"),
+        })
     }
     pub(crate) fn try_retire(self) -> Result<(), Self> {
         let mut state = self
@@ -699,6 +714,7 @@ impl SharedApplyRetirement {
         };
         if !Arc::ptr_eq(&self.origin, &shared.origin)
             || !matches!(shared.stage, SharedStage::Retired)
+            || self.physical_retirement.is_some()
             || shared
                 .returned
                 .lock()
@@ -740,7 +756,7 @@ pub(crate) fn shared_apply_layouts()
     Ok(SharedApplyLayouts {
         origin: arc_layout(Layout::new::<SharedOrigin>())
             .map_err(|_| WorkError::ArithmeticOverflow)?,
-        physical_return_cell: arc_layout(Layout::new::<Mutex<Option<SharedPhysicalReturn>>>())
+        physical_return_cell: arc_layout(Layout::new::<SharedReturnCell>())
             .map_err(|_| WorkError::ArithmeticOverflow)?,
         reply_backing: arc_layout(Layout::new::<ReservationBacking>())
             .map_err(|_| WorkError::ArithmeticOverflow)?,
