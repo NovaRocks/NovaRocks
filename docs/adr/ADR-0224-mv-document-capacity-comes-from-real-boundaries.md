@@ -1,7 +1,7 @@
 ---
 id: ADR-0224
 title: "MV document capacity comes from real boundaries"
-domain: [frontend-mv, provider-spi, frontend-durable-records, crate-boundary]
+domain: [frontend-mv, provider-spi, frontend-durable-records, crate-boundary, sql-compiler]
 status: active
 supersedes: []
 superseded-by: null
