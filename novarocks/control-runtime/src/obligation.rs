@@ -789,6 +789,10 @@ pub struct ReservationObligation {
     pub(crate) active: bool,
 }
 impl ReservationObligation {
+    /// A passive check against the original bound reservation's ledger and scope.
+    pub fn belongs_to(&self, scope: &ScopeHandle) -> bool {
+        self.scope.same_scope(scope)
+    }
     /// Validate only original ownership, under one original ledger lock. No
     /// lifecycle, generation, health or resource-release fact is inferred.
     pub(crate) fn validate_reported_work_binding(

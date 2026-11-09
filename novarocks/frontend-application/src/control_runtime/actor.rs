@@ -18,11 +18,14 @@
 //! The FE process owns one common actor carrier. P10a adds the real attempt
 //! variant; protocol state remains pure and rich objects stay in host Sources.
 
+use crate::task_execution::host::adapter::{AttemptActor, AttemptNotice, descriptor};
+use novarocks_attempt_protocol::{effect::AttemptEffect, input::AttemptInput};
 use novarocks_control_runtime::{
     actor::{Actor, ActorStep},
     actor_turn::Clock,
 };
 use novarocks_control_runtime_core::{
+    effect::EffectKind,
     identity::{Generation, ScopeId, Tick},
     mailbox::InputEnvelope,
 };
@@ -39,10 +42,12 @@ impl Clock for FrontendClock {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendActorKind {
+    Attempt,
     #[cfg(test)]
     Test,
 }
 pub(crate) enum FrontendActor {
+    Attempt(Box<AttemptActor>),
     #[cfg(test)]
     Test(Box<dyn TestActor>),
 }
@@ -51,13 +56,23 @@ pub(crate) enum FrontendInput {
     Timer,
     CapacityReleased,
     Membership(super::membership::MembershipUpdate),
+    Attempt(Box<AttemptInput>),
     #[cfg(test)]
     Test(u64),
 }
 #[derive(Clone, Debug)]
 pub(crate) enum FrontendEffect {
+    Attempt(Box<AttemptEffect>),
+    AttemptNotice(Box<AttemptNotice>),
+    AttemptOwnerFailed {
+        scope: ScopeId,
+        generation: Generation,
+        failed_input: InputEnvelope,
+    },
     #[cfg(test)]
-    Test { value: u64 },
+    Test {
+        value: u64,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum FrontendLaneKey {
@@ -66,15 +81,10 @@ pub(crate) enum FrontendLaneKey {
 }
 impl FrontendActor {
     pub(crate) fn kind(&self) -> FrontendActorKind {
-        #[cfg(test)]
-        {
-            match self {
-                Self::Test(_) => FrontendActorKind::Test,
-            }
-        }
-        #[cfg(not(test))]
-        {
-            match *self {}
+        match self {
+            Self::Attempt(_) => FrontendActorKind::Attempt,
+            #[cfg(test)]
+            Self::Test(_) => FrontendActorKind::Test,
         }
     }
 }
@@ -91,28 +101,17 @@ impl Actor for FrontendActor {
         value: FrontendInput,
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
-        #[cfg(test)]
-        {
-            match self {
-                Self::Test(actor) => actor.handle(now, input, value, step),
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (now, input, value, step);
-            match *self {}
+        match self {
+            Self::Attempt(actor) => actor.handle(now, input, value, step),
+            #[cfg(test)]
+            Self::Test(actor) => actor.handle(now, input, value, step),
         }
     }
     fn next_deadline(&self) -> Option<Tick> {
-        #[cfg(test)]
-        {
-            match self {
-                Self::Test(actor) => actor.next_deadline(),
-            }
-        }
-        #[cfg(not(test))]
-        {
-            match *self {}
+        match self {
+            Self::Attempt(actor) => actor.next_deadline(),
+            #[cfg(test)]
+            Self::Test(actor) => actor.next_deadline(),
         }
     }
     fn owner_failed(
@@ -121,9 +120,17 @@ impl Actor for FrontendActor {
         input: InputEnvelope,
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
-        // No suspect Core is inspected. P10a adds the attempt's fixed immutable
-        // failure projection beside the test-only implementation.
-        let _ = (scope, generation, input, step);
+        if let Some(work) = step.failure_work() {
+            step.effect(
+                descriptor(1, work, EffectKind::Cleanup),
+                FrontendEffect::AttemptOwnerFailed {
+                    scope,
+                    generation,
+                    failed_input: input,
+                },
+            )
+            .unwrap();
+        }
     }
 }
 #[cfg(test)]

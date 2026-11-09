@@ -164,6 +164,7 @@ struct PurposeSource(Arc<Mutex<Bank>>);
 fn value(effect: &FrontendEffect) -> u64 {
     match effect {
         FrontendEffect::Test { value } => *value,
+        _ => panic!("attempt effect entered the test Source"),
     }
 }
 impl EffectSource for PurposeSource {

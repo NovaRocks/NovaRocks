@@ -114,6 +114,22 @@ pub struct AttemptStart {
     pub observe_dev_root: bool,
 }
 
+impl AttemptStart {
+    /// Fit the largest indivisible primary input or dispatch continuation.
+    /// Each dispatch wake charges its Timer and round-tail entry separately.
+    pub fn minimum_core_step_units(&self) -> Option<usize> {
+        let batch = self.plan.transport.max_batch_items;
+        let dispatch =
+            crate::dispatch::BatchDispatchPass::max_batch_units(batch)?.checked_add(2)?;
+        Some(
+            dispatch
+                .max(batch.checked_mul(2)?)
+                .max(self.plan.establish_material.len())
+                .max(3),
+        )
+    }
+}
+
 /// Fixed roles from the original actor registration. These identities and
 /// mailbox geometry are metadata, with no admission or access authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -162,6 +162,10 @@ impl ActorRegistration {
             && Arc::ptr_eq(&self.scope, &other.scope)
             && Arc::ptr_eq(&self.origin, &other.origin)
     }
+    /// An already admitted role can lend its author only to this original actor.
+    pub fn matches_input_author(&self, author: &InputAuthor) -> bool {
+        self.actor == author.actor && Arc::ptr_eq(&self.origin, &author.origin)
+    }
     /// Match only a still-attached execution scope. After detachment the
     /// historical scope_id remains, but no execution scope is owned here.
     pub fn matches_scope(&self, scope: &ScopeHandle) -> bool {

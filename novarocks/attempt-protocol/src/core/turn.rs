@@ -57,6 +57,8 @@ pub struct AttemptStep {
     pub stop_producing: bool,
     pub effect: Option<AttemptEffect>,
     pub abort_settlement: Option<AttemptEffect>,
+    /// Reserved on the same action sequence for the host's passive turn report.
+    pub notice_action: Option<AttemptActionId>,
     pub root_control_processed: Option<AttemptInputId>,
     pub definitely_unsent_abort: Option<TaskOperationId>,
     pub retired_authorization: Option<TaskOperationId>,
@@ -189,6 +191,7 @@ impl AttemptCore for Core {
             stop_producing: false,
             effect: None,
             abort_settlement: None,
+            notice_action: None,
             root_control_processed: None,
             definitely_unsent_abort: None,
             retired_authorization: None,
@@ -219,6 +222,14 @@ impl AttemptCore for Core {
             self.execution.signal_dynamic_feedback_progress();
         }
         self.diagnostic_after_input(now);
+        if result.root_control_processed.is_some()
+            || result.definitely_unsent_abort.is_some()
+            || result.retired_authorization.is_some()
+            || result.diagnostic_failure.is_some()
+            || result.round_result.as_ref().is_some_and(Result::is_err)
+        {
+            result.notice_action = Some(self.turn.issue()?.0);
+        }
         result.selection = self.input_selection();
         Ok(result)
     }
