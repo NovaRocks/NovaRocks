@@ -355,6 +355,13 @@ impl PendingCapacityWakes {
     }
 }
 
+impl crate::transaction::ScopeHandle {
+    /// Register on the same ledger that owns this scope's reservations.
+    pub fn capacity_registrant(&self, waker: Waker) -> Result<CapacityRegistrant, RuntimeError> {
+        self.runtime.capacity_registrant(waker)
+    }
+}
+
 impl RuntimeLedger {
     pub fn capacity_registrant(&self, waker: Waker) -> Result<CapacityRegistrant, RuntimeError> {
         let mut state = self.shared.state.lock().expect("runtime ledger lock");

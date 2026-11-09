@@ -1078,7 +1078,9 @@ impl Core {
     ) -> Result<(), TaskExecutionError> {
         match input {
             AttemptInput::Timer => self.verify_source(claim.source, self.sources.actor)?,
-            AttemptInput::CapacityReleased => {}
+            AttemptInput::CapacityReleased => {
+                self.verify_source(claim.source, self.sources.capacity)?
+            }
             AttemptInput::Membership(_) => {}
             AttemptInput::Executor(fact) => match fact {
                 ExecutorFact::SubscriptionProgress(_)

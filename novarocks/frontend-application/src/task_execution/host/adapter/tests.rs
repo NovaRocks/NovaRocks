@@ -37,7 +37,7 @@ use novarocks_coordination_contract::{
 };
 use novarocks_execution_contract::AdmissionEpochCapability;
 use novarocks_types::NativeCompatibilityId;
-use std::{num::NonZeroUsize, task::Waker};
+use std::num::NonZeroUsize;
 
 fn start() -> AttemptStart {
     let legacy = crate::task_execution::tests::manifest_unstarted_regression_fixture();
@@ -132,6 +132,7 @@ fn start() -> AttemptStart {
             process: source(4),
             native: source(5),
             observation: source(6),
+            capacity: source(7),
             mailbox: [8; 4],
         },
         observe_dev_root: false,
@@ -139,11 +140,22 @@ fn start() -> AttemptStart {
 }
 
 #[test]
-fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
+fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let runtime = ActorRuntime::<FrontendActor>::new();
-    let layout =
-        NativeTransportCapacity::from_transport(novarocks_task_codec::TransportBudget::DEFAULT)
-            .unwrap();
+    let transport = novarocks_task_codec::TransportBudget::new(
+        1,
+        128,
+        64,
+        2,
+        1024,
+        4,
+        4096,
+        1,
+        2,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let layout = NativeTransportCapacity::from_transport(transport).unwrap();
     let ledger =
         RuntimeLedger::with_keyed_families(layout.process_limits(), layout.keyed_families())
             .unwrap();
@@ -165,13 +177,14 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
     let (mut original_work, mut original_capacity) = reserve(WorkKind::Settlement);
     original_work.start().unwrap();
     let start = start();
+    let target = start.plan.graph.root.backend_process_id();
     let sources = start.sources;
     let max_step_work = start.minimum_core_step_units().unwrap() + OUTPUT_UNITS;
-    let registered = AttemptActor::register(
+    let mut registered = AttemptActor::register(
         &runtime,
         start,
         scope.clone(),
-        layout,
+        layout.clone(),
         ActorConfig {
             mailbox: sources.mailbox,
             max_batches: 8,
@@ -183,19 +196,20 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
         &failure_work,
     )
     .unwrap();
-    let registration = &registered.original;
+    let registration = registered.original.clone();
     let actor = registration.actor();
     let mut original = CausalInputObligation::reserve_admitted(
         &runtime,
-        registration,
+        &registration,
         actor,
         InputClass::Lifecycle,
         &original_work,
     )
     .unwrap();
     let author = original.event_author().unwrap();
-    registered
+    let mut capacity_source = registered
         .bind(
+            &runtime,
             AttemptEffectAuthors {
                 business: author.clone(),
                 publication: author.clone(),
@@ -204,26 +218,69 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
                 settlement: author,
             },
             &original_capacity,
-            ledger.capacity_registrant(Waker::noop().clone()).unwrap(),
+            &original_work,
         )
         .unwrap();
 
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
-    for input in [AttemptInput::Bootstrap, AttemptInput::StartProtocol] {
-        original
-            .fill_with_receipt(None, post(input))
-            .unwrap_or_else(|failure| panic!("original input fill: {:?}", failure.error));
-        assert!(runtime.poll_one(Tick(1)).unwrap());
-        for (_, input) in runtime.committed_batches(actor, None, 8).unwrap() {
-            if runtime
-                .effect_inventory(actor, input, None, OUTPUT_UNITS)
-                .unwrap()
-                .is_empty()
-            {
-                runtime.retire_input(actor, input).unwrap();
-            }
-        }
+    original
+        .fill_with_receipt(None, post(AttemptInput::Bootstrap))
+        .unwrap_or_else(|failure| panic!("original input fill: {:?}", failure.error));
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    for (_, input) in runtime.committed_batches(actor, None, 8).unwrap() {
+        runtime.retire_input(actor, input).unwrap();
     }
+
+    let other = BackendProcessId::new_v7();
+    let occupy = |backend, items| {
+        scope
+            .reserve_next(
+                generation,
+                layout
+                    .queue_resources(backend, TransportCapacityLane::Ordinary, items, 32)
+                    .unwrap(),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap()
+    };
+    let binding = registered.binding.get().unwrap();
+    let target_blocker = occupy(target, 2);
+    assert!(
+        matches!(binding.reserve_queue(&scope, &layout, false, target, 1, 32),
+        Err(QueueStage::TargetFull(denied)) if denied == target)
+    );
+    assert!(capacity_source.input.in_flight().unwrap().is_none());
+    drop(target_blocker);
+    let first_wake = capacity_source
+        .input
+        .in_flight()
+        .unwrap()
+        .expect("actual target release wakes the actor");
+
+    let process_target = occupy(target, 2);
+    let process_other = occupy(other, 1);
+    assert!(matches!(
+        binding.reserve_queue(&scope, &layout, false, other, 1, 32),
+        Err(QueueStage::ProcessFull)
+    ));
+    drop(process_other);
+    drop(process_target);
+    assert_eq!(capacity_source.input.in_flight().unwrap(), Some(first_wake));
+    assert!(
+        binding
+            .reserve_queue(&scope, &layout, false, other, 1, 32)
+            .is_ok()
+    );
+    assert!(!capacity_source.retire_ready().unwrap());
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert!(capacity_source.retire_ready().unwrap());
+    let second_wake = capacity_source
+        .input
+        .in_flight()
+        .unwrap()
+        .expect("actual process release was coalesced");
+    assert_ne!(first_wake, second_wake);
 
     let publication = (0..8)
         .find_map(|_| {
@@ -266,11 +323,15 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
         "handoff does not complete the original publisher"
     );
 
-    let wrong = runtime
+    assert!(
+        !capacity_source.retire_ready().unwrap(),
+        "capacity cannot cross the selected publication"
+    );
+    let applied = runtime
         .reserve_admitted_input(
             actor,
             runtime_source(sources.publication),
-            InputClass::Control,
+            InputClass::Lifecycle,
             &original_work,
         )
         .unwrap()
@@ -280,6 +341,19 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
                 result: Ok(PublicationApplied::ProtocolBatch { published: true }),
             },
         )))
+        .unwrap();
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    runtime.retire_input(actor, applied).unwrap();
+    assert!(
+        capacity_source.retire_ready().unwrap(),
+        "actual publication allows the deferred wake"
+    );
+    assert!(capacity_source.input.in_flight().unwrap().is_none());
+
+    let wrong = runtime
+        .reserve_admitted_input(actor, actor, InputClass::Control, &original_work)
+        .unwrap()
+        .fill(post(AttemptInput::StartProtocol))
         .unwrap();
     assert!(runtime.poll_one(Tick(1)).unwrap());
     assert!(runtime.snapshot(actor).unwrap().failed);
@@ -313,7 +387,7 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
         .unwrap();
     {
         let session = runtime.claim_failure_publication(&cleanup).unwrap();
-        assert!(session.registration().same_registration(registration));
+        assert!(session.registration().same_registration(&registration));
         assert_eq!(session.generation(), cleanup.generation);
     }
     runtime.effect_completed(cleanup).unwrap();
@@ -326,6 +400,7 @@ fn original_runtime_drives_the_attempt_cut_and_projects_isolated_failure() {
 
     original_work.body_exited().unwrap();
     original_work.captures_exited().unwrap();
+    capacity_source.close_after_exit().unwrap();
     original.close_after_exit().unwrap();
     failure_work.body_exited().unwrap();
     failure_work.captures_exited().unwrap();

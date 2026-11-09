@@ -160,9 +160,18 @@ impl Core {
             process,
             native,
             observation,
+            capacity,
             mailbox,
         } = sources;
-        let distinct = [actor, publication_source, qa, process, native, observation];
+        let distinct = [
+            actor,
+            publication_source,
+            qa,
+            process,
+            native,
+            observation,
+            capacity,
+        ];
         let graph = TaskGraph::from_frozen(graph)?;
         if distinct
             .iter()
@@ -987,6 +996,7 @@ mod tests {
                 process: AttemptSourceId(id(6)),
                 native: AttemptSourceId(id(7)),
                 observation: AttemptSourceId(id(8)),
+                capacity: AttemptSourceId(id(9)),
                 mailbox: [4; 4],
             },
         }

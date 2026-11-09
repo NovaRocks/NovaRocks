@@ -62,8 +62,10 @@ pub(crate) enum FrontendInput {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum FrontendEffect {
-    Attempt(Box<AttemptEffect>),
-    AttemptNotice(Box<AttemptNotice>),
+    // The host peeks and indexes this same immutable effect without cloning
+    // a batch's operation list or publication rows.
+    Attempt(Arc<AttemptEffect>),
+    AttemptNotice(Arc<AttemptNotice>),
     AttemptOwnerFailed {
         scope: ScopeId,
         generation: Generation,
