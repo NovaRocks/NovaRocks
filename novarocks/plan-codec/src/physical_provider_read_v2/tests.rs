@@ -520,10 +520,9 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
         .map(|(ordinal, source)| (u32::MAX - ordinal as u32, source))
         .collect();
     let control = Control::default();
-    let bindings =
-        encode_provider_bindings(&bindings, PRIOR_SOURCE, binding_limits(), &control).unwrap();
+    let bindings = encode_provider_bindings(&bindings, SOURCE, binding_limits(), &control).unwrap();
     let payloads =
-        encode_connector_payloads(&payloads, PRIOR_SOURCE, payload_limits(), &control).unwrap();
+        encode_connector_payloads(&payloads, SOURCE, payload_limits(), &control).unwrap();
     let limits = crate::physical_package_v2::PackageEncodeLimits::FROZEN.reads;
     let receiver_limits = crate::physical_package_v2::PackageDecodeLimits::FROZEN.reads;
     let total_version_bytes = sources
@@ -533,7 +532,18 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
     assert_eq!(total_version_bytes, 11_840);
     assert!(total_version_bytes > 1024);
 
-    let encoded = encode_provider_reads(&inputs, &bindings, &payloads, SOURCE, limits).unwrap();
+    let mut source_work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let encode_source = bindings
+        .retained_invoice_floor_in(&mut source_work)
+        .unwrap()
+        .max(
+            payloads
+                .retained_invoice_floor_in(&mut source_work)
+                .unwrap(),
+        );
+    source_work.finish().unwrap();
+    let encoded =
+        encode_provider_reads(&inputs, &bindings, &payloads, encode_source, limits).unwrap();
     assert_eq!(encoded.facts().input_version_bytes, total_version_bytes);
     assert_eq!(encoded.source_count(), sources.len());
     for (id, original) in &inputs {
@@ -545,7 +555,7 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
         &inputs,
         &bindings,
         &payloads,
-        SOURCE,
+        encode_source,
         limits,
         &mut |facts| {
             snapshots.push(*facts);
@@ -560,16 +570,24 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
     work.finish().unwrap();
 
     let decoded_bindings =
-        decode_provider_bindings(bindings.as_wire(), PRIOR_SOURCE, binding_limits(), &control)
-            .unwrap();
+        decode_provider_bindings(bindings.as_wire(), SOURCE, binding_limits(), &control).unwrap();
     let decoded_payloads =
-        decode_connector_payloads(payloads.as_wire(), PRIOR_SOURCE, payload_limits(), &control)
-            .unwrap();
+        decode_connector_payloads(payloads.as_wire(), SOURCE, payload_limits(), &control).unwrap();
+    let mut source_work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+    let decode_source = decoded_bindings
+        .retained_invoice_floor_in(&mut source_work)
+        .unwrap()
+        .max(
+            decoded_payloads
+                .retained_invoice_floor_in(&mut source_work)
+                .unwrap(),
+        );
+    source_work.finish().unwrap();
     let decoded = decode_provider_reads(
         encoded.as_wire(),
         &decoded_bindings,
         &decoded_payloads,
-        SOURCE,
+        decode_source,
         receiver_limits,
     )
     .unwrap();
@@ -583,7 +601,7 @@ fn provider_read_namespace_frozen_profile_preserves_wide_version_facts_in_both_p
         encoded.as_wire(),
         &decoded_bindings,
         &decoded_payloads,
-        SOURCE,
+        decode_source,
         receiver_limits,
         &mut |facts| {
             snapshots.push(*facts);
