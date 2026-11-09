@@ -409,6 +409,7 @@ pub struct QueryTaskExecution {
         BTreeMap<crate::input::SendGeneration, (QueuedInputGrantRef, TaskOperationId)>,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
     create_granted: BTreeSet<TaskOperationId>,
+    create_retry_wakes: BTreeSet<(MonotonicInstant, TaskIdentity)>,
     quiesce_pass: Option<quiesce::QuiescePass>,
     lifecycle_deadlines: lifecycle_admission::LifecycleDeadlines,
     lifecycle_unknown: BTreeMap<TaskOperationId, lifecycle_admission::UnknownLifecycleSend>,
@@ -679,6 +680,7 @@ impl QueryTaskExecution {
             pending_update_grants: BTreeMap::new(),
             operation_targets: BTreeMap::new(),
             create_granted: BTreeSet::new(),
+            create_retry_wakes: BTreeSet::new(),
             quiesce_pass: None,
             lifecycle_deadlines: Default::default(),
             lifecycle_unknown: BTreeMap::new(),
@@ -1725,7 +1727,27 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?
             .identity();
         self.apply_prior_withdrawal(identity)?;
+        let create = ack.kind() == OperationKind::CreateTask;
+        let old_retry = if create {
+            self.task_by_identity_ref(identity)
+                .and_then(RemoteTask::create_retry_deadline)
+        } else {
+            None
+        };
         let result = self.acknowledge_task_inner(stage_id, task_id, ack, prior_create);
+        if create {
+            let next_retry = self
+                .task_by_identity_ref(identity)
+                .and_then(RemoteTask::create_retry_deadline);
+            if old_retry != next_retry {
+                if let Some(deadline) = old_retry {
+                    self.create_retry_wakes.remove(&(deadline, identity));
+                }
+                if let Some(deadline) = next_retry {
+                    self.create_retry_wakes.insert((deadline, identity));
+                }
+            }
+        }
         // Local FailedClosed can become terminal without a TaskStatus or Task
         // failure latch. Count it even on Err before the outer failure policy
         // selects its original cause or a sealed result's residual cleanup.
@@ -2104,10 +2126,15 @@ impl QueryTaskExecution {
             .filter_map(|(&participation, state)| state.gap_pending().then_some(participation))
     }
 
-    pub(crate) fn covered_recovery_expired(&self) -> bool {
+    pub(crate) fn covered_recovery_deadline(&self) -> Option<MonotonicInstant> {
         self.covered_gap_deadlines
             .first()
-            .is_some_and(|&(deadline, _)| self.now.has_reached(deadline))
+            .map(|&(deadline, _)| deadline)
+    }
+
+    pub(crate) fn covered_recovery_expired(&self) -> bool {
+        self.covered_recovery_deadline()
+            .is_some_and(|deadline| self.now.has_reached(deadline))
     }
 
     pub(crate) fn activate_covered_observation(&mut self) {
@@ -2891,12 +2918,9 @@ impl QueryTaskExecution {
         self.required_result_terminal_control_deadline.is_some()
     }
 
-    pub(crate) fn required_result_terminal_control_expired(&self) -> bool {
+    pub(crate) fn result_terminal_control_recovery_deadline(&self) -> Option<MonotonicInstant> {
         self.required_result_terminal_control_deadline
-            .is_some_and(|deadline| {
-                self.now.has_reached(deadline)
-                    && self.failure.cause().is_none_or(|cause| cause.is_derived())
-            })
+            .filter(|_| self.failure.cause().is_none_or(|cause| cause.is_derived()))
     }
 
     /// Test observation of accepted Task/output/Release facts, never actual exit.
@@ -4156,6 +4180,50 @@ mod bounded_drain_tests {
             Some(original.saturating_sub(Duration::from_millis(1)))
         );
     }
+    #[test]
+    fn busy_create_arms_a_single_charged_wake_for_the_original_replay() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        use novarocks_execution_contract::OperationOutcome;
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let operation = enqueue_create(&mut execution, task, grant(1));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
+        execution
+            .acknowledge(&refusal_reply(operation, OperationOutcome::PreparationBusy))
+            .unwrap();
+
+        let deadline = execution.now.saturating_add(Duration::from_millis(10));
+        assert_eq!(execution.next_create_retry_deadline(), Some(deadline));
+        let generation = grant(2).generation();
+        assert!(
+            execution
+                .begin_create_admission(task, generation.admission_effect())
+                .unwrap()
+                .is_none()
+        );
+        execution.set_now(deadline).unwrap();
+        assert!(!execution.consume_create_retry_wakes(&mut Turn(0)));
+        assert_eq!(execution.next_create_retry_deadline(), Some(deadline));
+        assert!(execution.consume_create_retry_wakes(&mut Turn(1)));
+        assert_eq!(execution.next_create_retry_deadline(), None);
+        assert!(matches!(
+            execution
+                .begin_create_admission(task, generation.admission_effect())
+                .unwrap()
+                .unwrap()
+                .body,
+            EffectBody::AdmitQueuedInput {
+                operation: intent,
+                generation: next,
+                payload: QueuedInputPayload::AlreadyRetained,
+                ..
+            } if intent.operation_id() == operation && next == generation
+        ));
+    }
+
     #[test]
     fn exact_create_replay_waits_for_a_fresh_generation_and_reuses_retained_payload() {
         use crate::effect::{EffectBody, QueuedInputPayload};

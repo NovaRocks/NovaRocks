@@ -1852,6 +1852,163 @@ mod tests {
     }
 
     #[test]
+    fn terminal_control_recovery_timer_waits_for_the_selected_observation_cut() {
+        use crate::{
+            AttemptCore,
+            effect::Publication,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+
+        for authoritative_evidence_at_deadline in [false, true] {
+            let start = start();
+            let now = start.initial_now;
+            let deadline = now.saturating_add(Duration::from_secs(30));
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut core = Core::new(start).unwrap();
+            let root = core.execution.graph().root_identity();
+            let step = |core: &mut Core, now, source, n, observation_tail, input| {
+                let claim = AttemptInputClaim {
+                    source,
+                    input: AttemptInputId(id(n)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: observation_tail,
+                    }),
+                };
+                core.handle(now, claim, input, &mut Units(32)).unwrap()
+            };
+            step(
+                &mut core,
+                now,
+                sources.actor,
+                1,
+                None,
+                AttemptInput::Bootstrap,
+            );
+            let demanded = step(
+                &mut core,
+                now,
+                sources.observation,
+                2,
+                None,
+                AttemptInput::Port(LogicalToAttempt {
+                    activation,
+                    body: LogicalToAttemptBody::TerminalControlDemand {
+                        token: AttemptRequestToken::new(id(40)),
+                        root,
+                    },
+                }),
+            );
+            assert_eq!(demanded.root_control_processed, Some(AttemptInputId(id(2))));
+            step(&mut core, now, sources.actor, 3, None, AttemptInput::Timer);
+            let publication = step(&mut core, now, sources.actor, 4, None, AttemptInput::Timer);
+            let Some(AttemptEffect {
+                id: effect,
+                body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+                ..
+            }) = publication.effect
+            else {
+                panic!("original round must publish its initial protocol facts");
+            };
+            let completed = step(
+                &mut core,
+                now,
+                sources.publication,
+                5,
+                None,
+                AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                    effect,
+                    result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+                }),
+            );
+            assert_eq!(completed.round_result, Some(Ok(())));
+            assert_eq!(core.next_deadline(), Some(deadline));
+
+            let timer = step(
+                &mut core,
+                deadline,
+                sources.actor,
+                5,
+                None,
+                AttemptInput::Timer,
+            );
+            assert_eq!(timer.selection, InputSelection::Only(sources.observation));
+            assert!(timer.round_result.is_none());
+
+            if authoritative_evidence_at_deadline {
+                let selected = Some(AttemptInputId(id(7)));
+                let waiting = step(
+                    &mut core,
+                    deadline,
+                    sources.actor,
+                    6,
+                    selected,
+                    AttemptInput::Timer,
+                );
+                assert_eq!(waiting.selection, InputSelection::Only(sources.observation));
+                assert_eq!(core.next_deadline(), None);
+                let observation = frame(
+                    &mut core,
+                    root,
+                    TaskState::Aborted,
+                    Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                );
+                step(
+                    &mut core,
+                    deadline,
+                    sources.observation,
+                    7,
+                    selected,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(vec![observation]).unwrap(),
+                    )),
+                );
+                let published = step(
+                    &mut core,
+                    deadline,
+                    sources.actor,
+                    8,
+                    None,
+                    AttemptInput::Timer,
+                );
+                assert!(matches!(
+                    published.effect,
+                    Some(AttemptEffect { body: EffectBody::Publish(Publication::RootStatus(projection)), .. })
+                    if matches!(projection.failure, AttemptRootFailure::Authoritative(_))
+                ));
+            } else {
+                step(
+                    &mut core,
+                    deadline,
+                    sources.actor,
+                    6,
+                    None,
+                    AttemptInput::Timer,
+                );
+                let failed = step(
+                    &mut core,
+                    deadline,
+                    sources.actor,
+                    7,
+                    None,
+                    AttemptInput::Timer,
+                );
+                assert!(matches!(
+                    failed.round_result,
+                    Some(Err(AttemptFailure::TaskProtocol(error)))
+                    if matches!(*error, TaskExecutionError::Schedule(ref detail)
+                        if detail.contains("did not arrive within its recovery budget"))
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn diagnostic_snapshot_keeps_early_data_and_excludes_late_data_until_actual_exit() {
         use super::round_tail::RoundTailStep;
         use crate::{

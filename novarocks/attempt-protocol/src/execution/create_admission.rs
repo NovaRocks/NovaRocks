@@ -20,12 +20,14 @@
 
 use super::{OperationTarget, QueryTaskExecution};
 use crate::{
+    capacity::StepContext,
     dispatch::{DispatchOperationState, LocalQueueCapacity},
     effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass},
     error::TaskExecutionError,
     input::{OperationObservation, QueuedInputGrantRef, SendGeneration},
     operation::OperationDispatchResult,
 };
+use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{OperationKind, TaskIdentity, TaskOperationId};
 use std::ops::Bound::{Excluded, Unbounded};
 
@@ -62,6 +64,30 @@ pub(crate) enum CreateGrantProgress {
 }
 
 impl QueryTaskExecution {
+    pub(crate) fn next_create_retry_deadline(&self) -> Option<MonotonicInstant> {
+        if self.terminal_cleanup_started || self.normal_drain_started {
+            return None;
+        }
+        self.create_retry_wakes
+            .first()
+            .map(|&(deadline, _)| deadline)
+    }
+
+    /// A due wake requests one candidate pass. If that pass is blocked on
+    /// capacity, the original capacity Source is responsible for the next wake.
+    pub(crate) fn consume_create_retry_wakes(&mut self, context: &mut dyn StepContext) -> bool {
+        while self
+            .next_create_retry_deadline()
+            .is_some_and(|deadline| self.now.has_reached(deadline))
+        {
+            if !context.charge(1) {
+                return false;
+            }
+            self.create_retry_wakes.pop_first();
+        }
+        true
+    }
+
     fn create_window_available(&self, task: TaskIdentity) -> bool {
         let backend = task.backend_process_id();
         self.deployment_window

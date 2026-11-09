@@ -674,6 +674,10 @@ impl RemoteTask {
             )
     }
 
+    pub(super) fn create_retry_deadline(&self) -> Option<MonotonicInstant> {
+        self.create_busy_until
+    }
+
     fn create_sendable(&self, now: MonotonicInstant) -> bool {
         !self.create_ownership_proven
             && self.create_in_flight.is_none()

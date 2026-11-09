@@ -115,6 +115,7 @@ pub(super) struct Turn {
     terminal_after_close: Option<TerminalWake>,
     cancellation_due: bool,
     split_failed: bool,
+    observation_recovery_failed: bool,
 }
 
 impl Turn {
@@ -283,9 +284,14 @@ impl AttemptCore for Core {
             }
             Phase::Idle => [
                 self.next_round_deadline(),
+                self.next_observation_recovery_deadline(),
                 self.candidates
                     .enabled
                     .then(|| self.execution.next_lifecycle_deadline())
+                    .flatten(),
+                self.candidates
+                    .enabled
+                    .then(|| self.execution.next_create_retry_deadline())
                     .flatten(),
                 self.convergence.next_deadline(),
                 self.terminal.next_deadline(),
@@ -477,7 +483,7 @@ impl Core {
                     self.turn.phase = Phase::Common { source_ready: true };
                 } else {
                     let seal = self.evaluate_pending_seal();
-                    self.select_root(seal);
+                    self.select_root(seal)?;
                 }
             }
             Phase::Common { .. } => self.consume_common(now, claim, input, context, result)?,
@@ -1017,7 +1023,7 @@ impl Core {
         seal: Option<super::SealedRootCut>,
     ) -> Result<(), TaskExecutionError> {
         if self.acknowledgements.run_round_tail() == Ok(true) || seal.is_some() {
-            self.select_root(seal);
+            self.select_root(seal)?;
         } else {
             self.begin_round_tail(true)?;
             self.turn.phase = Phase::Tail;
@@ -1202,7 +1208,55 @@ impl Core {
         Ok(())
     }
 
-    fn select_root(&mut self, cut: Option<SealedRootCut>) {
+    fn next_observation_recovery_deadline(&self) -> Option<MonotonicInstant> {
+        if self.turn.observation_recovery_failed
+            || self.stop.business_closed()
+            || self.terminal.terminal().is_some()
+        {
+            return None;
+        }
+        self.execution
+            .covered_recovery_deadline()
+            .into_iter()
+            .chain(self.execution.result_terminal_control_recovery_deadline())
+            .min()
+    }
+
+    fn observation_recovery_failure(&self) -> Option<TaskExecutionError> {
+        let now = self.execution.monotonic_now();
+        self.next_observation_recovery_deadline()
+            .filter(|&deadline| now.has_reached(deadline))?;
+        if !self.root.pending() && self.execution.covered_recovery_expired() {
+            Some(schedule(
+                "required covered observation evidence could not be recovered within its budget",
+            ))
+        } else if self
+            .execution
+            .result_terminal_control_recovery_deadline()
+            .is_some_and(|deadline| now.has_reached(deadline))
+        {
+            let root = self.execution.graph().root_identity();
+            Some(TaskExecutionError::Schedule(format!(
+                "required terminal control for revoked root {root:?} did not arrive within its recovery budget"
+            )))
+        } else {
+            None
+        }
+    }
+
+    fn select_root(&mut self, cut: Option<SealedRootCut>) -> Result<(), TaskExecutionError> {
+        // Decide after the selected Native and ordered observation inputs.
+        // If they selected a seal reply, deliver it at its original position.
+        if cut.is_none()
+            && let Some(failure) = self.observation_recovery_failure()
+        {
+            self.turn.observation_recovery_failed = true;
+            self.round_failure
+                .get_or_insert_with(|| protocol_failure(failure));
+            self.begin_round_tail(true)?;
+            self.turn.phase = Phase::Tail;
+            return Ok(());
+        }
         let cut = cut.or_else(|| {
             if !self.stop.business_closed() {
                 return None;
@@ -1252,6 +1306,7 @@ impl Core {
             publication_failure: None,
         });
         self.turn.phase = Phase::Root;
+        Ok(())
     }
 
     fn drive_root(
@@ -1392,6 +1447,9 @@ impl Core {
             self.candidates.authorization = None;
             self.candidates.wake = false;
             self.resume_after_terminal();
+            return Ok(());
+        }
+        if !self.execution.consume_create_retry_wakes(context) {
             return Ok(());
         }
         if !self.candidates.stage_cancels_done {
