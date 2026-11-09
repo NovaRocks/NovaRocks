@@ -1576,27 +1576,57 @@ impl QueryTaskExecution {
         Ok(true)
     }
 
-    /// Settles one released operation.
-    pub fn acknowledge(
+    /// A reply for the current physical send releases exactly its lane credit.
+    /// A stale or absent generation has no authority here. A definitive older
+    /// reply is handled by the operation owner separately from lane accounting.
+    pub(crate) fn acknowledge_current_send(
         &mut self,
+        generation: crate::input::SendGeneration,
+        ack: &OperationAcknowledgement,
+    ) -> Result<bool, TaskExecutionError> {
+        if !self
+            .dispatcher
+            .settle_generation(ack.operation_id(), generation)?
+        {
+            return Ok(false);
+        }
+        let target = self
+            .operation_targets
+            .remove(&ack.operation_id())
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        self.apply_operation_reply(target, ack)?;
+        Ok(true)
+    }
+
+    fn apply_operation_reply(
+        &mut self,
+        target: OperationTarget,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
-        let target = *self
-            .operation_targets
-            .get(&ack.operation_id())
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        self.dispatcher.settle(ack.operation_id())?;
-        self.operation_targets.remove(&ack.operation_id());
         match target {
             OperationTarget::Task { stage, task } => self.acknowledge_task(stage, task, ack),
             OperationTarget::Participation(participation) => {
                 self.acknowledge_participation(participation, ack)
             }
-            // The permit is already released above. The verdict belongs to the
-            // domain owner, which read this acknowledgement from the observer
-            // seam before the runner got here, so applying it a second time
-            // would be a second authority over the same progression.
+            // The actor owns the Abort verdict and consumes it through its
+            // original observer before applying dispatcher accounting.
             OperationTarget::ActorAbort => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn acknowledge(
+        &mut self,
+        ack: &OperationAcknowledgement,
+    ) -> Result<(), TaskExecutionError> {
+        let generation = self
+            .dispatcher
+            .in_flight_generation(ack.operation_id())
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        if self.acknowledge_current_send(generation, ack)? {
+            Ok(())
+        } else {
+            Err(TaskExecutionError::UnknownOperation)
         }
     }
 
@@ -3480,7 +3510,7 @@ mod bounded_drain_tests {
         begin_test_establish(&mut execution, participation);
         let op = enqueue_create(&mut execution, refused, grant(1));
         let batch = execution.dispatcher.take_batch().unwrap();
-        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
         let error = execution
             .acknowledge(&refusal_reply(op, OperationOutcome::IdentityMismatch))
             .unwrap_err();
@@ -3536,7 +3566,7 @@ mod bounded_drain_tests {
         let establish = begin_test_establish(&mut execution, participation);
         let op = enqueue_create(&mut execution, task, grant(1));
         let batch = execution.dispatcher.take_batch().unwrap();
-        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
         execution
             .acknowledge(&refusal_reply(op, OperationOutcome::NotReady))
             .unwrap();
@@ -4103,7 +4133,7 @@ mod bounded_drain_tests {
         let second = identity(&execution, 2);
         let inflight = enqueue_create(&mut execution, first, grant(1));
         let batch = execution.dispatcher.take_batch().unwrap();
-        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
         let unsent = enqueue_create(&mut execution, second, grant(2));
         let participation = execution.task(first.task_id()).unwrap().participation();
         let abort = execution.ids.issue();
@@ -4793,7 +4823,7 @@ mod stage_demand_cut_tests {
         let (operation, request) = execution.stage_cancel_after(None).unwrap();
         queue_cancel(&mut execution, operation, request, 11);
         let batch = execution.dispatcher.take_batch().unwrap();
-        execution.dispatcher.accept(batch.acceptance()).unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
         let reply = OperationReply {
             operation_id: operation,
             kind: OperationKind::CancelTask,

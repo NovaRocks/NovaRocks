@@ -118,13 +118,6 @@ impl TaskUpdateRequest {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DispatchAcceptance {
-    pub backend: BackendProcessId,
-    pub lane: DispatchLane,
-    pub operation_ids: Vec<TaskOperationId>,
-}
-
 impl crate::effect::DispatchBatch {
     pub fn with_queued_at(
         backend: BackendProcessId,
@@ -177,17 +170,6 @@ impl crate::effect::DispatchBatch {
         self,
     ) -> (Vec<OperationIntent>, Vec<crate::input::QueuedInputGrantRef>) {
         (self.operations.into_vec(), self.queued_inputs.into_vec())
-    }
-    pub fn acceptance(&self) -> DispatchAcceptance {
-        DispatchAcceptance {
-            backend: self.backend,
-            lane: self.lane,
-            operation_ids: self
-                .operations
-                .iter()
-                .map(OperationIntent::operation_id)
-                .collect(),
-        }
     }
 }
 impl OperationIntent {

@@ -30,6 +30,9 @@
 //! operation that has already been released: an immutable request that is
 //! already on its way keeps its position and converges on its own receipt.
 
+mod batch_pass;
+pub(crate) use batch_pass::{BatchDispatch, BatchDispatchPass};
+
 mod expiry;
 pub(crate) use expiry::{ExpiryProgress, QueueExpiryCursor};
 
@@ -43,8 +46,8 @@ use novarocks_types::identity::BackendProcessId;
 
 use super::error::{CapacityBound, TaskExecutionError};
 use crate::effect::{DispatchBatch, OperationIntent};
-use crate::input::QueuedInputGrantRef;
-use crate::intent::{DispatchAcceptance, TaskOperationQueueRequest};
+use crate::input::{QueuedInputGrantRef, SendGeneration};
+use crate::intent::TaskOperationQueueRequest;
 
 /// Every lane, in rotation order.
 const LANES: [DispatchLane; 4] = [
@@ -110,6 +113,14 @@ impl ExpiredOperation {
     }
 }
 
+/// The exact original same-method FIFO prefix selected for one physical send.
+struct BatchPrefix {
+    items: usize,
+    bytes: usize,
+    queued_at: MonotonicInstant,
+    control_progress: bool,
+}
+
 /// An indexed FIFO with original Abort priority. Exact cancellation never
 /// scans unrelated retained operations.
 #[derive(Debug, Default)]
@@ -132,6 +143,32 @@ impl OrderedQueue {
     fn front(&self) -> Option<&QueuedOperation> {
         self.entries.first_key_value().map(|(_, value)| value)
     }
+    fn batch_prefix(&self, allowance: usize, max_bytes: usize) -> Option<BatchPrefix> {
+        let head = self.front()?;
+        let run = head.intent.native_run_key();
+        let mut prefix = BatchPrefix {
+            items: 0,
+            bytes: 0,
+            queued_at: head.queued_at,
+            control_progress: run.0,
+        };
+        for entry in self.entries.values().take(allowance) {
+            if entry.intent.native_run_key() != run {
+                break;
+            }
+            let Some(bytes) = prefix.bytes.checked_add(entry.queued_bytes) else {
+                break;
+            };
+            if bytes > max_bytes {
+                break;
+            }
+            prefix.items += 1;
+            prefix.bytes = bytes;
+            prefix.queued_at = prefix.queued_at.min(entry.queued_at);
+        }
+        (prefix.items != 0).then_some(prefix)
+    }
+
     fn get(&self, id: TaskOperationId) -> Option<&QueuedOperation> {
         self.entries.get(self.positions.get(&id)?)
     }
@@ -218,6 +255,20 @@ impl BackendQueues {
 struct InFlightSlot {
     backend: BackendProcessId,
     lane: DispatchLane,
+    generation: SendGeneration,
+}
+
+fn batch_allowance(
+    queues: &BackendQueues,
+    lane: usize,
+    budget: DispatchBudget,
+    max_items: usize,
+) -> usize {
+    budget
+        .permits_for(LANES[lane])
+        .saturating_sub(queues.in_flight[lane])
+        .min(queues.credits[lane])
+        .min(max_items)
 }
 
 /// Exact carrier ownership for one operation inside the attempt dispatcher.
@@ -667,105 +718,71 @@ impl OperationDispatcher {
         lane: usize,
         max_items: usize,
     ) -> Option<DispatchBatch> {
-        let max_bytes = self.transport.max_batch_encoded_bytes();
-        let (operations, queue_permits, queued_bytes, queued_at) = {
-            let queues = self.backends.get_mut(&backend)?;
-            if queues.lanes[lane].is_empty() {
-                return None;
-            }
-            let permits = self.budget.permits_for(LANES[lane]);
-            let headroom = permits.saturating_sub(queues.in_flight[lane]);
-            let allowance = headroom.min(queues.credits[lane]).min(max_items);
-            if allowance == 0 {
-                return None;
-            }
-            let mut operations = Vec::new();
-            let mut queue_permits = Vec::new();
-            let mut queued_bytes = 0_usize;
-            let mut queued_at = None;
-            let original_run = queues.lanes[lane]
-                .front()
-                .expect("the lane was observed nonempty")
-                .intent
-                .native_run_key();
-            while operations.len() < allowance {
-                let Some(entry) = queues.lanes[lane].front() else {
-                    break;
-                };
-                // One original batch becomes one actual RPC/local offer.
-                // Keep a different method or max-wait at the SAME queue head
-                // for the next fair rotation, before moving any reservation.
-                // No operation is reticketed or reordered by this boundary.
-                if !operations.is_empty() && entry.intent.native_run_key() != original_run {
-                    break;
-                }
-                // Enqueueing already proved one operation fits. The aggregate
-                // check keeps the queue-side carrier of the whole batch under
-                // the same hard bound as its encoded request.
-                if queued_bytes.saturating_add(entry.queued_bytes) > max_bytes {
-                    break;
-                }
-                let entry = queues.lanes[lane]
-                    .pop_front()
-                    .expect("the front entry was just observed");
-                queued_bytes += entry.queued_bytes;
-                queued_at = Some(queued_at.map_or(entry.queued_at, |oldest| {
-                    std::cmp::min(oldest, entry.queued_at)
-                }));
-                queues.queued_items -= 1;
-                queues.queued_bytes -= entry.queued_bytes;
-                operations.push(entry.intent);
-                queue_permits.push(entry.queue_permit);
-            }
-            if operations.is_empty() {
-                return None;
-            }
-            queues.cursor = (lane + 1) % LANES.len();
-            (
-                operations,
-                queue_permits,
-                queued_bytes,
-                queued_at.expect("a nonempty batch has a queue timestamp"),
-            )
-        };
-        for operation in &operations {
-            let (_, _, at) = self
-                .queued_routes
-                .remove(&operation.operation_id())
-                .expect("released original queue route");
-            self.queued_times.remove(&(at, operation.operation_id()));
+        let queues = self.backends.get(&backend)?;
+        let allowance = batch_allowance(queues, lane, self.budget, max_items);
+        let prefix =
+            queues.lanes[lane].batch_prefix(allowance, self.transport.max_batch_encoded_bytes())?;
+        Some(self.take_batch_prefix(backend, lane, prefix))
+    }
+
+    fn take_batch_prefix(
+        &mut self,
+        backend: BackendProcessId,
+        lane: usize,
+        prefix: BatchPrefix,
+    ) -> DispatchBatch {
+        let queues = self
+            .backends
+            .get_mut(&backend)
+            .expect("same quoted backend");
+        let mut operations = Vec::with_capacity(prefix.items);
+        let mut queue_permits = Vec::with_capacity(prefix.items);
+        for _ in 0..prefix.items {
+            let entry = queues.lanes[lane]
+                .pop_front()
+                .expect("same quoted lane prefix");
+            let operation = entry.intent.operation_id();
+            self.queued_routes
+                .remove(&operation)
+                .expect("original queue route");
+            self.queued_times.remove(&(entry.queued_at, operation));
+            operations.push(entry.intent);
+            queue_permits.push(entry.queue_permit);
         }
-        self.queued_items -= operations.len();
-        self.queued_bytes -= queued_bytes;
-        let batch = DispatchBatch::with_queued_at(
+        queues.queued_items -= prefix.items;
+        queues.queued_bytes -= prefix.bytes;
+        queues.cursor = (lane + 1) % LANES.len();
+        self.queued_items -= prefix.items;
+        self.queued_bytes -= prefix.bytes;
+        DispatchBatch::with_queued_at(
             backend,
             LANES[lane],
             operations,
             queue_permits,
-            queued_bytes,
-            queued_at,
-        );
-        Some(batch)
+            prefix.bytes,
+            prefix.queued_at,
+        )
     }
 
-    /// Commits transport acceptance and only then consumes dispatch permits.
-    pub(crate) fn accept(
-        &mut self,
-        accepted: DispatchAcceptance,
-    ) -> Result<(), TaskExecutionError> {
+    /// Records the exact grant generation beside each occupied lane credit.
+    /// Only the receipt or withdrawal of that generation can free it.
+    pub(crate) fn accept(&mut self, batch: &DispatchBatch) -> Result<(), TaskExecutionError> {
+        let backend = batch.backend();
+        let lane = lane_index(batch.lane());
         let queues = self
             .backends
-            .get_mut(&accepted.backend)
+            .get_mut(&backend)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let lane = lane_index(accepted.lane);
-        let count = accepted.operation_ids.len();
+        let count = batch.operations.len();
         if count == 0
+            || count != batch.queued_inputs.len()
             || count > queues.credits[lane]
-            || queues.in_flight[lane].saturating_add(count) > self.budget.permits_for(accepted.lane)
-            || accepted
-                .operation_ids
-                .iter()
-                .any(|operation_id| self.in_flight.contains_key(operation_id))
+            || queues.in_flight[lane].saturating_add(count) > self.budget.permits_for(batch.lane())
+            || batch.operations.iter().any(|intent| {
+                let operation = intent.operation_id();
+                self.in_flight.contains_key(&operation)
+                    || self.queued_routes.contains_key(&operation)
+            })
         {
             return Err(TaskExecutionError::Schedule(
                 "transport accepted a batch outside its dispatcher reservation".to_owned(),
@@ -773,12 +790,13 @@ impl OperationDispatcher {
         }
         queues.credits[lane] -= count;
         queues.in_flight[lane] += count;
-        for operation_id in accepted.operation_ids {
+        for (intent, grant) in batch.operations.iter().zip(&batch.queued_inputs) {
             self.in_flight.insert(
-                operation_id,
+                intent.operation_id(),
                 InFlightSlot {
-                    backend: accepted.backend,
-                    lane: accepted.lane,
+                    backend,
+                    lane: batch.lane(),
+                    generation: grant.generation(),
                 },
             );
         }
@@ -861,19 +879,37 @@ impl OperationDispatcher {
         None
     }
 
-    /// Frees the permit one released operation held.
-    pub fn settle(&mut self, operation_id: TaskOperationId) -> Result<(), TaskExecutionError> {
-        let slot = self
-            .in_flight
-            .remove(&operation_id)
-            .ok_or(TaskExecutionError::UnknownOperation)?;
+    /// Retires the dispatcher credit of this physical send. The independent
+    /// WC grant and physical reservations remain with the original Source.
+    pub(crate) fn settle_generation(
+        &mut self,
+        operation: TaskOperationId,
+        generation: SendGeneration,
+    ) -> Result<bool, TaskExecutionError> {
+        let Some(slot) = self.in_flight.get(&operation).copied() else {
+            return Ok(false);
+        };
+        if slot.generation != generation {
+            return Ok(false);
+        }
         let queues = self
             .backends
             .get_mut(&slot.backend)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let lane = lane_index(slot.lane);
-        queues.in_flight[lane] = queues.in_flight[lane].saturating_sub(1);
-        Ok(())
+        queues.in_flight[lane] = queues.in_flight[lane]
+            .checked_sub(1)
+            .expect("the original in-flight row owns its lane credit");
+        self.in_flight.remove(&operation);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn in_flight_generation(
+        &self,
+        operation: TaskOperationId,
+    ) -> Option<SendGeneration> {
+        self.in_flight.get(&operation).map(|slot| slot.generation)
     }
 
     #[cfg(test)]
@@ -997,13 +1033,17 @@ mod indexed_queue_tests {
         assert_eq!(dispatcher.take_released_grant(), None);
         let mut expected = (1..=100).filter(|value| *value != 51);
         while let Some(batch) = dispatcher.take_batch() {
-            dispatcher.accept(batch.acceptance()).unwrap();
+            dispatcher.accept(&batch).unwrap();
             for (intent, original_grant) in batch.operations.iter().zip(batch.queued_inputs.iter())
             {
                 let next = expected.next().unwrap();
                 assert_eq!(intent.operation_id(), operation(next).operation_id());
                 assert_eq!(*original_grant, grant(next));
-                dispatcher.settle(intent.operation_id()).unwrap();
+                assert!(
+                    dispatcher
+                        .settle_generation(intent.operation_id(), original_grant.generation())
+                        .unwrap()
+                );
             }
         }
         assert_eq!(expected.next(), None);
@@ -1055,8 +1095,7 @@ mod indexed_queue_tests {
         dispatcher.restore_backpressured(batch);
         assert_eq!(dispatcher.queue_deadline(), Some(at(6)));
         let batch = dispatcher.take_batch().unwrap();
-        let acceptance = batch.acceptance();
-        dispatcher.accept(acceptance).unwrap();
+        dispatcher.accept(&batch).unwrap();
         assert_eq!(dispatcher.in_flight_operations(), 4);
         for (index, intent) in batch.operations.iter().enumerate() {
             assert_eq!(
@@ -1067,8 +1106,156 @@ mod indexed_queue_tests {
                 dispatcher.operation_state(intent.operation_id()).unwrap(),
                 DispatchOperationState::InFlight
             );
-            dispatcher.settle(intent.operation_id()).unwrap();
+            assert!(
+                dispatcher
+                    .settle_generation(
+                        intent.operation_id(),
+                        batch.queued_inputs[index].generation()
+                    )
+                    .unwrap()
+            );
         }
         assert_eq!(dispatcher.in_flight_operations(), 0);
+    }
+
+    #[test]
+    fn late_result_cannot_spend_the_replays_lane_credit() {
+        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, limits());
+        let request = operation(1);
+        let id = request.operation_id();
+        let backend = request.backend_process_id();
+        let lane = request.lane();
+        let first = grant(1);
+        let replay = grant(2);
+        dispatcher
+            .enqueue_reserved(request.clone(), at(1), first)
+            .unwrap();
+        let batch = dispatcher.take_batch().unwrap();
+        dispatcher.accept(&batch).unwrap();
+        assert!(
+            dispatcher
+                .settle_generation(id, first.generation())
+                .unwrap()
+        );
+        dispatcher.enqueue_reserved(request, at(2), replay).unwrap();
+
+        // An older result owns neither the queued replay nor its later
+        // in-flight credit, even though the operation identity is unchanged.
+        assert!(
+            !dispatcher
+                .settle_generation(id, first.generation())
+                .unwrap()
+        );
+        assert_eq!(
+            dispatcher.operation_state(id).unwrap(),
+            DispatchOperationState::Queued
+        );
+        let batch = dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), &[replay]);
+        dispatcher.accept(&batch).unwrap();
+        assert!(
+            !dispatcher
+                .settle_generation(id, first.generation())
+                .unwrap()
+        );
+        assert_eq!(dispatcher.lane_in_flight(backend, lane), 1);
+        assert!(
+            dispatcher
+                .settle_generation(id, replay.generation())
+                .unwrap()
+        );
+        assert!(
+            !dispatcher
+                .settle_generation(id, replay.generation())
+                .unwrap()
+        );
+        assert_eq!(dispatcher.lane_in_flight(backend, lane), 0);
+    }
+
+    #[test]
+    fn dispatch_yield_and_capacity_refusal_keep_the_original_fifo_until_one_send() {
+        use crate::capacity::{QueueStage, ReservationToken, StepContext};
+        struct Turn {
+            left: usize,
+            reservation: QueueStage,
+            requests: Vec<(DispatchLane, bool, BackendProcessId, usize, usize)>,
+        }
+        impl StepContext for Turn {
+            fn charge(&mut self, units: usize) -> bool {
+                let Some(left) = self.left.checked_sub(units) else {
+                    return false;
+                };
+                self.left = left;
+                true
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                lane: DispatchLane,
+                control: bool,
+                backend: BackendProcessId,
+                items: usize,
+                bytes: usize,
+            ) -> QueueStage {
+                self.requests.push((lane, control, backend, items, bytes));
+                self.reservation
+            }
+        }
+
+        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, limits());
+        let first = operation(1);
+        let backend = first.backend_process_id();
+        let first_id = first.operation_id();
+        let second = operation(2);
+        let second_id = second.operation_id();
+        dispatcher.enqueue_reserved(first, at(1), grant(1)).unwrap();
+        dispatcher
+            .enqueue_reserved(second, at(2), grant(2))
+            .unwrap();
+
+        let mut pass = BatchDispatchPass::new();
+        let mut turn = Turn {
+            left: 2,
+            reservation: QueueStage::TargetFull(backend),
+            requests: Vec::new(),
+        };
+        assert!(matches!(
+            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            BatchDispatch::Yield
+        ));
+        assert!(turn.requests.is_empty());
+        assert_eq!(dispatcher.queued_items(), 2);
+
+        turn.left = 8;
+        assert!(matches!(
+            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            BatchDispatch::Blocked
+        ));
+        assert_eq!(
+            turn.requests,
+            [(DispatchLane::Create, false, backend, 2, 512)]
+        );
+        assert_eq!(dispatcher.in_flight_operations(), 0);
+        assert_eq!(dispatcher.queued_entry(first_id).unwrap().queued_at, at(1));
+        assert_eq!(dispatcher.queued_entry(second_id).unwrap().queued_at, at(2));
+
+        let token = ReservationToken(NonZeroU64::new(17).unwrap());
+        turn.left = 10;
+        turn.reservation = QueueStage::Granted(token);
+        let BatchDispatch::Ready(crate::effect::EffectBody::SendBatch { batch, reservation }) =
+            pass.advance(&mut dispatcher, &mut turn).unwrap()
+        else {
+            panic!("the original grant and exact FIFO should be released");
+        };
+        assert_eq!(reservation, token);
+        assert_eq!(batch.operations[0].operation_id(), first_id);
+        assert_eq!(batch.operations[1].operation_id(), second_id);
+        assert_eq!(batch.queued_inputs.as_ref(), &[grant(1), grant(2)]);
+        assert_eq!(dispatcher.queued_items(), 0);
+        assert_eq!(dispatcher.in_flight_operations(), 2);
+        assert!(matches!(
+            pass.advance(&mut dispatcher, &mut turn).unwrap(),
+            BatchDispatch::Empty
+        ));
+        assert_eq!(turn.requests.len(), 2);
     }
 }
