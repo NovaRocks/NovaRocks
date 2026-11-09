@@ -47,24 +47,20 @@ use std::time::Duration;
 use crate::conclusion::{LatchOutcome, TerminationLatch};
 use crate::config::DispatchBudget;
 use crate::config::FrozenTransportLimits as TransportBudget;
-use crate::effect::{DispatchBatch, OperationIntent, TaskDomainIntent as TaskDomainUpdate};
+use crate::effect::{OperationIntent, TaskDomainIntent as TaskDomainUpdate};
 use crate::ids::OperationIds;
-use crate::input::{
-    ObservationBatch, ObservationEvent, OperationReply as OperationAcknowledgement,
-    ReceivedObservation,
-};
+use crate::input::{ObservationEvent, OperationReply as OperationAcknowledgement};
 use crate::input::{
     ObservationFact as CoveredStatusStreamFact, QueuedInputGrantRef, UpdateAdmission,
 };
 use crate::intent::TaskOperationQueueRequest;
 use crate::lease::RequestedLeaseDurations;
-use crate::operation::OperationDispatchResult;
 use crate::status_validation::GoneObservation;
 use novarocks_coordination_contract::AttemptInheritedAdmission as ReplacementWorkerAdmissionEvidence;
 use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution_contract::{
-    AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, ParticipationRef,
-    TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
+    AdmissionEpochCapability, CancelReason, OperationKind, ParticipationRef, TaskIdentity,
+    TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
 };
 use novarocks_execution_contract::{
     ParticipationConvergenceReceipt, QuiesceParticipationReceipt, TaskConvergenceReceipt,
@@ -79,9 +75,9 @@ use novarocks_types::identity::BackendProcessId;
 use super::dispatch::{DispatchOperationState, LocalQueueCapacity, OperationDispatcher};
 use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
-use super::participation_owner::{
-    ParticipationEstablishFacts, ParticipationOwner, ReleaseSettlement,
-};
+#[cfg(test)]
+use super::participation_owner::ParticipationEstablishFacts;
+use super::participation_owner::{ParticipationOwner, ReleaseSettlement};
 use super::remote_task::{CreateSettlement, RemoteTask, TaskTerminalReport, UpdateSettlement};
 use super::stage::{EdgeOpenTracker, StageExecution};
 
@@ -870,7 +866,7 @@ impl QueryTaskExecution {
                 .filter_map(|(participation, owner)| {
                     owner
                         .runtime_filter_contribution()
-                        .map(|telemetry| (participation.backend_process_id(), telemetry.clone()))
+                        .map(|telemetry| (participation.backend_process_id(), *telemetry))
                 })
                 .collect(),
             complete: self.owners.values().all(ParticipationOwner::is_released),
@@ -936,10 +932,9 @@ impl QueryTaskExecution {
             .and_then(|stage| stage.task(task_id))
             .and_then(RemoteTask::status)
             .filter(|status| status.is_terminal())
+            && let Some(diagnostics) = &mut self.diagnostics
         {
-            if let Some(diagnostics) = &mut self.diagnostics {
-                diagnostics.observe_terminal(status)?;
-            }
+            diagnostics.observe_terminal(status)?;
         }
         self.accepted_protocol_dirty_tasks.insert(task_id);
         self.note_accepted_protocol_change()
@@ -999,46 +994,42 @@ impl QueryTaskExecution {
         let mut pass = self.queue_expiry.take().ok_or_else(|| {
             TaskExecutionError::Schedule("queue expiry phase was not selected".into())
         })?;
-        loop {
-            match pass.cursor.advance(&mut self.dispatcher, context) {
-                crate::dispatch::ExpiryProgress::Yield => {
-                    self.queue_expiry = Some(pass);
-                    return Ok(QueueExpiryProgress::Yield);
+        match pass.cursor.advance(&mut self.dispatcher, context) {
+            crate::dispatch::ExpiryProgress::Yield => {
+                self.queue_expiry = Some(pass);
+                Ok(QueueExpiryProgress::Yield)
+            }
+            crate::dispatch::ExpiryProgress::Complete => Ok(QueueExpiryProgress::Complete(
+                pass.first_error.map_or(Ok(()), Err),
+            )),
+            crate::dispatch::ExpiryProgress::Expired(expired) => {
+                let (intent, waited, original_grant) = expired.into_parts();
+                let operation_id = intent.operation_id();
+                let kind = intent.kind();
+                let target = self
+                    .operation_targets
+                    .remove(&operation_id)
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                let definitely_unsent_abort =
+                    (target == OperationTarget::ActorAbort).then_some(operation_id);
+                if definitely_unsent_abort.is_none() {
+                    self.rollback_unsent(target, operation_id);
                 }
-                crate::dispatch::ExpiryProgress::Complete => {
-                    return Ok(QueueExpiryProgress::Complete(
-                        pass.first_error.map_or(Ok(()), Err),
-                    ));
-                }
-                crate::dispatch::ExpiryProgress::Expired(expired) => {
-                    let (intent, waited, original_grant) = expired.into_parts();
-                    let operation_id = intent.operation_id();
-                    let kind = intent.kind();
-                    let target = self
-                        .operation_targets
-                        .remove(&operation_id)
-                        .ok_or(TaskExecutionError::UnknownOperation)?;
-                    let definitely_unsent_abort =
-                        (target == OperationTarget::ActorAbort).then_some(operation_id);
-                    if definitely_unsent_abort.is_none() {
-                        self.rollback_unsent(target, operation_id);
-                    }
-                    let failure = TaskExecutionError::QueueResidenceExpired {
-                        operation_id,
-                        kind,
-                        waited,
-                    };
-                    self.note_split_admission(operation_id, Err(&failure));
-                    pass.first_error.get_or_insert(failure);
-                    // Return this SAME ref before consuming another row; no
-                    // amortized-growth return buffer on a poller step. The
-                    // Core retains the pending effect through Source Full.
-                    self.queue_expiry = Some(pass);
-                    return Ok(QueueExpiryProgress::ReleaseQueuedInput {
-                        grant: original_grant,
-                        definitely_unsent_abort,
-                    });
-                }
+                let failure = TaskExecutionError::QueueResidenceExpired {
+                    operation_id,
+                    kind,
+                    waited,
+                };
+                self.note_split_admission(operation_id, Err(&failure));
+                pass.first_error.get_or_insert(failure);
+                // Return this SAME ref before consuming another row; no
+                // amortized-growth return buffer on a poller step. The
+                // Core retains the pending effect through Source Full.
+                self.queue_expiry = Some(pass);
+                Ok(QueueExpiryProgress::ReleaseQueuedInput {
+                    grant: original_grant,
+                    definitely_unsent_abort,
+                })
             }
         }
     }
@@ -1053,21 +1044,7 @@ impl QueryTaskExecution {
         self.dispatcher.take_released_grant()
     }
 
-    /// Records one domain fact for one task.
-    ///
-    /// This is the seam the split-assignment and runtime-filter owners use.
-    /// The fact reaches the wire only when the task itself may send.
-
-    /// Reserves the two capacities an actor-owned Abort needs before its
-    /// bounded adapter slot is released.
-    ///
-    /// The preview remains in the adapter while this runs. A successful
-    /// result owns a real process queue permit, and the serial dispatcher has
-    /// proved that the exact backend's lifecycle lane can advance now. The
-    /// adapter slot is never treated as either authority.
-
-    /// Commits one actor-owned Abort after its exact adapter effect is taken.
-
+    /// Whether this exact Abort generation still belongs to the dispatcher.
     pub(crate) fn actor_abort_in_flight(
         &self,
         operation: TaskOperationId,
@@ -2152,10 +2129,6 @@ impl QueryTaskExecution {
             .is_some_and(|state| state.actual_stopped.contains_key(&identity))
     }
 
-    /// Applies frames that the new intake registered before a success seal in
-    /// one order. A frame from an older generation still contributes its
-    /// positive entity fact; it cannot advance the current coverage watermark.
-
     /// Entity facts can enter this owner only after the current/old generation's
     /// immutable opening witness has passed the subscription policy. The
     /// value moves here without cloning its decoded frame on the poller.
@@ -2447,9 +2420,6 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?;
         Ok(())
     }
-
-    /// Applies what the intake queued, then propagates one layer of stage
-    /// release.
 
     fn apply_published(
         &mut self,
@@ -2986,30 +2956,6 @@ impl QueryTaskExecution {
     ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
         self.failure.selected()
     }
-
-    /// Admits candidates in order, one serial pass.
-    ///
-    /// Each candidate is checked against this attempt's own queue bounds and
-    /// then reserved against process transport, and only then is its request
-    /// made to exist and queued; nothing else touches the queues in between,
-    /// so the reservation it was admitted with is exactly the one it holds.
-    ///
-    /// A full target -- this attempt's queue for that backend, or process
-    /// transport's window for it -- skips that target's later candidates and
-    /// lets every other target advance; a target's own order is never
-    /// crossed. A full attempt total or a full process-wide window ends the
-    /// pass, because no other target could be admitted either. A request that
-    /// could never fit any queue is an error, not backpressure.
-
-    /// Leaves one candidate exactly where it was.
-    ///
-    /// A minted candidate returns to its owner; a create or update position
-    /// was never taken. Only a position that genuinely had something to send
-    /// counts as a skip, so a stage release still learns whether every cancel
-    /// it owes went out.
-
-    /// Checks this attempt's own queue bounds for one request, then reserves
-    /// it against process transport.
 
     /// Retain the same pure owner decisions until the core's bounded driver
     /// can request the original native input grant. No host callback runs here.
@@ -3747,12 +3693,11 @@ mod bounded_drain_tests {
             CreateGrantProgress::Waiting
         ));
         assert!(execution.tracks_pending_update_grant(first));
-        assert_eq!(
+        assert!(
             execution
                 .advance_update_send(producer, grant(2).generation().admission_effect())
                 .unwrap()
-                .0,
-            true
+                .0
         );
         assert!(!execution.tracks_pending_update_grant(first));
         let batch = execution.dispatcher.take_batch().unwrap();

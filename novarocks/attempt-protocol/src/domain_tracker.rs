@@ -204,7 +204,7 @@ impl TaskDomainIntentTracker {
     pub fn record(&mut self, update: &TaskDomainUpdate) -> DomainProgression {
         match update {
             TaskDomainUpdate::SplitAssignment { node, offer, .. } => {
-                if !self.split_members.contains(&*node) {
+                if !self.split_members.contains(node) {
                     return DomainProgression::Conflict(DomainConflict::UnknownMember);
                 }
                 let watermark = self.split_watermark(*node);
@@ -687,7 +687,7 @@ mod tests {
         let offer = SplitOffer::batch(sequence(1), sequence(2), true).expect("range");
         let intent = TaskDomainUpdate::SplitAssignment {
             node: scan,
-            offer: offer,
+            offer,
             payload: payload(1).resource,
             queued_bytes: 1,
         };

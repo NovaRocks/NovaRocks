@@ -107,6 +107,7 @@ impl ProtocolPublicationCursor {
     /// Only unfinished charged traversal can request an immediate continuation.
     /// A ready batch waits for real Source credit; an in-flight batch waits for
     /// its actual apply result. Neither is a reason to poll an idle actor.
+    #[cfg(test)]
     pub(crate) fn needs_continuation(&self) -> bool {
         !self.failed
             && self

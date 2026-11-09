@@ -1250,7 +1250,7 @@ impl RemoteTask {
     /// adopt -- settles the create and releases its payload for good. An
     /// unknown outcome keeps the frozen parts for the identical resend; a
     /// definitive refusal closes the create.
-    pub fn on_create_ack(
+    pub(crate) fn on_create_ack(
         &mut self,
         ack: &OperationAcknowledgement,
         now: MonotonicInstant,

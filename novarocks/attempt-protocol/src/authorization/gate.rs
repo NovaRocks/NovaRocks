@@ -36,10 +36,11 @@ use crate::{
     error::TaskExecutionError,
     failure::AttemptFailure,
 };
+#[cfg(test)]
+use novarocks_coordination_contract::AttemptAuthorizationRef;
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptActivationIdentity, AttemptAuthorization, AttemptAuthorizationLimits,
-    AttemptAuthorizationRef, AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody,
-    LogicalToAttemptBody,
+    AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
 };
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::collections::BTreeMap;

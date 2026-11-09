@@ -1207,7 +1207,7 @@ impl ParticipationOwner {
                     runtime_filter,
                 } => {
                     self.participation.verify_matches(receipt.participation())?;
-                    (*outcome, runtime_filter.clone())
+                    (*outcome, *runtime_filter)
                 }
                 _ => {
                     return Err(TaskExecutionError::MissingReceipt(
