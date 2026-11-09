@@ -24,6 +24,7 @@
 //! `acknowledge` settles one released operation, and `apply_status` applies
 //! what the intake queued. Nothing here opens a connection.
 
+pub(crate) mod ack_phase;
 mod create_admission;
 mod send_replies;
 pub(crate) use create_admission::CreateGrantProgress;

@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::FrozenTransportLimits as TransportBudget;
 use crate::config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution_contract::{OperationKind, TaskOperationId};
+use novarocks_execution_contract::{OperationKind, OperationShape, TaskOperationId};
 use novarocks_types::identity::BackendProcessId;
 
 use super::error::{CapacityBound, TaskExecutionError};
@@ -260,7 +260,7 @@ struct InFlightSlot {
     backend: BackendProcessId,
     lane: DispatchLane,
     input: QueuedInputGrantRef,
-    kind: OperationKind,
+    shape: OperationShape,
     batch: Option<AttemptEffectId>,
     logical_pending: bool,
 }
@@ -817,7 +817,7 @@ impl OperationDispatcher {
                     backend,
                     lane: batch.lane(),
                     input: *grant,
-                    kind: intent.kind(),
+                    shape: intent.shape(),
                     batch: effect,
                     logical_pending: true,
                 },
@@ -929,7 +929,7 @@ impl OperationDispatcher {
         if slot.input.generation() != generation {
             return Ok(None);
         }
-        if kind.is_some_and(|kind| kind != slot.kind) {
+        if kind.is_some_and(|kind| kind != slot.shape.kind()) {
             return Err(TaskExecutionError::Schedule(
                 "reply kind differs from its original dispatch".into(),
             ));

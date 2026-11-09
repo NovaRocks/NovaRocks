@@ -407,6 +407,20 @@ pub struct MembershipView {
     pub processes: std::collections::BTreeMap<ParticipationRef, MembershipObservation>,
 }
 
+/// Passive identities copied from the original mailbox claim and source cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptSourceId(pub NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptInputId(pub NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSourceCut {
+    pub source: AttemptSourceId,
+    /// None means the registered source was empty at the original cut.
+    pub tail: Option<AttemptInputId>,
+}
+
 #[derive(Clone, Debug)]
 pub enum AttemptInput {
     Executor(ExecutorFact),

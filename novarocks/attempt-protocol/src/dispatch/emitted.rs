@@ -98,6 +98,18 @@ impl OperationDispatcher {
         }
     }
 
+    pub(crate) fn establish_rpc_start_is_current(
+        &self,
+        effect: AttemptEffectId,
+        operation: TaskOperationId,
+    ) -> bool {
+        self.in_flight.get(&operation).is_some_and(|row| {
+            row.logical_pending
+                && row.batch == Some(effect)
+                && row.shape == OperationShape::EstablishParticipation
+        })
+    }
+
     pub(crate) fn prior_reply_route(
         &self,
         operation: TaskOperationId,
@@ -109,7 +121,7 @@ impl OperationDispatcher {
                 .then_some(PriorReplyRoute::Queued(row.queue_permit));
         }
         let row = self.in_flight.get(&operation)?;
-        if row.kind != kind || generation >= row.input.generation() {
+        if row.shape.kind() != kind || generation >= row.input.generation() {
             return None;
         }
         Some(if row.logical_pending {
@@ -126,7 +138,7 @@ impl OperationDispatcher {
         generation: SendGeneration,
     ) -> bool {
         self.in_flight.get(&operation).is_some_and(|row| {
-            row.logical_pending && row.kind == kind && row.input.generation() == generation
+            row.logical_pending && row.shape.kind() == kind && row.input.generation() == generation
         })
     }
 
