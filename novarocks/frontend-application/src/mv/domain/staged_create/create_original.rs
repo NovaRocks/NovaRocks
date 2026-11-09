@@ -1701,9 +1701,8 @@ mod original_stage_tests {
 
     #[test]
     fn create_definition_retains_source_and_session_resolution_through_persistence() {
-        use novarocks_mv_application::persistence::{
-            codec::{QueryDialect, decode_definition, encode_definition},
-            validation::PersistenceDecodeBudget,
+        use novarocks_mv_application::persistence::codec::{
+            QueryDialect, decode_definition, encode_definition,
         };
         use novarocks_parser::ast::SyntaxEq;
         let expected_source = "select id /* 保留原文：多字节注释 */ ,\n\tcount(*) AS n -- 保留排版\n  from orders\n group by id";
@@ -1792,8 +1791,7 @@ mod original_stage_tests {
             expected_source.as_bytes()
         );
         let encoded = encode_definition(&documents.definition).unwrap();
-        let reloaded =
-            decode_definition(encoded.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+        let reloaded = decode_definition(encoded.as_bytes()).unwrap();
         assert_eq!(
             reloaded.query.effective_sql.as_bytes(),
             expected_source.as_bytes()
