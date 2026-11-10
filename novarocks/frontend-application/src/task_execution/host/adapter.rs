@@ -23,6 +23,7 @@ use super::failure_publication::{FailureContext, FailurePublications};
 use super::failure_supervisor::FailureSupervisor;
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
+    read_progress::ReadProgressInput,
 };
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
@@ -67,9 +68,10 @@ use novarocks_control_runtime_core::{
     scope::WorkKind,
 };
 use novarocks_coordination_contract::{LogicalToAttemptBody, MonotonicClock, MonotonicInstant};
-use novarocks_execution_contract::TaskOperationId;
+use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_types::BackendProcessId;
 use std::{
+    collections::BTreeMap,
     num::NonZeroU64,
     sync::{Arc, OnceLock},
     task::Waker,
@@ -104,6 +106,7 @@ pub(crate) struct AttemptActorRegistration {
     failure_work: ScopedWorkRef,
     root_control: RootControlBinding,
     ordered_bound: bool,
+    read_progress_bound: bool,
     startup_reserved: bool,
     abort_bound: bool,
     config: ActorConfig,
@@ -667,6 +670,46 @@ impl AttemptActorRegistration {
         )))
     }
 
+    /// Reserve one stable Ordinary notification role for each frozen
+    /// participation on the same original observation Source.
+    pub(crate) fn bind_read_progress(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        observation_work: &WorkObligation,
+    ) -> Result<BTreeMap<ParticipationRef, ReadProgressInput>, ObservationError> {
+        if self.read_progress_bound {
+            return Err(ObservationError::Busy);
+        }
+        if !self.scope.same_scope(observation_work.scope()) {
+            return Err(ObservationError::Runtime(
+                ActorTurnError::InputAuthorMismatch,
+            ));
+        }
+        let mut roles: BTreeMap<_, ReadProgressInput> = BTreeMap::new();
+        for member in self.failure_members.iter() {
+            let standing = match self.reserve_standing(
+                runtime,
+                self.observation_source,
+                InputClass::Ordinary,
+                observation_work,
+            ) {
+                Ok(standing) => standing,
+                Err(error) => {
+                    for role in roles.values() {
+                        role.close_after_exit().expect("unpublished progress role");
+                    }
+                    return Err(ObservationError::Runtime(error));
+                }
+            };
+            roles.insert(
+                member.participation,
+                ReadProgressInput::new(member.participation, standing),
+            );
+        }
+        self.read_progress_bound = true;
+        Ok(roles)
+    }
+
     /// One original writer owns both mailbox classes for this registration.
     /// A later Control input therefore cannot overtake its Lifecycle prefix.
     pub(crate) fn bind_observations(
@@ -957,6 +1000,7 @@ impl AttemptActor {
             failure_work: failure_work.reference(),
             root_control,
             ordered_bound: false,
+            read_progress_bound: false,
             startup_reserved: false,
             abort_bound: false,
             config,

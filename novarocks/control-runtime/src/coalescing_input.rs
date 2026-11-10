@@ -35,9 +35,23 @@ pub trait Merge: Send + 'static {
     fn unit() -> Self;
 }
 
+struct Update<T> {
+    value: T,
+    revision: u64,
+}
+
+impl<T: Merge> Update<T> {
+    fn merge(&mut self, newer: Self) {
+        self.value.merge(newer.value);
+        self.revision = newer.revision;
+    }
+}
+
 struct State<T> {
-    latest: Option<T>,
-    in_flight: bool,
+    latest: Option<Update<T>>,
+    in_flight: Option<u64>,
+    issued: u64,
+    retired: u64,
     closed: bool,
 }
 struct Inner<A: Actor, T> {
@@ -55,6 +69,31 @@ impl<A: Actor, T: Merge> Clone for CoalescingInput<A, T> {
         Self(self.0.clone())
     }
 }
+/// A passive receipt for one notification on its original role. It becomes
+/// retired when the occurrence covering it actually retires, including when
+/// the notification was merged into a newer value. It grants no input credit.
+pub struct CoalescedReceipt<A: Actor, T: Merge> {
+    original: Arc<Inner<A, T>>,
+    revision: u64,
+}
+
+impl<A: Actor, T: Merge> CoalescedReceipt<A, T> {
+    pub fn retired(&self) -> bool {
+        self.original
+            .state
+            .lock()
+            .expect("coalescing input state lock")
+            .retired
+            >= self.revision
+    }
+
+    /// Reconcile completion of concurrent notifications on the same role.
+    pub fn retain_later(&mut self, other: Self) {
+        assert!(Arc::ptr_eq(&self.original, &other.original));
+        self.revision = self.revision.max(other.revision);
+    }
+}
+
 impl<A: Actor, T: Merge> CoalescingInput<A, T> {
     /// `standing` must be an idle, prepaid input position. Its original Source
     /// chooses the input class; constructing this wrapper grants no new credit.
@@ -63,7 +102,9 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
             standing: Mutex::new(standing),
             state: Mutex::new(State {
                 latest: None,
-                in_flight: false,
+                in_flight: None,
+                issued: 0,
+                retired: 0,
                 closed: false,
             }),
             project,
@@ -87,19 +128,38 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
     /// Closed/ActorFailed closes notification admission. Other fill errors retain
     /// the merged value for the original host to retry; they never discard it.
     pub fn notify(&self, value: T) -> Result<Option<InputId>, ActorTurnError> {
-        let next = {
-            let mut state = self.0.state.lock().expect("coalescing input state lock");
-            if state.closed {
-                return Err(ActorTurnError::Closed);
-            }
-            if let Some(latest) = state.latest.as_mut() {
-                latest.merge(value);
-            } else {
-                state.latest = Some(value);
-            }
-            Self::claim_fill(&mut state)
-        };
+        let (_, next) = self.enqueue(value)?;
         self.fill(next)
+    }
+
+    /// Retain a receipt even if this notification waits behind an existing
+    /// occurrence. A refused fill never reports retirement.
+    pub fn notify_tracked(&self, value: T) -> Result<CoalescedReceipt<A, T>, ActorTurnError> {
+        let (revision, next) = self.enqueue(value)?;
+        self.fill(next)?;
+        Ok(CoalescedReceipt {
+            original: self.0.clone(),
+            revision,
+        })
+    }
+
+    fn enqueue(&self, value: T) -> Result<(u64, Option<Update<T>>), ActorTurnError> {
+        let mut state = self.0.state.lock().expect("coalescing input state lock");
+        if state.closed {
+            return Err(ActorTurnError::Closed);
+        }
+        let revision = state
+            .issued
+            .checked_add(1)
+            .ok_or(ActorTurnError::IdentityExhausted)?;
+        state.issued = revision;
+        let update = Update { value, revision };
+        if let Some(latest) = state.latest.as_mut() {
+            latest.merge(update);
+        } else {
+            state.latest = Some(update);
+        }
+        Ok((revision, Self::claim_fill(&mut state)))
     }
     /// Must follow actual `retire_input`, once per occurrence. A closed input
     /// does not refill. Concurrent
@@ -107,7 +167,9 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
     pub fn after_retire(&self) -> Result<Option<InputId>, ActorTurnError> {
         let next = {
             let mut state = self.0.state.lock().expect("coalescing input state lock");
-            state.in_flight = false;
+            if let Some(revision) = state.in_flight.take() {
+                state.retired = state.retired.max(revision);
+            }
             if state.closed {
                 return Ok(None);
             }
@@ -115,13 +177,13 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
         };
         self.fill(next)
     }
-    fn claim_fill(state: &mut State<T>) -> Option<T> {
-        if state.in_flight || state.closed {
+    fn claim_fill(state: &mut State<T>) -> Option<Update<T>> {
+        if state.in_flight.is_some() || state.closed {
             return None;
         }
-        let value = state.latest.take()?;
-        state.in_flight = true;
-        Some(value)
+        let update = state.latest.take()?;
+        state.in_flight = Some(update.revision);
+        Some(update)
     }
     /// Retries a retained notification after a nonterminal fill error. The
     /// original error is returned to the host; no new capacity is manufactured.
@@ -135,8 +197,8 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
         };
         self.fill(next)
     }
-    fn fill(&self, value: Option<T>) -> Result<Option<InputId>, ActorTurnError> {
-        let Some(value) = value else {
+    fn fill(&self, update: Option<Update<T>>) -> Result<Option<InputId>, ActorTurnError> {
+        let Some(update) = update else {
             return Ok(None);
         };
         // Actor notification can invoke an external waker. Never retain the
@@ -146,17 +208,23 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
             .standing
             .lock()
             .expect("coalescing standing input lock")
-            .fill((self.0.project)(&value));
+            .fill((self.0.project)(&update.value));
         match result {
             Ok(input) => Ok(Some(input)),
             Err((error, input)) => {
                 if matches!(error, ActorTurnError::Closed | ActorTurnError::ActorFailed) {
-                    self.close();
+                    let latest = {
+                        let mut state = self.0.state.lock().expect("coalescing input state lock");
+                        state.in_flight = None;
+                        state.closed = true;
+                        state.latest.take()
+                    };
+                    drop(latest);
                 } else {
                     let mut state = self.0.state.lock().expect("coalescing input state lock");
                     // Preserve chronological merge order when a concurrent
                     // notifier updated latest while the fill ran unlocked.
-                    let mut original = value;
+                    let mut original = update;
                     if let Some(newer) = state.latest.take() {
                         original.merge(newer);
                     }
@@ -165,13 +233,30 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
                     }
                     // Busy still denotes a real outstanding occurrence. Only
                     // its actual retirement may authorize another fill.
-                    state.in_flight = error == ActorTurnError::StandingInputBusy;
+                    state.in_flight = (error == ActorTurnError::StandingInputBusy).then_some(0);
                 }
                 drop(input);
                 Err(error)
             }
         }
     }
+    /// Retire at most one actual occurrence on this original standing role.
+    /// The owner has indexed the runtime input and released its captures.
+    pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        {
+            let standing = self
+                .0
+                .standing
+                .lock()
+                .expect("coalescing standing input lock");
+            if standing.in_flight()?.is_none() || !standing.retire_ready_after_exit()? {
+                return Ok(false);
+            }
+        }
+        self.after_retire()?;
+        Ok(true)
+    }
+
     /// Stops new notifications and discards pending updates. An occurrence
     /// whose fill right was already acquired still belongs to its original host.
     pub fn close(&self) {

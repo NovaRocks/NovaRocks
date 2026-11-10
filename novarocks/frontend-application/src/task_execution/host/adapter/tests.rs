@@ -339,6 +339,33 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     assert_eq!(lifecycle.class, InputClass::Lifecycle);
     assert_eq!(control.class, InputClass::Control);
 
+    let before_progress = inventory();
+    let read_progress = registered
+        .bind_read_progress(&runtime, &observation_work)
+        .unwrap();
+    assert!(
+        read_progress
+            .keys()
+            .eq(members.iter().map(|member| &member.participation))
+    );
+    let progress_positions: Vec<_> = inventory()
+        .into_iter()
+        .filter(|row| !before_progress.contains(row))
+        .collect();
+    assert_eq!(progress_positions.len(), members.len());
+    assert!(
+        progress_positions
+            .iter()
+            .all(|row| { row.source == lifecycle.source && row.class == InputClass::Ordinary })
+    );
+    assert!(matches!(
+        registered.bind_read_progress(&runtime, &observation_work),
+        Err(ObservationError::Busy)
+    ));
+    for role in read_progress.values() {
+        role.close_after_exit().unwrap();
+    }
+
     let before_owner_controls = inventory();
     let mut owner_controls = registered
         .prepare_owner_controls(&runtime, &original_work)

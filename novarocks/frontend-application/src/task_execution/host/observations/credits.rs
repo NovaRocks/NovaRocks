@@ -20,7 +20,9 @@
 use super::{
     InputSlotLoan, ObservationBudget, ObservationByteLoan, ObservationCredit, ObservationError,
     StreamKey,
+    read_progress::{ReadProgressInput, ReadProgressReceipt},
 };
+use novarocks_attempt_protocol::input::ReadProgressSnapshot;
 use novarocks_control_runtime::obligation::{
     OwnedPositionObligation, ReservationObligation, WorkObligation,
 };
@@ -36,6 +38,22 @@ use std::{
 struct ReadClaims {
     live: usize,
     waiter: Option<Waker>,
+    publishing_progress: usize,
+    progress: Option<ReadProgressReceipt>,
+    progress_failed: bool,
+}
+
+impl ReadClaims {
+    fn exited(&self) -> bool {
+        self.live == 0
+            && self.waiter.is_none()
+            && self.publishing_progress == 0
+            && !self.progress_failed
+            && self
+                .progress
+                .as_ref()
+                .is_none_or(ReadProgressReceipt::retired)
+    }
 }
 
 struct Credits {
@@ -128,13 +146,13 @@ impl ObservationCredits {
             .expect("observation credit owner")
             .streams
             .get(&stream)
-            .is_some_and(|row| row.live == 0 && row.waiter.is_none())
+            .is_some_and(ReadClaims::exited)
     }
 
     pub(crate) fn retire_stream(&self, stream: StreamKey) -> Result<(), ObservationError> {
         let mut state = self.state.lock().expect("observation credit owner");
         let row = state.read_claims(stream)?;
-        if row.live != 0 || row.waiter.is_some() {
+        if !row.exited() {
             return Err(ObservationError::Busy);
         }
         state.streams.remove(&stream);
@@ -185,6 +203,49 @@ impl ObservationCredits {
             .ok()
             .and_then(|row| row.waiter.take());
         drop(waiter);
+    }
+
+    pub(crate) fn read_resumed(
+        &self,
+        source: &ReadProgressInput,
+        progress: ReadProgressSnapshot,
+    ) -> Result<(), ObservationError> {
+        let stream = StreamKey {
+            participation: progress.participation,
+            generation: progress.generation,
+        };
+        {
+            let mut state = self.state.lock().expect("observation credit owner");
+            if state.closed {
+                return Err(ObservationError::Closed);
+            }
+            let row = state.read_claims(stream)?;
+            if row.live == 0 {
+                return Err(ObservationError::Busy);
+            }
+            // Keep the exact generation live while fill can wake the host.
+            row.publishing_progress += 1;
+        }
+        let published = source.publish(progress);
+        let mut state = self.state.lock().expect("observation credit owner");
+        let row = state
+            .read_claims(stream)
+            .expect("original progress publisher");
+        row.publishing_progress -= 1;
+        match published {
+            Ok(receipt) => {
+                if let Some(original) = row.progress.as_mut() {
+                    original.retain_later(receipt);
+                } else {
+                    row.progress = Some(receipt);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                row.progress_failed = true;
+                Err(error)
+            }
+        }
     }
 
     /// The canonical request owner must validate its original row before
@@ -260,10 +321,7 @@ impl ObservationCredits {
             if state.retiring
                 || state.control_live
                 || state.data_bytes != 0
-                || state
-                    .streams
-                    .values()
-                    .any(|row| row.live != 0 || row.waiter.is_some())
+                || state.streams.values().any(|row| !row.exited())
             {
                 return Err(ObservationError::Busy);
             }

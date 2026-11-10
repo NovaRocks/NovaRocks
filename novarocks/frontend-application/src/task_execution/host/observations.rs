@@ -20,6 +20,7 @@
 //! classes. Rich storage/byte loans stay here until the runtime input retires.
 
 pub(crate) mod credits;
+pub(crate) mod read_progress;
 
 use novarocks_attempt_protocol::{
     failure::AttemptFailure,

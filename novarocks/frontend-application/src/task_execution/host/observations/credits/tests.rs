@@ -213,3 +213,146 @@ fn wake_panic_keeps_the_original_return_unacknowledged() {
     assert_eq!(credits.retire_after_exit(), Err(ObservationError::Busy));
     assert_eq!(scope.snapshot().unwrap().storage, original_storage);
 }
+
+#[test]
+fn read_progress_retires_only_the_generations_covered_by_each_actual_occurrence() {
+    use crate::control_runtime::actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor};
+    use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact};
+    use novarocks_control_runtime::{
+        actor::{ActorConfig, ActorStep},
+        actor_turn::ActorRuntime,
+    };
+    use novarocks_control_runtime_core::{
+        identity::{ActorId, Tick},
+        mailbox::{InputClass, InputEnvelope},
+    };
+    use novarocks_coordination_contract::MonotonicInstant;
+    use std::time::Duration;
+
+    struct Recorder(Arc<Mutex<Vec<ReadProgressSnapshot>>>);
+    impl TestActor for Recorder {
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: InputEnvelope,
+            input: FrontendInput,
+            _: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            let FrontendInput::Attempt(input) = input else {
+                panic!("original read progress input");
+            };
+            let AttemptInput::Executor(ExecutorFact::ReadProgress(progress)) = *input else {
+                panic!("original read progress snapshot");
+            };
+            self.0.lock().unwrap().push(progress);
+        }
+    }
+
+    let old = stream();
+    let replacement = StreamKey {
+        generation: NonZeroU64::new(2).unwrap(),
+        ..old
+    };
+    let (credits, scope) = pool(&[old, replacement], 300);
+    let runtime = ActorRuntime::new();
+    let actor = ActorId::new(1).unwrap();
+    let source = ActorId::new(2).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let registration = runtime
+        .register_bound(
+            actor,
+            scope.clone(),
+            FrontendActor::Test(Box::new(Recorder(seen.clone()))),
+            ActorConfig {
+                mailbox: [4; 4],
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        )
+        .unwrap_or_else(|_| panic!("original read progress actor"));
+    let (mut work, mut reservation) = scope
+        .reserve_next(
+            Generation::new(1).unwrap(),
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    work.start().unwrap();
+    let standing = runtime
+        .reserve_admitted_input_for(&registration, source, InputClass::Ordinary, &work)
+        .unwrap()
+        .into_standing_input()
+        .unwrap();
+    let progress = ReadProgressInput::new(old.participation, standing);
+    let report = |key: StreamKey, revision| ReadProgressSnapshot {
+        participation: key.participation,
+        generation: key.generation,
+        resumed_at: MonotonicInstant::from_origin(Duration::from_millis(revision)),
+        resume_revision: NonZeroU64::new(revision).unwrap(),
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let old_credit = ready_credit(credits.poll_read(old, &mut cx));
+    credits.read_resumed(&progress, report(old, 1)).unwrap();
+    drop(old_credit);
+
+    let new_credit = ready_credit(credits.poll_read(replacement, &mut cx));
+    credits
+        .read_resumed(&progress, report(replacement, 1))
+        .unwrap();
+    drop(new_credit);
+    let new_credit = ready_credit(credits.poll_read(replacement, &mut cx));
+    credits
+        .read_resumed(&progress, report(replacement, 2))
+        .unwrap();
+    drop(new_credit);
+
+    assert!(!credits.stream_claims_exited(old));
+    assert!(!credits.stream_claims_exited(replacement));
+    assert!(!progress.retire_ready().unwrap());
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(*seen.lock().unwrap(), vec![report(old, 1)]);
+    assert!(!credits.stream_claims_exited(old));
+    assert_eq!(runtime.committed_batches(actor, None, 4).unwrap().len(), 1);
+    assert!(progress.retire_ready().unwrap());
+    credits.retire_stream(old).unwrap();
+    assert!(!credits.stream_claims_exited(replacement));
+
+    assert!(runtime.poll_one(Tick(2)).unwrap());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![report(old, 1), report(replacement, 2)]
+    );
+    assert_eq!(runtime.committed_batches(actor, None, 4).unwrap().len(), 1);
+    assert!(progress.retire_ready().unwrap());
+    assert!(credits.stream_claims_exited(replacement));
+    progress.close_after_exit().unwrap();
+
+    let new_credit = ready_credit(credits.poll_read(replacement, &mut cx));
+    assert_eq!(
+        credits.read_resumed(&progress, report(replacement, 3)),
+        Err(ObservationError::Runtime(
+            novarocks_control_runtime::actor_turn::ActorTurnError::Closed
+        ))
+    );
+    drop(new_credit);
+    assert!(!credits.stream_claims_exited(replacement));
+    assert_eq!(credits.retire_after_exit(), Err(ObservationError::Busy));
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    reservation.finish().unwrap();
+    scope.close_external().unwrap();
+    scope.reap_ready(8).unwrap();
+    runtime.close_actor_admission(actor).unwrap();
+    while let Some(turn) = runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    runtime.seal_actor(actor).unwrap();
+    runtime.remove_actor(actor).unwrap();
+    assert!(!scope.snapshot().unwrap().retirement_ready);
+}
