@@ -32,6 +32,7 @@ use crate::{
         },
         transport_withdrawal::AttemptEffectEnvelope,
     },
+    task_execution::bridge::abort::AbortReceiptSlot,
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
     task_execution::host::failure_supervisor::{
@@ -66,7 +67,7 @@ use novarocks_execution_contract::TaskOperationId;
 use novarocks_types::BackendProcessId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Weak},
     task::Poll,
 };
 
@@ -99,6 +100,7 @@ struct SendInFlight {
     header: WorkRetirementObserver,
     result: Option<ReturnedActorTransportResult>,
     retired: bool,
+    abort_keys: Vec<(TaskOperationId, SendGeneration)>,
 }
 
 pub(crate) struct AttemptFailureBinding {
@@ -131,7 +133,8 @@ pub(crate) struct AttemptTransportSource {
     report_author: Option<ReportedWork>,
     send_idle: [VecDeque<Position>; 2],
     send_live: BTreeMap<AttemptActionId, SendInFlight>,
-    failed_sends: BTreeSet<AttemptActionId>,
+    abort_receipts: BTreeMap<(TaskOperationId, SendGeneration), Weak<AbortReceiptSlot>>,
+    failed_sends: BTreeMap<AttemptActionId, Vec<(TaskOperationId, SendGeneration)>>,
     send_ready: VecDeque<AttemptActionId>,
     send_scan: usize,
     admission_scan: usize,
@@ -178,7 +181,8 @@ impl AttemptTransportSource {
             report_author: Some(send.report_author),
             send_idle: send.idle,
             send_live: BTreeMap::new(),
-            failed_sends: BTreeSet::new(),
+            abort_receipts: BTreeMap::new(),
+            failed_sends: BTreeMap::new(),
             send_ready: VecDeque::with_capacity(capacity),
             send_scan: 0,
             admission_scan: 0,
@@ -304,12 +308,16 @@ impl AttemptTransportSource {
                     .get(&(key.operation, key.generation))
                     .copied()
                     .unwrap_or_default();
-                Ok(SendMemberReport::new(
+                let mut member = SendMemberReport::new(
                     receipt,
                     references.filter,
                     references.workload,
                     first_poll,
-                ))
+                );
+                if let OperationIntent::AbortParticipation(request) = operation {
+                    member.retain_abort_receipt(request.participation());
+                }
+                Ok(member)
             })();
             match member {
                 Ok(member) => members.push(member),
@@ -395,6 +403,9 @@ impl AttemptTransportSource {
             return false;
         }
         let row = self.send_live.remove(&effect).expect("same retired send");
+        for key in row.abort_keys {
+            self.abort_receipts.remove(&key);
+        }
         let result = row.result.unwrap();
         self.send_idle[row.lane].push_back(result.original);
         true
@@ -467,7 +478,19 @@ impl EffectSource for AttemptTransportSource {
                     unreachable!()
                 };
                 assert!(self.in_flight.insert(effect.protocol.id));
-                Ok(self.calls[lane].as_mut().unwrap().bind(ticket, result))
+                let receipt = match &effect.protocol.body {
+                    EffectBody::Port(port) => match port.body {
+                        novarocks_coordination_contract::AttemptToLogicalBody::AbortSettlement {
+                            operation_id, receipt_generation: Some(generation), ..
+                        } => self.abort_receipts.get(&(operation_id, SendGeneration::new(generation))).and_then(Weak::upgrade),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                Ok(self.calls[lane]
+                    .as_mut()
+                    .unwrap()
+                    .bind_with_abort_receipt(ticket, result, receipt))
             }
             Prepaid::Admission => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
@@ -507,12 +530,21 @@ impl EffectSource for AttemptTransportSource {
                     unreachable!()
                 };
                 assert!(self.in_flight.insert(effect.protocol.id));
+                let abort_receipts = prepared.abort_receipts();
                 let (job, header) = prepared
                     .bind_tracked(runtime, ticket, result, &mut self.admission)
                     .map_err(|original| EffectBindRefusal {
                         error: original.error,
                         original: Box::new(original),
                     })?;
+                let abort_keys = abort_receipts
+                    .into_iter()
+                    .map(|(key, receipt)| {
+                        let address = (key.operation, key.generation);
+                        assert!(self.abort_receipts.insert(address, receipt).is_none());
+                        address
+                    })
+                    .collect();
                 assert!(
                     self.send_live
                         .insert(
@@ -522,6 +554,7 @@ impl EffectSource for AttemptTransportSource {
                                 header,
                                 result: None,
                                 retired: false,
+                                abort_keys,
                             }
                         )
                         .is_none()
@@ -596,7 +629,7 @@ impl EffectSource for AttemptTransportSource {
                     } else {
                         let row = self.send_live.remove(&effect).unwrap();
                         assert!(row.result.is_none());
-                        assert!(self.failed_sends.insert(effect));
+                        assert!(self.failed_sends.insert(effect, row.abort_keys).is_none());
                         self.other
                             .retain_transport_failure(Box::new(FailedSendResult {
                                 effect,
@@ -614,7 +647,10 @@ impl EffectSource for AttemptTransportSource {
                 self.in_flight.remove(&effect);
                 if let Some(row) = self.send_live.get_mut(&effect) {
                     row.retired = true;
-                } else if self.failed_sends.remove(&effect) {
+                } else if let Some(abort_keys) = self.failed_sends.remove(&effect) {
+                    for key in abort_keys {
+                        self.abort_receipts.remove(&key);
+                    }
                     self.other
                         .transport_event(effect, TransportSourceEvent::Retired);
                 } else {

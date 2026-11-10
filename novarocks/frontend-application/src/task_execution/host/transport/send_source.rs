@@ -19,8 +19,8 @@
 
 use super::{
     ActorSendReports, ActorTransportWork, AdmissionSource, BoundSend, FrozenSendRequests,
-    PreparedSendBatch, QueueWindow, SendBindingError, SourceLayouts, actor_transport_layouts,
-    original_run, prepare_actor_transport,
+    PreparedSendBatch, QueueWindow, SendBindingError, SendKey, SourceLayouts,
+    actor_transport_layouts, original_run, prepare_actor_transport,
 };
 use crate::{
     control_runtime::{
@@ -130,6 +130,15 @@ pub(crate) struct PreparedActorSend {
 }
 
 impl PreparedActorSend {
+    pub(super) fn abort_receipts(
+        &self,
+    ) -> Vec<(
+        SendKey,
+        std::sync::Weak<crate::task_execution::bridge::abort::AbortReceiptSlot>,
+    )> {
+        self.reports.abort_receipts()
+    }
+
     pub(crate) fn revoke_unused_reports(self) {
         super::send_reports::close_unlaunched(self.reports);
     }

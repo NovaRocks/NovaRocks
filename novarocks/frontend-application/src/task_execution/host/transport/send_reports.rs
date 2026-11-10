@@ -19,6 +19,7 @@ use super::{
     NativeReceiptInput, SendKey,
     receipt_input::{NativeReceiptError, RetiredNativeReceipt},
 };
+use crate::task_execution::bridge::abort::AbortReceiptSlot;
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
     task_execution::{
@@ -26,6 +27,7 @@ use crate::{
         operation::OperationDispatchResult,
     },
 };
+use novarocks_attempt_protocol::input::SendGeneration;
 use novarocks_attempt_protocol::{
     failure::HostFailureRef,
     input::{AttemptInput, ExecutorFact},
@@ -78,6 +80,7 @@ impl NativeProgressInput {
 
 pub(crate) struct SendMemberReport {
     receipt: Option<NativeReceiptInput>,
+    abort_receipt: Option<Arc<AbortReceiptSlot>>,
     filter: Option<PayloadRef>,
     workload: Option<HostFailureRef>,
     pub(crate) first_poll: Option<(ParticipationRef, NativeProgressInput)>,
@@ -93,6 +96,7 @@ impl SendMemberReport {
     ) -> Self {
         Self {
             receipt: Some(receipt),
+            abort_receipt: None,
             filter,
             workload,
             first_poll,
@@ -100,6 +104,19 @@ impl SendMemberReport {
             refused_receipt: None,
         }
     }
+    pub(super) fn retain_abort_receipt(&mut self, participation: ParticipationRef) {
+        let key = self
+            .receipt
+            .as_ref()
+            .expect("original Abort report position")
+            .key();
+        assert!(
+            self.abort_receipt
+                .replace(Arc::new(AbortReceiptSlot::new(key, participation)))
+                .is_none()
+        );
+    }
+
     fn record(&mut self, key: SendKey, ack: OperationAcknowledgement) {
         assert!(self.receipt_delivery.is_none() && self.refused_receipt.is_none());
         let filter = if matches!(
@@ -126,7 +143,16 @@ impl SendMemberReport {
             .as_mut()
             .expect("live original receipt position");
         match receipt.record(key, ack, filter, workload) {
-            Ok(()) => self.receipt_delivery = Some(receipt.submit()),
+            Ok(()) => {
+                if let Some(original) = &self.abort_receipt {
+                    original.record(
+                        receipt
+                            .prepared_ack()
+                            .expect("original prepared Abort receipt"),
+                    );
+                }
+                self.receipt_delivery = Some(receipt.submit());
+            }
             Err(refusal) => self.refused_receipt = Some(refusal),
         }
     }
@@ -312,6 +338,24 @@ impl ActorSendReports {
             .expect("original sender has exited")
     }
 
+    pub(super) fn abort_receipts(&self) -> Vec<(SendKey, std::sync::Weak<AbortReceiptSlot>)> {
+        self.rows
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("unlaunched original send reports")
+            .members
+            .iter()
+            .filter_map(|member| {
+                let original = member.abort_receipt.as_ref()?;
+                Some((
+                    member.receipt.as_ref().unwrap().key(),
+                    Arc::downgrade(original),
+                ))
+            })
+            .collect()
+    }
+
     fn loan(&self) -> RowLoan<'_> {
         let rows = self
             .rows
@@ -386,6 +430,7 @@ pub(crate) enum SendReportReturn {
         key: SendKey,
         delivery_error: Option<ActorTurnError>,
         receipt: RetiredNativeReceipt,
+        abort_receipt: Option<Arc<AbortReceiptSlot>>,
     },
     ReceiptRefused {
         key: SendKey,
@@ -481,6 +526,7 @@ impl SendReportRetirement {
                 key,
                 delivery_error,
                 receipt,
+                abort_receipt: member.abort_receipt.take(),
             }),
         };
         Ok(Advanced(returned))
@@ -490,18 +536,31 @@ impl SendReportRetirement {
 pub(crate) fn actor_send_report_layouts(
     items: usize,
     establishes: usize,
-) -> Result<[Layout; 4], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+    aborts: usize,
+) -> Result<[Layout; 6], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
     use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
     let inputs = items
         .checked_add(establishes)
         .and_then(|inputs| inputs.checked_add(1))
         .ok_or(LayoutResourceError::Arithmetic)?;
+    let abort_slot = arc_layout(Layout::new::<AbortReceiptSlot>())?.pad_to_align();
+    let abort_slots = Layout::from_size_align(
+        abort_slot
+            .size()
+            .checked_mul(aborts)
+            .ok_or(LayoutResourceError::Arithmetic)?,
+        abort_slot.align(),
+    )
+    .map_err(|_| LayoutResourceError::Arithmetic)?;
     Ok([
         arc_layout(Layout::new::<ActorSendReports>())?,
         Layout::array::<SendMemberReport>(items).map_err(|_| LayoutResourceError::Arithmetic)?,
         Layout::array::<(TaskOperationId, usize)>(items)
             .map_err(|_| LayoutResourceError::Arithmetic)?,
         Layout::array::<AttemptInput>(inputs).map_err(|_| LayoutResourceError::Arithmetic)?,
+        abort_slots,
+        Layout::array::<(TaskOperationId, SendGeneration)>(aborts)
+            .map_err(|_| LayoutResourceError::Arithmetic)?,
     ])
 }
 
@@ -521,6 +580,93 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
     use std::{num::NonZeroU64, time::Duration};
+
+    #[test]
+    fn abort_report_preserves_the_raw_worker_receipt_before_input_retirement() {
+        use novarocks_execution_contract::{
+            OperationOutcome, ParticipationReceipt, ParticipationState,
+        };
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let inbox = WithdrawalInbox::new(&scope);
+        let (mut work, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let part = ParticipationRef::new(
+            QueryExecutionId::new(QueryId::new(9, 13), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let key = SendKey {
+            operation: TaskOperationId::new_v7(),
+            generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+        };
+        let mut report = SendMemberReport::new(
+            NativeReceiptInput::new(
+                key,
+                OperationKind::AbortParticipation,
+                inbox.reserve_standing(&work),
+            ),
+            None,
+            None,
+            None,
+        );
+        report.retain_abort_receipt(part);
+        let original = OperationAcknowledgement::worker_receipt(
+            key.operation,
+            OperationKind::AbortParticipation,
+            OperationOutcome::Accepted,
+            AckPayload::Participation(ParticipationReceipt::new(
+                part,
+                ParticipationState::Aborting,
+            )),
+        );
+        report.record(key, original.clone());
+        let input = report.receipt_delivery.take().unwrap().unwrap();
+        let slot = report.abort_receipt.take().unwrap();
+        assert_eq!(slot.original_for_test(), Some(&original));
+        assert!(matches!(
+            report
+                .receipt
+                .as_mut()
+                .unwrap()
+                .retire_ready_after_exit()
+                .unwrap(),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            inbox.commit(input),
+            ExecutorFact::Operation(observation) if observation.generation == key.generation
+        ));
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        let Poll::Ready(Some(retired)) = report
+            .receipt
+            .as_mut()
+            .unwrap()
+            .retire_ready_after_exit()
+            .unwrap()
+        else {
+            panic!("original Abort report retired");
+        };
+        assert_eq!(retired.original, original);
+        assert_eq!(slot.original_for_test(), Some(&original));
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        inbox.finish();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    }
 
     #[test]
     fn native_report_positions_deliver_exact_progress_and_preserve_refused_ack() {
@@ -669,6 +815,7 @@ mod tests {
                 key,
                 delivery_error: None,
                 receipt: RetiredNativeReceipt { original: receipt, unpublished: None },
+                abort_receipt: None,
             })) if key == establish && receipt == original
         ));
         assert!(matches!(retirement.advance().unwrap(), Retired));

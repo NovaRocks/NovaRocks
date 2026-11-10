@@ -29,6 +29,10 @@ use crate::{
     },
     task_execution::{
         bridge::{
+            abort::{
+                AbortInputRetirement, AbortReceiptSlot, AbortSettlementOwner,
+                AppliedAbortSettlement,
+            },
             qa::AttemptQaBridge,
             terminal::{ConvergencePublication, TerminalOutbox, TerminalPublication},
         },
@@ -92,19 +96,33 @@ pub(crate) enum AttemptCallReply {
     },
     Terminal(Box<TerminalPublication>),
     Convergence(ConvergencePublication),
+    AbortSettled(AppliedAbortSettlement),
 }
 
-pub(crate) struct BoundAttemptCall(AttemptCallOwner);
+pub(crate) struct BoundAttemptCall {
+    owner: AttemptCallOwner,
+    abort: Option<(Arc<AbortSettlementOwner>, Option<Arc<AbortReceiptSlot>>)>,
+}
 impl BoundAttemptCall {
     pub(super) fn matches(&self, effect: &AttemptEffectEnvelope) -> bool {
-        self.0.matches(effect)
+        self.owner.matches(effect)
     }
 
     pub(super) async fn run(
         self,
         effect: Arc<AttemptEffectEnvelope>,
     ) -> Result<AttemptCallReply, Box<dyn std::any::Any + Send>> {
-        match self.0 {
+        if let Some((owner, receipt)) = self.abort {
+            let EffectBody::Port(port) = &effect.protocol.body else {
+                unreachable!("original Abort settlement port");
+            };
+            assert_eq!(port.action, effect.protocol.id);
+            return owner
+                .apply(port, receipt.as_deref())
+                .map(AttemptCallReply::AbortSettled)
+                .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>);
+        }
+        match self.owner {
             AttemptCallOwner::Qa(bridge) => {
                 let mut bridge = bridge.lock().await;
                 if let EffectBody::Port(port) = &effect.protocol.body
@@ -181,6 +199,7 @@ struct Live {
     effect: Arc<AttemptEffectEnvelope>,
     header: WorkRetirementObserver,
     result: Option<Position>,
+    abort_input: Option<AbortInputRetirement>,
     retired: bool,
 }
 
@@ -197,6 +216,7 @@ pub(crate) struct AttemptCallSource {
     observer: ConsumerId,
     owner: Option<AttemptCallOwner>,
     terminal: Option<Arc<TerminalOutbox>>,
+    abort: Option<Arc<AbortSettlementOwner>>,
     idle: Option<Position>,
     pending: Option<(Arc<AttemptEffectEnvelope>, ReportedWork)>,
     live: Option<Live>,
@@ -221,6 +241,7 @@ impl AttemptCallSource {
             observer,
             owner: Some(owner),
             terminal: None,
+            abort: None,
             idle: Some(position),
             pending: None,
             live: None,
@@ -231,6 +252,11 @@ impl AttemptCallSource {
     pub(crate) fn install_terminal(&mut self, original: Arc<TerminalOutbox>) {
         assert!(matches!(self.owner, Some(AttemptCallOwner::Qa(_))));
         assert!(self.terminal.replace(original).is_none());
+    }
+
+    pub(crate) fn install_abort(&mut self, original: Arc<AbortSettlementOwner>) {
+        assert!(matches!(self.owner, Some(AttemptCallOwner::Qa(_))));
+        assert!(self.abort.replace(original).is_none());
     }
 
     pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
@@ -309,6 +335,15 @@ impl AttemptCallSource {
         ticket: &EffectTicket<FrontendEffect>,
         result: Position,
     ) -> PreparedEffectJob {
+        self.bind_with_abort_receipt(ticket, result, None)
+    }
+
+    pub(super) fn bind_with_abort_receipt(
+        &mut self,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+        receipt: Option<Arc<AbortReceiptSlot>>,
+    ) -> PreparedEffectJob {
         let (effect, work) = self.pending.take().expect("same original call prepayment");
         assert!(
             matches!(&ticket.effect, FrontendEffect::Attempt(original) if Arc::ptr_eq(original, &effect))
@@ -320,13 +355,23 @@ impl AttemptCallSource {
                     effect: effect.clone(),
                     header,
                     result: None,
+                    abort_input: None,
                     retired: false,
                 })
                 .is_none()
         );
         let owner = self.owner.as_ref().expect("original call owner").clone();
+        let abort = effect.is_abort_settlement().then(|| {
+            (
+                self.abort
+                    .as_ref()
+                    .expect("original Abort settlement owner")
+                    .clone(),
+                receipt,
+            )
+        });
         prepare_actor_transport(effect, result, work, VecDeque::new(), self.observer, |_| {
-            ActorTransportWork::Call(BoundAttemptCall(owner))
+            ActorTransportWork::Call(BoundAttemptCall { owner, abort })
         })
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
     }
@@ -436,6 +481,17 @@ impl AttemptCallSource {
                     });
                 }
             }
+            AttemptCallReply::AbortSettled(applied) => {
+                if applied.result.is_err() {
+                    original.outcome =
+                        Some(BodyOutcome::Call(AttemptCallReply::AbortSettled(applied)));
+                    return Err(AttemptCallResultRefusal {
+                        original,
+                        publication: None,
+                    });
+                }
+                live.abort_input = applied.retirement;
+            }
         }
         assert!(live.result.replace(original.original).is_none());
         Ok(())
@@ -448,16 +504,21 @@ impl AttemptCallSource {
     }
 
     pub(crate) fn retire_result(&mut self) -> Result<bool, ActorTurnError> {
-        let Some(live) = self.live.as_ref() else {
+        let Some(live) = self.live.as_mut() else {
             return Ok(false);
         };
         let Some(result) = live.result.as_ref() else {
             return Ok(false);
         };
-        if !live.retired
-            || !result.retire_ready_after_exit()?
-            || !self.scope.reap_observed_header(&live.header)?
+        if !live.retired || !result.retire_ready_after_exit()? {
+            return Ok(false);
+        }
+        if let Some(original) = live.abort_input.as_mut()
+            && !original.retire_ready()?
         {
+            return Ok(false);
+        }
+        if !self.scope.reap_observed_header(&live.header)? {
             return Ok(false);
         }
         let result = self.live.take().unwrap().result.unwrap();
@@ -481,13 +542,19 @@ impl AttemptCallSource {
         Ok(true)
     }
 
-    pub(crate) fn take_drained_owner(&mut self) -> Option<AttemptCallOwner> {
+    pub(crate) fn take_drained_owner(
+        &mut self,
+    ) -> Option<(
+        AttemptCallOwner,
+        Option<Arc<AbortSettlementOwner>>,
+        Option<Arc<TerminalOutbox>>,
+    )> {
         if self.idle.is_none()
             && self.pending.is_none()
             && self.live.is_none()
             && self.failures.is_empty()
         {
-            self.owner.take()
+            Some((self.owner.take()?, self.abort.take(), self.terminal.take()))
         } else {
             None
         }

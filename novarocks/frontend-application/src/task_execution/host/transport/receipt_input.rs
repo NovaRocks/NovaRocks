@@ -144,6 +144,13 @@ impl NativeReceiptInput {
         Ok(())
     }
 
+    pub(super) fn prepared_ack(&self) -> Option<&OperationAcknowledgement> {
+        match &self.receipt {
+            Some(Receipt::Prepared { original, .. }) => Some(original),
+            _ => None,
+        }
+    }
+
     /// The actual fill decides Native FIFO order. On runtime refusal retain
     /// both originals, including the already materialized passive input.
     pub(crate) fn submit(&mut self) -> Result<InputId, ActorTurnError> {

@@ -137,6 +137,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
     pub(crate) qa: super::transport::AttemptCallSource,
+    pub(crate) abort: Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
     pub(crate) process: super::transport::AttemptCallSource,
     pub(crate) publication: super::transport::AttemptCallSource,
     pub(crate) send: super::transport::AttemptSendSource,
@@ -459,8 +460,10 @@ impl AttemptActorRegistration {
                 }
             }
         }
+        self.abort_bound = true;
         Ok(
             crate::task_execution::bridge::abort::AttemptAbortIngress::new(
+                self.original.clone(),
                 self.root_control.activation(),
                 positions,
                 capacity,
@@ -515,6 +518,9 @@ impl AttemptActorRegistration {
             || self.binding.get().is_none()
             || !self.scope.same_scope(startup_work.scope())
             || !transport
+                .abort
+                .matches(&self.original, self.root_control.activation())
+            || !transport
                 .retirement
                 .matches_registration(runtime, &self.original)
             || !transport
@@ -554,6 +560,7 @@ impl AttemptActorRegistration {
             retirement,
             admission,
             mut qa,
+            abort,
             process,
             publication,
             send,
@@ -564,6 +571,7 @@ impl AttemptActorRegistration {
             self.root_control.activation(),
         );
         qa.install_terminal(terminal.clone());
+        qa.install_abort(abort);
         let (failure_bridge, residual) = PendingFailureBridge::new(
             self.original.clone(),
             self.root_control.activation(),

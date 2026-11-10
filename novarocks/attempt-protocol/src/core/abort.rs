@@ -200,6 +200,17 @@ impl Aborts {
             && row.generations < self.limit.get()
     }
 
+    pub(super) fn retired_request(&self, request: AbortParticipation) -> bool {
+        self.rows
+            .get(&request.envelope().operation_id())
+            .is_some_and(|row| {
+                (row.closed || row.failed_closed)
+                    && row.request.participation() == request.participation()
+                    && row.request.envelope() == request.envelope()
+                    && row.request.cause() == request.cause()
+            })
+    }
+
     pub(super) fn begin(
         &mut self,
         execution: &QueryTaskExecution,
@@ -851,6 +862,12 @@ mod tests {
         }) if abort_action == action(10) && original == action(1))
         );
         assert!(execution.owner(participation).unwrap().is_released());
+        assert!(aborts.retired_request(request));
+        assert!(!aborts.retired_request(AbortParticipation::new(
+            execution.issue_operation_id(),
+            participation,
+            AbortCause::QueryFailed,
+        )));
         let late_grant = QueuedInputGrantRef::new(id(9), generation(2));
         assert!(
             matches!(aborts.grant(&mut execution, operation, late_grant).unwrap(),

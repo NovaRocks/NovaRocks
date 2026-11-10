@@ -656,7 +656,7 @@ impl Core {
                 LogicalToAttemptBody::Abort { action, request } => {
                     self.verify_owner_port(claim.source, port.activation)?;
                     let (admission, _) = self.turn.issue()?;
-                    if self.aborts.taking_over() {
+                    if self.aborts.taking_over() || self.aborts.retired_request(*request) {
                         result.abort_settlement = Some(self.abort_effect(
                             AttemptToLogicalBody::AbortSettlement {
                                 abort_action: *action,

@@ -420,8 +420,34 @@ impl NativeAbortEffect {
             .resolved_by_other_generation();
     }
 
-    pub(crate) fn settle(
+    pub(crate) fn transport_unknown(
         mut self,
+    ) -> Result<NativeLateAbortEffect, ParticipationStandDownError> {
+        let late = self
+            .submission
+            .take()
+            .expect("original Abort submission")
+            .transport_unknown()?;
+        Ok(NativeLateAbortEffect::new(late, self.worker_closed.clone()))
+    }
+
+    pub(crate) fn worker_settled(
+        mut self,
+        receipt: ParticipationReceipt,
+    ) -> Result<(), ParticipationStandDownError> {
+        let participation = receipt.participation();
+        self.submission
+            .take()
+            .expect("original Abort submission")
+            .worker_settled(receipt)?;
+        if let Some(observer) = &self.worker_closed {
+            observer(participation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn settle(
+        self,
         acknowledgement: &OperationAcknowledgement,
     ) -> Result<NativeAbortEffectSettlement, NativeAbortEffectSettleError> {
         if let Err(reason) = self.validate_acknowledgement(acknowledgement) {
@@ -436,17 +462,10 @@ impl NativeAbortEffect {
                     self,
                 ))
             }
-            OperationDispatchResult::TransportUnknown => {
-                let late = self
-                    .submission
-                    .take()
-                    .expect("a live Native Abort retains actor settlement authority")
-                    .transport_unknown()
-                    .map_err(NativeAbortEffectSettleError::Application)?;
-                Ok(NativeAbortEffectSettlement::TransportUnknown(
-                    NativeLateAbortEffect::new(late, self.worker_closed.clone()),
-                ))
-            }
+            OperationDispatchResult::TransportUnknown => self
+                .transport_unknown()
+                .map(NativeAbortEffectSettlement::TransportUnknown)
+                .map_err(NativeAbortEffectSettleError::Application),
             OperationDispatchResult::WorkerReceipt(_) => {
                 let expected_participation = match &self.intent {
                     OperationIntent::AbortParticipation(request) => request.participation(),
@@ -454,14 +473,8 @@ impl NativeAbortEffect {
                 };
                 let receipt = closing_receipt(expected_participation, acknowledgement)
                     .expect("Native Abort acknowledgement was validated before settlement");
-                self.submission
-                    .take()
-                    .expect("a live Native Abort retains actor settlement authority")
-                    .worker_settled(receipt)
+                self.worker_settled(receipt)
                     .map_err(NativeAbortEffectSettleError::Application)?;
-                if let Some(observer) = &self.worker_closed {
-                    observer(expected_participation);
-                }
                 Ok(NativeAbortEffectSettlement::WorkerSettled)
             }
         }
@@ -547,7 +560,7 @@ impl NativeLateAbortEffect {
             .identity()
     }
 
-    fn worker_settled(
+    pub(crate) fn worker_settled(
         mut self,
         receipt: ParticipationReceipt,
     ) -> Result<(), ParticipationStandDownError> {
@@ -567,6 +580,11 @@ impl NativeLateAbortEffect {
             .take()
             .expect("a live late Abort owner retains its settlement")
             .fail_closed()
+    }
+
+    /// A newer unknown retains the same operation's late authority.
+    pub(crate) fn superseded_by_newer_unknown(mut self) {
+        drop(self.settlement.take());
     }
 
     /// Another exact generation published the definitive Worker fact.
@@ -833,10 +851,14 @@ mod tests {
         use crate::{
             control_runtime::actor::FrontendActor,
             task_execution::{
-                bridge::abort::AttemptAbortIngress, host::custody::tests::WithdrawalInbox,
+                bridge::abort::{
+                    AbortReceiptSlot, AbortSettlementOwner, AbortSettlementRefusal,
+                    AttemptAbortIngress,
+                },
+                host::{custody::tests::WithdrawalInbox, transport::SendKey},
             },
         };
-        use novarocks_attempt_protocol::input::AttemptInput;
+        use novarocks_attempt_protocol::input::{AttemptInput, SendGeneration};
         use novarocks_control_runtime::transaction::RuntimeLedger;
         use novarocks_control_runtime_core::{
             capacity::{ReservationResources, ResourceVector},
@@ -844,7 +866,10 @@ mod tests {
             mailbox::InputClass,
             scope::{WorkAdmission, WorkKind},
         };
-        use novarocks_coordination_contract::{AttemptActionId, LogicalToAttemptBody};
+        use novarocks_coordination_contract::{
+            AbortIssueSettlement, AttemptActionId, AttemptToLogical, AttemptToLogicalBody,
+            LogicalToAttemptBody,
+        };
         use novarocks_query_application::coordination::AbortParticipationIssueState;
         use std::num::NonZeroU64;
 
@@ -925,12 +950,14 @@ mod tests {
             .into_standing_input()
             .unwrap();
         let port = Arc::new(AttemptAbortIngress::new(
+            inbox.registration().clone(),
             activation,
             [(exact, position)],
             route.capacity.clone(),
             None,
         ));
         route.port.lock().unwrap().replace(port.clone());
+        let settlement_owner = AbortSettlementOwner::new(port.clone());
         let admission = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
             exact,
@@ -976,8 +1003,33 @@ mod tests {
         .unwrap();
         let operation = identity.operation_id();
         assert!(port.take_submission(second, exact, operation).is_none());
-        let (original, mut retirement) = port.take_submission(first, exact, operation).unwrap();
+        let physical = |generation| AttemptActionId::new(NonZeroU64::new(generation).unwrap());
+        let settle = |abort_action, generation, receipt_generation, settlement| AttemptToLogical {
+            activation,
+            action: physical(100),
+            body: AttemptToLogicalBody::AbortSettlement {
+                abort_action,
+                generation,
+                receipt_generation,
+                participation: exact,
+                operation_id: operation,
+                settlement,
+            },
+        };
         let mut capacity = port.subscribe_capacity();
+        let unknown = settlement_owner
+            .apply(
+                &settle(
+                    first,
+                    physical(10),
+                    None,
+                    AbortIssueSettlement::TransportUnknown,
+                ),
+                None,
+            )
+            .unwrap();
+        unknown.result.unwrap();
+        let mut retirement = unknown.retirement.unwrap();
         assert!(!retirement.retire_ready().unwrap());
         assert!(matches!(
             port.try_reserve(identity),
@@ -995,15 +1047,6 @@ mod tests {
         assert_eq!(action, first);
         assert_eq!(request.envelope().operation_id(), operation);
         assert_eq!(request.participation(), exact);
-        let NativeAbortEffectSettlement::TransportUnknown(late) = original
-            .settle(&OperationAcknowledgement::transport_unknown(
-                operation,
-                OperationKind::AbortParticipation,
-            ))
-            .unwrap()
-        else {
-            panic!("retain the exact old QA authority");
-        };
         assert!(retirement.retire_ready().unwrap());
         capacity.changed().await.unwrap();
         drop(retirement);
@@ -1032,23 +1075,57 @@ mod tests {
         assert_eq!(replay_request.envelope(), request.envelope());
         assert_eq!(replay_request.participation(), request.participation());
         assert_eq!(replay_request.cause(), request.cause());
-        let (replay, mut retirement) = port.take_submission(second, exact, operation).unwrap();
-        settle_late_abort_receipt(
-            late,
-            &OperationAcknowledgement::worker_receipt(
-                operation,
-                OperationKind::AbortParticipation,
-                OperationOutcome::ParticipationTerminalReceipt,
-                AckPayload::Participation(ParticipationReceipt::new(
-                    exact,
-                    ParticipationState::TerminalRetained,
-                )),
-            ),
-        )
-        .unwrap();
-        replay.resolved_by_other_generation();
+        let closing = OperationAcknowledgement::worker_receipt(
+            operation,
+            OperationKind::AbortParticipation,
+            OperationOutcome::ParticipationTerminalReceipt,
+            AckPayload::Participation(ParticipationReceipt::new(
+                exact,
+                ParticipationState::TerminalRetained,
+            )),
+        );
+        let receipt = |generation| {
+            let receipt = AbortReceiptSlot::new(
+                SendKey {
+                    operation,
+                    generation: SendGeneration::new(physical(generation)),
+                },
+                exact,
+            );
+            receipt.record(&closing);
+            receipt
+        };
+        let worker = settle(
+            first,
+            physical(10),
+            Some(physical(10)),
+            AbortIssueSettlement::Worker(OperationOutcome::ParticipationTerminalReceipt),
+        );
+        assert!(matches!(
+            settlement_owner.apply(&worker, Some(&receipt(20))),
+            Err(AbortSettlementRefusal::WrongReceiptGeneration)
+        ));
+        let applied = settlement_owner.apply(&worker, Some(&receipt(10))).unwrap();
+        applied.result.unwrap();
+        let mut retirement = applied
+            .retirement
+            .expect("newer exact replay is relinquished");
         assert!(retirement.retire_ready().unwrap());
         drop(retirement);
+        let redundant = settlement_owner
+            .apply(
+                &settle(
+                    second,
+                    physical(20),
+                    None,
+                    AbortIssueSettlement::DefinitelyUnsent,
+                ),
+                None,
+            )
+            .unwrap();
+        redundant.result.unwrap();
+        assert!(redundant.retirement.is_none());
+        drop(settlement_owner);
         logical
             .observe_worker_stopped_and_participation_fenced(exact)
             .await

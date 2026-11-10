@@ -50,6 +50,11 @@ impl AttemptEffectEnvelope {
         self.handoff.as_ref()
     }
 
+    pub(crate) fn is_abort_settlement(&self) -> bool {
+        matches!(&self.protocol.body, EffectBody::Port(port)
+            if matches!(port.body, AttemptToLogicalBody::AbortSettlement { .. }))
+    }
+
     pub(crate) fn is_qa_call(&self) -> bool {
         match &self.protocol.body {
             EffectBody::EstablishAuthorization { .. } => true,
@@ -60,6 +65,7 @@ impl AttemptEffectEnvelope {
                     | AttemptToLogicalBody::PreReadyReplacementQuery { .. }
                     | AttemptToLogicalBody::AttemptTerminal(_)
                     | AttemptToLogicalBody::ConvergenceProgress { .. }
+                    | AttemptToLogicalBody::AbortSettlement { .. }
                     | AttemptToLogicalBody::AuthorizationRequest {
                         request: AttemptAuthorization::BeginAdmission(_)
                             | AttemptAuthorization::SettleAdmission { .. }

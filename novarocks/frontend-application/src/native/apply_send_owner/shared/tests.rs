@@ -554,7 +554,7 @@ fn pending_row(
         layouts.push(inline_encoding_layout(inline_encoding_body));
     }
     if actor.is_some() {
-        layouts.extend(transport::actor_send_report_layouts(1, 0).unwrap());
+        layouts.extend(transport::actor_send_report_layouts(1, 0, 0).unwrap());
         layouts.push(Layout::new::<custody::TransportRetirement>());
     }
     let (quote, plan) = transport::original_run_for_factory(
@@ -1602,6 +1602,7 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
                     key,
                     delivery_error: None,
                     receipt,
+                    ..
                 },
             ))) => {
                 assert_eq!(key.generation, observed.generation);
@@ -1883,6 +1884,7 @@ async fn run_actor_send(
                     key,
                     delivery_error: None,
                     receipt,
+                    ..
                 }) => {
                     assert_eq!(key.operation, receipt.original.operation_id());
                     assert!(receipt.unpublished.is_none());

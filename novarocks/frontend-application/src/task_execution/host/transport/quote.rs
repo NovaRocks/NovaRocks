@@ -70,8 +70,12 @@ pub(crate) fn original_run(
         .iter()
         .filter(|operation| matches!(operation, OperationIntent::EstablishParticipation(_)))
         .count();
+    let aborts = operations
+        .iter()
+        .filter(|operation| matches!(operation, OperationIntent::AbortParticipation(_)))
+        .count();
     let reports = layout_sum(
-        &super::send_reports::actor_send_report_layouts(operations.len(), establishes)
+        &super::send_reports::actor_send_report_layouts(operations.len(), establishes, aborts)
             .map_err(|_| WorkError::ArithmeticOverflow)?,
     )?;
     original_run_with_reports(operations, budget, source, reports)

@@ -19,26 +19,38 @@
 
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
-    task_execution::{abort_effect::NativeAbortEffect, intent::OperationIntent},
+    task_execution::{
+        abort_effect::{
+            NativeAbortEffect, NativeAbortEffectAckError, NativeLateAbortEffect, closing_receipt,
+        },
+        host::transport::SendKey,
+        intent::{OperationAcknowledgement, OperationIntent},
+    },
 };
-use novarocks_attempt_protocol::input::AttemptInput;
-use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
+use novarocks_attempt_protocol::{
+    failure::AttemptFailure,
+    input::{AttemptInput, SendGeneration},
+};
+use novarocks_control_runtime::actor_turn::{
+    ActorRegistration, ActorTurnError, StandingInputObligation,
+};
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, LogicalToAttempt, LogicalToAttemptBody,
+    AbortIssueSettlement, AttemptActionId, AttemptActivationIdentity, AttemptToLogical,
+    AttemptToLogicalBody, LogicalToAttempt, LogicalToAttemptBody,
 };
-use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
+use novarocks_execution_contract::{OperationKind, ParticipationRef, TaskOperationId};
 use novarocks_query_application::coordination::{
     AbortParticipationEffectAdmission, AbortParticipationEffectPort,
     AbortParticipationEffectReservation, AbortParticipationEffectSubmission,
-    AbortParticipationIssueIdentity,
+    AbortParticipationIssueIdentity, ParticipationStandDownError,
 };
 use std::{
     collections::BTreeMap,
     fmt,
     num::NonZeroU64,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -59,6 +71,7 @@ struct Slot {
 }
 
 struct Ingress {
+    registration: ActorRegistration,
     activation: AttemptActivationIdentity,
     slots: BTreeMap<ParticipationRef, Slot>,
     next_action: AtomicU64,
@@ -76,6 +89,7 @@ pub(crate) struct AttemptAbortIngress {
 
 impl AttemptAbortIngress {
     pub(crate) fn new(
+        registration: ActorRegistration,
         activation: AttemptActivationIdentity,
         positions: impl IntoIterator<Item = (ParticipationRef, Position)>,
         capacity: watch::Sender<u64>,
@@ -84,6 +98,11 @@ impl AttemptAbortIngress {
         let mut slots = BTreeMap::new();
         for (participation, position) in positions {
             assert_eq!(participation.query_execution_id(), activation.execution());
+            assert!(
+                position
+                    .author()
+                    .is_ok_and(|author| registration.matches_input_author(&author))
+            );
             assert!(
                 slots
                     .insert(
@@ -99,6 +118,7 @@ impl AttemptAbortIngress {
         }
         Self {
             original: Arc::new(Ingress {
+                registration,
                 activation,
                 slots,
                 next_action: AtomicU64::new(1),
@@ -117,10 +137,19 @@ impl AttemptAbortIngress {
         participation: ParticipationRef,
         operation: TaskOperationId,
     ) -> Option<(NativeAbortEffect, AbortInputRetirement)> {
+        self.take_matching(participation, operation, |held| held == action)
+    }
+
+    fn take_matching(
+        &self,
+        participation: ParticipationRef,
+        operation: TaskOperationId,
+        matches_action: impl FnOnce(AttemptActionId) -> bool,
+    ) -> Option<(NativeAbortEffect, AbortInputRetirement)> {
         let slot = self.original.slots.get(&participation)?;
         let mut current = slot.submitted.lock().expect("original Abort submission");
         if !current.as_ref().is_some_and(|row| {
-            row.action == action && row.original.intent().operation_id() == operation
+            matches_action(row.action) && row.original.intent().operation_id() == operation
         }) {
             return None;
         }
@@ -131,6 +160,7 @@ impl AttemptAbortIngress {
                 original: self.original.clone(),
                 participation,
                 input: Some(submitted.input),
+                action: submitted.action,
             },
         ))
     }
@@ -291,6 +321,7 @@ pub(crate) struct AbortInputRetirement {
     original: Arc<Ingress>,
     participation: ParticipationRef,
     input: Option<InputId>,
+    action: AttemptActionId,
 }
 
 impl AbortInputRetirement {
@@ -313,6 +344,221 @@ impl AbortInputRetirement {
         assert!(slot.booked.swap(false, Ordering::AcqRel));
         publish_capacity(&self.original.capacity);
         Ok(true)
+    }
+}
+
+/// Each slot belongs to the report of one physical Abort send. The sender
+/// aliases its canonical acknowledgement before publishing the passive input.
+pub(crate) struct AbortReceiptSlot {
+    key: SendKey,
+    participation: ParticipationRef,
+    original: OnceLock<OperationAcknowledgement>,
+}
+
+impl AbortReceiptSlot {
+    pub(crate) fn new(key: SendKey, participation: ParticipationRef) -> Self {
+        Self {
+            key,
+            participation,
+            original: OnceLock::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_for_test(&self) -> Option<&OperationAcknowledgement> {
+        self.original.get()
+    }
+
+    pub(crate) fn record(&self, acknowledgement: &OperationAcknowledgement) {
+        assert_eq!(acknowledgement.operation_id(), self.key.operation);
+        assert_eq!(acknowledgement.kind(), OperationKind::AbortParticipation);
+        if acknowledgement.worker_outcome().is_some() {
+            assert!(self.original.set(acknowledgement.clone()).is_ok());
+        }
+    }
+}
+
+struct LateSubmission {
+    action: AttemptActionId,
+    generation: AttemptActionId,
+    original: NativeLateAbortEffect,
+}
+
+#[derive(Default)]
+struct SettlementRow {
+    late: Option<LateSubmission>,
+    released_replay: Option<(AttemptActionId, TaskOperationId)>,
+}
+
+/// Runs in the original credentialed QA settlement work, outside the poller.
+/// The pending Abort and the latest late authority are bounded per participant.
+pub(crate) struct AbortSettlementOwner {
+    ingress: Arc<AttemptAbortIngress>,
+    rows: Mutex<BTreeMap<ParticipationRef, SettlementRow>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum AbortSettlementRefusal {
+    ForeignPort,
+    MissingOriginalSubmission,
+    WrongReceiptGeneration,
+    InvalidReceipt(NativeAbortEffectAckError),
+}
+
+#[must_use]
+pub(crate) struct AppliedAbortSettlement {
+    pub(crate) result: Result<(), ParticipationStandDownError>,
+    pub(crate) retirement: Option<AbortInputRetirement>,
+}
+
+impl AbortSettlementOwner {
+    pub(crate) fn new(ingress: Arc<AttemptAbortIngress>) -> Self {
+        let rows = ingress
+            .original
+            .slots
+            .keys()
+            .map(|part| (*part, SettlementRow::default()))
+            .collect();
+        Self {
+            ingress,
+            rows: Mutex::new(rows),
+        }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        registration: &ActorRegistration,
+        activation: AttemptActivationIdentity,
+    ) -> bool {
+        self.ingress
+            .original
+            .registration
+            .same_registration(registration)
+            && self.ingress.original.activation == activation
+    }
+
+    pub(crate) fn apply(
+        &self,
+        port: &AttemptToLogical<AttemptFailure>,
+        receipt: Option<&AbortReceiptSlot>,
+    ) -> Result<AppliedAbortSettlement, AbortSettlementRefusal> {
+        use AbortIssueSettlement as S;
+        let AttemptToLogicalBody::AbortSettlement {
+            abort_action,
+            generation,
+            receipt_generation,
+            participation,
+            operation_id,
+            settlement,
+        } = port.body
+        else {
+            return Err(AbortSettlementRefusal::ForeignPort);
+        };
+        if port.activation != self.ingress.original.activation {
+            return Err(AbortSettlementRefusal::ForeignPort);
+        }
+        let receipt = match (settlement, receipt_generation, receipt) {
+            (S::Worker(outcome), Some(original_generation), Some(receipt))
+                if receipt.key
+                    == (SendKey {
+                        operation: operation_id,
+                        generation: SendGeneration::new(original_generation),
+                    })
+                    && receipt.participation == participation =>
+            {
+                let original = receipt
+                    .original
+                    .get()
+                    .filter(|original| original.worker_outcome() == Some(outcome))
+                    .ok_or(AbortSettlementRefusal::WrongReceiptGeneration)?;
+                Some(
+                    closing_receipt(participation, original)
+                        .map_err(AbortSettlementRefusal::InvalidReceipt)?,
+                )
+            }
+            (S::Worker(_), _, _) => return Err(AbortSettlementRefusal::WrongReceiptGeneration),
+            (_, None, None) => None,
+            _ => return Err(AbortSettlementRefusal::WrongReceiptGeneration),
+        };
+        let mut rows = self.rows.lock().expect("original Abort settlement owner");
+        let row = rows
+            .get_mut(&participation)
+            .ok_or(AbortSettlementRefusal::ForeignPort)?;
+        if let Some((original, retirement)) =
+            self.ingress
+                .take_submission(abort_action, participation, operation_id)
+        {
+            let result = match settlement {
+                S::DefinitelyUnsent => original.definitely_unsent(),
+                S::FailedClosed => original.fail_closed(),
+                S::TransportUnknown => original.transport_unknown().map(|original| {
+                    if let Some(old) = row.late.replace(LateSubmission {
+                        action: abort_action,
+                        generation,
+                        original,
+                    }) {
+                        old.original.superseded_by_newer_unknown();
+                    }
+                }),
+                S::Worker(_) => {
+                    let result =
+                        original.worker_settled(receipt.expect("validated original Abort receipt"));
+                    if result.is_ok()
+                        && let Some(old) = row.late.take()
+                    {
+                        old.original.resolved_by_other_generation();
+                    }
+                    result
+                }
+            };
+            return Ok(AppliedAbortSettlement {
+                result,
+                retirement: Some(retirement),
+            });
+        }
+        if settlement == S::DefinitelyUnsent
+            && row.released_replay == Some((abort_action, operation_id))
+        {
+            row.released_replay = None;
+            return Ok(AppliedAbortSettlement {
+                result: Ok(()),
+                retirement: None,
+            });
+        }
+        if !row.late.as_ref().is_some_and(|late| {
+            late.action == abort_action
+                && late.generation == generation
+                && late.original.identity().operation_id() == operation_id
+        }) {
+            return Err(AbortSettlementRefusal::MissingOriginalSubmission);
+        }
+        let result = match settlement {
+            S::FailedClosed => row.late.take().unwrap().original.fail_closed(),
+            S::Worker(_) => row
+                .late
+                .take()
+                .unwrap()
+                .original
+                .worker_settled(receipt.expect("validated original Abort receipt")),
+            _ => return Err(AbortSettlementRefusal::MissingOriginalSubmission),
+        };
+        let (result, retirement) = if result.is_ok()
+            && let Some((replay, retirement)) =
+                self.ingress
+                    .take_matching(participation, operation_id, |action| action > abort_action)
+        {
+            row.released_replay = Some((retirement.action, operation_id));
+            let result = if matches!(settlement, S::Worker(_)) {
+                replay.resolved_by_other_generation();
+                Ok(())
+            } else {
+                replay.fail_closed()
+            };
+            (result, Some(retirement))
+        } else {
+            (result, None)
+        };
+        Ok(AppliedAbortSettlement { result, retirement })
     }
 }
 
