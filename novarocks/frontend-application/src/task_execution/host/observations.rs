@@ -19,6 +19,8 @@
 //! accepted order is its actual FIFO fill order, including across mailbox
 //! classes. Rich storage/byte loans stay here until the runtime input retires.
 
+pub(crate) mod credits;
+
 use novarocks_attempt_protocol::{
     failure::AttemptFailure,
     input::{

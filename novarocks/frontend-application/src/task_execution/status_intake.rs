@@ -460,13 +460,12 @@ impl ObservationIntake {
         wake: Arc<dyn StatusIntakeWake>,
         clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
-        let max_frame =
-            novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 4096;
+        let budget = super::host::observations::ObservationBudget::for_task_attempt();
         Self::new_with_clock(
-            4096,
-            4098,
-            max_frame * 4 + std::mem::size_of::<AcceptedRootControlRequest>(),
-            max_frame,
+            budget.queued_frames,
+            budget.total_positions,
+            budget.total_bytes,
+            budget.max_frame_bytes,
             wake,
             clock,
         )
