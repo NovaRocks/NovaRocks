@@ -34,9 +34,7 @@ use novarocks_frontend_application::task_protocol_config::{
     DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
 };
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
-use novarocks_native_adapter::{
-    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-};
+use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
@@ -1224,6 +1222,8 @@ pub struct FrontendWorkloadRuntimeConfig {
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
+    /// Complete retained backing allowance per original Client holder.
+    pub client_result_all_objects_bytes: u64,
     /// FE Internal computation windows and their matching fixed CPU positions.
     pub internal_result_positions: usize,
     /// Complete retained backing allowance per Internal window.
@@ -1257,6 +1257,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
             concurrency_limit: 256,
+            client_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
+                .all_objects_bytes[0],
             internal_result_positions: novarocks_workload_control::ResultCapacityConfig::V1
                 .positions[2],
             internal_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
@@ -2260,14 +2262,6 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     )
     .map_err(anyhow::Error::msg)
     .context("validate native result retained-byte limits")?;
-    let per_root = u64::try_from(runtime.result_retained_bytes_per_root)
-        .context("runtime.result_retained_bytes_per_root exceeds u64")?;
-    if per_root > FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES {
-        bail!(
-            "runtime.result_retained_bytes_per_root {per_root} exceeds the Native root-result payload limit {}",
-            FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
-        );
-    }
     Ok(())
 }
 
@@ -3200,9 +3194,7 @@ mod tests {
             64 * 1024 * 1024
         );
     }
-    use novarocks_native_adapter::{
-        FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-    };
+    use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_spi::connector::{
         CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
     };
@@ -3965,6 +3957,12 @@ access_key_secret = ""
 
     #[test]
     fn result_retained_config_rejects_zero_and_inverted_limits() {
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.result_retained_bytes_per_root, 16 * 1024 * 1024);
+        assert_eq!(
+            defaults.result_retained_bytes_per_process,
+            4 * 1024 * 1024 * 1024
+        );
         let mut runtime = RuntimeConfig {
             result_retained_bytes_per_root: 0,
             ..Default::default()
@@ -3990,16 +3988,12 @@ access_key_secret = ""
             .expect_err("a per-root cap above the process cap must fail");
         assert!(format!("{error:#}").contains("must not exceed"));
 
-        let above_wire = usize::try_from(FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES + 1)
-            .expect("the Native wire bound fits usize");
         runtime = RuntimeConfig {
-            result_retained_bytes_per_root: above_wire,
-            result_retained_bytes_per_process: above_wire,
+            result_retained_bytes_per_root: 256 * 1024 * 1024,
             ..Default::default()
         };
-        let error = validate_result_retained_config(&runtime)
-            .expect_err("a root payload above the Native decode envelope must fail");
-        assert!(format!("{error:#}").contains("Native root-result payload limit"));
+        validate_result_retained_config(&runtime)
+            .expect("retained inputs and outputs are not one wire payload");
     }
 
     #[test]

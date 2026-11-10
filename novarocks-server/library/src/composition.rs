@@ -848,6 +848,7 @@ fn compose_frontend_result_profile(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<FrontendResultCapacityProfile> {
     let mut capacity = novarocks_workload_control::ResultCapacityConfig::V1;
+    capacity.all_objects_bytes[0] = runtime.frontend_workload.client_result_all_objects_bytes;
     capacity.positions[2] = runtime.frontend_workload.internal_result_positions;
     capacity.all_objects_bytes[2] = runtime.frontend_workload.internal_result_all_objects_bytes;
     FrontendResultCapacityProfile::try_new(capacity).context("construct frontend result capacity")
@@ -1551,6 +1552,32 @@ fn remote_effect_guarantee(
 #[cfg(test)]
 mod frontend_runtime_policy_tests {
     use super::*;
+    #[test]
+    fn configured_client_bytes_reach_only_the_original_client_budget() {
+        let defaults = novarocks_workload_control::ResultCapacityConfig::V1;
+        let mut runtime: crate::app_config::RuntimeConfig =
+            toml::from_str("[frontend_workload]\nclient_result_all_objects_bytes = 201326592\n")
+                .unwrap();
+        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let installed = installed.declared();
+        assert_eq!(installed.all_objects_bytes[0], 192 * 1024 * 1024);
+        assert_eq!(
+            installed.all_objects_bytes[1..],
+            defaults.all_objects_bytes[1..]
+        );
+        assert_eq!(installed.positions, defaults.positions);
+        let default_runtime: crate::app_config::RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            compose_frontend_result_profile(&default_runtime)
+                .unwrap()
+                .declared()
+                .all_objects_bytes[0],
+            8 * 1024 * 1024
+        );
+        runtime.frontend_workload.client_result_all_objects_bytes = 0;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
     #[test]
     fn configured_internal_capacity_reaches_the_actual_runtime_projection() {
         let mut runtime = crate::app_config::RuntimeConfig::default();
