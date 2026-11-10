@@ -24,7 +24,7 @@ use novarocks_query_application::api::PlanSeal;
 use novarocks_result_contract::PerKind;
 use std::collections::BTreeSet;
 
-fn fixture() -> (
+pub(in crate::task_execution::host) fn fixture() -> (
     PublicationRecord,
     AttemptProtocolFactsReceiver,
     TaskIdentity,
@@ -63,7 +63,10 @@ fn fixture() -> (
     )
 }
 
-fn batch(revision: u64, changes: Vec<ProtocolTaskChange>) -> Publication {
+pub(in crate::task_execution::host) fn batch(
+    revision: u64,
+    changes: Vec<ProtocolTaskChange>,
+) -> Publication {
     Publication::ProtocolBatch(ProtocolPublication {
         owner_revision: revision,
         initial_membership: (revision == 0).then(|| std::sync::Arc::new(Default::default())),
@@ -78,7 +81,7 @@ fn protocol_publication_preserves_actual_publish_and_noop_receipts() {
     let (mut record, mut receiver, root, plan) = fixture();
     let activation = record.activation;
     assert_eq!(
-        record.publish(batch(0, Vec::new()), None).unwrap(),
+        record.publish(&batch(0, Vec::new()), None).unwrap(),
         PublicationApplied::ProtocolBatch { published: true }
     );
     let initial = receiver
@@ -88,7 +91,7 @@ fn protocol_publication_preserves_actual_publish_and_noop_receipts() {
     assert!(initial.is_initial());
     let initial_revision = initial.revision();
     assert_eq!(
-        record.publish(batch(0, Vec::new()), None).unwrap(),
+        record.publish(&batch(0, Vec::new()), None).unwrap(),
         PublicationApplied::ProtocolBatch { published: false }
     );
     assert!(
@@ -109,7 +112,7 @@ fn protocol_publication_preserves_actual_publish_and_noop_receipts() {
     assert_eq!(
         record
             .publish(
-                batch(
+                &batch(
                     1,
                     vec![ProtocolTaskChange {
                         identity: root,
@@ -132,7 +135,7 @@ fn protocol_publication_preserves_actual_publish_and_noop_receipts() {
     assert_eq!(delta.tasks()[0].identity(), root);
     assert_eq!(delta.tasks()[0].status(), Some(&status));
     assert_eq!(
-        record.publish(batch(1, Vec::new()), None).unwrap(),
+        record.publish(&batch(1, Vec::new()), None).unwrap(),
         PublicationApplied::ProtocolBatch { published: false }
     );
     assert!(
@@ -147,7 +150,7 @@ fn protocol_publication_preserves_actual_publish_and_noop_receipts() {
 fn protocol_publication_preserves_typed_error_without_readmodel_mutation() {
     let (mut record, mut receiver, root, plan) = fixture();
     let activation = record.activation;
-    record.publish(batch(0, Vec::new()), None).unwrap();
+    record.publish(&batch(0, Vec::new()), None).unwrap();
     receiver
         .take_changes(activation, root, plan)
         .unwrap()
@@ -160,7 +163,7 @@ fn protocol_publication_preserves_typed_error_without_readmodel_mutation() {
         root.backend_process_id(),
     );
     let result = record.publish(
-        batch(
+        &batch(
             1,
             vec![ProtocolTaskChange {
                 identity: foreign,
@@ -181,7 +184,7 @@ fn protocol_publication_preserves_typed_error_without_readmodel_mutation() {
             .is_none()
     );
     assert_eq!(
-        record.publish(batch(1, Vec::new()), None).unwrap(),
+        record.publish(&batch(1, Vec::new()), None).unwrap(),
         PublicationApplied::ProtocolBatch { published: true }
     );
     assert!(
@@ -200,7 +203,7 @@ fn final_info_publication_checks_original_profile_before_resolving_a_reference()
         root,
     );
     assert!(matches!(
-        record.publish(Publication::FinalTaskInfo(reference), None),
+        record.publish(&Publication::FinalTaskInfo(reference), None),
         Err(PublicationError::MissingProfileObserver)
     ));
 }

@@ -93,6 +93,7 @@ pub(crate) struct AttemptActorRegistration {
     native_source: ActorId,
     qa_source: ActorId,
     process_source: ActorId,
+    publication_source: ActorId,
     capacity_source: ActorId,
     observation_source: ActorId,
     membership_source: ActorId,
@@ -136,6 +137,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) admission: super::transport::AdmissionSource,
     pub(crate) qa: super::transport::AttemptCallSource,
     pub(crate) process: super::transport::AttemptCallSource,
+    pub(crate) publication: super::transport::AttemptCallSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -302,6 +304,29 @@ impl AttemptActorRegistration {
             observer,
             self.process_source,
             super::transport::AttemptCallOwner::Process(Arc::new(original)),
+        )
+    }
+
+    pub(crate) fn prepare_publication_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        owner: Arc<super::publication::AttemptPublicationOwner>,
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
+        if owner.activation() != self.root_control.activation() {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "publication Source belongs to another original activation",
+            ));
+        }
+        self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.publication_source,
+            super::transport::AttemptCallOwner::Publication(owner),
         )
     }
 
@@ -493,6 +518,7 @@ impl AttemptActorRegistration {
             admission,
             mut qa,
             process,
+            publication,
             send,
             executor: native,
             failure,
@@ -526,7 +552,7 @@ impl AttemptActorRegistration {
                     self.native_source,
                     self.scope.clone(),
                     admission,
-                    [Some(qa), Some(process)],
+                    [Some(qa), Some(process), Some(publication)],
                     send,
                     (
                         FailureContext {
@@ -808,6 +834,7 @@ impl AttemptActor {
         let native = runtime_source(start.sources.native);
         let qa_source = runtime_source(start.sources.qa);
         let process_source = runtime_source(start.sources.process);
+        let publication_source = runtime_source(start.sources.publication);
         let capacity_source = runtime_source(start.sources.capacity);
         let observation_source = runtime_source(start.sources.observation);
         let membership_source = runtime_source(start.sources.membership);
@@ -859,6 +886,7 @@ impl AttemptActor {
             native_source: native,
             qa_source,
             process_source,
+            publication_source,
             capacity_source,
             observation_source,
             membership_source,

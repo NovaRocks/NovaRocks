@@ -424,7 +424,7 @@ impl TaskFinalInfoCollector {
     pub(crate) fn publish_core_cut(
         &mut self,
         ready: ComputationReadyToken,
-        cut: novarocks_attempt_protocol::publication::DiagnosticPublication,
+        cut: &novarocks_attempt_protocol::publication::DiagnosticPublication,
         sources: super::host::publication::DiagnosticSourceSnapshot,
         mut resolve: impl FnMut(
             novarocks_attempt_protocol::input::FinalTaskInfoRef,
@@ -452,11 +452,8 @@ impl TaskFinalInfoCollector {
                 "core diagnostic publication differs from its exact frozen Task order".to_owned(),
             ));
         }
-        let (runtime_filters, split) = sources.into_selected(
-            &cut,
-            &self.expected_participations,
-            &self.expected_fragments,
-        )?;
+        let (runtime_filters, split) =
+            sources.into_selected(cut, &self.expected_participations, &self.expected_fragments)?;
         self.begin_profile_observation(ready)?;
         let publication = self
             .publication
@@ -466,7 +463,7 @@ impl TaskFinalInfoCollector {
             return Ok(false);
         }
         let mut tasks = Vec::with_capacity(cut.tasks.len());
-        for (task, observation) in cut.tasks {
+        for &(task, observation) in &cut.tasks {
             let observation = match observation {
                 core::DiagnosticTaskObservation::Available(reference) => {
                     if reference.task() != task {

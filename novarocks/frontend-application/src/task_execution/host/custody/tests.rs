@@ -334,6 +334,9 @@ impl TestActor for WithdrawalTarget {
                 novarocks_attempt_protocol::effect::EffectClass::Settlement => {
                     novarocks_control_runtime_core::effect::EffectKind::Settlement
                 }
+                novarocks_attempt_protocol::effect::EffectClass::Publication => {
+                    novarocks_control_runtime_core::effect::EffectKind::Publication
+                }
                 novarocks_attempt_protocol::effect::EffectClass::Reply => {
                     novarocks_control_runtime_core::effect::EffectKind::Reply
                 }
@@ -756,6 +759,285 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
     fixture.finish();
 }
 
+use crate::{
+    control_runtime::host::{EffectSource, PendingHandoff, PreparedEffectJob, SourceProgress},
+    task_execution::host::transport::AttemptCallSource,
+};
+use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket};
+use novarocks_coordination_contract::AttemptActionId;
+
+struct CallFixtureSource {
+    source: Arc<Mutex<AttemptCallSource>>,
+    process: Option<Arc<Mutex<AttemptCallSource>>>,
+    process_pending: bool,
+    scope: ScopeHandle,
+    published: Arc<AtomicUsize>,
+    closed: bool,
+}
+impl EffectSource for CallFixtureSource {
+    fn prepay_result(
+        &mut self,
+        effect: &FrontendEffect,
+    ) -> Option<CausalInputObligation<FrontendActor>> {
+        let FrontendEffect::Attempt(effect) = effect else {
+            unreachable!()
+        };
+        self.process_pending = effect.is_process_call();
+        let source = if self.process_pending {
+            self.process.as_ref().expect("original Process test source")
+        } else {
+            &self.source
+        };
+        source.lock().unwrap().prepay(effect).unwrap()
+    }
+    fn bind_job(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+    ) -> PreparedEffectJob {
+        let source = if self.process_pending {
+            self.process.as_ref().expect("original Process test source")
+        } else {
+            &self.source
+        };
+        source.lock().unwrap().bind(ticket, result)
+    }
+    fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
+        let source = if self.process_pending {
+            self.process.as_ref().expect("original Process test source")
+        } else {
+            &self.source
+        };
+        source.lock().unwrap().return_unclaimed(result);
+    }
+    fn core_consumed(&mut self, _: &[InputId]) {}
+    fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        let source = if effect.get() == 6 {
+            self.process.as_ref().expect("original Process test source")
+        } else {
+            &self.source
+        };
+        let mut source = source.lock().unwrap();
+        match event {
+            TransportSourceEvent::Result(original) => {
+                source
+                    .accept(original)
+                    .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+                self.published.fetch_add(1, Ordering::SeqCst);
+            }
+            TransportSourceEvent::Retired => source.transport_retired(effect),
+            original => std::panic::resume_unwind(Box::new(original)),
+        }
+    }
+    fn owner_failed_pending(&mut self, pending: PendingHandoff) {
+        std::panic::resume_unwind(Box::new(pending));
+    }
+    fn close_external(&mut self) {
+        self.closed = true;
+        self.scope.close_external().unwrap();
+    }
+    fn result_admission_closed(&self) -> bool {
+        self.closed
+    }
+    fn progress_retirement(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        _: Tick,
+        budget: usize,
+    ) -> SourceProgress {
+        let mut progressed = false;
+        let mut units = 0;
+        for source in std::iter::once(&self.source)
+            .chain(self.process.iter())
+            .take(budget)
+        {
+            units += 1;
+            progressed |= source.lock().unwrap().retire_result().unwrap();
+        }
+        SourceProgress {
+            units,
+            progressed,
+            more: false,
+            retired: self.closed && self.scope.join_ready().unwrap(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn publication_host_returns_original_result_and_typed_failure() {
+    use crate::{
+        control_runtime::{
+            actor::FrontendActorKind,
+            host::{FrontendLanePolicy, HostBinding, HostRegistry},
+            metrics::FrontendHostObservations,
+            transport_withdrawal::AttemptEffectEnvelope,
+        },
+        task_execution::host::{
+            publication::{AttemptPublicationOwner, OriginalHostFailure, PublicationError, tests},
+            transport::{ActorTransportExecutor, AttemptCallOwner},
+        },
+    };
+    use novarocks_attempt_protocol::{
+        effect::{AttemptEffect, EffectBody, EffectClass, Publication},
+        failure::AttemptFailure,
+        input::{FinalTaskInfoRef, PublicationApplied},
+    };
+    use novarocks_control_runtime::actor_turn::ProcessClock;
+    use novarocks_coordination_contract::AttemptRequestToken;
+    use std::{num::NonZeroU64, time::Duration};
+
+    let fixture = Fixture::new();
+    let generation = Generation::new(1).unwrap();
+    let (mut parent, mut payer) = fixture
+        .scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let (record, mut receiver, root, plan) = tests::fixture();
+    let owner = AttemptPublicationOwner::new(record, None);
+    let activation = owner.activation();
+    let id = |n| AttemptActionId::new(NonZeroU64::new(n).unwrap());
+    let first = id(1);
+    let second = id(2);
+    let command = |id, publication| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id,
+            class: EffectClass::Publication,
+            body: EffectBody::Publish(publication),
+        })
+    };
+    let reference = FinalTaskInfoRef::new(AttemptRequestToken::new(NonZeroU64::MIN), root);
+    let inbox = WithdrawalInbox::with_effect(
+        &fixture.scope,
+        [
+            command(first, tests::batch(0, Vec::new())),
+            command(second, Publication::FinalTaskInfo(reference)),
+        ],
+    );
+    let source = Arc::new(Mutex::new(AttemptCallSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer(),
+        AttemptCallOwner::Publication(owner),
+        inbox.reserve_result(&parent),
+    )));
+    let published = Arc::new(AtomicUsize::new(0));
+    let host = HostRegistry::new(
+        inbox.runtime.clone(),
+        fixture.ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            ProcessClock::default(),
+        ))),
+    );
+    let handle = Handle::current();
+    let mut exit = host
+        .register(HostBinding {
+            scope: fixture.scope.clone(),
+            registration: inbox.registration.clone(),
+            kind: FrontendActorKind::Test,
+            config: WithdrawalInbox::CONFIG,
+            policy: FrontendLanePolicy::attempt(1),
+            executor: Arc::new(ActorTransportExecutor(handle.clone())),
+            source: Box::new(CallFixtureSource {
+                source: source.clone(),
+                process: None,
+                process_pending: false,
+                scope: fixture.scope.clone(),
+                published: published.clone(),
+                closed: false,
+            }),
+            transport: Some(TransportRetirements::new(
+                inbox.runtime.clone(),
+                inbox.registration.clone(),
+                handle,
+                1,
+            )),
+        })
+        .unwrap_or_else(|_| panic!("original publication host"));
+    let drive_host = || {
+        while let Some(turn) = inbox.runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+    };
+    let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    for (index, expected) in [first, second].into_iter().enumerate() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while published.load(Ordering::SeqCst) <= index {
+                drive_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(published.load(Ordering::SeqCst), index + 1);
+        assert!(!source.lock().unwrap().retire_result().unwrap());
+        let (_, ExecutorFact::PublicationApplied { effect, result }) =
+            inbox.try_commit_next().unwrap()
+        else {
+            panic!("same original publication result");
+        };
+        assert_eq!(effect, expected);
+        if expected == first {
+            assert_eq!(
+                result.unwrap(),
+                PublicationApplied::ProtocolBatch { published: true }
+            );
+            assert!(
+                receiver
+                    .take_changes(activation, root, plan)
+                    .unwrap()
+                    .unwrap()
+                    .is_initial()
+            );
+        } else {
+            let Err(AttemptFailure::Host(failure)) = result else {
+                panic!("original typed publication failure");
+            };
+            assert_eq!(failure.original.0.get(), effect.get());
+            assert!(matches!(
+                source.lock().unwrap().take_failure(failure.original),
+                Some(OriginalHostFailure::Publication(
+                    PublicationError::MissingProfileObserver
+                ))
+            ));
+        }
+        inbox
+            .runtime
+            .retire_input(inbox.registration.actor(), commands[index])
+            .unwrap();
+        drive_host();
+    }
+    let mut original = source.lock().unwrap();
+    assert!(original.close_idle().unwrap());
+    let publisher = original
+        .take_drained_owner()
+        .expect("original publication role retired");
+    drop(original);
+    drop(publisher);
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    fixture.scope.reap_ready(128).unwrap();
+    exit.request_close().unwrap();
+    drive_host();
+    tokio::time::timeout(Duration::from_secs(1), exit.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
+}
+
 #[tokio::test]
 async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use crate::{
@@ -806,103 +1088,6 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         QueryId,
     };
     use std::{num::NonZeroU64, time::Duration};
-
-    struct Calls {
-        source: Arc<Mutex<AttemptCallSource>>,
-        process: Arc<Mutex<AttemptCallSource>>,
-        process_pending: bool,
-        scope: ScopeHandle,
-        published: Arc<AtomicUsize>,
-        closed: bool,
-    }
-    impl EffectSource for Calls {
-        fn prepay_result(
-            &mut self,
-            effect: &FrontendEffect,
-        ) -> Option<CausalInputObligation<FrontendActor>> {
-            let FrontendEffect::Attempt(effect) = effect else {
-                unreachable!()
-            };
-            self.process_pending = effect.is_process_call();
-            let source = if self.process_pending {
-                &self.process
-            } else {
-                &self.source
-            };
-            source.lock().unwrap().prepay(effect).unwrap()
-        }
-        fn bind_job(
-            &mut self,
-            _: &ActorRuntime<FrontendActor>,
-            _: &ActorHostTurn<FrontendActor>,
-            ticket: &EffectTicket<FrontendEffect>,
-            result: CausalInputObligation<FrontendActor>,
-        ) -> PreparedEffectJob {
-            let source = if self.process_pending {
-                &self.process
-            } else {
-                &self.source
-            };
-            source.lock().unwrap().bind(ticket, result)
-        }
-        fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
-            let source = if self.process_pending {
-                &self.process
-            } else {
-                &self.source
-            };
-            source.lock().unwrap().return_unclaimed(result);
-        }
-        fn core_consumed(&mut self, _: &[InputId]) {}
-        fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
-            let source = if effect.get() == 6 {
-                &self.process
-            } else {
-                &self.source
-            };
-            let mut source = source.lock().unwrap();
-            match event {
-                TransportSourceEvent::Result(original) => {
-                    source
-                        .accept(original)
-                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
-                    self.published.fetch_add(1, Ordering::SeqCst);
-                }
-                TransportSourceEvent::Retired => source.transport_retired(effect),
-                original => std::panic::resume_unwind(Box::new(original)),
-            }
-        }
-        fn owner_failed_pending(&mut self, pending: PendingHandoff) {
-            std::panic::resume_unwind(Box::new(pending));
-        }
-        fn close_external(&mut self) {
-            self.closed = true;
-            self.scope.close_external().unwrap();
-        }
-        fn result_admission_closed(&self) -> bool {
-            self.closed
-        }
-        fn progress_retirement(
-            &mut self,
-            _: &ActorRuntime<FrontendActor>,
-            _: &ActorHostTurn<FrontendActor>,
-            _: Tick,
-            budget: usize,
-        ) -> SourceProgress {
-            let mut progressed = false;
-            let mut units = 0;
-            for source in [&self.source, &self.process].into_iter().take(budget) {
-                units += 1;
-                progressed |= source.lock().unwrap().retire_result().unwrap();
-            }
-            SourceProgress {
-                units,
-                progressed,
-                more: false,
-                retired: self.closed && self.scope.join_ready().unwrap(),
-            }
-        }
-    }
 
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
@@ -1197,11 +1382,11 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             },
             policy: FrontendLanePolicy::attempt(1),
             executor: Arc::new(ActorTransportExecutor(handle.clone())),
-            source: Box::new(Calls {
+            source: Box::new(CallFixtureSource {
                 scope: fixture.scope.clone(),
                 source: source.clone(),
                 published: published.clone(),
-                process: process.clone(),
+                process: Some(process.clone()),
                 process_pending: false,
                 closed: false,
             }),

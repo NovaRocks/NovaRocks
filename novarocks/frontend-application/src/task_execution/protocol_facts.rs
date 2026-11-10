@@ -394,7 +394,7 @@ impl AttemptProtocolFactsPublisher {
     pub(super) fn publish_core_batch(
         &mut self,
         activation: AttemptActivationIdentity,
-        batch: novarocks_attempt_protocol::publication::ProtocolPublication,
+        batch: &novarocks_attempt_protocol::publication::ProtocolPublication,
     ) -> Result<bool, TaskExecutionError> {
         let frozen = &self.shared.frozen;
         match &batch.initial_membership {
@@ -411,7 +411,7 @@ impl AttemptProtocolFactsPublisher {
         self.bind_identity(activation)?;
         let mut seen = BTreeSet::new();
         let mut updates = Vec::with_capacity(batch.changes.len());
-        for change in batch.changes {
+        for change in &batch.changes {
             let index = self.shared.frozen.index(change.identity)?;
             if !seen.insert(index) {
                 return Err(protocol_error(
@@ -420,8 +420,8 @@ impl AttemptProtocolFactsPublisher {
             }
             updates.push(Update {
                 index,
-                status: change.status.map(Arc::new),
-                writer_witness: change.first_writer_witness.map(Arc::new),
+                status: change.status.clone().map(Arc::new),
+                writer_witness: change.first_writer_witness.clone().map(Arc::new),
             });
         }
         self.publish_updates(
@@ -1164,7 +1164,7 @@ mod tests {
         };
         assert!(
             publisher
-                .publish_core_batch(activation(1), batch(swapped))
+                .publish_core_batch(activation(1), &batch(swapped))
                 .is_err()
         );
         assert!(
@@ -1174,7 +1174,7 @@ mod tests {
                 .is_none()
         );
         publisher
-            .publish_core_batch(activation(1), batch(sources))
+            .publish_core_batch(activation(1), &batch(sources))
             .unwrap();
         let mut tracker = WriteProtocolTracker::from_initial(&take(&mut receiver)).unwrap();
         assert_eq!(
@@ -1238,7 +1238,7 @@ mod tests {
         publisher
             .publish_core_batch(
                 activation(1),
-                ProtocolPublication {
+                &ProtocolPublication {
                     owner_revision: 0,
                     initial_membership: Some(Arc::new(ProtocolMembership {
                         writers: [identity(2)].into(),
@@ -1285,7 +1285,7 @@ mod tests {
         ] {
             assert!(
                 publisher
-                    .publish_core_batch(activation(1), batch(bad))
+                    .publish_core_batch(activation(1), &batch(bad))
                     .is_err()
             );
             assert_eq!(*publisher.revisions.borrow(), original_revision);
@@ -1298,7 +1298,7 @@ mod tests {
         }
         assert!(
             publisher
-                .publish_core_batch(activation(2), batch(Vec::new()))
+                .publish_core_batch(activation(2), &batch(Vec::new()))
                 .is_err()
         );
         assert_eq!(*publisher.revisions.borrow(), original_revision);
@@ -1314,7 +1314,7 @@ mod tests {
         publisher
             .publish_core_batch(
                 activation(1),
-                ProtocolPublication {
+                &ProtocolPublication {
                     owner_revision: 0,
                     initial_membership: Some(Arc::new(ProtocolMembership {
                         writers: [identity(2)].into(),
@@ -1336,7 +1336,7 @@ mod tests {
         publisher
             .publish_core_batch(
                 activation(1),
-                ProtocolPublication {
+                &ProtocolPublication {
                     owner_revision: 1,
                     initial_membership: None,
                     changes: vec![

@@ -28,16 +28,24 @@ use crate::task_execution::{
 };
 use novarocks_attempt_protocol::{
     effect::Publication,
-    input::PublicationApplied,
+    failure::{
+        AttemptFailure, AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure,
+    },
+    input::{AttemptInput, ExecutorFact, PublicationApplied},
     publication::{DiagnosticPublication, DiagnosticSources, SplitDiagnosticObservation},
     start::PayloadRef,
 };
-use novarocks_coordination_contract::{AttemptActivationIdentity, AttemptRootFailure};
-use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
+use novarocks_coordination_contract::{
+    AttemptActionId, AttemptActivationIdentity, AttemptRootFailure,
+};
+use novarocks_execution_contract::{
+    ParticipationRef, SafeDetail, TaskIdentity, failure::FailureProjection,
+};
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::{
     api::{ComputationReadyToken, QueryExecutionError},
     coordination::{AcceptedAttemptFailure, AcceptedRootStatusSender},
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 use std::sync::Arc;
@@ -72,7 +80,7 @@ pub(crate) enum OriginalDiagnosticPayload {
 /// Records remain retained by its publication/result legs until this resolver
 /// transfers the exact rich values to the original watch/consumer. Consuming
 /// the core input alone cannot retire them. No fallback to current is legal.
-pub(crate) trait OriginalDiagnosticRecords {
+pub(crate) trait OriginalDiagnosticRecords: Send + Sync {
     fn binding(&self) -> OriginalDiagnosticBinding<'_>;
     fn payload(&self, reference: PayloadRef) -> Option<OriginalDiagnosticPayload>;
 }
@@ -239,6 +247,104 @@ impl std::error::Error for PublicationError {
     }
 }
 
+/// The original host error stays owned until the terminal or disposal
+/// custodian receives it. The Core only sees the compact typed projection.
+pub(crate) enum OriginalHostFailure {
+    Task(TaskExecutionError),
+    Publication(PublicationError),
+}
+
+impl OriginalHostFailure {
+    pub(crate) fn preparation_input(&self) -> ExecutionFailureInput {
+        match self {
+            Self::Task(original) | Self::Publication(PublicationError::Protocol(original)) => {
+                original.preparation_input()
+            }
+            Self::Publication(PublicationError::Root(original))
+                if original.execution_failure().is_some() =>
+            {
+                original.execution_failure().unwrap().clone()
+            }
+            Self::Publication(_) => ExecutionFailureInput::new(
+                QueryFailureReason::PreparationProtocol.failure_fact(),
+                SafeDetail::truncating("Native attempt publication failed"),
+                ExecutionFailureSite::Coordinator,
+            ),
+        }
+    }
+}
+
+/// Holds the canonical publisher and the original immutable diagnostic lookup.
+/// The paid Publication Source admits one publication at a time.
+pub(crate) struct AttemptPublicationOwner {
+    activation: AttemptActivationIdentity,
+    record: tokio::sync::Mutex<PublicationRecord>,
+    diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
+}
+
+impl AttemptPublicationOwner {
+    pub(crate) fn new(
+        record: PublicationRecord,
+        diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            activation: record.activation,
+            record: tokio::sync::Mutex::new(record),
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn activation(&self) -> AttemptActivationIdentity {
+        self.activation
+    }
+
+    pub(crate) async fn publish(
+        &self,
+        effect: AttemptActionId,
+        publication: &Publication,
+    ) -> (AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>) {
+        let result = self.apply(publication).await;
+        let (result, failure) = match result {
+            Ok(applied) => (Ok(applied), None),
+            Err(error) => {
+                let reference = HostFailureRef(std::num::NonZeroU64::new(effect.get()).unwrap());
+                let original = OriginalHostFailure::Publication(error);
+                let projected = AttemptFailure::Host(HostProjectedFailure {
+                    original: reference,
+                    kind: HostFailureKind::Execution,
+                    class: original.preparation_input().attempt_class(),
+                    site: AttemptFailureSite::Attempt,
+                });
+                (Err(projected), Some((reference, original)))
+            }
+        };
+        (
+            AttemptInput::Executor(ExecutorFact::PublicationApplied { effect, result }),
+            failure,
+        )
+    }
+
+    async fn apply(
+        &self,
+        publication: &Publication,
+    ) -> Result<PublicationApplied, PublicationError> {
+        let sources = match publication {
+            Publication::Diagnostics(cut) => {
+                let records = self
+                    .diagnostics
+                    .as_deref()
+                    .ok_or(PublicationError::MissingDiagnosticSources)?;
+                Some(
+                    DiagnosticSourceSnapshot::resolve(cut, records)
+                        .map_err(PublicationError::Protocol)?,
+                )
+            }
+            _ => None,
+        };
+        self.record.lock().await.publish(publication, sources)
+    }
+}
+
 pub(crate) struct PublicationRecord {
     activation: AttemptActivationIdentity,
     root: Option<AcceptedRootStatusSender>,
@@ -293,22 +399,22 @@ impl PublicationRecord {
     }
     pub(crate) fn publish(
         &mut self,
-        publication: Publication,
+        publication: &Publication,
         mut sources: Option<DiagnosticSourceSnapshot>,
     ) -> Result<PublicationApplied, PublicationError> {
         match publication {
             Publication::RootStatus(projection) => {
-                let failure = match projection.failure {
+                let failure = match &projection.failure {
                     AttemptRootFailure::None => AcceptedAttemptFailure::None,
                     AttemptRootFailure::DerivedPending => AcceptedAttemptFailure::DerivedPending,
                     AttemptRootFailure::Authoritative(failure) => {
-                        AcceptedAttemptFailure::Authoritative(failure)
+                        AcceptedAttemptFailure::Authoritative(failure.clone())
                     }
                 };
                 self.root
                     .as_ref()
                     .ok_or(PublicationError::MissingRootPublisher)?
-                    .publish_attempt_observation(projection.status, failure)
+                    .publish_attempt_observation(projection.status.clone(), failure)
                     .map_err(PublicationError::Root)?;
                 Ok(PublicationApplied::RootStatus)
             }
@@ -328,7 +434,7 @@ impl PublicationRecord {
                     .diagnostic_records
                     .as_ref()
                     .ok_or(PublicationError::MissingDiagnosticRecords)?
-                    .take_information(reference)
+                    .take_information(*reference)
                     .map_err(PublicationError::Diagnostic)?;
                 if info.final_status().identity() != reference.task() {
                     return Err(PublicationError::Protocol(TaskExecutionError::Schedule(
@@ -368,7 +474,7 @@ impl PublicationRecord {
                     observer.publish_root_status(
                         crate::preparation_diagnostics::StatementRootStatusObservation {
                             root: status.identity(),
-                            installed,
+                            installed: *installed,
                             status_version: status.version(),
                         },
                     );
@@ -391,4 +497,4 @@ impl PublicationRecord {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

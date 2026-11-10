@@ -32,8 +32,10 @@ use crate::{
             qa::AttemptQaBridge,
             terminal::{ConvergencePublication, TerminalOutbox, TerminalPublication},
         },
-        error::TaskExecutionError,
-        host::custody::ReturnedActorTransportResult,
+        host::{
+            custody::ReturnedActorTransportResult,
+            publication::{AttemptPublicationOwner, OriginalHostFailure},
+        },
     },
 };
 use novarocks_attempt_protocol::{
@@ -70,6 +72,7 @@ type Position = CausalInputObligation<FrontendActor>;
 pub(crate) enum AttemptCallOwner {
     Qa(Arc<Mutex<AttemptQaBridge>>),
     Process(Arc<AttemptProcessObserver>),
+    Publication(Arc<AttemptPublicationOwner>),
 }
 
 impl AttemptCallOwner {
@@ -77,6 +80,7 @@ impl AttemptCallOwner {
         match self {
             Self::Qa(_) => effect.is_qa_call(),
             Self::Process(_) => effect.is_process_call(),
+            Self::Publication(_) => effect.is_publication_call(),
         }
     }
 }
@@ -84,7 +88,7 @@ impl AttemptCallOwner {
 pub(crate) enum AttemptCallReply {
     Input {
         input: AttemptInput,
-        failure: Option<(HostFailureRef, TaskExecutionError)>,
+        failure: Option<(HostFailureRef, OriginalHostFailure)>,
     },
     Terminal(Box<TerminalPublication>),
     Convergence(ConvergencePublication),
@@ -136,12 +140,14 @@ impl BoundAttemptCall {
                         bridge.authorize(operation, request).await
                     }
                     EffectBody::Port(port) => bridge.handle_port(port).await,
-                    _ => unreachable!("same original QA effect"),
+                    _ => unreachable!("same original call effect"),
                 }
                 .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
                 Ok(AttemptCallReply::Input {
                     input: AttemptInput::Port(reply.reply),
-                    failure: reply.failure,
+                    failure: reply.failure.map(|(reference, original)| {
+                        (reference, OriginalHostFailure::Task(original))
+                    }),
                 })
             }
             AttemptCallOwner::Process(observer) => {
@@ -160,6 +166,13 @@ impl BoundAttemptCall {
                     failure: None,
                 })
             }
+            AttemptCallOwner::Publication(owner) => {
+                let EffectBody::Publish(publication) = &effect.protocol.body else {
+                    unreachable!("same original publication effect");
+                };
+                let (input, failure) = owner.publish(effect.protocol.id, publication).await;
+                Ok(AttemptCallReply::Input { input, failure })
+            }
         }
     }
 }
@@ -171,7 +184,7 @@ struct Live {
     retired: bool,
 }
 
-#[must_use = "retain the original QA result, input credit, and refused publication"]
+#[must_use = "retain the original call result, input credit, and refused publication"]
 pub(crate) struct AttemptCallResultRefusal {
     pub(crate) original: ReturnedActorTransportResult,
     pub(crate) publication: Option<CausalFillFailure<FrontendInput>>,
@@ -187,7 +200,7 @@ pub(crate) struct AttemptCallSource {
     idle: Option<Position>,
     pending: Option<(Arc<AttemptEffectEnvelope>, ReportedWork)>,
     live: Option<Live>,
-    failures: BTreeMap<HostFailureRef, TaskExecutionError>,
+    failures: BTreeMap<HostFailureRef, OriginalHostFailure>,
 }
 
 impl AttemptCallSource {
@@ -278,15 +291,15 @@ impl AttemptCallSource {
                 }
                 Err(error) => return Err(error),
             };
-        let (work, mut payer) = guard.bind(kind).expect("original QA child guard");
+        let (work, mut payer) = guard.bind(kind).expect("original call child guard");
         let report = ReportSlot::reserve_next(
             &mut payer,
             self.generation,
             1,
             [(self.observer, ConsumerKind::Observer)],
         )
-        .expect("original QA exit report");
-        let work = ReportedWork::try_new(work, payer, report).expect("same original QA work");
+        .expect("original call exit report");
+        let work = ReportedWork::try_new(work, payer, report).expect("same original call work");
         self.pending = Some((effect.clone(), work));
         Ok(self.idle.take())
     }
@@ -296,7 +309,7 @@ impl AttemptCallSource {
         ticket: &EffectTicket<FrontendEffect>,
         result: Position,
     ) -> PreparedEffectJob {
-        let (effect, work) = self.pending.take().expect("same original QA prepayment");
+        let (effect, work) = self.pending.take().expect("same original call prepayment");
         assert!(
             matches!(&ticket.effect, FrontendEffect::Attempt(original) if Arc::ptr_eq(original, &effect))
         );
@@ -342,7 +355,17 @@ impl AttemptCallSource {
             .is_some_and(|live| live.effect.protocol.id == effect)
     }
 
-    pub(super) fn needs_progress(&self, closing: bool) -> bool {
+    pub(super) fn is_quiescent(&self) -> bool {
+        self.pending.is_none() && self.live.is_none()
+    }
+
+    pub(super) fn take_unselected_failure(
+        &mut self,
+    ) -> Option<(HostFailureRef, OriginalHostFailure)> {
+        self.failures.pop_first()
+    }
+
+    pub(super) fn needs_progress(&self, closing: bool, retire_failures: bool) -> bool {
         self.live
             .as_ref()
             .is_some_and(|live| live.retired && live.result.is_some())
@@ -350,7 +373,7 @@ impl AttemptCallSource {
                 && self.pending.is_none()
                 && self.live.is_none()
                 && self.owner.is_some()
-                && (self.idle.is_some() || self.failures.is_empty())
+                && (self.idle.is_some() || self.failures.is_empty() || retire_failures)
     }
 
     pub(crate) fn accept(
@@ -360,7 +383,7 @@ impl AttemptCallSource {
         let live = self
             .live
             .as_mut()
-            .expect("original QA result has a live role");
+            .expect("original call result has a live role");
         assert!(Arc::ptr_eq(&original.effect, &live.effect));
         if !matches!(&original.outcome, Some(BodyOutcome::Call(_))) {
             return Err(AttemptCallResultRefusal {
@@ -419,7 +442,7 @@ impl AttemptCallSource {
     }
 
     pub(crate) fn transport_retired(&mut self, effect: AttemptActionId) {
-        let live = self.live.as_mut().expect("original QA retirement");
+        let live = self.live.as_mut().expect("original call retirement");
         assert_eq!(live.effect.protocol.id, effect);
         assert!(!std::mem::replace(&mut live.retired, true));
     }
@@ -442,7 +465,10 @@ impl AttemptCallSource {
         Ok(true)
     }
 
-    pub(crate) fn take_failure(&mut self, reference: HostFailureRef) -> Option<TaskExecutionError> {
+    pub(crate) fn take_failure(
+        &mut self,
+        reference: HostFailureRef,
+    ) -> Option<OriginalHostFailure> {
         self.failures.remove(&reference)
     }
 

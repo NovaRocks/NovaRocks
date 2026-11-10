@@ -37,6 +37,7 @@ use crate::{
     task_execution::host::failure_supervisor::{
         FailureCleanupPort, FailureSupervisor, RunningFailureSupervisor,
     },
+    task_execution::host::publication::OriginalHostFailure,
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent},
@@ -123,7 +124,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    calls: [Option<AttemptCallSource>; 2],
+    calls: [Option<AttemptCallSource>; 3],
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -150,7 +151,7 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        calls: [Option<AttemptCallSource>; 2],
+        calls: [Option<AttemptCallSource>; 3],
         send: AttemptSendSource,
         failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
@@ -404,8 +405,13 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
-            if original.is_qa_call() || original.is_process_call() {
-                let lane = usize::from(original.is_process_call());
+            let call_lane = match original {
+                original if original.is_qa_call() => Some(0),
+                original if original.is_process_call() => Some(1),
+                original if original.is_publication_call() => Some(2),
+                _ => None,
+            };
+            if let Some(lane) = call_lane {
                 let result = self.calls[lane]
                     .as_mut()
                     .expect("original attempt call Source")
@@ -552,8 +558,11 @@ impl EffectSource for AttemptTransportSource {
                     if let Some(BodyOutcome::Call(AttemptCallReply::Terminal(publication))) =
                         &mut original.outcome
                         && let Some(reference) = publication.host_reference()
-                        && let Some(failure) =
-                            self.admission.take_failure(reference).or_else(|| {
+                        && let Some(failure) = self
+                            .admission
+                            .take_failure(reference)
+                            .map(OriginalHostFailure::Task)
+                            .or_else(|| {
                                 self.calls
                                     .iter_mut()
                                     .flatten()
@@ -673,6 +682,15 @@ impl EffectSource for AttemptTransportSource {
         let mut units = 0;
         let mut progressed = false;
         let closing = self.result_admission_closed();
+        // A terminal already in flight can still claim an exact raw error
+        // from any call Source. Dispose unselected rows only after all paid
+        // call results retire and no further result loan can be issued.
+        let retire_failures = closing
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_quiescent);
         for _ in 0..self.calls.len() {
             if units == budget {
                 break;
@@ -681,7 +699,7 @@ impl EffectSource for AttemptTransportSource {
             self.call_scan = (lane + 1) % self.calls.len();
             let Some(source) = self.calls[lane]
                 .as_mut()
-                .filter(|source| source.needs_progress(closing))
+                .filter(|source| source.needs_progress(closing, retire_failures))
             else {
                 continue;
             };
@@ -689,6 +707,10 @@ impl EffectSource for AttemptTransportSource {
             progressed |= source.retire_result().expect("original call result");
             if closing {
                 progressed |= source.close_idle().expect("original idle call role");
+                if retire_failures && let Some(original) = source.take_unselected_failure() {
+                    self.other.retain_transport_release(Box::new(original));
+                    progressed = true;
+                }
                 if let Some(original) = source.take_drained_owner() {
                     self.other.retain_transport_release(Box::new(original));
                     progressed = true;

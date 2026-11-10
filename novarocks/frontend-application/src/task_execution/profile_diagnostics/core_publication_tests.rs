@@ -483,7 +483,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     let sources = DiagnosticSourceSnapshot::resolve(&foreign, &records).unwrap();
     assert!(
         collector
-            .publish_core_cut(ready, foreign, sources, unexpected_resolution)
+            .publish_core_cut(ready, &foreign, sources, unexpected_resolution)
             .is_err()
     );
     assert!(observer.current(ready).unwrap().is_none());
@@ -508,7 +508,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     sibling.1 = DiagnosticTaskObservation::Available(sibling_reference);
     let sources = DiagnosticSourceSnapshot::resolve(&bad_tasks, &records).unwrap();
     assert!(matches!(
-        collector.publish_core_cut(ready, bad_tasks, sources, |reference| {
+        collector.publish_core_cut(ready, &bad_tasks, sources, |reference| {
             assert_eq!(reference, sibling_reference);
             Ok(root_info.take().unwrap())
         }),
@@ -527,7 +527,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
         .1 = DiagnosticTaskObservation::Available(information_reference(2, root_task));
     let sources = DiagnosticSourceSnapshot::resolve(&wrong_reference, &records).unwrap();
     assert!(matches!(
-        collector.publish_core_cut(ready, wrong_reference, sources, unexpected_resolution),
+        collector.publish_core_cut(ready, &wrong_reference, sources, unexpected_resolution),
         Err(TaskExecutionError::Schedule(message))
             if message == "core diagnostic reference names a foreign Task"
     ));
@@ -544,7 +544,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
         .1 = DiagnosticTaskObservation::Available(root_reference);
     let sources = DiagnosticSourceSnapshot::resolve(&failed_resolution, &records).unwrap();
     assert!(matches!(
-        collector.publish_core_cut(ready, failed_resolution, sources, |reference| {
+        collector.publish_core_cut(ready, &failed_resolution, sources, |reference| {
             assert_eq!(reference, root_reference);
             Err(TaskExecutionError::UnknownOperation)
         }),
@@ -559,7 +559,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     let sources = DiagnosticSourceSnapshot::resolve(&cut, &wrong_binding).unwrap();
     assert!(
         collector
-            .publish_core_cut(ready, cut, sources, unexpected_resolution)
+            .publish_core_cut(ready, &cut, sources, unexpected_resolution)
             .is_err()
     );
     let before = SplitSourceProfile {
@@ -588,7 +588,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     let sources = DiagnosticSourceSnapshot::resolve(&first_cut, &records).unwrap();
     assert!(
         collector
-            .publish_core_cut(ready, first_cut, sources, |reference| {
+            .publish_core_cut(ready, &first_cut, sources, |reference| {
                 assert_eq!(reference, root_reference);
                 resolved += 1;
                 Ok(original_info.take().unwrap())
@@ -628,7 +628,7 @@ async fn core_publication_rejects_foreign_cut_and_keeps_original_snapshot_immuta
     let sources = DiagnosticSourceSnapshot::resolve(&later_cut, &records).unwrap();
     assert!(
         !collector
-            .publish_core_cut(ready, later_cut, sources, unexpected_resolution)
+            .publish_core_cut(ready, &later_cut, sources, unexpected_resolution)
             .unwrap()
     );
     let second = observer.current(ready).unwrap().unwrap();

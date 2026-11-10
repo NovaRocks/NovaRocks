@@ -17,7 +17,10 @@
 
 //! Terminal delivery to the original logical attempt.
 
-use crate::task_execution::{error::TaskExecutionError, host::failure_bridge::FailureBridge};
+use crate::task_execution::{
+    error::TaskExecutionError,
+    host::{failure_bridge::FailureBridge, publication::OriginalHostFailure},
+};
 use novarocks_attempt_protocol::{
     error::{ParticipantObservationFailure, TaskExecutionError as ProtocolError},
     failure::{AttemptFailure, AttemptFailureSite, HostFailureRef, ProtocolFailure},
@@ -42,7 +45,7 @@ use tokio::sync::Notify;
 /// The selected raw host error travels with the normal terminal that names it.
 pub(crate) struct TerminalPublication {
     port: AttemptToLogical<AttemptFailure>,
-    failure: Option<(HostFailureRef, TaskExecutionError)>,
+    failure: Option<(HostFailureRef, OriginalHostFailure)>,
 }
 
 impl TerminalPublication {
@@ -81,7 +84,7 @@ impl TerminalPublication {
     pub(crate) fn attach_host_failure(
         &mut self,
         reference: HostFailureRef,
-        failure: TaskExecutionError,
+        failure: OriginalHostFailure,
     ) {
         assert_eq!(self.host_reference(), Some(reference));
         assert!(self.failure.is_none());
@@ -775,7 +778,7 @@ mod tests {
 
         let mut publication = Box::new(TerminalPublication::new(port.clone()));
         assert_eq!(publication.host_reference(), Some(reference));
-        publication.attach_host_failure(reference, raw);
+        publication.attach_host_failure(reference, OriginalHostFailure::Task(raw));
         assert!(outbox.publish(publication).is_ok());
         assert!(
             outbox
