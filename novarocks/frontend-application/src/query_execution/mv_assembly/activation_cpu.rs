@@ -297,6 +297,8 @@ impl MvWriteAnalysis {
 }
 
 pub(crate) struct MvWriteFinishInput {
+    pub(crate) capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     pub(crate) continuation: Option<MvWriteContinuation>,
     pub(crate) facts: Option<Vec<ProviderReadFact>>,
     pub(crate) access: Option<FinalPlanRuntimeAccess<FrozenProviderRead>>,
@@ -397,6 +399,7 @@ impl MvWriteFinishInput {
                     session: self.session.as_ref(),
                 },
                 &self.control,
+                &self.capacity,
             )
             .map_err(crate::query_execution::mv_native_write::encode_compile_error)
             .map_err(MvApplicationError::from_compile)?;

@@ -268,12 +268,7 @@ impl ViewEngine for FrontendViewEngine {
             crate::query_execution::planning::sql_compile_control_from_connector_request(context);
         let provider = provider
             .with_local_views(request.local_views.clone())
-            .with_system_relations(self.kernel.system_relations().clone())
-            .with_definition_inputs(
-                context.clone(),
-                self.kernel.constant_policy(),
-                control.clone(),
-            );
+            .with_system_relations(self.kernel.system_relations().clone());
         let mut preparation =
             novarocks_sql::compiler::SqlCapturedCatalogPreparation::try_new_definition(
                 request.query.clone(),

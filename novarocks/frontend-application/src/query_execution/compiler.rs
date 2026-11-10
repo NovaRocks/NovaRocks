@@ -1108,9 +1108,10 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners()?,
-        scope.with_definition_owned(
-            state.constant_policy(),
+        scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
+            execution.cancellation().clone(),
+            query_opts.as_ref(),
         ),
         typed_connector_session()?,
     )?;
@@ -1213,7 +1214,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         .encode_writer_handle_payload(target.handle())
         .map_err(|error| error.to_string())?;
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
+    let (mut completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
         optimize_request,
         sink,
         ordinal,
@@ -1226,6 +1227,13 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     let facts = provider_source
         .resolve_provider_reads(&needs, &access_sink)
         .await?;
+    let system_facts = provider_source
+        .resolve_system_tables(completion.system_table_needs())
+        .await
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    completion
+        .install_system_tables(system_facts.into_boxed_slice(), &compile_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     // The original Provider retains every pending creator. Do not extract the
     // final access set until its local creator exit is proven by the same source.
     provider_source
@@ -1247,6 +1255,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         query_opts,
         write_session,
         &compile_control,
+        &capacity,
     )
 }
 
@@ -1348,6 +1357,7 @@ fn finish_prepared_iceberg_write_assembly(
     query_opts: Option<QueryOptions>,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
         session: write_session.as_ref(),
@@ -1386,6 +1396,7 @@ fn finish_prepared_iceberg_write_assembly(
         DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
         completion_control,
+        capacity,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         encoded,

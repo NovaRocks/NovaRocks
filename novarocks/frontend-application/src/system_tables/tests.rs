@@ -63,6 +63,12 @@ impl MaterializedViewInventory for Inventory {
         Ok(self.0.next())
     }
 }
+struct SnapshotInput {
+    declaration: Arc<SystemTableDeclaration>,
+    columns: Vec<usize>,
+    rows: Vec<SystemTableRow>,
+    batches: Vec<MaterializedSystemTableBatch>,
+}
 struct Source {
     local: LocalViewSnapshot,
     calls: Mutex<Vec<String>>,
@@ -73,6 +79,7 @@ struct Source {
     mvs: Vec<MaterializedViewFacts>,
     observed: Result<Vec<MvSourceObservation>, ConnectorError>,
     batch_sizes: Mutex<Vec<usize>>,
+    snapshot: Mutex<Option<SnapshotInput>>,
 }
 impl Source {
     fn new() -> Self {
@@ -86,6 +93,7 @@ impl Source {
             mvs: vec![],
             observed: Ok(vec![]),
             batch_sizes: Mutex::new(vec![]),
+            snapshot: Mutex::new(None),
         }
     }
     fn call(&self, name: impl Into<String>) {
@@ -155,23 +163,63 @@ impl StatementSystemTableSource for Source {
         self.call("observe");
         self.observed.clone().map_err(Into::into)
     }
-    async fn materialize_batch(
+    fn begin_snapshot(
         &self,
         declaration: Arc<SystemTableDeclaration>,
-        columns: Vec<usize>,
-        rows: Vec<SystemTableRow>,
-    ) -> Result<MaterializedSystemTableBatch, SystemTableError> {
-        self.batch_sizes.lock().unwrap().push(rows.len());
-        Ok(MaterializedSystemTableBatch {
-            batch: build_system_table_batch(&declaration, &columns, rows)?,
-            storage: held(),
-        })
+        columns: &[usize],
+    ) -> Result<(), SystemTableError> {
+        *self.snapshot.lock().unwrap() = Some(SnapshotInput {
+            declaration,
+            columns: columns.to_vec(),
+            rows: vec![],
+            batches: vec![],
+        });
+        Ok(())
     }
-    async fn finish_snapshot(
-        &self,
-        batches: Vec<MaterializedSystemTableBatch>,
-    ) -> Result<SystemTableSnapshot, SystemTableError> {
-        let (data, storage): (Vec<_>, Vec<_>) = batches
+    fn stage_row(&self, values: &[Option<&str>]) -> Result<RowStage, SystemTableError> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let input = snapshot.as_mut().unwrap();
+        input.rows.push(
+            input
+                .columns
+                .iter()
+                .map(|ordinal| values[*ordinal].map(str::to_owned))
+                .collect(),
+        );
+        Ok(RowStage::Staged)
+    }
+    async fn materialize_batch(&self) -> Result<(), SystemTableError> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let input = snapshot.as_mut().unwrap();
+        self.batch_sizes.lock().unwrap().push(input.rows.len());
+        // This is a fake fact source, not a proof of production capacity. The
+        // real CPU source owns the original-window construction tests.
+        let mut exact =
+            |_: std::alloc::Layout| Ok::<_, novarocks_type_contract::CompileControlError>(());
+        let mut opaque = |_: usize| Ok::<_, novarocks_type_contract::CompileControlError>(());
+        let storage = held();
+        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+            storage.clone(),
+            &mut exact,
+            &mut opaque,
+        );
+        let batch = build_system_table_batch(
+            &input.declaration,
+            &input.columns,
+            &input.rows,
+            &mut creation,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )?;
+        input
+            .batches
+            .push(MaterializedSystemTableBatch { batch, storage });
+        input.rows.clear();
+        Ok(())
+    }
+    async fn finish_snapshot(&self) -> Result<SystemTableSnapshot, SystemTableError> {
+        let input = self.snapshot.lock().unwrap().take().unwrap();
+        let (data, storage): (Vec<_>, Vec<_>) = input
+            .batches
             .into_iter()
             .map(|batch| (batch.batch, batch.storage))
             .unzip();

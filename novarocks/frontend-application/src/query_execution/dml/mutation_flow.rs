@@ -398,6 +398,7 @@ fn finish_change_stream_write(
     write_session: &Arc<ConnectorWriteSession>,
     query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<
     crate::query_execution::compiler::PreparedDmlWriteAssembly,
     crate::dml::error::DmlExecutionError,
@@ -464,6 +465,7 @@ fn finish_change_stream_write(
             },
         ),
         completion_control,
+        capacity,
     )?;
     Ok(
         crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
@@ -2844,6 +2846,7 @@ fn finish_cow_match_plan(
     declaration: &[novarocks_type_contract::FunctionValueType],
     query_options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<
     (
         novarocks_query_application::preparation::FrozenExecutionDescription,
@@ -2898,6 +2901,7 @@ fn finish_cow_match_plan(
         state.constant_policy(),
         None,
         completion_control,
+        capacity,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
@@ -3763,9 +3767,9 @@ mod tests {
             let trc_catalog =
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
             let trc_controls = Arc::clone(&connector_control);
-            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                trc_catalog.clone(),
-                trc_controls.clone(),
+            let trc_system_relations = std::sync::Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed declaration fixture"),
             );
             DmlExecutionKernel::new(
                 crate::query_execution::kernels::DmlPlanningServices::new(
@@ -5959,10 +5963,7 @@ mod tests {
                     );
                     let trc_controls = registry;
                     let trc_system_relations =
-                        crate::query_execution::kernels::test_system_relations(
-                            trc_catalog.clone(),
-                            trc_controls.clone(),
-                        );
+                        std::sync::Arc::new(novarocks_query_application::system_tables::SystemTableRegistry::try_new([]).expect("sealed declaration fixture"));
                     DmlExecutionKernel::new(
 crate::query_execution::kernels::DmlPlanningServices::new(
 Arc::new(

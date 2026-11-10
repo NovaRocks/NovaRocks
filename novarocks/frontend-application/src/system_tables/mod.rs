@@ -17,15 +17,21 @@
 
 //! Statement-scoped standard system-table providers.
 mod batch;
+mod construction;
 mod pinned_catalog;
 mod provider;
 mod source;
-pub(crate) use batch::build_system_table_batch;
+#[cfg(test)]
+use batch::build_system_table_batch;
+pub(crate) use construction::{RowStage, SystemTableCpuStaging, control_error};
 pub(crate) use pinned_catalog::PinnedCatalogListing;
 pub(crate) use provider::FrontendSystemTableProvider;
 pub(crate) use source::{
-    ListableMaterializedViews, MaterializedSystemTableBatch, MaterializedViewFacts,
-    MaterializedViewInventory, StatementSystemTableSource, SystemTableRow, repository_error,
+    ListableMaterializedViews, MaterializedViewFacts, MaterializedViewInventory,
+    StatementSystemTableSource, repository_error,
 };
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+use source::{MaterializedSystemTableBatch, SystemTableRow};

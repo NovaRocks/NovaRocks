@@ -1361,6 +1361,7 @@ impl CatalogApplicationService {
         execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
         receipt: Option<&crate::CatalogMutationReceipt>,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+        crate::validate_catalog_create_name(&command.instance_id)?;
         let repository = self.sql_mutation_authority()?;
         let (credential_bindings, provider_properties) =
             extract_catalog_credential_bindings(command.properties)?;
@@ -1450,6 +1451,7 @@ impl CatalogApplicationService {
         execution: Option<&novarocks_state_store_api::StateStoreExecutionContext>,
         receipt: Option<&crate::CatalogMutationReceipt>,
     ) -> Result<(), CatalogApplicationError> {
+        crate::validate_catalog_drop_name(&command.instance_id)?;
         let repository = self.sql_mutation_authority()?;
         let Some(existing) = match execution {
             Some(execution) => repository.get_in(&command.instance_id, execution).await,
@@ -1765,6 +1767,55 @@ fn materialization_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reserved_system_catalog_rejection_precedes_source_and_property_admission() {
+        let service = CatalogApplicationService::unavailable(
+            Arc::new(ConnectorControlHost::new()),
+            Arc::new(TestRuntimePublisher),
+            tokio::runtime::Handle::current(),
+            Arc::new(TestReferenceReader),
+        );
+        for name in ["system", "SyStEm"] {
+            for conditional in [false, true] {
+                let instance_id = ConnectorInstanceId::parse(name).unwrap();
+                let create = service
+                    .create_catalog_with_execution(
+                        CatalogCreateCommand {
+                            instance_id: instance_id.clone(),
+                            display_name: name.into(),
+                            properties: vec![],
+                            if_not_exists: conditional,
+                        },
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(create.kind(), CatalogApplicationErrorKind::AlreadyExists);
+                let drop = service
+                    .drop_catalog_with_execution(
+                        CatalogDropCommand {
+                            instance_id,
+                            if_exists: conditional,
+                        },
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    drop.kind(),
+                    CatalogApplicationErrorKind::UnsupportedOperation
+                );
+                assert_eq!(
+                    novarocks_failure_contract::FailureProjection::failure_fact(&drop).class(),
+                    novarocks_failure_contract::FailureClass::Unsupported
+                );
+            }
+        }
+        assert_eq!(service.projection_count(), 0);
+    }
 
     #[test]
     fn create_catalog_extracts_node_local_sources_without_retyping_static() {

@@ -1136,8 +1136,7 @@ impl QueryTaskExecution {
             .get_mut(&stage_id)
             .and_then(|stage| stage.task_mut(task_id))
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        let request =
-            TaskOperationQueueRequest::task_update(remote.identity(), &update);
+        let request = TaskOperationQueueRequest::task_update(remote.identity(), &update);
         self.dispatcher.validate_queue_request(request)?;
         remote.begin_input_preparation(update)?;
         remote.poll_input_preparation(self.sink.as_ref())
@@ -1785,10 +1784,8 @@ impl QueryTaskExecution {
                 self.edge_control_effects.front_mut().unwrap().input = Some(input);
             }
             let row = self.edge_control_effects.front_mut().unwrap();
-            let request = TaskOperationQueueRequest::task_update(
-                producer,
-                row.input.as_ref().unwrap(),
-            );
+            let request =
+                TaskOperationQueueRequest::task_update(producer, row.input.as_ref().unwrap());
             self.dispatcher.validate_queue_request(request)?;
             let Some(permit) =
                 Self::reserve_process_request(self.sink.as_ref(), request, &mut row.preparation)?

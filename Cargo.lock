@@ -3186,6 +3186,7 @@ dependencies = [
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
+ "novarocks-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",

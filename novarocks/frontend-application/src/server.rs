@@ -165,7 +165,7 @@ struct FrontendRoleProducts {
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
     maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
@@ -327,7 +327,7 @@ async fn build_frontend_role_products(
     host: &mut FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
+    system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
 ) -> Result<FrontendRoleProducts, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
@@ -339,15 +339,7 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    let system_relations = novarocks_query_application::system_catalog::SystemCatalogRelations::new(
-        Arc::new(
-            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
-                catalog_service.clone(),
-                connector_control.clone(),
-            ),
-        ),
-        system_catalog,
-    );
+    let system_relations = system_catalog;
     let query_application_control = Arc::new(
         novarocks_query_application::query_control::QueryApplicationControl::new(
             host.frontend_process_id(),
@@ -541,6 +533,7 @@ async fn build_frontend_role_products(
             host.connector_blocking_io_supervisor(),
             view_service.clone(),
             system_relations.clone(),
+            mv_readiness.clone(),
         ),
         execution: (
             host.connector_blocking_io_supervisor(),
@@ -590,6 +583,7 @@ async fn build_frontend_role_products(
                         host.connector_blocking_io_supervisor(),
                         view_service.clone(),
                         system_relations.clone(),
+                        mv_readiness.clone(),
                     ),
                     (
                         host.connector_blocking_io_supervisor(),
@@ -624,6 +618,7 @@ async fn build_frontend_role_products(
             host.connector_blocking_io_supervisor(),
             view_service.clone(),
             system_relations.clone(),
+            mv_readiness.clone(),
         ),
         connector_control: typed_connector_control.clone(),
         blocking: host.connector_blocking_io_supervisor(),
@@ -713,6 +708,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
             host.session_properties(),
+            products.system_relations.clone(),
         ));
     let catalog_command_executor =
         core_capabilities::catalog_command_executor(core_capabilities::CatalogCommandPorts::new(
@@ -804,6 +800,7 @@ fn build_frontend_query_session_factory_from_role_products(
             view_service.clone(),
             products.system_relations.clone(),
         )
+        .with_state_store_original(host.state_store_original_binding())
         .with_write_runtime(
             host.connector_blocking_io_supervisor(),
             host.write_data_runtime(),
@@ -857,7 +854,7 @@ fn build_frontend_query_session_factory_from_role_products(
 #[cfg(test)]
 async fn build_frontend_query_session_factory(
     host: &mut FrontendApplicationHost,
-    system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog>,
+    system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
@@ -1068,9 +1065,10 @@ where
         config.native_ingress,
     )?;
     let exchange_port = report_server.bound_addr().port();
-    let system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog> =
+    let system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry> =
         Arc::new(
-            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                .expect("sealed system table declarations"),
         );
     let mut products = match build_frontend_role_products(
         host,
@@ -1723,7 +1721,8 @@ mod tests {
         let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(
-                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed system table declarations"),
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
@@ -1924,7 +1923,8 @@ mod tests {
         let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(
-                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed system table declarations"),
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
@@ -1980,7 +1980,8 @@ mod tests {
         let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(
-                novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed system table declarations"),
             ),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
@@ -2512,11 +2513,12 @@ mod tests {
             let built = build_frontend_query_session_factory(
                 &mut host,
                 Arc::new(
-                    novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                    novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                        .expect("sealed system table declarations"),
                 ),
                 0,
                 Arc::new(UnavailableMvStorageObservationPort),
-                )
+            )
             .await;
             let (session_factory, mut products) = match built {
                 Ok(products) => products,
@@ -2767,11 +2769,12 @@ mod tests {
             let built = build_frontend_query_session_factory(
                 &mut host,
                 Arc::new(
-                    novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                    novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                        .expect("sealed system table declarations"),
                 ),
                 0,
                 Arc::new(UnavailableMvStorageObservationPort),
-                )
+            )
             .await;
             let (session_factory, mut products) = match built {
                 Ok(products) => products,

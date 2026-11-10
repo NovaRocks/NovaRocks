@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Same-ticket original Native action, selected local offer and paid reply plan.
+//! Same-ticket original Native action, selected local offer and responsibility-accounted reply plan.
 use super::super::{
     data_runtime::CachedNativeChannel,
     transport::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff},

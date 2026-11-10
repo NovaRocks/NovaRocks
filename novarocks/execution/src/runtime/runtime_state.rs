@@ -561,13 +561,7 @@ impl RuntimeState {
     ///
     /// StarRocks BE uses query option `batch_size` (aka `RuntimeState::chunk_size()`).
     pub fn chunk_size(&self) -> usize {
-        self.query_options
-            .as_ref()
-            .and_then(|opts| opts.batch_size)
-            .filter(|v| *v > 0)
-            .map(|v| v as usize)
-            .unwrap_or(4096)
-            .max(1)
+        super::query_options::chunk_size(self.query_options.as_ref())
     }
 
     pub fn runtime_profile_report_interval_ns(&self) -> Option<i64> {

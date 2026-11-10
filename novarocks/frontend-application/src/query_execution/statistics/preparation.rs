@@ -554,6 +554,8 @@ fn build_statistics_plan_parts(
         static_plan_carrier,
         constant_policy,
         &completion_control,
+        crate::query_execution::physical_encoding::encoding_capacity(execution)
+            .map_err(DistributedQueryError::from_encode)?,
     )
     .map_err(DistributedQueryError::from_encode)?;
     // All fallible signed-description/control work precedes the linear access

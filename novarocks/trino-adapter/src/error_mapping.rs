@@ -428,11 +428,12 @@ fn execution_code(input: &ExecutionFailureInput) -> Code {
     // ConnectorMutationFailureKind::AlreadyExists owns the Data/CONNECTOR/6002
     // fact (spi/connector/mutation.rs). Its entity is unspecified, so the wire
     // uses Trino's general ALREADY_EXISTS rather than guessing a table kind.
+    // CatalogApplicationErrorKind::AlreadyExists owns Data/METADATA/902.
     let fact = input.fact();
     if code == Code::GenericUser
         && fact.class() == FailureClass::Data
-        && fact.reason().domain() == domain::CONNECTOR.get()
-        && fact.reason().code() == 6002
+        && ((fact.reason().domain() == domain::CONNECTOR.get() && fact.reason().code() == 6002)
+            || (fact.reason().domain() == domain::METADATA.get() && fact.reason().code() == 902))
     {
         return Code::AlreadyExists;
     }
@@ -484,6 +485,8 @@ fn user_code(code: &str) -> Option<Code> {
         "sql.validate.duplicate_cte_name" => DuplicateNamedQuery,
         "sql.validate.duplicate_window_name" => DuplicateWindowName,
         "sql.validate.invalid_window_frame_bounds" => InvalidWindowFrame,
+        "sql.analyze.unknown_catalog" => CatalogNotFound,
+        "sql.analyze.unknown_schema" => SchemaNotFound,
         "sql.analyze.unknown_table" => TableNotFound,
         "sql.analyze.unknown_column" => ColumnNotFound,
         "sql.analyze.unknown_function" => FunctionNotFound,

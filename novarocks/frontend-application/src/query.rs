@@ -1480,10 +1480,10 @@ impl FrontendQuerySession {
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         let sql: Arc<str> = sql.into();
-        let ParsedStatement::Query(query) = &parsed_statement else {
+        let ParsedStatement::Query(_) = &parsed_statement else {
             return Err(internal_error("read admission requires a query statement"));
         };
-        let purpose = FrontendQueryPurpose::client_query(query);
+        let purpose = FrontendQueryPurpose::ClientRows;
         let (deadline, timeout_ms) = {
             let state = self.state.lock().map_err(poisoned_state)?;
             governed_query_deadline(&state)?

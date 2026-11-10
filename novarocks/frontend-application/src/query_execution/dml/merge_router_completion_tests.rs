@@ -416,7 +416,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .unwrap_or_else(|(error, _)| panic!("pair original completed plan: {error}"));
     let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
         paired,
         &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,

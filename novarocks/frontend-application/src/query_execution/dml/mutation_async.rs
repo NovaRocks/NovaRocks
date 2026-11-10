@@ -462,6 +462,7 @@ impl PreparedMorMutationWrite {
             &self.session,
             options,
             &control,
+            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
         )
     }
 }
@@ -490,9 +491,10 @@ fn install_fact_source(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider,
         state.completion_fact_owners()?,
-        scope.with_definition_owned(
-            state.constant_policy(),
+        scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(facts.execution()),
+            facts.execution().cancellation().clone(),
+            None,
         ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
@@ -578,6 +580,7 @@ impl PreparedCowSelection {
             &self.declarations,
             options.as_ref(),
             &control,
+            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
         )?;
         let signed = self.facts.signed()?;
         Ok(PreparedCowMatchAssembly {

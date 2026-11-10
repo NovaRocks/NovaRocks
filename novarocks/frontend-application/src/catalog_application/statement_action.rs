@@ -124,6 +124,15 @@ pub(crate) fn prepare_for_application(
             ));
         }
     };
+    match &input {
+        Mutation::Create(command) => {
+            novarocks_catalog_application::validate_catalog_create_name(&command.instance_id)
+        }
+        Mutation::Drop(command) => {
+            novarocks_catalog_application::validate_catalog_drop_name(&command.instance_id)
+        }
+    }
+    .map_err(SharedFailureCause::new)?;
     let application = application.ok_or_else(|| invalid("catalog application is unavailable"))?;
     application
         .require_catalog_mutation_admission()

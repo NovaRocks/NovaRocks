@@ -388,18 +388,18 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
         Default::default(), repository, Default::default(),
         crate::mv::domain::test_admission::management_entrance(), Default::default(),
     );
-    let inventory = crate::mv::domain::readiness::MvReadinessPort::from_product(
+    let inventory = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
         product.keyed_readiness_service().unwrap(),
         runtime.handle().clone(),
         product.management_entrance().unwrap(),
-    );
+    ));
     let owners = {
         let trc_catalog =
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
         let trc_controls = Arc::new(ConnectorControlHost::new());
-        let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-            trc_catalog.clone(),
-            trc_controls.clone(),
+        let trc_system_relations = std::sync::Arc::new(
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                .expect("sealed declaration fixture"),
         );
         CompletionFactOwners::new(
             trc_catalog.clone(),
@@ -411,6 +411,7 @@ fn observe_actual_completion_port(kind: ActualCompletionPort, class: ResultWindo
             blocking.clone(),
             Arc::new(novarocks_query_application::view::QueryViewService::new()),
             trc_system_relations,
+            Arc::clone(&inventory),
         )
     };
     drop(inventory);

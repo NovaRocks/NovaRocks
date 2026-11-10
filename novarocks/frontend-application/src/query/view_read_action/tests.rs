@@ -110,9 +110,9 @@ impl Fixture {
                 .unwrap_or_else(|| {
                     Arc::new(novarocks_catalog_application::ConnectorControlHost::new())
                 });
-            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                trc_catalog.clone(),
-                trc_controls.clone(),
+            let trc_system_relations = std::sync::Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed declaration fixture"),
             );
             ViewExecutionKernel::new(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),

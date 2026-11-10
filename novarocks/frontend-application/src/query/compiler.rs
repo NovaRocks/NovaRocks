@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::information_schema;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::connector::connector_planning_context_for_query_on_runtime;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
@@ -47,36 +46,18 @@ use novarocks_sql::compiler::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrontendQueryPurpose {
     ClientRows,
-    LocalRows,
 }
 
 impl FrontendQueryPurpose {
-    pub(crate) fn client_query(query: &Query) -> Self {
-        if information_schema::is_local_materialized_views_query(query) {
-            Self::LocalRows
-        } else {
-            Self::ClientRows
-        }
-    }
-
     pub(crate) fn window_class(self) -> novarocks_workload_control::ResultWindowClass {
         use novarocks_workload_control::ResultWindowClass;
         match self {
             Self::ClientRows => ResultWindowClass::Client,
-            Self::LocalRows => ResultWindowClass::Local,
         }
     }
 
     fn validate(self, statement: &Statement) -> Result<(), FrontendQueryCompilerError> {
-        let valid = match (self, statement) {
-            (Self::ClientRows, Statement::Query(query)) => {
-                !information_schema::is_local_materialized_views_query(query)
-            }
-            (Self::LocalRows, Statement::Query(query)) => {
-                information_schema::is_local_materialized_views_query(query)
-            }
-            _ => false,
-        };
+        let valid = matches!((self, statement), (Self::ClientRows, Statement::Query(_)));
         if valid {
             Ok(())
         } else {
@@ -272,6 +253,7 @@ impl FrontendQueryCompiler {
             self.connector_blocking_io.clone(),
             Arc::clone(self.view.view_service()),
             self.system_tables.system_relations().clone(),
+            Arc::clone(&self.mv_readiness),
         )
     }
 
@@ -716,57 +698,15 @@ mod purpose_tests {
     }
 
     #[test]
-    fn client_admission_uses_only_the_exact_local_immediate_shape() {
-        for sql in [
-            "SELECT * FROM information_schema.materialized_views",
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.MATERIALIZED_VIEWS WHERE IS_ACTIVE = true ORDER BY TABLE_NAME",
-        ] {
-            let parsed = statement(sql);
-            let Statement::Query(query) = &parsed else {
-                panic!("expected query")
-            };
-            assert_eq!(
-                FrontendQueryPurpose::client_query(query),
-                FrontendQueryPurpose::LocalRows,
-                "{sql}"
-            );
-            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_ok());
-            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_err());
-        }
-        for sql in [
-            "SELECT 1",
-            "SELECT TABLE_NAME FROM information_schema.tables",
-            "SELECT * FROM catalog.information_schema.materialized_views",
-            "SELECT * FROM information_schema.materialized_views m JOIN t ON m.TABLE_NAME = t.name",
-            "SELECT * FROM information_schema.materialized_views UNION ALL SELECT * FROM information_schema.materialized_views",
-            "SELECT * FROM (SELECT * FROM information_schema.materialized_views) m",
-        ] {
-            let parsed = statement(sql);
-            let Statement::Query(query) = &parsed else {
-                panic!("expected query")
-            };
-            assert_eq!(
-                FrontendQueryPurpose::client_query(query),
-                FrontendQueryPurpose::ClientRows,
-                "{sql}"
-            );
-            assert!(FrontendQueryPurpose::ClientRows.validate(&parsed).is_ok());
-            assert!(FrontendQueryPurpose::LocalRows.validate(&parsed).is_err());
-        }
-    }
-
-    #[test]
     fn synchronous_read_purposes_reject_explain_and_do_not_infer_scalar_output() {
         let select = statement("SELECT 1");
         assert!(FrontendQueryPurpose::ClientRows.validate(&select).is_ok());
         for sql in ["EXPLAIN SELECT 1", "EXPLAIN ANALYZE SELECT 1"] {
             let explain = statement(sql);
-            for purpose in [
-                FrontendQueryPurpose::ClientRows,
-                FrontendQueryPurpose::LocalRows,
-            ] {
-                assert!(purpose.validate(&explain).is_err(), "{sql}: {purpose:?}");
-            }
+            assert!(
+                FrontendQueryPurpose::ClientRows.validate(&explain).is_err(),
+                "{sql}"
+            );
         }
     }
 }

@@ -226,7 +226,7 @@ pub(super) fn collect(
     Ok((plan, needs.into_boxed_slice()))
 }
 
-pub(super) fn install(
+pub(crate) fn install(
     plan: &mut PhysicalPlanNode,
     expected: &[SystemTableSnapshotNeed],
     facts: Box<[SystemTableSnapshotFact]>,

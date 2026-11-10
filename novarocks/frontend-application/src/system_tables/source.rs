@@ -163,18 +163,19 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
         occurrences: &[RelationOccurrence],
         context: &ConnectorRequestContext,
     ) -> Result<Vec<MvSourceObservation>, SystemTableError>;
-    /// Run build_system_table_batch inside the original pure planning CPU turn,
-    /// supplying the original creator's constructed storage responsibility.
-    async fn materialize_batch(
+    /// Begin one snapshot in the original stable CPU body; no payload is copied here.
+    fn begin_snapshot(
         &self,
         declaration: Arc<SystemTableDeclaration>,
-        required_columns: Vec<usize>,
-        rows: Vec<SystemTableRow>,
-    ) -> Result<MaterializedSystemTableBatch, SystemTableError>;
-    /// Retain every batch's original storage in one checked lifetime using the
-    /// same creator, and move the batch sequence without concatenating arrays.
-    async fn finish_snapshot(
+        required_columns: &[usize],
+    ) -> Result<(), SystemTableError>;
+    /// Reserve the original window before copying borrowed row facts into that body.
+    fn stage_row(
         &self,
-        batches: Vec<MaterializedSystemTableBatch>,
-    ) -> Result<SystemTableSnapshot, SystemTableError>;
+        values: &[Option<&str>],
+    ) -> Result<super::construction::RowStage, SystemTableError>;
+    /// Construct and retain a batch in the original CPU body after actual turn exit.
+    async fn materialize_batch(&self) -> Result<(), SystemTableError>;
+    /// Move the sequence only after its original creator has funded final storage.
+    async fn finish_snapshot(&self) -> Result<SystemTableSnapshot, SystemTableError>;
 }

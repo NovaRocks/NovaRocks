@@ -50,7 +50,7 @@ use prost::Message;
 
 use crate::metrics::task_creation::{RetainedPayload, static_fragment_frozen};
 use crate::query_execution::artifact::FragmentId;
-use crate::query_execution::package_freeze::{PackageFreezeError, encode_checked_package};
+use crate::query_execution::package_freeze::PackageFreezeError;
 
 /// One static sink branch, in the order the static plan declares it.
 ///
@@ -219,11 +219,15 @@ impl FragmentArtifact {
     /// nothing beside it restates them. The facts are read from the same
     /// package's physical fragment, and its sink branches from the plan
     /// edges that sink names, in declared order.
-    pub(crate) fn freeze_package(
+    pub(crate) fn freeze_package_with_creator(
         package: &FragmentPackage,
         edges: &BTreeMap<EdgeId, Edge>,
         carrier: &CompiledPackageCarrier,
         control: &dyn PureCompileControl,
+        creation: &mut novarocks_type_contract::ValueSchemaCreation<
+            '_,
+            novarocks_type_contract::CompileControlError,
+        >,
     ) -> Result<Arc<Self>, PackageFreezeError> {
         let fragment = package.fragment();
         let fragment_id = fragment.id().get();
@@ -291,9 +295,34 @@ impl FragmentArtifact {
             carries_runtime_filter_bindings: true,
         };
         let frozen = wire::FrozenFragment {
-            package: encode_checked_package(package, carrier, control)?.into(),
+            package: crate::query_execution::package_freeze::encode_checked_package_with_creator(
+                package, carrier, control, creation,
+            )?
+            .into(),
         };
-        let content = FrozenBytes::freeze_encoded(frozen.encode_to_vec());
+        let layout = std::alloc::Layout::array::<u8>(frozen.encoded_len()).map_err(|_| {
+            PackageFreezeError::Control(novarocks_type_contract::CompileControlError::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            ))
+        })?;
+        creation
+            .request_layout(layout)
+            .map_err(PackageFreezeError::Control)?;
+        let owner = FrozenBytes::encoded_custody_layout::<
+            novarocks_type_contract::ValueTypeStorageLifetime,
+        >()
+        .map_err(|_| {
+            PackageFreezeError::Control(novarocks_type_contract::CompileControlError::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            ))
+        })?;
+        creation
+            .request_layout(owner)
+            .map_err(PackageFreezeError::Control)?;
+        let content = FrozenBytes::freeze_encoded_with_custody(
+            frozen.encode_to_vec(),
+            creation.storage_lifetime(),
+        );
         #[cfg(test)]
         tests::record_freeze();
         let retained = static_fragment_frozen(content.len());
@@ -302,6 +331,24 @@ impl FragmentArtifact {
             facts,
             _retained: retained,
         }))
+    }
+
+    /// Pure semantic fixtures explicitly choose their construction author.
+    #[cfg(test)]
+    pub(crate) fn freeze_package(
+        package: &FragmentPackage,
+        edges: &BTreeMap<EdgeId, Edge>,
+        carrier: &CompiledPackageCarrier,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self>, PackageFreezeError> {
+        let mut request = |_| Ok::<_, novarocks_type_contract::CompileControlError>(());
+        let mut opaque = |_| Ok::<_, novarocks_type_contract::CompileControlError>(());
+        let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut opaque,
+        );
+        Self::freeze_package_with_creator(package, edges, carrier, control, &mut creation)
     }
 
     /// The frozen bytes every task of this fragment is created from.
@@ -702,6 +749,99 @@ pub(crate) mod tests {
             &control,
         )
         .expect("a genuine package freezes")
+    }
+
+    #[test]
+    fn statement_funded_fragment_bytes_keep_the_original_receipt_until_last_rpc_alias() {
+        use novarocks_plan_codec::physical_package_v2::{
+            PackageDecodeLimits, decode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        let original = frozen_package(
+            3,
+            11,
+            [7; 16],
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: false,
+            },
+            None,
+            0,
+        );
+        let wire = wire::FrozenFragment::decode(original.content().bytes().clone()).unwrap();
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
+        let package = decode_fragment_package(
+            &wire.package,
+            &model,
+            &PackageDecodeLimits::FROZEN,
+            &control,
+        )
+        .unwrap();
+        let carrier = CompiledPackageCarrier::for_test(
+            novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
+            novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
+        );
+        let (_control, root, capacity, _positions) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = capacity.try_window_alias().unwrap();
+        let artifact = crate::query_execution::required_constant_eval::with_root_value_creation(
+            &root.owner.scope(),
+            &window,
+            &control,
+            |creation| {
+                FragmentArtifact::freeze_package_with_creator(
+                    &package,
+                    &BTreeMap::new(),
+                    &carrier,
+                    &control,
+                    creation,
+                )
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let charged = window.retained_payload_bytes();
+        assert!(charged >= artifact.content().encoded_backing_capacity().unwrap() as u64);
+        let rpc = artifact.content().to_bytes();
+        let replay = rpc.clone();
+        assert!(artifact.content().shares_backing_with(
+            &novarocks_execution_contract::FrozenBytes::freeze(rpc.clone())
+        ));
+        drop(artifact);
+        drop(rpc);
+        assert_eq!(window.retained_payload_bytes(), charged);
+        assert!(!replay.is_empty());
+        drop(replay);
+        assert_eq!(window.retained_payload_bytes(), 0);
+        let occupied = window
+            .reserve_payload_bytes(window.payload_capacity_bytes())
+            .unwrap();
+        let refused = crate::query_execution::required_constant_eval::with_root_value_creation(
+            &root.owner.scope(),
+            &window,
+            &control,
+            |creation| {
+                FragmentArtifact::freeze_package_with_creator(
+                    &package,
+                    &BTreeMap::new(),
+                    &carrier,
+                    &control,
+                    creation,
+                )
+            },
+        );
+        assert!(matches!(
+            refused,
+            Err(novarocks_type_contract::CompileControlError::Source(_))
+        ));
+        assert_eq!(
+            window.retained_payload_bytes(),
+            window.payload_capacity_bytes()
+        );
+        drop(occupied);
+        assert_eq!(window.retained_payload_bytes(), 0);
     }
 
     #[test]

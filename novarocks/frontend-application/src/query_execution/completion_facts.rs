@@ -30,6 +30,7 @@
 
 mod planning_cpu;
 mod provider_source;
+mod system_source;
 pub(crate) use planning_cpu::{
     CompletedReadCpuInput, FrontendPlanningCpuSource, LogicalFinishInput, ReadEncodingInput,
     ReadEncodingPurpose,
@@ -86,20 +87,29 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 #[derive(Clone)]
 pub(crate) struct CompletionFactOwners {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<ConnectorControlHost>,
     statistics: Arc<UnifiedStatisticsResolver>,
     materialized_views: MvCandidateReader,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     blocking: ConnectorBlockingIoSupervisor,
 }
 
 impl CompletionFactOwners {
+    pub(crate) fn with_state_store_original(
+        mut self,
+        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    ) -> Self {
+        self.state_store = binding;
+        self
+    }
     pub(crate) fn system_relations(
         &self,
-    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+    ) -> &Arc<novarocks_query_application::system_tables::SystemTableRegistry> {
         &self.system_relations
     }
     pub(crate) const fn new(
@@ -111,7 +121,8 @@ impl CompletionFactOwners {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         blocking: ConnectorBlockingIoSupervisor,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     ) -> Self {
         Self {
             view_service,
@@ -121,6 +132,8 @@ impl CompletionFactOwners {
             connector_control,
             statistics,
             materialized_views,
+            mv_readiness,
+            state_store: None,
             mv_storage_observation,
             blocking,
         }
@@ -140,14 +153,15 @@ pub(crate) struct StatementFactScope {
     connector_context: ConnectorRequestContext,
     current_catalog: Option<Arc<str>>,
     capacity: QueryResultCapacityBinding,
-    definition: Option<DefinitionFactInputs>,
+    planning: Option<StatementPlanningInputs>,
     query_local_overlays:
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
 }
 
 #[derive(Clone)]
-struct DefinitionFactInputs {
-    policy: novarocks_functions::ConstantPolicy,
+struct StatementPlanningInputs {
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+    batch_target_rows: usize,
     control: novarocks_sql::compiler::SqlCompileControl,
     cpu: Option<Arc<FrontendPlanningCpuSource>>,
 }
@@ -174,7 +188,7 @@ impl StatementFactScope {
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
             capacity,
-            definition: None,
+            planning: None,
             query_local_overlays: Vec::new(),
         })
     }
@@ -226,26 +240,30 @@ impl StatementFactScope {
         scope.state_store = StatementStateStore::Governed(state_store);
         Ok(scope)
     }
-    pub(crate) fn with_definition_owned(
+    pub(crate) fn with_snapshot_planning_owned(
         mut self,
-        policy: novarocks_functions::ConstantPolicy,
         control: novarocks_sql::compiler::SqlCompileControl,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+        options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
     ) -> Self {
-        self.definition = Some(DefinitionFactInputs {
-            policy,
+        self.planning = Some(StatementPlanningInputs {
+            cancellation,
+            batch_target_rows: snapshot_batch_target(options),
             control,
             cpu: None,
         });
         self
     }
-    pub(crate) fn with_definition_planning(
+    pub(crate) fn with_snapshot_planning(
         mut self,
-        policy: novarocks_functions::ConstantPolicy,
         control: novarocks_sql::compiler::SqlCompileControl,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+        options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
         cpu: Arc<FrontendPlanningCpuSource>,
     ) -> Self {
-        self.definition = Some(DefinitionFactInputs {
-            policy,
+        self.planning = Some(StatementPlanningInputs {
+            cancellation,
+            batch_target_rows: snapshot_batch_target(options),
             control,
             cpu: Some(cpu),
         });
@@ -258,6 +276,14 @@ impl StatementFactScope {
         self.query_local_overlays = overlays;
         self
     }
+}
+
+fn snapshot_batch_target(
+    options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
+) -> usize {
+    let resolved =
+        crate::query_execution::contract::ResolvedQueryOptions::from_upstream(options.cloned());
+    novarocks_execution::runtime::query_options::chunk_size(Some(resolved.runtime_options()))
 }
 
 /// Answers relation lookups from the frontend catalog.
@@ -308,34 +334,12 @@ impl CatalogFactPort for FrontendCatalogFacts {
         .with_catalog_application(self.owners.catalog_application.as_deref())
         .with_local_views(self.local_views.clone()?)
         .with_system_relations(self.owners.system_relations().clone());
-        let materializer = if let Some(input) = self.scope.definition.as_ref() {
-            materializer.with_definition_inputs(
-                self.scope.connector_context.clone(),
-                input.policy,
-                input.control.clone(),
-            )
-        } else {
-            materializer
-        };
         let mut facts = Vec::with_capacity(needs.len());
         for need in needs {
             // Local views and generated overlays retain their precedence.
             if let Some(fact) = materializer.local_view_fact(need) {
                 facts.push(fact?);
                 continue;
-            }
-            if let Some(input) = self.scope.definition.as_ref() {
-                let cpu = input.cpu.as_ref().ok_or_else(|| {
-                    novarocks_sql::compiler::SqlCompileError::Compilation(
-                        "definition CPU source is not installed in its original custody".into(),
-                    )
-                })?;
-                if let Some(result) = materializer.system_relation_fact_on_cpu(need, cpu).await
-                    && let Some(fact) = result?
-                {
-                    facts.push(fact);
-                    continue;
-                }
             }
             facts.push(materializer.resolve_relation_fact_async(need).await?);
         }
@@ -472,7 +476,7 @@ pub(crate) fn install_frontend_fact_source(
     session: ConnectorSession,
 ) -> Result<(), String> {
     let mut scope = scope;
-    let owned_catalog_cpu = scope.definition.as_mut().and_then(|input| {
+    let owned_catalog_cpu = scope.planning.as_mut().and_then(|input| {
         if input.cpu.is_some() {
             return None;
         }
@@ -491,9 +495,16 @@ pub(crate) fn install_frontend_fact_source(
         )
         .with_creator_mode(scope.creator_mode),
     );
-    let facts = Arc::new(statement_fact_source(owners, scope, provider.clone()));
+    let system = system_source::FrontendSystemTableFacts::new(owners.clone(), scope.clone())
+        .map_err(|error| error.to_string())?;
+    let facts = Arc::new(statement_fact_source(
+        owners,
+        scope,
+        provider.clone(),
+        system.clone(),
+    ));
     custody
-        .install(facts, provider, owned_catalog_cpu)
+        .install(facts, provider, owned_catalog_cpu, system)
         .map_err(|original| {
             // No work can have been issued by this rejected new port. Destruction
             // is outside the fixed custody lock; the old source remains unchanged.
@@ -512,12 +523,14 @@ pub(crate) fn statement_fact_source<A>(
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
+    system_tables: Arc<dyn novarocks_query_application::preparation::SystemTableSnapshotFactPort>,
 ) -> QueryCompletionFactSource<A> {
     QueryCompletionFactSource::new(
         Arc::new(FrontendCatalogFacts::new(owners.clone(), scope.clone())),
         Arc::new(FrontendStatisticsFacts::new(owners.clone(), scope.clone())),
         Arc::new(FrontendMaterializedViewFacts::new(owners, scope)),
         provider_reads,
+        system_tables,
     )
 }
 

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::source::{MaterializedSystemTableBatch, StatementSystemTableSource, SystemTableRow};
+use super::construction::RowStage;
+use super::source::StatementSystemTableSource;
 use async_trait::async_trait;
 use novarocks_mv_application::freshness::mv_publication_freshness;
 use novarocks_query_application::system_tables::{
@@ -42,16 +43,14 @@ impl FrontendSystemTableProvider {
 struct Batches<'a> {
     provider: &'a FrontendSystemTableProvider,
     request: &'a SystemTableRequest<'a>,
-    rows: Vec<SystemTableRow>,
-    batches: Vec<MaterializedSystemTableBatch>,
+    rows: usize,
 }
 impl<'a> Batches<'a> {
     fn new(provider: &'a FrontendSystemTableProvider, request: &'a SystemTableRequest<'a>) -> Self {
         Self {
             provider,
             request,
-            rows: Vec::new(),
-            batches: vec![],
+            rows: 0,
         }
     }
     async fn push(&mut self, values: &[Option<&str>]) -> Result<(), SystemTableError> {
@@ -59,37 +58,34 @@ impl<'a> Batches<'a> {
             .context
             .original_operation_control()
             .check_active()?;
-        self.rows.push(
-            self.request
-                .required_columns
-                .iter()
-                .map(|&i| values[i].map(str::to_owned))
-                .collect(),
-        );
-        if self.rows.len() == self.request.batch_target_rows {
+        if self.provider.source.stage_row(values)? == RowStage::FlushRequired {
+            self.flush().await?;
+            if self.provider.source.stage_row(values)? != RowStage::Staged {
+                return Err(SystemTableError::Internal(
+                    "empty system-table batch cannot accept one row".into(),
+                ));
+            }
+        }
+        self.rows = self
+            .rows
+            .checked_add(1)
+            .ok_or_else(|| SystemTableError::Internal("system-table row count overflow".into()))?;
+        if self.rows == self.request.batch_target_rows {
             self.flush().await?;
         }
         Ok(())
     }
     async fn flush(&mut self) -> Result<(), SystemTableError> {
-        if self.rows.is_empty() {
+        if self.rows == 0 {
             return Ok(());
         }
-        let batch = self
-            .provider
-            .source
-            .materialize_batch(
-                Arc::clone(&self.request.declaration),
-                self.request.required_columns.clone(),
-                std::mem::take(&mut self.rows),
-            )
-            .await?;
-        self.batches.push(batch);
+        self.provider.source.materialize_batch().await?;
+        self.rows = 0;
         Ok(())
     }
     async fn finish(mut self) -> Result<SystemTableSnapshot, SystemTableError> {
         self.flush().await?;
-        self.provider.source.finish_snapshot(self.batches).await
+        self.provider.source.finish_snapshot().await
     }
 }
 #[async_trait]
@@ -102,6 +98,8 @@ impl SystemTableProvider for FrontendSystemTableProvider {
             .context
             .original_operation_control()
             .check_active()?;
+        self.source
+            .begin_snapshot(Arc::clone(&request.declaration), &request.required_columns)?;
         let mut batches = Batches::new(self, request);
         if request.key_constraint.is_none() {
             return batches.finish().await;

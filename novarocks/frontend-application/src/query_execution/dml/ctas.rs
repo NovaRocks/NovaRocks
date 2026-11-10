@@ -1122,6 +1122,7 @@ async fn plan_query_for_ctas_source_async(
     current_database: &str,
     query: &Query,
     execution: &QueryExecutionContext,
+    query_options: Option<&QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
 ) -> Result<PlannedCtasSourceQuery, CtasFailure> {
@@ -1162,9 +1163,10 @@ async fn plan_query_for_ctas_source_async(
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners().map_err(internal_failure)?,
-        scope.with_definition_owned(
-            state.constant_policy(),
+        scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
+            execution.cancellation().clone(),
+            query_options,
         ),
         crate::query_execution::compiler::typed_connector_session().map_err(internal_failure)?,
     )
@@ -1267,21 +1269,29 @@ async fn prepare_planned_ctas_connector_write_async(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
 
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_ctas_connector_write_plan(
-        &planned.source,
-        sink,
-        write_target_ordinal,
-        session
-            .statistics_requirements(write_target_ordinal)
-            .map_err(|error| error.to_string())?,
-        &planned.optimizer_settings,
-        planned.decimal_overflow_policy,
-        &completion_control,
-    )?;
+    let (mut completion, needs) =
+        novarocks_sql::planning::dml::begin_final_ctas_connector_write_plan(
+            &planned.source,
+            sink,
+            write_target_ordinal,
+            session
+                .statistics_requirements(write_target_ordinal)
+                .map_err(|error| error.to_string())?,
+            &planned.optimizer_settings,
+            planned.decimal_overflow_policy,
+            &completion_control,
+        )?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
     let facts = provider_source
         .resolve_provider_reads(&needs, &access_sink)
         .await?;
+    let system_facts = provider_source
+        .resolve_system_tables(completion.system_table_needs())
+        .await
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    completion
+        .install_system_tables(system_facts.into_boxed_slice(), &completion_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     provider_source
         .close()
         .await
@@ -1342,6 +1352,7 @@ async fn prepare_planned_ctas_connector_write_async(
             },
         ),
         &completion_control,
+        crate::query_execution::physical_encoding::encoding_capacity(execution)?,
     )?;
     Ok(
         crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
@@ -1578,6 +1589,7 @@ impl DmlExecutionKernel {
             &request.current_database,
             &request.command.source,
             &request.execution,
+            request.query_options.as_ref(),
             &connector_context,
             provider_source,
         )
@@ -2612,7 +2624,9 @@ impl PreparedCtasTargetPreflight {
             &preflight.planning_pin,
         )
         .map_err(internal_failure)?;
-        stack.session().io_profile().map_err(connector_failure)
+        kernel
+            .snapshot_io_profile(stack.session().io_profile().map_err(connector_failure)?)
+            .map_err(connector_failure)
     }
     pub(crate) fn validate_source(
         &self,

@@ -33,7 +33,7 @@ use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::catalog::SessionCatalogPort;
-use novarocks_query_application::system_catalog::SystemCatalogRelations;
+use novarocks_query_application::system_tables::SystemTableRegistry;
 use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -57,42 +57,18 @@ pub struct QueryPreparationKernel {
 
 /// Read-only system-table query dependencies.
 ///
-/// `information_schema` materialization is query preparation, not a command
-/// service.  It receives exactly the local catalog snapshot source, the
-/// connector control resolver needed for namespace facts, the injected system
-/// catalog, and the durable MV metadata reader.  In particular, it has no DML
-/// or MV mutation capability.
+/// Immutable system declarations only. Statement capabilities are owned by
+/// the original completion Source, never by this static kernel.
 #[derive(Clone)]
 pub struct SystemTableQueryKernel {
-    system_relations: SystemCatalogRelations,
-    mv_readiness: Arc<MvReadinessPort>,
+    system_relations: Arc<SystemTableRegistry>,
 }
-
 impl SystemTableQueryKernel {
-    pub fn new(
-        system_relations: SystemCatalogRelations,
-        mv_readiness: Arc<MvReadinessPort>,
-    ) -> Self {
-        Self {
-            system_relations,
-            mv_readiness,
-        }
+    pub fn new(system_relations: Arc<SystemTableRegistry>) -> Self {
+        Self { system_relations }
     }
-    pub fn system_relations(&self) -> &SystemCatalogRelations {
+    pub fn system_relations(&self) -> &Arc<SystemTableRegistry> {
         &self.system_relations
-    }
-    pub fn facts_port(
-        &self,
-    ) -> &Arc<dyn novarocks_query_application::system_catalog_rewrite::SystemCatalogFactsPort> {
-        self.system_relations.facts_port()
-    }
-    pub fn system_catalog(
-        &self,
-    ) -> &Arc<dyn novarocks_query_application::system_catalog::SystemCatalog> {
-        self.system_relations.system_catalog()
-    }
-    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
-        &self.mv_readiness
     }
 }
 
@@ -177,13 +153,14 @@ pub struct DmlExecutionKernel {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
-    system_relations: SystemCatalogRelations,
+    system_relations: Arc<SystemTableRegistry>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
@@ -201,7 +178,7 @@ pub struct DmlPlanningServices {
     static_plan_carrier: CompiledPackageCarrier,
     catalog_service: Arc<QueryCatalogService>,
     view_service: Arc<dyn ViewService>,
-    system_relations: SystemCatalogRelations,
+    system_relations: Arc<SystemTableRegistry>,
 }
 
 impl DmlPlanningServices {
@@ -211,7 +188,7 @@ impl DmlPlanningServices {
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
         view_service: Arc<dyn ViewService>,
-        system_relations: SystemCatalogRelations,
+        system_relations: Arc<SystemTableRegistry>,
     ) -> Self {
         Self {
             functions,
@@ -256,9 +233,37 @@ impl DmlExecutionKernel {
             mv_storage_observation,
             mv_readiness,
             connector_runtime: None,
+            state_store: None,
             write_runtime: None,
             lake_publication_runtime_policy: None,
         }
+    }
+
+    pub(crate) fn with_state_store_original(
+        mut self,
+        binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,
+    ) -> Self {
+        self.state_store = binding;
+        self
+    }
+    pub(crate) fn snapshot_io_profile(
+        &self,
+        profile: novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let Some(binding) = &self.state_store else {
+            return Ok(profile);
+        };
+        let mut dependencies = profile.initial_dependencies().to_vec();
+        dependencies.extend_from_slice(binding.blocking_dependency_facts());
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
+            profile.geometry().clone(),
+            dependencies,
+        )
     }
 
     /// Original role-owned handles, installed before any INSERT action.
@@ -300,7 +305,9 @@ impl DmlExecutionKernel {
                 blocking.clone(),
                 Arc::clone(&self.view_service),
                 self.system_relations.clone(),
-            ),
+                Arc::clone(&self.mv_readiness),
+            )
+            .with_state_store_original(self.state_store.clone()),
         )
     }
 
@@ -392,11 +399,11 @@ pub struct ViewExecutionKernel {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     view_service: Arc<dyn ViewService>,
-    system_relations: SystemCatalogRelations,
+    system_relations: Arc<SystemTableRegistry>,
 }
 
 impl ViewExecutionKernel {
-    pub(crate) fn system_relations(&self) -> &SystemCatalogRelations {
+    pub(crate) fn system_relations(&self) -> &Arc<SystemTableRegistry> {
         &self.system_relations
     }
     pub fn new(
@@ -406,7 +413,7 @@ impl ViewExecutionKernel {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
         constant_policy: novarocks_functions::ConstantPolicy,
-        system_relations: SystemCatalogRelations,
+        system_relations: Arc<SystemTableRegistry>,
     ) -> Self {
         Self {
             constant_policy,
@@ -599,6 +606,7 @@ impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 /// property admission remain separate from generic command dispatch.
 #[derive(Clone)]
 pub struct SessionCatalogResolver {
+    system_relations: Arc<SystemTableRegistry>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -614,8 +622,10 @@ impl SessionCatalogResolver {
         session_properties: Arc<
             novarocks_query_application::sql::session::registry::SessionPropertyRegistry,
         >,
+        system_relations: Arc<SystemTableRegistry>,
     ) -> Self {
         Self {
+            system_relations,
             catalog_service,
             catalog_application,
             connector_control,
@@ -638,7 +648,9 @@ impl novarocks_query_application::sql::session::registry::SessionCatalogProperty
         use novarocks_query_application::sql::session::registry::{
             CatalogPropertyIdentity, CatalogPropertyMetadata, SessionCatalogPropertyAdmission,
         };
-        if catalog == novarocks_types::naming::DEFAULT_CATALOG {
+        if catalog == novarocks_types::naming::DEFAULT_CATALOG
+            || catalog == novarocks_types::naming::SYSTEM_CATALOG
+        {
             let _local = self.catalog_service.local().read().map_err(|_| {
                 QueryServiceError::new(
                     QueryServiceErrorKind::Internal,
@@ -687,6 +699,9 @@ impl novarocks_query_application::sql::session::registry::SessionCatalogProperty
 #[async_trait::async_trait]
 impl SessionCatalogPort for SessionCatalogResolver {
     fn database_exists(&self, database_name: &str) -> Result<bool, QueryServiceError> {
+        if database_name == novarocks_types::naming::INFORMATION_SCHEMA {
+            return Ok(true);
+        }
         self.catalog_service
             .local()
             .read()
@@ -701,6 +716,9 @@ impl SessionCatalogPort for SessionCatalogResolver {
     }
 
     fn require_external_catalog_ready(&self, catalog_name: &str) -> Result<(), QueryServiceError> {
+        if catalog_name == novarocks_types::naming::SYSTEM_CATALOG {
+            return Ok(());
+        }
         let application = self.catalog_application.as_ref().ok_or_else(|| {
             QueryServiceError::new(
                 QueryServiceErrorKind::Unavailable,
@@ -736,6 +754,17 @@ impl SessionCatalogPort for SessionCatalogResolver {
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
+        if catalog_name == novarocks_types::naming::SYSTEM_CATALOG {
+            return Ok(self
+                .system_relations
+                .schemas(&novarocks_sql::system_table::SystemTableBinding::System)
+                .iter()
+                .any(|schema| schema == namespace_name));
+        }
+        if namespace_name == novarocks_types::naming::INFORMATION_SCHEMA {
+            self.require_external_catalog_ready(catalog_name)?;
+            return Ok(true);
+        }
         crate::connector::metadata_namespace_exists_async(
             self.connector_control.as_ref(),
             request,
@@ -748,24 +777,6 @@ impl SessionCatalogPort for SessionCatalogResolver {
 }
 
 #[cfg(test)]
-pub(crate) fn test_system_relations(
-    catalog_service: Arc<QueryCatalogService>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-) -> SystemCatalogRelations {
-    SystemCatalogRelations::new(
-        Arc::new(
-            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
-                catalog_service,
-                connector_control,
-            ),
-        ),
-        Arc::new(
-            novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
-        ),
-    )
-}
-
-#[cfg(test)]
 mod session_catalog_tests {
     use std::sync::Arc;
 
@@ -773,7 +784,43 @@ mod session_catalog_tests {
     use novarocks_query_application::sql::catalog::SessionCatalogPort;
     use novarocks_types::naming::DEFAULT_DATABASE;
 
-    use super::SessionCatalogResolver;
+    use super::{SessionCatalogResolver, SystemTableRegistry};
+
+    #[tokio::test]
+    async fn built_in_system_session_catalog_uses_the_installed_registry_without_external_admission()
+     {
+        use novarocks_query_application::sql::session::registry::{
+            SessionCatalogPropertyAdmission, SessionCatalogPropertyPort,
+        };
+        let resolver = resolver_without_catalog_application();
+        resolver.require_external_catalog_ready("system").unwrap();
+        let SessionCatalogPropertyAdmission::Ready(metadata) =
+            resolver.session_property_catalog("system").unwrap()
+        else {
+            panic!("built-in catalog property metadata");
+        };
+        assert_eq!(metadata.catalog(), "system");
+        assert!(metadata.identity().is_none());
+        assert_eq!(metadata.declarations().count(), 0);
+        assert!(resolver.database_exists("information_schema").unwrap());
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
+        let (_control, _root, capacity, _positions) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        for (namespace, expected) in [
+            ("metadata", true),
+            ("information_schema", true),
+            ("absent", false),
+        ] {
+            assert_eq!(
+                resolver
+                    .external_namespace_exists(context.clone(), &capacity, "system", namespace)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
 
     fn resolver_without_catalog_application() -> SessionCatalogResolver {
         SessionCatalogResolver::new(
@@ -784,6 +831,7 @@ mod session_catalog_tests {
                 novarocks_query_application::sql::session::registry::SessionPropertyRegistry::new()
                     .unwrap(),
             ),
+            Arc::new(SystemTableRegistry::try_new([]).unwrap()),
         )
     }
 
@@ -818,6 +866,7 @@ mod session_catalog_tests {
                 novarocks_query_application::sql::session::registry::SessionPropertyRegistry::new()
                     .unwrap(),
             ),
+            Arc::new(SystemTableRegistry::try_new([]).unwrap()),
         );
         let cancellation = novarocks_spi::connector::ConnectorStopOwner::new();
         let request = crate::connector::connector_request_context(None, cancellation.view())

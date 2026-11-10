@@ -27,8 +27,8 @@ use crate::state_store::execution::StateStoreOriginalOwner;
 use io_source::ReadMetadataIoSource;
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
-    ExecutionOutputObligation, LocalResultProducer, LogicalExecutionExitObserver,
-    LogicalExecutionExitReceipt, StatementNativeHealthFailure,
+    ExecutionOutputObligation, LogicalExecutionExitObserver, LogicalExecutionExitReceipt,
+    StatementNativeHealthFailure,
 };
 use novarocks_query_application::session_control::{
     GovernedActionContext, GovernedQueryStatementOwner, GovernedStatementAction,
@@ -504,13 +504,11 @@ impl GovernedStatementResidual for ReadNativeTail {
     }
 }
 struct ReadStatementAction {
-    family: novarocks_result_contract::ClientPresentationFamily,
     planning_cpu: Arc<FrontendPlanningCpuSource>,
     preparation_health: Option<StatementNativeHealthFailure>,
     provider: Arc<FrontendCompletionCustody>,
     provider_close: Option<ProviderClose>,
     provider_close_result: Option<Result<(), StatementNativeHealthFailure>>,
-    local: Option<novarocks_query_application::api::OwnedLocalResult>,
     tail: Option<Box<ReadNativeTail>>,
     preparation: Option<Preparation>,
     prepared: Option<Result<PreparedQueryOperation, QueryServiceError>>,
@@ -590,27 +588,6 @@ impl ReadStatementAction {
                 match prepared {
                     Err(error) => self.error = Some(error),
                     Ok(PreparedQueryOperation::LogicalRead(read)) => self.read = Some(read),
-                    Ok(PreparedQueryOperation::Immediate(immediate)) => {
-                        match immediate.into_result() {
-                            StatementResult::Query(result) => {
-                                match LocalResultProducer::try_new(
-                                    owner.scope(),
-                                    owner.result_window_alias().expect("admitted local window"),
-                                    self.family,
-                                )
-                                .and_then(|p| p.produce(|| Ok(result)))
-                                {
-                                    Ok(result) => self.local = Some(result),
-                                    Err(e) => self.error = Some(internal_error(e)),
-                                }
-                            }
-                            _ => {
-                                self.error = Some(internal_error(
-                                    "Read immediate has a foreign protocol owner",
-                                ))
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -621,22 +598,7 @@ impl ReadStatementAction {
                 novarocks_failure_contract::SharedFailureCause::new(error),
             ));
         }
-        if self.error.is_none() && self.local.is_some() {
-            match tail.poll_business_exit(cx) {
-                Poll::Pending | Poll::Ready(Err(_)) => return Poll::Pending,
-                Poll::Ready(Ok(())) => {}
-            }
-            if let Some(error) = tail.services.io().original().and_then(|io| io.failure()) {
-                self.error = Some(QueryServiceError::from_failure_cause(
-                    novarocks_failure_contract::SharedFailureCause::new(error),
-                ));
-            } else {
-                self.result_transferred = true;
-                return Poll::Ready(Ok(StatementActionValue::Local(
-                    self.local.take().expect("closed local Read result"),
-                )));
-            }
-        }
+
         if self.error.is_none() && self.read.is_some() {
             // Actual physical footer, not an idle projection's final settlement,
             // is the preparation-to-Native cut. Unknown remains in the tail.
@@ -741,7 +703,6 @@ impl ReadStatementAction {
             if !tail.native.is_launched() {
                 // A refused mount left every original input in this action.
                 // Dispose those inputs before retiring its unlaunched stage.
-                drop(self.local.take());
                 drop(self.original.input.take());
                 drop(self.original.request.take());
                 drop(self.read.take());
@@ -823,15 +784,12 @@ impl FrontendQuerySession {
         statement: GovernedQueryStatementOwner,
         purpose: FrontendQueryPurpose,
     ) -> Result<StatementResult, QueryServiceError> {
-        let family = match state.presentation().copied() {
-            Some(family) => family,
-            None => {
-                return Ok(self.governed_typed_error(
-                    internal_error("Read client result requires an explicit presentation"),
-                    statement,
-                ));
-            }
-        };
+        if state.presentation().is_none() {
+            return Ok(self.governed_typed_error(
+                internal_error("Read client result requires an explicit presentation"),
+                statement,
+            ));
+        }
         let window = statement
             .result_window_alias()
             .ok_or_else(|| internal_error("Read has no original result window"))?;
@@ -924,13 +882,11 @@ impl FrontendQuerySession {
             Arc::clone(&planning_cpu),
         )) as ProviderClose);
         let action = ReadStatementAction {
-            family,
             planning_cpu,
             preparation_health: None,
             provider,
             provider_close,
             provider_close_result: None,
-            local: None,
             tail: Some(Box::new(ReadNativeTail {
                 services: ReadNativeServices::new(state_store_owner, io),
                 native: ReadNativeStageTail::new(stage),

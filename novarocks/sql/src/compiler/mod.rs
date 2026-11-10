@@ -1684,13 +1684,15 @@ pub use crate::explain::completed::{
 pub use crate::explain::completed_tree::render_completed_plan_tree;
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{
-    FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_needs,
+    FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_inputs,
+    collect_provider_needs,
 };
 use completion_driver::{
     SqlCatalogCompletionState, SqlMaterializedViewCompletionState, SqlProviderReadCompletionState,
     SqlStatisticsCompletionState, resume_catalog, resume_materialized_view, resume_provider_read,
     resume_statistics,
 };
+pub(crate) use system_table_completion::install as install_system_table_snapshots;
 
 impl SqlCompiler {
     pub fn analyze(
