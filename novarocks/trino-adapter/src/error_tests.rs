@@ -114,6 +114,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.validate.duplicate_cte_name" => "DUPLICATE_NAMED_QUERY",
         "sql.validate.duplicate_window_name" => "DUPLICATE_WINDOW_NAME",
         "sql.validate.invalid_window_frame_bounds" => "INVALID_WINDOW_FRAME",
+        "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
+        "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
         "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",
