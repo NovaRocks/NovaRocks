@@ -63,7 +63,7 @@ use novarocks_workload_control::{
 use std::{alloc::Layout, collections::VecDeque, sync::Arc};
 
 /// Native, Physical, Action and Reply each dispose under an actual role.
-const APPLY_DISPOSAL_ROLES: usize = 4;
+pub(super) const APPLY_DISPOSAL_ROLES: usize = 4;
 const ROLE_STORAGE: OwnedSlotNeed = OwnedSlotNeed {
     work_headers: 1,
     completions: 1,
@@ -305,9 +305,10 @@ impl PreparedActorSend {
                     wire: context.wire,
                     client: context.client,
                     apply: context.apply,
-                    reports: self.reports,
+                    reports: super::send_reports::SendReports::Actor(self.reports),
                     clock: context.clock,
                     lifecycle: self.lifecycle,
+                    deadline: None,
                     original_captures: Box::new(()),
                 }))
             },
@@ -317,7 +318,11 @@ impl PreparedActorSend {
     }
 }
 
-fn cleanup_role(scope: &ScopeHandle, parent: ReservationId, observer: ConsumerId) -> ReportedWork {
+pub(super) fn cleanup_role(
+    scope: &ScopeHandle,
+    parent: ReservationId,
+    observer: ConsumerId,
+) -> ReportedWork {
     let reserve = || {
         let epoch = scope.gates()?.generation;
         scope.reserve_child_next(
@@ -351,6 +356,12 @@ fn quote(
 ) -> Result<(NativeAsyncActionQuote, NativeUnaryEncodingPlan), WorkError> {
     let [effect, handoff, bound, result, retirement, send] =
         actor_transport_layouts(true).map_err(|_| WorkError::ArithmeticOverflow)?;
+    let mut layouts = Vec::from([effect, handoff, bound, result, retirement, send]);
+    layouts.extend(shared_source_layouts()?);
+    original_run(operations, budget, SourceLayouts { original: &layouts })
+}
+
+pub(super) fn shared_source_layouts() -> Result<[Layout; 15], WorkError> {
     let local = storage_layouts().map_err(|_| WorkError::ArithmeticOverflow)?;
     let native = shared_apply_layouts()?;
     let disposal_value = [
@@ -362,13 +373,7 @@ fn quote(
     .into_iter()
     .max_by_key(Layout::size)
     .unwrap();
-    let layouts = [
-        effect,
-        handoff,
-        bound,
-        result,
-        retirement,
-        send,
+    Ok([
         local.transport_record,
         local.transport_registration,
         local.exit_custody,
@@ -385,6 +390,5 @@ fn quote(
         native.disposal_input,
         native.disposal_input,
         disposal_value,
-    ];
-    original_run(operations, budget, SourceLayouts { original: &layouts })
+    ])
 }

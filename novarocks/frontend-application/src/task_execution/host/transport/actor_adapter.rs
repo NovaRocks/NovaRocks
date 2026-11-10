@@ -78,11 +78,13 @@ impl ActorTransportWork {
             (Self::Send(bound), EffectBody::SendBatch { batch, reservation }) => {
                 let items = batch.operations.len();
                 bound.resolved.matches_effect(effect)
-                    && bound.reports.matches(
-                        effect.protocol.id,
-                        &bound.resolved.keys,
-                        &bound.resolved.operations,
-                    )
+                    && bound.reports.actor().is_some_and(|reports| {
+                        reports.matches(
+                            effect.protocol.id,
+                            &bound.resolved.keys,
+                            &bound.resolved.operations,
+                        )
+                    })
                     && items != 0
                     && bound.queue.parent_reservation().get() == reservation.0.get()
                     && bound.backend == batch.backend
@@ -110,7 +112,7 @@ impl ActorTransportWork {
 
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
-            Self::Send(send) => Some(send.reports.clone()),
+            Self::Send(send) => send.reports.actor().cloned(),
             Self::Admit(_) => None,
         }
     }

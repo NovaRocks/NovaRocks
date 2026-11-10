@@ -17,7 +17,7 @@
 
 //! First-wins original receipt custody. Pure P05 projections classify wire
 //! evidence; neither this guard nor the host chooses a retry or protocol exit.
-use super::{queue_input::SendKey, send_reports::ActorSendReports};
+use super::{queue_input::SendKey, send_reports::SendReports};
 use crate::{
     native::{
         apply_send_owner::OriginalReplyPublisher,
@@ -31,7 +31,7 @@ use crate::{
 };
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_models::novarocks as proto;
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
 
 pub(crate) struct PendingReceipt {
     pub(crate) key: SendKey,
@@ -40,7 +40,7 @@ pub(crate) struct PendingReceipt {
 pub(crate) struct AcceptedReceipts {
     pending: VecDeque<PendingReceipt>,
     publisher: OriginalReplyPublisher,
-    reports: Arc<ActorSendReports>,
+    reports: SendReports,
 }
 impl AcceptedReceipts {
     /// All canonical Source cells were funded before the original operations
@@ -48,7 +48,7 @@ impl AcceptedReceipts {
     pub(crate) fn new(
         sent: Vec<PendingReceipt>,
         publisher: OriginalReplyPublisher,
-        reports: Arc<ActorSendReports>,
+        reports: SendReports,
     ) -> Self {
         assert!(
             !sent.is_empty(),

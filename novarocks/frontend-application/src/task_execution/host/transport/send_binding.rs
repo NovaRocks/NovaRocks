@@ -225,7 +225,7 @@ impl PreparedSendBatch {
         Ok((
             queue,
             ResolvedBatch {
-                effect: self.effect,
+                effect: Some(self.effect),
                 operations: self.operations,
                 queued_inputs,
                 keys: self.keys,
@@ -258,14 +258,31 @@ pub(crate) struct SendBindingRefusal {
 
 /// The same committed batch after all original grants have become loans.
 pub(crate) struct ResolvedBatch {
-    effect: Arc<AttemptEffectEnvelope>,
+    effect: Option<Arc<AttemptEffectEnvelope>>,
     pub(super) operations: Vec<OperationIntent>,
     pub(super) queued_inputs: Vec<SendInputLoan>,
     pub(super) keys: Arc<[SendKey]>,
 }
 impl ResolvedBatch {
+    pub(super) fn cleanup_abort(
+        request: novarocks_execution_contract::AbortParticipation,
+        input: SendInputLoan,
+        keys: Arc<[SendKey]>,
+    ) -> Self {
+        assert_eq!(&*keys, &[input.key()]);
+        assert_eq!(input.key().operation, request.envelope().operation_id());
+        Self {
+            effect: None,
+            operations: vec![OperationIntent::AbortParticipation(request)],
+            queued_inputs: vec![input],
+            keys,
+        }
+    }
+
     pub(super) fn matches_effect(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
-        Arc::ptr_eq(&self.effect, effect)
+        self.effect
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(original, effect))
     }
 
     #[cfg(test)]

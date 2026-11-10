@@ -994,6 +994,11 @@ impl Loopback {
         )]));
     }
 
+    pub(in crate::native) fn fail_abort_owner(&self) {
+        self.peer
+            .expect_apply(ApplyAnswer::Outcomes(vec![OperationOutcome::OwnerFailed]));
+    }
+
     pub(in crate::native) async fn settle(&mut self) -> bool {
         for shutdown in &mut self.shutdown {
             if let Some(shutdown) = shutdown.take() {

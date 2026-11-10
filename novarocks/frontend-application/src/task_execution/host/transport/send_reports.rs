@@ -163,6 +163,60 @@ pub(crate) struct ActorSendReports {
     rows: Mutex<Option<SendReportRows>>,
 }
 
+/// A cleanup send has one original reply cell and no failed-Core mailbox leg.
+pub(super) struct AbortReply {
+    pub(super) key: SendKey,
+    pub(super) value: Mutex<Option<OperationAcknowledgement>>,
+    pub(super) outcome: Mutex<Option<super::source_ports::BodyOutcome>>,
+}
+
+#[derive(Clone)]
+pub(super) enum SendReports {
+    Actor(Arc<ActorSendReports>),
+    Abort(Arc<AbortReply>),
+}
+
+impl SendReports {
+    pub(super) fn actor(&self) -> Option<&Arc<ActorSendReports>> {
+        match self {
+            Self::Actor(reports) => Some(reports),
+            Self::Abort(_) => None,
+        }
+    }
+
+    pub(super) fn record_ack(&self, key: SendKey, ack: OperationAcknowledgement) {
+        match self {
+            Self::Actor(reports) => reports.record_ack(key, ack),
+            Self::Abort(reply) => {
+                assert_eq!(key, reply.key);
+                assert_eq!(ack.operation_id(), key.operation);
+                assert_eq!(
+                    ack.kind(),
+                    novarocks_execution_contract::OperationKind::AbortParticipation
+                );
+                assert!(reply.value.lock().unwrap().replace(ack).is_none());
+            }
+        }
+    }
+
+    pub(super) fn send_started(&self, at: MonotonicInstant) {
+        if let Some(actor) = self.actor() {
+            actor.send_started(at);
+        }
+    }
+
+    pub(super) fn establish_rpc_started(
+        &self,
+        operation: TaskOperationId,
+        participation: ParticipationRef,
+        at: MonotonicInstant,
+    ) {
+        self.actor()
+            .expect("Establish always uses the admitted Core port")
+            .establish_rpc_started(operation, participation, at);
+    }
+}
+
 struct RowLoan<'a> {
     owner: &'a Mutex<Option<SendReportRows>>,
     rows: Option<SendReportRows>,

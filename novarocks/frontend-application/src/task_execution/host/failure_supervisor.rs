@@ -221,6 +221,7 @@ impl FailureSupervisor {
 pub(crate) enum FailureSupervisorError {
     Join(JoinError),
     Exit(ExitWorkError),
+    ChildExitUnresolved,
 }
 
 #[must_use = "the host retains the supervisor's Join, panic, and original ticket"]
@@ -261,11 +262,13 @@ impl RunningFailureSupervisor {
             Ok(Err(error)) => return Poll::Ready(Err(FailureSupervisorError::Exit(error))),
             Ok(Ok(())) => {}
         }
-        assert!(
-            self.custody
-                .actual_exit_ready()
-                .expect("supervisor actual exit")
-        );
+        if !self
+            .custody
+            .actual_exit_ready()
+            .expect("supervisor actual exit")
+        {
+            return Poll::Ready(Err(FailureSupervisorError::ChildExitUnresolved));
+        }
         self.report
             .consume(self.observer)
             .expect("original exit report leg");

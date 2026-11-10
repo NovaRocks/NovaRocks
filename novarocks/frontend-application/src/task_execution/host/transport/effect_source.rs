@@ -78,7 +78,7 @@ pub(crate) struct NativeReportReferences {
 
 pub(crate) struct AttemptSendSource {
     pub(crate) requests: FrozenSendRequests,
-    pub(crate) contexts: BTreeMap<BackendProcessId, SendContext>,
+    pub(crate) contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     pub(crate) report_references:
         BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
     pub(crate) report_author: ReportedWork,
@@ -122,7 +122,7 @@ pub(crate) struct AttemptTransportSource {
     scope: ScopeHandle,
     admission: AdmissionSource,
     requests: FrozenSendRequests,
-    contexts: BTreeMap<BackendProcessId, SendContext>,
+    contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
     report_author: Option<ReportedWork>,
     send_idle: [VecDeque<Position>; 2],

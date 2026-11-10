@@ -21,7 +21,7 @@ use super::{
     capacity::{EncodingCustody, QueueCustody},
     prepare::PrepareSend,
     send_binding::ResolvedBatch,
-    send_reports::ActorSendReports,
+    send_reports::SendReports,
     settlement::{AcceptedReceipts, PendingReceipt},
     source_ports::{BodyOutcome, TransportLeg},
 };
@@ -69,9 +69,10 @@ pub(crate) struct BoundSend {
     pub(crate) wire: AttemptWireFacts,
     pub(crate) client: Client,
     pub(crate) apply: ApplySendPort,
-    pub(crate) reports: Arc<ActorSendReports>,
+    pub(super) reports: SendReports,
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) lifecycle: Option<LifecycleStarts>,
+    pub(super) deadline: Option<tokio::time::Instant>,
     pub(crate) original_captures: Box<dyn Any + Send>,
 }
 pub(crate) struct SendJob {
@@ -86,9 +87,10 @@ struct Captures {
     wire: AttemptWireFacts,
     transport: novarocks_task_codec::TransportBudget,
     client: Client,
-    reports: Arc<ActorSendReports>,
+    reports: SendReports,
     clock: Arc<dyn MonotonicClock>,
     lifecycle: Option<LifecycleStarts>,
+    deadline: Option<tokio::time::Instant>,
     _original: Box<dyn Any + Send>,
     panic: novarocks_control_runtime::exit_work::PanicSink,
 }
@@ -106,7 +108,7 @@ fn sent(intent: &crate::task_execution::intent::OperationIntent) -> SentOperatio
         },
     }
 }
-fn local_refusal(reports: &ActorSendReports, item: PendingReceipt, outcome: OperationOutcome) {
+fn local_refusal(reports: &SendReports, item: PendingReceipt, outcome: OperationOutcome) {
     reports.record_ack(
         item.key,
         OperationAcknowledgement::local_refusal(
@@ -155,6 +157,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         reports,
         clock,
         lifecycle,
+        deadline,
         original_captures,
     } = *bound;
     let lane = if control_progress {
@@ -189,6 +192,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         inputs: resolved.queued_inputs,
         registration,
         keys: resolved.keys.clone(),
+        deadline,
     });
     let captures = Captures {
         operations: resolved.operations,
@@ -200,6 +204,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         reports: reports.clone(),
         clock: clock.clone(),
         lifecycle,
+        deadline,
         _original: original_captures,
         panic: panic.clone(),
     };
@@ -240,7 +245,7 @@ async fn encode_and_send(
             Err(detail) => {
                 tracing::warn!(detail=%detail, kind=intent.kind().as_str(), "task operation cannot be encoded");
                 local_refusal(
-                    captures.reports.as_ref(),
+                    &captures.reports,
                     item,
                     OperationOutcome::InvalidStateOrRequest,
                 );
@@ -254,11 +259,7 @@ async fn encode_and_send(
         Ok(requests) => requests,
         Err(error) => {
             for item in pending {
-                local_refusal(
-                    captures.reports.as_ref(),
-                    item,
-                    OperationOutcome::ResourceExhausted,
-                );
+                local_refusal(&captures.reports, item, OperationOutcome::ResourceExhausted);
             }
             return BodyOutcome::RawFailure(Box::new(error));
         }
@@ -266,7 +267,7 @@ async fn encode_and_send(
     if requests.len() != 1 {
         for item in pending {
             local_refusal(
-                captures.reports.as_ref(),
+                &captures.reports,
                 item,
                 OperationOutcome::InvalidStateOrRequest,
             );
@@ -280,25 +281,20 @@ async fn encode_and_send(
     };
     if let Err(error) = encoding.shrink_to(actual) {
         for item in pending {
-            local_refusal(
-                captures.reports.as_ref(),
-                item,
-                OperationOutcome::ResourceExhausted,
-            );
+            local_refusal(&captures.reports, item, OperationOutcome::ResourceExhausted);
         }
         return BodyOutcome::RawFailure(Box::new(error));
     }
     if let Err(error) = captures.queue.mark_in_flight() {
         for item in pending {
-            local_refusal(
-                captures.reports.as_ref(),
-                item,
-                OperationOutcome::ResourceExhausted,
-            );
+            local_refusal(&captures.reports, item, OperationOutcome::ResourceExhausted);
         }
         return BodyOutcome::RawFailure(Box::new(error));
     }
     let expires = tokio::time::Instant::now() + request.deadline;
+    let expires = captures
+        .deadline
+        .map_or(expires, |limit| expires.min(limit));
     let publisher = ready
         .publisher
         .take()
@@ -350,6 +346,7 @@ struct PreparationInput {
     inputs: Vec<super::queue_input::SendInputLoan>,
     registration: TransportJoinRegistration,
     keys: Arc<[super::queue_input::SendKey]>,
+    deadline: Option<tokio::time::Instant>,
 }
 async fn prepare_input(
     input: PreparationInput,
@@ -380,7 +377,16 @@ async fn prepare_input(
         input.inputs,
         input.registration,
     ) {
-        Ok(preparation) => preparation.await,
+        Ok(preparation) => match input.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, preparation)
+                .await
+                .map_err(|_| {
+                    super::prepare::PreparationFailure::Governance(
+                        novarocks_workload_control::WorkError::CapacityWaitTimeout,
+                    )
+                })?,
+            None => preparation.await,
+        },
         Err(error) => Err(error),
     }
 }

@@ -66,6 +66,29 @@ pub(crate) fn original_run(
     ),
     WorkError,
 > {
+    let establishes = operations
+        .iter()
+        .filter(|operation| matches!(operation, OperationIntent::EstablishParticipation(_)))
+        .count();
+    let reports = layout_sum(
+        &super::send_reports::actor_send_report_layouts(operations.len(), establishes)
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+    )?;
+    original_run_with_reports(operations, budget, source, reports)
+}
+
+pub(super) fn original_run_with_reports(
+    operations: &[OperationIntent],
+    budget: TransportBudget,
+    source: SourceLayouts<'_>,
+    reports: usize,
+) -> Result<
+    (
+        NativeAsyncActionQuote,
+        novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan,
+    ),
+    WorkError,
+> {
     let layouts = send::backing_layouts();
     let preparation = layouts[0]
         .size()
@@ -97,14 +120,6 @@ pub(crate) fn original_run(
         novarocks_workload_control::joint_admission::NativeQueuedInputGrant,
     >(operations.len())?
     .size();
-    let establishes = operations
-        .iter()
-        .filter(|operation| matches!(operation, OperationIntent::EstablishParticipation(_)))
-        .count();
-    let reports = layout_sum(
-        &super::send_reports::actor_send_report_layouts(operations.len(), establishes)
-            .map_err(|_| WorkError::ArithmeticOverflow)?,
-    )?;
     let owned_peak = native
         .checked_add(preparation.max(transition).max(encoded))
         .and_then(|peak| peak.checked_add(attached_inputs))

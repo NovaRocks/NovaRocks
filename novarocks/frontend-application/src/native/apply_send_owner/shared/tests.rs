@@ -1665,20 +1665,36 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
 
 #[tokio::test]
 async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal() {
-    run_actor_send(true, false).await;
+    run_actor_send(true, None).await;
 }
 
 #[tokio::test]
 async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
-    run_actor_send(false, false).await;
+    run_actor_send(false, None).await;
 }
 
 #[tokio::test]
 async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
-    run_actor_send(false, true).await;
+    run_actor_send(
+        false,
+        Some(novarocks_execution_contract::OperationOutcome::Accepted),
+    )
+    .await;
 }
 
-async fn run_actor_send(withdraw: bool, fail_core: bool) {
+#[tokio::test]
+async fn actor_send_failure_retains_worker_owner_failure_and_unknown_residual() {
+    run_actor_send(
+        false,
+        Some(novarocks_execution_contract::OperationOutcome::OwnerFailed),
+    )
+    .await;
+}
+
+async fn run_actor_send(
+    withdraw: bool,
+    failure_verdict: Option<novarocks_execution_contract::OperationOutcome>,
+) {
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{
@@ -1692,7 +1708,7 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
     use crate::task_execution::host::failure_supervisor::{
-        FailureCleanupPort, FailureCleanupRequest, FailureSupervisor,
+        FailureCleanupRequest, FailureSupervisor,
     };
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
@@ -1713,10 +1729,13 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody, MonotonicInstant,
     };
-    use novarocks_execution_contract::{AbortCause, AbortParticipation, ParticipationRef};
+    use novarocks_execution_contract::{
+        AbortCause, AbortParticipation, OperationOutcome, ParticipationRef,
+    };
     use novarocks_types::FrontendProcessId;
 
     let roles = Roles::new();
+    let fail_core = failure_verdict.is_some();
     let mut peer = if withdraw {
         None
     } else {
@@ -1744,6 +1763,12 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
     let starts = lifecycle.starts();
     if let Some(peer) = &peer {
         peer.accept_abort(participation);
+        match failure_verdict {
+            Some(OperationOutcome::Accepted) => peer.accept_abort(participation),
+            Some(OperationOutcome::OwnerFailed) => peer.fail_abort_owner(),
+            None => {}
+            Some(other) => panic!("unsupported fixture failure verdict {other:?}"),
+        }
     }
     let abort = AbortParticipation::new(
         TaskOperationId::new_v7(),
@@ -1839,6 +1864,22 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
                 Some(OperationIntent::AbortParticipation(_))
             ));
         }
+        fn retain_transport_failure(&mut self, original: Box<dyn std::any::Any + Send>) {
+            use crate::task_execution::host::failure_supervisor::FailureSupervisorError;
+            if let Some((error, panic)) =
+                original.downcast_ref::<(FailureSupervisorError, PanicSink)>()
+            {
+                eprintln!("Failure supervisor test observed {error:?}");
+                if let Some(raw) = panic.take() {
+                    eprintln!(
+                        "Failure supervisor raw payload: {:?} {:?}",
+                        raw.downcast_ref::<String>(),
+                        raw.downcast_ref::<&str>()
+                    );
+                }
+            }
+            std::panic::resume_unwind(original);
+        }
         fn transport_event(&mut self, _: AttemptActionId, original: custody::TransportSourceEvent) {
             match original {
                 custody::TransportSourceEvent::Report(transport::SendReportReturn::Receipt {
@@ -1918,26 +1959,26 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
 
     #[derive(Default)]
     struct CleanupState {
-        aborts: Vec<AbortParticipation>,
+        aborts: Vec<transport::FailureAbortAttempt>,
         residual: Option<FailureCleanupRequest>,
         dropped: bool,
     }
     struct CleanupPort(Arc<Mutex<CleanupState>>);
-    impl FailureCleanupPort for CleanupPort {
-        fn abort_once(
-            &mut self,
-            request: AbortParticipation,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(async move {
-                self.0.lock().unwrap().aborts.push(request);
-            })
-        }
+    impl transport::FailureResidualPort for CleanupPort {
         fn finish(
             self: Box<Self>,
             original: FailureCleanupRequest,
+            attempts: Vec<transport::FailureAbortAttempt>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async move {
-                assert!(self.0.lock().unwrap().residual.replace(original).is_none());
+                for attempt in &attempts {
+                    if let Err(error) = &attempt.result {
+                        eprintln!("Original failure Abort: {error:?}");
+                    }
+                }
+                let mut state = self.0.lock().unwrap();
+                assert!(state.residual.replace(original).is_none());
+                state.aborts = attempts;
             })
         }
     }
@@ -1947,7 +1988,10 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
         }
     }
 
-    let failure_work = roles.cleanup(parent.id());
+    let (failure_work, failure_capacity, failure_report) = roles.cleanup(parent.id()).into_parts();
+    let failure_payer = failure_capacity.id();
+    let failure_work =
+        ReportedWork::try_new(failure_work, failure_capacity, failure_report).unwrap();
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
         [(admit, None), (send.clone(), Some(queue))],
@@ -2000,6 +2044,7 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
         observer: observer(),
     };
     let actor = inbox.registration().actor();
+    let contexts = Arc::new(BTreeMap::from([(backend, context)]));
     let actor_runtime = inbox.runtime();
     let host = HostRegistry::new(
         actor_runtime.clone(),
@@ -2015,6 +2060,12 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
         &roles.scope,
     ));
     let cleanup = Arc::new(Mutex::new(CleanupState::default()));
+    let failure_port = transport::NativeFailureCleanup::new(
+        contexts.clone(),
+        failure_payer,
+        handle.clone(),
+        Box::new(CleanupPort(cleanup.clone())),
+    );
     let supervisor = FailureSupervisor::new(
         actor_runtime.clone(),
         inbox.registration().clone(),
@@ -2043,7 +2094,7 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
             admission,
             transport::AttemptSendSource {
                 requests,
-                contexts: BTreeMap::from([(backend, context)]),
+                contexts,
                 report_references: BTreeMap::new(),
                 report_author,
                 idle: send_idle,
@@ -2055,7 +2106,7 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
                 },
                 transport::AttemptFailureBinding {
                     supervisor,
-                    port: Box::new(CleanupPort(cleanup.clone())),
+                    port: Box::new(failure_port),
                 },
             ),
             Box::new(ScopeOwner {
@@ -2234,7 +2285,24 @@ async fn run_actor_send(withdraw: bool, fail_core: bool) {
         let [abort] = cleanup.aborts.as_slice() else {
             panic!("one frozen failure abort")
         };
-        assert_eq!(abort.participation(), participation);
+        assert_eq!(abort.request.participation(), participation);
+        let outcome = abort
+            .result
+            .as_ref()
+            .unwrap_or_else(|error| panic!("failed to deliver original failure Abort: {error:?}"));
+        let receipt = outcome.receipt.as_ref().unwrap();
+        assert_eq!(receipt.operation, abort.request.envelope().operation_id());
+        assert_ne!(receipt.operation, key.operation);
+        assert_eq!(
+            receipt.worker.as_ref().unwrap().outcome(),
+            failure_verdict.unwrap()
+        );
+        assert_eq!(
+            receipt.participation_state,
+            (failure_verdict == Some(OperationOutcome::Accepted))
+                .then_some(novarocks_execution_contract::ParticipationState::Aborting)
+        );
+        assert_eq!(peer.as_ref().unwrap().control_requests(), 2);
         let residual = cleanup.residual.as_ref().unwrap();
         assert_eq!(&*residual.unknown_participations, &[participation]);
         residual.publication.unwrap();
