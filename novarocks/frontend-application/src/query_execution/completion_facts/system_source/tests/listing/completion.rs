@@ -156,7 +156,7 @@ async fn original_fe_completion_materializes_reads_joins_aggregates_and_analyze_
                 &mut fixture.driver,
                 driver.complete(
                     request(sql, intent, compile),
-                    &source.scope.capacity.scope(),
+                    source.scope.capacity.scope(),
                     &taken,
                     cpu.as_ref(),
                 ),
@@ -287,7 +287,7 @@ async fn original_fe_completion_rejects_a_provider_carrier_type_mismatch_as_inte
                     SqlCompileIntent::Query,
                     source.planning().unwrap().control.clone(),
                 ),
-                &source.scope.capacity.scope(),
+                source.scope.capacity.scope(),
                 &taken,
                 cpu.as_ref(),
             ),

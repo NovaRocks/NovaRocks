@@ -246,7 +246,6 @@ impl HadoopFileSystemCatalog {
 
     /// Both listing and existence use the same complete directory/probe walk.
     /// Existence keeps only a bool rather than cloning unused TableIdent values.
-
     async fn scan_external_tables(
         &self,
         namespace: &NamespaceIdent,
@@ -666,13 +665,7 @@ fn hex_digest(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-// Eight bounded path temporaries cover namespace joins, probe paths, and
-// provider-relative paths while the directory/result containers coexist.
-
-/// Refuse a directory listing that exceeds the caller's listing bound. The
-/// refusal is carried as the typed source so the catalog owner can keep its
-/// `ResourceExhausted` classification.
-
+/// Preserve the caller's typed read-control failure without a listing-size gate.
 fn check_catalog_read_control(
     control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
 ) -> Result<()> {

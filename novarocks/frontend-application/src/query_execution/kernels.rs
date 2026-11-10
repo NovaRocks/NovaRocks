@@ -261,7 +261,7 @@ impl DmlExecutionKernel {
         dependencies.sort_unstable();
         dependencies.dedup();
         novarocks_spi::connector::ConnectorMetadataMaintenanceIoProfile::from_geometry(
-            profile.geometry().clone(),
+            *profile.geometry(),
             dependencies,
         )
     }

@@ -185,8 +185,7 @@ fn receive_and_run(
     .unwrap();
     runtime.shutdown_driver_execution().unwrap();
     runtime.shutdown_sink_io().unwrap();
-    drop(project_host);
-    drop(type_host);
+    // Retain the original preparation loan through real driver and sink shutdown.
     drop(loan);
     drop(original);
     chunks

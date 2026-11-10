@@ -379,7 +379,7 @@ mod tests {
         };
         // Repeated empty singular strings are legal protobuf. The final
         // visible value remains the same empty, redacted producer detail.
-        let mut details = vec![0x12, 0x00].repeat(9 * 1024 * 1024 / 2);
+        let mut details = [0x12, 0x00].repeat(9 * 1024 * 1024 / 2);
         details.extend(verdict.encode_to_vec());
         let mut receipt_bytes = wire::TaskOperationReceipt {
             operation_id: receipt.operation_id,

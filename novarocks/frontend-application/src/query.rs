@@ -311,32 +311,26 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
                             novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
                         ) =>
                     {
-                        iceberg_ref
-                            .execute_command(
-                                &command,
-                                context.session().current_database(),
-                                command_context.connector_context(),
-                            )
-                            .map_err(Into::into)
+                        iceberg_ref.execute_command(
+                            &command,
+                            context.session().current_database(),
+                            command_context.connector_context(),
+                        )
                     }
                     novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command) => {
-                        catalog
-                            .execute_iceberg_command(
-                                &command,
-                                context.session().current_catalog(),
-                                context.session().current_database(),
-                                command_context.connector_context(),
-                            )
-                            .map_err(Into::into)
-                    }
-                    command => catalog
-                        .execute_command(
+                        catalog.execute_iceberg_command(
                             &command,
                             context.session().current_catalog(),
                             context.session().current_database(),
                             command_context.connector_context(),
                         )
-                        .map_err(Into::into),
+                    }
+                    command => catalog.execute_command(
+                        &command,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        command_context.connector_context(),
+                    ),
                 }
             },
         )

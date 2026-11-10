@@ -689,6 +689,57 @@ fn prepare_pipeline_execution_from_graph(
     })
 }
 
+/// Run a provider-free compiled component through the real preparation and
+/// driver join. Integration tests supply the original runtime and tracker;
+/// the caller owns their shutdown. The collector only substitutes the external
+/// sink, so this proves component execution rather than Native delivery.
+#[cfg(any(test, novarocks_dev_controls))]
+#[doc(hidden)]
+pub fn run_compiled_component_for_test(
+    program: Arc<novarocks_local_program::LocalProgram>,
+    runtime: Arc<crate::runtime::execution_runtime::ExecutionRuntime>,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> ExecutionResult<Vec<crate::exec::chunk::Chunk>> {
+    let state = Arc::new(RuntimeState::for_local_execution(
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(tracker),
+        Some(runtime),
+    ));
+    let output = crate::exec::operators::ResultSinkBuffer::new();
+    let sink = crate::exec::operators::ResultSinkFactory::new(output.clone());
+    let dop = i32::try_from(program.graph().profile().pipeline_dop().get())
+        .expect("component fixture DOP fits i32");
+    let prepared = prepare_compiled_program_with_sink_materializer(
+        program,
+        Duration::from_millis(10),
+        |_, authors| {
+            authors.seal().map_err(compiled_pipeline_launch_error)?;
+            Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(Box::new(sink)))
+        },
+        ExchangeBindings::default(),
+        ScanBindings::default(),
+        crate::runtime::task::CompiledWriterBindings::default(),
+        None,
+        None,
+        dop,
+        state,
+        Arc::new(crate::runtime::task::io::NoopTaskEventSink),
+        None,
+    )
+    .map_err(|error| error.cause().clone())?;
+    let running = prepared.start();
+    running.join()?;
+    assert!(
+        running.completion.stopped_fact().is_some(),
+        "successful component join proves actual driver exit"
+    );
+    Ok(output.take_chunks())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::exec::chunk::Chunk;
@@ -2193,55 +2244,4 @@ mod tests {
             )
         );
     }
-}
-
-/// Run a provider-free compiled component through the real preparation and
-/// driver join. Integration tests supply the original runtime and tracker;
-/// the caller owns their shutdown. The collector only substitutes the external
-/// sink, so this proves component execution rather than Native delivery.
-#[cfg(any(test, novarocks_dev_controls))]
-#[doc(hidden)]
-pub fn run_compiled_component_for_test(
-    program: Arc<novarocks_local_program::LocalProgram>,
-    runtime: Arc<crate::runtime::execution_runtime::ExecutionRuntime>,
-    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
-) -> ExecutionResult<Vec<crate::exec::chunk::Chunk>> {
-    let state = Arc::new(RuntimeState::for_local_execution(
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(tracker),
-        Some(runtime),
-    ));
-    let output = crate::exec::operators::ResultSinkBuffer::new();
-    let sink = crate::exec::operators::ResultSinkFactory::new(output.clone());
-    let dop = i32::try_from(program.graph().profile().pipeline_dop().get())
-        .expect("component fixture DOP fits i32");
-    let prepared = prepare_compiled_program_with_sink_materializer(
-        program,
-        Duration::from_millis(10),
-        |_, authors| {
-            authors.seal().map_err(compiled_pipeline_launch_error)?;
-            Ok(crate::runtime::task::sink::MaterializedCompiledSink::single(Box::new(sink)))
-        },
-        ExchangeBindings::default(),
-        ScanBindings::default(),
-        crate::runtime::task::CompiledWriterBindings::default(),
-        None,
-        None,
-        dop,
-        state,
-        Arc::new(crate::runtime::task::io::NoopTaskEventSink),
-        None,
-    )
-    .map_err(|error| error.cause().clone())?;
-    let running = prepared.start();
-    running.join()?;
-    assert!(
-        running.completion.stopped_fact().is_some(),
-        "successful component join proves actual driver exit"
-    );
-    Ok(output.take_chunks())
 }
