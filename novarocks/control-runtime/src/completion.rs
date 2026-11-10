@@ -106,7 +106,7 @@ impl ReportSlot {
         max_consumers: usize,
         consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
     ) -> Result<Self, RuntimeError> {
-        Self::reserve_inner(owner, Some(id), generation, max_consumers, consumers)
+        Self::reserve_inner(owner, Some(id), Some(generation), max_consumers, consumers)
     }
     /// Claims one original completion position and its actual report under the
     /// same ledger transaction. Iterator execution stays outside every lock.
@@ -116,12 +116,21 @@ impl ReportSlot {
         max_consumers: usize,
         consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
     ) -> Result<Self, RuntimeError> {
-        Self::reserve_inner(owner, None, generation, max_consumers, consumers)
+        Self::reserve_inner(owner, None, Some(generation), max_consumers, consumers)
+    }
+    /// Bind a local exit report from the positions of an already admitted,
+    /// bound Work. Scope failure cannot invalidate those original positions.
+    /// This grants no admission, start, or generation-sensitive publication.
+    pub fn reserve_exit_observer_for_admitted(
+        owner: &mut crate::obligation::ReservationObligation,
+        observer: ConsumerId,
+    ) -> Result<Self, RuntimeError> {
+        Self::reserve_inner(owner, None, None, 1, [(observer, ConsumerKind::Observer)])
     }
     fn reserve_inner(
         owner: &mut impl ReportStorageOwner,
         explicit: Option<SlotId>,
-        generation: Generation,
+        generation: Option<Generation>,
         max_consumers: usize,
         consumers: impl IntoIterator<Item = (ConsumerId, ConsumerKind)>,
     ) -> Result<Self, RuntimeError> {
@@ -151,11 +160,12 @@ impl ReportSlot {
             .scopes
             .get(&scope.id)
             .ok_or(RuntimeError::UnknownScope)?;
-        if scope_state.generation() != generation {
+        if generation.is_some_and(|expected| scope_state.generation() != expected) {
             return Err(
                 novarocks_control_runtime_core::scope::ScopeError::GenerationMismatch.into(),
             );
         }
+        let generation = scope_state.generation();
         if scope_state.work(producer).is_none() {
             return Err(novarocks_control_runtime_core::scope::ScopeError::UnknownWork.into());
         }

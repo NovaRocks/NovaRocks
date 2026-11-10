@@ -39,7 +39,7 @@ use novarocks_control_runtime::{
     exit_work::{GatedOutcome, GatedWork, run_future},
     transaction::{RuntimeLedger, ScopeHandle},
 };
-use novarocks_control_runtime_core::{identity::Generation, scope::WorkKind};
+use novarocks_control_runtime_core::identity::Generation;
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_execution_contract::OperationOutcome;
 use novarocks_workload_control::joint_admission::{
@@ -85,8 +85,6 @@ struct Captures {
     client: Client,
     reports: Arc<dyn TransportReports>,
     clock: Arc<dyn MonotonicClock>,
-    lane: TransportCapacityLane,
-    quoted_bytes: usize,
     _original: Box<dyn Any + Send>,
     panic: novarocks_control_runtime::exit_work::PanicSink,
 }
@@ -198,8 +196,6 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         client,
         reports: reports.clone(),
         clock: clock.clone(),
-        lane,
-        quoted_bytes: encoding.protobuf_bytes(),
         _original: original_captures,
         panic: panic.clone(),
     };
@@ -391,7 +387,7 @@ async fn execute_prepared(
     captures: Captures,
     prepared: Result<super::prepare::ReadyAction, super::prepare::PreparationFailure>,
 ) -> BodyOutcome {
-    let ready = match prepared {
+    let mut ready = match prepared {
         Ok(ready) => ready,
         Err(error) => {
             for (intent, key) in captures.operations.iter().zip(captures.keys.iter()) {
@@ -413,15 +409,11 @@ async fn execute_prepared(
         Ok(guard) => guard,
         Err(error) => return BodyOutcome::LocalFailure(error),
     };
-    let kind = if captures.lane == TransportCapacityLane::Control {
-        WorkKind::Settlement
-    } else {
-        WorkKind::Business
+    let encoding_job = match ready.bind_encoding(guard) {
+        Ok(job) => job,
+        Err(error) => return BodyOutcome::RawFailure(Box::new(error)),
     };
-    let encoding_job = captures
-        .reports
-        .bind_encoding(guard, kind, captures.quoted_bytes);
-    let encoding = EncodingCustody::new(encoding_job.window, Arc::downgrade(&captures.reports));
+    let encoding = EncodingCustody::new(encoding_job.window, encoding_job.returned);
     let panic = captures.panic.clone();
     let child = encode_and_send(captures, ready, encoding);
     match run_future(encoding_job.exit, child, panic).await {

@@ -317,6 +317,7 @@ impl Roles {
         parent: ReservationId,
         backend: BackendProcessId,
         bytes: usize,
+        kind: WorkKind,
     ) -> StepRegistration {
         let mut resources = self
             .layout
@@ -324,7 +325,7 @@ impl Roles {
             .unwrap();
         resources.owned_slots = role_slots();
         self.scope
-            .reserve_child_next(generation(), parent, resources, WorkKind::Cleanup)
+            .reserve_child_next(generation(), parent, resources, kind)
             .unwrap()
     }
     fn finish(self) {
@@ -337,6 +338,7 @@ impl Roles {
 #[derive(Clone, Copy)]
 enum Mode {
     Encoded,
+    InlineEncoded { fail_scope: bool },
     Unused,
 }
 struct EncodingChild {
@@ -348,6 +350,9 @@ struct Captures {
     preparation: SharedApplyPreparation,
     mode: Mode,
     encoded: Arc<Mutex<Option<EncodingChild>>>,
+    inline: Option<(custody::TransportJoinRegistration, custody::EncodingBinding)>,
+    fail_scope: Option<ScopeHandle>,
+    panic: PanicSink,
 }
 fn transport_factory(
     exit: ExitObligation,
@@ -366,6 +371,22 @@ fn transport_factory(
 }
 fn fixture_body(captures: Captures, (): ()) -> impl Future<Output = ()> {
     async move {
+        if let Some((source, binding)) = captures.inline {
+            if let Some(scope) = captures.fail_scope {
+                assert_ne!(scope.fail().unwrap(), generation());
+            }
+            let guard = captures.preparation.take_encoding().unwrap();
+            let job = source.bind_encoding(guard, binding).unwrap();
+            let encoding = transport::EncodingCustody::new(job.window, job.returned);
+            novarocks_control_runtime::exit_work::run_future(
+                job.exit,
+                inline_encoding_body(encoding),
+                captures.panic,
+            )
+            .await
+            .unwrap();
+            return;
+        }
         if matches!(captures.mode, Mode::Encoded) {
             let (work, mut capacity) = captures
                 .preparation
@@ -397,6 +418,17 @@ fn fixture_body(captures: Captures, (): ()) -> impl Future<Output = ()> {
             });
         }
     }
+}
+fn inline_encoding_body(mut encoding: transport::EncodingCustody) -> impl Future<Output = ()> {
+    poll_fn(move |_| {
+        encoding.shrink_to(1).unwrap();
+        Poll::Ready(())
+    })
+}
+fn inline_encoding_layout<F: Future<Output = ()>>(
+    _: fn(transport::EncodingCustody) -> F,
+) -> Layout {
+    Layout::new::<F>()
 }
 fn actual_gated_backing<F: Future<Output = ()>>(body: fn(Captures, ()) -> F) -> [Layout; 4] {
     GatedWork::<Captures>::backing_layouts::<std::future::Ready<()>, F>(body)
@@ -474,7 +506,11 @@ struct Row {
 async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mode: Mode) -> Row {
     let backend = BackendProcessId::new_v7();
     let operation = cancel(backend);
-    let layouts = source_layouts();
+    let mut layouts = source_layouts();
+    if matches!(mode, Mode::InlineEncoded { .. }) {
+        layouts.extend(custody::encoding_owned_layouts().unwrap());
+        layouts.push(inline_encoding_layout(inline_encoding_body));
+    }
     let (quote, plan) = transport::original_run_for_factory(
         &[operation.clone()],
         TransportBudget::DEFAULT,
@@ -510,7 +546,12 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
         Poll::Ready(Ok(offer)) => offer,
         _ => panic!("original Native action offer"),
     };
-    let encoding = roles.encoding(principal, backend, plan.protobuf_bytes());
+    let encoding_kind = if matches!(mode, Mode::InlineEncoded { .. }) {
+        WorkKind::Settlement
+    } else {
+        WorkKind::Cleanup
+    };
+    let encoding = roles.encoding(principal, backend, plan.protobuf_bytes(), encoding_kind);
     let slot = runtime.apply_send_port().reserve_original_slot(1).unwrap();
     let panic = PanicSink::new();
     let inner = panic.clone();
@@ -563,14 +604,29 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
     drop(action);
     let encoded = Arc::new(Mutex::new(None));
     let cell = Arc::clone(&encoded);
+    let inline = matches!(mode, Mode::InlineEncoded { .. }).then(|| custody::EncodingBinding {
+        layout: roles.layout.clone(),
+        backend,
+        lane: TransportCapacityLane::Control,
+        quoted_bytes: plan.protobuf_bytes(),
+    });
+    let fail_scope =
+        matches!(mode, Mode::InlineEncoded { fail_scope: true }).then(|| roles.scope.clone());
+    assert!(matches!(
+        source.take_encoding_return(),
+        Err(custody::CustodyError::OriginalAttachmentUnresolved)
+    ));
     launch
-        .spawn(&Handle::current(), exit, move |exit, _| {
+        .spawn(&Handle::current(), exit, move |exit, source| {
             transport_factory(
                 exit,
                 Captures {
                     preparation,
                     mode,
                     encoded: cell,
+                    inline: inline.map(|binding| (source, binding)),
+                    fail_scope,
+                    panic: inner.clone(),
                 },
                 inner,
             )
@@ -580,8 +636,28 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
         .await
         .unwrap()
         .expect("actual same row Join");
-    let mut bound = encoded.lock().unwrap().take();
-    if let Some(original) = bound.take() {
+    let bound = encoded.lock().unwrap().take();
+    let (encoding, child) = if let Some(original) = bound {
+        (
+            Some(original.quota),
+            Some((original.custody, original.exit)),
+        )
+    } else {
+        let original = source.take_encoding_return().unwrap();
+        assert_eq!(
+            original.is_some(),
+            matches!(mode, Mode::InlineEncoded { .. })
+        );
+        if let Some(ref original) = original {
+            assert_eq!(original.resources().unwrap().quota.get(TOTAL_BYTES), 1);
+            assert!(matches!(
+                source.take_encoding_return(),
+                Err(custody::CustodyError::CompletionAlreadyIssued)
+            ));
+        }
+        (original, None)
+    };
+    let retirement = if let Some(encoding) = encoding {
         let facts = completion.join_facts();
         let queue_id = queue.id();
         let (completion, funds) =
@@ -594,35 +670,23 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
             panic!("same funding returned")
         };
         assert_eq!(queue.id(), queue_id);
-        let retirement = complete_shared_join(
+        complete_shared_join(
             completion,
-            SharedApplyFunding::Encoded(ReturnedQuota {
-                queue,
-                encoding: original.quota,
-            }),
+            SharedApplyFunding::Encoded(ReturnedQuota { queue, encoding }),
         )
-        .unwrap_or_else(|_| panic!("same encoded proof accepted"));
-        Row {
-            source,
-            retirement,
-            child: Some((original.custody, original.exit)),
-            publisher: Some(publisher),
-            cleanup,
-            completed: Vec::with_capacity(4),
-            settlement: None,
-        }
+        .unwrap_or_else(|_| panic!("same encoded proof accepted"))
     } else {
-        let retirement = complete_shared_join(completion, SharedApplyFunding::UnusedQueue(queue))
-            .unwrap_or_else(|_| panic!("same unused proof accepted"));
-        Row {
-            source,
-            retirement,
-            child: None,
-            publisher: Some(publisher),
-            cleanup,
-            completed: Vec::with_capacity(4),
-            settlement: None,
-        }
+        complete_shared_join(completion, SharedApplyFunding::UnusedQueue(queue))
+            .unwrap_or_else(|_| panic!("same unused proof accepted"))
+    };
+    Row {
+        source,
+        retirement,
+        child,
+        publisher: Some(publisher),
+        cleanup,
+        completed: Vec::with_capacity(4),
+        settlement: None,
     }
 }
 struct DropGate {
@@ -818,10 +882,18 @@ async fn finish_row(
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn unused_shared_row_disposes_same_guard_then_returns_funds_before_wc_queue_exit() {
+    shared_row_releases_funds_before_wc_queue_exit(Mode::Unused).await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_encoding_returns_its_typed_partition_after_the_original_join() {
+    shared_row_releases_funds_before_wc_queue_exit(Mode::InlineEncoded { fail_scope: false }).await;
+    shared_row_releases_funds_before_wc_queue_exit(Mode::InlineEncoded { fail_scope: true }).await;
+}
+async fn shared_row_releases_funds_before_wc_queue_exit(mode: Mode) {
     let roles = Roles::new();
     let mut wc = Governed::new();
     let mut runtime = FrontendDataRuntime::new(Handle::current());
-    let original = row(&roles, &runtime, &mut wc, Mode::Unused).await;
+    let original = row(&roles, &runtime, &mut wc, mode).await;
     roles.scope.close_external().unwrap();
     let before = roles
         .ledger
@@ -986,7 +1058,7 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     let operation = cancel(backend);
     let (parent, queue, principal) = roles.parent(backend, operation.queued_bytes());
     let queue_id = queue.id();
-    let encoding = roles.encoding(principal, backend, 64);
+    let encoding = roles.encoding(principal, backend, 64, WorkKind::Cleanup);
     let input = wc.admit(NativeQueuedInputQuote::for_original_native_input(
         NonZeroU64::new(Layout::new::<NativeQueuedInputGrant>().size() as u64).unwrap(),
         0,

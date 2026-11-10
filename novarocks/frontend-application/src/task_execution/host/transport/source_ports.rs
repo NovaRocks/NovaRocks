@@ -19,22 +19,15 @@
 //! alternate protocol owners, result stores, Work factories or quota wallets.
 
 use super::{
-    capacity::{EncodingWindow, ReturnedPhysical},
+    capacity::ReturnedPhysical,
     queue_input::{OriginalQueuedInput, SendInputLoan, SendKey},
 };
 use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
-use novarocks_control_runtime::{exit_custody::ExitObligation, obligation::StepRegistration};
-use novarocks_control_runtime_core::scope::WorkKind;
+use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
-
-pub(crate) struct EncodingJob {
-    /// Same reserve_child_next_or_wait guard, bound to one actual child Work.
-    pub(crate) exit: ExitObligation,
-    pub(crate) window: EncodingWindow,
-}
 
 pub(crate) enum BodyOutcome {
     /// The same real WC grant is installed in the canonical Source record.
@@ -72,15 +65,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
     /// Consume the original WC input and bind its actual host record before
     /// exposing the passive reference. Ordinary refusal returns the full input.
     fn install_input(&self, input: OriginalQueuedInput) -> Result<(), OriginalQueuedInput>;
-    /// No borrowed grant or numeric reference is accepted as a producer.
-    /// This hook binds the same paid child guard, report/captures/consumer and
-    /// real ExitCustody; it does not create another Work or capacity invoice.
-    fn bind_encoding(
-        &self,
-        guard: StepRegistration,
-        kind: WorkKind,
-        quoted_bytes: usize,
-    ) -> EncodingJob;
     /// Gated capture teardown parks ONLY the same financial partition here.
     /// This is not physical-return/actual-exit evidence. Source retains it and
     /// its original report/Join obligations. Once its unique Join truly exits,

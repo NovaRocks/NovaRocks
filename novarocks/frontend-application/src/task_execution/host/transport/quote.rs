@@ -75,8 +75,13 @@ pub(crate) fn original_run(
     let transition = body
         .checked_add(layouts[2].size())
         .ok_or(WorkError::ArithmeticOverflow)?;
+    let encoding_roles = layout_sum(
+        &crate::task_execution::host::custody::encoding_owned_layouts()
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+    )?;
     let encoded = body
         .checked_add(layouts[4].size())
+        .and_then(|size| size.checked_add(encoding_roles))
         .ok_or(WorkError::ArithmeticOverflow)?;
     // destroy_pre releases P and its waits before GatedBody exists. The tuple
     // coexists with body creation; the encode F is allocated only after that

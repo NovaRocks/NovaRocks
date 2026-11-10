@@ -27,7 +27,9 @@ use crate::native::{
     transport::{Client, NativeChannelSource, NativeDialHandoff},
     transport_capacity::{NativeTransportCapacity, TransportCapacityLane},
 };
-use crate::task_execution::host::custody::TransportJoinRegistration;
+use crate::task_execution::host::custody::{
+    CustodyError, EncodingBinding, EncodingJob, TransportJoinRegistration,
+};
 use novarocks_control_runtime::{
     capacity_notification::CapacityRegistrant,
     obligation::StepRegistration,
@@ -71,6 +73,16 @@ pub(crate) struct ReadyAction {
     pub(crate) call: Option<NativeCallSource>,
     pub(crate) publisher: Option<crate::native::apply_send_owner::OriginalReplyPublisher>,
     pub(crate) row: SharedApplyPreparation,
+    encoding: Option<(TransportJoinRegistration, EncodingBinding)>,
+}
+impl ReadyAction {
+    pub(crate) fn bind_encoding(
+        &mut self,
+        guard: StepRegistration,
+    ) -> Result<EncodingJob, CustodyError> {
+        let (source, binding) = self.encoding.take().expect("one original encoding binding");
+        source.bind_encoding(guard, binding)
+    }
 }
 impl Drop for ReadyAction {
     fn drop(&mut self) {
@@ -562,6 +574,15 @@ impl Future for PrepareSend {
             call: physical.call.take(),
             publisher: Some(publisher),
             row,
+            encoding: Some((
+                this.registration.clone(),
+                EncodingBinding {
+                    layout: this.layout.clone(),
+                    backend: this.backend,
+                    lane: this.lane,
+                    quoted_bytes: this.encoding_bytes,
+                },
+            )),
         };
         drop(physical);
         drop(this.registrant.take());

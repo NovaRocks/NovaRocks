@@ -45,6 +45,8 @@ pub(crate) use actor_adapter::{
     ActorTransportHandoff, ActorTransportResultPort, ActorTransportWork, BoundActorTransport,
     actor_transport_layouts, handoff_actor_transport,
 };
+#[cfg(test)]
+pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{
     EncodingWindow, QueueCustody, QueueWindow, QuotaLeg, ReturnedPhysical, ReturnedQuota,
 };
@@ -58,6 +60,5 @@ pub(crate) use quote::{
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(crate) use send::{BoundSend, SendJob, run as run_send};
 pub(crate) use source_ports::{
-    BodyOutcome, EncodingJob, ResolvedBatch, TransportCompletionObligation, TransportLeg,
-    TransportReports,
+    BodyOutcome, ResolvedBatch, TransportCompletionObligation, TransportLeg, TransportReports,
 };

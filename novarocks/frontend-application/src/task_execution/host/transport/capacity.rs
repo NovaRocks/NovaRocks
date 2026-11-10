@@ -21,7 +21,9 @@
 use crate::native::transport_capacity::{
     NativeTransportCapacity, TOTAL_BYTES, TransportCapacityError, TransportCapacityLane,
 };
-use novarocks_control_runtime::{obligation::ReservationObligation, transaction::RuntimeError};
+use novarocks_control_runtime::{
+    obligation::ReservationObligation, owned_return::OwnedReturnSender, transaction::RuntimeError,
+};
 use novarocks_control_runtime_core::{capacity::ReservationResources, identity::ReservationId};
 use novarocks_types::BackendProcessId;
 
@@ -180,7 +182,6 @@ pub(crate) type ReturnedPhysical = crate::native::apply_send_owner::SharedPhysic
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QuotaLeg {
     Queue,
-    Encoding,
 }
 struct ReturnQuota {
     leg: QuotaLeg,
@@ -247,30 +248,28 @@ impl Drop for QueueCustody {
     }
 }
 pub(crate) struct EncodingCustody {
-    window: Option<EncodingWindow>,
-    returned: ReturnQuota,
+    original: Option<(EncodingWindow, OwnedReturnSender<ReservationObligation>)>,
 }
 impl EncodingCustody {
     pub(crate) fn new(
         window: EncodingWindow,
-        source: std::sync::Weak<dyn super::source_ports::TransportReports>,
+        returned: OwnedReturnSender<ReservationObligation>,
     ) -> Self {
         Self {
-            window: Some(window),
-            returned: ReturnQuota {
-                leg: QuotaLeg::Encoding,
-                source,
-            },
+            original: Some((window, returned)),
         }
     }
     pub(crate) fn shrink_to(&mut self, actual: usize) -> Result<(), CapacityFailure> {
-        self.window.as_mut().unwrap().shrink_to(actual)
+        let (window, _) = self.original.as_mut().expect("live original encoding");
+        window.shrink_to(actual)
     }
 }
 impl Drop for EncodingCustody {
     fn drop(&mut self) {
-        if let Some(window) = self.window.take() {
-            self.returned.stage(window.into_original());
+        if let Some((window, returned)) = self.original.take() {
+            if let Err(refused) = returned.publish(window.into_original()) {
+                std::panic::resume_unwind(Box::new(refused));
+            }
         }
     }
 }

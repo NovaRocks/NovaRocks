@@ -427,7 +427,7 @@ enum TransportRegistrationState {
     Unattached,
     UnattachedJoined,
     Attaching,
-    Attached(SharedApplyJoinObligation),
+    Attached(SharedApplyJoinObligation, ReservationId),
     Refused(RefusedAttachment),
     PhysicalRetiring,
     Issued,
@@ -459,6 +459,7 @@ struct TransportRegistration {
     parent: WorkId,
     state: Mutex<TransportRegistrationState>,
     send: Mutex<Option<OriginalSendQueue>>,
+    encoding: Mutex<Option<encoding::EncodingChild>>,
     retained: Mutex<Option<Arc<Self>>>,
 }
 #[derive(Clone)]
@@ -627,11 +628,12 @@ impl TransportJoinRegistration {
         }
         // Native may wake its own owner here. An unwind leaves the original
         // attachment unresolved, so an observed Join cannot clear the row.
+        let encoding_id = encoding.reservation_id();
         let attached = slot.prepare_shared(inputs, encoding);
         let mut state = record.state.lock().unwrap_or_else(|e| e.into_inner());
         match attached {
             Ok((preparation, join)) => {
-                *state = TransportRegistrationState::Attached(join);
+                *state = TransportRegistrationState::Attached(join, encoding_id);
                 Ok(preparation)
             }
             Err(refusal) => {
@@ -752,6 +754,7 @@ impl OriginalTransportJoinObligation {
             parent,
             state: Mutex::new(TransportRegistrationState::Unattached),
             send: Mutex::new(None),
+            encoding: Mutex::new(None),
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
@@ -768,6 +771,35 @@ impl OriginalTransportJoinObligation {
         TransportJoinRegistration {
             original: Arc::downgrade(&self.native),
         }
+    }
+
+    /// The encoding body is inline in the original transport Join. Move its
+    /// one typed return only after that Join and the parent report were read.
+    pub(crate) fn take_encoding_return(
+        &mut self,
+    ) -> Result<Option<ReservationObligation>, CustodyError> {
+        if !matches!(
+            *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
+            TransportRegistrationState::PhysicalRetiring
+        ) {
+            return Err(CustodyError::OriginalAttachmentUnresolved);
+        }
+        let Some(mut child) = self
+            .native
+            .encoding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return Ok(None);
+        };
+        let result = child.take_partition().map(Some);
+        *self
+            .native
+            .encoding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(child);
+        result
     }
     pub(crate) fn take_handoff_failure(&self) -> Option<Box<dyn std::any::Any + Send>> {
         self.role.take_handoff_failure()
@@ -810,7 +842,7 @@ impl OriginalTransportJoinObligation {
             }
             _ => {}
         }
-        let next = if matches!(*state, TransportRegistrationState::Attached(_)) {
+        let next = if matches!(*state, TransportRegistrationState::Attached(..)) {
             TransportRegistrationState::PhysicalRetiring
         } else if self
             .native
@@ -825,7 +857,7 @@ impl OriginalTransportJoinObligation {
         };
         let original = match std::mem::replace(&mut *state, next) {
             TransportRegistrationState::Unattached => None,
-            TransportRegistrationState::Attached(original) => Some(original),
+            TransportRegistrationState::Attached(original, _) => Some(original),
             _ => unreachable!("qualified original attachment"),
         };
         let facts = self
@@ -976,6 +1008,18 @@ impl OriginalTransportJoinObligation {
         ) {
             return Ok(false);
         }
+        let encoding = self
+            .native
+            .encoding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|child| child.custody.clone());
+        if let Some(encoding) = encoding
+            && !encoding::EncodingChild::retired(&encoding)?
+        {
+            return Ok(false);
+        }
         if self.role.retire()? {
             let retained = self
                 .native
@@ -1020,6 +1064,8 @@ pub(crate) fn storage_layouts()
 
 mod physical_return;
 pub(crate) use physical_return::{PhysicalInputRetirementObligation, PhysicalReturnError};
+mod encoding;
+pub(crate) use encoding::{EncodingBinding, EncodingJob, owned_layouts as encoding_owned_layouts};
 
 #[cfg(test)]
 mod tests;
