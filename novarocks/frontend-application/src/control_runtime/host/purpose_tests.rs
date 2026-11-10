@@ -889,8 +889,19 @@ fn owner_failure_during_full_credit_probe_reaches_the_original_custodian_before_
     assert_eq!(dropped, 1);
 }
 
+use crate::task_execution::host::failure_supervisor::{
+    FailureCleanupPort, FailureCleanupRequest, FailureSupervisor, RunningFailureSupervisor,
+};
+
 struct SupervisorSource {
-    cleanup: Arc<Mutex<Option<EffectTicket<FrontendEffect>>>>,
+    setup: Option<(
+        FailureSupervisor,
+        FailureContext,
+        Box<dyn FailureCleanupPort>,
+    )>,
+    running: Option<RunningFailureSupervisor>,
+    cleanup: Arc<Mutex<Option<(InputId, InputId)>>>,
+    unresolved: novarocks_coordination_contract::AttemptActionId,
 }
 
 impl EffectSource for SupervisorSource {
@@ -927,7 +938,18 @@ impl EffectSource for SupervisorSource {
         context: Option<FailureContext>,
     ) {
         assert!(context.is_none());
-        assert!(self.cleanup.lock().unwrap().replace(ticket).is_none());
+        let FrontendEffect::AttemptOwnerFailed { failed_input, .. } = &ticket.effect else {
+            unreachable!()
+        };
+        assert!(
+            self.cleanup
+                .lock()
+                .unwrap()
+                .replace((ticket.input, failed_input.input))
+                .is_none()
+        );
+        let (supervisor, context, port) = self.setup.take().unwrap();
+        self.running = Some(supervisor.start(ticket, context, Box::new([self.unresolved]), port));
     }
 
     fn close_external(&mut self) {}
@@ -938,19 +960,64 @@ impl EffectSource for SupervisorSource {
 
     fn progress_retirement(
         &mut self,
-        _: &ActorRuntime<FrontendActor>,
-        _: &ActorHostTurn<FrontendActor>,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
         _: Tick,
-        _: usize,
+        budget: usize,
     ) -> SourceProgress {
-        SourceProgress {
+        let mut progress = SourceProgress {
             units: 0,
             progressed: false,
             more: false,
-            // No ordinary Source custody remains. The fixture holds the
-            // supervisor Work separately to exercise the host's own gate.
-            retired: true,
+            retired: false,
+        };
+        if budget != 0
+            && let Some(running) = self.running.as_mut()
+        {
+            progress.units = 1;
+            if let std::task::Poll::Ready(result) = running.progress() {
+                result.unwrap();
+                let (_, failed) = self.cleanup.lock().unwrap().unwrap();
+                runtime
+                    .retire_input(turn.registration().actor(), failed)
+                    .unwrap();
+                self.running.take();
+                progress.progressed = true;
+                progress.retired = true;
+            }
         }
+        progress
+    }
+}
+
+struct HoldCleanup {
+    reached: tokio::sync::oneshot::Sender<(
+        FailureCleanupRequest,
+        Vec<novarocks_execution_contract::AbortParticipation>,
+    )>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    aborts: Vec<novarocks_execution_contract::AbortParticipation>,
+}
+impl FailureCleanupPort for HoldCleanup {
+    fn abort_once(
+        &mut self,
+        request: novarocks_execution_contract::AbortParticipation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.aborts.push(request);
+        })
+    }
+
+    fn finish(
+        self: Box<Self>,
+        original: FailureCleanupRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            self.reached
+                .send((original, self.aborts))
+                .unwrap_or_else(|_| panic!("original cleanup observer"));
+            self.release.await.unwrap();
+        })
     }
 }
 
@@ -967,7 +1034,6 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         failure_publication::{FailurePublications, ReplyAdmissionError, RootControlReplyKind},
     };
     use novarocks_attempt_protocol::failure::AttemptFailure;
-    use novarocks_control_runtime::exit_work::{PanicSink, run_future};
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptToLogical,
         AttemptToLogicalBody,
@@ -1026,7 +1092,6 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         .unwrap()
         .bind(WorkKind::Cleanup)
         .unwrap();
-    let work_ref = work.reference();
     let runtime = ActorRuntime::new();
     let config = ActorConfig {
         mailbox: [4; 4],
@@ -1065,8 +1130,14 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let lifecycle = FailureLifecycle::freeze([participation].into_iter());
+    let late_participation = ParticipationRef::new(
+        execution,
+        participation.frontend_process_id(),
+        BackendProcessId::new_v7(),
+    );
+    let lifecycle = FailureLifecycle::freeze([participation, late_participation].into_iter());
     lifecycle.starts().record(participation);
+    let late_start = lifecycle.starts();
     let publications = Arc::new(FailurePublications::new(
         registration.clone(),
         activation,
@@ -1143,9 +1214,17 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         [(consumer, ConsumerKind::Observer)],
     )
     .unwrap();
-    let (custody, exit) =
-        ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+    let supervisor = FailureSupervisor::new(
+        runtime.clone(),
+        registration.clone(),
+        ReportedWork::try_new(work, capacity, report).unwrap(),
+        consumer,
+        tokio::runtime::Handle::current(),
+    );
     let cleanup = Arc::new(Mutex::new(None));
+    let unresolved = AttemptActionId::new(NonZeroU64::new(7).unwrap());
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let (reached, mut reached_cleanup) = tokio::sync::oneshot::channel();
     let executor = Arc::new(HoldingExecutor::default());
     let host = HostRegistry::new(
         runtime.clone(),
@@ -1161,6 +1240,17 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             policy: FrontendLanePolicy::attempt(1),
             source: Box::new(SupervisorSource {
                 cleanup: cleanup.clone(),
+                setup: Some((
+                    supervisor,
+                    context,
+                    Box::new(HoldCleanup {
+                        reached,
+                        release: wait,
+                        aborts: Vec::new(),
+                    })
+                )),
+                running: None,
+                unresolved,
             }),
             executor: executor.clone(),
             transport: None,
@@ -1174,27 +1264,11 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         .unwrap();
     assert!(runtime.poll_one(Tick(1)).unwrap());
     host.drive(Tick(1), runtime.claim_host_actor().unwrap());
-    let ticket = cleanup.lock().unwrap().take().unwrap();
-    assert_eq!(ticket.descriptor.work, work_ref);
-    assert!(
-        matches!(&ticket.effect, FrontendEffect::AttemptOwnerFailed { scope: id, generation, failed_input }
-        if *id == scope.id() && *generation == ticket.generation && *generation != initial
-            && failed_input.input == failed)
-    );
-    let supervisor = ticket.input;
-    let unresolved = AttemptActionId::new(NonZeroU64::new(7).unwrap());
-    let (release, wait) = tokio::sync::oneshot::channel::<()>();
-    let mut job = Box::pin(run_future(
-        exit,
-        async {
-            context
-                .publish(&runtime, &ticket, Box::new([unresolved]))
-                .unwrap();
-            wait.await.unwrap();
-        },
-        PanicSink::new(),
-    ));
-    assert!(futures::poll!(job.as_mut()).is_pending());
+    let (supervisor, triggering) = cleanup.lock().unwrap().unwrap();
+    assert_eq!(triggering, failed);
+    let lost = tokio::time::timeout(std::time::Duration::from_secs(1), publications.take_lost())
+        .await
+        .unwrap();
     let failed_reply = reply.take_once().unwrap();
     assert_eq!(failed_reply.activation, activation);
     if let Some(original) = original_reply {
@@ -1213,9 +1287,6 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         }
     }
     assert!(reply.take_once().is_none());
-    let lost = tokio::time::timeout(std::time::Duration::from_secs(1), publications.take_lost())
-        .await
-        .unwrap();
     assert_eq!(lost.activation, activation);
     assert!(
         matches!(&lost.body, AttemptToLogicalBody::AttemptLost { failure: AttemptFailure::OwnerFailed, unknown_participations, unresolved_actions } if **unknown_participations == [participation] && **unresolved_actions == [unresolved])
@@ -1230,19 +1301,38 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
     ));
     runtime.notify_host_actor(&registration).unwrap();
     host.drive(Tick(2), runtime.claim_host_actor().unwrap());
-    assert!(cleanup.lock().unwrap().is_none());
     assert!(executor.jobs.lock().unwrap().is_empty());
     assert!(runtime.claim_host_actor().is_none());
-    assert!(!host.is_empty() && !custody.actual_exit_ready().unwrap());
-
-    release.send(()).unwrap();
-    job.as_mut().await.unwrap();
-    drop(job);
-    assert!(custody.actual_exit_ready().unwrap());
-    runtime.effect_completed_for(&registration, ticket).unwrap();
-    runtime.retire_input(actor, supervisor).unwrap();
-    runtime.retire_input(actor, failed).unwrap();
-    assert!(runtime.take_failure_payload(actor).unwrap().is_some());
+    assert!(!host.is_empty());
+    assert!(matches!(
+        reached_cleanup.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    late_start.record(late_participation);
+    drop(late_start);
+    let (original, aborts) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), reached_cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+    original.publication.unwrap();
+    assert_eq!(
+        original.core_panic.downcast_ref::<&str>().copied(),
+        Some("fixture failure after original reply admission")
+    );
+    let mut expected = [participation, late_participation];
+    expected.sort();
+    assert_eq!(&*original.unknown_participations, &expected);
+    assert!(
+        aborts
+            .iter()
+            .map(|request| request.participation())
+            .eq(expected)
+    );
+    assert!(matches!(
+        runtime.retire_input(actor, supervisor),
+        Err(ActorTurnError::EffectsRemain)
+    ));
     bridge_work.body_exited().unwrap();
     bridge_work.captures_exited().unwrap();
     if let Some(role) = role.as_mut() {
@@ -1252,12 +1342,18 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
     bridge_scope.close_external().unwrap();
     ledger.reap_scope_ready(bridge_scope.id(), 8).unwrap();
     ledger.remove_scope(bridge_scope.id()).unwrap();
-    report.consume(consumer).unwrap();
-    assert!(custody.try_retire().unwrap());
-    ledger.reap_scope_ready(scope.id(), 8).unwrap();
-    scope.close_external().unwrap();
-    runtime.notify_host_actor(&registration).unwrap();
-    host.drive(Tick(3), runtime.claim_host_actor().unwrap());
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !host.is_empty() {
+            if let Some(turn) = runtime.claim_host_actor() {
+                host.drive(Tick(3), turn);
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
 }
 
