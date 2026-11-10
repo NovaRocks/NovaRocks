@@ -32,7 +32,10 @@ use crate::task_execution::host::custody::{
 };
 use novarocks_control_runtime::{
     actor::ActorConfig,
-    actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
+    actor_turn::{
+        ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
+        FailureSourceState,
+    },
     causal_input::CausalInputObligation,
     effect_dispatch::{DispatchError, EffectDispatch, EffectLanePolicy, EffectRelease},
     exit_custody::ExitObligation,
@@ -136,6 +139,12 @@ pub(crate) trait EffectSource: Send + 'static {
     /// arrange actual unused withdrawal/cleanup and retain all partial custody.
     /// It may neither inspect the suspect Core nor drop the job as proof of exit.
     fn owner_failed_pending(&mut self, pending: PendingHandoff);
+    /// Transfer the one supervisor effect to its original cleanup owner.
+    /// The owner launches its prepaid Work off the poller and retains the
+    /// ticket until publication and actual exit allow the input to retire.
+    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
+        std::panic::resume_unwind(Box::new(ticket));
+    }
     /// Stop new external admission while draining already admitted effects.
     fn close_external(&mut self);
     /// True only when no new original result loan can be issued. Closing the
@@ -242,6 +251,7 @@ struct HostMachine {
     scan_remaining: Option<usize>,
     rescan_requested: bool,
     pending: Option<PendingHandoff>,
+    failure_handed_off: bool,
     external_closed: bool,
 }
 struct HostEntry {
@@ -395,6 +405,7 @@ impl HostRegistry {
                     scan_remaining: None,
                     rescan_requested: false,
                     pending: None,
+                    failure_handed_off: false,
                     external_closed: false,
                 })),
             }),
@@ -613,10 +624,33 @@ impl HostRegistry {
         if failed && let Some(pending) = machine.pending.take() {
             machine.source.owner_failed_pending(pending);
         }
+        if failed && !machine.failure_handed_off {
+            let actor = entry.registration.actor();
+            if let FailureSourceState::ClosedPending(input) =
+                self.runtime.failure_source_state(actor)?
+            {
+                budget -= 1;
+                // The failure fence becomes visible before the supervisor
+                // batch commits. The Core turn wakes this host on commit.
+                match self.runtime.effect_inventory(actor, input, None, 1) {
+                    Ok(effects) => {
+                        if let [(descriptor, _)] = effects.as_slice() {
+                            let ticket = self.runtime.take_effect(actor, input, descriptor.id)?;
+                            self.runtime.validate_failure_effect_ticket(&ticket)?;
+                            machine.source.owner_failed_cleanup(ticket);
+                            machine.failure_handed_off = true;
+                            handoffs += 1;
+                        }
+                    }
+                    Err(ActorTurnError::UnknownInput) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         let transport = machine.transport.as_mut().map(|transport| {
             // One original row visit per host turn leaves the original
             // indexing allowance available to make the Core and effects run.
-            transport.progress(turn, 1, |effect, event| {
+            transport.progress(turn, budget.min(1), |effect, event| {
                 machine.source.transport_event(effect, event);
             })
         });
@@ -635,6 +669,15 @@ impl HostRegistry {
             retired.progressed |= transport.progressed;
             retired.more |= transport.more;
             retired.retired &= machine.transport.as_ref().unwrap().is_empty();
+        }
+        if retired.retired
+            && matches!(
+                self.runtime
+                    .failure_source_state(entry.registration.actor())?,
+                FailureSourceState::ClosedPending(_)
+            )
+        {
+            retired.retired = false;
         }
         if retired.progressed && machine.scan_remaining.is_some() {
             machine.rescan_requested = true;

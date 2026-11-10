@@ -889,6 +889,205 @@ fn owner_failure_during_full_credit_probe_reaches_the_original_custodian_before_
     assert_eq!(dropped, 1);
 }
 
+struct SupervisorSource {
+    cleanup: Arc<Mutex<Option<EffectTicket<FrontendEffect>>>>,
+}
+
+impl EffectSource for SupervisorSource {
+    fn prepay_result(
+        &mut self,
+        _: &FrontendEffect,
+    ) -> Option<CausalInputObligation<FrontendActor>> {
+        panic!("supervisor cleanup does not borrow a business input position")
+    }
+
+    fn bind_job(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        _: &EffectTicket<FrontendEffect>,
+        _: CausalInputObligation<FrontendActor>,
+    ) -> PreparedEffectJob {
+        panic!("supervisor cleanup uses its original Work")
+    }
+
+    fn return_unclaimed_result(&mut self, _: CausalInputObligation<FrontendActor>) {
+        unreachable!();
+    }
+
+    fn core_consumed(&mut self, _: &[InputId]) {}
+
+    fn owner_failed_pending(&mut self, _: PendingHandoff) {
+        unreachable!();
+    }
+
+    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
+        assert!(self.cleanup.lock().unwrap().replace(ticket).is_none());
+    }
+
+    fn close_external(&mut self) {}
+
+    fn result_admission_closed(&self) -> bool {
+        true
+    }
+
+    fn progress_retirement(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        _: Tick,
+        _: usize,
+    ) -> SourceProgress {
+        SourceProgress {
+            units: 0,
+            progressed: false,
+            more: false,
+            // No ordinary Source custody remains. The fixture holds the
+            // supervisor Work separately to exercise the host's own gate.
+            retired: true,
+        }
+    }
+}
+
+#[tokio::test]
+async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() {
+    use novarocks_control_runtime::{
+        exit_work::{PanicSink, run_future},
+        publication::PublishedReply,
+    };
+
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let initial = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, initial).unwrap();
+    let (work, mut capacity) = scope
+        .reserve_next(
+            initial,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let work_ref = work.reference();
+    let runtime = ActorRuntime::new();
+    let config = ActorConfig {
+        mailbox: [4; 4],
+        max_batches: 4,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 8,
+        max_step_work: 1,
+    };
+    let actor = ActorId::new(1).unwrap();
+    let registration = runtime
+        .register_supervised_bound(
+            actor,
+            scope.clone(),
+            FrontendActor::Test(Box::new(Emitter { batches: vec![] })),
+            config,
+            &work,
+        )
+        .unwrap_or_else(|(error, _)| panic!("supervised registration: {error:?}"));
+    let consumer = ConsumerId::new(1).unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut capacity,
+        initial,
+        1,
+        [(consumer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let (custody, exit) =
+        ExitCustody::from_admitted(ReportedWork::try_new(work, capacity, report.clone()).unwrap());
+    let cleanup = Arc::new(Mutex::new(None));
+    let executor = Arc::new(HoldingExecutor::default());
+    let host = HostRegistry::new(
+        runtime.clone(),
+        ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(FixedClock))),
+    );
+    assert!(
+        host.register(HostBinding {
+            scope: scope.clone(),
+            registration: registration.clone(),
+            kind: FrontendActorKind::Test,
+            config,
+            policy: FrontendLanePolicy::attempt(1),
+            source: Box::new(SupervisorSource {
+                cleanup: cleanup.clone(),
+            }),
+            executor: executor.clone(),
+            transport: None,
+        })
+        .is_ok()
+    );
+    let failed = runtime
+        .reserve_input(actor, actor, InputClass::Lifecycle)
+        .unwrap()
+        .fill(FrontendInput::Test(CLEANUP_FENCE))
+        .unwrap();
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    host.drive(Tick(1), runtime.claim_host_actor().unwrap());
+    let ticket = cleanup.lock().unwrap().take().unwrap();
+    assert_eq!(ticket.descriptor.work, work_ref);
+    assert!(
+        matches!(&ticket.effect, FrontendEffect::AttemptOwnerFailed { scope: id, generation, failed_input }
+        if *id == scope.id() && *generation == ticket.generation && *generation != initial
+            && failed_input.input == failed)
+    );
+    let supervisor = ticket.input;
+    let reply = PublishedReply::new(&scope);
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let mut job = Box::pin(run_future(
+        exit,
+        async {
+            let mut session = runtime.claim_failure_publication(&ticket).unwrap();
+            assert!(session.registration().same_registration(&registration));
+            session
+                .commit_reply(&reply, Arc::new("OwnerFailed"))
+                .unwrap();
+            wait.await.unwrap();
+        },
+        PanicSink::new(),
+    ));
+    assert!(futures::poll!(job.as_mut()).is_pending());
+    assert_eq!(reply.take_once().as_deref(), Some(&"OwnerFailed"));
+    assert!(matches!(
+        runtime.retire_input(actor, supervisor),
+        Err(ActorTurnError::EffectsRemain)
+    ));
+    runtime.notify_host_actor(&registration).unwrap();
+    host.drive(Tick(2), runtime.claim_host_actor().unwrap());
+    assert!(cleanup.lock().unwrap().is_none());
+    assert!(executor.jobs.lock().unwrap().is_empty());
+    assert!(runtime.claim_host_actor().is_none());
+    assert!(!host.is_empty() && !custody.actual_exit_ready().unwrap());
+
+    release.send(()).unwrap();
+    job.as_mut().await.unwrap();
+    drop(job);
+    assert!(custody.actual_exit_ready().unwrap());
+    runtime.effect_completed_for(&registration, ticket).unwrap();
+    runtime.retire_input(actor, supervisor).unwrap();
+    runtime.retire_input(actor, failed).unwrap();
+    assert!(runtime.take_failure_payload(actor).unwrap().is_some());
+    report.consume(consumer).unwrap();
+    assert!(custody.try_retire().unwrap());
+    ledger.reap_scope_ready(scope.id(), 8).unwrap();
+    scope.close_external().unwrap();
+    runtime.notify_host_actor(&registration).unwrap();
+    host.drive(Tick(3), runtime.claim_host_actor().unwrap());
+    assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+}
+
 #[test]
 fn inactive_financial_author_without_core_failure_preserves_the_original_typed_error() {
     let f = Fixture::new(vec![vec![(1, 1, vec![])]], &[]);

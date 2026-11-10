@@ -493,6 +493,10 @@ impl EffectSource for AttemptTransportSource {
         self.other.owner_failed_pending(pending);
     }
 
+    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
+        self.other.owner_failed_cleanup(ticket);
+    }
+
     fn close_external(&mut self) {
         self.other.close_external();
     }
