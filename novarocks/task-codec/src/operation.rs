@@ -69,7 +69,7 @@ use crate::domain::{
     decode_credential_domain, decode_participation_domain, decode_plan_node_split_receipt,
     decode_task_domain,
 };
-use crate::resource_preflight::{check_creation_metadata, check_frozen_fragment};
+use crate::resource_preflight::check_creation_metadata;
 
 /// Domain separation tags for the shared facts an establish installs.
 /// They are distinct from the tags an advance uses, because the same content
@@ -175,25 +175,6 @@ impl DecodedCreateTask {
     pub fn into_parts_with_retained_bytes(self) -> (CreateTask, TaskCreationInput, usize) {
         (self.request, self.input, self.retained_bytes)
     }
-}
-
-/// Checks the private canonical carrier before its codec owner allocates it.
-fn check_canonical_assignment_size(
-    assignment: &novarocks::TaskAssignment,
-    frozen_bytes: usize,
-    budget: TransportBudget,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    if frozen_bytes
-        .checked_add(assignment.encoded_len())
-        .is_none_or(|total| total > budget.max_descriptor_encoded_bytes())
-    {
-        return Err(out_of_range(
-            path,
-            "canonical creation plan carriers exceed the hard limit",
-        ));
-    }
-    Ok(())
 }
 
 /// A decoded update request, with its typed domain content retained.
@@ -521,25 +502,14 @@ pub fn decode_operation(
                 OperationKind::CreateTask,
                 path.field("envelope"),
             )?;
-            check_frozen_fragment(create.frozen_fragment.as_ref()).map_err(|error| {
-                out_of_range(
-                    create_path.clone().field("frozen_fragment"),
-                    error.to_string(),
-                )
-            })?;
-            check_creation_metadata(
-                create.creation_metadata.as_ref(),
-                create.frozen_fragment.len(),
-            )
-            .map_err(|error| {
+            check_creation_metadata(create.creation_metadata.as_ref()).map_err(|error| {
                 out_of_range(
                     create_path.clone().field("creation_metadata"),
                     error.to_string(),
                 )
             })?;
-            // The static fragment is bounded above but deliberately not
-            // decoded here: only the backend that wins this identity's
-            // creation interprets it.
+            // The static fragment stays opaque here: only the backend
+            // that wins this identity's creation interprets it.
             // Each retained item owns only its bounded fields. Prost Bytes can
             // otherwise keep a whole multi-item request allocation alive.
             let metadata = novarocks::CreationMetadata::decode(
@@ -592,15 +562,6 @@ pub fn decode_operation(
                     "create requires a task assignment",
                 )
             })?;
-            check_canonical_assignment_size(
-                &assignment,
-                create.frozen_fragment.len(),
-                TransportBudget::DEFAULT,
-                create_path
-                    .clone()
-                    .field("creation_metadata")
-                    .field("assignment"),
-            )?;
             let assignment = decode_task_assignment(
                 assignment,
                 &descriptor,
@@ -966,7 +927,7 @@ pub fn decode_operation_batch(
     if !budget.batch_fits(src.operations.len(), encoded_len) {
         return Err(out_of_range(
             path.clone().field("operations"),
-            "operation batch exceeds its item or byte budget",
+            "operation batch exceeds its item bound",
         ));
     }
     let mut operations = Vec::with_capacity(src.operations.len());
@@ -1018,7 +979,7 @@ pub fn decode_ordinary_operation_batch_with_skip(
     if !budget.batch_fits(src.operations.len(), src.encoded_len()) {
         return Err(out_of_range(
             path.field("operations"),
-            "operation batch exceeds its item or byte budget",
+            "operation batch exceeds its item bound",
         ));
     }
     let mut operations = Vec::with_capacity(src.operations.len());
@@ -2082,7 +2043,7 @@ pub fn encode_operation_batch(
     if !budget.batch_fits(request.operations.len(), encoded_len) {
         return Err(out_of_range(
             FieldPath::root("apply_task_operations").field("operations"),
-            "operation batch exceeds its item or byte budget",
+            "operation batch exceeds its item bound",
         ));
     }
     Ok(request)
@@ -3642,42 +3603,6 @@ mod covered_wire_tests {
             source_revision: None,
         };
         assert!(encode_covered_status_event(&bad_prefix).is_err());
-    }
-}
-
-#[cfg(test)]
-mod canonical_assignment_size_tests {
-    use super::*;
-
-    #[test]
-    fn noncanonical_unpacked_single_value_cannot_expand_past_plan_carrier_bound() {
-        // Legal unpacked field 3 uses two bytes; canonical packed encoding needs three.
-        let raw_assignment = [0x18, 0x07];
-        let assignment = novarocks::TaskAssignment::decode(raw_assignment.as_slice()).unwrap();
-        let budget = TransportBudget::new(
-            1,
-            16,
-            8,
-            2,
-            32,
-            4,
-            64,
-            1,
-            1,
-            std::time::Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(6 + raw_assignment.len() <= budget.max_descriptor_encoded_bytes());
-        assert_eq!(assignment.encoded_len(), 3);
-        let path = FieldPath::root("assignment");
-        assert_eq!(
-            check_canonical_assignment_size(&assignment, 6, budget, path.clone())
-                .unwrap_err()
-                .kind(),
-            &novarocks_proto_codec::ProtocolErrorKind::OutOfRange
-        );
-        assert!(check_canonical_assignment_size(&assignment, 5, budget, path.clone()).is_ok());
-        assert!(check_canonical_assignment_size(&assignment, usize::MAX, budget, path).is_err());
     }
 }
 

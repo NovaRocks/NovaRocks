@@ -25,9 +25,8 @@ use novarocks_query_application::system_catalog_rewrite::{
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorControlRegistry, ConnectorError, ConnectorErrorKind,
-    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorListingBound,
-    ConnectorListingBudget, ConnectorNamespaceIdentity, ConnectorRequestContext,
-    ConnectorTableIdentity,
+    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorListingPageSize,
+    ConnectorNamespaceIdentity, ConnectorRequestContext, ConnectorTableIdentity,
 };
 
 use novarocks_sql::compiler::SqlCompileError;
@@ -63,9 +62,7 @@ impl FrontendSystemCatalogFacts {
                 .local()
                 .read()
                 .expect("standalone catalog read lock");
-            bounded_local_schema_names_typed(ConnectorListingBound::V1, || {
-                catalog.database_names()
-            })?
+            local_schema_names_typed(|| catalog.database_names())?
         };
         definition_check_active(request)?;
         Ok(SystemCatalogFacts {
@@ -111,15 +108,10 @@ fn definition_check_active(request: &ConnectorRequestContext) -> Result<(), SqlC
         .map_err(definition_error)
 }
 
-fn bounded_local_schema_names_typed<'a, I>(
-    bound: ConnectorListingBound,
-    names: impl Fn() -> I,
-) -> Result<Vec<String>, SqlCompileError>
+fn local_schema_names_typed<'a, I>(names: impl Fn() -> I) -> Result<Vec<String>, SqlCompileError>
 where
     I: Iterator<Item = &'a str>,
 {
-    let mut budget = ConnectorListingBudget::new(bound).map_err(definition_error)?;
-    budget.admit_names(names()).map_err(definition_error)?;
     let mut schema_names = names().map(str::to_owned).collect::<Vec<_>>();
     schema_names.sort();
     schema_names.dedup();
@@ -129,7 +121,6 @@ where
 fn definition_schema_names(
     namespaces: Vec<ConnectorNamespaceIdentity>,
     instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-    budget: &mut ConnectorListingBudget,
 ) -> Result<Vec<String>, SqlCompileError> {
     if namespaces
         .iter()
@@ -140,13 +131,7 @@ fn definition_schema_names(
             "system namespace listing returned another catalog identity",
         )));
     }
-    budget
-        .admit_names(
-            namespaces
-                .iter()
-                .map(|namespace| namespace.namespace.as_ref()),
-        )
-        .map_err(definition_error)?;
+
     let mut names = namespaces
         .into_iter()
         .map(|namespace| namespace.namespace.to_string())
@@ -159,7 +144,6 @@ fn definition_schema_names(
 fn definition_table_names(
     tables: Vec<ConnectorTableIdentity>,
     namespace: &ConnectorNamespaceIdentity,
-    budget: &mut ConnectorListingBudget,
 ) -> Result<Vec<String>, SqlCompileError> {
     if tables.iter().any(|table| {
         table.instance_id != namespace.instance_id || table.namespace != namespace.namespace
@@ -169,12 +153,7 @@ fn definition_table_names(
             "system table listing returned another namespace identity",
         )));
     }
-    budget
-        .admit_qualified_names(
-            namespace.namespace.as_ref(),
-            tables.iter().map(|table| table.table.as_ref()),
-        )
-        .map_err(definition_error)?;
+
     let mut names = tables
         .into_iter()
         .map(|table| table.table.to_string())
@@ -184,55 +163,34 @@ fn definition_table_names(
     Ok(names)
 }
 
-/// Copy local schema names into one bounded snapshot. The names are admitted
-/// before any of them is copied; an over-bound catalog is refused, never
-/// truncated.
-fn bounded_local_schema_names<'a, I>(
-    bound: ConnectorListingBound,
-    names: impl Fn() -> I,
-) -> Result<Vec<String>, String>
+/// Copy and normalize local schema names without a snapshot quota.
+fn local_schema_names<'a, I>(names: impl Fn() -> I) -> Result<Vec<String>, String>
 where
     I: Iterator<Item = &'a str>,
 {
-    let mut budget = ConnectorListingBudget::new(bound).map_err(|error| error.to_string())?;
-    budget
-        .admit_names(names())
-        .map_err(|error| format!("list local schemas: {error}"))?;
     let mut schema_names = names().map(str::to_string).collect::<Vec<_>>();
     schema_names.sort();
     schema_names.dedup();
     Ok(schema_names)
 }
 
-/// Collect one catalog's schema and table names as one bounded snapshot.
-///
-/// Each source listing is bounded by what the snapshot has left, and its
-/// names are charged against the whole snapshot before they are retained, so
-/// many namespaces with many tables cannot together exceed `bound`. A table
-/// entry retains its schema name as well and is charged for both.
-type BoundedExternalNames = (Vec<String>, Vec<(String, String)>);
+/// Collect the complete authoritative namespace and table facts.
+type ExternalNames = (Vec<String>, Vec<(String, String)>);
 
-fn bounded_external_names(
-    bound: ConnectorListingBound,
+fn external_names(
     include_table_names: bool,
-    list_namespaces: impl FnOnce(ConnectorListingBound) -> Result<Vec<String>, String>,
-    mut list_tables: impl FnMut(&str, ConnectorListingBound) -> Result<Vec<String>, String>,
-) -> Result<BoundedExternalNames, String> {
-    let mut budget = ConnectorListingBudget::new(bound).map_err(|error| error.to_string())?;
-    let mut schema_names = list_namespaces(budget.remaining_bound())?;
+    list_namespaces: impl FnOnce() -> Result<Vec<String>, String>,
+    mut list_tables: impl FnMut(&str) -> Result<Vec<String>, String>,
+) -> Result<ExternalNames, String> {
+    let mut schema_names = list_namespaces()?;
     schema_names.sort();
     schema_names.dedup();
-    budget
-        .admit_names(schema_names.iter().map(String::as_str))
-        .map_err(|error| format!("list external schemas: {error}"))?;
 
     let mut table_names = Vec::new();
     if include_table_names {
         for schema_name in &schema_names {
-            let tables = list_tables(schema_name, budget.remaining_bound())?;
-            budget
-                .admit_qualified_names(schema_name, tables.iter().map(String::as_str))
-                .map_err(|error| format!("list external tables in {schema_name}: {error}"))?;
+            let tables = list_tables(schema_name)?;
+
             table_names.extend(tables.into_iter().map(|table| (schema_name.clone(), table)));
         }
     }
@@ -253,19 +211,18 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             return Ok(None);
         };
         let instance_id = planning_pin.binding().descriptor().instance_id.clone();
-        let mut budget =
-            ConnectorListingBudget::new(ConnectorListingBound::V1).map_err(definition_error)?;
+
         let namespaces = planning_pin
             .binding()
             .metadata()
             .list_namespaces(ConnectorListNamespacesRequest {
                 instance_id: instance_id.clone(),
-                bound: budget.remaining_bound(),
+                page_size: ConnectorListingPageSize::DEFAULT,
                 context: context.clone(),
             })
             .map_err(definition_error)?;
         definition_check_active(&context)?;
-        let schema_names = definition_schema_names(namespaces, &instance_id, &mut budget)?;
+        let schema_names = definition_schema_names(namespaces, &instance_id)?;
         let mut table_names = Vec::new();
         if include_table_names {
             for schema in &schema_names {
@@ -279,12 +236,12 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                     .metadata()
                     .list_tables(ConnectorListTablesRequest {
                         namespace: namespace.clone(),
-                        bound: budget.remaining_bound(),
+                        page_size: ConnectorListingPageSize::DEFAULT,
                         context: context.clone(),
                     })
                     .map_err(definition_error)?;
                 definition_check_active(&context)?;
-                let tables = definition_table_names(tables, &namespace, &mut budget)?;
+                let tables = definition_table_names(tables, &namespace)?;
                 table_names.extend(tables.into_iter().map(|table| (schema.clone(), table)));
             }
         }
@@ -311,20 +268,19 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                 return Ok(None);
             };
             let instance_id = planning_pin.binding().descriptor().instance_id.clone();
-            let mut budget =
-                ConnectorListingBudget::new(ConnectorListingBound::V1).map_err(definition_error)?;
+
             let namespaces = planning_pin
                 .binding()
                 .metadata()
                 .list_namespaces_async(ConnectorListNamespacesRequest {
                     instance_id: instance_id.clone(),
-                    bound: budget.remaining_bound(),
+                    page_size: ConnectorListingPageSize::DEFAULT,
                     context: context.clone(),
                 })
                 .await
                 .map_err(definition_error)?;
             definition_check_active(&context)?;
-            let schema_names = definition_schema_names(namespaces, &instance_id, &mut budget)?;
+            let schema_names = definition_schema_names(namespaces, &instance_id)?;
             let mut table_names = Vec::new();
             if include_table_names {
                 for schema in &schema_names {
@@ -338,13 +294,13 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                         .metadata()
                         .list_tables_async(ConnectorListTablesRequest {
                             namespace: namespace.clone(),
-                            bound: budget.remaining_bound(),
+                            page_size: ConnectorListingPageSize::DEFAULT,
                             context: context.clone(),
                         })
                         .await
                         .map_err(definition_error)?;
                     definition_check_active(&context)?;
-                    let tables = definition_table_names(tables, &namespace, &mut budget)?;
+                    let tables = definition_table_names(tables, &namespace)?;
                     table_names.extend(tables.into_iter().map(|table| (schema.clone(), table)));
                 }
             }
@@ -364,7 +320,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                 .local()
                 .read()
                 .expect("standalone catalog read lock");
-            bounded_local_schema_names(ConnectorListingBound::V1, || catalog.database_names())?
+            local_schema_names(|| catalog.database_names())?
         };
         Ok(SystemCatalogFacts {
             catalog_name: "default_catalog".to_string(),
@@ -387,13 +343,11 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                 Ok(planning_pin) => planning_pin,
                 Err(_) => return Ok(None),
             };
-            let mut budget = ConnectorListingBudget::new(ConnectorListingBound::V1)
-                .map_err(|e| e.to_string())?;
+
             let mut schema_names =
                 crate::connector::metadata_list_namespaces_with_planning_pin_async(
                     planning_pin.clone(),
                     request.clone(),
-                    budget.remaining_bound(),
                 )
                 .await?
                 .into_iter()
@@ -401,9 +355,7 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                 .collect::<Vec<_>>();
             schema_names.sort();
             schema_names.dedup();
-            budget
-                .admit_names(schema_names.iter().map(String::as_str))
-                .map_err(|e| format!("list external schemas: {e}"))?;
+
             let mut table_names = Vec::new();
             if include_table_names {
                 for schema in &schema_names {
@@ -411,12 +363,9 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
                         &planning_pin,
                         request.clone(),
                         schema,
-                        budget.remaining_bound(),
                     )
                     .await?;
-                    budget
-                        .admit_qualified_names(schema, tables.iter().map(String::as_str))
-                        .map_err(|e| format!("list external tables in {schema}: {e}"))?;
+
                     table_names.extend(tables.into_iter().map(|table| (schema.clone(), table)));
                 }
             }
@@ -443,27 +392,24 @@ impl SystemCatalogFactsPort for FrontendSystemCatalogFacts {
             Err(_) => return Ok(None),
         };
         let listing_lease = planning_pin.clone();
-        let (schema_names, table_names) = bounded_external_names(
-            ConnectorListingBound::V1,
+        let (schema_names, table_names) = external_names(
             include_table_names,
-            |bound| {
+            || {
                 Ok(
                     crate::connector::metadata_list_namespaces_with_planning_pin(
                         planning_pin,
                         request.clone(),
-                        bound,
                     )?
                     .into_iter()
                     .map(|namespace| namespace.namespace.to_string())
                     .collect(),
                 )
             },
-            |schema_name, bound| {
+            |schema_name| {
                 crate::connector::metadata_list_tables_with_planning_pin(
                     &listing_lease,
                     request.clone(),
                     schema_name,
-                    bound,
                 )
             },
         )?;
@@ -650,121 +596,28 @@ mod tests {
         ));
         assert_eq!(error, SqlCompileError::CompilationSource(source));
     }
-
     #[test]
-    fn definition_local_listing_budget_retains_the_original_resource_error() {
-        let local = ["sales", "ops", "hr"];
-        assert_eq!(
-            bounded_local_schema_names_typed(bound(), || local.iter().copied()).unwrap(),
-            names(&["hr", "ops", "sales"])
-        );
-        assert_eq!(
-            bounded_local_schema_names_typed(
-                ConnectorListingBound {
-                    entries: 2,
-                    ..bound()
-                },
-                || local.iter().copied(),
-            )
-            .unwrap_err(),
-            SqlCompileError::ResourceExhausted
-        );
-    }
-
-    fn bound() -> ConnectorListingBound {
-        ConnectorListingBound {
-            entries: 5,
-            total_name_bytes: 16,
-            ..ConnectorListingBound::V1
-        }
-    }
-
-    fn names(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| value.to_string()).collect()
-    }
-
-    #[test]
-    fn external_snapshot_bounds_every_listing_by_what_is_left() {
-        let mut table_bounds = Vec::new();
-        let (schemas, tables) = bounded_external_names(
-            bound(),
+    fn local_and_external_names_accept_complete_snapshots_above_former_quotas() {
+        let names: Vec<_> = (0..65_537)
+            .map(|i| format!("{i:08}-{}", "n".repeat(256)))
+            .collect();
+        assert!(names.iter().map(String::len).sum::<usize>() > 16 * 1024 * 1024);
+        let local = local_schema_names_typed(|| names.iter().map(String::as_str)).unwrap();
+        assert_eq!(local, names);
+        let (schemas, tables) = external_names(
             true,
-            |bound| {
-                assert_eq!(bound.entries, 5);
-                assert_eq!(bound.total_name_bytes, 16);
-                Ok(names(&["b", "a", "a"]))
-            },
-            |schema, bound| {
-                table_bounds.push((schema.to_string(), bound.entries, bound.total_name_bytes));
-                Ok(match schema {
-                    "a" => names(&["t1"]),
-                    _ => names(&["t2", "t3"]),
-                })
+            || Ok(vec!["db".into()]),
+            |schema| {
+                assert_eq!(schema, "db");
+                Ok(names.clone())
             },
         )
         .unwrap();
-        assert_eq!(schemas, names(&["a", "b"]));
+        assert_eq!(schemas, ["db"]);
+        assert_eq!(tables.len(), 65_537);
         assert_eq!(
-            tables,
-            [
-                ("a".to_string(), "t1".to_string()),
-                ("b".to_string(), "t2".to_string()),
-                ("b".to_string(), "t3".to_string()),
-            ]
+            tables.last().unwrap(),
+            &("db".to_owned(), names.last().unwrap().clone())
         );
-        // Each table entry is charged its schema name as well: 1 + 2 bytes.
-        assert_eq!(
-            table_bounds,
-            [("a".to_string(), 3, 14), ("b".to_string(), 2, 11)]
-        );
-    }
-
-    #[test]
-    fn many_small_listings_cannot_together_exceed_the_snapshot() {
-        let mut listed = Vec::new();
-        let error = bounded_external_names(
-            bound(),
-            true,
-            |_| Ok(names(&["a", "b", "c"])),
-            |schema, _| {
-                listed.push(schema.to_string());
-                Ok(names(&["t1", "t2"]))
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("entries bound"), "{error}");
-        // The second table listing overflows the snapshot and is refused; the
-        // third namespace is never listed.
-        assert_eq!(listed, names(&["a", "b"]));
-
-        let error = bounded_external_names(
-            ConnectorListingBound {
-                total_name_bytes: 8,
-                ..bound()
-            },
-            true,
-            |_| Ok(names(&["ab"])),
-            |_, _| Ok(names(&["t1", "t2"])),
-        )
-        .unwrap_err();
-        assert!(error.contains("total_name_bytes bound"), "{error}");
-    }
-
-    #[test]
-    fn local_schema_names_are_refused_whole_when_over_bound() {
-        let local = ["sales", "ops", "hr"];
-        assert_eq!(
-            bounded_local_schema_names(bound(), || local.iter().copied()).unwrap(),
-            names(&["hr", "ops", "sales"])
-        );
-        let error = bounded_local_schema_names(
-            ConnectorListingBound {
-                entries: 2,
-                ..bound()
-            },
-            || local.iter().copied(),
-        )
-        .unwrap_err();
-        assert!(error.contains("entries bound"), "{error}");
     }
 }

@@ -184,21 +184,10 @@ impl MvProjectionVersion {
     }
 }
 
-/// One explicit inventory promise. It is supplied by the local consumer;
-/// planning and maintenance reads retain their separate repository contract.
-#[derive(Clone, Copy, Debug)]
-pub struct MvProjectionInventoryBound {
-    pub entries: usize,
-    pub snapshot_bytes: usize,
-    pub single_name_bytes: usize,
-    pub continuation_token_bytes: usize,
-}
-
 /// Local dependency display reads share one exact page contract with a
 /// complete thin classification inventory and a separate finite collector.
 #[derive(Clone, Copy, Debug)]
 pub struct MvDependencyReadBound {
-    pub inventory: MvProjectionInventoryBound,
     pub entries: usize,
     pub collection_bytes: usize,
 }
@@ -214,25 +203,12 @@ pub struct MvProjectionInventoryEntry {
 
 pub(crate) struct MvProjectionInventoryBuilder {
     entries: Vec<MvProjectionInventoryEntry>,
-    payload_bytes: usize,
-    bound: MvProjectionInventoryBound,
 }
 
 impl MvProjectionInventoryBuilder {
-    pub(crate) fn new(bound: MvProjectionInventoryBound) -> Result<Self, MvRepositoryError> {
-        if bound.entries == 0
-            || bound.snapshot_bytes == 0
-            || bound.single_name_bytes == 0
-            || bound.continuation_token_bytes == 0
-        {
-            return Err(Self::refusal(
-                "MV inventory requires nonzero explicit bounds",
-            ));
-        }
+    pub(crate) fn new() -> Result<Self, MvRepositoryError> {
         Ok(Self {
             entries: Vec::new(),
-            payload_bytes: 0,
-            bound,
         })
     }
 
@@ -246,60 +222,9 @@ impl MvProjectionInventoryBuilder {
         target: &MvTarget,
         object: &novarocks_spi::connector::ConnectorTableObjectId,
     ) -> Result<(), MvRepositoryError> {
-        if self.entries.len() >= self.bound.entries {
-            return Err(Self::refusal("MV inventory exceeds its entry bound"));
-        }
-        if [
-            target.catalog().unwrap_or_default(),
-            target.namespace(),
-            target.name(),
-        ]
-        .into_iter()
-        .any(|name| name.len() > self.bound.single_name_bytes)
-        {
-            return Err(Self::refusal(
-                "MV inventory exceeds its single name byte bound",
-            ));
-        }
-        let payload = [
-            target.catalog().map_or(0, str::len),
-            target.namespace().len(),
-            target.name().len(),
-            object.as_bytes().len(),
-            4 * 64,
-        ]
-        .into_iter()
-        .try_fold(self.payload_bytes, usize::checked_add)
-        .ok_or_else(|| Self::refusal("MV inventory snapshot size overflows"))?;
-        let capacity = if self.entries.len() == self.entries.capacity() {
-            self.entries
-                .capacity()
-                .saturating_mul(2)
-                .max(1)
-                .min(self.bound.entries)
-        } else {
-            self.entries.capacity()
-        };
-        // During growth both old and new vector allocations may coexist.
-        let vector_slots = if capacity != self.entries.capacity() {
-            capacity.checked_add(self.entries.capacity())
-        } else {
-            Some(capacity)
-        };
-        let peak = vector_slots
-            .and_then(|n| n.checked_mul(std::mem::size_of::<MvProjectionInventoryEntry>()))
-            .and_then(|n| n.checked_add(payload))
-            .ok_or_else(|| Self::refusal("MV inventory snapshot size overflows"))?;
-        if peak > self.bound.snapshot_bytes {
-            return Err(Self::refusal(
-                "MV inventory exceeds its snapshot byte bound",
-            ));
-        }
-        if capacity != self.entries.capacity() {
-            self.entries
-                .try_reserve_exact(capacity - self.entries.len())
-                .map_err(|_| Self::refusal("MV inventory allocation failed"))?;
-        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| Self::refusal("MV inventory allocation failed"))?;
         // Copy only the opaque identity bytes. A small locator cannot retain
         // a larger decoder backing through a Bytes alias.
         let object_id = novarocks_spi::connector::ConnectorTableObjectId::try_new(
@@ -313,11 +238,45 @@ impl MvProjectionInventoryBuilder {
             target: target.clone(),
             object_id,
         });
-        self.payload_bytes = payload;
         Ok(())
     }
 
     pub(crate) fn finish(self) -> Vec<MvProjectionInventoryEntry> {
         self.entries
+    }
+}
+
+#[cfg(test)]
+mod inventory_capacity_tests {
+    use super::*;
+    // Inventory custody is the lowest layer that owns all retained thin locators.
+    // Repository tests separately protect its single-snapshot one-record paging.
+    #[test]
+    fn thin_inventory_accepts_more_than_former_entry_and_snapshot_quotas() {
+        let mut inventory = MvProjectionInventoryBuilder::new().unwrap();
+        let object = novarocks_spi::connector::ConnectorTableObjectId::try_new(
+            bytes::Bytes::from_static(b"opaque-object"),
+        )
+        .unwrap();
+        for index in 0..65_537 {
+            let target = MvTarget::from_parts(
+                Some("ice"),
+                "sales",
+                &format!("{index:08}-{}", "n".repeat(256)),
+            );
+            inventory.push_facts(index, &target, &object).unwrap();
+        }
+        let entries = inventory.finish();
+        assert_eq!(entries.len(), 65_537);
+        assert!(
+            entries
+                .iter()
+                .map(|entry| entry.target.name().len())
+                .sum::<usize>()
+                > 16 * 1024 * 1024
+        );
+        assert_eq!(entries[0].mv_id, 0);
+        assert_eq!(entries.last().unwrap().mv_id, 65_536);
+        assert!(entries.iter().all(|entry| entry.object_id == object));
     }
 }

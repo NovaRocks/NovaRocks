@@ -78,7 +78,8 @@ pub(super) fn projection_facts(
 }
 
 // Only an independently checkable lower floor. The caller must invoice ALL
-// retained source backing; deeper BTree/Arrow/string owners are not guessed.
+// structural source backing; deeper BTree/string owners are not guessed.
+// Arc-held system-relation data is a separate resource contribution.
 pub(super) fn source_floor(
     fragment: &Fragment,
     uses: &PhysicalRootUses,

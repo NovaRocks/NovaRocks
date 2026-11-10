@@ -444,7 +444,7 @@ mod suspension_tests {
         };
         let namespaces = ConnectorListNamespacesRequest {
             instance_id: table.table.instance_id.clone(),
-            bound: ConnectorListingBound::V1,
+            page_size: ConnectorListingPageSize::DEFAULT,
             context: context.clone(),
         };
         let namespace_request = ConnectorNamespaceRequest {
@@ -453,7 +453,7 @@ mod suspension_tests {
         };
         let tables = ConnectorListTablesRequest {
             namespace,
-            bound: ConnectorListingBound::V1,
+            page_size: ConnectorListingPageSize::DEFAULT,
             context: context.clone(),
         };
         let references = ConnectorReadReferenceFactsRequest {

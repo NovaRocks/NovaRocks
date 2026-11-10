@@ -698,6 +698,7 @@ const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Scan { .. } => "Scan",
         NodeKind::Values { .. } => "Values",
+        NodeKind::SystemRelation { .. } => "SystemRelation",
         NodeKind::Filter { .. } => "Filter",
         NodeKind::Project { .. } => "Project",
         NodeKind::Aggregate { .. } => "Aggregate",

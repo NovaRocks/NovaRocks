@@ -15,11 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Whole-package sender: one checked FragmentPackage to the complete 22-field
-//! wire DTO. The input is already checked by its FE owner; this author only
-//! composes the original component encoders on one caller control. Each
-//! component gates its own limits; the whole DTO has one coarse size bound.
-//! There is no second cross-component ledger on the sender side.
+//! Whole-package sender from a checked FragmentPackage. Structural components
+//! retain their own frozen limits. Snapshot data is a separate final component
+//! funded by its actual creator, without a whole-DTO size quota.
 
 use super::binding_sources::{BindingSourceLimits, collect_binding_sources_in};
 use super::definition_sources::{DefinitionSourceLimits, collect_definition_sources_in};
@@ -94,6 +92,7 @@ use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
+#[cfg(test)]
 use prost::Message;
 use std::{cell::Cell, fmt};
 
@@ -103,8 +102,6 @@ use std::{cell::Cell, fmt};
 #[derive(Clone, Copy, Debug)]
 pub struct PackageEncodeLimits {
     pub source_retained_bytes: usize,
-    /// Coarse bound on the complete encoded DTO, checked before return.
-    pub max_wire_bytes: usize,
     pub views: TypeViewLimits,
     pub binding_sources: BindingSourceLimits,
     pub provider_sources: ProviderSourceLimits,
@@ -133,6 +130,7 @@ pub struct PackageEncodeLimits {
 #[derive(Debug)]
 pub enum PackageEncodeError {
     Control(CompileControlError),
+    SystemRelation(super::system_relation::SystemRelationError),
     Source(TypeViewError),
     Provider(ProviderSourceError),
     Metadata(PackageMetadataCodecError),
@@ -153,6 +151,14 @@ pub enum PackageEncodeError {
     ExpressionControl(ControlCodecError),
     Scan(ReadScanCodecError),
     Writer(WriterRecipeCodecError),
+}
+impl From<super::system_relation::SystemRelationError> for PackageEncodeError {
+    fn from(error: super::system_relation::SystemRelationError) -> Self {
+        match error {
+            super::system_relation::SystemRelationError::Control(e) => Self::Control(e),
+            e => Self::SystemRelation(e),
+        }
+    }
 }
 impl From<CompileControlError> for PackageEncodeError {
     fn from(cause: CompileControlError) -> Self {
@@ -198,6 +204,7 @@ impl fmt::Display for PackageEncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
+            Self::SystemRelation(e) => e.fmt(f),
             Self::Source(e) => e.fmt(f),
             Self::Provider(e) => write!(f, "{e:?}"),
             Self::Metadata(e) => e.fmt(f),
@@ -225,6 +232,7 @@ impl std::error::Error for PackageEncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Control(source) => Some(source),
+            Self::SystemRelation(source) => Some(source),
             Self::Source(source) => Some(source),
             Self::Provider(source) => Some(source),
             Self::Metadata(source) => Some(source),
@@ -255,18 +263,90 @@ pub fn encode_fragment_package(
     limits: &PackageEncodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
-    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode_fragment_package_in(package, limits, &mut work);
-    work.finish_result(result, PackageEncodeError::Control)
+    let mut request = |_: std::alloc::Layout| Ok::<_, std::convert::Infallible>(());
+    let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut opaque,
+    );
+    encode_fragment_package_with_creator(package, limits, &mut creation, control)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
+pub fn encode_fragment_package_with_creator<H>(
+    package: &p::FragmentPackage,
+    limits: &PackageEncodeLimits,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    control: &dyn PureCompileControl,
+) -> Result<
+    wire::FragmentPackage,
+    crate::host_projection_v2::ProjectionFailure<PackageEncodeError, H>,
+> {
+    use crate::host_projection_v2::ProjectionFailure;
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)
+        .map_err(|e| ProjectionFailure::Codec(PackageEncodeError::Control(e)))?;
+    let result = (|| {
+        let mut original_host = None;
+        let encoded =
+            encode_fragment_package_structural_in(package, limits, &mut work, &mut |layout| {
+                if layout.size() == 0 {
+                    return Ok(());
+                }
+                match creation.request_layout(layout) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        original_host = Some(error);
+                        Err(PackageEncodeError::Control(
+                            CompileControlError::ResourceExhausted,
+                        ))
+                    }
+                }
+            });
+        if let Some(error) = original_host {
+            return Err(ProjectionFailure::Host(error));
+        }
+        let mut output = encoded.map_err(ProjectionFailure::Codec)?;
+        super::system_relation::encode_units(package, &mut output, creation, &mut work)
+            .map_err(|e| super::system_relation::map_failure(e, PackageEncodeError::from))?;
+        Ok(output)
+    })();
+    // Complete only successful work. Every already-authored codec or creator
+    // refusal remains primary; a later footer must not replace that cause.
+    work.finish_result(result, |error| {
+        ProjectionFailure::Codec(PackageEncodeError::Control(error))
+    })
+}
+
+#[cfg(test)]
 fn encode_fragment_package_in<'s>(
     package: &'s p::FragmentPackage,
     l: &PackageEncodeLimits,
     work: &mut CompileCheckpoints<'s>,
 ) -> Result<wire::FragmentPackage, PackageEncodeError> {
+    encode_fragment_package_structural_in(package, l, work, &mut |_| Ok(()))
+}
+fn encode_fragment_package_structural_in<'s>(
+    package: &'s p::FragmentPackage,
+    l: &PackageEncodeLimits,
+    work: &mut CompileCheckpoints<'s>,
+    snapshot_header_allocation: &mut dyn FnMut(
+        std::alloc::Layout,
+    ) -> Result<(), PackageEncodeError>,
+) -> Result<wire::FragmentPackage, PackageEncodeError> {
     let source = l.source_retained_bytes;
     let fragment = package.fragment();
+    if fragment.nodes().values().any(|node| {
+        matches!(
+            &node.kind,
+            p::NodeKind::SystemRelation {
+                data: p::SystemRelationData::Deferred,
+                ..
+            }
+        )
+    }) {
+        return Err(super::system_relation::SystemRelationError::Deferred.into());
+    }
 
     // Source collection on one budget. The budget gates its own limits; its
     // parent hook is the sender itself, which keeps no second ledger.
@@ -594,6 +674,13 @@ fn encode_fragment_package_in<'s>(
         work,
     )?;
 
+    let system_relation_units = super::system_relation::encode_headers(
+        package,
+        &views,
+        &mut budget,
+        snapshot_header_allocation,
+        work,
+    )?;
     // Namespaces borrow earlier ones; release them in reverse dependency order.
     let expressions = expressions.into_wire();
     let values = values.into_wire();
@@ -642,11 +729,9 @@ fn encode_fragment_package_in<'s>(
         writes,
         annotations: metadata.annotations,
         connector_expressions,
+        system_relation_units,
     };
     work.step()?;
-    if output.encoded_len() > l.max_wire_bytes {
-        return Err(CompileControlError::ResourceExhausted.into());
-    }
     Ok(output)
 }
 

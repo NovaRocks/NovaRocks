@@ -52,7 +52,9 @@ pub(crate) mod create_original;
 
 #[path = "staged_create/current_metadata_cpu.rs"]
 mod current_metadata_cpu;
-pub(crate) use current_metadata_cpu::{CurrentMetadataCapture, CurrentProjectionMetadataCpu};
+pub(crate) use current_metadata_cpu::{
+    CaptureFailure, CurrentMetadataCapture, CurrentProjectionMetadataCpu,
+};
 
 pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
     now_unix_millis().map(ManagementTimestamp::from_unix_millis)

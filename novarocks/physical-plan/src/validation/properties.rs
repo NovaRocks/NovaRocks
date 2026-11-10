@@ -1671,6 +1671,20 @@ fn derive_node_output_properties_from(
         NodeKind::ExchangeSource { .. } => {
             return Ok(exchange_anchor.map(super::cuts::inbound_cut_output_properties));
         }
+        NodeKind::SystemRelation { .. } => {
+            let expected = crate::PhysicalProperties {
+                distribution: Distribution::Singleton,
+                ordering: Box::default(),
+                row_multiplicity: RowMultiplicity::SingleCopy,
+            };
+            if target.actual(node, &expected) != &expected {
+                errors.push(ValidationError::new(
+                    path,
+                    "system relation requires single-copy singleton placement",
+                ));
+            }
+            return Ok(Some(expected));
+        }
         NodeKind::Values { .. } => {
             let NodeKind::Values { rows } = &node.kind else {
                 unreachable!();

@@ -153,6 +153,7 @@ pub struct PackageDecodeLimits {
 #[derive(Debug)]
 pub enum PackageDecodeError {
     Control(CompileControlError),
+    SystemRelation(super::system_relation::SystemRelationError),
     Wire(PackageWireError),
     Metadata(PackageMetadataCodecError),
     Type(TypeCodecError),
@@ -176,6 +177,14 @@ pub enum PackageDecodeError {
     Requests(CallRequestError),
     Package(FragmentPackageError),
     Invalid(&'static str),
+}
+impl From<super::system_relation::SystemRelationError> for PackageDecodeError {
+    fn from(error: super::system_relation::SystemRelationError) -> Self {
+        match error {
+            super::system_relation::SystemRelationError::Control(e) => Self::Control(e),
+            e => Self::SystemRelation(e),
+        }
+    }
 }
 impl From<CompileControlError> for PackageDecodeError {
     fn from(cause: CompileControlError) -> Self {
@@ -313,6 +322,7 @@ impl fmt::Display for PackageDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(error) => error.fmt(f),
+            Self::SystemRelation(error) => error.fmt(f),
             Self::Wire(error) => error.fmt(f),
             Self::Metadata(error) => error.fmt(f),
             Self::Type(error) => error.fmt(f),
@@ -343,6 +353,7 @@ impl std::error::Error for PackageDecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Control(source) => Some(source),
+            Self::SystemRelation(source) => Some(source),
             Self::Wire(source) => Some(source),
             Self::Metadata(source) => Some(source),
             Self::Type(source) => Some(source),
@@ -661,8 +672,21 @@ fn decode_fragment_package_factory_core<
     // publication. Each decoded namespace floor carries the invoice it was
     // given, so the chain keeps their maximum and never sums an invoice twice.
     let mut invoice = add(
-        add(usage.input_bytes, usage.root_inline_bytes)?,
-        usage.peak_requested_heap_bytes_upper,
+        add(
+            usage
+                .input_bytes
+                .checked_sub(usage.system_relation_input_bytes)
+                .ok_or(PackageDecodeError::Invalid(
+                    "system relation input classification exceeds source",
+                ))?,
+            usage.root_inline_bytes,
+        )?,
+        usage
+            .peak_requested_heap_bytes_upper
+            .checked_sub(usage.system_relation_requested_heap_bytes_upper)
+            .ok_or(PackageDecodeError::Invalid(
+                "system relation heap classification exceeds source",
+            ))?,
     )?;
 
     // Mandatory singular components have no default.
@@ -1063,7 +1087,7 @@ fn decode_fragment_package_factory_core<
     // L3-L5: every loan of values, parameters and pools ends with this block.
     // Headers and the expression namespace precede the materializations whose
     // laws add only their own outputs to those borrowed floors.
-    let (arena, nodes, result) = {
+    let (arena, mut nodes, result) = {
         let function_headers = prepare_function_binding_headers_in(
             &wire_package.function_bindings,
             &types,
@@ -1220,6 +1244,35 @@ fn decode_fragment_package_factory_core<
         )?;
     }
 
+    // Snapshot data is decoded under its real creator after all structural namespaces.
+    // Its complete data allocation is deliberately absent from their invoices.
+    if let Some(creator) = creation.as_deref_mut() {
+        super::system_relation::decode_units(
+            &wire_package,
+            &mut nodes,
+            &values,
+            &types,
+            creator,
+            work,
+        )
+        .map_err(|e| super::system_relation::map_failure(e, PackageDecodeError::from))?;
+    } else {
+        let mut request = |_: std::alloc::Layout| Ok::<_, std::convert::Infallible>(());
+        let mut opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
+        let mut creator =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        super::system_relation::decode_units(
+            &wire_package,
+            &mut nodes,
+            &values,
+            &types,
+            &mut creator,
+            work,
+        )
+        .map_err(|e| {
+            ProjectionFailure::Codec(PackageDecodeError::SystemRelation(e.without_host()))
+        })?;
+    }
     // L7: the original structural constructor and request publication.
     let fragment = p::Fragment::try_from_structure_in(
         p::FragmentStructureInput {

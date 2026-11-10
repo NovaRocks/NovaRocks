@@ -196,6 +196,7 @@ fn make_quote(
     input_bytes: usize,
     queue_bytes: usize,
     budget: TransportBudget,
+    control: bool,
 ) -> Result<NativeAsyncActionQuote, WorkError> {
     let layouts = known_input_layouts_for_composition(
         std::num::NonZeroUsize::new(items).ok_or(WorkError::Conflict)?,
@@ -245,9 +246,13 @@ fn make_quote(
     let reply_meta = Layout::array::<std::sync::OnceLock<OperationAcknowledgement>>(items)
         .map_err(|_| WorkError::ArithmeticOverflow)?
         .size();
-    let plan =
-        novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(budget);
-    let reply_bytes = novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+    let response_max = budget.message_limits().response_max_bytes(control);
+    let plan = novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+        items,
+        response_max,
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let reply_bytes = response_max
         .checked_add(plan.peak_bytes())
         .ok_or(WorkError::ArithmeticOverflow)?;
     Ok(NativeAsyncActionQuote::for_original_native_transport(
@@ -268,38 +273,31 @@ pub(super) fn original_run_encoding(
     use novarocks_task_codec::operation::wire_size as size;
     let mut bytes = 0usize;
     for operation in operations {
-        let control = is_small_control(operation);
-        let item = match operation {
-            OperationIntent::AcquireParticipationAdmissionTicket(value) => size::acquire(*value),
-            OperationIntent::EstablishParticipation(value) => size::establish(value),
-            OperationIntent::CreateTask(value) => size::create(
-                value.envelope(),
-                value.parts().fragment().content().len(),
-                value.parts().metadata().len(),
-            ),
-            OperationIntent::UpdateTask(value) => size::update(value, control),
-            OperationIntent::UpdateParticipation(value) => match value.as_ref() {
-                UpdateParticipation::Establish(value) => size::establish(value),
-                UpdateParticipation::AdvanceDomain(value) => size::advance(value),
-                UpdateParticipation::RenewLease(value) => size::renew(value, control),
-            },
-            OperationIntent::CancelTask(value) => size::cancel(*value, control),
-            OperationIntent::QuiesceParticipation(value) => size::quiesce(*value, control),
-            OperationIntent::AbortParticipation(value) => size::abort(*value, control),
-            OperationIntent::ReleaseParticipation(value) => size::release(*value, control),
-            #[cfg(test)]
-            OperationIntent::FetchTaskDynamicFilters(_) => return Err(WorkError::Conflict),
-        }
-        .map_err(|error| match error {
-            size::WireSizeError::Overflow => WorkError::ArithmeticOverflow,
-            size::WireSizeError::NotCodecProduced => WorkError::Conflict,
-        })?;
+        let item = operation
+            .encoded_protobuf_bytes()
+            .map_err(|error| match error {
+                size::WireSizeError::Overflow => WorkError::ArithmeticOverflow,
+                size::WireSizeError::NotCodecProduced => WorkError::Conflict,
+            })?;
         bytes = bytes
-            .checked_add(size::batch_item(item).map_err(|_| WorkError::ArithmeticOverflow)?)
+            .checked_add(item)
             .ok_or(WorkError::ArithmeticOverflow)?;
     }
     if !budget.batch_fits(operations.len(), bytes) {
-        return Err(WorkError::Capacity("Native original encoded method run"));
+        return Err(WorkError::Capacity("Native original method item count"));
+    }
+    let control = operations
+        .first()
+        .ok_or(WorkError::Conflict)?
+        .requires_control_progress();
+    if operations
+        .iter()
+        .any(|operation| operation.requires_control_progress() != control)
+    {
+        return Err(WorkError::Conflict);
+    }
+    if bytes > budget.message_limits().request_max_bytes(control) {
+        return Err(WorkError::Capacity("Native original method message length"));
     }
     novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(bytes)
         .ok_or(WorkError::ArithmeticOverflow)
@@ -359,6 +357,7 @@ impl NativeTaskOperationSink {
                     .ok_or(WorkError::ArithmeticOverflow)?,
                 encoding.protobuf_bytes(),
                 budget,
+                operations[0].requires_control_progress(),
             )?,
         })
     }

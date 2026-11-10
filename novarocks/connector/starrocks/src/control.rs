@@ -403,7 +403,7 @@ mod tests {
                 .metadata()
                 .list_tables(ConnectorListTablesRequest {
                     namespace,
-                    bound: novarocks_spi::connector::ConnectorListingBound::V1,
+                    page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                     context: context(),
                 })
                 .expect("table listing")

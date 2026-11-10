@@ -235,87 +235,38 @@ impl HadoopFileSystemCatalog {
         })
     }
 
-    fn check_listing_location(&self, namespace: Option<&NamespaceIdent>) -> Result<()> {
-        let components = namespace.map(|namespace| namespace.as_ref());
-        let bytes = components
-            .into_iter()
-            .flatten()
-            .try_fold(self.warehouse_location.len(), |bytes, component| {
-                bytes.checked_add(component.len())?.checked_add(1)
-            })
-            .ok_or_else(crate::fs_io::listing_refusal)?;
-        // Include the longest suffix used by the listing's existence probes.
-        crate::fs_io::check_listing_path_size(
-            bytes
-                .checked_add(32)
-                .ok_or_else(crate::fs_io::listing_refusal)?,
-        )
-    }
-
     async fn external_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
         self.list_tables_for_read(
             namespace,
             self.listing_binding()?,
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
         )
         .await
     }
 
     /// Both listing and existence use the same complete directory/probe walk.
     /// Existence keeps only a bool rather than cloning unused TableIdent values.
+
     async fn scan_external_tables(
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: novarocks_spi::connector::ConnectorListingBound,
-        workspace_bytes: usize,
+        page_size: novarocks_spi::connector::ConnectorListingPageSize,
         retain_tables: bool,
     ) -> Result<(Vec<TableIdent>, bool)> {
-        self.check_listing_location(Some(namespace))?;
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
-        let namespace_location = self.namespace_location(namespace);
-        let children = crate::fs_io::list_directories(
-            &namespace_location,
-            binding.clone(),
-            bound,
-            workspace_bytes,
-        )
-        .await?;
-        check_directory_listing_bound(&children, bound)?;
-        let source_bytes = directory_heap_bytes(&children)?;
-        let qualifier_bytes = namespace_clone_heap_bytes(namespace)?;
-        let mut retained_qualifiers = 0usize;
+        let location = self.namespace_location(namespace);
+        let children =
+            crate::fs_io::list_directories(&location, binding.clone(), page_size).await?;
         let mut tables = Vec::new();
         let mut found = false;
         for table in children {
             check_catalog_read_control(&control)?;
-            let path_bytes = namespace_location
-                .len()
-                .checked_add(table.len())
-                .and_then(|bytes| bytes.checked_add(32))
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            crate::fs_io::check_listing_path_size(path_bytes)?;
-            if versions::physical_exists(&format!("{namespace_location}/{table}"), binding.clone())
-                .await?
-            {
-                check_catalog_read_control(&control)?;
+            if versions::physical_exists(&format!("{location}/{table}"), binding.clone()).await? {
                 found = true;
                 if retain_tables {
-                    let next_qualifiers = retained_qualifiers
-                        .checked_add(qualifier_bytes)
-                        .ok_or_else(crate::fs_io::listing_refusal)?;
-                    let other_bytes = source_bytes
-                        .checked_add(next_qualifiers)
-                        .ok_or_else(crate::fs_io::listing_refusal)?;
-                    crate::fs_io::grow_listing_vec(
-                        &mut tables,
-                        other_bytes,
-                        workspace_bytes,
-                        bound.entries,
-                    )?;
                     tables.push(TableIdent::new(namespace.clone(), table));
-                    retained_qualifiers = next_qualifiers;
                 }
             }
         }
@@ -325,73 +276,38 @@ impl HadoopFileSystemCatalog {
         Ok((tables, found))
     }
 
-    async fn list_namespaces_bounded(
+    async fn list_namespaces_paged(
         &self,
         parent: Option<&NamespaceIdent>,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        page_size: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<NamespaceIdent>> {
-        self.check_listing_location(parent)?;
-        let workspace_bytes = hadoop_listing_workspace();
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
         let location = parent
             .map(|parent| self.namespace_location(parent))
             .unwrap_or_else(|| self.warehouse_location.clone());
         let children =
-            crate::fs_io::list_directories(&location, binding.clone(), bound, workspace_bytes)
-                .await?;
-        check_directory_listing_bound(&children, bound)?;
-        let source_bytes = directory_heap_bytes(&children)?;
-        let parent_bytes = parent
-            .map(namespace_clone_heap_bytes)
-            .transpose()?
-            .unwrap_or(0);
-        let mut namespace_bytes = 0usize;
+            crate::fs_io::list_directories(&location, binding.clone(), page_size).await?;
         let mut namespaces = Vec::new();
         for child in children {
             check_catalog_read_control(&control)?;
             if child.starts_with('.') {
                 continue;
             }
-            let next_namespace_bytes = namespace_bytes
-                .checked_add(parent_bytes)
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<String>()))
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            let other_bytes = source_bytes
-                .checked_add(next_namespace_bytes)
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            crate::fs_io::grow_listing_vec(
-                &mut namespaces,
-                other_bytes,
-                workspace_bytes,
-                bound.entries,
-            )?;
             let namespace = match parent {
                 Some(parent) => {
-                    // Build the exact component backing after its whole request
-                    // was admitted; to_vec followed by push could grow twice.
-                    let mut components = Vec::with_capacity(parent.as_ref().len() + 1);
-                    components.extend(parent.as_ref().iter().cloned());
-                    components.push(child);
-                    NamespaceIdent::from_vec(components)?
+                    let mut parts = parent.as_ref().to_vec();
+                    parts.push(child);
+                    NamespaceIdent::from_vec(parts)?
                 }
                 None => NamespaceIdent::new(child),
             };
-            let held_bytes = namespaces
-                .capacity()
-                .checked_mul(std::mem::size_of::<NamespaceIdent>())
-                .and_then(|slots| other_bytes.checked_add(slots))
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            let remaining = workspace_bytes
-                .checked_sub(held_bytes)
-                .ok_or_else(crate::fs_io::listing_refusal)?;
             if self
-                .namespace_exists_bounded(&namespace, binding.clone(), bound, remaining)
+                .namespace_exists_for_read(&namespace, binding.clone())
                 .await?
             {
                 namespaces.push(namespace);
-                namespace_bytes = next_namespace_bytes;
             }
         }
         namespaces.sort_unstable();
@@ -400,24 +316,20 @@ impl HadoopFileSystemCatalog {
         Ok(namespaces)
     }
 
-    /// Refuse the complete root source before probing any child. The internal
-    /// existence source uses V1 and the workspace left by its parent.
+    /// Return all discoverable namespace facts through the original binding.
     pub(crate) async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<NamespaceIdent>> {
-        self.list_namespaces_bounded(None, binding, bound).await
+        self.list_namespaces_paged(None, binding, bound).await
     }
 
-    async fn namespace_exists_bounded(
+    pub(crate) async fn namespace_exists_for_read(
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
-        _bound: novarocks_spi::connector::ConnectorListingBound,
-        workspace_bytes: usize,
     ) -> Result<bool> {
-        self.check_listing_location(Some(namespace))?;
         let control = binding.operation_control();
         check_catalog_read_control(&control)?;
         let file_io =
@@ -429,41 +341,23 @@ impl HadoopFileSystemCatalog {
         if exists {
             return Ok(true);
         }
-        // The caller's bound describes the namespace output, not the table
-        // directories needed to prove that this namespace exists. The latter
-        // are a separate source under V1 and the same remaining workspace.
         self.scan_external_tables(
             namespace,
             binding,
-            novarocks_spi::connector::ConnectorListingBound::V1,
-            workspace_bytes,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             false,
         )
         .await
         .map(|(_, found)| found)
     }
 
-    pub(crate) async fn namespace_exists_for_read(
-        &self,
-        namespace: &NamespaceIdent,
-        binding: crate::access_binding::IcebergReadBinding,
-    ) -> Result<bool> {
-        self.namespace_exists_bounded(
-            namespace,
-            binding,
-            novarocks_spi::connector::ConnectorListingBound::V1,
-            hadoop_listing_workspace(),
-        )
-        .await
-    }
-
     pub(crate) async fn list_tables_for_read(
         &self,
         namespace: &NamespaceIdent,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<TableIdent>> {
-        self.scan_external_tables(namespace, binding, bound, hadoop_listing_workspace(), true)
+        self.scan_external_tables(namespace, binding, bound, true)
             .await
             .map(|(tables, _)| tables)
     }
@@ -774,55 +668,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 // Eight bounded path temporaries cover namespace joins, probe paths, and
 // provider-relative paths while the directory/result containers coexist.
-fn hadoop_listing_workspace() -> usize {
-    crate::fs_io::HADOOP_LISTING_WORKSPACE_BYTES
-        - 8 * novarocks_spi::connector::ConnectorListingBound::V1.name_bytes
-}
-
-fn directory_heap_bytes(children: &Vec<String>) -> Result<usize> {
-    children.iter().try_fold(
-        children
-            .capacity()
-            .checked_mul(std::mem::size_of::<String>())
-            .ok_or_else(crate::fs_io::listing_refusal)?,
-        |bytes, child| {
-            bytes
-                .checked_add(child.capacity())
-                .ok_or_else(crate::fs_io::listing_refusal)
-        },
-    )
-}
-
-fn namespace_clone_heap_bytes(namespace: &NamespaceIdent) -> Result<usize> {
-    namespace.as_ref().iter().try_fold(
-        namespace
-            .as_ref()
-            .len()
-            .checked_mul(std::mem::size_of::<String>())
-            .ok_or_else(crate::fs_io::listing_refusal)?,
-        |bytes, component| {
-            bytes
-                .checked_add(component.len())
-                .ok_or_else(crate::fs_io::listing_refusal)
-        },
-    )
-}
 
 /// Refuse a directory listing that exceeds the caller's listing bound. The
 /// refusal is carried as the typed source so the catalog owner can keep its
 /// `ResourceExhausted` classification.
-fn check_directory_listing_bound(
-    children: &[String],
-    bound: novarocks_spi::connector::ConnectorListingBound,
-) -> Result<()> {
-    bound.check_complete_listing(children).map_err(|refusal| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Hadoop catalog directory listing refused by its listing bound",
-        )
-        .with_source(refusal)
-    })
-}
 
 fn check_catalog_read_control(
     control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
@@ -841,10 +690,10 @@ impl Catalog for HadoopFileSystemCatalog {
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
-        self.list_namespaces_bounded(
+        self.list_namespaces_paged(
             parent,
             self.listing_binding()?,
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
         )
         .await
     }
@@ -872,7 +721,6 @@ impl Catalog for HadoopFileSystemCatalog {
         }
         // The compatibility constructor may answer its exact marker probe,
         // but has no receipt for a custom Storage's listing allocations.
-        self.check_listing_location(Some(namespace))?;
         if self
             .file_io
             .exists(self.namespace_marker_location(namespace))
@@ -1026,13 +874,6 @@ mod tests {
         )
     }
 
-    fn listing_error_kind(error: &Error) -> ConnectorErrorKind {
-        std::error::Error::source(error)
-            .and_then(|source| source.downcast_ref::<ConnectorError>())
-            .expect("typed listing refusal")
-            .kind()
-    }
-
     #[test]
     fn bounded_hadoop_listing_preserves_marker_fallback_and_hierarchical_names() {
         crate::hadoop_catalog::tests::on_bridge(async move {
@@ -1090,11 +931,7 @@ mod tests {
                     .await
                     .expect("fallback")
             );
-            let bound = novarocks_spi::connector::ConnectorListingBound {
-                entries: 2,
-                page_entries: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            };
+            let bound = novarocks_spi::connector::ConnectorListingPageSize::new(1).unwrap();
             let tables = catalog
                 .list_tables_for_read(
                     &NamespaceIdent::new("external".into()),
@@ -1106,86 +943,15 @@ mod tests {
             assert_eq!(tables.len(), 1);
             assert_eq!(tables[0].name(), "table");
             assert_eq!(
-                listing_error_kind(
-                    &catalog
-                        .list_tables_for_read(
-                            &NamespaceIdent::new("external".into()),
-                            local_test_binding(),
-                            novarocks_spi::connector::ConnectorListingBound {
-                                entries: 1,
-                                ..bound
-                            },
-                        )
-                        .await
-                        .expect_err("whole source exceeds caller bound")
-                ),
-                ConnectorErrorKind::ResourceExhausted
-            );
-        });
-    }
-
-    #[test]
-    fn bounded_hadoop_scan_precharges_qualifier_and_result_backing() {
-        crate::hadoop_catalog::tests::on_bridge(async move {
-            let warehouse = tempfile::tempdir().expect("warehouse");
-            std::fs::create_dir_all(warehouse.path().join("n/t/metadata")).expect("table");
-            std::fs::write(warehouse.path().join("n/t/metadata/v1.metadata.json"), b"1")
-                .expect("hint");
-            let location = warehouse.path().to_string_lossy().to_string();
-            let catalog = Arc::new(test_catalog(&location));
-            let namespace = NamespaceIdent::new("n".into());
-            let bound = novarocks_spi::connector::ConnectorListingBound {
-                entries: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            };
-            let source_bytes = std::mem::size_of::<String>() + 1;
-            let result_bytes = source_bytes
-                + namespace_clone_heap_bytes(&namespace).expect("qualifier")
-                + std::mem::size_of::<TableIdent>();
-            assert_eq!(
-                listing_error_kind(
-                    &catalog
-                        .scan_external_tables(
-                            &namespace,
-                            local_test_binding(),
-                            bound,
-                            result_bytes - 1,
-                            true,
-                        )
-                        .await
-                        .expect_err("clone/result before allocation")
-                ),
-                ConnectorErrorKind::ResourceExhausted
-            );
-            assert_eq!(
                 catalog
-                    .scan_external_tables(
-                        &namespace,
+                    .list_tables_for_read(
+                        &NamespaceIdent::new("external".into()),
                         local_test_binding(),
-                        bound,
-                        result_bytes,
-                        true
+                        novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                     )
                     .await
-                    .expect("exact result boundary")
-                    .0
-                    .len(),
-                1
-            );
-            // The existence fallback walks the same complete source and all probes
-            // while retaining no TableIdent namespace clones.
-            assert!(
-                catalog
-                    .scan_external_tables(
-                        &namespace,
-                        local_test_binding(),
-                        bound,
-                        source_bytes,
-                        false
-                    )
-                    .await
-                    .expect("existence under remaining workspace")
-                    .1
+                    .expect("complete source is independent of request page granularity"),
+                tables
             );
         });
     }
@@ -1205,12 +971,7 @@ mod tests {
             }
             let location = warehouse.path().to_string_lossy().to_string();
             let catalog = Arc::new(test_catalog(&location));
-            let bound = novarocks_spi::connector::ConnectorListingBound {
-                entries: 1,
-                name_bytes: 1,
-                total_name_bytes: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            };
+            let bound = novarocks_spi::connector::ConnectorListingPageSize::new(256).unwrap();
             assert_eq!(
                 catalog
                     .list_namespaces_for_read(local_test_binding(), bound)
@@ -1315,7 +1076,7 @@ mod tests {
                     &catalog
                         .list_namespaces_for_read(
                             cancelled_binding.clone(),
-                            novarocks_spi::connector::ConnectorListingBound::V1,
+                            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                         )
                         .await
                         .expect_err("cancelled namespace list"),
@@ -1337,7 +1098,7 @@ mod tests {
                         .list_tables_for_read(
                             &namespace,
                             cancelled_binding.clone(),
-                            novarocks_spi::connector::ConnectorListingBound::V1,
+                            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                         )
                         .await
                         .expect_err("cancelled table list"),

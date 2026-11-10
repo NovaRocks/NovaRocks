@@ -244,6 +244,7 @@ mod arithmetic_lowering_tests;
 
 mod sort;
 mod stream_sink;
+mod system_relation;
 mod topn;
 mod values;
 

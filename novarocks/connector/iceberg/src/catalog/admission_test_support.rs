@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
+use novarocks_spi::connector::{ConnectorError, ConnectorListingPageSize};
 
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::{CatalogOutcome, CatalogUnsupported};
@@ -341,7 +341,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
     }
     async fn list_namespaces(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_namespaces(bound).await
     }
@@ -356,7 +356,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_tables(namespace, bound).await
     }
@@ -461,7 +461,7 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_views(namespace, bound).await
     }

@@ -540,6 +540,41 @@ impl FragmentBuilder {
         self.insert_leaf(node, output, NodeKind::Values { rows })
     }
 
+    /// Adds one immutable metadata snapshot at single-copy singleton placement.
+    pub fn add_system_relation(
+        &mut self,
+        node: NodeId,
+        output: Box<[ValueId]>,
+        output_fields: std::sync::Arc<[arrow_schema::FieldRef]>,
+        data: crate::SystemRelationData,
+    ) -> Result<(), BuildError> {
+        if output.len() != output_fields.len() {
+            return Err(BuildError::SystemRelation(
+                "system relation output width differs",
+            ));
+        }
+        for (id, field) in output.iter().zip(output_fields.iter()) {
+            let value = self.values.get(id).ok_or(BuildError::UndefinedValue(*id))?;
+            if value.ty.data_type() != field.data_type()
+                || value.ty.nullable() != field.is_nullable()
+            {
+                return Err(BuildError::SystemRelation(
+                    "system relation field differs from its complete output type",
+                ));
+            }
+        }
+        data.validate_schema(&output_fields)
+            .map_err(BuildError::SystemRelation)?;
+        self.insert_leaf(
+            node,
+            output,
+            NodeKind::SystemRelation {
+                output_fields,
+                data,
+            },
+        )
+    }
+
     /// Adds a generated integer series.
     pub fn add_generate_series(
         &mut self,
@@ -1305,6 +1340,7 @@ pub enum BuildError {
     },
     /// An inline row does not fill the output port, leaving a column with no
     /// value or a value with no column.
+    SystemRelation(&'static str),
     ValuesRowWidthMismatch {
         node: NodeId,
         expected: usize,
@@ -1412,6 +1448,7 @@ impl fmt::Display for BuildError {
                 node.get(),
                 value.get()
             ),
+            Self::SystemRelation(message) => formatter.write_str(message),
             Self::ValuesRowWidthMismatch {
                 node,
                 expected,

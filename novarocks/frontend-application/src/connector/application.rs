@@ -427,12 +427,10 @@ pub(crate) fn context_for_planning_pin_typed(
 
 /// Enumerate namespaces through an admission-frozen connector control lease.
 /// Ordering and duplicate handling stay application-owned so providers only
-/// expose their authoritative catalog facts. The provider refuses a listing
-/// that would exceed `bound`.
+/// expose their authoritative catalog facts. Pagination is a request granularity.
 pub fn metadata_list_namespaces_with_planning_pin(
     binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
-    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_pin(&binding, context)?;
@@ -441,7 +439,7 @@ pub fn metadata_list_namespaces_with_planning_pin(
         .metadata()
         .list_namespaces(ConnectorListNamespacesRequest {
             instance_id,
-            bound,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context,
         })
         .map_err(|error| error.to_string())
@@ -450,7 +448,6 @@ pub fn metadata_list_namespaces_with_planning_pin(
 pub(crate) async fn metadata_list_namespaces_with_planning_pin_async(
     binding: novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
-    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_pin(&binding, context)?;
@@ -459,7 +456,7 @@ pub(crate) async fn metadata_list_namespaces_with_planning_pin_async(
         .metadata()
         .list_namespaces_async(ConnectorListNamespacesRequest {
             instance_id,
-            bound,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context,
         })
         .await
@@ -471,13 +468,11 @@ pub(crate) async fn metadata_list_namespaces_with_planning_pin_async(
 ///
 /// This is what makes a namespace's contents knowable to SQL. Without it a
 /// caller can only drop children it can already name, which is no help to
-/// anyone who did not create them. The provider refuses a listing that would
-/// exceed `bound`.
+/// anyone who did not create them.
 pub fn metadata_list_tables_with_planning_pin(
     binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
-    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_pin(binding, context)?;
@@ -489,7 +484,7 @@ pub fn metadata_list_tables_with_planning_pin(
                 instance_id,
                 namespace: Arc::from(namespace),
             },
-            bound,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context,
         })
         .map_err(|error| error.to_string())?
@@ -505,7 +500,6 @@ pub(crate) async fn metadata_list_tables_with_planning_pin_async(
     binding: &novarocks_spi::connector::ConnectorControlPlanningPin,
     context: ConnectorRequestContext,
     namespace: &str,
-    bound: novarocks_spi::connector::ConnectorListingBound,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
     let context = context_for_planning_pin(binding, context)?;
@@ -517,7 +511,7 @@ pub(crate) async fn metadata_list_tables_with_planning_pin_async(
                 instance_id,
                 namespace: Arc::from(namespace),
             },
-            bound,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context,
         })
         .await

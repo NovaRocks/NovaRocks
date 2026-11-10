@@ -152,26 +152,8 @@ fn whole_sender_output_passes_generated_preflight_and_is_deterministic() {
 }
 
 #[test]
-fn whole_sender_refuses_over_coarse_bound_component_limit_and_control() {
+fn whole_sender_preserves_component_limit_and_control() {
     for (_name, package) in fixtures() {
-        let size = encode_fragment_package(&package, &encode_limits(), &Control::default())
-            .unwrap()
-            .encoded_len();
-        let exact = PackageEncodeLimits {
-            max_wire_bytes: size,
-            ..encode_limits()
-        };
-        encode_fragment_package(&package, &exact, &Control::default()).unwrap();
-        let under = PackageEncodeLimits {
-            max_wire_bytes: size - 1,
-            ..encode_limits()
-        };
-        assert!(matches!(
-            encode_fragment_package(&package, &under, &Control::default()),
-            Err(PackageEncodeError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
         let mut tight = encode_limits();
         tight.definition_sources.max_values = package.fragment().values().len() - 1;
         assert!(matches!(

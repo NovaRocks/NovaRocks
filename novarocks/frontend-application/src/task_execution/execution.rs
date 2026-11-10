@@ -1137,7 +1137,7 @@ impl QueryTaskExecution {
             .and_then(|stage| stage.task_mut(task_id))
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let request =
-            TaskOperationQueueRequest::task_update(remote.identity().backend_process_id(), &update);
+            TaskOperationQueueRequest::task_update(remote.identity(), &update);
         self.dispatcher.validate_queue_request(request)?;
         remote.begin_input_preparation(update)?;
         remote.poll_input_preparation(self.sink.as_ref())
@@ -1786,7 +1786,7 @@ impl QueryTaskExecution {
             }
             let row = self.edge_control_effects.front_mut().unwrap();
             let request = TaskOperationQueueRequest::task_update(
-                producer.backend_process_id(),
+                producer,
                 row.input.as_ref().unwrap(),
             );
             self.dispatcher.validate_queue_request(request)?;
@@ -2815,8 +2815,6 @@ impl QueryTaskExecution {
                 let Some(candidate) = remote.create_candidate(now)? else {
                     return Ok(CandidateAdmission::Nothing);
                 };
-                self.dispatcher
-                    .validate_plan_carrier_bytes(candidate.plan_carrier_bytes())?;
                 let permit = match Self::reserve_candidate(
                     &self.dispatcher,
                     self.sink.as_ref(),

@@ -1831,12 +1831,12 @@ impl IcebergMetadataContext {
     }
 
     /// Enumerate namespaces for one request, refused as a whole when the
-    /// listing would exceed `bound`. The catalog's classification survives,
+    /// listing fails. The catalog's classification survives,
     /// so a bound refusal stays `ResourceExhausted`.
     pub(crate) fn list_namespaces_for_request(
         &self,
         request: &ConnectorRequestContext,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
         let owner = Arc::clone(self.novarocks_catalog());
         let binding = self
@@ -1858,7 +1858,7 @@ impl IcebergMetadataContext {
     pub(crate) async fn list_namespaces_for_request_async(
         &self,
         request: &ConnectorRequestContext,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
         let owner = Arc::clone(self.novarocks_catalog());
         let binding = self
@@ -1926,13 +1926,13 @@ impl IcebergMetadataContext {
     }
 
     /// Enumerate one namespace's tables for one request, refused as a whole
-    /// when the listing would exceed `bound`. The catalog's classification
+    /// when the listing fails. The catalog's classification
     /// survives, so a bound refusal stays `ResourceExhausted`.
     pub(crate) fn list_tables_for_request(
         &self,
         namespace: &str,
         request: &ConnectorRequestContext,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
         let namespace =
             NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);
@@ -1962,7 +1962,7 @@ impl IcebergMetadataContext {
         &self,
         namespace: &str,
         request: &ConnectorRequestContext,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, (ConnectorErrorKind, String)> {
         let namespace =
             NamespaceIdent::new(normalize_identifier(namespace).map_err(invalid_request)?);

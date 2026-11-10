@@ -21,8 +21,7 @@
 use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
 use crate::persistence::dependency::StoredMvDependency;
 use crate::repository::{
-    MvDependencyReadBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
-    MvRepositoryError, MvRepositoryErrorKind,
+    MvDependencyReadBound, MvProjectionInventoryEntry, MvRepositoryError, MvRepositoryErrorKind,
 };
 
 pub(crate) struct DependencyCollector {
@@ -33,7 +32,6 @@ pub(crate) struct DependencyCollector {
 
 impl DependencyCollector {
     pub(crate) fn new(bound: MvDependencyReadBound) -> Result<Self, MvRepositoryError> {
-        MvProjectionInventoryBuilder::new(bound.inventory)?;
         if bound.entries == 0 || bound.collection_bytes == 0 {
             return Err(refusal(
                 "MV dependency reads require nonzero explicit bounds",
@@ -56,18 +54,6 @@ impl DependencyCollector {
             return Err(refusal("MV dependencies exceed their entry bound"));
         }
         let object = &dependency.upstream;
-        if [
-            object.catalog.as_deref().unwrap_or_default(),
-            &object.database_or_namespace,
-            &object.name,
-        ]
-        .into_iter()
-        .any(|name| name.len() > self.bound.inventory.single_name_bytes)
-        {
-            return Err(refusal(
-                "MV dependencies exceed their single name byte bound",
-            ));
-        }
         let payload = [
             dependency.upstream_object_id.capacity(),
             object.catalog.as_ref().map_or(0, String::capacity),

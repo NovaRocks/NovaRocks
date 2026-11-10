@@ -655,7 +655,7 @@ fn enumerate_admitted_force_drop_children(
         .metadata()
         .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
             namespace: namespace_identity.clone(),
-            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context: connector_context.clone(),
         })
         .map_err(|error| error.to_string())?
@@ -672,7 +672,7 @@ fn enumerate_admitted_force_drop_children(
     let mut views = view_metadata
         .list_views(novarocks_spi::connector::ConnectorListViewsRequest {
             namespace: namespace_identity.clone(),
-            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context: connector_context.clone(),
         })
         .map_err(|error| error.to_string())?
@@ -1573,6 +1573,7 @@ mod force_drop_admission_tests {
         admitted: bool,
         exists: bool,
         views_supported: bool,
+        table_count: usize,
         calls: Mutex<Vec<&'static str>>,
     }
     impl ConnectorMetadata for Capability {
@@ -1591,7 +1592,12 @@ mod force_drop_admission_tests {
             request: ConnectorListTablesRequest,
         ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
             self.calls.lock().unwrap().push("tables");
-            Ok(["z", "a"]
+            let tables = if self.table_count == 2 {
+                vec!["z".to_owned(), "a".to_owned()]
+            } else {
+                (0..self.table_count).map(|i| format!("t{i:08}")).collect()
+            };
+            Ok(tables
                 .into_iter()
                 .map(|table| ConnectorTableIdentity {
                     instance_id: self.descriptor.instance_id.clone(),
@@ -1718,11 +1724,12 @@ mod force_drop_admission_tests {
 
     #[test]
     fn force_drop_admits_before_reads_and_keeps_complete_enumeration() {
-        for (admitted, exists, views_supported) in [
-            (false, true, false),
-            (true, false, true),
-            (true, true, false),
-            (true, true, true),
+        for (admitted, exists, views_supported, table_count) in [
+            (false, true, false, 2),
+            (true, false, true, 2),
+            (true, true, false, 2),
+            (true, true, true, 2),
+            (true, true, true, 65_537),
         ] {
             let descriptor = ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
@@ -1733,6 +1740,7 @@ mod force_drop_admission_tests {
                 admitted,
                 exists,
                 views_supported,
+                table_count,
                 calls: Mutex::new(Vec::new()),
             });
             let binding = ConnectorControlBinding::try_new(
@@ -1783,7 +1791,11 @@ mod force_drop_admission_tests {
                 assert_eq!(
                     result.unwrap(),
                     Some((
-                        vec!["a".to_string(), "z".to_string()],
+                        if table_count == 2 {
+                            vec!["a".to_string(), "z".to_string()]
+                        } else {
+                            (0..table_count).map(|i| format!("t{i:08}")).collect()
+                        },
                         vec!["v1".to_string(), "v2".to_string()]
                     ))
                 );

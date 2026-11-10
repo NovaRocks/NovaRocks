@@ -17,6 +17,7 @@
 
 //! Product policy and scheduling over validated lake document projections.
 
+use crate::freshness::exact_inputs_match;
 use std::collections::BTreeMap;
 
 use crate::persistence::codec::{
@@ -119,23 +120,6 @@ fn validate_current_inputs(
         }
     }
     Ok(())
-}
-
-fn exact_inputs_match(published: &[PublicationInput], current: &[PublicationInput]) -> bool {
-    let by_occurrence = current
-        .iter()
-        .map(|input| (input.relation_occurrence_id, input))
-        .collect::<BTreeMap<_, _>>();
-    let published_ids = published
-        .iter()
-        .map(|input| input.relation_occurrence_id)
-        .collect::<std::collections::BTreeSet<_>>();
-    published.len() == current.len()
-        && by_occurrence.len() == current.len()
-        && published_ids.len() == published.len()
-        && published
-            .iter()
-            .all(|input| by_occurrence.get(&input.relation_occurrence_id).copied() == Some(input))
 }
 
 pub fn mv_keyed_scheduler_semantic_decision(

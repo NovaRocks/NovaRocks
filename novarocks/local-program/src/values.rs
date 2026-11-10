@@ -35,8 +35,8 @@ use novarocks_type_contract::{
 use crate::{ProgramExprId, StaticLayout};
 use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
 
-/// The frozen descriptor is capped at 16 MiB by task-codec. Values have an
-/// independent cap because Arrow materialization can expand the wire input.
+/// Historical policy for ordinary SQL VALUES backing. System relations use
+/// StaticBatchSequence and do not inherit this independent policy.
 pub const MAX_STATIC_VALUES_BACKING_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]

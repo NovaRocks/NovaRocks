@@ -43,7 +43,7 @@ use novarocks_query_application::{
 };
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorError, ConnectorErrorKind, ConnectorListViewsRequest,
-    ConnectorListingBound, ConnectorNamespaceIdentity, ConnectorRequestContext,
+    ConnectorListingPageSize, ConnectorNamespaceIdentity, ConnectorRequestContext,
     ConnectorViewIdentity, ProviderMetadataCpuPort,
 };
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
@@ -329,7 +329,7 @@ pub(crate) fn open_views<'a>(
                 instance_id: lease.binding().descriptor().instance_id.clone(),
                 namespace: Arc::from(namespace),
             },
-            bound: ConnectorListingBound::V1,
+            page_size: ConnectorListingPageSize::DEFAULT,
             context: context.clone(),
         },
         cpu,

@@ -130,6 +130,7 @@ use novarocks_native_trust::{
     NativeTrust,
 };
 use novarocks_task_codec::TransportBudget;
+pub use novarocks_task_codec::TransportMessageLimits;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 
@@ -244,8 +245,8 @@ impl FrontendTaskTransportBudget {
 
     pub fn try_new(
         max_batch_items: usize,
-        max_batch_encoded_bytes: usize,
-        max_descriptor_encoded_bytes: usize,
+        batch_target_encoded_bytes: usize,
+        message_limits: TransportMessageLimits,
         max_query_backend_queued_operations: usize,
         max_query_backend_queued_bytes: usize,
         max_backend_queued_operations: usize,
@@ -256,8 +257,8 @@ impl FrontendTaskTransportBudget {
     ) -> Option<Self> {
         TransportBudget::new(
             max_batch_items,
-            max_batch_encoded_bytes,
-            max_descriptor_encoded_bytes,
+            batch_target_encoded_bytes,
+            message_limits,
             max_query_backend_queued_operations,
             max_query_backend_queued_bytes,
             max_backend_queued_operations,
@@ -273,12 +274,12 @@ impl FrontendTaskTransportBudget {
         self.0.max_batch_items()
     }
 
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.0.max_batch_encoded_bytes()
+    pub const fn batch_target_encoded_bytes(self) -> usize {
+        self.0.batch_target_encoded_bytes()
     }
 
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.0.max_descriptor_encoded_bytes()
+    pub const fn message_limits(self) -> TransportMessageLimits {
+        self.0.message_limits()
     }
 
     pub const fn max_query_backend_queued_operations(self) -> usize {
@@ -440,7 +441,7 @@ mod tests {
         let budget = FrontendTaskTransportBudget::try_new(
             2,
             1024,
-            512,
+            super::TransportMessageLimits::DEFAULT,
             4,
             4096,
             4,
@@ -452,8 +453,11 @@ mod tests {
         .expect("valid native transport budget");
 
         assert_eq!(budget.max_batch_items(), 2);
-        assert_eq!(budget.max_batch_encoded_bytes(), 1024);
-        assert_eq!(budget.max_descriptor_encoded_bytes(), 512);
+        assert_eq!(budget.batch_target_encoded_bytes(), 1024);
+        assert_eq!(
+            budget.message_limits(),
+            super::TransportMessageLimits::DEFAULT
+        );
         assert_eq!(budget.max_query_backend_queued_operations(), 4);
         assert_eq!(budget.max_query_backend_queued_bytes(), 4096);
         assert_eq!(budget.max_backend_queued_operations(), 4);

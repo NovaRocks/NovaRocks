@@ -1005,6 +1005,37 @@ impl TaskOperationSink for NativeTaskOperationSink {
         request: crate::task_execution::intent::TaskOperationQueueRequest,
         preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
+        let sizing = (|| -> Result<(), novarocks_workload_control::WorkError> {
+            use novarocks_workload_control::WorkError;
+            let bytes = request.encoded_bytes().map_err(|error| match error {
+                novarocks_task_codec::operation::wire_size::WireSizeError::Overflow => {
+                    WorkError::ArithmeticOverflow
+                }
+                novarocks_task_codec::operation::wire_size::WireSizeError::NotCodecProduced => {
+                    WorkError::Conflict
+                }
+            })?;
+            if bytes
+                > self
+                    .transport
+                    .message_limits()
+                    .request_max_bytes(request.requires_control_progress())
+            {
+                return Err(WorkError::Capacity("Native operation message length"));
+            }
+            let windows =
+                crate::task_execution::intent::NativeRequestWindows::for_transport(self.transport)
+                    .map_err(|_| WorkError::InvalidConfig("Native request windows"))?;
+            if request.queued_bytes()
+                > windows.empty_queue_capacity(request.requires_control_progress())
+            {
+                return Err(WorkError::Capacity("Native operation empty queue window"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = sizing {
+            return TaskOperationQueueAdmission::Rejected(error);
+        }
         let result = self.reserve_paid_queue_in(request, preparation);
         if matches!(
             &result,
@@ -1178,6 +1209,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             .expect("original paid encoding source remains installed");
         settle_unencodable(self, unencodable);
         observe_batch(batch.lane(), items, encoded_bytes);
+        let batch_requires_control = batch.operations()[0].requires_control_progress();
         let queue_permits = batch.commit_queue_permits();
         // All method runs inherit the same submit-time origin. A later run
         // cannot gain another full max-wait after earlier runs consumed time.
@@ -1204,9 +1236,13 @@ impl TaskOperationSink for NativeTaskOperationSink {
             physical: physical.call.take(),
             action_tail: Some(action_tail),
             reply_plan:
-                novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
-                    self.transport,
-                ),
+                novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+                    items,
+                    self.transport
+                        .message_limits()
+                        .response_max_bytes(batch_requires_control),
+                )
+                .expect("the same original reply layout was registered before admission"),
         };
         let reservations = ApplyReservations::new(queue_permits, encoding_permit);
         // The pure async constructor does not poll user code. Once committed,
@@ -1760,7 +1796,7 @@ async fn send_operations_in(
             (call, acquired)
         }
     };
-    let mut grpc = client.grpc_for_reserved_call(reserved);
+    let mut grpc = client.grpc_for_reserved_call(reserved, method);
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported
@@ -1858,6 +1894,44 @@ async fn send_operations_in(
     outcome
 }
 
+#[cfg(test)]
+async fn fixture_apply_request<T: prost::Message + Send + 'static>(
+    grpc: &mut super::transport::AuthenticatedOperationTestGrpc,
+    request: tonic::Request<T>,
+    method: NativeRpcMethod,
+    original_count: usize,
+    response_max: usize,
+) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+    let reply = novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+        original_count,
+        response_max,
+    )
+    .expect("the fixture retains its original request count and method limit");
+    let encoding =
+        novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(
+            request.get_ref().encoded_len(),
+        )
+        .expect("a fixture method request is nonempty");
+    let path = match method {
+        NativeRpcMethod::ApplyTaskOperations => "/novarocks.NovaRocksGrpc/ApplyTaskOperations",
+        NativeRpcMethod::ApplyTaskControlOperations => {
+            "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations"
+        }
+        _ => unreachable!("only original Apply fixtures use this codec"),
+    };
+    grpc.ready()
+        .await
+        .map_err(|error| tonic::Status::unknown(format!("Service was not ready: {error}")))?;
+    grpc.unary(
+        request,
+        tonic::codegen::http::uri::PathAndQuery::from_static(path),
+        novarocks_native_adapter::native_codec::NativeProstCodec::with_original_operation_plans(
+            reply, encoding,
+        ),
+    )
+    .await
+}
+
 // Legacy wire-only fixtures exercise their original request/classifier
 // contract directly. Production has no source-free call to this author.
 #[cfg(test)]
@@ -1872,15 +1946,17 @@ async fn send_operations(
         EncodedMethodRequest::Ordinary(_) => NativeRpcMethod::ApplyTaskOperations,
         EncodedMethodRequest::Control(_) => NativeRpcMethod::ApplyTaskControlOperations,
     };
-    let (mut grpc, acquired) =
-        tokio::time::timeout_at(expires_at, client.grpc_with_channel_identity(method))
-            .await
-            .map_err(|_| OperationDispatchResult::TransportUnknown)?
-            .map_err(|error| {
-                let outcome = classify_channel_error(&error);
-                tracing::warn!(detail = %error, "task operation channel acquisition failed");
-                outcome
-            })?;
+    let (mut grpc, acquired) = tokio::time::timeout_at(
+        expires_at,
+        client.operation_test_grpc_with_channel_identity(method),
+    )
+    .await
+    .map_err(|_| OperationDispatchResult::TransportUnknown)?
+    .map_err(|error| {
+        let outcome = classify_channel_error(&error);
+        tracing::warn!(detail = %error, "task operation channel acquisition failed");
+        outcome
+    })?;
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported
@@ -1889,12 +1965,15 @@ async fn send_operations(
         client.invalidate_channel_if_current(method, &acquired);
         return Err(OperationDispatchResult::TransportUnknown);
     }
+    let response_max = client.method_message_limits(method).1;
     let call = async {
         match request {
             EncodedMethodRequest::Ordinary(request) => {
+                let original_count = request.operations.len();
                 let mut wire = tonic::Request::new(request);
                 wire.set_timeout(remaining);
-                let rpc = grpc.apply_task_operations(wire);
+                let rpc =
+                    fixture_apply_request(&mut grpc, wire, method, original_count, response_max);
                 tokio::pin!(rpc);
                 let mut started = false;
                 std::future::poll_fn(|cx| {
@@ -1910,9 +1989,11 @@ async fn send_operations(
                 .await
             }
             EncodedMethodRequest::Control(request) => {
+                let original_count = request.operations.len();
                 let mut wire = tonic::Request::new(request);
                 wire.set_timeout(remaining);
-                let rpc = grpc.apply_task_control_operations(wire);
+                let rpc =
+                    fixture_apply_request(&mut grpc, wire, method, original_count, response_max);
                 tokio::pin!(rpc);
                 let mut started = false;
                 std::future::poll_fn(|cx| {
@@ -3767,10 +3848,16 @@ mod tests {
             operations.len() as u64
         );
         assert_eq!(quote.custody().get(JointResource::QueueRecords), 0);
-        assert_eq!(quote.custody().get(JointResource::PayloadBytes),
-            (novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
-            + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(budget)
-                .peak_bytes()) as u64);
+        assert_eq!(
+            quote.custody().get(JointResource::PayloadBytes),
+            (budget.message_limits().control_response_max_bytes
+                + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+                    operations.len(),
+                    budget.message_limits().control_response_max_bytes
+                )
+                .unwrap()
+                .peak_bytes()) as u64
+        );
         let mut over = operations.clone();
         over.push(cancel_intent(99, backend));
         assert!(NativeTaskOperationSink::progress_for_original_method_run(&over, budget).is_err());
@@ -4656,7 +4743,11 @@ mod tests {
             let (shutdown, stop) = tokio::sync::oneshot::channel();
             let served = tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(NovaRocksGrpcServer::new(peer))
+                    .add_service(
+                        NovaRocksGrpcServer::new(peer)
+                            .max_decoding_message_size(128 * 1024 * 1024)
+                            .max_encoding_message_size(128 * 1024 * 1024),
+                    )
                     .serve_with_incoming_shutdown(incoming, async {
                         let _ = stop.await;
                     })
@@ -4752,14 +4843,24 @@ mod tests {
     }
 
     mod governed_wire;
+    mod message_limits;
 
     fn sink_fixture(loopback: Loopback, backend: BackendProcessId) -> SinkFixture {
-        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        sink_fixture_with_budget(loopback, backend, TransportBudget::DEFAULT)
+    }
+
+    fn sink_fixture_with_budget(
+        loopback: Loopback,
+        backend: BackendProcessId,
+        budget: TransportBudget,
+    ) -> SinkFixture {
+        let runtime =
+            FrontendDataRuntime::new_with_task_budget(tokio::runtime::Handle::current(), budget);
         let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
         let governed = governed_wire::GovernedWireRole::new(&loopback);
         let sink = NativeTaskOperationSink::new(
             &[loopback.descriptor(backend)],
-            TransportBudget::DEFAULT,
+            budget,
             test_attempt_facts(),
             acks.handle(),
             runtime.clone(),
@@ -5592,9 +5693,19 @@ mod tests {
     #[test]
     fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
         let backend = BackendProcessId::new_v7();
-        let transport =
-            TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
-                .expect("one ordinary and one control batch fit");
+        let transport = TransportBudget::new(
+            2,
+            1024,
+            novarocks_task_codec::TransportMessageLimits::DEFAULT,
+            4,
+            256 * 1024 * 1024,
+            4,
+            512 * 1024 * 1024,
+            1,
+            2,
+            Duration::from_secs(1),
+        )
+        .expect("one ordinary and one control batch fit");
         let dispatch = DispatchBudget::new(1, 1, 1, 1).expect("nonzero lane permits");
         let mut dispatcher = OperationDispatcher::new(dispatch, transport);
         dispatcher
@@ -5642,7 +5753,9 @@ mod tests {
                 backend,
                 NativeTransportLane::Ordinary,
                 transport.max_batch_items(),
-                transport.max_operation_queued_bytes(),
+                crate::task_execution::intent::NativeRequestWindows::for_transport(transport)
+                    .unwrap()
+                    .empty_queue_capacity(false),
             )
             .expect("fill the ordinary queue window exactly");
         let ordinary_encoding = supervisor
@@ -6011,8 +6124,8 @@ mod tests {
         let client = &fixture.sink.targets[&backend].client;
         let operation = tokio::time::timeout(Duration::from_secs(5), async {
             let method = NativeRpcMethod::ApplyTaskOperations;
-            let (mut grpc, acquired) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
-            let response = grpc.apply_task_operations(Request::new(wire.clone())).await;
+            let (mut grpc, acquired) = client.operation_test_grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+            let response = fixture_apply_request(&mut grpc, Request::new(wire.clone()), method, wire.operations.len(), client.method_message_limits(method).1).await;
             let proof = proof.await?;
             anyhow::ensure!(proof.stream_id > proof.last_stream_id && proof.last_stream_id == 0, "actual stream did not exceed actual GOAWAY last id");
             anyhow::ensure!(proof.reason == u32::from(reason) && proof.body == expected, "actual frame or original request bytes differ");
@@ -6030,8 +6143,8 @@ mod tests {
                     drop(status);
                     if reason == h2::Reason::NO_ERROR && classified == OperationDispatchResult::TransportUnknown {
                         client.invalidate_channel_if_current(method, &acquired);
-                        let (mut grpc, _) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
-                        receipt = Some(grpc.apply_task_operations(Request::new(wire.clone())).await?.into_inner());
+                        let (mut grpc, _) = client.operation_test_grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+                        receipt = Some(fixture_apply_request(&mut grpc, Request::new(wire.clone()), method, wire.operations.len(), client.method_message_limits(method).1).await?.into_inner());
                     }
                     (Some(code), observed, Some(classified))
                 }
@@ -6270,60 +6383,28 @@ mod tests {
         let fixture = sink_fixture(Loopback::start().await, backend);
         let supervisor = fixture.sink.data_runtime.task_transport_supervisor();
         let before = supervisor.snapshot();
-        let mut batch = released_batch(
-            backend,
-            vec![OperationIntent::FetchTaskDynamicFilters(
-                FetchTaskDynamicFilters::new(TaskOperationId::new_v7(), identity(1, backend), None),
-            )],
-        );
-        let original_id = batch.operations()[0].operation_id();
-        let original_bytes = batch.queued_bytes();
-        let permits = batch
-            .operations()
-            .iter()
-            .map(|intent| fixture.governed.reserve(&fixture.sink, intent))
-            .collect();
-        batch.replace_fixture_permits(permits);
-        let held = supervisor.snapshot();
-        assert_eq!(held.retained_items, before.retained_items + 1);
-        assert!(held.retained_queued_and_encoded_bytes > before.retained_queued_and_encoded_bytes);
-
-        let returned = match fixture.sink.try_submit(batch) {
-            TaskOperationSubmit::AdmissionFailed {
-                batch,
-                error: novarocks_workload_control::WorkError::Conflict,
-            } => batch,
-            other => panic!("a read must be refused by the closed batch vocabulary: {other:?}"),
-        };
-        assert_eq!(returned.operations().len(), 1);
-        assert_eq!(returned.operations()[0].operation_id(), original_id);
-        assert_eq!(
-            returned.operations()[0].kind(),
-            OperationKind::FetchTaskDynamicFilters
-        );
-        assert_eq!(returned.queued_bytes(), original_bytes);
-        assert_eq!(
-            supervisor.snapshot(),
-            held,
-            "the caller still owns its exact paid input"
-        );
-        assert!(
-            fixture.acks.drain_events().is_empty(),
-            "refusal cannot manufacture an ACK"
-        );
-        assert!(
-            fixture.loopback.peer.applied().is_empty(),
-            "a read has its own RPC and never becomes a batch item"
-        );
-        assert_eq!(fixture.loopback.peer.control_requests(), 0);
-        drop(returned);
-        fixture.governed.drive();
+        let intent = OperationIntent::FetchTaskDynamicFilters(FetchTaskDynamicFilters::new(
+            TaskOperationId::new_v7(),
+            identity(1, backend),
+            None,
+        ));
+        let mut preparation = crate::task_execution::intent::TaskOperationQueuePreparation::new();
+        assert!(matches!(
+            fixture
+                .sink
+                .try_reserve_queue(intent.queue_request(), &mut preparation),
+            TaskOperationQueueAdmission::Rejected(novarocks_workload_control::WorkError::Conflict)
+        ));
         assert_eq!(
             supervisor.snapshot(),
             before,
-            "only actual input drop returns the queue charge"
+            "a non-operation has no batch encoding and cannot acquire a queue reservation"
         );
         assert!(fixture.acks.drain_events().is_empty());
+        assert!(fixture.loopback.peer.applied().is_empty());
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
+        drop(preparation);
+        message_limits::close(fixture).await;
     }
 
     #[test]
@@ -8675,9 +8756,19 @@ mod tests {
             }
         );
         assert_eq!(error.failure_fact().reason().code(), 103);
-        let other_budget =
-            TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
-                .unwrap();
+        let other_budget = TransportBudget::new(
+            2,
+            1024,
+            novarocks_task_codec::TransportMessageLimits::DEFAULT,
+            4,
+            256 * 1024 * 1024,
+            4,
+            512 * 1024 * 1024,
+            1,
+            2,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let error = NativeTaskOperationSink::new(
             &[descriptor],
             other_budget,

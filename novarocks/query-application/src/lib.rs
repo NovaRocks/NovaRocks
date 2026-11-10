@@ -80,6 +80,7 @@ pub mod statement_effect;
 /// Read-only `information_schema` materialization contracts and providers.
 pub mod system_catalog;
 pub mod system_catalog_rewrite;
+pub mod system_tables;
 pub mod view;
 mod view_iceberg;
 mod view_service;

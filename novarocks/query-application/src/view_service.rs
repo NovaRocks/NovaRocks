@@ -47,6 +47,18 @@ pub struct LocalViewSnapshot {
     entries: Arc<HashMap<SessionViewKey, StoredView>>,
 }
 impl LocalViewSnapshot {
+    /// Names from this immutable statement snapshot; no live registry read.
+    pub fn names_in_namespace<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.entries
+            .keys()
+            .filter(move |key| key.catalog == catalog && key.database == namespace)
+            .map(|key| key.view.as_str())
+    }
+
     pub fn get(
         &self,
         identity: &novarocks_types::naming::TableIdentity,

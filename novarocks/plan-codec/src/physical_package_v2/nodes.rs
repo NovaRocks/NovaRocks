@@ -231,6 +231,7 @@ pub(super) fn prepare_node_encode_in<'node, 'namespace, 'loan, 'source, 'control
         p::NodeKind::Filter { .. }
         | p::NodeKind::Project { .. }
         | p::NodeKind::Values { .. }
+        | p::NodeKind::SystemRelation { .. }
         | p::NodeKind::Limit { .. }
         | p::NodeKind::GenerateSeries { .. } => {
             PreparedNodeEncode::Simple(prepare_simple_node_encode_in(
@@ -392,6 +393,7 @@ pub(super) fn prepare_node_decode_in<'node, 'namespace, 'loan, 'wire, 'control>(
         Some(wire::physical_node::Kind::Filter(_))
         | Some(wire::physical_node::Kind::Project(_))
         | Some(wire::physical_node::Kind::Values(_))
+        | Some(wire::physical_node::Kind::SystemRelation(_))
         | Some(wire::physical_node::Kind::Limit(_))
         | Some(wire::physical_node::Kind::GenerateSeries(_)) => {
             PreparedNodeDecode::Simple(prepare_simple_node_decode_in(

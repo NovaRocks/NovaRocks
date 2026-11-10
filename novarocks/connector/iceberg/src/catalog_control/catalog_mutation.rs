@@ -2236,7 +2236,7 @@ fn execute_view_publication(
                         .list_tables_for_request(
                             &namespace,
                             &request.context,
-                            novarocks_spi::connector::ConnectorListingBound::V1,
+                            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                         )
                         .map_err(|(kind, message)| ConnectorError::new(kind, message))?
                         .iter()
