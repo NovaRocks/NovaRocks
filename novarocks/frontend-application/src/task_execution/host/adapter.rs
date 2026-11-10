@@ -31,6 +31,7 @@ use crate::{
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
     },
+    task_execution::host::custody::TransportRetirements,
 };
 use novarocks_attempt_protocol::{
     AttemptCore, Core, InputSelection,
@@ -238,17 +239,27 @@ impl AttemptActorRegistration {
         startup_work: &WorkObligation,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
-    ) -> Result<PreparedAttemptHost, (AttemptRegistrationError, Box<dyn EffectSource>)> {
+        transport: TransportRetirements,
+    ) -> Result<
+        PreparedAttemptHost,
+        (
+            AttemptRegistrationError,
+            Box<dyn EffectSource>,
+            TransportRetirements,
+        ),
+    > {
         if self.startup_reserved
             || !self.ordered_bound
             || self.binding.get().is_none()
             || !self.scope.same_scope(startup_work.scope())
+            || !transport.matches_registration(runtime, &self.original)
         {
             return Err((
                 AttemptRegistrationError::InvalidConfig(
                     "attempt startup requires its original bound Sources and Work",
                 ),
                 source,
+                transport,
             ));
         }
         let input = match self.reserve_standing(
@@ -258,7 +269,9 @@ impl AttemptActorRegistration {
             startup_work,
         ) {
             Ok(input) => input,
-            Err(error) => return Err((AttemptRegistrationError::Runtime(error), source)),
+            Err(error) => {
+                return Err((AttemptRegistrationError::Runtime(error), source, transport));
+            }
         };
         self.startup_reserved = true;
         Ok(PreparedAttemptHost {
@@ -270,6 +283,7 @@ impl AttemptActorRegistration {
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
                 source,
                 executor: executor.clone(),
+                transport: Some(transport),
             },
             startup: AttemptStartup {
                 registration: self.original.clone(),

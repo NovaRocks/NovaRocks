@@ -211,6 +211,7 @@ impl EffectSource for PurposeSource {
         );
         let original = bank.originals.get_mut(&value).unwrap();
         PreparedEffectJob {
+            transport: None,
             effect: ticket.effect.clone(),
             exit: original.exit.take().unwrap(),
             result,
@@ -454,6 +455,7 @@ impl Fixture {
             },
             source: Box::new(PurposeSource(bank.clone())),
             executor: executor.clone(),
+            transport: None,
         })
         .unwrap_or_else(|_| panic!("actual purpose Source registration"));
         Self {

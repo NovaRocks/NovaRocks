@@ -27,6 +27,9 @@ use super::{
     actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendLaneKey},
     metrics::FrontendHostObservations,
 };
+use crate::task_execution::host::custody::{
+    TransportRetirement, TransportRetirements, TransportSourceEvent,
+};
 use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
@@ -55,6 +58,9 @@ pub(crate) struct PreparedEffectJob {
     pub(crate) exit: ExitObligation,
     pub(crate) result: CausalInputObligation<FrontendActor>,
     pub(crate) captures: Box<dyn Any + Send>,
+    /// The same original transport Join owner moves to the host before
+    /// handing off the launch credential and original result to the executor.
+    pub(crate) transport: Option<Box<TransportRetirement>>,
 }
 pub(crate) trait EffectExecutor: Send + Sync + 'static {
     /// A temporary refusal must arrange the original host's real availability
@@ -91,6 +97,15 @@ pub(crate) trait EffectSource: Send + 'static {
     /// If this makes already-exited work retireable, handle it now or notify
     /// this original host registration once; never wait for a periodic scan.
     fn core_consumed(&mut self, inputs: &[InputId]);
+    /// A transport-enabled Source consumes these same originals. The host
+    /// scheduler only routes them and does not interpret outcome or failure.
+    fn transport_event(
+        &mut self,
+        _effect: novarocks_coordination_contract::AttemptActionId,
+        original: TransportSourceEvent,
+    ) {
+        std::panic::resume_unwind(Box::new(original));
+    }
     /// The immutable failure custodian takes these same originals; it must
     /// arrange actual unused withdrawal/cleanup and retain all partial custody.
     /// It may neither inspect the suspect Core nor drop the job as proof of exit.
@@ -189,6 +204,7 @@ struct HostMachine {
     policy: FrontendLanePolicy,
     source: Box<dyn EffectSource>,
     executor: Arc<dyn EffectExecutor>,
+    transport: Option<TransportRetirements>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -215,6 +231,7 @@ pub(crate) struct HostBinding {
     pub(crate) policy: FrontendLanePolicy,
     pub(crate) source: Box<dyn EffectSource>,
     pub(crate) executor: Arc<dyn EffectExecutor>,
+    pub(crate) transport: Option<TransportRetirements>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -250,7 +267,11 @@ impl HostRegistry {
         }
     }
     pub(crate) fn register(&self, binding: HostBinding) -> Result<(), HostRegistrationRefusal> {
-        if !binding.registration.matches_scope(&binding.scope) {
+        if !binding.registration.matches_scope(&binding.scope)
+            || binding.transport.as_ref().is_some_and(|transport| {
+                !transport.matches_registration(&self.runtime, &binding.registration)
+            })
+        {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
                 runtime_error: None,
@@ -339,6 +360,7 @@ impl HostRegistry {
                     policy: binding.policy,
                     source: binding.source,
                     executor: binding.executor,
+                    transport: binding.transport,
                     scan_remaining: None,
                     rescan_requested: false,
                     pending: None,
@@ -560,7 +582,17 @@ impl HostRegistry {
         if failed && let Some(pending) = machine.pending.take() {
             machine.source.owner_failed_pending(pending);
         }
-        let retired = machine
+        let transport = machine.transport.as_mut().map(|transport| {
+            // One original row visit per host turn leaves the original
+            // indexing allowance available to make the Core and effects run.
+            transport.progress(turn, 1, |effect, event| {
+                machine.source.transport_event(effect, event);
+            })
+        });
+        if let Some(transport) = &transport {
+            budget -= transport.units;
+        }
+        let mut retired = machine
             .source
             .progress_retirement(&self.runtime, turn, now, budget);
         assert!(
@@ -568,6 +600,11 @@ impl HostRegistry {
             "Source work uses the original finite host allowance"
         );
         budget -= retired.units;
+        if let Some(transport) = transport {
+            retired.progressed |= transport.progressed;
+            retired.more |= transport.more;
+            retired.retired &= machine.transport.as_ref().unwrap().is_empty();
+        }
         if retired.progressed && machine.scan_remaining.is_some() {
             machine.rescan_requested = true;
         }
@@ -619,6 +656,11 @@ impl HostRegistry {
                 machine.rescan_requested = true;
             }
             machine.source.core_consumed(&indexed.inputs);
+            if !indexed.inputs.is_empty()
+                && let Some(transport) = &machine.transport
+            {
+                transport.original_input_progress();
+            }
         }
         while budget != 0 {
             if machine.pending.is_none() || handoff_refused {
@@ -673,6 +715,9 @@ impl HostRegistry {
                         self.runtime
                             .effect_completed(ticket)
                             .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        if let Some(transport) = &machine.transport {
+                            transport.original_input_progress();
+                        }
                         machine.rescan_requested = true;
                     } else {
                         original_dispatch!(machine.dispatch.defer_candidate(&candidate));
@@ -680,6 +725,15 @@ impl HostRegistry {
                     continue;
                 }
                 if machine.pending.is_some() || machine.source.result_admission_closed() {
+                    original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    continue;
+                }
+                if matches!(metadata, FrontendEffect::Attempt(effect) if effect.handoff().is_some())
+                    && machine
+                        .transport
+                        .as_ref()
+                        .is_some_and(|transport| !transport.has_room())
+                {
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 }
@@ -713,9 +767,20 @@ impl HostRegistry {
                         return Err(error.into());
                     }
                 };
-                let job = machine
+                let mut job = machine
                     .source
                     .bind_job(&self.runtime, turn, &ticket, prepaid);
+                if let Some(retirement) = job.transport.take() {
+                    let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                        std::panic::resume_unwind(Box::new((job, retirement)));
+                    };
+                    let Some(transport) = machine.transport.as_mut() else {
+                        std::panic::resume_unwind(Box::new((job, retirement)));
+                    };
+                    if let Err((_, retirement)) = transport.track(effect.clone(), retirement) {
+                        std::panic::resume_unwind(Box::new((job, retirement)));
+                    }
+                }
                 machine.pending = Some(PendingHandoff { ticket, job });
                 if budget == 0 {
                     break;
@@ -742,6 +807,9 @@ impl HostRegistry {
                         .runtime
                         .effect_completed_with_receipt(pending.ticket)
                         .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                    if let Some(transport) = &machine.transport {
+                        transport.original_input_progress();
+                    }
                     if let Some((key, EffectRelease::Completed)) = lane {
                         original_dispatch!(
                             machine
@@ -1054,7 +1122,8 @@ mod tests {
                     scope: source_scope,
                     closing: false
                 }),
-                executor: Arc::new(NoExecutor)
+                executor: Arc::new(NoExecutor),
+                transport: None,
             })
             .is_ok()
         );
@@ -1186,6 +1255,7 @@ mod tests {
                 exit: self.exit.take().unwrap(),
                 result,
                 captures: self.captures.take().unwrap(),
+                transport: None,
             }
         }
         fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
@@ -1429,7 +1499,8 @@ mod tests {
                     closing: false,
                     report_consumed: false
                 }),
-                executor: executor.clone()
+                executor: executor.clone(),
+                transport: None,
             })
             .is_ok()
         );
@@ -1667,7 +1738,8 @@ mod tests {
                         closing: false,
                         report_consumed: false
                     }),
-                    executor: Arc::new(NoExecutor)
+                    executor: Arc::new(NoExecutor),
+                    transport: None,
                 })
                 .is_ok()
         );

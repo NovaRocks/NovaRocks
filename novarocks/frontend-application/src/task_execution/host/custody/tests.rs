@@ -299,15 +299,32 @@ use novarocks_control_runtime_core::{
 };
 
 type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, ExecutorFact)>>>;
-struct WithdrawalTarget(ObservedWithdrawals);
+struct WithdrawalTarget(
+    ObservedWithdrawals,
+    Option<Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>>,
+);
 impl TestActor for WithdrawalTarget {
     fn handle(
         &mut self,
         _: Tick,
         envelope: InputEnvelope,
         value: FrontendInput,
-        _: &mut ActorStep<'_, FrontendEffect>,
+        step: &mut ActorStep<'_, FrontendEffect>,
     ) {
+        if matches!(value, FrontendInput::Test(_)) {
+            let effect = self.1.take().expect("one original transport command");
+            let work = step.input_work().expect("original admission author");
+            step.effect(
+                crate::task_execution::host::adapter::descriptor(
+                    effect.protocol.id.get(),
+                    work,
+                    novarocks_control_runtime_core::effect::EffectKind::Business,
+                ),
+                FrontendEffect::Attempt(effect),
+            )
+            .unwrap();
+            return;
+        }
         let FrontendInput::Attempt(value) = value else {
             panic!("expected an original attempt input");
         };
@@ -326,6 +343,21 @@ pub(crate) struct WithdrawalInbox {
 }
 impl WithdrawalInbox {
     pub(crate) fn new(scope: &ScopeHandle) -> Self {
+        Self::with_effect(scope, None)
+    }
+    const CONFIG: ActorConfig = ActorConfig {
+        mailbox: [4; 4],
+        max_batches: 4,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 8,
+        max_step_work: 1,
+    };
+
+    fn with_effect(
+        scope: &ScopeHandle,
+        effect: Option<Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>>,
+    ) -> Self {
         let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
         let source = ActorId::new(2).unwrap();
@@ -334,15 +366,8 @@ impl WithdrawalInbox {
             .register_bound_with_source_cut(
                 actor,
                 scope.clone(),
-                FrontendActor::Test(Box::new(WithdrawalTarget(observed.clone()))),
-                ActorConfig {
-                    mailbox: [4; 4],
-                    max_batches: 4,
-                    max_effects_per_step: 1,
-                    max_dependencies_per_effect: 0,
-                    turn_budget: 8,
-                    max_step_work: 1,
-                },
+                FrontendActor::Test(Box::new(WithdrawalTarget(observed.clone(), effect))),
+                Self::CONFIG,
                 source,
             )
             .unwrap_or_else(|(error, _)| panic!("{error}"));
@@ -602,12 +627,17 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     use super::actor_result::AdmissionPublicationError;
     use crate::{
         control_runtime::{
-            host::{EffectExecutor, PreparedEffectJob},
+            actor::FrontendActorKind,
+            host::{
+                EffectSource, FrontendLanePolicy, HostBinding, HostRegistry, PendingHandoff,
+                PreparedEffectJob, SourceProgress,
+            },
+            metrics::FrontendHostObservations,
             transport_withdrawal::AttemptEffectEnvelope,
         },
         task_execution::host::transport::{
-            self, ActorTransportExecutor, ActorTransportWork, BoundActorTransport, BoundQueue,
-            GrantedInputs, SendKey, SourceLayouts,
+            self, ActorTransportExecutor, ActorTransportWork, BoundQueue, GrantedInputs, SendKey,
+            SourceLayouts,
         },
     };
     use novarocks_attempt_protocol::{
@@ -625,11 +655,8 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     use std::{num::NonZeroU64, time::Duration};
 
     let fixture = Fixture::new();
-    let inbox = WithdrawalInbox::new(&fixture.scope);
     let mut wc = transport::GovernedQueuedInputFixture::new();
     let original = fixture.reported(None);
-    let result = inbox.reserve(&original);
-    let result_author = result.event_author().unwrap();
     let id = AttemptActionId::new(NonZeroU64::MIN);
     let key = SendKey {
         operation: TaskOperationId::new_v7(),
@@ -657,55 +684,175 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             payload: QueuedInputPayload::NewCreation(payload),
         },
     });
-    let panic = PanicSink::new();
-    let (owner, exit, launch) =
-        OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
-            .unwrap_or_else(|e| panic!("{}", e.error));
+    struct Source {
+        scope: ScopeHandle,
+        result: Option<CausalInputObligation<FrontendActor>>,
+        original: Option<ReportedWork>,
+        bound: Option<BoundQueue>,
+        completed: Arc<Mutex<Option<actor_result::ReturnedActorTransportResult>>>,
+        closing: bool,
+    }
+    impl EffectSource for Source {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            self.result.take()
+        }
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &novarocks_control_runtime::actor_turn::ActorHostTurn<FrontendActor>,
+            ticket: &novarocks_control_runtime::actor_turn::EffectTicket<FrontendEffect>,
+            result: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                unreachable!()
+            };
+            transport::prepare_actor_transport(
+                effect.clone(),
+                result,
+                self.original.take().unwrap(),
+                Default::default(),
+                observer(),
+                |_| ActorTransportWork::Admit(Box::new(self.bound.take().unwrap())),
+            )
+            .unwrap_or_else(|_| panic!("same original transport role"))
+        }
+        fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
+            assert!(self.result.replace(result).is_none());
+        }
+        fn core_consumed(&mut self, _: &[InputId]) {}
+        fn transport_event(
+            &mut self,
+            effect: AttemptActionId,
+            original: super::TransportSourceEvent,
+        ) {
+            match original {
+                super::TransportSourceEvent::Result(result) => {
+                    assert_eq!(result.effect.protocol.id, effect);
+                    assert!(self.completed.lock().unwrap().replace(result).is_none());
+                }
+                super::TransportSourceEvent::Retired => {}
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
+        }
+        fn owner_failed_pending(&mut self, pending: PendingHandoff) {
+            std::panic::resume_unwind(Box::new(pending));
+        }
+        fn close_external(&mut self) {
+            self.closing = true;
+            self.scope.close_external().unwrap();
+        }
+        fn result_admission_closed(&self) -> bool {
+            self.closing
+        }
+        fn progress_retirement(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &novarocks_control_runtime::actor_turn::ActorHostTurn<FrontendActor>,
+            _: Tick,
+            budget: usize,
+        ) -> SourceProgress {
+            let units = if self.closing {
+                self.scope.reap_ready(budget).unwrap()
+            } else {
+                0
+            };
+            let retired = self.closing && self.scope.join_ready().unwrap();
+            SourceProgress {
+                units,
+                progressed: units != 0,
+                more: units != 0 && !retired,
+                retired,
+            }
+        }
+    }
+
+    let inbox = WithdrawalInbox::with_effect(&fixture.scope, Some(effect));
+    let result = inbox.reserve(&original);
+    let command = inbox
+        .runtime
+        .reserve_admitted_input_for(
+            &inbox.registration,
+            inbox.source,
+            InputClass::Lifecycle,
+            original.work(),
+        )
+        .unwrap()
+        .fill(FrontendInput::Test(1))
+        .unwrap();
     let layouts = transport::actor_transport_layouts(false).unwrap();
     let quote = transport::queued_input_quote(8192, SourceLayouts { original: &layouts }).unwrap();
-    let job = PreparedEffectJob {
-        effect: FrontendEffect::Attempt(effect.clone()),
-        exit,
-        result,
-        captures: Box::new(BoundActorTransport {
-            effect,
-            work: ActorTransportWork::Admit(Box::new(BoundQueue {
+    let completed = Arc::new(Mutex::new(None));
+    let handle = Handle::current();
+    let host = HostRegistry::new(
+        inbox.runtime.clone(),
+        fixture.ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            novarocks_control_runtime::actor_turn::ProcessClock::default(),
+        ))),
+    );
+    host.register(HostBinding {
+        scope: fixture.scope.clone(),
+        registration: inbox.registration.clone(),
+        kind: FrontendActorKind::Test,
+        config: WithdrawalInbox::CONFIG,
+        policy: FrontendLanePolicy::attempt(1),
+        executor: Arc::new(ActorTransportExecutor(handle.clone())),
+        source: Box::new(Source {
+            scope: fixture.scope.clone(),
+            result: Some(result),
+            original: Some(original),
+            bound: Some(BoundQueue {
                 key,
                 scope_generation: Generation::new(1).unwrap(),
                 control: false,
                 quote,
                 authority: wc.authority(),
                 original_captures: Box::new(()),
-            })),
-            launch,
-            panic,
-            result_author,
+            }),
+            completed: completed.clone(),
+            closing: false,
         }),
-    };
-    let handle = Handle::current();
-    let mut reaper = super::TransportRetirement::new(owner, Default::default(), observer());
-    assert!(ActorTransportExecutor(handle.clone()).handoff(job).is_ok());
-    assert!(matches!(reaper.take_actor_result(), Ok(None)));
-    inbox.assert_no_result();
-    let joined = tokio::time::timeout(
-        Duration::from_secs(2),
-        poll_fn(|cx| {
-            wc.progress();
-            let result = reaper.poll_step(&handle, cx);
-            if result.is_pending() {
-                cx.waker().wake_by_ref();
-            }
-            result
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap_or_else(|_| panic!("original admission Join"));
-    assert!(matches!(joined, super::TransportRetirementStep::Advanced));
-    let mut result = reaper
-        .take_actor_result()
-        .unwrap_or_else(|_| panic!("admission has no send reports"))
+        transport: Some(super::TransportRetirements::new(
+            inbox.runtime.clone(),
+            inbox.registration.clone(),
+            handle,
+            1,
+        )),
+    })
+    .unwrap_or_else(|_| panic!("same original host route"));
+
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let mut first_turns = 0;
+    while let Some(turn) = inbox.runtime.claim_host_actor() {
+        host.drive(Tick(1), turn);
+        first_turns += 1;
+        assert!(first_turns <= 4, "a pending Join must let the host sleep");
+    }
+    assert!(first_turns > 0);
+    assert!(completed.lock().unwrap().is_none());
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), command)
         .unwrap();
+    inbox.assert_no_result();
+
+    let mut result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            wc.progress();
+            while let Some(turn) = inbox.runtime.claim_host_actor() {
+                host.drive(Tick(1), turn);
+            }
+            if let Some(result) = completed.lock().unwrap().take() {
+                break result;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(result.withdrawal.is_none());
     let mut inputs = GrantedInputs::default();
     assert!(matches!(
@@ -753,18 +900,10 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     drop(original_grant);
     drop(payload_retention);
     assert!(result.close_result_after_exit().unwrap());
-    assert!(matches!(
-        poll_fn(|cx| reaper.poll_step(&handle, cx))
-            .await
-            .unwrap_or_else(|_| panic!("original admission retirement")),
-        super::TransportRetirementStep::Retired,
-    ));
-    fixture.scope.close_external().unwrap();
-    fixture
-        .ledger
-        .reap_scope_ready(fixture.scope.id(), 128)
-        .unwrap();
-    inbox.finish();
-    fixture.finish();
+    host.close_registration();
+    while let Some(turn) = inbox.runtime.claim_host_actor() {
+        host.drive(Tick(1), turn);
+    }
+    assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
     assert!(wc.finish());
 }

@@ -30,12 +30,17 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::host::custody::{
-        CustodyError, TransportJoinHandoff, TransportJoinRegistration,
+        CustodyError, CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
+        TransportJoinRegistration, TransportRetirement,
     },
 };
 use novarocks_attempt_protocol::effect::EffectBody;
-use novarocks_control_runtime::{actor_turn::InputAuthor, exit_work::PanicSink};
-use std::{alloc::Layout, sync::Arc};
+use novarocks_control_runtime::{
+    actor_turn::InputAuthor, causal_input::CausalInputObligation, exit_work::PanicSink,
+    reported_work::ReportedWork,
+};
+use novarocks_control_runtime_core::identity::ConsumerId;
+use std::{alloc::Layout, collections::VecDeque, sync::Arc};
 use tokio::runtime::Handle;
 
 /// Holds only the authority to stage a body outcome in its original record.
@@ -115,7 +120,7 @@ impl ActorTransportWork {
 /// native binding and the distinct actor-result wrapper.
 pub(crate) fn actor_transport_layouts(
     send: bool,
-) -> Result<[Layout; 5], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+) -> Result<[Layout; 6], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
     use novarocks_control_runtime::exit_work::HandoffCell;
     use novarocks_type_contract::owned_resources::layout::arc_layout;
     Ok([
@@ -123,12 +128,60 @@ pub(crate) fn actor_transport_layouts(
         arc_layout(Layout::new::<HandoffCell>())?,
         Layout::new::<BoundActorTransport>(),
         Layout::new::<ActorResultObligation>(),
+        Layout::new::<TransportRetirement>(),
         if send {
             Layout::new::<BoundSend>()
         } else {
             Layout::new::<BoundQueue>()
         },
     ])
+}
+
+/// Prepare the job and its matching host retirement row from the same
+/// already-admitted Work. The binder uses its actual Join registration to
+/// attach any original queue window and WC grants.
+pub(crate) fn prepare_actor_transport(
+    effect: Arc<AttemptEffectEnvelope>,
+    result: CausalInputObligation<crate::control_runtime::actor::FrontendActor>,
+    original: ReportedWork,
+    cleanup: VecDeque<ReportedWork>,
+    observer: ConsumerId,
+    bind: impl FnOnce(TransportJoinRegistration) -> ActorTransportWork,
+) -> Result<PreparedEffectJob, TransportPreparationRefusal> {
+    let result_author = result.event_author().expect("original prepaid result");
+    let panic = PanicSink::new();
+    let (owner, exit, launch) =
+        match OriginalTransportJoinObligation::prepare(original, observer, panic.clone()) {
+            Ok(prepared) => prepared,
+            Err(refused) => {
+                return Err(TransportPreparationRefusal {
+                    refused,
+                    result,
+                    cleanup,
+                });
+            }
+        };
+    let work = bind(owner.registration());
+    Ok(PreparedEffectJob {
+        effect: FrontendEffect::Attempt(effect.clone()),
+        exit,
+        result,
+        captures: Box::new(BoundActorTransport {
+            effect,
+            work,
+            launch,
+            panic,
+            result_author,
+        }),
+        transport: Some(Box::new(TransportRetirement::new(owner, cleanup, observer))),
+    })
+}
+
+#[must_use]
+pub(crate) struct TransportPreparationRefusal {
+    pub(crate) refused: CustodyRefusal,
+    pub(crate) result: CausalInputObligation<crate::control_runtime::actor::FrontendActor>,
+    pub(crate) cleanup: VecDeque<ReportedWork>,
 }
 
 pub(crate) enum ActorTransportHandoff {
@@ -152,6 +205,9 @@ pub(crate) fn handoff_actor_transport(
     runtime: &Handle,
     job: PreparedEffectJob,
 ) -> Result<ActorTransportHandoff, PreparedEffectJob> {
+    if job.transport.is_some() {
+        return Err(job);
+    }
     let Some(bound) = job.captures.downcast_ref::<BoundActorTransport>() else {
         return Err(job);
     };
@@ -169,6 +225,7 @@ pub(crate) fn handoff_actor_transport(
         exit,
         result,
         captures,
+        transport,
     } = job;
     let bound = captures
         .downcast_ref::<BoundActorTransport>()
@@ -184,6 +241,7 @@ pub(crate) fn handoff_actor_transport(
             exit,
             result,
             captures,
+            transport,
         });
     }
     let BoundActorTransport {

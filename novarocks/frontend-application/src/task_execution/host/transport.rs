@@ -46,7 +46,7 @@ mod source_ports;
 // Only these controlled original-object entry points are exposed to the host.
 pub(crate) use actor_adapter::{
     ActorTransportExecutor, ActorTransportHandoff, ActorTransportWork, BoundActorTransport,
-    actor_transport_layouts, handoff_actor_transport,
+    actor_transport_layouts, handoff_actor_transport, prepare_actor_transport,
 };
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;

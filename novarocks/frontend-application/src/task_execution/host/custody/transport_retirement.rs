@@ -31,6 +31,7 @@ use crate::{
 };
 use novarocks_control_runtime::{
     actor_turn::ActorTurnError, exit_custody::ExitCustody, reported_work::ReportedWork,
+    transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::identity::ConsumerId;
 use std::{
@@ -111,6 +112,14 @@ impl TransportRetirement {
 
     pub(crate) fn original(&self) -> &OriginalTransportJoinObligation {
         &self.original
+    }
+
+    pub(crate) fn scope(&self) -> &ScopeHandle {
+        &self.original.native.scope
+    }
+
+    pub(super) fn retain_unresolved(&mut self) {
+        self.failed = true;
     }
 
     pub(crate) fn active_disposal(&self) -> Option<&OriginalDisposalObligation> {
