@@ -769,7 +769,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::{
             actor_gate::tests::logical_execution,
-            bridge::qa::AttemptQaBridge,
+            bridge::{qa::AttemptQaBridge, terminal::TerminalOutbox},
             host::transport::{
                 ActorTransportExecutor, AttemptCallOwner, AttemptCallSource,
                 AttemptEstablishMaterial, AttemptProcessObserver,
@@ -783,8 +783,8 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use novarocks_control_runtime::actor_turn::{ActorHostTurn, Clock, EffectTicket, ProcessClock};
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
-        AttemptAuthorizationRef, AttemptIssueSettlement, AttemptRequestToken, AttemptToLogical,
-        AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+        AttemptAuthorizationRef, AttemptIssueSettlement, AttemptRequestToken, AttemptTerminal,
+        AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
@@ -1055,20 +1055,27 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             .into_iter()
             .all(|effect| effect.handoff().is_none())
     );
+    let refusal = novarocks_attempt_protocol::failure::AttemptFailure::TaskProtocol(Box::new(
+        novarocks_attempt_protocol::error::TaskExecutionError::PreReadyEstablishRejected {
+            participation,
+            operation_id,
+            rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                outcome: OperationOutcome::IdentityMismatch,
+                detail: None,
+                acknowledgement: None,
+            },
+        },
+    ));
     let permission = AttemptEffectEnvelope::new(AttemptEffect {
         id: AttemptActionId::new(id(5)),
         class: EffectClass::Settlement,
-        body: EffectBody::Port(port(5, AttemptToLogicalBody::PreReadyReplacementQuery {
-            token: token(5),
-            refusal: novarocks_attempt_protocol::failure::AttemptFailure::TaskProtocol(Box::new(
-                novarocks_attempt_protocol::error::TaskExecutionError::PreReadyEstablishRejected {
-                    participation, operation_id,
-                    rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
-                        outcome: OperationOutcome::IdentityMismatch, detail: None, acknowledgement: None,
-                    },
-                },
-            )),
-        })),
+        body: EffectBody::Port(port(
+            5,
+            AttemptToLogicalBody::PreReadyReplacementQuery {
+                token: token(5),
+                refusal: refusal.clone(),
+            },
+        )),
     });
     let sample = AttemptEffectEnvelope::new(AttemptEffect {
         id: AttemptActionId::new(id(6)),
@@ -1078,10 +1085,18 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             participation,
         },
     });
+    let terminal = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(id(7)),
+        class: EffectClass::Settlement,
+        body: EffectBody::Port(port(
+            7,
+            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(refusal)),
+        )),
+    });
     let mailbox = [8; 4];
     let inbox = WithdrawalInbox::with_commands(
         &fixture.scope,
-        [begin, grant, first, second, permission, sample].map(|effect| (effect, None)),
+        [begin, grant, first, second, permission, sample, terminal].map(|effect| (effect, None)),
         mailbox,
     );
     let source = Arc::new(Mutex::new(AttemptCallSource::new(
@@ -1096,6 +1111,8 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         )))),
         inbox.reserve_result(&parent),
     )));
+    let terminal = TerminalOutbox::new(activation);
+    source.lock().unwrap().install_terminal(terminal.clone());
     let endpoint = RuntimeEndpoint::new("127.0.0.1", 1701).unwrap();
     let replacement = BackendProcessId::new_v7();
     let process_source = ActorId::new(3).unwrap();
@@ -1260,6 +1277,29 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         .retire_input(inbox.registration.actor(), sample_command)
         .unwrap();
     drive_host();
+    let terminal_command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    await_reply(7).await;
+    let novarocks_query_application::api::NativeAttemptTerminal::Failed(failure) =
+        terminal.terminal(|_| None).await.unwrap()
+    else {
+        panic!("the original refusal was delivered");
+    };
+    assert!(failure.pre_ready_replacement().is_none());
+    assert_eq!(
+        failure.input().site(),
+        novarocks_query_application::execution_error::ExecutionFailureSite::Operation {
+            participation,
+            operation_id,
+            kind: OperationKind::UpdateParticipation,
+        }
+    );
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), terminal_command)
+        .unwrap();
+    drive_host();
+    inbox.assert_no_result();
     let mut sample_owner = process.lock().unwrap();
     assert!(sample_owner.close_idle().unwrap());
     let process_owner = sample_owner

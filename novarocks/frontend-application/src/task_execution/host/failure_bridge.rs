@@ -28,15 +28,11 @@ use novarocks_control_runtime::actor_turn::ActorRegistration;
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptToLogical, AttemptToLogicalBody,
 };
-use novarocks_execution_contract::{ParticipationRef, SafeDetail, failure::FailureProjection};
-use novarocks_query_application::{
-    api::{
-        BackendProcessObservation, BackendProcessObservationService,
-        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
-        NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeParticipationConvergence,
-        StatementNativeHealthFailure,
-    },
-    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
+use novarocks_execution_contract::ParticipationRef;
+use novarocks_query_application::api::{
+    BackendProcessObservation, BackendProcessObservationService, NativeActiveConvergenceClosure,
+    NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeAttemptPreparationFailure,
+    NativeAttemptTerminal, NativeParticipationConvergence, StatementNativeHealthFailure,
 };
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Instant};
 use tokio::sync::oneshot;
@@ -158,11 +154,7 @@ impl FailureBridge {
             }
         ));
         NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
-            ExecutionFailureInput::new(
-                QueryFailureReason::NativeFuturePanicked.failure_fact(),
-                SafeDetail::truncating("Native attempt Core failed"),
-                ExecutionFailureSite::Coordinator,
-            ),
+            crate::task_execution::bridge::terminal::owner_failure(),
         ))
     }
 

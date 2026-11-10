@@ -128,6 +128,7 @@ pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
     pub(crate) failure: PendingFailureBridge,
+    pub(crate) terminal: Arc<crate::task_execution::bridge::terminal::TerminalOutbox>,
 }
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
@@ -454,12 +455,16 @@ impl AttemptActorRegistration {
         let AttemptTransportBinding {
             retirement,
             admission,
-            qa,
+            mut qa,
             process,
             send,
             executor: native,
             failure,
         } = transport;
+        let terminal = crate::task_execution::bridge::terminal::TerminalOutbox::new(
+            self.root_control.activation(),
+        );
+        qa.install_terminal(terminal.clone());
         let (failure_bridge, residual) = PendingFailureBridge::new(
             self.original.clone(),
             self.root_control.activation(),
@@ -514,6 +519,7 @@ impl AttemptActorRegistration {
                 next: Some(AttemptInput::Bootstrap),
             },
             failure: failure_bridge,
+            terminal,
         })
     }
 

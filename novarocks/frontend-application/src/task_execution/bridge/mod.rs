@@ -16,3 +16,4 @@
 // under the License.
 
 pub(super) mod qa;
+pub(crate) mod terminal;

@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use super::terminal::replacement_refusal;
 use crate::task_execution::{error::TaskExecutionError, host::transport::AttemptEstablishMaterial};
 use novarocks_attempt_protocol::{
     effect::OperationIntent,
@@ -479,66 +480,6 @@ impl AttemptQaBridge {
         });
         (failure, (original, error))
     }
-}
-
-fn replacement_refusal(
-    refusal: &AttemptFailure,
-) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
-    use novarocks_attempt_protocol::error::TaskExecutionError as ProtocolError;
-    use novarocks_execution_contract::{
-        OperationKind, OperationOutcome, operation::OperationResult,
-    };
-
-    let AttemptFailure::TaskProtocol(original) = refusal else {
-        return None;
-    };
-    let (participation, operation_id, kind, rejection) = match original.as_ref() {
-        ProtocolError::PreReadyEstablishRejected {
-            participation,
-            operation_id,
-            rejection,
-        } => (
-            *participation,
-            *operation_id,
-            OperationKind::UpdateParticipation,
-            rejection,
-        ),
-        ProtocolError::OperationFailed {
-            task: Some(task),
-            participation,
-            operation_id,
-            kind: OperationKind::CreateTask,
-            rejection,
-        } if task.backend_process_id() == participation.backend_process_id()
-            && task.query_execution_id() == participation.query_execution_id() =>
-        {
-            (
-                *participation,
-                *operation_id,
-                OperationKind::CreateTask,
-                rejection,
-            )
-        }
-        _ => return None,
-    };
-    if !matches!(
-        rejection,
-        OperationResult::Verdict {
-            outcome: OperationOutcome::IdentityMismatch,
-            ..
-        }
-    ) {
-        return None;
-    }
-    Some(
-        TaskExecutionError::OperationFailed {
-            participation,
-            operation_id,
-            kind,
-            rejection: rejection.clone(),
-        }
-        .preparation_input(),
-    )
 }
 
 #[derive(Debug, Default)]

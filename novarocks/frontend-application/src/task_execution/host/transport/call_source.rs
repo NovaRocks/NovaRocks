@@ -28,12 +28,15 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::{
-        bridge::qa::AttemptQaBridge, error::TaskExecutionError,
+        bridge::{qa::AttemptQaBridge, terminal::TerminalOutbox},
+        error::TaskExecutionError,
         host::custody::ReturnedActorTransportResult,
     },
 };
 use novarocks_attempt_protocol::{
-    effect::EffectBody, failure::HostFailureRef, input::AttemptInput,
+    effect::EffectBody,
+    failure::{AttemptFailure, HostFailureRef},
+    input::AttemptInput,
 };
 use novarocks_control_runtime::{
     actor_turn::{ActorTurnError, EffectTicket},
@@ -77,9 +80,12 @@ impl AttemptCallOwner {
     }
 }
 
-pub(crate) struct AttemptCallReply {
-    input: AttemptInput,
-    failure: Option<(HostFailureRef, TaskExecutionError)>,
+pub(crate) enum AttemptCallReply {
+    Input {
+        input: AttemptInput,
+        failure: Option<(HostFailureRef, TaskExecutionError)>,
+    },
+    Terminal(AttemptToLogical<AttemptFailure>),
 }
 
 pub(crate) struct BoundAttemptCall(AttemptCallOwner);
@@ -95,6 +101,16 @@ impl BoundAttemptCall {
         match self.0 {
             AttemptCallOwner::Qa(bridge) => {
                 let mut bridge = bridge.lock().await;
+                if let EffectBody::Port(port) = &effect.protocol.body
+                    && matches!(port.body, AttemptToLogicalBody::AttemptTerminal(_))
+                {
+                    if port.activation != bridge.activation() || port.action != effect.protocol.id {
+                        return Err(Box::new(
+                            crate::task_execution::bridge::qa::AttemptQaPortError::WrongRequest,
+                        ));
+                    }
+                    return Ok(AttemptCallReply::Terminal(port.clone()));
+                }
                 let reply = match &effect.protocol.body {
                     EffectBody::EstablishAuthorization { operation, request } => {
                         bridge.authorize(operation, request).await
@@ -103,7 +119,7 @@ impl BoundAttemptCall {
                     _ => unreachable!("same original QA effect"),
                 }
                 .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
-                Ok(AttemptCallReply {
+                Ok(AttemptCallReply::Input {
                     input: AttemptInput::Port(reply.reply),
                     failure: reply.failure,
                 })
@@ -119,7 +135,7 @@ impl BoundAttemptCall {
                 let sample = observer
                     .read(request, participation)
                     .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
-                Ok(AttemptCallReply {
+                Ok(AttemptCallReply::Input {
                     input: AttemptInput::Executor(sample),
                     failure: None,
                 })
@@ -147,6 +163,7 @@ pub(crate) struct AttemptCallSource {
     parent: ReservationId,
     observer: ConsumerId,
     owner: Option<AttemptCallOwner>,
+    terminal: Option<Arc<TerminalOutbox>>,
     idle: Option<Position>,
     pending: Option<(Arc<AttemptEffectEnvelope>, ReportedWork)>,
     live: Option<Live>,
@@ -170,11 +187,17 @@ impl AttemptCallSource {
             parent: payer.id(),
             observer,
             owner: Some(owner),
+            terminal: None,
             idle: Some(position),
             pending: None,
             live: None,
             failures: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn install_terminal(&mut self, original: Arc<TerminalOutbox>) {
+        assert!(matches!(self.owner, Some(AttemptCallOwner::Qa(_))));
+        assert!(self.terminal.replace(original).is_none());
     }
 
     pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
@@ -325,19 +348,36 @@ impl AttemptCallSource {
                 publication: None,
             });
         }
-        let Some(BodyOutcome::Call(AttemptCallReply { input, failure })) = original.outcome.take()
-        else {
-            unreachable!("validated original QA outcome");
+        let Some(BodyOutcome::Call(reply)) = original.outcome.take() else {
+            unreachable!("validated original call outcome");
         };
-        if let Some((reference, failure)) = failure {
-            assert!(self.failures.insert(reference, failure).is_none());
-        }
-        let input = FrontendInput::Attempt(Box::new(input));
-        if let Err(publication) = original.original.fill_with_receipt(None, input) {
-            return Err(AttemptCallResultRefusal {
-                original,
-                publication: Some(publication),
-            });
+        match reply {
+            AttemptCallReply::Input { input, failure } => {
+                if let Some((reference, failure)) = failure {
+                    assert!(self.failures.insert(reference, failure).is_none());
+                }
+                let input = FrontendInput::Attempt(Box::new(input));
+                if let Err(publication) = original.original.fill_with_receipt(None, input) {
+                    return Err(AttemptCallResultRefusal {
+                        original,
+                        publication: Some(publication),
+                    });
+                }
+            }
+            AttemptCallReply::Terminal(port) => {
+                let publication = if let Some(outbox) = self.terminal.as_ref() {
+                    outbox.publish(port)
+                } else {
+                    Err(port)
+                };
+                if let Err(refused) = publication {
+                    original.outcome = Some(BodyOutcome::Call(AttemptCallReply::Terminal(refused)));
+                    return Err(AttemptCallResultRefusal {
+                        original,
+                        publication: None,
+                    });
+                }
+            }
         }
         assert!(live.result.replace(original.original).is_none());
         Ok(())
