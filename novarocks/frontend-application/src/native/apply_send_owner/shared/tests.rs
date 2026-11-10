@@ -249,10 +249,18 @@ impl Roles {
         backend: BackendProcessId,
         bytes: usize,
     ) -> (ReportedWork, transport::QueueWindow, ReservationId) {
+        self.parent_with_items(backend, 1, bytes)
+    }
+    fn parent_with_items(
+        &self,
+        backend: BackendProcessId,
+        items: usize,
+        bytes: usize,
+    ) -> (ReportedWork, transport::QueueWindow, ReservationId) {
         let lane = TransportCapacityLane::Control;
         let mut resources = self
             .layout
-            .queue_resources(backend, lane, 1, bytes)
+            .queue_resources(backend, lane, items, bytes)
             .unwrap();
         resources.owned_slots = role_slots();
         let guard = self
@@ -271,7 +279,7 @@ impl Roles {
             self.layout.clone(),
             backend,
             lane,
-            1,
+            items,
             bytes,
         )
         .unwrap();
@@ -1207,36 +1215,58 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
     let roles = Roles::new();
     let inbox = custody::tests::WithdrawalInbox::new(&roles.scope);
     let mut wc = transport::GovernedQueuedInputFixture::new();
-    let operation = cancel(BackendProcessId::new_v7());
-    let key = send_key(&operation);
-    let input = wc.admit(key, 0);
-    let (parent, queue, _) = roles.parent(operation.backend_process_id(), operation.queued_bytes());
+    let backend = BackendProcessId::new_v7();
+    let operations = [cancel(backend), cancel(backend)];
+    let keys = [
+        send_key(&operations[0]),
+        transport::SendKey {
+            operation: operations[1].operation_id(),
+            generation: novarocks_attempt_protocol::input::SendGeneration::new(
+                AttemptActionId::new(NonZeroU64::new(2).unwrap()),
+            ),
+        },
+    ];
+    let references = [
+        QueuedInputGrantRef::new(NonZeroU64::MIN, keys[0].generation),
+        QueuedInputGrantRef::new(NonZeroU64::new(2).unwrap(), keys[1].generation),
+    ];
+    let mut inputs = transport::GrantedInputs::default();
+    inputs.install(references[0], wc.admit(keys[0], 0));
+    let queued_bytes = operations.iter().map(OperationIntent::queued_bytes).sum();
+    let (parent, queue, principal) = roles.parent_with_items(backend, 2, queued_bytes);
     let result = inbox.reserve(&parent);
     let author = result.event_author().unwrap();
-    let OperationIntent::CancelTask(cancel) = &operation else {
-        unreachable!()
-    };
-    let protocol = ProtocolIntent::CancelTask(cancel.clone());
-    let effect_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let protocol = operations.each_ref().map(|operation| {
+        let OperationIntent::CancelTask(cancel) = operation else {
+            unreachable!()
+        };
+        ProtocolIntent::CancelTask(cancel.clone())
+    });
+    let effect_id = AttemptActionId::new(NonZeroU64::new(3).unwrap());
     let effect = AttemptEffectEnvelope::new(AttemptEffect {
         id: effect_id,
         class: EffectClass::Settlement,
         body: EffectBody::SendBatch {
             batch: DispatchBatch {
-                backend: operation.backend_process_id(),
-                lane: protocol.lane(),
+                backend,
+                lane: protocol[0].lane(),
                 control_progress: true,
-                operations: Box::new([protocol]),
-                queued_bytes: operation.queued_bytes(),
+                operations: Box::new(protocol),
+                queued_bytes,
                 queued_at: MonotonicInstant::from_origin(Duration::ZERO),
-                queued_inputs: Box::new([QueuedInputGrantRef::new(
-                    NonZeroU64::MIN,
-                    key.generation,
-                )]),
+                queued_inputs: Box::new(references),
             },
-            reservation: novarocks_attempt_protocol::capacity::ReservationToken(NonZeroU64::MIN),
+            reservation: novarocks_attempt_protocol::capacity::ReservationToken(
+                NonZeroU64::new(principal.get()).unwrap(),
+            ),
         },
     });
+    let mut requests = transport::FrozenSendRequests::default();
+    for operation in operations {
+        assert!(requests.install(operation).is_ok());
+    }
+    let prepared = transport::PreparedSendBatch::resolve(effect.clone(), &requests).unwrap();
+    assert_eq!(prepared.operations().len(), 2);
     let withdrawal = effect.handoff().unwrap().clone();
     let panic = PanicSink::new();
     let inner = panic.clone();
@@ -1245,16 +1275,20 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             .unwrap_or_else(|error| panic!("{}", error.error));
     assert!(launch.bind_actor_result(effect, &author, result).is_ok());
     let registration = source.registration();
-    let keys: Arc<[transport::SendKey]> = Arc::from([key]);
-    let queue = transport::QueueCustody::new(queue, registration.clone(), keys.clone());
-    let input = match input.bind_send(registration.clone(), 1) {
-        Err(original) => original,
-        Ok(_) => panic!("the original loan requires its exact registered position"),
+    let refused = match prepared.bind(&mut inputs, queue, registration.clone()) {
+        Err(refused) => refused,
+        Ok(_) => panic!("missing tail must not consume the available prefix"),
     };
-    let loan = input
-        .bind_send(registration.clone(), 0)
-        .unwrap_or_else(|_| panic!("same original input"));
-    assert!(!registration.claim_input(0, key));
+    assert_eq!(refused.error, transport::SendBindingError::MissingGrant);
+    assert!(inputs.contains(references[0]));
+    inputs.install(references[1], wc.admit(keys[1], 0));
+    let (queue, resolved) = refused
+        .batch
+        .bind(&mut inputs, refused.window, registration.clone())
+        .unwrap_or_else(|_| panic!("the same complete original batch must bind"));
+    assert!(references.iter().all(|grant| !inputs.contains(*grant)));
+    let (keys, loans) = resolved.into_parts();
+    assert!(!registration.claim_input(0, keys[0]));
     let arbitration = withdrawal.clone();
     let (entered, waiting) = tokio::sync::oneshot::channel();
     launch
@@ -1263,11 +1297,13 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             exit,
             move |exit, registration| async move {
                 assert!(queue.matches_send(&registration, &keys));
-                assert!(loan.matches_send(&registration, 0, key));
+                for (index, loan) in loans.iter().enumerate() {
+                    assert!(loan.matches_send(&registration, index, keys[index]));
+                }
                 let before_handoff = async move {
                     entered.send(()).unwrap();
                     std::future::pending::<()>().await;
-                    drop(loan);
+                    drop(loans);
                 };
                 let outcome = GatedWork::new(exit, queue, arbitration, inner)
                     .run(generation(), before_handoff, |_, ()| ready(()))
@@ -1313,8 +1349,11 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             .unwrap()
             .unwrap()
             .used[0],
-        1
+        2
     );
+    assert!(!retirement.finish_one().unwrap());
+    assert!(source.take_actor_result().is_none());
+    inbox.assert_no_result();
     assert!(retirement.finish_one().unwrap());
     let mut result = source
         .take_actor_result()

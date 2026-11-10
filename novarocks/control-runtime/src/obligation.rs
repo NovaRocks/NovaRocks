@@ -810,6 +810,21 @@ impl ReservationObligation {
     pub fn belongs_to(&self, scope: &ScopeHandle) -> bool {
         self.scope.same_scope(scope)
     }
+    /// Check the actual bound Work of this active partition in its ledger.
+    pub fn belongs_to_bound_work(&self, scope: &ScopeHandle, work: WorkId) -> bool {
+        self.active
+            && self.belongs_to(scope)
+            && self
+                .scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock")
+                .ledger
+                .reservation(self.id)
+                .is_some_and(|original| original.bound && original.work == work)
+    }
     /// Validate only original ownership, under one original ledger lock. No
     /// lifecycle, generation, health or resource-release fact is inferred.
     pub(crate) fn validate_reported_work_binding(

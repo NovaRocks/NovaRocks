@@ -65,11 +65,12 @@ pub(crate) enum ActorTransportWork {
     Admit(Box<BoundQueue>),
 }
 impl ActorTransportWork {
-    fn matches(&self, body: &EffectBody) -> bool {
-        match (self, body) {
+    fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
+        match (self, &effect.protocol.body) {
             (Self::Send(bound), EffectBody::SendBatch { batch, reservation }) => {
                 let items = batch.operations.len();
-                items != 0
+                bound.resolved.matches_effect(effect)
+                    && items != 0
                     && bound.queue.parent_reservation().get() == reservation.0.get()
                     && bound.backend == batch.backend
                     && bound.control_progress == batch.control_progress
@@ -134,7 +135,7 @@ pub(crate) fn handoff_actor_transport(
         return Err(job);
     };
     if !Arc::ptr_eq(effect, &bound.effect)
-        || !bound.work.matches(&effect.protocol.body)
+        || !bound.work.matches(effect)
         || !bound.launch.owns_exit(&job.exit)
     {
         return Err(job);

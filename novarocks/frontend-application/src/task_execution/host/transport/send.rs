@@ -20,8 +20,9 @@
 use super::{
     capacity::{EncodingCustody, QueueCustody},
     prepare::PrepareSend,
+    send_binding::ResolvedBatch,
     settlement::{AcceptedReceipts, PendingReceipt},
-    source_ports::{BodyOutcome, ResolvedBatch, TransportLeg, TransportReports},
+    source_ports::{BodyOutcome, TransportLeg, TransportReports},
 };
 use crate::{
     native::{

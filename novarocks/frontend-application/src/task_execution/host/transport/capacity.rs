@@ -86,6 +86,7 @@ pub(crate) struct QueueWindow {
     layout: NativeTransportCapacity,
     backend: BackendProcessId,
     lane: TransportCapacityLane,
+    items: usize,
     queued_bytes: usize,
 }
 impl QueueWindow {
@@ -104,11 +105,21 @@ impl QueueWindow {
             layout,
             backend,
             lane,
+            items,
             queued_bytes,
         })
     }
     pub(crate) fn parent_reservation(&self) -> ReservationId {
         self.quota.parent
+    }
+    pub(super) fn matches_batch(
+        &self,
+        batch: &novarocks_attempt_protocol::effect::DispatchBatch,
+    ) -> bool {
+        self.backend == batch.backend
+            && (self.lane == TransportCapacityLane::Control) == batch.control_progress
+            && self.items == batch.operations.len()
+            && self.queued_bytes == batch.queued_bytes
     }
     pub(crate) fn mark_in_flight(&mut self) -> Result<(), CapacityFailure> {
         self.quota.refund(self.layout.in_flight_release(
@@ -184,16 +195,26 @@ pub(crate) struct QueueCustody {
     source: TransportJoinRegistration,
 }
 impl QueueCustody {
+    #[cfg(test)]
     pub(crate) fn new(
         window: QueueWindow,
         source: TransportJoinRegistration,
         keys: Arc<[SendKey]>,
     ) -> Self {
-        source.register_send(&window.quota.original, keys);
-        Self {
+        Self::try_new(window, source, keys).unwrap_or_else(|_| panic!("same original send queue"))
+    }
+    pub(super) fn try_new(
+        window: QueueWindow,
+        source: TransportJoinRegistration,
+        keys: Arc<[SendKey]>,
+    ) -> Result<Self, QueueWindow> {
+        if !source.register_send(&window.quota.original, keys) {
+            return Err(window);
+        }
+        Ok(Self {
             window: Some(window),
             source,
-        }
+        })
     }
     pub(crate) fn parent_reservation(&self) -> ReservationId {
         self.window.as_ref().unwrap().parent_reservation()

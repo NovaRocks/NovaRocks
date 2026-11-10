@@ -18,8 +18,8 @@
 //! Seams implemented only by P10a's original per-attempt Source. They are not
 //! alternate protocol owners, result stores, Work factories or quota wallets.
 
-use super::queue_input::{OriginalQueuedInput, SendInputLoan, SendKey};
-use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
+use super::queue_input::{OriginalQueuedInput, SendKey};
+use crate::task_execution::intent::OperationAcknowledgement;
 use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
@@ -59,20 +59,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
         participation: ParticipationRef,
         at: MonotonicInstant,
     );
-}
-
-/// Rich requests are resolved by the same canonical host record. In particular
-/// an Establish returns the exact Arc frozen BEFORE QA authorization. Rebuilding
-/// an equivalent Establish request here is forbidden.
-pub(crate) struct ResolvedBatch {
-    pub(crate) operations: Vec<OperationIntent>,
-    /// Each loan is resolved from the exact operation and generation-bearing
-    /// QueuedInputGrantRef in the core's original batch, before this binding is
-    /// exposed. record()/operation ids alone cannot supply a generation.
-    pub(crate) queued_inputs: Vec<SendInputLoan>,
-    /// Same original binding's preallocated generation association. The
-    /// factory only moves this storage; it never clones N entries on a poller.
-    pub(crate) keys: Arc<[SendKey]>,
 }
 
 /// Original per-job result obligation, supplied by the same admitted Source.

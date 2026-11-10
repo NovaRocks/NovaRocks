@@ -45,11 +45,27 @@ impl GrantedInputs {
         grant: QueuedInputGrantRef,
         expected: SendKey,
     ) -> Option<OriginalQueuedInput> {
-        if expected.generation != grant.generation()
-            || self.originals.get(&grant.record())?.key() != expected
-        {
+        if !self.matches(grant, expected) {
             return None;
         }
         self.originals.remove(&grant.record())
+    }
+
+    pub(super) fn matches(&self, grant: QueuedInputGrantRef, expected: SendKey) -> bool {
+        expected.generation == grant.generation()
+            && self
+                .originals
+                .get(&grant.record())
+                .is_some_and(|input| input.key() == expected)
+    }
+
+    /// ReleaseQueuedInput carries only the reference. Return the original
+    /// unbound grant to the Source's credentialed disposal carrier.
+    pub(crate) fn take_for_release(
+        &mut self,
+        grant: QueuedInputGrantRef,
+    ) -> Option<OriginalQueuedInput> {
+        let key = self.originals.get(&grant.record())?.key();
+        self.take(grant, key)
     }
 }

@@ -38,6 +38,7 @@ mod quote;
 mod receipt_input;
 mod release_wake;
 mod send;
+mod send_binding;
 mod settlement;
 mod source_ports;
 
@@ -59,6 +60,9 @@ pub(crate) use quote::{
 };
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(crate) use send::{BoundSend, SendJob, run as run_send};
+pub(crate) use send_binding::{
+    FrozenSendRequests, PreparedSendBatch, ResolvedBatch, SendBindingError, SendBindingRefusal,
+};
 pub(crate) use source_ports::{
-    BodyOutcome, ResolvedBatch, TransportCompletionObligation, TransportLeg, TransportReports,
+    BodyOutcome, TransportCompletionObligation, TransportLeg, TransportReports,
 };

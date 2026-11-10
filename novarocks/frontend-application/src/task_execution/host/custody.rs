@@ -494,13 +494,18 @@ impl TransportJoinRegistration {
     /// Install the original Source's fixed, already-priced return positions
     /// before lending its inputs. The partition is later matched to the
     /// actual returned reservation in this same ledger and Scope.
-    pub(crate) fn register_send(&self, partition: &ReservationObligation, keys: Arc<[SendKey]>) {
+    pub(crate) fn register_send(
+        &self,
+        partition: &ReservationObligation,
+        keys: Arc<[SendKey]>,
+    ) -> bool {
         assert!(!keys.is_empty(), "one original input for every send member");
-        let record = self.original.upgrade().expect("original send Join owner");
-        assert!(
-            partition.belongs_to(&record.scope),
-            "same original send Scope"
-        );
+        let Some(record) = self.original.upgrade() else {
+            return false;
+        };
+        if !partition.belongs_to_bound_work(&record.scope, record.parent) {
+            return false;
+        }
         let returned = std::iter::repeat_with(|| SendInputPosition::Unissued)
             .take(keys.len())
             .collect();
@@ -508,18 +513,23 @@ impl TransportJoinRegistration {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert!(matches!(*state, TransportRegistrationState::Unattached));
+        if !matches!(*state, TransportRegistrationState::Unattached) {
+            return false;
+        }
         let mut send = record
             .send
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert!(send.is_none(), "one original send queue");
+        if send.is_some() {
+            return false;
+        }
         *send = Some(OriginalSendQueue {
             partition: partition.id(),
             quota: QueueReturn::Lent,
             keys,
             returned,
         });
+        true
     }
 
     pub(crate) fn matches_send(&self, partition: ReservationId, keys: &Arc<[SendKey]>) -> bool {
