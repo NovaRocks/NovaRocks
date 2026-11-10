@@ -62,6 +62,20 @@ async fn source_in(
     blocking: ConnectorBlockingIoSupervisor,
     scope: StatementFactScope,
 ) -> Arc<FrontendSystemTableFacts> {
+    source_in_registry(
+        blocking,
+        scope,
+        Arc::new(
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([]).unwrap(),
+        ),
+    )
+    .await
+}
+async fn source_in_registry(
+    blocking: ConnectorBlockingIoSupervisor,
+    scope: StatementFactScope,
+    registry: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+) -> Arc<FrontendSystemTableFacts> {
     let (product, _repository) = crate::mv::domain::test_admission::keyed_product().await;
     let readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
         product.keyed_readiness_service().unwrap(),
@@ -77,9 +91,7 @@ async fn source_in(
         Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
         blocking,
         Arc::new(novarocks_query_application::view::QueryViewService::new()),
-        Arc::new(
-            novarocks_query_application::system_tables::SystemTableRegistry::try_new([]).unwrap(),
-        ),
+        registry,
         readiness,
     );
     FrontendSystemTableFacts::new(owners, scope).unwrap()

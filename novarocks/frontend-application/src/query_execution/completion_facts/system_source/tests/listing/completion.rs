@@ -24,7 +24,7 @@ use novarocks_query_application::preparation::{
 };
 use novarocks_sql::compiler::*;
 use std::sync::atomic::AtomicUsize;
-struct NoExternalScans;
+pub(super) struct NoExternalScans;
 #[async_trait]
 impl ProviderReadFactPort for NoExternalScans {
     type Access = ();
@@ -50,7 +50,7 @@ impl SystemTableSnapshotFactPort for CountSnapshots {
         self.source.resolve_system_tables(needs).await
     }
 }
-fn request(
+pub(super) fn request(
     sql: &str,
     intent: SqlCompileIntent,
     control: SqlCompileControl,

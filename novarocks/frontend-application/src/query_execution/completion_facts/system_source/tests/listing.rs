@@ -67,6 +67,25 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(provider: &ListingFixture, class: ResultWindowClass) -> Self {
+        Self::new_in(
+            provider,
+            class,
+            Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .unwrap(),
+            ),
+            ResultCapacityConfig::V1,
+            Duration::from_secs(5),
+        )
+        .await
+    }
+    async fn new_in(
+        provider: &ListingFixture,
+        class: ResultWindowClass,
+        registry: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+        capacity_config: ResultCapacityConfig,
+        compile_duration: Duration,
+    ) -> Self {
         let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 8,
             business_limit: 8,
@@ -84,9 +103,7 @@ impl Fixture {
         control
             .configure_control_storage(ControlStorageConfig::new(8, &[]))
             .unwrap();
-        control
-            .configure_result_capacity(ResultCapacityConfig::V1)
-            .unwrap();
+        control.configure_result_capacity(capacity_config).unwrap();
         let cpu = InternalResultCpuOwner::try_new(
             QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -134,7 +151,7 @@ impl Fixture {
         let cancellation =
             QueryCancellationView::governed(scope.cancellation().unwrap(), Some(1000));
         let compile = novarocks_sql::compiler::SqlCompileControl::new(
-            Some(Instant::now() + Duration::from_secs(5)),
+            Some(Instant::now() + compile_duration),
             crate::query_execution::planning::sql_cancellation_observation(cancellation.clone()),
         );
         let capacity = QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap();
@@ -152,7 +169,7 @@ impl Fixture {
             None,
             FrontendPlanningCpuSource::new(blocking.clone()),
         );
-        let source = super::source_in(blocking, scope).await;
+        let source = super::source_in_registry(blocking, scope, registry).await;
         let pin = crate::connector::metadata_binding_typed(provider.registry.as_ref(), "catalog")
             .unwrap();
         let pin = Arc::new(PinnedCatalogListing::new(pin, context).unwrap());
@@ -365,3 +382,5 @@ async fn original_metadata_cpu_footer_precedes_source_close_and_window_retiremen
 }
 
 mod completion;
+
+mod scale;
