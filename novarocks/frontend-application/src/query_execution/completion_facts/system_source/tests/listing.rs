@@ -384,3 +384,5 @@ async fn original_metadata_cpu_footer_precedes_source_close_and_window_retiremen
 mod completion;
 
 mod scale;
+
+mod dml;
