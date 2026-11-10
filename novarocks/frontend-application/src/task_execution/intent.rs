@@ -37,8 +37,8 @@ use novarocks_execution::task_execution::{
     EstablishParticipation, OperationKind, OperationOutcome, OperationShape,
     ParticipationAdmissionTicketReceipt, ParticipationDomainUpdate, ParticipationReceipt,
     QuiesceParticipation, QuiesceParticipationReceipt, ReleaseOutcome, ReleaseParticipation,
-    TaskDomainUpdate, TaskOperationId, UpdateParticipation, UpdateTask, UpdateTaskReceipt,
-    status::SafeDetail,
+    RenewParticipationLease, TaskDomainUpdate, TaskOperationId, UpdateParticipation, UpdateTask,
+    UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_types::identity::BackendProcessId;
@@ -63,6 +63,7 @@ pub enum OperationIntent {
     CreateTask(super::creation::CreateTaskIntent),
     UpdateTask(Arc<UpdateTask>),
     UpdateParticipation(Arc<UpdateParticipation>),
+    RenewParticipationLease(RenewParticipationLease),
     CancelTask(CancelTask),
     QuiesceParticipation(QuiesceParticipation),
     AbortParticipation(AbortParticipation),
@@ -79,6 +80,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().kind(),
             Self::UpdateTask(request) => request.envelope().kind(),
             Self::UpdateParticipation(request) => request.envelope().kind(),
+            Self::RenewParticipationLease(request) => request.envelope().kind(),
             Self::CancelTask(request) => request.envelope().kind(),
             Self::QuiesceParticipation(request) => request.envelope().kind(),
             Self::AbortParticipation(request) => request.envelope().kind(),
@@ -95,6 +97,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().operation_id(),
             Self::UpdateTask(request) => request.envelope().operation_id(),
             Self::UpdateParticipation(request) => request.envelope().operation_id(),
+            Self::RenewParticipationLease(request) => request.envelope().operation_id(),
             Self::CancelTask(request) => request.envelope().operation_id(),
             Self::QuiesceParticipation(request) => request.envelope().operation_id(),
             Self::AbortParticipation(request) => request.envelope().operation_id(),
@@ -117,6 +120,7 @@ impl OperationIntent {
             Self::CreateTask(_) => OperationShape::CreateTask,
             Self::UpdateTask(_) => OperationShape::UpdateTask,
             Self::UpdateParticipation(request) => request.shape(),
+            Self::RenewParticipationLease(_) => OperationShape::RenewParticipationLease,
             Self::CancelTask(_) => OperationShape::CancelTask,
             Self::QuiesceParticipation(_) => OperationShape::QuiesceParticipation,
             Self::AbortParticipation(_) => OperationShape::AbortParticipation,
@@ -158,6 +162,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().max_wait().get(),
             Self::UpdateTask(request) => request.envelope().max_wait().get(),
             Self::UpdateParticipation(request) => request.envelope().max_wait().get(),
+            Self::RenewParticipationLease(request) => request.envelope().max_wait().get(),
             Self::CancelTask(request) => request.envelope().max_wait().get(),
             Self::QuiesceParticipation(request) => request.envelope().max_wait().get(),
             Self::AbortParticipation(request) => request.envelope().max_wait().get(),
@@ -183,6 +188,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.identity().backend_process_id(),
             Self::UpdateTask(request) => request.identity().backend_process_id(),
             Self::UpdateParticipation(request) => request.participation().backend_process_id(),
+            Self::RenewParticipationLease(request) => request.participation().backend_process_id(),
             Self::CancelTask(request) => request.identity().backend_process_id(),
             Self::QuiesceParticipation(request) => request.participation().backend_process_id(),
             Self::AbortParticipation(request) => request.participation().backend_process_id(),
@@ -219,7 +225,8 @@ impl OperationIntent {
                 }
                 UpdateParticipation::RenewLease(_) => 0,
             },
-            Self::CancelTask(_)
+            Self::RenewParticipationLease(_)
+            | Self::CancelTask(_)
             | Self::QuiesceParticipation(_)
             | Self::AbortParticipation(_)
             | Self::ReleaseParticipation(_) => 0,

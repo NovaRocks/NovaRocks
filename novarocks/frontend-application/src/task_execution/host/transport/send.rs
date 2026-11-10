@@ -99,7 +99,7 @@ fn sent(intent: &crate::task_execution::intent::OperationIntent) -> SentOperatio
         operation_id: intent.operation_id(),
         kind: intent.kind(),
         address: AckAddress::of(intent),
-        lease_renewal: matches!(intent,crate::task_execution::intent::OperationIntent::UpdateParticipation(value) if matches!(value.as_ref(),novarocks_execution_contract::UpdateParticipation::RenewLease(_))),
+        lease_renewal: crate::native::task_transport::wire::is_lease_renewal(intent),
         establish_participation: match intent {
             crate::task_execution::intent::OperationIntent::EstablishParticipation(value) => {
                 Some(value.participation())

@@ -761,16 +761,20 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
                 PricedTaskCreation, creation_owner_header_bytes, tests::original_creation_seed,
             },
             host::transport::{
-                self, ActorTransportExecutor, AdmissionSource, FrozenSendRequests, SendKey,
+                self, ActorTransportExecutor, AdmissionSource, FrozenSendRequests,
+                PreparedSendBatch, SendBindingError, SendKey,
             },
         },
     };
     use novarocks_attempt_protocol::{
-        effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
+        effect::{
+            AttemptEffect, DispatchBatch, EffectBody, EffectClass, OperationIntent,
+            QueuedInputPayload,
+        },
         input::SendGeneration,
         start::PayloadRef,
     };
-    use novarocks_coordination_contract::AttemptActionId;
+    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
     use novarocks_execution_contract::{OperationEnvelope, OperationKind, TaskOperationId};
     use std::{num::NonZeroU64, time::Duration};
 
@@ -1069,7 +1073,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         .creation_for_test(key.operation)
         .expect("the frozen request is installed before Core consumes the grant");
     let ExecutorFact::QueuedInputGranted {
-        operation,
+        operation: admitted_operation,
         grant,
         queued_bytes,
     } = inbox.commit(input)
@@ -1077,9 +1081,48 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         panic!("same queued input grant");
     };
     assert_eq!(
-        (operation, queued_bytes, grant.generation()),
+        (admitted_operation, queued_bytes, grant.generation()),
         (key.operation, quote.queued_bytes, key.generation)
     );
+    let send = |operation: OperationIntent| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id: AttemptActionId::new(NonZeroU64::new(4).unwrap()),
+            class: EffectClass::Business,
+            body: EffectBody::SendBatch {
+                batch: DispatchBatch {
+                    backend: task.backend_process_id(),
+                    lane: operation.lane(),
+                    control_progress: false,
+                    operations: Box::new([operation]),
+                    queued_bytes,
+                    queued_at: MonotonicInstant::ORIGIN,
+                    queued_inputs: Box::new([grant]),
+                },
+                reservation: novarocks_attempt_protocol::capacity::ReservationToken(
+                    NonZeroU64::MIN,
+                ),
+            },
+        })
+    };
+    {
+        let requests = requests.lock().unwrap();
+        let prepared = PreparedSendBatch::resolve(send(operation.clone()), &requests).unwrap();
+        let [crate::task_execution::intent::OperationIntent::CreateTask(original)] =
+            prepared.operations()
+        else {
+            panic!("resolved the exact first creation");
+        };
+        assert!(original.same_original(&frozen));
+        let mut foreign = operation.clone();
+        let OperationIntent::CreateTask { creation, .. } = &mut foreign else {
+            unreachable!()
+        };
+        *creation = PayloadRef(NonZeroU64::new(2).unwrap());
+        assert!(matches!(
+            PreparedSendBatch::resolve(send(foreign), &requests),
+            Err(SendBindingError::WrongRequest)
+        ));
+    }
     inbox
         .runtime
         .retire_input(inbox.registration.actor(), create_command)

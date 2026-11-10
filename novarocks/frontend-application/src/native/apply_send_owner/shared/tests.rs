@@ -1384,10 +1384,7 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             ),
         },
     });
-    let mut requests = transport::FrozenSendRequests::default();
-    for operation in operations {
-        assert!(requests.install(operation).is_ok());
-    }
+    let requests = transport::FrozenSendRequests::default();
     let prepared = transport::PreparedSendBatch::resolve(effect.clone(), &requests).unwrap();
     assert_eq!(prepared.operations().len(), 2);
     let withdrawal = effect.handoff().unwrap().clone();
@@ -1861,17 +1858,6 @@ async fn run_actor_send(
             unreachable!()
         }
         fn core_consumed(&mut self, _: &[novarocks_control_runtime_core::identity::InputId]) {}
-        fn retain_transport_release(&mut self, original: Box<dyn std::any::Any + Send>) {
-            let archive = original
-                .downcast::<transport::FrozenSendRequests>()
-                .unwrap_or_else(|original| std::panic::resume_unwind(original));
-            let originals = archive.into_originals();
-            assert_eq!(originals.len(), 1);
-            assert!(matches!(
-                originals.into_values().next(),
-                Some(OperationIntent::AbortParticipation(_))
-            ));
-        }
         fn retain_transport_failure(&mut self, original: Box<dyn std::any::Any + Send>) {
             use crate::task_execution::host::failure_supervisor::FailureSupervisorError;
             if let Some((error, panic)) =
@@ -2052,8 +2038,7 @@ async fn run_actor_send(
         VecDeque::from([inbox.reserve_result(&parent)]),
     ];
     let report_author = roles.cleanup(parent.id());
-    let mut requests = transport::FrozenSendRequests::default();
-    assert!(requests.install(operation).is_ok());
+    let requests = transport::FrozenSendRequests::default();
     let endpoint = peer.as_ref().map_or_else(
         || novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()),
         |peer| peer.control_endpoint.native_endpoint().clone(),

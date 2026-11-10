@@ -64,6 +64,7 @@ pub fn encode_operation(
         OperationIntent::UpdateParticipation(request) => {
             encode_participation_operation(request, attempt)
         }
+        OperationIntent::RenewParticipationLease(request) => Ok(encode_renew_lease(request)),
         OperationIntent::CancelTask(request) => Ok(encode_cancel_task(*request)),
         OperationIntent::QuiesceParticipation(request) => {
             Ok(codec::encode_quiesce_participation(*request))
@@ -226,12 +227,12 @@ pub(super) const fn consumes_ack_body_for_outcome(
 
 /// Whether this intent is a lease renewal, decided from the neutral command
 /// rather than from its kind, which an establish shares.
-pub(super) fn is_lease_renewal(intent: &OperationIntent) -> bool {
+pub(crate) fn is_lease_renewal(intent: &OperationIntent) -> bool {
     matches!(
         intent,
         OperationIntent::UpdateParticipation(request)
             if matches!(request.as_ref(), UpdateParticipation::RenewLease(_))
-    )
+    ) || matches!(intent, OperationIntent::RenewParticipationLease(_))
 }
 
 /// One item this transport actually put on the wire.
@@ -274,6 +275,9 @@ impl AckAddress {
                 Self::Participation(request.participation())
             }
             OperationIntent::UpdateParticipation(request) => {
+                Self::Participation(request.participation())
+            }
+            OperationIntent::RenewParticipationLease(request) => {
                 Self::Participation(request.participation())
             }
             OperationIntent::AbortParticipation(request) => {

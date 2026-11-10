@@ -282,6 +282,7 @@ pub(crate) fn original_run_encoding(
                 UpdateParticipation::AdvanceDomain(value) => size::advance(value),
                 UpdateParticipation::RenewLease(value) => size::renew(value, control),
             },
+            OperationIntent::RenewParticipationLease(value) => size::renew(value, control),
             OperationIntent::CancelTask(value) => size::cancel(*value, control),
             OperationIntent::QuiesceParticipation(value) => size::quiesce(*value, control),
             OperationIntent::AbortParticipation(value) => size::abort(*value, control),

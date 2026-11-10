@@ -23,7 +23,10 @@ use crate::{
         intent::OperationIntent,
     },
 };
-use novarocks_attempt_protocol::{effect::EffectBody, start::PayloadRef};
+use novarocks_attempt_protocol::{
+    effect::{EffectBody, OperationIntent as ProtocolIntent},
+    start::PayloadRef,
+};
 use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -95,6 +98,84 @@ impl FrozenSendRequests {
     pub(super) fn is_empty(&self) -> bool {
         self.originals.is_empty()
     }
+
+    /// These lifecycle commands already carry the complete immutable
+    /// request in Core. The host copies the value into its paid batch and
+    /// borrows rich backing only for the payload-bearing commands.
+    fn resolve(&self, passive: &ProtocolIntent) -> Result<OperationIntent, SendBindingError> {
+        let original = match passive {
+            ProtocolIntent::AcquireParticipationAdmissionTicket(request) => {
+                OperationIntent::AcquireParticipationAdmissionTicket(*request)
+            }
+            ProtocolIntent::RenewParticipationLease(request) => {
+                OperationIntent::RenewParticipationLease(request.clone())
+            }
+            ProtocolIntent::CancelTask(request) => OperationIntent::CancelTask(*request),
+            ProtocolIntent::QuiesceParticipation(request) => {
+                OperationIntent::QuiesceParticipation(*request)
+            }
+            ProtocolIntent::AbortParticipation(request) => {
+                OperationIntent::AbortParticipation(*request)
+            }
+            ProtocolIntent::ReleaseParticipation(request) => {
+                OperationIntent::ReleaseParticipation(*request)
+            }
+            _ => {
+                let operation = passive.operation_id();
+                let original = self
+                    .originals
+                    .get(&operation)
+                    .ok_or(SendBindingError::MissingRequest)?;
+                let same = match (passive, original) {
+                    (
+                        ProtocolIntent::CreateTask {
+                            envelope,
+                            identity,
+                            creation,
+                            queued_bytes,
+                        },
+                        OperationIntent::CreateTask(request),
+                    ) => {
+                        self.creation_payloads.get(creation) == Some(&operation)
+                            && request.envelope() == *envelope
+                            && request.identity() == *identity
+                            && request.queued_bytes() == *queued_bytes
+                    }
+                    (
+                        ProtocolIntent::EstablishParticipation {
+                            envelope,
+                            participation,
+                            ticket,
+                            initial_lease_sequence,
+                            initial_lease_valid_for,
+                            ..
+                        },
+                        OperationIntent::EstablishParticipation(request),
+                    ) => {
+                        request.envelope() == *envelope
+                            && request.participation() == *participation
+                            && request.admission_ticket_id() == *ticket
+                            && request.initial_lease_sequence() == *initial_lease_sequence
+                            && request.initial_lease_valid_for() == *initial_lease_valid_for
+                    }
+                    (
+                        ProtocolIntent::UpdateTask { identity, .. },
+                        OperationIntent::UpdateTask(request),
+                    ) => request.identity() == *identity,
+                    (
+                        ProtocolIntent::AdvanceParticipationDomain { participation, .. },
+                        OperationIntent::UpdateParticipation(request),
+                    ) => request.participation() == *participation,
+                    _ => false,
+                };
+                if !same {
+                    return Err(SendBindingError::WrongRequest);
+                }
+                original.clone()
+            }
+        };
+        Ok(original)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -138,10 +219,7 @@ impl PreparedSendBatch {
                 return Err(SendBindingError::WrongBatch);
             }
             let operation = passive.operation_id();
-            let original = requests
-                .originals
-                .get(&operation)
-                .ok_or(SendBindingError::MissingRequest)?;
+            let original = requests.resolve(passive)?;
             let run = original.native_run_key();
             if original.shape() != passive.shape()
                 || original.backend_process_id() != batch.backend
@@ -153,7 +231,7 @@ impl PreparedSendBatch {
             {
                 return Err(SendBindingError::WrongRequest);
             }
-            operations.push(original.clone());
+            operations.push(original);
             keys.push(SendKey {
                 operation,
                 generation: grant.generation(),
@@ -298,5 +376,57 @@ impl ResolvedBatch {
     #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Arc<[SendKey]>, Vec<SendInputLoan>) {
         (self.keys, self.queued_inputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::task_transport::wire::{
+        AttemptWireFacts, encode_operation, is_lease_renewal,
+    };
+    use novarocks_execution_contract::{
+        LeaseSequence, LeaseValidFor, ParticipationRef, RenewParticipationLease,
+        UpdateParticipation,
+    };
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
+        QueryId,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn core_renewal_projects_inline_with_its_exact_wire_identity() {
+        let participation = ParticipationRef::new(
+            QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let original = RenewParticipationLease::new(
+            TaskOperationId::new_v7(),
+            participation,
+            LeaseSequence::INITIAL.next().unwrap(),
+            LeaseValidFor::new(Duration::from_secs(5)).unwrap(),
+        );
+        let passive = ProtocolIntent::RenewParticipationLease(original.clone());
+        let projected = FrozenSendRequests::default().resolve(&passive).unwrap();
+        let existing = OperationIntent::UpdateParticipation(Arc::new(
+            UpdateParticipation::RenewLease(original),
+        ));
+        let facts = AttemptWireFacts {
+            native_compatibility_id: NativeCompatibilityId::new([1; 32]),
+        };
+        assert!(matches!(
+            projected,
+            OperationIntent::RenewParticipationLease(_)
+        ));
+        assert_eq!(projected.operation_id(), passive.operation_id());
+        assert_eq!(projected.queued_bytes(), passive.queued_bytes());
+        assert_eq!(projected.native_run_key(), existing.native_run_key());
+        assert!(is_lease_renewal(&projected));
+        assert_eq!(
+            encode_operation(&projected, &facts).unwrap(),
+            encode_operation(&existing, &facts).unwrap()
+        );
     }
 }
