@@ -848,8 +848,18 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_abort_rearms_only_after_its_original_control_input_retires() {
+        exercise_registered_abort_route(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_abort_route_fences_settlement_and_returns_the_original_control_input() {
+        exercise_registered_abort_route(true).await;
+    }
+
+    async fn exercise_registered_abort_route(fail_owner: bool) {
         use crate::{
             control_runtime::actor::FrontendActor,
+            query_execution::native_execution_adapter::LogicalAbortRouter,
             task_execution::{
                 bridge::abort::{
                     AbortReceiptSlot, AbortSettlementOwner, AbortSettlementRefusal,
@@ -873,36 +883,10 @@ mod tests {
         use novarocks_query_application::coordination::AbortParticipationIssueState;
         use std::num::NonZeroU64;
 
-        #[derive(Debug)]
-        struct Route {
-            port: Mutex<Option<Arc<AttemptAbortIngress>>>,
-            capacity: watch::Sender<u64>,
-        }
-
-        impl AbortParticipationEffectPort for Route {
-            fn subscribe_capacity(&self) -> watch::Receiver<u64> {
-                self.capacity.subscribe()
-            }
-
-            fn try_reserve(
-                &self,
-                identity: AbortParticipationIssueIdentity,
-            ) -> AbortParticipationEffectAdmission {
-                self.port
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map_or(AbortParticipationEffectAdmission::Backpressured, |port| {
-                        port.try_reserve(identity)
-                    })
-            }
-        }
-
         let exact = participation(BackendProcessId::new_v7());
-        let route = Arc::new(Route {
-            port: Mutex::new(None),
-            capacity: watch::channel(0).0,
-        });
+        let router = LogicalAbortRouter::new();
+        let route = router.reserve_route(execution()).unwrap();
+        assert!(router.reserve_route(execution()).is_err());
         let (work_owner, execution_stage) = governed_execution();
         let limit = NonZeroUsize::new(2).unwrap();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
@@ -916,7 +900,7 @@ mod tests {
             execution_stage,
         )
         .unwrap()
-        .with_abort_participation_effect_port(route.clone(), limit);
+        .with_abort_participation_effect_port(router.clone(), limit);
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
@@ -953,10 +937,10 @@ mod tests {
             inbox.registration().clone(),
             activation,
             [(exact, position)],
-            route.capacity.clone(),
+            router.capacity_author(),
             None,
         ));
-        route.port.lock().unwrap().replace(port.clone());
+        route.publish(port.clone());
         let settlement_owner = AbortSettlementOwner::new(port.clone());
         let admission = AcquireParticipationAdmissionTicket::new(
             TaskOperationId::new_v7(),
@@ -1032,7 +1016,7 @@ mod tests {
         let mut retirement = unknown.retirement.unwrap();
         assert!(!retirement.retire_ready().unwrap());
         assert!(matches!(
-            port.try_reserve(identity),
+            router.try_reserve(identity),
             AbortParticipationEffectAdmission::Backpressured
         ));
         assert!(!capacity.has_changed().unwrap());
@@ -1075,56 +1059,107 @@ mod tests {
         assert_eq!(replay_request.envelope(), request.envelope());
         assert_eq!(replay_request.participation(), request.participation());
         assert_eq!(replay_request.cause(), request.cause());
-        let closing = OperationAcknowledgement::worker_receipt(
-            operation,
-            OperationKind::AbortParticipation,
-            OperationOutcome::ParticipationTerminalReceipt,
-            AckPayload::Participation(ParticipationReceipt::new(
-                exact,
-                ParticipationState::TerminalRetained,
-            )),
-        );
-        let receipt = |generation| {
-            let receipt = AbortReceiptSlot::new(
-                SendKey {
-                    operation,
-                    generation: SendGeneration::new(physical(generation)),
-                },
-                exact,
-            );
-            receipt.record(&closing);
-            receipt
-        };
-        let worker = settle(
-            first,
-            physical(10),
-            Some(physical(10)),
-            AbortIssueSettlement::Worker(OperationOutcome::ParticipationTerminalReceipt),
-        );
-        assert!(matches!(
-            settlement_owner.apply(&worker, Some(&receipt(20))),
-            Err(AbortSettlementRefusal::WrongReceiptGeneration)
-        ));
-        let applied = settlement_owner.apply(&worker, Some(&receipt(10))).unwrap();
-        applied.result.unwrap();
-        let mut retirement = applied
-            .retirement
-            .expect("newer exact replay is relinquished");
-        assert!(retirement.retire_ready().unwrap());
-        drop(retirement);
-        let redundant = settlement_owner
-            .apply(
-                &settle(
-                    second,
-                    physical(20),
+        if fail_owner {
+            let mut drained = settlement_owner.drain_failed();
+            assert!(drained.errors.is_empty());
+            assert_eq!(drained.retirements.len(), 1);
+            assert!(matches!(
+                router.try_reserve(identity),
+                AbortParticipationEffectAdmission::Closed
+            ));
+            let stale = settlement_owner
+                .apply(
+                    &settle(
+                        first,
+                        physical(10),
+                        Some(physical(10)),
+                        AbortIssueSettlement::Worker(
+                            OperationOutcome::ParticipationTerminalReceipt,
+                        ),
+                    ),
                     None,
-                    AbortIssueSettlement::DefinitelyUnsent,
-                ),
-                None,
-            )
+                )
+                .unwrap();
+            stale.result.unwrap();
+            assert!(stale.retirement.is_none());
+            assert!(
+                drained
+                    .retirements
+                    .pop_front()
+                    .unwrap()
+                    .retire_ready()
+                    .unwrap()
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if logical
+                        .stand_down_snapshot(exact)
+                        .await
+                        .unwrap()
+                        .is_some_and(|snapshot| {
+                            snapshot.issue_state()
+                                == Some(AbortParticipationIssueState::FailedClosed)
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
             .unwrap();
-        redundant.result.unwrap();
-        assert!(redundant.retirement.is_none());
+        } else {
+            let closing = OperationAcknowledgement::worker_receipt(
+                operation,
+                OperationKind::AbortParticipation,
+                OperationOutcome::ParticipationTerminalReceipt,
+                AckPayload::Participation(ParticipationReceipt::new(
+                    exact,
+                    ParticipationState::TerminalRetained,
+                )),
+            );
+            let receipt = |generation| {
+                let receipt = AbortReceiptSlot::new(
+                    SendKey {
+                        operation,
+                        generation: SendGeneration::new(physical(generation)),
+                    },
+                    exact,
+                );
+                receipt.record(&closing);
+                receipt
+            };
+            let worker = settle(
+                first,
+                physical(10),
+                Some(physical(10)),
+                AbortIssueSettlement::Worker(OperationOutcome::ParticipationTerminalReceipt),
+            );
+            assert!(matches!(
+                settlement_owner.apply(&worker, Some(&receipt(20))),
+                Err(AbortSettlementRefusal::WrongReceiptGeneration)
+            ));
+            let applied = settlement_owner.apply(&worker, Some(&receipt(10))).unwrap();
+            applied.result.unwrap();
+            let mut retirement = applied
+                .retirement
+                .expect("newer exact replay is relinquished");
+            assert!(retirement.retire_ready().unwrap());
+            drop(retirement);
+            let redundant = settlement_owner
+                .apply(
+                    &settle(
+                        second,
+                        physical(20),
+                        None,
+                        AbortIssueSettlement::DefinitelyUnsent,
+                    ),
+                    None,
+                )
+                .unwrap();
+            redundant.result.unwrap();
+            assert!(redundant.retirement.is_none());
+        }
         drop(settlement_owner);
         logical
             .observe_worker_stopped_and_participation_fenced(exact)
@@ -1135,10 +1170,10 @@ mod tests {
             .await
             .unwrap();
 
-        route.port.lock().unwrap().take();
+        drop(route);
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        Arc::try_unwrap(port).unwrap().close_after_exit().unwrap();
+        assert!(port.close_after_exit().unwrap());
         payer.finish().unwrap();
         scope.close_external().unwrap();
         ledger.reap_scope_ready(scope.id(), 8).unwrap();

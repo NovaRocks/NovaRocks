@@ -32,7 +32,9 @@ use crate::{
         },
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::bridge::abort::AbortReceiptSlot,
+    task_execution::bridge::abort::{
+        AbortInputRetirement, AbortReceiptSlot, DrainedAbortSubmissions,
+    },
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
     task_execution::host::failure_supervisor::{
@@ -106,6 +108,7 @@ struct SendInFlight {
 pub(crate) struct AttemptFailureBinding {
     pub(crate) supervisor: FailureSupervisor,
     pub(crate) port: Box<dyn FailureCleanupPort>,
+    pub(crate) abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
 }
 
 enum Supervisor {
@@ -142,6 +145,9 @@ pub(crate) struct AttemptTransportSource {
     pending: Option<Prepaid>,
     failure: Option<FailureContext>,
     supervisor: Option<Supervisor>,
+    abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
+    abort_inputs: VecDeque<AbortInputRetirement>,
+    abort_scan: usize,
     in_flight: BTreeSet<AttemptActionId>,
     external_closed: bool,
     other: Box<dyn EffectSource>,
@@ -156,7 +162,7 @@ impl AttemptTransportSource {
         admission: AdmissionSource,
         calls: [Option<AttemptCallSource>; 3],
         send: AttemptSendSource,
-        failure: (FailureContext, AttemptFailureBinding),
+        mut failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
@@ -189,6 +195,9 @@ impl AttemptTransportSource {
             call_scan: 0,
             pending: None,
             failure: Some(failure.0),
+            abort_drain: failure.1.abort_drain.take(),
+            abort_inputs: VecDeque::new(),
+            abort_scan: 0,
             supervisor: Some(Supervisor::Armed(failure.1)),
             in_flight: BTreeSet::new(),
             external_closed: false,
@@ -239,6 +248,25 @@ impl AttemptTransportSource {
                 Poll::Pending => false,
                 Poll::Ready(Ok(())) => {
                     self.supervisor.take();
+                    if let Some(mut handoff) = self.abort_drain.take() {
+                        let failed = self
+                            .runtime
+                            .snapshot(self.registration.actor())
+                            .expect("original attempt registration")
+                            .failed;
+                        match handoff.try_recv() {
+                            Ok(drained) => {
+                                assert!(failed && self.abort_inputs.is_empty());
+                                self.abort_inputs = drained.retirements;
+                                if !drained.errors.is_empty() {
+                                    self.other
+                                        .retain_transport_failure(Box::new(drained.errors));
+                                }
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) if !failed => {}
+                            Err(error) => std::panic::resume_unwind(Box::new(error)),
+                        }
+                    }
                     true
                 }
                 Poll::Ready(Err(error)) => {
@@ -699,6 +727,9 @@ impl EffectSource for AttemptTransportSource {
 
     fn close_external(&mut self) {
         if !self.external_closed {
+            if let Some(qa) = &self.calls[0] {
+                qa.close_abort_ingress();
+            }
             self.other.close_external();
             self.external_closed = true;
         }
@@ -759,6 +790,25 @@ impl EffectSource for AttemptTransportSource {
         } else {
             false
         };
+        if self.abort_scan == 0 {
+            self.abort_scan = self.abort_inputs.len();
+        }
+        if units < budget && self.abort_scan != 0 {
+            self.abort_scan -= 1;
+            units += 1;
+            let mut original = self
+                .abort_inputs
+                .pop_front()
+                .expect("original drained Abort input");
+            if original
+                .retire_ready()
+                .expect("original Abort input retirement")
+            {
+                progressed = true;
+            } else {
+                self.abort_inputs.push_back(original);
+            }
+        }
         if self.admission_scan == 0 {
             self.admission_scan = self.admission.awaiting_result_retirement();
         }
@@ -836,10 +886,12 @@ impl EffectSource for AttemptTransportSource {
         progress.units += units;
         progress.progressed |= progressed || supervisor_advanced;
         progress.more |= supervisor_advanced
+            || self.abort_scan != 0
             || self.admission_scan != 0
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
         progress.retired &= self.supervisor.is_none()
+            && self.abort_inputs.is_empty()
             && self
                 .calls
                 .iter()

@@ -176,12 +176,18 @@ pub(crate) trait FailureResidualPort: Send + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
+use crate::task_execution::bridge::abort::{AbortSettlementOwner, DrainedAbortSubmissions};
+
 pub(crate) struct NativeFailureCleanup {
     targets: Arc<BTreeMap<BackendProcessId, SendContext>>,
     parent: ReservationId,
     executor: Handle,
     attempts: Vec<FailureAbortAttempt>,
     residual: Box<dyn FailureResidualPort>,
+    abort_drain: Option<(
+        Arc<AbortSettlementOwner>,
+        tokio::sync::oneshot::Sender<DrainedAbortSubmissions>,
+    )>,
 }
 
 impl NativeFailureCleanup {
@@ -198,7 +204,17 @@ impl NativeFailureCleanup {
             executor,
             attempts,
             residual,
+            abort_drain: None,
         }
+    }
+
+    pub(crate) fn with_abort_drain(
+        mut self,
+        owner: Arc<AbortSettlementOwner>,
+        handoff: tokio::sync::oneshot::Sender<DrainedAbortSubmissions>,
+    ) -> Self {
+        assert!(self.abort_drain.replace((owner, handoff)).is_none());
+        self
     }
 }
 
@@ -230,7 +246,14 @@ impl FailureCleanupPort for NativeFailureCleanup {
         self: Box<Self>,
         original: FailureCleanupRequest,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        self.residual.finish(original, self.attempts)
+        Box::pin(async move {
+            if let Some((owner, handoff)) = self.abort_drain {
+                if let Err(drained) = handoff.send(owner.drain_failed()) {
+                    std::panic::resume_unwind(Box::new(drained));
+                }
+            }
+            self.residual.finish(original, self.attempts).await;
+        })
     }
 }
 

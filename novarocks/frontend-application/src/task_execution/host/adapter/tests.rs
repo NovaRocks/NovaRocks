@@ -299,7 +299,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     assert!(!registered.root_control_binding().same_original(&lookalike));
     let pool = Bank::make(budget, positions, registered.root_control_binding().clone());
     let clock = Arc::new(ManualClock::default());
-    let inventory = || runtime.standing_input_inventory(actor, None, 8).unwrap();
+    let inventory = || runtime.standing_input_inventory(actor, None, 16).unwrap();
     let before = inventory();
     let mut bind = |source: Arc<dyn ObservationSourcePool>| {
         registered.bind_observations(
@@ -339,6 +339,27 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         owner_controls_inventory
             .iter()
             .all(|row| { row.source == actor && row.class == InputClass::Control })
+    );
+
+    let before_abort_route = inventory();
+    let abort_router = crate::query_execution::native_execution_adapter::LogicalAbortRouter::new();
+    let (abort_route, abort_ingress, abort_settlement) = abort_router
+        .install_registered_attempt(&mut registered, &runtime, &original_work)
+        .unwrap();
+    let abort_positions: Vec<_> = inventory()
+        .into_iter()
+        .filter(|row| !before_abort_route.contains(row))
+        .collect();
+    assert_eq!(abort_positions.len(), members.len());
+    assert!(
+        abort_positions
+            .iter()
+            .all(|row| row.source == actor && row.class == InputClass::Control)
+    );
+    assert!(
+        abort_router
+            .install_registered_attempt(&mut registered, &runtime, &original_work)
+            .is_err()
     );
 
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
@@ -564,6 +585,9 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         if matches!(&*input, AttemptInput::Executor(ExecutorFact::Operation(observation))
             if observation.generation == key.generation))
     );
+    assert!(abort_ingress.close_after_exit().unwrap());
+    drop(abort_route);
+    drop(abort_settlement);
     startup.close_after_exit().unwrap();
     owner_controls.close_after_exit().unwrap();
     owner_controls.close_after_exit().unwrap();

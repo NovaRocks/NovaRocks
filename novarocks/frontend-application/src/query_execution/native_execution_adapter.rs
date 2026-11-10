@@ -118,15 +118,17 @@ use novarocks_query_application::api::{BackendProcessObservationService, Backend
 /// One logical execution's Abort port. Every physical attempt installs one
 /// exact route and retains its registration through residual convergence.
 #[derive(Debug)]
-struct LogicalAbortRouter {
-    routes: Mutex<BTreeMap<novarocks_types::QueryExecutionId, Arc<NativeAbortEffectAdapter>>>,
+pub(crate) struct LogicalAbortRouter {
+    routes: Mutex<
+        BTreeMap<novarocks_types::QueryExecutionId, Option<Arc<dyn AbortParticipationEffectPort>>>,
+    >,
     capacity_epoch: watch::Sender<u64>,
     worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
     closure_epoch: watch::Sender<u64>,
 }
 
 impl LogicalAbortRouter {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (capacity_epoch, _) = watch::channel(0);
         let (closure_epoch, _) = watch::channel(0);
         Arc::new(Self {
@@ -137,46 +139,94 @@ impl LogicalAbortRouter {
         })
     }
 
-    fn install(
+    pub(crate) fn reserve_route(
         self: &Arc<Self>,
         execution: novarocks_types::QueryExecutionId,
-        capacity: NonZeroUsize,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<(LogicalAbortRoute, NativeAbortEffectIntake), NativeAttemptActivationFailure> {
-        let closed = Arc::clone(&self.worker_closed_participations);
-        let closure_epoch = self.closure_epoch.clone();
-        let observer = Arc::new(move |participation| {
-            closed
-                .lock()
-                .expect("logical Abort closed-participation facts")
-                .insert(participation);
-            closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
-        });
-        let (adapter, intake) = NativeAbortEffectAdapter::bounded_with_observer(
-            capacity,
-            wake,
-            self.capacity_epoch.clone(),
-            Some(observer),
-        );
+    ) -> Result<LogicalAbortRoute, NativeAttemptActivationFailure> {
         let mut routes = self.routes.lock().expect("logical Abort route table");
-        if routes.insert(execution, adapter).is_some() {
+        let std::collections::btree_map::Entry::Vacant(route) = routes.entry(execution) else {
             return Err(NativeAttemptActivationFailure::new(
                 attempt_runtime_failure(
                     QueryFailureReason::PreparationProtocol,
                     "logical execution installed the same Native Abort route twice",
                 ),
             ));
-        }
-        drop(routes);
-        self.capacity_epoch
-            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
-        Ok((
-            LogicalAbortRoute {
-                execution,
-                router: Arc::clone(self),
-            },
-            intake,
-        ))
+        };
+        route.insert(None);
+        Ok(LogicalAbortRoute {
+            execution,
+            router: self.clone(),
+        })
+    }
+
+    pub(crate) fn capacity_author(&self) -> watch::Sender<u64> {
+        self.capacity_epoch.clone()
+    }
+
+    fn closure_observer(&self) -> Arc<dyn Fn(ParticipationRef) + Send + Sync> {
+        let closed = self.worker_closed_participations.clone();
+        let closure_epoch = self.closure_epoch.clone();
+        Arc::new(move |participation| {
+            closed
+                .lock()
+                .expect("logical Abort closed-participation facts")
+                .insert(participation);
+            closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        })
+    }
+
+    fn install(
+        self: &Arc<Self>,
+        execution: novarocks_types::QueryExecutionId,
+        capacity: NonZeroUsize,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<(LogicalAbortRoute, NativeAbortEffectIntake), NativeAttemptActivationFailure> {
+        let route = self.reserve_route(execution)?;
+        let (adapter, intake) = NativeAbortEffectAdapter::bounded_with_observer(
+            capacity,
+            wake,
+            self.capacity_author(),
+            Some(self.closure_observer()),
+        );
+        route.publish(adapter);
+        Ok((route, intake))
+    }
+
+    pub(crate) fn install_registered_attempt(
+        self: &Arc<Self>,
+        attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
+            crate::control_runtime::actor::FrontendActor,
+        >,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> Result<
+        (
+            LogicalAbortRoute,
+            Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
+            Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
+        ),
+        NativeAttemptActivationFailure,
+    > {
+        let route = self.reserve_route(attempt.root_control_binding().activation().execution())?;
+        let ingress = attempt
+            .prepare_abort_ingress(
+                runtime,
+                work,
+                self.capacity_author(),
+                Some(self.closure_observer()),
+            )
+            .map(Arc::new)
+            .map_err(|error| {
+                NativeAttemptActivationFailure::new(attempt_runtime_failure(
+                    QueryFailureReason::PreparationProtocol,
+                    error.to_string(),
+                ))
+            })?;
+        let settlement = Arc::new(
+            crate::task_execution::bridge::abort::AbortSettlementOwner::new(ingress.clone()),
+        );
+        route.publish(ingress.clone());
+        Ok((route, ingress, settlement))
     }
 
     fn worker_closed_participations(&self) -> Arc<Mutex<BTreeSet<ParticipationRef>>> {
@@ -202,6 +252,7 @@ impl AbortParticipationEffectPort for LogicalAbortRouter {
             .lock()
             .expect("logical Abort route table")
             .get(&execution)
+            .and_then(Option::as_ref)
             .map_or(AbortParticipationEffectAdmission::Backpressured, |route| {
                 route.try_reserve(identity)
             })
@@ -209,18 +260,40 @@ impl AbortParticipationEffectPort for LogicalAbortRouter {
 }
 
 #[derive(Debug)]
-struct LogicalAbortRoute {
+pub(crate) struct LogicalAbortRoute {
     execution: novarocks_types::QueryExecutionId,
     router: Arc<LogicalAbortRouter>,
 }
 
+impl LogicalAbortRoute {
+    pub(crate) fn publish(&self, endpoint: Arc<dyn AbortParticipationEffectPort>) {
+        {
+            let mut routes = self
+                .router
+                .routes
+                .lock()
+                .expect("logical Abort route table");
+            let original = routes
+                .get_mut(&self.execution)
+                .expect("reserved original Abort route");
+            assert!(original.is_none());
+            *original = Some(endpoint);
+        }
+        self.router
+            .capacity_epoch
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+    }
+}
+
 impl Drop for LogicalAbortRoute {
     fn drop(&mut self) {
-        self.router
+        let original = self
+            .router
             .routes
             .lock()
             .expect("logical Abort route table")
             .remove(&self.execution);
+        drop(original);
         self.router
             .capacity_epoch
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));

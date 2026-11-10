@@ -259,6 +259,12 @@ impl AttemptCallSource {
         assert!(self.abort.replace(original).is_none());
     }
 
+    pub(super) fn close_abort_ingress(&self) {
+        if let Some(original) = &self.abort {
+            original.close_external();
+        }
+    }
+
     pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
         self.scope.same_scope(scope)
     }

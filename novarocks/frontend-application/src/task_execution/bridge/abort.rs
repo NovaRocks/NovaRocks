@@ -46,7 +46,7 @@ use novarocks_query_application::coordination::{
     AbortParticipationIssueIdentity, ParticipationStandDownError,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     num::NonZeroU64,
     sync::{
@@ -65,7 +65,7 @@ struct Submitted {
 }
 
 struct Slot {
-    position: Position,
+    position: Mutex<Option<Position>>,
     booked: AtomicBool,
     submitted: Mutex<Option<Submitted>>,
 }
@@ -108,7 +108,7 @@ impl AttemptAbortIngress {
                     .insert(
                         participation,
                         Slot {
-                            position,
+                            position: Mutex::new(Some(position)),
                             booked: AtomicBool::new(false),
                             submitted: Mutex::new(None),
                         }
@@ -153,8 +153,15 @@ impl AttemptAbortIngress {
         }) {
             return None;
         }
-        let submitted = current.take().unwrap();
-        Some((
+        Some(self.submission_and_retirement(participation, current.take().unwrap()))
+    }
+
+    fn submission_and_retirement(
+        &self,
+        participation: ParticipationRef,
+        submitted: Submitted,
+    ) -> (NativeAbortEffect, AbortInputRetirement) {
+        (
             submitted.original,
             AbortInputRetirement {
                 original: self.original.clone(),
@@ -162,7 +169,7 @@ impl AttemptAbortIngress {
                 input: Some(submitted.input),
                 action: submitted.action,
             },
-        ))
+        )
     }
 
     pub(crate) fn close_external(&self) {
@@ -171,9 +178,10 @@ impl AttemptAbortIngress {
         }
     }
 
-    /// Unregister the route and join its original callers before consuming
-    /// this owner. Refusal keeps every still-live position.
-    pub(crate) fn close_after_exit(self) -> Result<(), Self> {
+    /// The original standing roles close after their last booked occurrence
+    /// actually retires. Other custodians may still hold the same ingress
+    /// allocation while the runtime needs these roles gone to seal the actor.
+    pub(crate) fn close_after_exit(&self) -> Result<bool, ActorTurnError> {
         self.close_external();
         if self
             .original
@@ -181,15 +189,19 @@ impl AttemptAbortIngress {
             .values()
             .any(|slot| slot.booked.load(Ordering::Acquire))
         {
-            return Err(self);
+            return Ok(false);
         }
-        let original = Arc::try_unwrap(self.original).map_err(|original| Self { original })?;
-        for mut slot in original.slots.into_values() {
-            slot.position
-                .close_after_exit()
-                .expect("exited original Abort Control position");
+        for slot in self.original.slots.values() {
+            let mut position = slot
+                .position
+                .lock()
+                .expect("original Abort Control position");
+            if let Some(original) = position.as_mut() {
+                original.close_after_exit()?;
+                position.take();
+            }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -286,7 +298,20 @@ impl AbortParticipationEffectReservation for AbortReservation {
         // uses. An immediately woken Core cannot settle an unbound action.
         let mut current = slot.submitted.lock().expect("original Abort submission");
         assert!(current.is_none());
-        match slot.position.fill(input) {
+        if self.original.closed.load(Ordering::Acquire) {
+            drop(current);
+            drop(original);
+            return;
+        }
+        let position = slot
+            .position
+            .lock()
+            .expect("original Abort Control position");
+        match position
+            .as_ref()
+            .expect("booked original Control position")
+            .fill(input)
+        {
             Ok(input) => {
                 *current = Some(Submitted {
                     action: self.action,
@@ -330,15 +355,22 @@ impl AbortInputRetirement {
             return Ok(true);
         };
         let slot = &self.original.slots[&self.participation];
-        if slot
-            .position
-            .in_flight()?
-            .is_some_and(|input| input != expected)
         {
-            return Err(ActorTurnError::InputAuthorMismatch);
-        }
-        if !slot.position.retire_ready_after_exit()? {
-            return Ok(false);
+            // Booking excludes all other position users until the original
+            // occurrence retires. The poller never waits on this lock.
+            let position = slot
+                .position
+                .try_lock()
+                .expect("exclusive booked Abort Control position");
+            let original = position
+                .as_ref()
+                .expect("booked original Abort Control position");
+            if original.in_flight()?.is_some_and(|input| input != expected) {
+                return Err(ActorTurnError::InputAuthorMismatch);
+            }
+            if !original.retire_ready_after_exit()? {
+                return Ok(false);
+            }
         }
         self.input = None;
         assert!(slot.booked.swap(false, Ordering::AcqRel));
@@ -394,7 +426,17 @@ struct SettlementRow {
 /// The pending Abort and the latest late authority are bounded per participant.
 pub(crate) struct AbortSettlementOwner {
     ingress: Arc<AttemptAbortIngress>,
-    rows: Mutex<BTreeMap<ParticipationRef, SettlementRow>>,
+    state: Mutex<SettlementState>,
+}
+
+struct SettlementState {
+    rows: BTreeMap<ParticipationRef, SettlementRow>,
+    fenced: bool,
+}
+
+pub(crate) struct DrainedAbortSubmissions {
+    pub(crate) retirements: VecDeque<AbortInputRetirement>,
+    pub(crate) errors: Vec<(ParticipationRef, ParticipationStandDownError)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -421,7 +463,10 @@ impl AbortSettlementOwner {
             .collect();
         Self {
             ingress,
-            rows: Mutex::new(rows),
+            state: Mutex::new(SettlementState {
+                rows,
+                fenced: false,
+            }),
         }
     }
 
@@ -435,6 +480,46 @@ impl AbortSettlementOwner {
             .registration
             .same_registration(registration)
             && self.ingress.original.activation == activation
+    }
+
+    pub(crate) fn close_external(&self) {
+        self.ingress.close_external();
+    }
+
+    /// Only the original failure Work runs this drain. The same gate that
+    /// serializes Abort settlement fences later executor starts.
+    pub(crate) fn drain_failed(&self) -> DrainedAbortSubmissions {
+        self.close_external();
+        let mut state = self.state.lock().expect("original Abort settlement owner");
+        assert!(!std::mem::replace(&mut state.fenced, true));
+        let mut retirements = VecDeque::with_capacity(state.rows.len());
+        let mut errors = Vec::new();
+        for (&participation, row) in &mut state.rows {
+            let slot = &self.ingress.original.slots[&participation];
+            let submitted = slot
+                .submitted
+                .lock()
+                .expect("original Abort submission")
+                .take();
+            if let Some(original) = submitted {
+                let (original, retirement) = self
+                    .ingress
+                    .submission_and_retirement(participation, original);
+                if let Err(error) = original.fail_closed() {
+                    errors.push((participation, error));
+                }
+                retirements.push_back(retirement);
+            }
+            if let Some(original) = row.late.take()
+                && let Err(error) = original.original.fail_closed()
+            {
+                errors.push((participation, error));
+            }
+        }
+        DrainedAbortSubmissions {
+            retirements,
+            errors,
+        }
     }
 
     pub(crate) fn apply(
@@ -456,6 +541,18 @@ impl AbortSettlementOwner {
         };
         if port.activation != self.ingress.original.activation {
             return Err(AbortSettlementRefusal::ForeignPort);
+        }
+        let mut state = self.state.lock().expect("original Abort settlement owner");
+        let fenced = state.fenced;
+        let row = state
+            .rows
+            .get_mut(&participation)
+            .ok_or(AbortSettlementRefusal::ForeignPort)?;
+        if fenced {
+            return Ok(AppliedAbortSettlement {
+                result: Ok(()),
+                retirement: None,
+            });
         }
         let receipt = match (settlement, receipt_generation, receipt) {
             (S::Worker(outcome), Some(original_generation), Some(receipt))
@@ -480,10 +577,6 @@ impl AbortSettlementOwner {
             (_, None, None) => None,
             _ => return Err(AbortSettlementRefusal::WrongReceiptGeneration),
         };
-        let mut rows = self.rows.lock().expect("original Abort settlement owner");
-        let row = rows
-            .get_mut(&participation)
-            .ok_or(AbortSettlementRefusal::ForeignPort)?;
         if let Some((original, retirement)) =
             self.ingress
                 .take_submission(abort_action, participation, operation_id)

@@ -571,19 +571,21 @@ impl AttemptActorRegistration {
             self.root_control.activation(),
         );
         qa.install_terminal(terminal.clone());
-        qa.install_abort(abort);
+        qa.install_abort(abort.clone());
         let (failure_bridge, residual) = PendingFailureBridge::new(
             self.original.clone(),
             self.root_control.activation(),
             self.failure_members.clone(),
             self.failure_publications.clone(),
         );
+        let (abort_drain, abort_retirement) = tokio::sync::oneshot::channel();
         let cleanup = super::transport::NativeFailureCleanup::new(
             send.contexts.clone(),
             failure.reservation_id(),
             native.0.clone(),
             residual,
-        );
+        )
+        .with_abort_drain(abort, abort_drain);
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -610,6 +612,7 @@ impl AttemptActorRegistration {
                         super::transport::AttemptFailureBinding {
                             supervisor: failure,
                             port: Box::new(cleanup),
+                            abort_drain: Some(abort_retirement),
                         },
                     ),
                     source,

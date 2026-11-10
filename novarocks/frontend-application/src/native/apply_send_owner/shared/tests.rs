@@ -2106,12 +2106,40 @@ async fn run_actor_send(
     });
     let cleanup = Arc::new(Mutex::new(CleanupState::default()));
     let release_parent = Arc::new(AtomicBool::new(!fail_core));
+    let (abort_ingress, abort_sender, abort_drain) = if fail_core {
+        use crate::task_execution::bridge::abort::{AbortSettlementOwner, AttemptAbortIngress};
+        let role = actor_runtime
+            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &parent)
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        let ingress = Arc::new(AttemptAbortIngress::new(
+            inbox.registration().clone(),
+            activation,
+            [(participation, role)],
+            tokio::sync::watch::channel(0).0,
+            None,
+        ));
+        let (handoff, drain) = tokio::sync::oneshot::channel();
+        (
+            Some(ingress.clone()),
+            Some((Arc::new(AbortSettlementOwner::new(ingress)), handoff)),
+            Some(drain),
+        )
+    } else {
+        (None, None, None)
+    };
     let failure_port = transport::NativeFailureCleanup::new(
         contexts.clone(),
         failure_payer,
         handle.clone(),
         Box::new(CleanupPort(cleanup.clone(), Some(residual_port))),
     );
+    let failure_port = if let Some((owner, sender)) = abort_sender {
+        failure_port.with_abort_drain(owner, sender)
+    } else {
+        failure_port
+    };
     let supervisor = FailureSupervisor::new(
         actor_runtime.clone(),
         inbox.registration().clone(),
@@ -2155,6 +2183,7 @@ async fn run_actor_send(
                     transport::AttemptFailureBinding {
                         supervisor,
                         port: Box::new(failure_port),
+                        abort_drain,
                     },
                 ),
                 Box::new(ScopeOwner {
@@ -2344,6 +2373,7 @@ async fn run_actor_send(
         })
         .await
         .unwrap();
+        assert!(abort_ingress.unwrap().close_after_exit().unwrap());
         let deadline = if failure_verdict == Some(OperationOutcome::Accepted) {
             Instant::now()
         } else {
