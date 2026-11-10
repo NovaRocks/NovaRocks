@@ -363,6 +363,21 @@ impl WithdrawalInbox {
         )
         .unwrap()
     }
+    pub(crate) fn reserve_standing(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> novarocks_control_runtime::actor_turn::StandingInputObligation<FrontendActor> {
+        self.runtime
+            .reserve_admitted_input_for(
+                &self.registration,
+                self.source,
+                InputClass::Lifecycle,
+                work,
+            )
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    }
     pub(crate) fn assert_no_result(&self) {
         assert_eq!(
             self.runtime
@@ -456,7 +471,7 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
         OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
             .unwrap_or_else(|e| panic!("{}", e.error));
     let mut foreign_result = handoff
-        .bind_actor_result(effect.clone(), &author, foreign_result)
+        .bind_actor_result(effect.clone(), &author, foreign_result, None)
         .err()
         .expect("another position of the same Work cannot substitute");
     assert!(
@@ -467,7 +482,7 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
     );
     assert!(
         handoff
-            .bind_actor_result(effect.clone(), &author, result)
+            .bind_actor_result(effect.clone(), &author, result, None)
             .is_ok()
     );
     let (staged, observe) = tokio::sync::oneshot::channel();

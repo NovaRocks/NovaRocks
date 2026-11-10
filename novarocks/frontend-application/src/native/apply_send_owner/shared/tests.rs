@@ -1273,7 +1273,11 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
     let (mut source, exit, launch) =
         OriginalTransportJoinObligation::prepare(parent, observer(), panic)
             .unwrap_or_else(|error| panic!("{}", error.error));
-    assert!(launch.bind_actor_result(effect, &author, result).is_ok());
+    assert!(
+        launch
+            .bind_actor_result(effect, &author, result, None)
+            .is_ok()
+    );
     let registration = source.registration();
     let refused = match prepared.bind(&mut inputs, queue, registration.clone()) {
         Err(refused) => refused,

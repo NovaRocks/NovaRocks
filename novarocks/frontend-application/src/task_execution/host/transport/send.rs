@@ -21,8 +21,9 @@ use super::{
     capacity::{EncodingCustody, QueueCustody},
     prepare::PrepareSend,
     send_binding::ResolvedBatch,
+    send_reports::ActorSendReports,
     settlement::{AcceptedReceipts, PendingReceipt},
-    source_ports::{BodyOutcome, TransportLeg, TransportReports},
+    source_ports::{BodyOutcome, TransportLeg},
 };
 use crate::{
     native::{
@@ -68,7 +69,7 @@ pub(crate) struct BoundSend {
     pub(crate) wire: AttemptWireFacts,
     pub(crate) client: Client,
     pub(crate) apply: ApplySendPort,
-    pub(crate) reports: Arc<dyn TransportReports>,
+    pub(crate) reports: Arc<ActorSendReports>,
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) original_captures: Box<dyn Any + Send>,
 }
@@ -84,7 +85,7 @@ struct Captures {
     wire: AttemptWireFacts,
     transport: novarocks_task_codec::TransportBudget,
     client: Client,
-    reports: Arc<dyn TransportReports>,
+    reports: Arc<ActorSendReports>,
     clock: Arc<dyn MonotonicClock>,
     _original: Box<dyn Any + Send>,
     panic: novarocks_control_runtime::exit_work::PanicSink,
@@ -103,7 +104,7 @@ fn sent(intent: &crate::task_execution::intent::OperationIntent) -> SentOperatio
         },
     }
 }
-fn local_refusal(reports: &dyn TransportReports, item: PendingReceipt, outcome: OperationOutcome) {
+fn local_refusal(reports: &ActorSendReports, item: PendingReceipt, outcome: OperationOutcome) {
     reports.record_ack(
         item.key,
         OperationAcknowledgement::local_refusal(

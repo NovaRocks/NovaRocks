@@ -17,7 +17,7 @@
 
 //! First-wins original receipt custody. Pure P05 projections classify wire
 //! evidence; neither this guard nor the host chooses a retry or protocol exit.
-use super::{queue_input::SendKey, source_ports::TransportReports};
+use super::{queue_input::SendKey, send_reports::ActorSendReports};
 use crate::{
     native::{
         apply_send_owner::OriginalReplyPublisher,
@@ -39,7 +39,7 @@ pub(crate) struct PendingReceipt {
 pub(crate) struct AcceptedReceipts {
     pending: VecDeque<PendingReceipt>,
     publisher: OriginalReplyPublisher,
-    reports: Arc<dyn TransportReports>,
+    reports: Arc<ActorSendReports>,
 }
 impl AcceptedReceipts {
     /// All canonical Source cells were funded before the original operations
@@ -47,7 +47,7 @@ impl AcceptedReceipts {
     pub(crate) fn new(
         sent: Vec<PendingReceipt>,
         publisher: OriginalReplyPublisher,
-        reports: Arc<dyn TransportReports>,
+        reports: Arc<ActorSendReports>,
     ) -> Self {
         assert!(
             !sent.is_empty(),

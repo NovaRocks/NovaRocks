@@ -19,7 +19,7 @@
 //! and local call custody stay on the same authenticated role client stack.
 //! P05 classifies wire evidence; this module makes no retry/terminal decision.
 
-use super::source_ports::TransportReports;
+use super::send_reports::ActorSendReports;
 use crate::native::{
     task_transport::{
         NativeCallSource,
@@ -46,7 +46,7 @@ pub(crate) async fn send_operations_in(
     client: &Client,
     request: EncodedMethodRequest,
     expires_at: tokio::time::Instant,
-    reports: &dyn TransportReports,
+    reports: &ActorSendReports,
     clock: &dyn MonotonicClock,
     establishes: &[(TaskOperationId, ParticipationRef)],
     selected: &mut Option<NativeCallSource>,

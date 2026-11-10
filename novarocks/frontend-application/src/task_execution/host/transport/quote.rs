@@ -97,9 +97,18 @@ pub(crate) fn original_run(
         novarocks_workload_control::joint_admission::NativeQueuedInputGrant,
     >(operations.len())?
     .size();
+    let establishes = operations
+        .iter()
+        .filter(|operation| matches!(operation, OperationIntent::EstablishParticipation(_)))
+        .count();
+    let reports = layout_sum(
+        &super::send_reports::actor_send_report_layouts(operations.len(), establishes)
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
+    )?;
     let owned_peak = native
         .checked_add(preparation.max(transition).max(encoded))
         .and_then(|peak| peak.checked_add(attached_inputs))
+        .and_then(|peak| peak.checked_add(reports))
         .ok_or(WorkError::ArithmeticOverflow)?;
     original_run_inventory(
         operations,

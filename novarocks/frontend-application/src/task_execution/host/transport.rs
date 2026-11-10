@@ -39,6 +39,7 @@ mod receipt_input;
 mod release_wake;
 mod send;
 mod send_binding;
+mod send_reports;
 mod settlement;
 mod source_ports;
 
@@ -63,6 +64,8 @@ pub(crate) use send::{BoundSend, SendJob, run as run_send};
 pub(crate) use send_binding::{
     FrozenSendRequests, PreparedSendBatch, ResolvedBatch, SendBindingError, SendBindingRefusal,
 };
-pub(crate) use source_ports::{
-    BodyOutcome, TransportCompletionObligation, TransportLeg, TransportReports,
+pub(crate) use send_reports::{
+    ActorSendReports, NativeProgressInput, SendMemberReport, SendReportRows,
+    actor_send_report_layouts,
 };
+pub(crate) use source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg};

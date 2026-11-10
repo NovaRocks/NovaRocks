@@ -20,7 +20,7 @@
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
-use super::transport::{NativeReceiptInput, SendKey};
+use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use crate::{
     control_runtime::{
@@ -382,6 +382,18 @@ impl AttemptActorRegistration {
         let position =
             self.reserve_standing(runtime, self.native_source, InputClass::Lifecycle, work)?;
         Ok(NativeReceiptInput::new(key, kind, position))
+    }
+
+    pub(crate) fn reserve_native_progress(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+    ) -> Result<NativeProgressInput, ActorTurnError> {
+        if !self.scope.same_scope(work.scope()) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        self.reserve_standing(runtime, self.native_source, InputClass::Lifecycle, work)
+            .map(NativeProgressInput::new)
     }
 
     fn reserve_standing(

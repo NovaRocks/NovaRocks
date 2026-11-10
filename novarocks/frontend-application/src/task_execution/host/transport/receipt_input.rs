@@ -80,6 +80,12 @@ pub(crate) struct NativeReceiptInput {
     receipt: Option<Receipt>,
 }
 impl NativeReceiptInput {
+    pub(super) fn key(&self) -> SendKey {
+        self.key
+    }
+    pub(super) fn kind(&self) -> OperationKind {
+        self.kind
+    }
     pub(in crate::task_execution::host) fn new(
         key: SendKey,
         kind: OperationKind,

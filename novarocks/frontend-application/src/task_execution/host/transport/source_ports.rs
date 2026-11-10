@@ -18,11 +18,8 @@
 //! Seams implemented only by P10a's original per-attempt Source. They are not
 //! alternate protocol owners, result stores, Work factories or quota wallets.
 
-use super::queue_input::{OriginalQueuedInput, SendKey};
-use crate::task_execution::intent::OperationAcknowledgement;
+use super::queue_input::OriginalQueuedInput;
 use novarocks_control_runtime::exit_custody::ExitObligation;
-use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
 
@@ -37,28 +34,6 @@ pub(crate) enum BodyOutcome {
     /// final logical/error consumer, independently of Core input consumption.
     LocalFailure(WorkError),
     RawFailure(Box<dyn Any + Send>),
-}
-
-/// Per-job port bound by the original Source record. Implementations keep a
-/// Weak reference to the Join-owning record; routes need no invented numeric
-/// JobKey and holding the port must not make an owner/Join cycle.
-pub(crate) trait TransportReports: Send + Sync + 'static {
-    /// Cells already exist before the original operation/QueuedInputGranted
-    /// becomes visible. This never allocates/reissues authors from a WorkId.
-    /// The original canonical acknowledgement retains its real raw cause and
-    /// rich body. P10a projects the passive AP fact from this same record.
-    fn record_ack(&self, key: SendKey, ack: OperationAcknowledgement);
-    /// Independent original paid progress input; never deferred until final
-    /// RPC outcome and never proof that Establish unary was polled.
-    fn send_started(&self, at: MonotonicInstant);
-    /// Invoked exactly after this same original unary future's first poll.
-    /// Independent prepaid progress input, not the job's single result role.
-    fn establish_rpc_started(
-        &self,
-        operation: TaskOperationId,
-        participation: ParticipationRef,
-        at: MonotonicInstant,
-    );
 }
 
 /// Original per-job result obligation, supplied by the same admitted Source.

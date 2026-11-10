@@ -24,7 +24,7 @@ use crate::{
         actor::{FrontendActor, FrontendInput},
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::host::transport::{BodyOutcome, GrantedInputs, SendKey},
+    task_execution::host::transport::{ActorSendReports, BodyOutcome, GrantedInputs, SendKey},
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, QueuedInputPayload},
@@ -46,6 +46,7 @@ pub(crate) struct ReturnedActorTransportResult {
     pub(crate) effect: Arc<AttemptEffectEnvelope>,
     pub(crate) original: CausalInputObligation<FrontendActor>,
     pub(crate) outcome: Option<BodyOutcome>,
+    pub(crate) send_reports: Option<Arc<ActorSendReports>>,
     /// On refusal the same prepared event and original position remain
     /// available to the Source's failure/retirement path.
     pub(crate) withdrawal: Option<Result<InputId, CausalFillFailure<FrontendInput>>>,
@@ -63,6 +64,7 @@ impl TransportJoinHandoff {
         effect: Arc<AttemptEffectEnvelope>,
         expected: &InputAuthor,
         original: CausalInputObligation<FrontendActor>,
+        send_reports: Option<Arc<ActorSendReports>>,
     ) -> Result<(), CausalInputObligation<FrontendActor>> {
         let Some(record) = self.registration.original.upgrade() else {
             return Err(original);
@@ -85,6 +87,7 @@ impl TransportJoinHandoff {
             effect,
             original,
             outcome: None,
+            send_reports,
             withdrawal: None,
         });
         Ok(())

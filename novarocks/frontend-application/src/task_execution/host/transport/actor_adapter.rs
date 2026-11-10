@@ -18,6 +18,7 @@
 //! Only this adapter knows Actor routing and its original paid causal result.
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
+    ActorSendReports,
     queued_job::{BoundQueue, QueueJob, run as run_queue},
     send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
@@ -70,6 +71,11 @@ impl ActorTransportWork {
             (Self::Send(bound), EffectBody::SendBatch { batch, reservation }) => {
                 let items = batch.operations.len();
                 bound.resolved.matches_effect(effect)
+                    && bound.reports.matches(
+                        effect.protocol.id,
+                        &bound.resolved.keys,
+                        &bound.resolved.operations,
+                    )
                     && items != 0
                     && bound.queue.parent_reservation().get() == reservation.0.get()
                     && bound.backend == batch.backend
@@ -92,6 +98,13 @@ impl ActorTransportWork {
                     && bound.control == operation.requires_control_progress()
             }
             _ => false,
+        }
+    }
+
+    fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
+        match self {
+            Self::Send(send) => Some(send.reports.clone()),
+            Self::Admit(_) => None,
         }
     }
 }
@@ -149,11 +162,12 @@ pub(crate) fn handoff_actor_transport(
     let bound = captures
         .downcast_ref::<BoundActorTransport>()
         .expect("checked actor transport binding");
-    if let Err(result) =
-        bound
-            .launch
-            .bind_actor_result(bound.effect.clone(), &bound.result_author, result)
-    {
+    if let Err(result) = bound.launch.bind_actor_result(
+        bound.effect.clone(),
+        &bound.result_author,
+        result,
+        bound.work.send_reports(),
+    ) {
         return Err(PreparedEffectJob {
             effect,
             exit,
