@@ -1076,3 +1076,101 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     roles.finish();
     assert!(wc.finish());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
+    use novarocks_attempt_protocol::input::SendGeneration;
+    use novarocks_control_runtime::exit_work::{GatedNotStarted, GatedOutcome, Withdrawal};
+    use novarocks_coordination_contract::AttemptActionId;
+
+    let roles = Roles::new();
+    let mut wc = transport::GovernedQueuedInputFixture::new();
+    let operation = cancel(BackendProcessId::new_v7());
+    let key = transport::SendKey {
+        operation: operation.operation_id(),
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+    };
+    let input = wc.admit(key, 0);
+    let (parent, queue, _) = roles.parent(operation.backend_process_id(), operation.queued_bytes());
+    let panic = PanicSink::new();
+    let inner = panic.clone();
+    let (mut source, exit, launch) =
+        OriginalTransportJoinObligation::prepare(parent, observer(), panic)
+            .unwrap_or_else(|error| panic!("{}", error.error));
+    let registration = source.registration();
+    let keys: Arc<[transport::SendKey]> = Arc::from([key]);
+    registration.register_send(&queue, keys.clone());
+    let input = match input.bind_send(registration.clone(), 1) {
+        Err(original) => original,
+        Ok(_) => panic!("the original loan requires its exact registered position"),
+    };
+    let loan = input
+        .bind_send(registration.clone(), 0)
+        .unwrap_or_else(|_| panic!("same original input"));
+    assert!(!registration.claim_input(0, key));
+    let withdrawal = Arc::new(HandoffCell::new());
+    let arbitration = withdrawal.clone();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let queue_id = queue.id();
+    launch
+        .spawn(
+            &Handle::current(),
+            exit,
+            move |exit, registration| async move {
+                assert!(registration.matches_send(queue_id, &keys));
+                assert!(loan.matches_send(&registration, 0, key));
+                let before_handoff = async move {
+                    entered.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(loan);
+                };
+                let outcome = GatedWork::new(exit, (), arbitration, inner)
+                    .run(generation(), before_handoff, |(), ()| ready(()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    GatedOutcome::NotStarted(GatedNotStarted::Withdrawn)
+                );
+            },
+        )
+        .unwrap();
+    waiting.await.unwrap();
+    let queue = match source.retire_unattached_send(queue) {
+        Err(original) => original,
+        Ok(_) => panic!("waiting for Apply cannot prove original Join"),
+    };
+    assert_eq!(withdrawal.withdraw(), Withdrawal::Withdrawn);
+    assert!(
+        poll_fn(|cx| source.poll_shared_completion(cx))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut retirement = source
+        .retire_unattached_send(queue)
+        .unwrap_or_else(|_| panic!("actual Join and original loan return qualify retirement"));
+    assert!(!source.try_retire().unwrap());
+    assert_eq!(
+        roles
+            .ledger
+            .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+            .unwrap()
+            .unwrap()
+            .used[0],
+        1
+    );
+    assert!(retirement.finish_one().unwrap());
+    assert!(source.try_retire().unwrap());
+    assert_eq!(
+        roles
+            .ledger
+            .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+            .unwrap()
+            .unwrap()
+            .used,
+        [0, 0]
+    );
+    roles.finish();
+    assert!(wc.finish());
+}

@@ -160,7 +160,12 @@ fn original_run_inventory(
         array::<(bool, proto::TaskOperation)>(operations.len())?,
         array::<EncodedMethodBatch>(1)?,
         array::<super::settlement::PendingReceipt>(operations.len())?,
-        array::<super::queue_input::SendKey>(operations.len())?,
+        novarocks_type_contract::owned_resources::layout::arc_layout(array::<
+            super::queue_input::SendKey,
+        >(operations.len())?)
+        .map_err(|_| WorkError::ArithmeticOverflow)?,
+        crate::task_execution::host::custody::send_input_positions_layout(operations.len())
+            .map_err(|_| WorkError::ArithmeticOverflow)?,
         array::<SendInputLoan>(operations.len())?,
         array::<proto::TaskOperation>(operations.len())?,
         array::<proto::TaskControlOperation>(operations.len())?,

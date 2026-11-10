@@ -105,6 +105,10 @@ impl QueueWindow {
     }
     /// After actual encoding and immediately before RPC use. Only the original
     /// queue-window shares return; total item/byte and encoded shares remain.
+    pub(crate) fn partition_obligation(&self) -> &ReservationObligation {
+        &self.quota.original
+    }
+
     pub(crate) fn mark_in_flight(&mut self) -> Result<(), CapacityFailure> {
         self.quota.refund(self.layout.in_flight_release(
             self.backend,

@@ -16,7 +16,8 @@
 // under the License.
 
 //! Real WC queued-input admission, without a second Native transport window.
-use super::{capacity::QueueCustody, proposal_wait::ProposalWait, source_ports::TransportReports};
+use super::proposal_wait::ProposalWait;
+use crate::task_execution::host::custody::TransportJoinRegistration;
 use novarocks_attempt_protocol::input::SendGeneration;
 use novarocks_execution_contract::TaskOperationId;
 use novarocks_workload_control::{
@@ -30,7 +31,6 @@ use std::{
     future::Future,
     mem::ManuallyDrop,
     pin::Pin,
-    sync::{Arc, Weak},
     task::{Context, Poll},
 };
 
@@ -68,21 +68,25 @@ impl OriginalQueuedInput {
     > {
         self.borrow().retain_payload()
     }
-    /// Requires the actual original queue object, not a bool/descriptor proof.
+    /// Requires the original Join registration with its already-bound queue.
     /// The Source binds this loan only after associating that reservation with
     /// its same canonical (operation, send-generation) record.
     pub(crate) fn bind_send(
         mut self,
-        _queue: &QueueCustody,
-        source: &Arc<dyn TransportReports>,
-    ) -> SendInputLoan {
-        SendInputLoan {
+        source: TransportJoinRegistration,
+        index: usize,
+    ) -> Result<SendInputLoan, Self> {
+        if !source.claim_input(index, self.key) {
+            return Err(self);
+        }
+        Ok(SendInputLoan {
             input: Some(ReturnedQueuedInput {
                 key: self.key,
                 input: ManuallyDrop::new(self.input.take().expect("same original WC input")),
             }),
-            source: Arc::downgrade(source),
-        }
+            source,
+            index,
+        })
     }
 
     pub(crate) fn borrow(&self) -> &NativeQueuedInputGrant {
@@ -152,7 +156,8 @@ impl ReturnedQueuedInput {
 /// the actual object in the Source's prepaid return cell. No queue exit occurs.
 pub(crate) struct SendInputLoan {
     input: Option<ReturnedQueuedInput>,
-    source: Weak<dyn TransportReports>,
+    source: TransportJoinRegistration,
+    index: usize,
 }
 impl SendInputLoan {
     pub(crate) fn key(&self) -> SendKey {
@@ -160,6 +165,14 @@ impl SendInputLoan {
     }
     pub(crate) fn borrow(&self) -> &NativeQueuedInputGrant {
         self.input.as_ref().expect("original input loan").borrow()
+    }
+    pub(crate) fn matches_send(
+        &self,
+        registration: &TransportJoinRegistration,
+        index: usize,
+        key: SendKey,
+    ) -> bool {
+        self.index == index && self.key() == key && self.source.same_send_owner(registration)
     }
     pub(crate) fn into_original(mut self) -> NativeQueuedInputGrant {
         self.input
@@ -176,10 +189,7 @@ impl Drop for SendInputLoan {
         let Some(input) = self.input.take() else {
             return;
         };
-        let Some(source) = self.source.upgrade() else {
-            std::panic::resume_unwind(Box::new(UnprovenInputReturn { _input: input }));
-        };
-        if let Err(input) = source.stage_input(input) {
+        if let Err(input) = self.source.stage_input(self.index, input) {
             std::panic::resume_unwind(Box::new(UnprovenInputReturn { _input: input }));
         }
     }

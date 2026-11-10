@@ -19,6 +19,7 @@
 //! install a Join. A Native completion consumes its original row obligation
 //! after the same Join and original role observations, never a numeric hint.
 
+use super::transport::{ReturnedQueuedInput, SendKey};
 use crate::native::apply_send_owner::{
     ApplySlot, JoinFacts, NativeDisposalBody, NativeDisposalRequest, NativeDisposalReturn,
     RegistrationFailure, SharedApplyJoinObligation, SharedApplyPreparation,
@@ -424,6 +425,7 @@ impl Drop for OriginalDisposalObligation {
 
 enum TransportRegistrationState {
     Unattached,
+    UnattachedJoined,
     Attaching,
     Attached(SharedApplyJoinObligation),
     Refused(RefusedAttachment),
@@ -435,10 +437,28 @@ struct RefusedAttachment {
     queue: ReservationId,
     join_observed: bool,
 }
+struct OriginalSendQueue {
+    partition: ReservationId,
+    keys: Arc<[SendKey]>,
+    returned: Box<[SendInputPosition]>,
+}
+enum SendInputPosition {
+    Unissued,
+    Lent,
+    Returned(ReturnedQueuedInput),
+}
+
+pub(crate) fn send_input_positions_layout(
+    items: usize,
+) -> Result<std::alloc::Layout, std::alloc::LayoutError> {
+    std::alloc::Layout::array::<SendInputPosition>(items)
+}
+
 struct TransportRegistration {
     scope: ScopeHandle,
     parent: WorkId,
     state: Mutex<TransportRegistrationState>,
+    send: Mutex<Option<OriginalSendQueue>>,
     retained: Mutex<Option<Arc<Self>>>,
 }
 #[derive(Clone)]
@@ -452,6 +472,95 @@ pub(crate) type SharedApplyAttachRefusal = (
     StepRegistration,
 );
 impl TransportJoinRegistration {
+    /// Install the original Source's fixed, already-priced return positions
+    /// before lending its inputs. The partition is later matched to the
+    /// actual returned reservation in this same ledger and Scope.
+    pub(crate) fn register_send(&self, partition: &ReservationObligation, keys: Arc<[SendKey]>) {
+        assert!(!keys.is_empty(), "one original input for every send member");
+        let record = self.original.upgrade().expect("original send Join owner");
+        assert!(
+            partition.belongs_to(&record.scope),
+            "same original send Scope"
+        );
+        let returned = std::iter::repeat_with(|| SendInputPosition::Unissued)
+            .take(keys.len())
+            .collect();
+        let state = record
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(matches!(*state, TransportRegistrationState::Unattached));
+        let mut send = record
+            .send
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(send.is_none(), "one original send queue");
+        *send = Some(OriginalSendQueue {
+            partition: partition.id(),
+            keys,
+            returned,
+        });
+    }
+
+    pub(crate) fn matches_send(&self, partition: ReservationId, keys: &Arc<[SendKey]>) -> bool {
+        self.original.upgrade().is_some_and(|record| {
+            record
+                .send
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|send| send.partition == partition && Arc::ptr_eq(&send.keys, keys))
+        })
+    }
+
+    pub(crate) fn same_send_owner(&self, other: &Self) -> bool {
+        self.original.ptr_eq(&other.original)
+    }
+
+    pub(crate) fn claim_input(&self, index: usize, key: SendKey) -> bool {
+        let Some(record) = self.original.upgrade() else {
+            return false;
+        };
+        let mut send = record
+            .send
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(send) = send.as_mut() else {
+            return false;
+        };
+        if send.keys.get(index) != Some(&key)
+            || !matches!(send.returned[index], SendInputPosition::Unissued)
+        {
+            return false;
+        }
+        send.returned[index] = SendInputPosition::Lent;
+        true
+    }
+
+    pub(crate) fn stage_input(
+        &self,
+        index: usize,
+        input: ReturnedQueuedInput,
+    ) -> Result<(), ReturnedQueuedInput> {
+        let Some(record) = self.original.upgrade() else {
+            return Err(input);
+        };
+        let mut send = record
+            .send
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(send) = send.as_mut() else {
+            return Err(input);
+        };
+        if send.keys.get(index) != Some(&input.key())
+            || !matches!(send.returned[index], SendInputPosition::Lent)
+        {
+            return Err(input);
+        }
+        send.returned[index] = SendInputPosition::Returned(input);
+        Ok(())
+    }
+
     /// The actual send attempts attachment once. A refusal stays with the
     /// original Join owner through the pre-handoff withdrawal boundary.
     pub(crate) fn attach_send(
@@ -642,6 +751,7 @@ impl OriginalTransportJoinObligation {
             scope,
             parent,
             state: Mutex::new(TransportRegistrationState::Unattached),
+            send: Mutex::new(None),
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
@@ -690,6 +800,7 @@ impl OriginalTransportJoinObligation {
                 return Poll::Ready(Ok(None));
             }
             TransportRegistrationState::Refused(_)
+            | TransportRegistrationState::UnattachedJoined
             | TransportRegistrationState::PhysicalRetiring
             | TransportRegistrationState::Issued => {
                 return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
@@ -701,6 +812,14 @@ impl OriginalTransportJoinObligation {
         }
         let next = if matches!(*state, TransportRegistrationState::Attached(_)) {
             TransportRegistrationState::PhysicalRetiring
+        } else if self
+            .native
+            .send
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            TransportRegistrationState::UnattachedJoined
         } else {
             TransportRegistrationState::Issued
         };
@@ -722,6 +841,56 @@ impl OriginalTransportJoinObligation {
             facts,
         })))
     }
+    /// Reclaim an original send that exited before getting an Apply row.
+    /// Every original loan must have reached its registered return cell.
+    pub(crate) fn retire_unattached_send(
+        &self,
+        queue: ReservationObligation,
+    ) -> Result<PhysicalInputRetirementObligation, ReservationObligation> {
+        let returned = {
+            let mut state = self
+                .native
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !matches!(*state, TransportRegistrationState::UnattachedJoined) {
+                return Err(queue);
+            }
+            let mut send = self
+                .native
+                .send
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let original = send
+                .as_ref()
+                .expect("joined send still owns its original queue");
+            if queue.id() != original.partition
+                || !queue.belongs_to(&self.native.scope)
+                || original
+                    .returned
+                    .iter()
+                    .any(|slot| !matches!(slot, SendInputPosition::Returned(_)))
+            {
+                return Err(queue);
+            }
+            *state = TransportRegistrationState::PhysicalRetiring;
+            send.take().expect("qualified original send").returned
+        };
+        let inputs = returned
+            .into_vec()
+            .into_iter()
+            .map(|slot| match slot {
+                SendInputPosition::Returned(input) => input.into_original(),
+                _ => unreachable!("every original loan returned"),
+            })
+            .collect();
+        Ok(PhysicalInputRetirementObligation::unused_queue(
+            queue,
+            inputs,
+            TransportPhysicalRetirement(Arc::downgrade(&self.native)),
+        ))
+    }
+
     /// The original job has joined without attaching a Native row. Release
     /// the unused local slot and child guard and move the still-queued grants
     /// into the original financial-first retirement continuation.
@@ -772,8 +941,14 @@ impl OriginalTransportJoinObligation {
         if !matches!(
             *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
             TransportRegistrationState::Unattached
-        ) || self.role.report.publication_state()?
-            != novarocks_control_runtime_core::completion::SlotState::RevokedUnused
+        ) || self
+            .native
+            .send
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+            || self.role.report.publication_state()?
+                != novarocks_control_runtime_core::completion::SlotState::RevokedUnused
             || !self.role.custody.actual_exit_ready()?
         {
             return Ok(false);

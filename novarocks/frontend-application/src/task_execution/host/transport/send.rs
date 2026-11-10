@@ -78,7 +78,7 @@ pub(crate) struct SendJob {
 }
 struct Captures {
     operations: Vec<crate::task_execution::intent::OperationIntent>,
-    keys: Vec<super::queue_input::SendKey>,
+    keys: Arc<[super::queue_input::SendKey]>,
     queue: QueueCustody,
     wire: AttemptWireFacts,
     transport: novarocks_task_codec::TransportBudget,
@@ -168,6 +168,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
     assert_eq!(resolved.operations.len(), resolved.keys.len());
     let parent = queue.parent_reservation();
     let queue_partition = queue.partition();
+    assert!(registration.matches_send(queue_partition, &resolved.keys));
     let client_for_pre = client.clone();
     let pre = prepare_input(PreparationInput {
         authority,
@@ -185,6 +186,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         apply,
         inputs: resolved.queued_inputs,
         registration,
+        keys: resolved.keys.clone(),
         queue: queue_partition,
     });
     let captures = Captures {
@@ -225,7 +227,7 @@ async fn encode_and_send(
 ) -> BodyOutcome {
     let mut operations = Vec::with_capacity(captures.operations.len());
     let mut pending = Vec::with_capacity(captures.operations.len());
-    for (intent, key) in captures.operations.iter().zip(&captures.keys) {
+    for (intent, key) in captures.operations.iter().zip(captures.keys.iter()) {
         let item = PendingReceipt {
             key: *key,
             sent: sent(intent),
@@ -348,11 +350,21 @@ struct PreparationInput {
     apply: ApplySendPort,
     inputs: Vec<super::queue_input::SendInputLoan>,
     registration: TransportJoinRegistration,
+    keys: Arc<[super::queue_input::SendKey]>,
     queue: novarocks_control_runtime_core::identity::ReservationId,
 }
 async fn prepare_input(
     input: PreparationInput,
 ) -> Result<super::prepare::ReadyAction, super::prepare::PreparationFailure> {
+    assert!(
+        input
+            .inputs
+            .iter()
+            .zip(input.keys.iter())
+            .enumerate()
+            .all(|(index, (loan, key))| loan.matches_send(&input.registration, index, *key)),
+        "original send owns every exact loan"
+    );
     match PrepareSend::new(
         &input.authority,
         input.original_quote,
@@ -382,7 +394,7 @@ async fn execute_prepared(
     let ready = match prepared {
         Ok(ready) => ready,
         Err(error) => {
-            for (intent, key) in captures.operations.iter().zip(&captures.keys) {
+            for (intent, key) in captures.operations.iter().zip(captures.keys.iter()) {
                 captures.reports.record_ack(
                     *key,
                     OperationAcknowledgement::from_dispatch_result(

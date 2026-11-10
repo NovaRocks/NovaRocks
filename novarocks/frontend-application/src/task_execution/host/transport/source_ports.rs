@@ -20,7 +20,7 @@
 
 use super::{
     capacity::{EncodingWindow, ReturnedPhysical},
-    queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey},
+    queue_input::{OriginalQueuedInput, SendInputLoan, SendKey},
 };
 use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
 use novarocks_control_runtime::{exit_custody::ExitObligation, obligation::StepRegistration};
@@ -81,12 +81,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
         kind: WorkKind,
         quoted_bytes: usize,
     ) -> EncodingJob;
-    /// A pre-handoff input loan returns to the same canonical per-send cell.
-    /// This stores actual objects only. The Source keeps them until its unique
-    /// transport Join and every original queue/encoding reservation really
-    /// retires; only then may it finish WC queue exit. Refusal returns the same
-    /// unexited object and UNKNOWN custody, never a replacement record.
-    fn stage_input(&self, original: ReturnedQueuedInput) -> Result<(), ReturnedQueuedInput>;
     /// Gated capture teardown parks ONLY the same financial partition here.
     /// This is not physical-return/actual-exit evidence. Source retains it and
     /// its original report/Join obligations. Once its unique Join truly exits,
@@ -118,7 +112,7 @@ pub(crate) struct ResolvedBatch {
     pub(crate) queued_inputs: Vec<SendInputLoan>,
     /// Same original binding's preallocated generation association. The
     /// factory only moves this storage; it never clones N entries on a poller.
-    pub(crate) keys: Vec<SendKey>,
+    pub(crate) keys: Arc<[SendKey]>,
 }
 
 /// Original per-job result obligation, supplied by the same admitted Source.
