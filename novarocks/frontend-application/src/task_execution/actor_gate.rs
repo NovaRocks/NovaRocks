@@ -33,12 +33,12 @@ use crate::task_execution::operation::OperationDispatchResult;
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
 use novarocks_query_application::coordination::{
     AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueError, EstablishIssueSubmit,
-    EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
     EstablishTransportSubmission, LateEstablishWorkerSettlement, LogicalExecutionActorError,
     NativeAttemptDrive,
 };
 use novarocks_types::NativeCompatibilityId;
 
+use super::bridge::establish::EstablishSubmissionCapture;
 use super::error::TaskExecutionError;
 use super::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
@@ -747,50 +747,6 @@ fn actor_establish_error(error: EstablishIssueError) -> TaskExecutionError {
     TaskExecutionError::Establish(error)
 }
 
-#[derive(Debug, Default)]
-struct EstablishSubmissionCapture {
-    submission: Arc<Mutex<Option<EstablishTransportSubmission>>>,
-}
-
-impl EstablishSubmissionCapture {
-    fn take(&self) -> Option<EstablishTransportSubmission> {
-        self.submission
-            .lock()
-            .expect("Establish submission capture")
-            .take()
-    }
-}
-
-impl EstablishTransportSink for EstablishSubmissionCapture {
-    fn try_reserve(
-        &self,
-        _identity: novarocks_query_application::coordination::EstablishIssueIdentity,
-    ) -> EstablishTransportAdmission {
-        EstablishTransportAdmission::Admitted(Box::new(EstablishSubmissionCaptureReservation {
-            submission: Arc::clone(&self.submission),
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct EstablishSubmissionCaptureReservation {
-    submission: Arc<Mutex<Option<EstablishTransportSubmission>>>,
-}
-
-impl EstablishTransportReservation for EstablishSubmissionCaptureReservation {
-    fn submit(self: Box<Self>, submission: EstablishTransportSubmission) {
-        let previous = self
-            .submission
-            .lock()
-            .expect("Establish submission capture")
-            .replace(submission);
-        assert!(
-            previous.is_none(),
-            "one Establish authorization transfers exactly one submission guard"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -943,6 +899,235 @@ mod tests {
         logical.activate_initial().await.expect("attempt activated");
         let drive = logical.native_attempt_drive();
         (logical, drive, abort_intake)
+    }
+
+    #[tokio::test]
+    async fn core_establish_bridge_keeps_late_worker_settlement_distinct_from_unsent_replay() {
+        use crate::{
+            query_execution::lifecycle_plan::QueryCredentialLeases,
+            task_execution::{
+                bridge::establish::{EstablishPortError, EstablishQaBridge},
+                host::transport::AttemptEstablishMaterial,
+                sources::AttemptEstablishFacts,
+            },
+        };
+        use novarocks_attempt_protocol::effect::OperationIntent as ProtocolIntent;
+        use novarocks_coordination_contract::{
+            AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
+            AttemptIssueSettlement, AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody,
+            LogicalToAttemptBody,
+        };
+        use novarocks_execution_contract::OperationEnvelope;
+        use novarocks_query_application::coordination::{
+            EstablishIssueState, EstablishWorkerSettlement,
+        };
+        use std::num::NonZeroU64;
+
+        let participation = participation(BackendProcessId::new_v7());
+        let (mut logical, drive, _abort_intake) = logical_execution(participation).await;
+        let compatibility = NativeCompatibilityId::new([31; 32]);
+        let OperationIntent::AcquireParticipationAdmissionTicket(admission) =
+            admission(participation, 31)
+        else {
+            unreachable!()
+        };
+        let issue = drive.begin_admission_issue(admission).await.unwrap();
+        let ticket = AdmissionTicketId::try_from_bytes([31; 16]).unwrap();
+        let receipt =
+            ParticipationAdmissionTicketReceipt::new(ticket, participation, admission.valid_for());
+        drive
+            .settle_admission_issue(
+                issue,
+                AdmissionIssueSettlement::applied(
+                    admission.envelope().operation_id(),
+                    OperationOutcome::Accepted,
+                    receipt,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let facts = AttemptEstablishFacts::freeze(
+            Default::default(),
+            [(participation.backend_process_id(), Default::default())],
+            Default::default(),
+            &QueryCredentialLeases::empty(),
+        )
+        .unwrap();
+        let mut next_payload = NonZeroU64::MIN;
+        let (quotes, material) =
+            AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
+        let operation_id = TaskOperationId::new_v7();
+        let original = ProtocolIntent::EstablishParticipation {
+            envelope: OperationEnvelope::with_default_wait(
+                operation_id,
+                OperationKind::UpdateParticipation,
+            ),
+            participation,
+            ticket,
+            initial_lease_sequence: LeaseSequence::INITIAL,
+            initial_lease_valid_for: admission.valid_for(),
+            material: quotes[&participation].material,
+            queued_bytes: quotes[&participation].queued_bytes,
+        };
+        let activation = drive.identity();
+        let mut bridge = EstablishQaBridge::new(Arc::new(drive), compatibility, Arc::new(material));
+        let token = |id| AttemptRequestToken::new(NonZeroU64::new(id).unwrap());
+        let port = |id, body| AttemptToLogical {
+            activation,
+            action: AttemptActionId::new(NonZeroU64::new(id).unwrap()),
+            body,
+        };
+        let authorize = |id, request| {
+            port(
+                id,
+                AttemptToLogicalBody::AuthorizationRequest {
+                    token: token(id),
+                    request,
+                },
+            )
+        };
+        let settle = |id, authorization, settlement| {
+            port(
+                id,
+                AttemptToLogicalBody::EstablishSettlement {
+                    token: token(id),
+                    authorization,
+                    participation,
+                    operation_id,
+                    settlement,
+                },
+            )
+        };
+        let first = bridge
+            .authorize(
+                &original,
+                &authorize(
+                    1,
+                    AttemptAuthorization::Establish {
+                        participation,
+                        operation_id,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let LogicalToAttemptBody::AuthorizationReply {
+            decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(first)),
+            ..
+        } = first.reply.body
+        else {
+            panic!("the original QA issue must authorize Establish");
+        };
+        assert!(matches!(
+            bridge
+                .settle(&settle(2, first, AttemptIssueSettlement::TransportUnknown))
+                .unwrap()
+                .reply
+                .body,
+            LogicalToAttemptBody::EstablishSettlementReply { result: Ok(()), .. }
+        ));
+
+        let replay = bridge
+            .authorize(
+                &original,
+                &authorize(
+                    3,
+                    AttemptAuthorization::ReauthorizeEstablish {
+                        participation,
+                        operation_id,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let LogicalToAttemptBody::AuthorizationReply {
+            decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(replay)),
+            ..
+        } = replay.reply.body
+        else {
+            panic!("the original QA issue must authorize the same replay");
+        };
+        assert_ne!(first, replay);
+        assert!(matches!(
+            bridge.settle(&settle(4, first, AttemptIssueSettlement::DefinitelyUnsent)),
+            Err(EstablishPortError::WrongGuard)
+        ));
+        assert!(matches!(
+            bridge.settle(&port(
+                5,
+                AttemptToLogicalBody::DetachEstablish {
+                    token: token(5),
+                    authorization: replay,
+                    participation,
+                    operation_id,
+                }
+            )),
+            Err(EstablishPortError::WrongGuard)
+        ));
+        assert!(matches!(
+            bridge
+                .settle(&settle(6, replay, AttemptIssueSettlement::DefinitelyUnsent))
+                .unwrap()
+                .reply
+                .body,
+            LogicalToAttemptBody::EstablishSettlementReply { result: Ok(()), .. }
+        ));
+        assert!(matches!(
+            bridge
+                .settle(&settle(
+                    7,
+                    first,
+                    AttemptIssueSettlement::Worker(OperationOutcome::Accepted)
+                ))
+                .unwrap()
+                .reply
+                .body,
+            LogicalToAttemptBody::EstablishSettlementReply { result: Ok(()), .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logical
+                    .establish_snapshot(participation)
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| {
+                        snapshot.state()
+                            == EstablishIssueState::WorkerSettled(
+                                EstablishWorkerSettlement::Applied,
+                            )
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old determinate Worker receipt settles the original QA record");
+        drop(bridge);
+        logical.abandon_running_attempt();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while logical
+                .stand_down_snapshot(participation)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        logical
+            .observe_worker_process_replaced(participation)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[derive(Debug)]
