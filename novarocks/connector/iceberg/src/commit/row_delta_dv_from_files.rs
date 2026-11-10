@@ -222,7 +222,7 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
         .await?;
         // The preparer never deletes a superseded BE object: another logical DV
         // may still use the same physical Puffin. Finalization owns reachability.
-        super::overwrite::prepare_snapshot_change(
+        super::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

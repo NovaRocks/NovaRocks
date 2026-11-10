@@ -230,7 +230,7 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
             added,
         )
         .await?;
-        super::overwrite::prepare_snapshot_change(
+        super::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

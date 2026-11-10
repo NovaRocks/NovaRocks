@@ -38,7 +38,7 @@ Iceberg 提交如何保留文件的历史身份，在只触及少量条目时复
 
 - **按物理序位继承。** 在选择前解析条目。显式 row ID 不推进 cursor，DELETED 不占用存活数据范围。已提交来源缺 manifest row-ID 起点时，绑定结果为 null。待提交来源可保留显式值。
 - **按观察范围证明。** T 完成绑定准确 list、目标及已处理的候选来源。位置删除与 DV 共用目标 spec、typed partition 和 sequence 规则。物理新增历史沿完整祖先窗口识别 ADDED，包含 REPLACE。完整存活观察和局部查询各自保留自己的证据。
-- **先过滤，再标准合并。** 未选来源保留引用。普通准备对 data/delete 候选按 spec 和真实长度从尾装箱，首个候选所在箱应用 min-count。REWRITE MANIFESTS 与零文件槽操作沿自身布局。取消或首错后由原 FileIO 窗口排空已开始工作。
+- **先过滤，再标准合并。** 未选来源保留引用。普通准备对 data/delete 候选按 spec 和真实长度从尾装箱，首个候选所在箱应用 min-count。REWRITE MANIFESTS 与零文件槽操作沿自身布局。普通快照按最终列表统计新建、保留和替换的 manifest。替换只统计确实被过滤或合并的旧来源，旧删除清单自然退出及中间写出单独看待。取消或首错后由原 FileIO 窗口排空已开始工作。
 - **由真实历史 schema 写出。** 核验原条目身份和原存储事实后，仅在写出副本上规范化分区值和必要的 bounds。字段 ID、界的方向和数值语义保留。v3 DATE 到 TIMESTAMP 或 TIMESTAMP_NS 分别按微秒或纳秒受检换算，输出可由同一 SDK 读取。
 - **用实际 list 推进 prefix。** SDK 的成功写出决定序列和行范围。原 staging 成功后才能向下一步骤公开这些 descriptor。外部提交结果及产物处理沿原生命周期。
 

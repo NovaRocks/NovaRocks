@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::iceberg::spec::{ManifestContentType, ManifestFile, TableMetadata};
@@ -28,6 +28,27 @@ use super::manifest_sources::{LocatedEntry, SnapshotSources};
 use super::model::ArtifactWriter;
 use super::staging::{ManifestEntryWrite, write_sourced_manifest};
 
+pub(crate) struct OrdinaryManifests {
+    manifests: Vec<ManifestFile>,
+    created: usize,
+    kept: usize,
+    replaced: usize,
+}
+
+impl OrdinaryManifests {
+    pub(super) fn into_snapshot_manifests(
+        self,
+        summary: &mut HashMap<String, String>,
+    ) -> Vec<ManifestFile> {
+        summary.extend([
+            ("manifests-created".to_owned(), self.created.to_string()),
+            ("manifests-kept".to_owned(), self.kept.to_string()),
+            ("manifests-replaced".to_owned(), self.replaced.to_string()),
+        ]);
+        self.manifests
+    }
+}
+
 /// Ordinary snapshot producers all filter before the operation's standard merge.
 pub(crate) async fn ordinary_manifests(
     view: &super::staging::StagedView<'_>,
@@ -35,34 +56,54 @@ pub(crate) async fn ordinary_manifests(
     sources: Option<&SnapshotSources<'_>>,
     removed: &[&LocatedEntry],
     added: Vec<ManifestFile>,
-) -> Result<Vec<ManifestFile>> {
+) -> Result<OrdinaryManifests> {
     let mut candidates = added
         .into_iter()
         .map(MergeCandidate::pending)
         .collect::<Vec<_>>();
-    if let Some(sources) = sources {
-        candidates.extend(
-            apply_removals(
-                view.metadata(),
-                view.artifacts(),
-                view.preparation().io_window_width,
-                snapshot_id,
-                sources,
-                removed.iter().copied(),
-            )
-            .await?,
-        );
-    } else if !removed.is_empty() {
-        return Err(invalid("Manifest removal requires a completed parent list"));
-    }
-    super::manifest_merge::merge_manifests(
+    let eligible_previous = if let Some(sources) = sources {
+        let (filtered, eligible_previous) = apply_removals(
+            view.metadata(),
+            view.artifacts(),
+            view.preparation().io_window_width,
+            snapshot_id,
+            sources,
+            removed.iter().copied(),
+        )
+        .await?;
+        candidates.extend(filtered);
+        eligible_previous
+    } else {
+        if !removed.is_empty() {
+            return Err(invalid("Manifest removal requires a completed parent list"));
+        }
+        0
+    };
+    let manifests = super::manifest_merge::merge_manifests(
         view.artifacts(),
         view.metadata(),
         snapshot_id,
         view.preparation(),
         candidates,
     )
-    .await
+    .await?;
+    let created = manifests
+        .iter()
+        .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+        .count();
+    let kept = manifests.len() - created;
+    // An eligible previous source is either kept or replaced. Pending filter
+    // outputs and new ADDED manifests are not previous sources, even if merged.
+    // Aged-off sources that contain only old DELETED entries were ineligible.
+    let replaced = eligible_previous
+        .checked_sub(kept)
+        .ok_or_else(|| invalid("Final manifest list retained unobserved sources"))?;
+    Ok(OrdinaryManifests {
+        manifests,
+        created,
+        kept,
+        replaced,
+    })
 }
 
 type OrdinalSelection<'a> = BTreeMap<usize, &'a LocatedEntry>;
@@ -74,7 +115,7 @@ async fn apply_removals<'a, 'entry>(
     snapshot_id: i64,
     sources: &'a SnapshotSources<'_>,
     removed: impl IntoIterator<Item = &'entry LocatedEntry>,
-) -> Result<Vec<MergeCandidate<'a>>> {
+) -> Result<(Vec<MergeCandidate<'a>>, usize)> {
     let mut selections = BTreeMap::<usize, OrdinalSelection<'_>>::new();
     for entry in removed {
         if selections
@@ -99,7 +140,8 @@ async fn apply_removals<'a, 'entry>(
     if !selections.is_empty() {
         return Err(invalid("Manifest removal refers to an absent source"));
     }
-    ordered_window(
+    let eligible_previous = inputs.len();
+    let candidates = ordered_window(
         io_window_width,
         inputs,
         || artifacts.check_active(),
@@ -124,7 +166,8 @@ async fn apply_removals<'a, 'entry>(
             }
         },
     )
-    .await
+    .await?;
+    Ok((candidates, eligible_previous))
 }
 
 async fn filter_source(

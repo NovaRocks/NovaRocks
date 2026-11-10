@@ -71,7 +71,7 @@ impl super::staging::Preparer for OverwritePreparer {
         // Every old entry is removed, so the new row total is fully known even
         // when the parent's total includes already-deleted rows or is absent.
         summary.insert("total-records".into(), summary["added-records"].clone());
-        prepare_snapshot_change(
+        prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,
@@ -159,6 +159,29 @@ pub(crate) async fn write_added_intent_data(
         );
     }
     Ok(manifests)
+}
+
+/// Ordinary layout adds the standard manifest counts without altering row/file effects.
+pub(crate) async fn prepare_ordinary_snapshot_change(
+    view: &super::staging::StagedView<'_>,
+    intent: &super::model::OperationIntent,
+    snapshot_id: i64,
+    operation: Operation,
+    manifests: super::manifest_transform::OrdinaryManifests,
+    mut properties: HashMap<String, String>,
+    truncate_full_table: bool,
+) -> crate::iceberg::Result<super::staging::PreparedChange> {
+    let manifests = manifests.into_snapshot_manifests(&mut properties);
+    prepare_snapshot_change(
+        view,
+        intent,
+        snapshot_id,
+        operation,
+        manifests,
+        properties,
+        truncate_full_table,
+    )
+    .await
 }
 
 /// Shared snapshot assembly uses the actual successful manifest-list allocation.
@@ -1639,6 +1662,205 @@ pub(crate) mod preparer_tests {
         assert_eq!(old.data_file().first_row_id(), None);
         assert_eq!(old.sequence_number, Some(1));
         assert_eq!(old.file_sequence_number, Some(1));
+    }
+
+    #[tokio::test]
+    async fn ordinary_manifest_counts_exclude_intermediates_and_preserve_file_effects() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::ArtifactWriter;
+        use crate::iceberg::spec::{Literal, Transform};
+
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let base = fixture.metadata(FormatVersion::V3);
+        let old_spec_id = base.default_partition_spec_id();
+        let old = AddedContent::new_logical_data(
+            data("s3://b/historical.parquet", 3, Struct::empty()),
+            old_spec_id,
+        )
+        .unwrap();
+        let intent = fixture.intent(&base, "main", vec![old]);
+        let (base, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let current_spec = PartitionSpec::builder(base.current_schema().clone())
+            .add_partition_field("id", "partition_id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap()
+            .into_unbound();
+        let mut base = base
+            .into_builder(None)
+            .add_partition_spec(current_spec)
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .set_properties(HashMap::from([(
+                "commit.manifest-merge.enabled".into(),
+                "false".into(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let current_spec_id = base.default_partition_spec_id();
+        let added = |path, records, partition| {
+            AddedContent::new_logical_data(
+                data(
+                    path,
+                    records,
+                    Struct::from_iter([Some(Literal::long(partition))]),
+                ),
+                current_spec_id,
+            )
+            .unwrap()
+        };
+        for file in [
+            added("s3://b/a.parquet", 2, 1_i64),
+            added("s3://b/b.parquet", 5, 2_i64),
+        ] {
+            let intent = fixture.intent(&base, "main", vec![file]);
+            (base, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        }
+        let before = crate::manifest::load_manifest_list(
+            base.current_snapshot().unwrap(),
+            attempt.file_io(),
+            &base,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.entries().len(), 3);
+        let historical = before
+            .entries()
+            .iter()
+            .find(|descriptor| descriptor.partition_spec_id == old_spec_id)
+            .unwrap();
+        let base = base
+            .into_builder(None)
+            .set_properties(HashMap::from([
+                ("commit.manifest-merge.enabled".into(), "true".into()),
+                ("commit.manifest.min-count-to-merge".into(), "2".into()),
+            ]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = fixture.intent(&base, "main", vec![added("s3://b/c.parquet", 7, 3)]);
+        let (after_append, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let snapshot = after_append.current_snapshot().unwrap();
+        let after = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_append)
+            .await
+            .unwrap();
+        assert_eq!(after.entries().len(), 2);
+        assert!(after.entries().contains(historical));
+        let merged = after
+            .entries()
+            .iter()
+            .find(|descriptor| descriptor.partition_spec_id == current_spec_id)
+            .unwrap();
+        assert_eq!(merged.added_snapshot_id, snapshot.snapshot_id());
+        assert!(
+            before
+                .entries()
+                .iter()
+                .all(|old| old.manifest_path != merged.manifest_path)
+        );
+        for (property, expected) in [
+            ("manifests-created", "1"),
+            ("manifests-kept", "1"),
+            ("manifests-replaced", "2"),
+            ("added-data-files", "1"),
+            ("added-records", "7"),
+            ("deleted-data-files", "0"),
+            ("total-records", "17"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
+
+        let intent = fixture.intent(
+            &after_append,
+            "main",
+            vec![added("s3://b/replacement.parquet", 11, 4)],
+        );
+        let (after_overwrite, _) = fixture
+            .stage(after_append, &intent, &OverwritePreparer)
+            .await;
+        let snapshot = after_overwrite.current_snapshot().unwrap();
+        let outputs =
+            crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_overwrite)
+                .await
+                .unwrap();
+        assert_eq!(outputs.entries().len(), 2);
+        assert!(
+            outputs
+                .entries()
+                .iter()
+                .all(|descriptor| descriptor.added_snapshot_id == snapshot.snapshot_id())
+        );
+        assert!(outputs.entries().iter().all(|descriptor| {
+            after
+                .entries()
+                .iter()
+                .all(|old| old.manifest_path != descriptor.manifest_path)
+        }));
+        for (property, expected) in [
+            ("manifests-created", "2"),
+            ("manifests-kept", "0"),
+            ("manifests-replaced", "2"),
+            ("added-data-files", "1"),
+            ("added-records", "11"),
+            ("deleted-data-files", "4"),
+            ("deleted-records", "17"),
+            ("total-records", "11"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
+
+        let aged_off = outputs
+            .entries()
+            .iter()
+            .find(|manifest| manifest.partition_spec_id == old_spec_id)
+            .unwrap();
+        assert!(!aged_off.has_added_files() && !aged_off.has_existing_files());
+        let base = after_overwrite
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                "commit.manifest-merge.enabled".into(),
+                "false".into(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = fixture.intent(&base, "main", vec![added("s3://b/d.parquet", 13, 5)]);
+        let (after_age_off, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let snapshot = after_age_off.current_snapshot().unwrap();
+        let final_list =
+            crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_age_off)
+                .await
+                .unwrap();
+        assert_eq!(final_list.entries().len(), 2);
+        assert!(!final_list.entries().contains(aged_off));
+        for (property, expected) in [
+            ("manifests-created", "1"),
+            ("manifests-kept", "1"),
+            ("manifests-replaced", "0"),
+            ("added-data-files", "1"),
+            ("added-records", "13"),
+            ("total-records", "24"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
     }
 
     #[tokio::test]

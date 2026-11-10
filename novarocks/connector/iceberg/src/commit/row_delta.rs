@@ -134,7 +134,7 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
             added,
         )
         .await?;
-        crate::commit::overwrite::prepare_snapshot_change(
+        crate::commit::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

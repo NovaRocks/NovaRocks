@@ -327,7 +327,7 @@ pub(crate) async fn prepare_physical_rewrite(
     if !data_rewrite {
         summary.insert("rewritten-delete-files".into(), removed.len().to_string());
     }
-    super::overwrite::prepare_snapshot_change(
+    super::overwrite::prepare_ordinary_snapshot_change(
         view,
         intent,
         snapshot_id,
