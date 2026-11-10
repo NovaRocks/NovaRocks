@@ -28,8 +28,6 @@ pub enum StatisticsStatement {
     ShowAnalyzeJobs(ShowAnalyzeJobs),
     CancelAnalyze(CancelAnalyze),
     ShowTableStats(ShowTableStats),
-    ShowBasicStatsMeta(ShowBasicStatsMeta),
-    ShowHistogramStatsMeta(ShowHistogramStatsMeta),
     DropStats(DropStats),
     DropHistogram(DropHistogram),
     DropMultipleColumnsStats(DropMultipleColumnsStats),
@@ -42,8 +40,6 @@ impl StatisticsStatement {
             Self::ShowAnalyzeJobs(value) => value.span,
             Self::CancelAnalyze(value) => value.span,
             Self::ShowTableStats(value) => value.span,
-            Self::ShowBasicStatsMeta(value) => value.span,
-            Self::ShowHistogramStatsMeta(value) => value.span,
             Self::DropStats(value) => value.span,
             Self::DropHistogram(value) => value.span,
             Self::DropMultipleColumnsStats(value) => value.span,
@@ -81,16 +77,6 @@ pub struct CancelAnalyze {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShowTableStats {
     pub name: ObjectName,
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShowBasicStatsMeta {
-    pub span: Span,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShowHistogramStatsMeta {
     pub span: Span,
 }
 
@@ -138,10 +124,6 @@ pub(crate) fn write_sql(statement: &StatisticsStatement, output: &mut String) {
             output.push_str("SHOW TABLE STATS ");
             output.push_str(&print_object_name(&value.name));
         }
-        StatisticsStatement::ShowBasicStatsMeta(_) => output.push_str("SHOW BASIC STATS META"),
-        StatisticsStatement::ShowHistogramStatsMeta(_) => {
-            output.push_str("SHOW HISTOGRAM STATS META")
-        }
         StatisticsStatement::DropStats(value) => {
             output.push_str("DROP STATS ");
             output.push_str(&print_object_name(&value.name));
@@ -177,10 +159,7 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &StatisticsSta
         StatisticsStatement::DropMultipleColumnsStats(value) => {
             visitor.visit_object_name(&value.name)
         }
-        StatisticsStatement::ShowAnalyzeJobs(_)
-        | StatisticsStatement::CancelAnalyze(_)
-        | StatisticsStatement::ShowBasicStatsMeta(_)
-        | StatisticsStatement::ShowHistogramStatsMeta(_) => {}
+        StatisticsStatement::ShowAnalyzeJobs(_) | StatisticsStatement::CancelAnalyze(_) => {}
     }
 }
 
@@ -221,12 +200,6 @@ pub(crate) fn fold<F: Fold + ?Sized>(
         }
         StatisticsStatement::ShowAnalyzeJobs(value) => StatisticsStatement::ShowAnalyzeJobs(value),
         StatisticsStatement::CancelAnalyze(value) => StatisticsStatement::CancelAnalyze(value),
-        StatisticsStatement::ShowBasicStatsMeta(value) => {
-            StatisticsStatement::ShowBasicStatsMeta(value)
-        }
-        StatisticsStatement::ShowHistogramStatsMeta(value) => {
-            StatisticsStatement::ShowHistogramStatsMeta(value)
-        }
     }
 }
 

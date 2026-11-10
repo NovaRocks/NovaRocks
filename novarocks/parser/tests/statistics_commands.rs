@@ -23,7 +23,7 @@ use novarocks_parser::{
 
 #[test]
 fn statistics_command_corpus_is_typed_and_round_trips() {
-    let source = "analyze full table `ice`.db.t (`a`, b) with sync mode; SHOW ANALYZE JOBS; KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419; SHOW TABLE STATS db.t; SHOW BASIC STATS META; SHOW HISTOGRAM STATS META; DROP STATS db.t; DROP HISTOGRAM ON db.t (`a`, b); DROP MULTIPLE COLUMNS STATS db.t";
+    let source = "analyze full table `ice`.db.t (`a`, b) with sync mode; SHOW ANALYZE JOBS; KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419; SHOW TABLE STATS db.t; DROP STATS db.t; DROP HISTOGRAM ON db.t (`a`, b); DROP MULTIPLE COLUMNS STATS db.t";
     let statements = parse(source).expect("statistics corpus parse");
     assert!(matches!(
         statements[0],
@@ -43,22 +43,14 @@ fn statistics_command_corpus_is_typed_and_round_trips() {
     ));
     assert!(matches!(
         statements[4],
-        Statement::Statistics(StatisticsStatement::ShowBasicStatsMeta(_))
-    ));
-    assert!(matches!(
-        statements[5],
-        Statement::Statistics(StatisticsStatement::ShowHistogramStatsMeta(_))
-    ));
-    assert!(matches!(
-        statements[6],
         Statement::Statistics(StatisticsStatement::DropStats(_))
     ));
     assert!(matches!(
-        statements[7],
+        statements[5],
         Statement::Statistics(StatisticsStatement::DropHistogram(_))
     ));
     assert!(matches!(
-        statements[8],
+        statements[6],
         Statement::Statistics(StatisticsStatement::DropMultipleColumnsStats(_))
     ));
     let printed = print_statements(&statements);
@@ -73,9 +65,15 @@ fn malformed_statistics_forms_have_parse_errors() {
         error.to_user_error("ANALYZE TABLE t (a,").code().as_str(),
         "sql.parse.unexpected_token"
     );
-    let error = parse("SHOW BASIC STATS").expect_err("META is required");
-    assert_eq!(
-        error.to_user_error("SHOW BASIC STATS").code().as_str(),
-        "sql.parse.unexpected_token"
-    );
+    for source in [
+        "SHOW BASIC STATS",
+        "SHOW BASIC STATS META",
+        "SHOW HISTOGRAM STATS META",
+    ] {
+        let error = parse(source).expect_err("retired metadata command must fail in parsing");
+        assert_eq!(
+            error.to_user_error(source).code().as_str(),
+            "sql.parse.unexpected_token"
+        );
+    }
 }

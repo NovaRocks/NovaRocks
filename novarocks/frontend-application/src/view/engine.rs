@@ -55,14 +55,6 @@ impl ViewService for EmptyViewService {
         novarocks_query_application::view::QueryViewService::new().catalog_snapshot()
     }
 
-    fn prepare_show_views(
-        &self,
-        _statement: &novarocks_parser::ast::ShowViews,
-        _context: ViewRequestContext<'_>,
-    ) -> Result<novarocks_query_application::view::PreparedShowViews, String> {
-        Err("view service is not injected".to_string())
-    }
-
     fn execute_statement(
         &self,
         _engine: &dyn ViewEngine,
@@ -365,13 +357,6 @@ mod tests {
             _context: &ConnectorRequestContext,
         ) -> Result<Vec<ViewColumnDefinition>, novarocks_sql::compiler::SqlCompileError> {
             unreachable!("empty view service must not access the engine")
-        }
-    }
-
-    #[tokio::test]
-    async fn show_views_listing_errors_preserve_connector_error_text() {
-        for kind in crate::catalog_application::statement::external_listing_tests::error_kinds() {
-            crate::query::view_read_action::tests::assert_listing_error_text(kind).await;
         }
     }
 

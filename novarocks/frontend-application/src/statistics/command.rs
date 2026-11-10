@@ -227,9 +227,7 @@ fn lower_application_command(
                 )?,
             }
         }
-        StatisticsSqlCommand::ShowBasicStatsMeta
-        | StatisticsSqlCommand::ShowHistogramStatsMeta
-        | StatisticsSqlCommand::DropStats { .. }
+        StatisticsSqlCommand::DropStats { .. }
         | StatisticsSqlCommand::DropHistogram { .. }
         | StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
             return Err(

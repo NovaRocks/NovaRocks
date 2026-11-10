@@ -29,17 +29,9 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
         return Ok(None);
     }
     if !parser.peek_word(1, "BACKENDS")
-        && [
-            "ANALYZE",
-            "TABLE",
-            "CREATE",
-            "BASIC",
-            "HISTOGRAM",
-            "ALTER",
-            "MATERIALIZED",
-        ]
-        .iter()
-        .any(|word| parser.peek_word(1, word))
+        && ["ANALYZE", "TABLE", "CREATE", "ALTER", "MATERIALIZED"]
+            .iter()
+            .any(|word| parser.peek_word(1, word))
     {
         return Ok(None);
     }

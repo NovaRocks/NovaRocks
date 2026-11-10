@@ -124,7 +124,6 @@ mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
-pub(crate) mod view_read_action;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -1773,26 +1772,6 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
-        if let ParsedStatement::View(novarocks_parser::ast::ViewStatement::Show(show)) =
-            &parsed_statement
-        {
-            let action = match self.service.query_compiler.prepare_show_views_action(
-                show.clone(),
-                context,
-                command_context,
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(product_command_error(error)),
-                        statement,
-                    ));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
         if let Ok(Some(ProductSqlCommand::Catalog(
             command @ (novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
             | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }),

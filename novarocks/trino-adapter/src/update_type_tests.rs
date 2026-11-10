@@ -28,13 +28,10 @@ fn row_statements_and_empty_input_do_not_publish_an_update_type() {
         ShowProcessList,
         ShowAnalyzeJobs,
         ShowTableStats,
-        ShowBasicStatsMeta,
-        ShowHistogramStatsMeta,
         ShowCreateTable,
         ShowOptimize,
         ShowMaterializedViews,
         ExplainMaterializedViewRefresh,
-        ShowViews,
         ShowCreateView,
     ] {
         assert_eq!(update_type(kind), None, "{kind:?}");
