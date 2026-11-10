@@ -231,6 +231,14 @@ impl FailureBridge {
                 }
             }
         }
+        if let Some(error) = self
+            .residual
+            .as_ref()
+            .and_then(|residual| residual.original.root_reply.as_ref().err())
+            .cloned()
+        {
+            return Err(self.retain_failure("Native original root reply delivery failed", error));
+        }
         if !self.valid_residual() {
             return Err(self.retain_failure(
                 "Native failure residual did not prove local transport custody",

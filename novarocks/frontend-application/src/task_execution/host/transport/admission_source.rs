@@ -256,6 +256,15 @@ impl AdmissionSource {
         batch.bind(&mut self.grants, window, registration)
     }
 
+    pub(super) fn project_failure(
+        &self,
+        reference: HostFailureRef,
+    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
+        self.failures
+            .get(&reference)
+            .map(TaskExecutionError::preparation_input)
+    }
+
     pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<TaskExecutionError> {
         self.failures.remove(&failure)
     }

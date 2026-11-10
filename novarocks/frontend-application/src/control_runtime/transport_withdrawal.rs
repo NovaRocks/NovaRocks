@@ -88,8 +88,13 @@ impl AttemptEffectEnvelope {
         matches!(self.protocol.body, EffectBody::ObserveProcess { .. })
     }
 
+    pub(crate) fn is_root_control_reply(&self) -> bool {
+        matches!(&self.protocol.body, EffectBody::Port(port)
+            if crate::task_execution::bridge::root_control::reply_kind(&port.body).is_some())
+    }
+
     pub(crate) fn is_publication_call(&self) -> bool {
-        matches!(self.protocol.body, EffectBody::Publish(_))
+        matches!(self.protocol.body, EffectBody::Publish(_)) || self.is_root_control_reply()
     }
 
     pub(crate) fn retire_handoff(&self) {

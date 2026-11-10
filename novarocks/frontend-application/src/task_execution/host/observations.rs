@@ -29,7 +29,7 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::{
     actor::Actor,
-    actor_turn::{ActorRegistration, ActorTurnError, StandingInputObligation},
+    actor_turn::{ActorRegistration, ActorTurnError, InputAuthor, StandingInputObligation},
     causal_input::{CausalFillFailure, CausalInputObligation},
     obligation::OwnedPositionObligation,
 };
@@ -43,7 +43,7 @@ use std::alloc::Layout;
 use std::{
     collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -62,6 +62,7 @@ struct RootControlOrigin {
     registration: ActorRegistration,
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
+    reply_author: OnceLock<InputAuthor>,
 }
 #[derive(Clone)]
 pub(crate) struct RootControlBinding(Arc<RootControlOrigin>);
@@ -78,6 +79,7 @@ impl RootControlBinding {
             registration,
             activation,
             root,
+            reply_author: OnceLock::new(),
         })))
     }
     pub(crate) fn registration(&self) -> &ActorRegistration {
@@ -86,6 +88,20 @@ impl RootControlBinding {
     pub(crate) fn activation(&self) -> AttemptActivationIdentity {
         self.0.activation
     }
+    pub(crate) fn root(&self) -> TaskIdentity {
+        self.0.root
+    }
+
+    pub(crate) fn bind_reply_author(&self, author: InputAuthor) {
+        assert!(self.0.registration.matches_input_author(&author));
+        assert_ne!(self.0.registration.scope_id(), author.work().scope);
+        assert!(self.0.reply_author.set(author).is_ok());
+    }
+
+    pub(crate) fn reply_author(&self) -> Option<&InputAuthor> {
+        self.0.reply_author.get()
+    }
+
     pub(crate) fn same_original(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -602,6 +618,14 @@ impl<A: Actor> Clone for OrderedObservationInput<A> {
         Self(self.0.clone())
     }
 }
+pub(crate) struct WeakOrderedObservationInput<A: Actor>(Weak<Inner<A>>);
+
+impl<A: Actor> WeakOrderedObservationInput<A> {
+    pub(crate) fn upgrade(&self) -> Option<OrderedObservationInput<A>> {
+        self.0.upgrade().map(OrderedObservationInput)
+    }
+}
+
 impl<A: Actor> OrderedObservationInput<A> {
     /// Both standings are prepaid for the same target incarnation and source:
     /// Lifecycle for observations, Control for root controls. Their authority
@@ -1230,7 +1254,25 @@ impl<A: Actor> OrderedObservationInput<A> {
         }
         self.drive()
     }
+    pub(crate) fn weak(&self) -> WeakOrderedObservationInput<A> {
+        WeakOrderedObservationInput(Arc::downgrade(&self.0))
+    }
+
+    pub(crate) fn root_binding(&self) -> &RootControlBinding {
+        &self.0.root_binding
+    }
+
     pub(crate) fn root_control(&self, reference: RootControlRef) -> Result<(), ObservationError> {
+        self.queue_root_control(reference)?;
+        self.drive()
+    }
+
+    /// Success transfers the actual original request into the ordered cut.
+    /// A subsequent writer error cannot turn that transfer into a refusal.
+    pub(crate) fn queue_root_control(
+        &self,
+        reference: RootControlRef,
+    ) -> Result<(), ObservationError> {
         if !reference.belongs_to(&self.0.root_binding) {
             return Err(ObservationError::InvalidRootControl);
         }
@@ -1252,7 +1294,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                 state.queue.push_back(entry);
             }
         }
-        self.drive()
+        Ok(())
     }
     /// A snapshot is independent of the full ingress and includes received but
     /// not-yet-applied liveness. One lock covers all receive/pause registration.
@@ -1386,7 +1428,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                 .accepted_unretired -= 1;
         }
     }
-    fn drive(&self) -> Result<(), ObservationError> {
+    pub(crate) fn drive(&self) -> Result<(), ObservationError> {
         loop {
             let prepared = {
                 let mut state = self.0.state.lock().expect("ordered observation state");

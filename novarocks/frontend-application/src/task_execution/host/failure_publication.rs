@@ -18,10 +18,13 @@
 //! Publication from the original supervisor Work after attempt Core failure.
 
 use super::failure_lifecycle::FailureLifecycle;
-use crate::control_runtime::actor::{FrontendActor, FrontendEffect};
+use crate::{
+    control_runtime::actor::{FrontendActor, FrontendEffect},
+    task_execution::bridge::root_control::RootControlRequests,
+};
 use novarocks_attempt_protocol::failure::AttemptFailure;
 use novarocks_control_runtime::{
-    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
+    actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket, InputAuthor},
     obligation::WorkObligation,
     publication::{FailurePublicationSession, PublishedReply},
     transaction::ScopeHandle,
@@ -32,13 +35,13 @@ use novarocks_coordination_contract::{
 };
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 use tokio::sync::Notify;
 
 pub(crate) type AttemptReply = PublishedReply<AttemptToLogical<AttemptFailure>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootControlReplyKind {
     Seal,
     TerminalControl,
@@ -68,6 +71,7 @@ pub(crate) struct FailurePublications {
     registration: ActorRegistration,
     activation: AttemptActivationIdentity,
     replies: Mutex<RootReplies>,
+    root_requests: OnceLock<Weak<RootControlRequests>>,
     lost: AttemptReply,
     lost_ready: Notify,
 }
@@ -91,9 +95,14 @@ impl FailurePublications {
             registration,
             activation,
             replies: Mutex::new(RootReplies::Open(None)),
+            root_requests: OnceLock::new(),
             lost: PublishedReply::new(scope),
             lost_ready: Notify::new(),
         }
+    }
+
+    pub(crate) fn bind_root_requests(&self, original: &Arc<RootControlRequests>) {
+        assert!(self.root_requests.set(Arc::downgrade(original)).is_ok());
     }
 
     pub(crate) fn reserve_reply(
@@ -115,6 +124,31 @@ impl FailurePublications {
                 Err(ActorTurnError::ActorFailed) => return Err(ReplyAdmissionError::OwnerFailed),
                 Err(error) => return Err(ReplyAdmissionError::Runtime(error)),
             };
+        self.reserve_target(token, kind, target)
+    }
+
+    pub(crate) fn reserve_bound_reply(
+        &self,
+        author: &InputAuthor,
+        token: AttemptRequestToken,
+        kind: RootControlReplyKind,
+    ) -> Result<AttemptReply, ReplyAdmissionError> {
+        if !self.registration.matches_input_author(author)
+            || author.work().scope == self.registration.scope_id()
+        {
+            return Err(ReplyAdmissionError::Runtime(
+                ActorTurnError::PublicationTargetMismatch,
+            ));
+        }
+        self.reserve_target(token, kind, PublishedReply::new_for_input(author))
+    }
+
+    fn reserve_target(
+        &self,
+        token: AttemptRequestToken,
+        kind: RootControlReplyKind,
+        target: AttemptReply,
+    ) -> Result<AttemptReply, ReplyAdmissionError> {
         let mut replies = self.replies.lock().expect("original bridge reply slot");
         let slot = match &mut *replies {
             RootReplies::Open(slot) if slot.is_none() => slot,
@@ -140,6 +174,37 @@ impl FailurePublications {
             return true;
         }
         false
+    }
+
+    /// Only an offer refused before it entered the ordered Source may
+    /// recover an uncommitted original request from this gate.
+    pub(crate) fn cancel_unpublished_reply(&self, token: AttemptRequestToken) -> bool {
+        let mut replies = self.replies.lock().expect("original bridge reply slot");
+        if let RootReplies::Open(slot) = &mut *replies
+            && slot
+                .as_ref()
+                .is_some_and(|reply| reply.token == token && !reply.target.is_committed())
+        {
+            *slot = None;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn root_reply_fenced(&self) -> bool {
+        matches!(
+            *self.replies.lock().expect("original bridge reply slot"),
+            RootReplies::Failed
+        )
+    }
+
+    pub(crate) async fn deliver_committed_root_after_failure(
+        &self,
+    ) -> Result<(), super::publication::PublicationError> {
+        if let Some(original) = self.root_requests.get().and_then(Weak::upgrade) {
+            original.deliver_committed_after_failure().await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn take_lost(&self) -> Arc<AttemptToLogical<AttemptFailure>> {
@@ -187,7 +252,12 @@ impl FailurePublications {
                     body,
                 }),
             ) {
-                Ok(()) | Err((ActorTurnError::ReplyAlreadyCommitted, _)) => {}
+                Ok(()) => {
+                    if let Some(requests) = self.root_requests.get().and_then(Weak::upgrade) {
+                        requests.deliver_owner_failed(token);
+                    }
+                }
+                Err((ActorTurnError::ReplyAlreadyCommitted, _)) => {}
                 Err((error, _)) => return Err(error),
             }
         }

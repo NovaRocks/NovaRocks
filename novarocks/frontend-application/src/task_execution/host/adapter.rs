@@ -119,6 +119,7 @@ pub(crate) struct AttemptEffectAuthors {
 }
 
 struct AttemptBinding {
+    root_control: RootControlBinding,
     authors: AttemptEffectAuthors,
     generation: Generation,
     queue_parent: ReservationId,
@@ -317,7 +318,9 @@ impl AttemptActorRegistration {
         observer: novarocks_control_runtime_core::identity::ConsumerId,
         owner: Arc<super::publication::AttemptPublicationOwner>,
     ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
-        if owner.activation() != self.root_control.activation() {
+        if owner.activation() != self.root_control.activation()
+            || !owner.matches_root(&self.root_control)
+        {
             return Err(AttemptRegistrationError::InvalidConfig(
                 "publication Source belongs to another original activation",
             ));
@@ -670,6 +673,7 @@ impl AttemptActorRegistration {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         observation_work: &WorkObligation,
+        root_control_work: &WorkObligation,
         pool: Arc<dyn ObservationSourcePool>,
         clock: Arc<dyn MonotonicClock>,
         progress: Waker,
@@ -681,6 +685,7 @@ impl AttemptActorRegistration {
             .root_control
             .same_original(&pool.fixed_root_control_binding())
             || !self.scope.same_scope(observation_work.scope())
+            || self.scope.same_scope(root_control_work.scope())
         {
             return Err(ObservationError::InvalidRootControl);
         }
@@ -696,7 +701,7 @@ impl AttemptActorRegistration {
             runtime,
             self.observation_source,
             InputClass::Control,
-            observation_work,
+            root_control_work,
         ) {
             Ok(controls) => controls,
             Err(error) => {
@@ -706,6 +711,9 @@ impl AttemptActorRegistration {
                 return Err(ObservationError::Runtime(error));
             }
         };
+        let reply_author = controls
+            .author()
+            .expect("original admitted root-control position");
         let ingress = OrderedObservationInput::new(
             observations,
             controls,
@@ -724,6 +732,7 @@ impl AttemptActorRegistration {
                 .expect("unpublished root-control position is unused");
             error
         })?;
+        self.root_control.bind_reply_author(reply_author);
         self.ordered_bound = true;
         Ok(ingress)
     }
@@ -834,6 +843,7 @@ impl AttemptActorRegistration {
         assert!(
             self.binding
                 .set(AttemptBinding {
+                    root_control: self.root_control.clone(),
                     authors,
                     generation: self.original.initial_epoch(),
                     queue_parent: queue_parent.id(),
@@ -1183,14 +1193,23 @@ impl AttemptBinding {
 impl TurnContext<'_, '_> {
     fn emit(&mut self, effect: AttemptEffect) {
         let (kind, author) = {
-            let authors = &self
+            let binding = self
                 .binding
-                .expect("attempt effect uses its original Source")
-                .authors;
+                .expect("attempt effect uses its original Source");
+            let authors = &binding.authors;
             match effect.class {
                 EffectClass::Business => (EffectKind::Business, &authors.business),
                 EffectClass::Publication => (EffectKind::Publication, &authors.publication),
-                EffectClass::Reply => (EffectKind::Reply, &authors.reply),
+                EffectClass::Reply => {
+                    let author = match &effect.body {
+                        EffectBody::Port(port) if matches!(port.body,
+                            novarocks_coordination_contract::AttemptToLogicalBody::SealResult { .. }
+                            | novarocks_coordination_contract::AttemptToLogicalBody::TerminalControlResult { .. }
+                        ) => binding.root_control.reply_author().expect("original root-control reply author"),
+                        _ => &authors.reply,
+                    };
+                    (EffectKind::Reply, author)
+                }
                 EffectClass::Cleanup => (EffectKind::Cleanup, &authors.cleanup),
                 EffectClass::Settlement => (EffectKind::Settlement, &authors.settlement),
             }

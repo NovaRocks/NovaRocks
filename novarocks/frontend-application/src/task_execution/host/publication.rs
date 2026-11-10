@@ -20,11 +20,15 @@
 //! jobs; these methods run outside the actor poller and every runtime lock.
 
 use super::pumps::{DiagnosticRecords, PumpRecordError};
-use crate::task_execution::{
-    error::TaskExecutionError,
-    execution::ReleasedRuntimeFilterContributions,
-    profile_diagnostics::{ProfileSplitDiagnostic, TaskFinalInfoCollector},
-    protocol_facts::AttemptProtocolFactsPublisher,
+use crate::{
+    control_runtime::actor::{FrontendActor, FrontendEffect},
+    task_execution::{
+        bridge::root_control::{RootControlRequests, reply_kind},
+        error::TaskExecutionError,
+        execution::ReleasedRuntimeFilterContributions,
+        profile_diagnostics::{ProfileSplitDiagnostic, TaskFinalInfoCollector},
+        protocol_facts::AttemptProtocolFactsPublisher,
+    },
 };
 use novarocks_attempt_protocol::{
     effect::Publication,
@@ -35,8 +39,9 @@ use novarocks_attempt_protocol::{
     publication::{DiagnosticPublication, DiagnosticSources, SplitDiagnosticObservation},
     start::PayloadRef,
 };
+use novarocks_control_runtime::actor_turn::{ActorRuntime, ActorTurnError, EffectTicket};
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptRootFailure,
+    AttemptActionId, AttemptActivationIdentity, AttemptRootFailure, AttemptToLogical,
 };
 use novarocks_execution_contract::{
     ParticipationRef, SafeDetail, TaskIdentity, failure::FailureProjection,
@@ -217,6 +222,7 @@ impl DiagnosticSourceSnapshot {
 #[derive(Debug)]
 pub(crate) enum PublicationError {
     MissingRootPublisher,
+    MissingRootControlReply,
     MissingProfileObserver,
     MissingDiagnosticRecords,
     MissingOriginalComputationCut,
@@ -280,22 +286,82 @@ pub(crate) struct AttemptPublicationOwner {
     activation: AttemptActivationIdentity,
     record: tokio::sync::Mutex<PublicationRecord>,
     diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
+    root: Option<Arc<RootControlRequests>>,
 }
 
 impl AttemptPublicationOwner {
     pub(crate) fn new(
         record: PublicationRecord,
         diagnostics: Option<Arc<dyn OriginalDiagnosticRecords>>,
+        root: Option<Arc<RootControlRequests>>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let owner = Arc::new(Self {
             activation: record.activation,
             record: tokio::sync::Mutex::new(record),
             diagnostics,
-        })
+            root,
+        });
+        if let Some(root) = &owner.root {
+            root.bind_publisher(&owner);
+        }
+        owner
     }
 
     pub(crate) fn activation(&self) -> AttemptActivationIdentity {
         self.activation
+    }
+
+    pub(crate) fn matches_root(&self, binding: &super::observations::RootControlBinding) -> bool {
+        self.root.as_ref().is_some_and(|root| root.matches(binding))
+    }
+
+    pub(crate) fn commit_root_reply(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        original: Arc<AttemptToLogical<AttemptFailure>>,
+        projection: Option<(HostFailureRef, ExecutionFailureInput)>,
+    ) -> Result<(), (ActorTurnError, Arc<AttemptToLogical<AttemptFailure>>)> {
+        let Some(root) = &self.root else {
+            return Err((ActorTurnError::PublicationTargetMismatch, original));
+        };
+        root.commit_reply(runtime, ticket, original, projection)
+    }
+
+    pub(crate) async fn deliver_committed_root(
+        &self,
+        token: novarocks_coordination_contract::AttemptRequestToken,
+    ) -> Result<(), PublicationError> {
+        self.root
+            .as_ref()
+            .expect("original root-control request owner")
+            .deliver(token, &mut *self.record.lock().await)
+    }
+
+    pub(crate) async fn deliver_root_reply(
+        &self,
+        port: &AttemptToLogical<AttemptFailure>,
+    ) -> Result<
+        Option<(AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>)>,
+        PublicationError,
+    > {
+        use super::failure_publication::RootControlReplyKind;
+        let (token, kind) = reply_kind(&port.body).expect("original root-control reply");
+        let root = self
+            .root
+            .as_ref()
+            .expect("original root-control request owner");
+        let result = self.deliver_committed_root(token).await;
+        if matches!(result, Err(PublicationError::MissingRootControlReply)) && root.owner_failed() {
+            return Ok(None);
+        }
+        match kind {
+            RootControlReplyKind::Seal => Ok(Some(Self::publication_result(
+                port.action,
+                result.map(|()| PublicationApplied::SealResult),
+            ))),
+            RootControlReplyKind::TerminalControl => result.map(|()| None),
+        }
     }
 
     pub(crate) async fn publish(
@@ -303,7 +369,13 @@ impl AttemptPublicationOwner {
         effect: AttemptActionId,
         publication: &Publication,
     ) -> (AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>) {
-        let result = self.apply(publication).await;
+        Self::publication_result(effect, self.apply(publication).await)
+    }
+
+    fn publication_result(
+        effect: AttemptActionId,
+        result: Result<PublicationApplied, PublicationError>,
+    ) -> (AttemptInput, Option<(HostFailureRef, OriginalHostFailure)>) {
         let (result, failure) = match result {
             Ok(applied) => (Ok(applied), None),
             Err(error) => {

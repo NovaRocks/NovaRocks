@@ -505,6 +505,43 @@ impl EffectSource for AttemptTransportSource {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
                 };
+                if let EffectBody::Port(port) = &effect.protocol.body
+                    && crate::task_execution::bridge::root_control::reply_kind(&port.body).is_some()
+                {
+                    use novarocks_coordination_contract::AttemptToLogicalBody;
+                    let failure = match &port.body {
+                        AttemptToLogicalBody::SealResult {
+                            result: Err(failure),
+                            ..
+                        }
+                        | AttemptToLogicalBody::TerminalControlResult {
+                            result: Err(failure),
+                            ..
+                        } => {
+                            crate::task_execution::bridge::terminal::host_failure_reference(failure)
+                        }
+                        _ => None,
+                    };
+                    let projection = failure.and_then(|reference| {
+                        let input = self.admission.project_failure(reference).or_else(|| {
+                            self.calls
+                                .iter()
+                                .flatten()
+                                .find_map(|source| source.project_failure(reference))
+                        })?;
+                        Some((reference, input))
+                    });
+                    let source = self.calls[lane].as_mut().unwrap();
+                    if let Err((error, original)) =
+                        source.commit_root_reply(runtime, ticket, port, projection)
+                    {
+                        source.return_unclaimed(result);
+                        return Err(EffectBindRefusal {
+                            error,
+                            original: Box::new(original),
+                        });
+                    }
+                }
                 assert!(self.in_flight.insert(effect.protocol.id));
                 let receipt = match &effect.protocol.body {
                     EffectBody::Port(port) => match port.body {
@@ -632,8 +669,12 @@ impl EffectSource for AttemptTransportSource {
                     {
                         publication.attach_host_failure(reference, failure);
                     }
-                    if let Err(refused) = self.calls[lane].as_mut().unwrap().accept(original) {
+                    let source = self.calls[lane].as_mut().unwrap();
+                    if let Err(refused) = source.accept(original) {
                         self.other.retain_transport_failure(Box::new(refused));
+                    }
+                    if let Some(original) = source.take_refused_root_input() {
+                        self.other.retain_transport_release(Box::new(original));
                     }
                 }
                 TransportSourceEvent::Retired => {

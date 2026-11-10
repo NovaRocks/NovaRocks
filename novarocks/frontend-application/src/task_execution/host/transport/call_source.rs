@@ -97,6 +97,7 @@ pub(crate) enum AttemptCallReply {
     Terminal(Box<TerminalPublication>),
     Convergence(ConvergencePublication),
     AbortSettled(AppliedAbortSettlement),
+    RootControlDelivered,
 }
 
 pub(crate) struct BoundAttemptCall {
@@ -184,13 +185,21 @@ impl BoundAttemptCall {
                     failure: None,
                 })
             }
-            AttemptCallOwner::Publication(owner) => {
-                let EffectBody::Publish(publication) = &effect.protocol.body else {
-                    unreachable!("same original publication effect");
-                };
-                let (input, failure) = owner.publish(effect.protocol.id, publication).await;
-                Ok(AttemptCallReply::Input { input, failure })
-            }
+            AttemptCallOwner::Publication(owner) => match &effect.protocol.body {
+                EffectBody::Publish(publication) => {
+                    let (input, failure) = owner.publish(effect.protocol.id, publication).await;
+                    Ok(AttemptCallReply::Input { input, failure })
+                }
+                EffectBody::Port(port) => owner
+                    .deliver_root_reply(port)
+                    .await
+                    .map(|result| match result {
+                        Some((input, failure)) => AttemptCallReply::Input { input, failure },
+                        None => AttemptCallReply::RootControlDelivered,
+                    })
+                    .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>),
+                _ => unreachable!("same original publication effect"),
+            },
         }
     }
 }
@@ -221,6 +230,7 @@ pub(crate) struct AttemptCallSource {
     pending: Option<(Arc<AttemptEffectEnvelope>, ReportedWork)>,
     live: Option<Live>,
     failures: BTreeMap<HostFailureRef, OriginalHostFailure>,
+    refused_root_input: Option<CausalFillFailure<FrontendInput>>,
 }
 
 impl AttemptCallSource {
@@ -246,7 +256,39 @@ impl AttemptCallSource {
             pending: None,
             live: None,
             failures: BTreeMap::new(),
+            refused_root_input: None,
         }
+    }
+
+    pub(super) fn commit_root_reply(
+        &self,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        port: &AttemptToLogical<novarocks_attempt_protocol::failure::AttemptFailure>,
+        projection: Option<(
+            HostFailureRef,
+            novarocks_query_application::execution_error::ExecutionFailureInput,
+        )>,
+    ) -> Result<
+        (),
+        (
+            ActorTurnError,
+            Arc<AttemptToLogical<novarocks_attempt_protocol::failure::AttemptFailure>>,
+        ),
+    > {
+        let Some(AttemptCallOwner::Publication(owner)) = &self.owner else {
+            unreachable!("original publication Source");
+        };
+        owner.commit_root_reply(runtime, ticket, Arc::new(port.clone()), projection)
+    }
+
+    pub(super) fn project_failure(
+        &self,
+        reference: HostFailureRef,
+    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
+        self.failures
+            .get(&reference)
+            .map(OriginalHostFailure::preparation_input)
     }
 
     pub(crate) fn install_terminal(&mut self, original: Arc<TerminalOutbox>) {
@@ -452,10 +494,22 @@ impl AttemptCallSource {
                 }
                 let input = FrontendInput::Attempt(Box::new(input));
                 if let Err(publication) = original.original.fill_with_receipt(None, input) {
-                    return Err(AttemptCallResultRefusal {
-                        original,
-                        publication: Some(publication),
-                    });
+                    if original.effect.is_root_control_reply()
+                        && matches!(
+                            publication.error,
+                            ActorTurnError::ActorFailed | ActorTurnError::Closed
+                        )
+                    {
+                        // The actual QA delivery is already done. Keep the
+                        // refused original Core input and retire its paid role
+                        // after Join, even though the Core cannot consume it.
+                        assert!(self.refused_root_input.replace(publication).is_none());
+                    } else {
+                        return Err(AttemptCallResultRefusal {
+                            original,
+                            publication: Some(publication),
+                        });
+                    }
                 }
             }
             AttemptCallReply::Terminal(port) => {
@@ -487,6 +541,7 @@ impl AttemptCallSource {
                     });
                 }
             }
+            AttemptCallReply::RootControlDelivered => {}
             AttemptCallReply::AbortSettled(applied) => {
                 if applied.result.is_err() {
                     original.outcome =
@@ -501,6 +556,10 @@ impl AttemptCallSource {
         }
         assert!(live.result.replace(original.original).is_none());
         Ok(())
+    }
+
+    pub(super) fn take_refused_root_input(&mut self) -> Option<CausalFillFailure<FrontendInput>> {
+        self.refused_root_input.take()
     }
 
     pub(crate) fn transport_retired(&mut self, effect: AttemptActionId) {

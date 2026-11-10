@@ -18,4 +18,5 @@
 pub(crate) mod abort;
 pub(crate) mod control;
 pub(super) mod qa;
+pub(crate) mod root_control;
 pub(crate) mod terminal;

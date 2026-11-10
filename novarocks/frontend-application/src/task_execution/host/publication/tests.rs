@@ -207,3 +207,275 @@ fn final_info_publication_checks_original_profile_before_resolving_a_reference()
         Err(PublicationError::MissingProfileObserver)
     ));
 }
+
+#[tokio::test]
+async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell() {
+    use crate::{
+        control_runtime::{
+            actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor},
+            transport_withdrawal::AttemptEffectEnvelope,
+        },
+        task_execution::{
+            bridge::root_control::{RootControlRequests, reply_kind},
+            host::{
+                adapter::descriptor,
+                failure_publication::FailurePublications,
+                observations::{
+                    ObservationBudget, OrderedObservationInput, RootControlBinding,
+                    tests::{Bank, ManualClock},
+                },
+            },
+        },
+    };
+    use novarocks_attempt_protocol::{
+        effect::{AttemptEffect, EffectBody, EffectClass},
+        input::AttemptInput,
+    };
+    use novarocks_control_runtime::{
+        actor::{ActorConfig, ActorStep},
+        actor_turn::ActorRuntime,
+        transaction::RuntimeLedger,
+    };
+    use novarocks_control_runtime_core::{
+        capacity::{ReservationResources, ResourceVector},
+        effect::EffectKind,
+        identity::{ActorId, Generation, Tick},
+        mailbox::{InputClass, InputEnvelope},
+        owned_storage::{OwnedSlotKind, OwnedSlotNeed},
+        scope::{WorkAdmission, WorkKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptActionId, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
+    };
+    use novarocks_query_application::coordination::accepted_root_status_projection_with_control_port;
+    use std::{num::NonZeroU64, task::Waker};
+
+    struct ReplyActor;
+    impl TestActor for ReplyActor {
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: InputEnvelope,
+            value: FrontendInput,
+            step: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            let FrontendInput::Attempt(input) = value else {
+                panic!("original root input")
+            };
+            let AttemptInput::Port(port) = *input else {
+                panic!("original root port")
+            };
+            let body = match port.body {
+                LogicalToAttemptBody::TerminalControlDemand { token, .. } => {
+                    AttemptToLogicalBody::TerminalControlResult {
+                        token,
+                        result: Ok(()),
+                    }
+                }
+                LogicalToAttemptBody::SealRequest { token } => AttemptToLogicalBody::SealResult {
+                    token,
+                    result: Ok(Arc::from([])),
+                },
+                _ => panic!("original root control kind"),
+            };
+            let id = AttemptActionId::new(NonZeroU64::MIN);
+            let effect = AttemptEffectEnvelope::new(AttemptEffect {
+                id,
+                class: EffectClass::Reply,
+                body: EffectBody::Port(AttemptToLogical {
+                    activation: port.activation,
+                    action: id,
+                    body,
+                }),
+            });
+            let author = step.input_author().unwrap().clone();
+            step.effect_from_author(
+                &author,
+                descriptor(id.get(), author.work(), EffectKind::Reply),
+                FrontendEffect::Attempt(effect),
+            )
+            .unwrap();
+        }
+    }
+
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let generation = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let bridge = ledger.open_scope_next(None, generation).unwrap();
+    let budget = ObservationBudget {
+        queued_frames: 1,
+        total_positions: 3,
+        max_frame_bytes: 2048,
+        control_bytes: 512,
+        total_bytes: 2560,
+    };
+    let (mut observations, mut positions) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    let (mut control, mut control_payer) = bridge
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    observations.start().unwrap();
+    control.start().unwrap();
+    let runtime = ActorRuntime::new();
+    let actor = ActorId::new(1).unwrap();
+    let source = ActorId::new(2).unwrap();
+    let registration = runtime
+        .register_bound(
+            actor,
+            scope.clone(),
+            FrontendActor::Test(Box::new(ReplyActor)),
+            ActorConfig {
+                mailbox: [8; 4],
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        )
+        .unwrap_or_else(|_| panic!("original root actor"));
+    let (mut publication, _, root, _) = fixture();
+    let activation = publication.activation;
+    let binding =
+        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
+    let failure = Arc::new(FailurePublications::new(
+        registration.clone(),
+        activation,
+        &scope,
+    ));
+    let requests = RootControlRequests::new(binding.clone(), failure);
+    let pool = Bank::make(
+        budget,
+        (0..budget.total_positions)
+            .map(|_| {
+                let mut slot = positions.take_position(OwnedSlotKind::Input).unwrap();
+                slot.bind().unwrap();
+                slot
+            })
+            .collect(),
+        binding.clone(),
+    );
+    pool.bind_root_requests(requests.clone());
+    let reserve = |class, work| {
+        runtime
+            .reserve_admitted_input_for(&registration, source, class, work)
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    };
+    let control_position = reserve(InputClass::Control, &control);
+    binding.bind_reply_author(control_position.author().unwrap());
+    let ingress = OrderedObservationInput::new(
+        reserve(InputClass::Lifecycle, &observations),
+        control_position,
+        pool.clone(),
+        binding,
+        Arc::new(ManualClock::default()),
+        |input| FrontendInput::Attempt(Box::new(input)),
+        Waker::noop().clone(),
+    )
+    .unwrap_or_else(|_| panic!("original ordered root Source"));
+    requests.bind_ingress(&ingress);
+    let (sender, status) =
+        accepted_root_status_projection_with_control_port(root, requests.clone());
+    sender
+        .publish_attempt_observation(
+            TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(1).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap(),
+            AcceptedAttemptFailure::None,
+        )
+        .unwrap();
+    publication.root = Some(sender);
+
+    for seal in [false, true] {
+        let mut reply = if seal {
+            status.begin_success_seal_request()
+        } else {
+            status.begin_terminal_control_request()
+        }
+        .unwrap();
+        assert!(status.begin_terminal_control_request().is_err());
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        let batches = runtime.committed_batches(actor, None, 4).unwrap();
+        assert_eq!(batches.len(), 1);
+        let input = batches[0].1;
+        let (action, _) = runtime
+            .effect_inventory(actor, input, None, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(action.work, control.reference());
+        let ticket = runtime.take_effect(actor, input, action.id).unwrap();
+        let FrontendEffect::Attempt(effect) = &ticket.effect else {
+            panic!("original root reply effect")
+        };
+        let EffectBody::Port(port) = &effect.protocol.body else {
+            panic!("original root reply port")
+        };
+        let (token, _) = reply_kind(&port.body).unwrap();
+        requests
+            .commit_reply(&runtime, &ticket, Arc::new(port.clone()), None)
+            .unwrap();
+        assert!(matches!(
+            reply.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        runtime.effect_completed(ticket).unwrap();
+        runtime.retire_input(actor, input).unwrap();
+        ingress.root_control_processed(input).unwrap();
+        ingress.input_retired(input).unwrap();
+        requests.deliver(token, &mut publication).unwrap();
+        reply.await.unwrap().unwrap();
+    }
+    assert!(
+        publication.root.is_none(),
+        "success moved the original publisher"
+    );
+    ingress.close_after_exit().unwrap();
+    pool.retire_positions();
+    for (work, payer, owner) in [
+        (&mut observations, &mut positions, &scope),
+        (&mut control, &mut control_payer, &bridge),
+    ] {
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        payer.finish().unwrap();
+        owner.close_external().unwrap();
+        ledger.reap_scope_ready(owner.id(), 16).unwrap();
+    }
+    while let Some(turn) = runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    runtime.remove_actor(actor).unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    ledger.remove_scope(bridge.id()).unwrap();
+    assert!(runtime.is_empty() && ledger.is_empty());
+}

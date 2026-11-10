@@ -49,6 +49,7 @@ use tokio::{
 pub(crate) struct FailureCleanupRequest {
     pub(crate) core_panic: PanicPayload,
     pub(crate) publication: Result<(), ActorTurnError>,
+    pub(crate) root_reply: Result<(), Arc<super::publication::PublicationError>>,
     pub(crate) unknown_participations: Box<[ParticipationRef]>,
 }
 
@@ -150,6 +151,11 @@ impl FailureSupervisor {
                 &body_ticket,
                 unresolved_actions.into_iter().collect(),
             );
+            let root_reply = context
+                .publications
+                .deliver_committed_root_after_failure()
+                .await
+                .map_err(Arc::new);
             let aborts = context.lifecycle.started_aborts().await;
             for &request in &aborts {
                 port.abort_once(request).await;
@@ -167,6 +173,7 @@ impl FailureSupervisor {
             port.finish(FailureCleanupRequest {
                 core_panic,
                 publication,
+                root_reply,
                 unknown_participations,
             })
             .await;

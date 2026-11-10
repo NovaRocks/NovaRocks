@@ -915,7 +915,7 @@ async fn publication_host_returns_original_result_and_typed_failure() {
         .bind(WorkKind::Cleanup)
         .unwrap();
     let (record, mut receiver, root, plan) = tests::fixture();
-    let owner = AttemptPublicationOwner::new(record, None);
+    let owner = AttemptPublicationOwner::new(record, None, None);
     let activation = owner.activation();
     let id = |n| AttemptActionId::new(NonZeroU64::new(n).unwrap());
     let first = id(1);

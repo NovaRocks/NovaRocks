@@ -301,10 +301,23 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let clock = Arc::new(ManualClock::default());
     let inventory = || runtime.standing_input_inventory(actor, None, 16).unwrap();
     let before = inventory();
+    let control_scope = ledger.open_scope_next(None, generation).unwrap();
+    let (mut root_control_work, mut root_control_capacity) = control_scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    root_control_work.start().unwrap();
     let mut bind = |source: Arc<dyn ObservationSourcePool>| {
         registered.bind_observations(
             &runtime,
             &observation_work,
+            &root_control_work,
             source,
             clock.clone(),
             Waker::noop().clone(),
@@ -595,6 +608,12 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     observation_work.body_exited().unwrap();
     observation_work.captures_exited().unwrap();
     observations.close_after_exit().unwrap();
+    root_control_work.body_exited().unwrap();
+    root_control_work.captures_exited().unwrap();
+    root_control_capacity.finish().unwrap();
+    control_scope.close_external().unwrap();
+    control_scope.reap_ready(8).unwrap();
+    ledger.remove_scope(control_scope.id()).unwrap();
     pool.retire_positions();
     capacity_source.close_after_exit().unwrap();
     original.close_after_exit().unwrap();

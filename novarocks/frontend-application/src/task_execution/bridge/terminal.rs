@@ -63,22 +63,7 @@ impl TerminalPublication {
         else {
             return None;
         };
-        match failure {
-            AttemptFailure::Host(host)
-            | AttemptFailure::EstablishReplayExhausted { original: host, .. } => {
-                Some(host.original)
-            }
-            AttemptFailure::TaskProtocol(original) => match original.as_ref() {
-                ProtocolError::Workload(host)
-                | ProtocolError::HostExecution(host)
-                | ProtocolError::SplitAssignment(host)
-                | ProtocolError::Actor(host)
-                | ProtocolError::NativeTransport(host)
-                | ProtocolError::Establish(host) => Some(host.original),
-                _ => None,
-            },
-            _ => None,
-        }
+        host_failure_reference(failure)
     }
 
     pub(crate) fn attach_host_failure(
@@ -139,6 +124,23 @@ impl ConvergenceOutbox {
             }
             self.ready.notified().await;
         }
+    }
+}
+
+pub(crate) fn host_failure_reference(failure: &AttemptFailure) -> Option<HostFailureRef> {
+    match failure {
+        AttemptFailure::Host(host)
+        | AttemptFailure::EstablishReplayExhausted { original: host, .. } => Some(host.original),
+        AttemptFailure::TaskProtocol(original) => match original.as_ref() {
+            ProtocolError::Workload(host)
+            | ProtocolError::HostExecution(host)
+            | ProtocolError::SplitAssignment(host)
+            | ProtocolError::Actor(host)
+            | ProtocolError::NativeTransport(host)
+            | ProtocolError::Establish(host) => Some(host.original),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -349,7 +351,7 @@ fn project_terminal(
     )?))
 }
 
-fn project_failure(
+pub(super) fn project_failure(
     failure: &AttemptFailure,
     resolve_host: &mut impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
 ) -> Result<NativeAttemptPreparationFailure, TerminalProjectionError> {
