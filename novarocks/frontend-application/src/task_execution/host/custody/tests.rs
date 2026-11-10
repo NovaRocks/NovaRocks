@@ -285,3 +285,154 @@ async fn invalid_observer_returns_original_reported_work_before_factory_runs() {
     assert!(same);
     assert_eq!(ran.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn actor_transport_keeps_the_original_result_position_through_join() {
+    use crate::{
+        control_runtime::actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor},
+        task_execution::host::transport::BodyOutcome,
+    };
+    use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody, EffectClass};
+    use novarocks_control_runtime::{
+        actor::{ActorConfig, ActorStep},
+        actor_turn::ActorRuntime,
+        causal_input::CausalInputObligation,
+        exit_work::GatedNotStarted,
+    };
+    use novarocks_control_runtime_core::{
+        identity::{ActorId, Tick},
+        mailbox::{InputClass, InputEnvelope},
+    };
+    use novarocks_coordination_contract::AttemptActionId;
+    use std::num::NonZeroU64;
+
+    struct Target;
+    impl TestActor for Target {
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: InputEnvelope,
+            _: FrontendInput,
+            _: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            panic!("this test only supervises the original input position");
+        }
+    }
+
+    let fixture = Fixture::new();
+    let runtime = ActorRuntime::new();
+    let actor = ActorId::new(1).unwrap();
+    let source = ActorId::new(2).unwrap();
+    let registration = runtime
+        .register_bound_with_source_cut(
+            actor,
+            fixture.scope.clone(),
+            FrontendActor::Test(Box::new(Target)),
+            ActorConfig {
+                mailbox: [4; 4],
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+            source,
+        )
+        .unwrap_or_else(|(error, _)| panic!("{error}"));
+    let original = fixture.reported(None);
+    let reserve = |work: &ReportedWork| {
+        CausalInputObligation::reserve_admitted(
+            &runtime,
+            &registration,
+            source,
+            InputClass::Lifecycle,
+            work.work(),
+        )
+        .unwrap()
+    };
+    let result = reserve(&original);
+    let author = result.event_author().unwrap();
+    let foreign_result = reserve(&original);
+    let foreign_author = foreign_result.event_author().unwrap();
+    let id = AttemptActionId::new(NonZeroU64::MIN);
+    let effect = Arc::new(AttemptEffect {
+        id,
+        class: EffectClass::Cleanup,
+        body: EffectBody::Withdraw { effect: id },
+    });
+    let panic = PanicSink::new();
+    let (mut owner, exit, handoff) =
+        OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
+            .unwrap_or_else(|e| panic!("{}", e.error));
+    let mut foreign_result = handoff
+        .bind_actor_result(effect.clone(), &author, foreign_result)
+        .err()
+        .expect("another position of the same Work cannot substitute");
+    assert!(
+        foreign_result
+            .event_author()
+            .unwrap()
+            .same_binding(&foreign_author)
+    );
+
+    assert!(
+        handoff
+            .bind_actor_result(effect.clone(), &author, result)
+            .is_ok()
+    );
+    let (staged, observe) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    handoff
+        .spawn(&Handle::current(), exit, |exit, port| async move {
+            exit.revoke_unused_and_exit().unwrap();
+            assert!(
+                port.stage_actor_outcome(BodyOutcome::Unused(GatedNotStarted::Withdrawn))
+                    .is_ok()
+            );
+            assert!(
+                port.stage_actor_outcome(BodyOutcome::InputInstalled)
+                    .is_err()
+            );
+            staged.send(()).unwrap();
+            wait.await.unwrap();
+        })
+        .unwrap();
+    observe.await.unwrap();
+    assert!(owner.take_actor_result().is_none());
+    assert!(!owner.try_retire().unwrap());
+    release.send(()).unwrap();
+    assert!(
+        poll_fn(|cx| owner.poll_shared_completion(cx))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!owner.try_retire().unwrap());
+    let mut returned = owner.take_actor_result().expect("actual original result");
+    assert!(Arc::ptr_eq(&returned.effect, &effect));
+    assert!(
+        returned
+            .original
+            .event_author()
+            .unwrap()
+            .same_binding(&author)
+    );
+    assert!(matches!(
+        returned.outcome,
+        Some(BodyOutcome::Unused(GatedNotStarted::Withdrawn))
+    ));
+    assert!(owner.take_actor_result().is_none());
+    returned.original.close_after_exit().unwrap();
+    foreign_result.close_after_exit().unwrap();
+    assert!(owner.try_retire().unwrap());
+    fixture.scope.close_external().unwrap();
+    fixture
+        .ledger
+        .reap_scope_ready(fixture.scope.id(), 128)
+        .unwrap();
+    while let Some(turn) = runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    runtime.remove_actor(actor).unwrap();
+    fixture.finish();
+}

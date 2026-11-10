@@ -23,43 +23,31 @@ use super::{
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
 };
 use crate::{
-    control_runtime::{
-        actor::{FrontendActor, FrontendEffect},
-        host::PreparedEffectJob,
+    control_runtime::{actor::FrontendEffect, host::PreparedEffectJob},
+    task_execution::host::custody::{
+        CustodyError, TransportJoinHandoff, TransportJoinRegistration,
     },
-    task_execution::host::custody::{CustodyError, TransportJoinHandoff},
 };
 use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
 use novarocks_control_runtime::{
-    causal_input::CausalInputObligation,
+    actor_turn::InputAuthor,
     exit_work::{HandoffCell, PanicSink},
 };
 use std::{alloc::Layout, sync::Arc};
 use tokio::runtime::Handle;
 
-/// The same Source owns the original result store. This port holds only a
-/// Weak reference to its Join-owning record and is prepaid before dispatch.
-pub(crate) trait ActorTransportResultPort: Send + Sync + 'static {
-    fn body_finished(
-        &self,
-        routing: FrontendEffect,
-        outcome: BodyOutcome,
-        original: CausalInputObligation<FrontendActor>,
-    );
-}
-struct ActorResultObligation {
-    routing: FrontendEffect,
-    original: CausalInputObligation<FrontendActor>,
-    port: Arc<dyn ActorTransportResultPort>,
+/// Holds only the authority to stage a body outcome in its original record.
+struct ActorResultObligation(TransportJoinRegistration);
+struct UnprovenBodyOutcome {
+    _original: BodyOutcome,
 }
 impl TransportCompletionObligation for ActorResultObligation {
     fn body_finished(self: Box<Self>, outcome: BodyOutcome) {
-        let Self {
-            routing,
-            original,
-            port,
-        } = *self;
-        port.body_finished(routing, outcome, original);
+        if let Err(original) = self.0.stage_actor_outcome(outcome) {
+            std::panic::resume_unwind(Box::new(UnprovenBodyOutcome {
+                _original: original,
+            }));
+        }
     }
 }
 /// The original Source binds the same admitted job, launch authority and
@@ -70,7 +58,9 @@ pub(crate) struct BoundActorTransport {
     pub(crate) launch: TransportJoinHandoff,
     pub(crate) handoff: Arc<HandoffCell>,
     pub(crate) panic: PanicSink,
-    pub(crate) result: Arc<dyn ActorTransportResultPort>,
+    /// Exact pre-paid position selected by the Source, which can belong to
+    /// a purpose author admitted before the send's step guard is bound.
+    pub(crate) result_author: InputAuthor,
 }
 pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
@@ -151,37 +141,48 @@ pub(crate) fn handoff_actor_transport(
         result,
         captures,
     } = job;
+    let bound = captures
+        .downcast_ref::<BoundActorTransport>()
+        .expect("checked actor transport binding");
+    if let Err(result) =
+        bound
+            .launch
+            .bind_actor_result(bound.effect.clone(), &bound.result_author, result)
+    {
+        return Err(PreparedEffectJob {
+            effect,
+            exit,
+            result,
+            captures,
+        });
+    }
     let BoundActorTransport {
         work,
         launch,
         handoff,
         panic,
-        result: port,
         effect: _,
+        result_author: _,
     } = *captures
         .downcast::<BoundActorTransport>()
         .expect("checked actor transport binding");
-    let leg = |exit| TransportLeg {
+    let leg = |exit, registration| TransportLeg {
         exit,
         handoff,
         panic,
-        result: Box::new(ActorResultObligation {
-            routing: effect,
-            original: result,
-            port,
-        }),
+        result: Box::new(ActorResultObligation(registration)),
     };
     let spawned = match work {
         ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_send(SendJob {
-                leg: leg(exit),
+                leg: leg(exit, registration.clone()),
                 registration,
                 bound,
             })
         }),
-        ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit, _| {
+        ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_queue(QueueJob {
-                leg: leg(exit),
+                leg: leg(exit, registration),
                 bound,
             })
         }),

@@ -477,6 +477,7 @@ struct TransportRegistration {
     state: Mutex<TransportRegistrationState>,
     send: Mutex<Option<OriginalSendQueue>>,
     encoding: Mutex<Option<encoding::EncodingChild>>,
+    actor_result: Mutex<actor_result::ActorResultState>,
     retained: Mutex<Option<Arc<Self>>>,
 }
 #[derive(Clone)]
@@ -825,6 +826,7 @@ impl OriginalTransportJoinObligation {
             state: Mutex::new(TransportRegistrationState::Unattached),
             send: Mutex::new(None),
             encoding: Mutex::new(None),
+            actor_result: Mutex::new(actor_result::ActorResultState::Unbound),
             retained: Mutex::new(None),
         });
         *native.retained.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&native));
@@ -1070,6 +1072,13 @@ impl OriginalTransportJoinObligation {
             return Ok(false);
         }
         self.role.resolve_local_report()?;
+        if self.actor_result_held() {
+            let mut state = self.native.state.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*state, TransportRegistrationState::Unattached) {
+                *state = TransportRegistrationState::Issued;
+            }
+            return Ok(false);
+        }
         if self.role.retire()? {
             let retained = self
                 .native
@@ -1090,6 +1099,9 @@ impl OriginalTransportJoinObligation {
             *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
             TransportRegistrationState::Issued
         ) {
+            return Ok(false);
+        }
+        if self.actor_result_held() {
             return Ok(false);
         }
         let encoding = self
@@ -1150,6 +1162,7 @@ mod physical_return;
 pub(crate) use physical_return::{PhysicalInputRetirementObligation, PhysicalReturnError};
 mod encoding;
 pub(crate) use encoding::{EncodingBinding, EncodingJob, owned_layouts as encoding_owned_layouts};
+mod actor_result;
 
 #[cfg(test)]
 mod tests;
