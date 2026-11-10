@@ -136,6 +136,23 @@ pub(crate) struct SendReportRows {
     pub(crate) started: NativeProgressInput,
     pub(crate) members: Box<[SendMemberReport]>,
 }
+pub(super) fn close_unlaunched(reports: Arc<ActorSendReports>) {
+    let mut retirement = SendReportRetirement::after_join(reports)
+        .unwrap_or_else(|reports| std::panic::resume_unwind(Box::new(reports)));
+    for _ in 0..=2 * retirement.positions() {
+        match retirement
+            .advance()
+            .expect("unlaunched original report positions")
+        {
+            SendReportRetirementStep::Advanced(None) | SendReportRetirementStep::Pending => {}
+            SendReportRetirementStep::Retired => return,
+            SendReportRetirementStep::Advanced(Some(report)) => {
+                std::panic::resume_unwind(Box::new(report))
+            }
+        }
+    }
+    std::panic::resume_unwind(Box::new(retirement));
+}
 
 /// The actual sender has exclusive access to the original prepaid positions
 /// while reporting. The Source retains this same record through real Join

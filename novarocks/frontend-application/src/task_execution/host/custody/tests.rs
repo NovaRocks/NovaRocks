@@ -440,6 +440,9 @@ impl WithdrawalInbox {
     pub(crate) fn registration(&self) -> &ActorRegistration {
         &self.registration
     }
+    pub(crate) fn source(&self) -> ActorId {
+        self.source
+    }
 
     pub(crate) fn runtime(&self) -> &ActorRuntime<FrontendActor> {
         &self.runtime
@@ -450,23 +453,35 @@ impl WithdrawalInbox {
         work: &novarocks_control_runtime::obligation::WorkObligation,
         action: novarocks_coordination_contract::AttemptActionId,
     ) -> novarocks_control_runtime::actor_turn::EffectTicket<FrontendEffect> {
-        let input = self
-            .runtime
-            .reserve_admitted_input_for(
-                &self.registration,
-                self.source,
-                InputClass::Lifecycle,
-                work,
-            )
-            .unwrap()
-            .fill(FrontendInput::Test(1))
-            .unwrap();
+        let input = self.submit_command(work);
         assert!(self.runtime.poll_one(Tick(1)).unwrap());
         self.runtime
             .take_effect(
                 self.registration.actor(),
                 input,
                 novarocks_control_runtime_core::identity::ActionId::new(action.get()).unwrap(),
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn submit_command(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> InputId {
+        self.reserve_command(work)
+            .fill(FrontendInput::Test(1))
+            .unwrap()
+    }
+    pub(crate) fn reserve_command(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> novarocks_control_runtime::actor_turn::ReservedInputObligation<FrontendActor> {
+        self.runtime
+            .reserve_admitted_input_for(
+                &self.registration,
+                self.source,
+                InputClass::Lifecycle,
+                work,
             )
             .unwrap()
     }
@@ -514,15 +529,23 @@ impl WithdrawalInbox {
         fact
     }
     pub(crate) fn commit(&self, input: InputId) -> ExecutorFact {
+        let (actual, fact) = self.try_commit_next().expect("same original input");
+        assert_eq!(actual, input);
+        fact
+    }
+
+    pub(crate) fn try_commit_next(&self) -> Option<(InputId, ExecutorFact)> {
         if self.observed.lock().unwrap().is_empty() {
-            assert!(self.runtime.poll_one(Tick(1)).unwrap());
+            self.runtime.poll_one(Tick(1)).unwrap();
         }
         let mut observed = self.observed.lock().unwrap();
+        if observed.is_empty() {
+            return None;
+        }
         let (envelope, fact) = observed.remove(0);
         assert_eq!(envelope.source, self.source);
         assert_eq!(envelope.class, InputClass::Lifecycle);
-        assert_eq!(envelope.input, input);
-        fact
+        Some((envelope.input, fact))
     }
     pub(crate) fn finish(self) {
         while let Some(turn) = self.runtime.claim_host_actor() {

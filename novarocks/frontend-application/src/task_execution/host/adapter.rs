@@ -118,6 +118,12 @@ pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
 }
+pub(crate) struct AttemptTransportBinding {
+    pub(crate) retirement: TransportRetirements,
+    pub(crate) admission: super::transport::AdmissionSource,
+    pub(crate) send: super::transport::AttemptSendSource,
+    pub(crate) executor: super::transport::ActorTransportExecutor,
+}
 
 /// One paid original Lifecycle position, reused only after actual input
 /// retirement. The application opens external ingress after StartProtocol.
@@ -302,20 +308,22 @@ impl AttemptActorRegistration {
         startup_work: &WorkObligation,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
-        transport: TransportRetirements,
+        transport: AttemptTransportBinding,
     ) -> Result<
         PreparedAttemptHost,
         (
             AttemptRegistrationError,
             Box<dyn EffectSource>,
-            TransportRetirements,
+            AttemptTransportBinding,
         ),
     > {
         if self.startup_reserved
             || !self.ordered_bound
             || self.binding.get().is_none()
             || !self.scope.same_scope(startup_work.scope())
-            || !transport.matches_registration(runtime, &self.original)
+            || !transport
+                .retirement
+                .matches_registration(runtime, &self.original)
         {
             return Err((
                 AttemptRegistrationError::InvalidConfig(
@@ -337,6 +345,12 @@ impl AttemptActorRegistration {
             }
         };
         self.startup_reserved = true;
+        let AttemptTransportBinding {
+            retirement,
+            admission,
+            send,
+            executor: native,
+        } = transport;
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -344,9 +358,20 @@ impl AttemptActorRegistration {
                 kind: FrontendActorKind::Attempt,
                 config: self.config,
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
-                source,
-                executor: executor.clone(),
-                transport: Some(transport),
+                source: Box::new(super::transport::AttemptTransportSource::new(
+                    runtime.clone(),
+                    self.original.clone(),
+                    self.native_source,
+                    self.scope.clone(),
+                    admission,
+                    send,
+                    source,
+                )),
+                executor: Arc::new(super::transport::AttemptTransportExecutor {
+                    native,
+                    other: executor.clone(),
+                }),
+                transport: Some(retirement),
             },
             startup: AttemptStartup {
                 registration: self.original.clone(),

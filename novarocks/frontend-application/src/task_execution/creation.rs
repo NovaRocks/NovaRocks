@@ -759,6 +759,19 @@ impl Clone for CreateTaskIntent {
     }
 }
 impl CreateTaskIntent {
+    /// Move the original queue payload pin into the frozen request before
+    /// any physical send clones it. Every subsequent clone retains it.
+    pub(crate) fn bind_admitted_payload(
+        &mut self,
+        retention: novarocks_resource_contract::ExistingOwnerRetentionPin,
+    ) -> Result<(), novarocks_resource_contract::ExistingOwnerRetentionPin> {
+        if self.retention.is_some() {
+            return Err(retention);
+        }
+        self.retention = Some(retention);
+        Ok(())
+    }
+
     pub(crate) fn new(
         envelope: OperationEnvelope,
         identity: TaskIdentity,

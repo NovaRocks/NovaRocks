@@ -91,6 +91,32 @@ pub(crate) trait EffectSource: Send + 'static {
         ticket: &EffectTicket<FrontendEffect>,
         result: CausalInputObligation<FrontendActor>,
     ) -> PreparedEffectJob;
+    /// A concurrent owner fence can refuse the original step guard after
+    /// ticket claim. The failure owner must receive the original prepayment.
+    fn try_bind_job(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+    ) -> Result<PreparedEffectJob, EffectBindRefusal> {
+        Ok(self.bind_job(runtime, turn, ticket, result))
+    }
+    fn owner_failed_binding(
+        &mut self,
+        ticket: EffectTicket<FrontendEffect>,
+        refused: EffectBindRefusal,
+    ) {
+        std::panic::resume_unwind(Box::new((ticket, refused)));
+    }
+    fn retain_transport_failure(&mut self, original: Box<dyn Any + Send>) {
+        std::panic::resume_unwind(original);
+    }
+    /// Receives the actual unbound grant or retained payload for the
+    /// same claimed cleanup effect. The binder must move it off the poller.
+    fn retain_transport_release(&mut self, original: Box<dyn Any + Send>) {
+        std::panic::resume_unwind(original);
+    }
     fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>);
     /// Core consumption is proved by these original committed runtime inputs;
     /// it is not a capture, result-consumer, or producer-exit acknowledgement.
@@ -125,6 +151,11 @@ pub(crate) trait EffectSource: Send + 'static {
         now: Tick,
         budget: usize,
     ) -> SourceProgress;
+}
+#[must_use]
+pub(crate) struct EffectBindRefusal {
+    pub(crate) error: ActorTurnError,
+    pub(crate) original: Box<dyn Any + Send>,
 }
 pub(crate) struct SourceProgress {
     pub(crate) units: usize,
@@ -767,9 +798,26 @@ impl HostRegistry {
                         return Err(error.into());
                     }
                 };
-                let mut job = machine
-                    .source
-                    .bind_job(&self.runtime, turn, &ticket, prepaid);
+                let mut job =
+                    match machine
+                        .source
+                        .try_bind_job(&self.runtime, turn, &ticket, prepaid)
+                    {
+                        Ok(job) => job,
+                        Err(refused)
+                            if self.runtime.snapshot(entry.registration.actor())?.failed =>
+                        {
+                            machine.source.owner_failed_binding(ticket, refused);
+                            machine.scan_remaining = None;
+                            return Ok(HostProgress {
+                                units: entry.budget - budget,
+                                handoffs,
+                                more: true,
+                                retired: false,
+                            });
+                        }
+                        Err(refused) => std::panic::resume_unwind(Box::new((ticket, refused))),
+                    };
                 if let Some(retirement) = job.transport.take() {
                     let FrontendEffect::Attempt(effect) = &ticket.effect else {
                         std::panic::resume_unwind(Box::new((job, retirement)));

@@ -85,6 +85,7 @@ pub(crate) fn send_queue_resources(
     Ok(resources)
 }
 
+#[derive(Clone)]
 pub(crate) struct SendContext {
     pub(crate) registration: ActorRegistration,
     pub(crate) ledger: RuntimeLedger,
@@ -128,6 +129,9 @@ pub(crate) struct PreparedActorSend {
 }
 
 impl PreparedActorSend {
+    pub(crate) fn revoke_unused_reports(self) {
+        super::send_reports::close_unlaunched(self.reports);
+    }
     pub(crate) fn prepare(
         effect: Arc<AttemptEffectEnvelope>,
         requests: &FrozenSendRequests,
@@ -188,6 +192,23 @@ impl PreparedActorSend {
         result: CausalInputObligation<FrontendActor>,
         admission: &mut AdmissionSource,
     ) -> Result<PreparedEffectJob, SendClaimRefusal> {
+        self.bind_tracked(runtime, ticket, result, admission)
+            .map(|(job, _)| job)
+    }
+
+    pub(super) fn bind_tracked(
+        self,
+        runtime: &ActorRuntime<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: CausalInputObligation<FrontendActor>,
+        admission: &mut AdmissionSource,
+    ) -> Result<
+        (
+            PreparedEffectJob,
+            novarocks_control_runtime::obligation::WorkRetirementObserver,
+        ),
+        SendClaimRefusal,
+    > {
         let EffectBody::SendBatch { batch, reservation } = &self.effect.protocol.body else {
             unreachable!("validated original SendBatch");
         };
@@ -225,6 +246,7 @@ impl PreparedActorSend {
             (TransportCapacityLane::Ordinary, WorkKind::Business)
         };
         let (work, mut capacity) = guard.bind(kind).expect("original queue guard kind");
+        let header = work.retirement_observer();
         let window = QueueWindow::split(
             &mut capacity,
             self.context.layout.clone(),
@@ -250,7 +272,7 @@ impl PreparedActorSend {
         let backend = batch.backend;
         let control_progress = batch.control_progress;
         let context = self.context;
-        Ok(prepare_actor_transport(
+        let job = prepare_actor_transport(
             self.effect,
             result,
             original,
@@ -282,7 +304,8 @@ impl PreparedActorSend {
                 }))
             },
         )
-        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused))))
+        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+        Ok((job, header))
     }
 }
 

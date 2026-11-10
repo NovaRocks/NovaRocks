@@ -26,6 +26,10 @@ pub(crate) struct GrantedInputs {
     originals: BTreeMap<NonZeroU64, OriginalQueuedInput>,
 }
 impl GrantedInputs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.originals.is_empty()
+    }
+
     pub(crate) fn contains(&self, grant: QueuedInputGrantRef) -> bool {
         self.originals.contains_key(&grant.record())
     }

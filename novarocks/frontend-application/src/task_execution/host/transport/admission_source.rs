@@ -168,6 +168,17 @@ impl AdmissionSource {
         self.payloads.remove(&payload)?.pin
     }
 
+    pub(super) fn clone_payload_pin(
+        &self,
+        payload: PayloadRef,
+    ) -> Option<ExistingOwnerRetentionPin> {
+        self.payloads
+            .get(&payload)?
+            .pin
+            .as_ref()
+            .map(|pin| pin.try_clone().expect("same original admitted payload"))
+    }
+
     pub(crate) fn take_grant(
         &mut self,
         grant: QueuedInputGrantRef,
@@ -178,6 +189,22 @@ impl AdmissionSource {
 
     pub(super) fn grants(&self) -> &GrantedInputs {
         &self.grants
+    }
+
+    pub(super) fn release_grant(
+        &mut self,
+        grant: QueuedInputGrantRef,
+    ) -> Option<OriginalQueuedInput> {
+        self.grants.take_for_release(grant)
+    }
+
+    pub(super) fn is_drained(&self) -> bool {
+        self.pending.is_none()
+            && self.headers.is_empty()
+            && self.grants.is_empty()
+            && self.payloads.is_empty()
+            && self.failures.is_empty()
+            && self.idle.iter().all(VecDeque::is_empty)
     }
 
     pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {

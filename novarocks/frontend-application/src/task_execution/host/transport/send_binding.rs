@@ -20,8 +20,9 @@ use crate::{
     control_runtime::transport_withdrawal::AttemptEffectEnvelope,
     task_execution::{host::custody::TransportJoinRegistration, intent::OperationIntent},
 };
-use novarocks_attempt_protocol::effect::EffectBody;
-use novarocks_execution_contract::TaskOperationId;
+use novarocks_attempt_protocol::{effect::EffectBody, start::PayloadRef};
+use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
+use novarocks_resource_contract::ExistingOwnerRetentionPin;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -32,6 +33,7 @@ use std::{
 #[derive(Default)]
 pub(crate) struct FrozenSendRequests {
     originals: BTreeMap<TaskOperationId, OperationIntent>,
+    creation_payloads: BTreeMap<PayloadRef, TaskOperationId>,
 }
 impl FrozenSendRequests {
     pub(crate) fn install(&mut self, original: OperationIntent) -> Result<(), OperationIntent> {
@@ -44,8 +46,44 @@ impl FrozenSendRequests {
         Ok(())
     }
 
-    pub(crate) fn retire(&mut self, operation: TaskOperationId) -> Option<OperationIntent> {
+    pub(crate) fn into_originals(self) -> BTreeMap<TaskOperationId, OperationIntent> {
+        self.originals
+    }
+
+    pub(super) fn bind_creation(
+        &mut self,
+        operation: TaskOperationId,
+        task: TaskIdentity,
+        payload: PayloadRef,
+        pin: ExistingOwnerRetentionPin,
+    ) -> Result<(), ExistingOwnerRetentionPin> {
+        let Some(OperationIntent::CreateTask(original)) = self.originals.get_mut(&operation) else {
+            return Err(pin);
+        };
+        if original.identity() != task || self.creation_payloads.contains_key(&payload) {
+            return Err(pin);
+        }
+        original.bind_admitted_payload(pin)?;
+        self.creation_payloads.insert(payload, operation);
+        Ok(())
+    }
+
+    pub(super) fn retire_creation(
+        &mut self,
+        task: TaskIdentity,
+        payload: PayloadRef,
+    ) -> Option<OperationIntent> {
+        let operation = *self.creation_payloads.get(&payload)?;
+        if !matches!(self.originals.get(&operation), Some(OperationIntent::CreateTask(original)) if original.identity() == task)
+        {
+            return None;
+        }
+        self.creation_payloads.remove(&payload);
         self.originals.remove(&operation)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.originals.is_empty()
     }
 }
 
