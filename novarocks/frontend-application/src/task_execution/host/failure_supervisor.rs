@@ -125,6 +125,9 @@ impl FailureSupervisor {
             && self.registration.same_registration(registration)
             && self.original.work().reference() == work
     }
+    pub(crate) fn reservation_id(&self) -> novarocks_control_runtime_core::identity::ReservationId {
+        self.original.reservation_id()
+    }
 
     pub(crate) fn start(
         self,

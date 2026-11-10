@@ -123,6 +123,14 @@ pub(crate) enum AbortSendError {
         AbortSendResult,
     ),
 }
+impl AbortSendError {
+    pub(crate) fn exit_unproven(&self) -> bool {
+        matches!(
+            self,
+            Self::Prepare(..) | Self::Retire(..) | Self::Header(..)
+        )
+    }
+}
 impl std::fmt::Debug for AbortSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

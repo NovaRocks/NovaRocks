@@ -51,7 +51,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 /// Executor refusal returns this entire original job. Implementations only
 /// submit through a credentialed carrier; they must not poll bodies, perform
@@ -265,9 +265,25 @@ struct HostEntry {
     kind: FrontendActorKind,
     budget: usize,
     close_requested: AtomicBool,
+    exit: watch::Sender<bool>,
     // The exclusive host turn takes this original state out, then releases
     // the mutex before every Source/ledger/executor operation and Waker.
     machine: Mutex<Option<HostMachine>>,
+}
+
+/// Observation of one installed host's actual Actor and Scope removal.
+pub(crate) struct HostExit {
+    registration: ActorRegistration,
+    exited: watch::Receiver<bool>,
+}
+impl HostExit {
+    pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
+        self.registration.same_registration(registration)
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<(), watch::error::RecvError> {
+        self.exited.wait_for(|exited| *exited).await.map(|_| ())
+    }
 }
 pub(crate) struct HostBinding {
     pub(crate) scope: ScopeHandle,
@@ -312,7 +328,10 @@ impl HostRegistry {
             changed: Notify::new(),
         }
     }
-    pub(crate) fn register(&self, binding: HostBinding) -> Result<(), HostRegistrationRefusal> {
+    pub(crate) fn register(
+        &self,
+        binding: HostBinding,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
         if !binding.registration.matches_scope(&binding.scope)
             || binding.transport.as_ref().is_some_and(|transport| {
                 !transport.matches_registration(&self.runtime, &binding.registration)
@@ -392,6 +411,11 @@ impl HostRegistry {
             inventory,
             binding.policy,
         );
+        let (exit, exited) = watch::channel(false);
+        let observed = HostExit {
+            registration: binding.registration.clone(),
+            exited,
+        };
         state.entries.insert(
             binding.scope.id(),
             Arc::new(HostEntry {
@@ -400,6 +424,7 @@ impl HostRegistry {
                 kind: binding.kind,
                 budget,
                 close_requested: AtomicBool::new(false),
+                exit,
                 machine: Mutex::new(Some(HostMachine {
                     withdrawals: Arc::default(),
                     dispatch,
@@ -417,7 +442,7 @@ impl HostRegistry {
         );
         drop(state);
         self.changed.notify_waiters();
-        Ok(())
+        Ok(observed)
     }
     pub(crate) fn kind(&self, scope: ScopeId) -> Option<FrontendActorKind> {
         self.state
@@ -581,6 +606,7 @@ impl HostRegistry {
                 .expect("frontend host registry lock")
                 .entries
                 .remove(&entry.scope.id());
+            entry.exit.send_replace(true);
         } else {
             *entry.machine.lock().expect("frontend host state lock") = Some(machine);
             turn.release(progress.more).unwrap_or_else(|error| {

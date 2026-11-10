@@ -17,8 +17,10 @@
 
 //! Bind the pure AttemptCore to the original FE actor turn and work authors.
 
+use super::failure_bridge::PendingFailureBridge;
 use super::failure_lifecycle::FailureLifecycle;
 use super::failure_publication::{FailureContext, FailurePublications};
+use super::failure_supervisor::FailureSupervisor;
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
@@ -93,6 +95,7 @@ pub(crate) struct AttemptActorRegistration {
     observation_source: ActorId,
     membership_source: ActorId,
     members: Option<Arc<[FrozenMember]>>,
+    failure_members: Arc<[FrozenMember]>,
     failure_lifecycle: Option<FailureLifecycle>,
     failure_publications: Arc<FailurePublications>,
     failure_work: ScopedWorkRef,
@@ -122,13 +125,14 @@ struct AttemptBinding {
 pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
+    pub(crate) failure: PendingFailureBridge,
 }
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
-    pub(crate) failure: super::transport::AttemptFailureBinding,
+    pub(crate) failure: FailureSupervisor,
 }
 
 /// One paid original Lifecycle position, reused only after actual input
@@ -332,7 +336,6 @@ impl AttemptActorRegistration {
                 .matches_registration(runtime, &self.original)
             || !transport
                 .failure
-                .supervisor
                 .matches(runtime, &self.original, self.failure_work)
         {
             return Err((
@@ -362,6 +365,18 @@ impl AttemptActorRegistration {
             executor: native,
             failure,
         } = transport;
+        let (failure_bridge, residual) = PendingFailureBridge::new(
+            self.original.clone(),
+            self.root_control.activation(),
+            self.failure_members.clone(),
+            self.failure_publications.clone(),
+        );
+        let cleanup = super::transport::NativeFailureCleanup::new(
+            send.contexts.clone(),
+            failure.reservation_id(),
+            native.0.clone(),
+            residual,
+        );
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -384,7 +399,10 @@ impl AttemptActorRegistration {
                                 .expect("original failure lifecycle"),
                             publications: self.failure_publications.clone(),
                         },
-                        failure,
+                        super::transport::AttemptFailureBinding {
+                            supervisor: failure,
+                            port: Box::new(cleanup),
+                        },
                     ),
                     source,
                 )),
@@ -399,6 +417,7 @@ impl AttemptActorRegistration {
                 input,
                 next: Some(AttemptInput::Bootstrap),
             },
+            failure: failure_bridge,
         })
     }
 
@@ -701,6 +720,7 @@ impl AttemptActor {
             observation_source,
             membership_source,
             members: Some(members.clone()),
+            failure_members: members.clone(),
             failure_lifecycle: Some(FailureLifecycle::freeze(
                 members.iter().map(|member| member.participation),
             )),

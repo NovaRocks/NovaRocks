@@ -83,6 +83,9 @@ impl RootControlBinding {
     pub(crate) fn registration(&self) -> &ActorRegistration {
         &self.0.registration
     }
+    pub(crate) fn activation(&self) -> AttemptActivationIdentity {
+        self.0.activation
+    }
     pub(crate) fn same_original(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

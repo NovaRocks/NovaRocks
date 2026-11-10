@@ -73,6 +73,14 @@ pub(crate) struct FailurePublications {
 }
 
 impl FailurePublications {
+    pub(crate) fn matches(
+        &self,
+        registration: &ActorRegistration,
+        activation: AttemptActivationIdentity,
+    ) -> bool {
+        self.registration.same_registration(registration) && self.activation == activation
+    }
+
     pub(crate) fn new(
         registration: ActorRegistration,
         activation: AttemptActivationIdentity,

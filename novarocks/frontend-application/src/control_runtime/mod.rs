@@ -50,8 +50,9 @@ use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
 use crate::task_execution::host::adapter::{AttemptStartup, PreparedAttemptHost};
+use crate::task_execution::host::failure_bridge::{FailureBridge, PendingFailureBridge};
 use actor::{FrontendActor, FrontendClock};
-use host::{HostBinding, HostRegistrationRefusal, HostRegistry};
+use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
 use membership::{
     MembershipObserver, MembershipRegistry, MembershipShutdownError, MembershipTarget,
 };
@@ -109,6 +110,7 @@ pub(crate) struct FrontendControlRuntime {
     host: Arc<HostRegistry>,
     members: Arc<MembershipRegistry>,
     member_observer: MembershipObserver,
+    backend_processes: Arc<dyn BackendProcessObservationPort>,
     pollers: Option<PollerPool<FrontendActor>>,
     membership_joined: bool,
     observation: RuntimeObservation,
@@ -120,15 +122,26 @@ impl FrontendControlRuntime {
     pub(crate) fn register_attempt(
         &self,
         prepared: PreparedAttemptHost,
-    ) -> Result<AttemptStartup, (HostRegistrationRefusal, AttemptStartup)> {
-        let PreparedAttemptHost { binding, startup } = prepared;
+    ) -> Result<
+        (AttemptStartup, FailureBridge),
+        (
+            HostRegistrationRefusal,
+            AttemptStartup,
+            PendingFailureBridge,
+        ),
+    > {
+        let PreparedAttemptHost {
+            binding,
+            startup,
+            failure,
+        } = prepared;
         match self.register(binding) {
-            Ok(()) => Ok(startup),
-            Err(refusal) => Err((refusal, startup)),
+            Ok(exit) => Ok((startup, failure.bind(exit, self.backend_processes.clone()))),
+            Err(refusal) => Err((refusal, startup, failure)),
         }
     }
 
-    fn register(&self, binding: HostBinding) -> Result<(), HostRegistrationRefusal> {
+    fn register(&self, binding: HostBinding) -> Result<HostExit, HostRegistrationRefusal> {
         let open = self
             .registration_open
             .lock()
@@ -178,7 +191,8 @@ impl FrontendControlRuntime {
         .map_err(FrontendControlStartError::Pollers)?;
         // The service's actual Join is stored directly in this same owner;
         // creating it adds no query Work that could block ledger drain.
-        let member_observer = MembershipObserver::start(data, backend_processes, members.clone());
+        let member_observer =
+            MembershipObserver::start(data, backend_processes.clone(), members.clone());
         Ok(Self {
             registration_open: Mutex::new(true),
             runtime,
@@ -187,6 +201,7 @@ impl FrontendControlRuntime {
             host,
             members,
             member_observer,
+            backend_processes,
             pollers: Some(pollers),
             membership_joined: false,
             observation,

@@ -1695,6 +1695,7 @@ async fn run_actor_send(
     withdraw: bool,
     failure_verdict: Option<novarocks_execution_contract::OperationOutcome>,
 ) {
+    use crate::control_runtime::membership::FrozenMember;
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{
@@ -1705,6 +1706,7 @@ async fn run_actor_send(
         transport_withdrawal::AttemptEffectEnvelope,
     };
     use crate::task_execution::clock::ProcessMonotonicClock;
+    use crate::task_execution::host::failure_bridge::PendingFailureBridge;
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
     use crate::task_execution::host::failure_supervisor::{
@@ -1730,7 +1732,12 @@ async fn run_actor_send(
         AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
-        AbortCause, AbortParticipation, OperationOutcome, ParticipationRef,
+        AbortCause, AbortParticipation, OperationOutcome, ParticipationRef, RuntimeEndpoint,
+    };
+    use novarocks_query_application::api::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
+        NativeAttemptTerminal, NativeParticipationConvergence,
     };
     use novarocks_types::FrontendProcessId;
 
@@ -1832,6 +1839,7 @@ async fn run_actor_send(
         exited: bool,
         finished: bool,
         receipt: Arc<Mutex<Option<crate::task_execution::intent::OperationAcknowledgement>>>,
+        release_parent: Arc<AtomicBool>,
     }
     impl EffectSource for ScopeOwner {
         fn prepay_result(
@@ -1918,7 +1926,7 @@ async fn run_actor_send(
             budget: usize,
         ) -> SourceProgress {
             let mut units = 0;
-            if self.closing && budget != 0 {
+            if self.closing && budget != 0 && self.release_parent.load(Ordering::Acquire) {
                 if !self.exited {
                     self.parent.body_exited().unwrap();
                     self.parent.captures_exited().unwrap();
@@ -1959,14 +1967,16 @@ async fn run_actor_send(
 
     #[derive(Default)]
     struct CleanupState {
-        aborts: Vec<transport::FailureAbortAttempt>,
-        residual: Option<FailureCleanupRequest>,
+        transferred: bool,
         dropped: bool,
     }
-    struct CleanupPort(Arc<Mutex<CleanupState>>);
+    struct CleanupPort(
+        Arc<Mutex<CleanupState>>,
+        Option<Box<dyn transport::FailureResidualPort>>,
+    );
     impl transport::FailureResidualPort for CleanupPort {
         fn finish(
-            self: Box<Self>,
+            mut self: Box<Self>,
             original: FailureCleanupRequest,
             attempts: Vec<transport::FailureAbortAttempt>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -1976,15 +1986,40 @@ async fn run_actor_send(
                         eprintln!("Original failure Abort: {error:?}");
                     }
                 }
-                let mut state = self.0.lock().unwrap();
-                assert!(state.residual.replace(original).is_none());
-                state.aborts = attempts;
+                self.1.take().unwrap().finish(original, attempts).await;
+                self.0.lock().unwrap().transferred = true;
             })
         }
     }
     impl Drop for CleanupPort {
         fn drop(&mut self) {
             self.0.lock().unwrap().dropped = true;
+        }
+    }
+    struct ProcessFacts {
+        backend: BackendProcessId,
+        endpoint: RuntimeEndpoint,
+        replacement: BackendProcessId,
+        changed: tokio::sync::watch::Sender<u64>,
+    }
+    impl BackendProcessObservationPort for ProcessFacts {
+        fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.changed.subscribe()
+        }
+        fn observe_process_at_endpoint(
+            &self,
+            expected: BackendProcessId,
+            endpoint: &RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, BackendTopologyError> {
+            assert_eq!(expected, self.backend);
+            assert_eq!(endpoint, &self.endpoint);
+            Ok(if *self.changed.borrow() == 0 {
+                BackendProcessObservation::Unobservable
+            } else {
+                BackendProcessObservation::Replaced {
+                    current_process: self.replacement,
+                }
+            })
         }
     }
 
@@ -2054,17 +2089,38 @@ async fn run_actor_send(
         ))),
     );
     let receipt = Arc::new(Mutex::new(None));
+    let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
     let publications = Arc::new(FailurePublications::new(
         inbox.registration().clone(),
-        AttemptActivationIdentity::from_parts(1, execution, 1),
+        activation,
         &roles.scope,
     ));
+    let original_endpoint = peer.as_ref().map_or_else(
+        || RuntimeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()),
+        |peer| peer.control_endpoint.clone(),
+    );
+    let (failure_bridge, residual_port) = PendingFailureBridge::new(
+        inbox.registration().clone(),
+        activation,
+        Arc::new([FrozenMember {
+            participation,
+            endpoint: original_endpoint.clone(),
+        }]),
+        publications.clone(),
+    );
+    let processes = Arc::new(ProcessFacts {
+        backend,
+        endpoint: original_endpoint,
+        replacement: BackendProcessId::new_v7(),
+        changed: tokio::sync::watch::channel(0).0,
+    });
     let cleanup = Arc::new(Mutex::new(CleanupState::default()));
+    let release_parent = Arc::new(AtomicBool::new(!fail_core));
     let failure_port = transport::NativeFailureCleanup::new(
         contexts.clone(),
         failure_payer,
         handle.clone(),
-        Box::new(CleanupPort(cleanup.clone())),
+        Box::new(CleanupPort(cleanup.clone(), Some(residual_port))),
     );
     let supervisor = FailureSupervisor::new(
         actor_runtime.clone(),
@@ -2073,64 +2129,67 @@ async fn run_actor_send(
         observer(),
         handle.clone(),
     );
-    host.register(HostBinding {
-        scope: roles.scope.clone(),
-        registration: inbox.registration().clone(),
-        kind: FrontendActorKind::Test,
-        config: ActorConfig {
-            mailbox: [8; 4],
-            max_batches: 4,
-            max_effects_per_step: 1,
-            max_dependencies_per_effect: 0,
-            turn_budget: 8,
-            max_step_work: 1,
-        },
-        policy: FrontendLanePolicy::attempt(1),
-        source: Box::new(transport::AttemptTransportSource::new(
-            actor_runtime.clone(),
-            inbox.registration().clone(),
-            inbox.source(),
-            roles.scope.clone(),
-            admission,
-            transport::AttemptSendSource {
-                requests,
-                contexts,
-                report_references: BTreeMap::new(),
-                report_author,
-                idle: send_idle,
+    let exit = host
+        .register(HostBinding {
+            scope: roles.scope.clone(),
+            registration: inbox.registration().clone(),
+            kind: FrontendActorKind::Test,
+            config: ActorConfig {
+                mailbox: [8; 4],
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
             },
-            (
-                FailureContext {
-                    lifecycle,
-                    publications: publications.clone(),
+            policy: FrontendLanePolicy::attempt(1),
+            source: Box::new(transport::AttemptTransportSource::new(
+                actor_runtime.clone(),
+                inbox.registration().clone(),
+                inbox.source(),
+                roles.scope.clone(),
+                admission,
+                transport::AttemptSendSource {
+                    requests,
+                    contexts,
+                    report_references: BTreeMap::new(),
+                    report_author,
+                    idle: send_idle,
                 },
-                transport::AttemptFailureBinding {
-                    supervisor,
-                    port: Box::new(failure_port),
-                },
-            ),
-            Box::new(ScopeOwner {
-                scope: roles.scope.clone(),
-                parent,
-                payer,
-                closing: false,
-                exited: false,
-                finished: false,
-                receipt: receipt.clone(),
+                (
+                    FailureContext {
+                        lifecycle,
+                        publications: publications.clone(),
+                    },
+                    transport::AttemptFailureBinding {
+                        supervisor,
+                        port: Box::new(failure_port),
+                    },
+                ),
+                Box::new(ScopeOwner {
+                    scope: roles.scope.clone(),
+                    parent,
+                    payer,
+                    closing: false,
+                    exited: false,
+                    finished: false,
+                    receipt: receipt.clone(),
+                    release_parent: release_parent.clone(),
+                }),
+            )),
+            executor: Arc::new(transport::AttemptTransportExecutor {
+                native: transport::ActorTransportExecutor(handle.clone()),
+                other: Arc::new(OtherExecutor),
             }),
-        )),
-        executor: Arc::new(transport::AttemptTransportExecutor {
-            native: transport::ActorTransportExecutor(handle.clone()),
-            other: Arc::new(OtherExecutor),
-        }),
-        transport: Some(custody::TransportRetirements::new(
-            actor_runtime.clone(),
-            inbox.registration().clone(),
-            handle,
-            1,
-        )),
-    })
-    .unwrap_or_else(|_| panic!("same host registration"));
+            transport: Some(custody::TransportRetirements::new(
+                actor_runtime.clone(),
+                inbox.registration().clone(),
+                handle,
+                1,
+            )),
+        })
+        .unwrap_or_else(|_| panic!("same host registration"));
+    let mut bridge = failure_bridge.bind(exit, processes.clone());
     let advance_host = || {
         while let Some(turn) = actor_runtime.claim_host_actor() {
             host.drive(Tick(1), turn);
@@ -2245,9 +2304,13 @@ async fn run_actor_send(
             .unwrap();
         assert!(actor_runtime.poll_one(Tick(2)).unwrap());
         advance_host();
-        let lost = tokio::time::timeout(Duration::from_secs(1), publications.take_lost())
+        let terminal = tokio::time::timeout(Duration::from_secs(1), bridge.terminal())
             .await
             .unwrap();
+        assert!(
+            matches!(terminal, NativeAttemptTerminal::Failed(error) if error.class() == novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure)
+        );
+        let lost = bridge.original_loss();
         assert!(
             matches!(&lost.body, AttemptToLogicalBody::AttemptLost { unknown_participations, unresolved_actions, .. }
             if &**unknown_participations == &[participation] && &**unresolved_actions == &[send_id])
@@ -2270,6 +2333,37 @@ async fn run_actor_send(
         );
         drop(original);
     }
+    let cancellation = fail_core.then(|| wc.root.owner.scope().cancellation().unwrap());
+    if fail_core {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cleanup.lock().unwrap().transferred {
+                drive(&mut wc.driver);
+                advance_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let deadline = if failure_verdict == Some(OperationOutcome::Accepted) {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(5)
+        };
+        let mut waiting = Box::pin(bridge.converge(NativeActiveConvergenceRequest::new(
+            cancellation.as_ref().unwrap().clone(),
+            deadline,
+        )));
+        assert!(
+            futures::poll!(waiting.as_mut()).is_pending(),
+            "remote deadline cannot settle original local work"
+        );
+        drop(waiting);
+        assert!(!host.is_empty());
+        release_parent.store(true, Ordering::Release);
+        actor_runtime
+            .notify_host_actor(inbox.registration())
+            .unwrap();
+    }
     tokio::time::timeout(Duration::from_secs(3), async {
         while !host.is_empty() {
             drive(&mut wc.driver);
@@ -2279,10 +2373,11 @@ async fn run_actor_send(
     })
     .await
     .unwrap();
-    let cleanup = cleanup.lock().unwrap();
-    assert!(cleanup.dropped);
+    assert!(cleanup.lock().unwrap().dropped);
     if fail_core {
-        let [abort] = cleanup.aborts.as_slice() else {
+        let cancellation = cancellation.unwrap();
+        let (residual, attempts) = bridge.original_residual();
+        let [abort] = attempts else {
             panic!("one frozen failure abort")
         };
         assert_eq!(abort.request.participation(), participation);
@@ -2303,13 +2398,44 @@ async fn run_actor_send(
                 .then_some(novarocks_execution_contract::ParticipationState::Aborting)
         );
         assert_eq!(peer.as_ref().unwrap().control_requests(), 2);
-        let residual = cleanup.residual.as_ref().unwrap();
         assert_eq!(&*residual.unknown_participations, &[participation]);
         residual.publication.unwrap();
+        if failure_verdict == Some(OperationOutcome::OwnerFailed) {
+            processes.changed.send_replace(1);
+        }
+        let closure = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.converge(NativeActiveConvergenceRequest::new(
+                cancellation.clone(),
+                Instant::now() + Duration::from_secs(5),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if failure_verdict == Some(OperationOutcome::Accepted) {
+            assert!(
+                matches!(closure, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if &*exact_participations == &[participation])
+            );
+            processes.changed.send_replace(1);
+            let original = bridge
+                .converge(NativeActiveConvergenceRequest::new(
+                    cancellation,
+                    Instant::now() + Duration::from_secs(5),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                matches!(original, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if &*exact_participations == &[participation])
+            );
+        } else {
+            assert!(
+                matches!(closure, NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(facts)) if &*facts == &[NativeParticipationConvergence::worker_process_replaced(participation)])
+            );
+        }
     } else {
-        assert!(cleanup.aborts.is_empty() && cleanup.residual.is_none());
+        assert!(!cleanup.lock().unwrap().transferred);
     }
-    drop(cleanup);
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
     let deadline = Instant::now() + Duration::from_secs(3);
     runtime.drain_original_apply_until(deadline).await.unwrap();
