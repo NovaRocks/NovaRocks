@@ -23,6 +23,7 @@ use crate::actor::Actor;
 use crate::actor_turn::{
     ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, CompletedEffect, EffectTicket,
 };
+use crate::exit_work::{HandoffCell, HandoffState};
 use crate::sync::Arc;
 use novarocks_control_runtime_core::{
     effect::EffectState,
@@ -79,6 +80,7 @@ pub struct EffectCandidate<'h, A: Actor, K> {
     marker: Ready<K>,
     effect: EffectRef,
     metadata: Option<A::Effect>,
+    withdrawn: Option<std::sync::Arc<HandoffCell>>,
 }
 impl<A: Actor, K> EffectCandidate<'_, A, K> {
     pub fn effect_ref(&self) -> EffectRef {
@@ -184,6 +186,16 @@ where
         runtime: &ActorRuntime<A>,
         budget: usize,
     ) -> Result<IndexedBatches, DispatchError> {
+        self.index_committed_with(runtime, budget, |_| {})
+    }
+    /// Visit the same committed metadata once, within its existing index
+    /// charge, before the host can claim any candidate from the batch.
+    pub fn index_committed_with(
+        &mut self,
+        runtime: &ActorRuntime<A>,
+        budget: usize,
+        mut index: impl FnMut(&A::Effect),
+    ) -> Result<IndexedBatches, DispatchError> {
         let runtime = self.completion_runtime.as_ref().unwrap_or(runtime).clone();
         if runtime.snapshot(self.actor)?.failed {
             return Err(DispatchError::OwnerFailed);
@@ -219,6 +231,7 @@ where
                 let metadata = runtime
                     .pending_effect_metadata(self.actor, input, descriptor.id)?
                     .ok_or(DispatchError::MissingMetadata)?;
+                index(&metadata);
                 let effect = EffectRef {
                     input,
                     action: descriptor.id,
@@ -250,12 +263,31 @@ where
         runtime: &ActorRuntime<A>,
         host: &'h ActorHostTurn<A>,
     ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
+        self.peek_candidate_inner(runtime, host, None::<fn(&A::Effect) -> _>)
+    }
+    /// Only this exact pending metadata may qualify an already withdrawn
+    /// carrier for handoff after stop. Normal business keeps its usual gate.
+    pub fn peek_candidate_with_withdrawal<'h>(
+        &self,
+        runtime: &ActorRuntime<A>,
+        host: &'h ActorHostTurn<A>,
+        handoff: impl FnOnce(&A::Effect) -> Option<std::sync::Arc<HandoffCell>>,
+    ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
+        self.peek_candidate_inner(runtime, host, Some(handoff))
+    }
+    fn peek_candidate_inner<'h>(
+        &self,
+        runtime: &ActorRuntime<A>,
+        host: &'h ActorHostTurn<A>,
+        handoff: Option<impl FnOnce(&A::Effect) -> Option<std::sync::Arc<HandoffCell>>>,
+    ) -> Result<Option<EffectCandidate<'h, A, P::LaneKey>>, DispatchError> {
         self.validate_candidate_host(runtime, host)?;
         let Some(marker) = self.ready.front().copied() else {
             return Ok(None);
         };
         let entry = self.candidate_entry(marker)?;
-        let metadata = if runtime.effect_ready_for(host, entry.effect.input, entry.effect.action)? {
+        let normal = runtime.effect_ready_for(host, entry.effect.input, entry.effect.action)?;
+        let mut metadata = if normal || handoff.is_some() {
             Some(
                 runtime
                     .pending_effect_metadata(self.actor, entry.effect.input, entry.effect.action)?
@@ -264,6 +296,21 @@ where
         } else {
             None
         };
+        let withdrawn = metadata
+            .as_ref()
+            .and_then(|metadata| handoff.and_then(|handoff| handoff(metadata)))
+            .filter(|cell| cell.state() == HandoffState::Withdrawn);
+        if !normal
+            && (withdrawn.is_none()
+                || !runtime.effect_ready_for_dispatch(
+                    host,
+                    entry.effect.input,
+                    entry.effect.action,
+                    true,
+                )?)
+        {
+            metadata = None;
+        }
         Ok(Some(EffectCandidate {
             origin: self.origin.clone(),
             runtime: runtime.clone(),
@@ -271,6 +318,7 @@ where
             marker,
             effect: entry.effect,
             metadata,
+            withdrawn,
         }))
     }
     /// Claim only the sampled original head. NotReady preserves its marker and
@@ -285,8 +333,16 @@ where
             return Err(DispatchError::InvalidCandidate);
         }
         let entry = self.validate_candidate(candidate)?;
-        let ticket = match runtime.take_effect(self.actor, entry.effect.input, entry.effect.action)
-        {
+        let withdrawn = candidate
+            .withdrawn
+            .as_ref()
+            .is_some_and(|cell| cell.state() == HandoffState::Withdrawn);
+        let ticket = match runtime.take_effect_for_dispatch(
+            self.actor,
+            entry.effect.input,
+            entry.effect.action,
+            withdrawn,
+        ) {
             Ok(ticket) => ticket,
             Err(ActorTurnError::Effect(
                 novarocks_control_runtime_core::effect::EffectError::NotReady,

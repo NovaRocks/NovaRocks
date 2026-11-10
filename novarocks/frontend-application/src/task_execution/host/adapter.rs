@@ -21,6 +21,7 @@ use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
 use super::transport::{NativeReceiptInput, SendKey};
+use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
@@ -815,7 +816,11 @@ impl TurnContext<'_, '_> {
             self.step
                 .effect(
                     descriptor(id, work, kind),
-                    FrontendEffect::Attempt(Arc::new(effect)),
+                    FrontendEffect::Attempt(
+                        crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope::new(
+                            effect,
+                        ),
+                    ),
                 )
                 .unwrap();
         } else {
@@ -823,7 +828,11 @@ impl TurnContext<'_, '_> {
                 .effect_from_author(
                     author,
                     descriptor(id, author.work(), kind),
-                    FrontendEffect::Attempt(Arc::new(effect)),
+                    FrontendEffect::Attempt(
+                        crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope::new(
+                            effect,
+                        ),
+                    ),
                 )
                 .unwrap();
         }

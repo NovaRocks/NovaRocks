@@ -135,7 +135,7 @@ impl FrontendLanePolicy {
                 let FrontendEffect::Attempt(effect) = effect else {
                     return None;
                 };
-                match &effect.body {
+                match &effect.protocol.body {
                     EffectBody::SendBatch { batch, .. } => Some(FrontendLaneKey::Send {
                         target: batch.backend,
                         lane: batch.lane,
@@ -184,6 +184,7 @@ pub(crate) struct PendingHandoff {
     pub(crate) job: PreparedEffectJob,
 }
 struct HostMachine {
+    withdrawals: Arc<super::transport_withdrawal::TransportWithdrawalRoutes>,
     dispatch: EffectDispatch<FrontendActor, FrontendLanePolicy>,
     policy: FrontendLanePolicy,
     source: Box<dyn EffectSource>,
@@ -333,6 +334,7 @@ impl HostRegistry {
                 budget,
                 close_requested: AtomicBool::new(false),
                 machine: Mutex::new(Some(HostMachine {
+                    withdrawals: Arc::default(),
                     dispatch,
                     policy: binding.policy,
                     source: binding.source,
@@ -603,8 +605,15 @@ impl HostRegistry {
         }
         let mut blocked = false;
         if budget != 0 {
-            let indexed =
-                original_dispatch!(machine.dispatch.index_committed(&self.runtime, budget));
+            let indexed = original_dispatch!(machine.dispatch.index_committed_with(
+                &self.runtime,
+                budget,
+                |metadata| {
+                    if let FrontendEffect::Attempt(effect) = metadata {
+                        machine.withdrawals.index(effect);
+                    }
+                }
+            ));
             budget -= indexed.units;
             if !indexed.inputs.is_empty() && machine.scan_remaining.is_some() {
                 machine.rescan_requested = true;
@@ -613,10 +622,6 @@ impl HostRegistry {
         }
         while budget != 0 {
             if machine.pending.is_none() {
-                if machine.source.result_admission_closed() {
-                    blocked = true;
-                    break;
-                }
                 let remaining = machine
                     .scan_remaining
                     .get_or_insert_with(|| machine.dispatch.ready_positions());
@@ -627,7 +632,14 @@ impl HostRegistry {
                 // original dependency/stop predicate currently blocks it.
                 *remaining -= 1;
                 budget -= 1;
-                let candidate = match machine.dispatch.peek_candidate(&self.runtime, turn) {
+                let candidate = match machine.dispatch.peek_candidate_with_withdrawal(
+                    &self.runtime,
+                    turn,
+                    |metadata| match metadata {
+                        FrontendEffect::Attempt(effect) => effect.handoff().cloned(),
+                        _ => None,
+                    },
+                ) {
                     Ok(Some(candidate)) => candidate,
                     Ok(None) => {
                         machine.scan_remaining = Some(0);
@@ -650,6 +662,28 @@ impl HostRegistry {
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 };
+                if let FrontendEffect::Attempt(effect) = metadata
+                    && let novarocks_attempt_protocol::effect::EffectBody::Withdraw { effect } =
+                        effect.protocol.body
+                {
+                    if let Some(ticket) = original_dispatch!(
+                        machine.dispatch.claim_candidate(&self.runtime, &candidate)
+                    ) {
+                        machine.withdrawals.withdraw(effect);
+                        let _ = self
+                            .runtime
+                            .effect_completed_with_receipt(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        machine.rescan_requested = true;
+                    } else {
+                        original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    }
+                    continue;
+                }
+                if machine.source.result_admission_closed() {
+                    original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    continue;
+                }
                 let Some(prepaid) = machine.source.prepay_result(metadata) else {
                     // Rotate this same original marker, never its same-lane
                     // tail. An independent purpose may have its own paid role.
@@ -819,11 +853,13 @@ mod tests {
         let policy = FrontendLanePolicy::attempt(3);
         let id = NonZeroU64::new(1).unwrap();
         let effect = |body| {
-            FrontendEffect::Attempt(Arc::new(AttemptEffect {
-                id: AttemptActionId::new(id),
-                class: EffectClass::Business,
-                body,
-            }))
+            FrontendEffect::Attempt(
+                super::super::transport_withdrawal::AttemptEffectEnvelope::new(AttemptEffect {
+                    id: AttemptActionId::new(id),
+                    class: EffectClass::Business,
+                    body,
+                }),
+            )
         };
         let send = |backend, lane, control_progress| {
             effect(EffectBody::SendBatch {

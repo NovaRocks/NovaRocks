@@ -18,10 +18,9 @@
 //! The FE process owns one common actor carrier. P10a adds the real attempt
 //! variant; protocol state remains pure and rich objects stay in host Sources.
 
+use super::transport_withdrawal::AttemptEffectEnvelope;
 use crate::task_execution::host::adapter::{AttemptActor, AttemptNotice, descriptor};
-use novarocks_attempt_protocol::{
-    config::DispatchLane, effect::AttemptEffect, input::AttemptInput,
-};
+use novarocks_attempt_protocol::{config::DispatchLane, input::AttemptInput};
 use novarocks_control_runtime::{
     actor::{Actor, ActorStep},
     actor_turn::Clock,
@@ -68,7 +67,7 @@ pub(crate) enum FrontendInput {
 pub(crate) enum FrontendEffect {
     // The host peeks and indexes this same immutable effect without cloning
     // a batch's operation list or publication rows.
-    Attempt(Arc<AttemptEffect>),
+    Attempt(Arc<AttemptEffectEnvelope>),
     AttemptNotice(Arc<AttemptNotice>),
     AttemptOwnerFailed {
         scope: ScopeId,

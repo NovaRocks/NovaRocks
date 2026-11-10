@@ -355,11 +355,12 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
     let foreign_result = reserve(&original);
     let foreign_author = foreign_result.event_author().unwrap();
     let id = AttemptActionId::new(NonZeroU64::MIN);
-    let effect = Arc::new(AttemptEffect {
-        id,
-        class: EffectClass::Cleanup,
-        body: EffectBody::Withdraw { effect: id },
-    });
+    let effect =
+        crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope::new(AttemptEffect {
+            id,
+            class: EffectClass::Cleanup,
+            body: EffectBody::Withdraw { effect: id },
+        });
     let panic = PanicSink::new();
     let (mut owner, exit, handoff) =
         OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())

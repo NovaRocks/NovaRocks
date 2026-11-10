@@ -19,8 +19,10 @@ use super::{
     OriginalTransportJoinObligation, TransportJoinHandoff, TransportJoinRegistration,
     TransportRegistrationState,
 };
-use crate::{control_runtime::actor::FrontendActor, task_execution::host::transport::BodyOutcome};
-use novarocks_attempt_protocol::effect::AttemptEffect;
+use crate::{
+    control_runtime::{actor::FrontendActor, transport_withdrawal::AttemptEffectEnvelope},
+    task_execution::host::transport::BodyOutcome,
+};
 use novarocks_control_runtime::{actor_turn::InputAuthor, causal_input::CausalInputObligation};
 use std::sync::Arc;
 
@@ -29,7 +31,7 @@ use std::sync::Arc;
 /// custody. In particular, it never implies that a send was withdrawn.
 #[must_use = "finish the original result input or give it to failure custody"]
 pub(crate) struct ReturnedActorTransportResult {
-    pub(crate) effect: Arc<AttemptEffect>,
+    pub(crate) effect: Arc<AttemptEffectEnvelope>,
     pub(crate) original: CausalInputObligation<FrontendActor>,
     pub(crate) outcome: Option<BodyOutcome>,
 }
@@ -43,7 +45,7 @@ impl TransportJoinHandoff {
     /// destroy its captures. Refusal preserves the original prepared job.
     pub(crate) fn bind_actor_result(
         &self,
-        effect: Arc<AttemptEffect>,
+        effect: Arc<AttemptEffectEnvelope>,
         expected: &InputAuthor,
         original: CausalInputObligation<FrontendActor>,
     ) -> Result<(), CausalInputObligation<FrontendActor>> {

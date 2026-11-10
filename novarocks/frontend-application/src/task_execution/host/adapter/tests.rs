@@ -425,11 +425,11 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         panic!("expected the original Core publication");
     };
     assert!(matches!(
-        effect.body,
+        effect.protocol.body,
         EffectBody::Publish(Publication::ProtocolBatch(_))
     ));
     assert_eq!(publication.descriptor.work, original_work.reference());
-    let effect = effect.id;
+    let effect = effect.protocol.id;
     let input = publication.input;
     runtime.effect_completed(publication).unwrap();
     runtime.retire_input(actor, input).unwrap();

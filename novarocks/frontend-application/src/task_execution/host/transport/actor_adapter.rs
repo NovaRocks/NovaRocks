@@ -23,16 +23,15 @@ use super::{
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
 };
 use crate::{
-    control_runtime::{actor::FrontendEffect, host::PreparedEffectJob},
+    control_runtime::{
+        actor::FrontendEffect, host::PreparedEffectJob, transport_withdrawal::AttemptEffectEnvelope,
+    },
     task_execution::host::custody::{
         CustodyError, TransportJoinHandoff, TransportJoinRegistration,
     },
 };
-use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
-use novarocks_control_runtime::{
-    actor_turn::InputAuthor,
-    exit_work::{HandoffCell, PanicSink},
-};
+use novarocks_attempt_protocol::effect::EffectBody;
+use novarocks_control_runtime::{actor_turn::InputAuthor, exit_work::PanicSink};
 use std::{alloc::Layout, sync::Arc};
 use tokio::runtime::Handle;
 
@@ -53,10 +52,9 @@ impl TransportCompletionObligation for ActorResultObligation {
 /// The original Source binds the same admitted job, launch authority and
 /// canonical grants before returning it to the common host.
 pub(crate) struct BoundActorTransport {
-    pub(crate) effect: Arc<AttemptEffect>,
+    pub(crate) effect: Arc<AttemptEffectEnvelope>,
     pub(crate) work: ActorTransportWork,
     pub(crate) launch: TransportJoinHandoff,
-    pub(crate) handoff: Arc<HandoffCell>,
     pub(crate) panic: PanicSink,
     /// Exact pre-paid position selected by the Source, which can belong to
     /// a purpose author admitted before the send's step guard is bound.
@@ -99,8 +97,14 @@ impl ActorTransportWork {
 
 /// The Source quotes the actual allocations, including the selected boxed
 /// native binding and the distinct actor-result wrapper.
-pub(crate) fn actor_transport_layouts(send: bool) -> [Layout; 3] {
-    [
+pub(crate) fn actor_transport_layouts(
+    send: bool,
+) -> Result<[Layout; 5], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+    use novarocks_control_runtime::exit_work::HandoffCell;
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    Ok([
+        arc_layout(Layout::new::<AttemptEffectEnvelope>())?,
+        arc_layout(Layout::new::<HandoffCell>())?,
         Layout::new::<BoundActorTransport>(),
         Layout::new::<ActorResultObligation>(),
         if send {
@@ -108,7 +112,7 @@ pub(crate) fn actor_transport_layouts(send: bool) -> [Layout; 3] {
         } else {
             Layout::new::<BoundQueue>()
         },
-    ]
+    ])
 }
 
 pub(crate) enum ActorTransportHandoff {
@@ -130,7 +134,7 @@ pub(crate) fn handoff_actor_transport(
         return Err(job);
     };
     if !Arc::ptr_eq(effect, &bound.effect)
-        || !bound.work.matches(&effect.body)
+        || !bound.work.matches(&effect.protocol.body)
         || !bound.launch.owns_exit(&job.exit)
     {
         return Err(job);
@@ -159,13 +163,16 @@ pub(crate) fn handoff_actor_transport(
     let BoundActorTransport {
         work,
         launch,
-        handoff,
         panic,
-        effect: _,
+        effect,
         result_author: _,
     } = *captures
         .downcast::<BoundActorTransport>()
         .expect("checked actor transport binding");
+    let handoff = effect
+        .handoff()
+        .expect("committed transport handoff")
+        .clone();
     let leg = |exit, registration| TransportLeg {
         exit,
         handoff,

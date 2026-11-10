@@ -1597,6 +1597,7 @@ pub struct EffectTicketView<E> {
 pub struct EffectTicket<E> {
     view: EffectTicketView<E>,
     origin: Arc<()>,
+    withdrawn: bool,
 }
 impl<E> std::ops::Deref for EffectTicket<E> {
     type Target = EffectTicketView<E>;
@@ -1922,6 +1923,7 @@ impl<A: Actor> FailurePublicationSession<A> {
                     .clone(),
             },
             origin: self.origin.clone(),
+            withdrawn: false,
         })
     }
     pub fn commit_snapshot<T>(
@@ -3642,6 +3644,15 @@ impl<A: Actor> ActorRuntime<A> {
         input: InputId,
         action: ActionId,
     ) -> Result<bool, ActorTurnError> {
+        self.effect_ready_for_dispatch(host, input, action, false)
+    }
+    pub(crate) fn effect_ready_for_dispatch(
+        &self,
+        host: &ActorHostTurn<A>,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<bool, ActorTurnError> {
         if !host.active || !self.same_runtime(&host.runtime) {
             return Err(ActorTurnError::EffectTicketOriginMismatch);
         }
@@ -3655,8 +3666,16 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        Self::effect_start_status(node, &inbox, &ledger, &execution_scope, input, action)
-            .map(|(ready, _)| ready)
+        Self::effect_start_status(
+            node,
+            &inbox,
+            &ledger,
+            &execution_scope,
+            input,
+            action,
+            withdrawn,
+        )
+        .map(|(ready, _)| ready)
     }
     fn effect_start_status(
         node: &ActorCell<A>,
@@ -3665,6 +3684,7 @@ impl<A: Actor> ActorRuntime<A> {
         execution_scope: &ScopeHandle,
         input: InputId,
         action: ActionId,
+        withdrawn: bool,
     ) -> Result<(bool, Generation), ActorTurnError> {
         let batch = inbox
             .batches
@@ -3701,7 +3721,10 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failed && inbox.failure_input != Some(input) {
             return Err(ActorTurnError::ActorFailed);
         }
+        // A withdrawn carrier may transfer metadata to run the existing
+        // unused teardown. Its original Work start gate remains closed.
         if stopped
+            && !withdrawn
             && descriptor.kind == novarocks_control_runtime_core::effect::EffectKind::Business
         {
             return Ok((false, author_generation));
@@ -3718,6 +3741,15 @@ impl<A: Actor> ActorRuntime<A> {
         input: InputId,
         action: ActionId,
     ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
+        self.take_effect_for_dispatch(actor, input, action, false)
+    }
+    pub(crate) fn take_effect_for_dispatch(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
         let node = self.node(actor)?;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         let execution_scope = node.scope.current_scope();
@@ -3727,8 +3759,15 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let (ready, author_generation) =
-            Self::effect_start_status(&node, &inbox, &ledger, &execution_scope, input, action)?;
+        let (ready, author_generation) = Self::effect_start_status(
+            &node,
+            &inbox,
+            &ledger,
+            &execution_scope,
+            input,
+            action,
+            withdrawn,
+        )?;
         if !ready {
             return Err(EffectError::NotReady.into());
         }
@@ -3772,6 +3811,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .clone(),
             },
             origin: node.origin.clone(),
+            withdrawn,
         })
     }
     /// Read-only validation of this original ticket's current publication
@@ -4051,7 +4091,7 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        self.validate_publication(&node, &inbox, &ledger, ticket, &execution_scope)?;
+        self.validate_started_ticket(&node, &inbox, &ledger, ticket, &execution_scope)?;
         let batch = inbox
             .batches
             .get_mut(&ticket.input)
@@ -4477,6 +4517,21 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(scope.generation())
     }
     fn validate_publication(
+        &self,
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        ticket: &EffectTicket<A::Effect>,
+        target: &ScopeHandle,
+    ) -> Result<(), ActorTurnError> {
+        if ticket.withdrawn {
+            return Err(EffectError::NotReady.into());
+        }
+        self.validate_started_ticket(node, inbox, ledger, ticket, target)
+    }
+    /// Includes a withdrawn carrier's claim on its still-unbound original
+    /// guard. Such a ticket cannot authorize Work start or publication.
+    fn validate_started_ticket(
         &self,
         node: &ActorCell<A>,
         inbox: &Inbox<A>,

@@ -41,7 +41,7 @@ use std::collections::BTreeSet;
 const CLEANUP_FENCE: u64 = u64::MAX;
 #[derive(Clone)]
 struct Planned {
-    value: u64,
+    effect: FrontendEffect,
     dependencies: Vec<u64>,
     work: ScopedWorkRef,
 }
@@ -67,16 +67,24 @@ impl TestActor for Emitter {
                 EffectDescriptor {
                     id: ActionId::new(index as u64 + 1).unwrap(),
                     work: planned.work,
-                    kind: EffectKind::Business,
+                    kind: match &planned.effect {
+                        FrontendEffect::Attempt(effect)
+                            if matches!(
+                                effect.protocol.body,
+                                novarocks_attempt_protocol::effect::EffectBody::Withdraw { .. }
+                            ) =>
+                        {
+                            EffectKind::Cleanup
+                        }
+                        _ => EffectKind::Business,
+                    },
                     dependencies: planned
                         .dependencies
                         .iter()
                         .map(|id| ActionId::new(*id).unwrap())
                         .collect(),
                 },
-                FrontendEffect::Test {
-                    value: planned.value,
-                },
+                planned.effect.clone(),
             )
             .unwrap();
         }
@@ -164,7 +172,8 @@ struct PurposeSource(Arc<Mutex<Bank>>);
 fn value(effect: &FrontendEffect) -> u64 {
     match effect {
         FrontendEffect::Test { value } => *value,
-        _ => panic!("attempt effect entered the test Source"),
+        FrontendEffect::Attempt(effect) => effect.protocol.id.get(),
+        _ => panic!("unexpected effect entered the test Source"),
     }
 }
 impl EffectSource for PurposeSource {
@@ -289,6 +298,13 @@ impl Fixture {
     // Each tuple is value/lane/dependencies; identities are correlations only.
     // Every author/loan comes from the same actual reserve/bind/registration.
     fn new(groups: Vec<Vec<(u64, u64, Vec<u64>)>>, full: &[u64]) -> Self {
+        Self::with_effects(groups, full, |value| FrontendEffect::Test { value })
+    }
+    fn with_effects(
+        groups: Vec<Vec<(u64, u64, Vec<u64>)>>,
+        full: &[u64],
+        make_effect: impl Fn(u64) -> FrontendEffect,
+    ) -> Self {
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
@@ -320,7 +336,7 @@ impl Fixture {
                     .bind(WorkKind::Business)
                     .unwrap();
                 batch.push(Planned {
-                    value,
+                    effect: make_effect(value),
                     dependencies,
                     work: work.reference(),
                 });
@@ -329,6 +345,10 @@ impl Fixture {
             }
             batches.push(batch);
         }
+        let attempts = batches
+            .iter()
+            .flatten()
+            .any(|entry| matches!(entry.effect, FrontendEffect::Attempt(_)));
         let runtime = ActorRuntime::new();
         let config = ActorConfig {
             mailbox: [32; 4],
@@ -420,9 +440,13 @@ impl Fixture {
             registration: registration.clone(),
             kind: FrontendActorKind::Test,
             config,
-            policy: FrontendLanePolicy {
-                lane,
-                per_step_inventory: max_effects,
+            policy: if attempts {
+                FrontendLanePolicy::attempt(max_effects)
+            } else {
+                FrontendLanePolicy {
+                    lane,
+                    per_step_inventory: max_effects,
+                }
             },
             source: Box::new(PurposeSource(bank.clone())),
             executor: executor.clone(),
@@ -885,4 +909,78 @@ fn inactive_financial_author_without_core_failure_preserves_the_original_typed_e
     assert!(!core_failed && empty);
     assert!(observed.visits.is_empty() && observed.borrowed.is_empty() && accepted.is_empty());
     assert_eq!(dropped, 1);
+}
+
+#[test]
+fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
+    use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
+    use novarocks_attempt_protocol::{
+        capacity::ReservationToken,
+        config::DispatchLane,
+        effect::{AttemptEffect, DispatchBatch, EffectBody, EffectClass},
+    };
+    use novarocks_control_runtime::exit_work::HandoffState;
+    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+    use novarocks_types::BackendProcessId;
+    use std::{num::NonZeroU64, time::Duration};
+
+    let send_id = AttemptActionId::new(NonZeroU64::MIN);
+    let send = AttemptEffectEnvelope::new(AttemptEffect {
+        id: send_id,
+        class: EffectClass::Business,
+        body: EffectBody::SendBatch {
+            batch: DispatchBatch {
+                backend: BackendProcessId::new_v7(),
+                lane: DispatchLane::Create,
+                control_progress: false,
+                operations: Box::new([]),
+                queued_bytes: 0,
+                queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                queued_inputs: Box::new([]),
+            },
+            reservation: ReservationToken(NonZeroU64::MIN),
+        },
+    });
+    let withdraw = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(NonZeroU64::new(2).unwrap()),
+        class: EffectClass::Cleanup,
+        body: EffectBody::Withdraw { effect: send_id },
+    });
+    let f = Fixture::with_effects(
+        vec![vec![(1, 1, vec![])], vec![(2, 2, vec![])]],
+        &[1],
+        |value| {
+            FrontendEffect::Attempt(if value == 1 {
+                send.clone()
+            } else {
+                withdraw.clone()
+            })
+        },
+    );
+    f.send(0);
+    let (_, idle_before) = f.to_idle();
+    let pending_before = send.handoff().unwrap().state();
+    f.send(1);
+    f.scope.request_stop().unwrap();
+    let (_, idle_after) = f.to_idle();
+    let (blocked, handed_off) = f.captured();
+    let withdrawn = send.handoff().unwrap().state();
+    f.release_credit(1);
+    let (_, idle_after_credit) = f.to_idle();
+    let (released, handed_off_after_credit) = f.captured();
+    let same_cell = f.executor.jobs.lock().unwrap().iter().any(|job| {
+        let FrontendEffect::Attempt(effect) = &job.effect else {
+            return false;
+        };
+        Arc::ptr_eq(effect.handoff().unwrap(), send.handoff().unwrap())
+    });
+    let (dropped, empty) = f.finish(false);
+    assert!(idle_before && idle_after && idle_after_credit && empty);
+    assert_eq!(pending_before, HandoffState::Pending);
+    assert_eq!(withdrawn, HandoffState::Withdrawn);
+    assert!(blocked.bound.is_empty() && handed_off.is_empty());
+    assert_eq!(released.bound, [1]);
+    assert_eq!(handed_off_after_credit, [1]);
+    assert!(same_cell);
+    assert_eq!(dropped, 2);
 }

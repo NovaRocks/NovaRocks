@@ -699,3 +699,52 @@ fn exact_readiness_rechecks_stop_and_scope_failure_before_ticket_claim() {
         initially_ready && stopped && no_new_borrow && failed && original_failure && failed_claim
     );
 }
+
+#[test]
+fn stopped_business_only_transfers_a_withdrawn_carrier_for_teardown() {
+    let mut f = Fixture::new();
+    let input = f.send(vec![effect(1, EffectRelease::Started, 10)]);
+    let mut dispatch =
+        EffectDispatch::with_completion_runtime(f.runtime.clone(), actor(), 2, Policy);
+    dispatch.index_committed(&f.runtime, 8).unwrap();
+    f.scope.request_stop().unwrap();
+    let host = f.runtime.claim_host_actor().unwrap();
+    let cell = Arc::new(HandoffCell::new());
+    let pending = dispatch
+        .peek_candidate_with_withdrawal(&f.runtime, &host, |_| Some(cell.clone()))
+        .unwrap()
+        .unwrap();
+    assert!(pending.metadata().is_none());
+    assert!(
+        dispatch
+            .claim_candidate(&f.runtime, &pending)
+            .unwrap()
+            .is_none()
+    );
+    cell.withdraw();
+    let withdrawn = dispatch
+        .peek_candidate_with_withdrawal(&f.runtime, &host, |_| Some(cell.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(withdrawn.effect_ref().input, input);
+    assert!(withdrawn.metadata().is_some());
+    let ticket = dispatch
+        .claim_candidate(&f.runtime, &withdrawn)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.runtime.validate_effect_ticket(&ticket),
+        Err(ActorTurnError::Effect(
+            novarocks_control_runtime_core::effect::EffectError::NotReady
+        ))
+    ));
+    assert!(matches!(
+        f.runtime.start_effect_work(&ticket, &mut f.work),
+        Err(ActorTurnError::Effect(
+            novarocks_control_runtime_core::effect::EffectError::NotReady
+        ))
+    ));
+    f.runtime.effect_completed(ticket).unwrap();
+    host.release(false).unwrap();
+    f.finish();
+}
