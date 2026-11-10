@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The original paid reply lane for Establish authorization and settlement.
+//! A paid reply lane for one original attempt port.
 
-use super::{ActorTransportWork, BodyOutcome, prepare_actor_transport};
+use super::{
+    ActorTransportWork, BodyOutcome, prepare_actor_transport,
+    process_observation::AttemptProcessObserver,
+};
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendEffect, FrontendInput},
@@ -25,8 +28,7 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::{
-        bridge::qa::{AttemptQaBridge, AttemptQaPortError, AttemptQaReply},
-        error::TaskExecutionError,
+        bridge::qa::AttemptQaBridge, error::TaskExecutionError,
         host::custody::ReturnedActorTransportResult,
     },
 };
@@ -60,19 +62,68 @@ use tokio::sync::Mutex;
 
 type Position = CausalInputObligation<FrontendActor>;
 
-pub(crate) struct BoundAttemptQa(Arc<Mutex<AttemptQaBridge>>);
-impl BoundAttemptQa {
+#[derive(Clone)]
+pub(crate) enum AttemptCallOwner {
+    Qa(Arc<Mutex<AttemptQaBridge>>),
+    Process(Arc<AttemptProcessObserver>),
+}
+
+impl AttemptCallOwner {
+    fn matches(&self, effect: &AttemptEffectEnvelope) -> bool {
+        match self {
+            Self::Qa(_) => effect.is_qa_call(),
+            Self::Process(_) => effect.is_process_call(),
+        }
+    }
+}
+
+pub(crate) struct AttemptCallReply {
+    input: AttemptInput,
+    failure: Option<(HostFailureRef, TaskExecutionError)>,
+}
+
+pub(crate) struct BoundAttemptCall(AttemptCallOwner);
+impl BoundAttemptCall {
+    pub(super) fn matches(&self, effect: &AttemptEffectEnvelope) -> bool {
+        self.0.matches(effect)
+    }
+
     pub(super) async fn run(
         self,
         effect: Arc<AttemptEffectEnvelope>,
-    ) -> Result<AttemptQaReply, AttemptQaPortError> {
-        let mut bridge = self.0.lock().await;
-        match &effect.protocol.body {
-            EffectBody::EstablishAuthorization { operation, request } => {
-                bridge.authorize(operation, request).await
+    ) -> Result<AttemptCallReply, Box<dyn std::any::Any + Send>> {
+        match self.0 {
+            AttemptCallOwner::Qa(bridge) => {
+                let mut bridge = bridge.lock().await;
+                let reply = match &effect.protocol.body {
+                    EffectBody::EstablishAuthorization { operation, request } => {
+                        bridge.authorize(operation, request).await
+                    }
+                    EffectBody::Port(port) => bridge.handle_port(port).await,
+                    _ => unreachable!("same original QA effect"),
+                }
+                .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
+                Ok(AttemptCallReply {
+                    input: AttemptInput::Port(reply.reply),
+                    failure: reply.failure,
+                })
             }
-            EffectBody::Port(port) => bridge.handle_port(port).await,
-            _ => unreachable!("same original QA effect"),
+            AttemptCallOwner::Process(observer) => {
+                let EffectBody::ObserveProcess {
+                    request,
+                    participation,
+                } = effect.protocol.body
+                else {
+                    unreachable!("same original Process effect");
+                };
+                let sample = observer
+                    .read(request, participation)
+                    .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
+                Ok(AttemptCallReply {
+                    input: AttemptInput::Executor(sample),
+                    failure: None,
+                })
+            }
         }
     }
 }
@@ -85,30 +136,30 @@ struct Live {
 }
 
 #[must_use = "retain the original QA result, input credit, and refused publication"]
-pub(crate) struct AttemptQaResultRefusal {
+pub(crate) struct AttemptCallResultRefusal {
     pub(crate) original: ReturnedActorTransportResult,
     pub(crate) publication: Option<CausalFillFailure<FrontendInput>>,
 }
 
-pub(crate) struct AttemptQaSource {
+pub(crate) struct AttemptCallSource {
     scope: ScopeHandle,
     generation: Generation,
     parent: ReservationId,
     observer: ConsumerId,
-    bridge: Option<Arc<Mutex<AttemptQaBridge>>>,
+    owner: Option<AttemptCallOwner>,
     idle: Option<Position>,
     pending: Option<(Arc<AttemptEffectEnvelope>, ReportedWork)>,
     live: Option<Live>,
     failures: BTreeMap<HostFailureRef, TaskExecutionError>,
 }
 
-impl AttemptQaSource {
+impl AttemptCallSource {
     pub(crate) fn new(
         parent: &WorkObligation,
         payer: &ReservationObligation,
         generation: Generation,
         observer: ConsumerId,
-        bridge: AttemptQaBridge,
+        owner: AttemptCallOwner,
         position: Position,
     ) -> Self {
         let scope = parent.scope().clone();
@@ -118,7 +169,7 @@ impl AttemptQaSource {
             generation,
             parent: payer.id(),
             observer,
-            bridge: Some(Arc::new(Mutex::new(bridge))),
+            owner: Some(owner),
             idle: Some(position),
             pending: None,
             live: None,
@@ -134,7 +185,11 @@ impl AttemptQaSource {
         &mut self,
         effect: &Arc<AttemptEffectEnvelope>,
     ) -> Result<Option<Position>, RuntimeError> {
-        assert!(effect.is_qa_call());
+        assert!(
+            self.owner
+                .as_ref()
+                .is_some_and(|owner| owner.matches(effect))
+        );
         assert!(self.pending.is_none());
         if self.idle.is_none() {
             return Ok(None);
@@ -213,13 +268,9 @@ impl AttemptQaSource {
                 })
                 .is_none()
         );
-        let bridge = self
-            .bridge
-            .as_ref()
-            .expect("original QA executor owner")
-            .clone();
+        let owner = self.owner.as_ref().expect("original call owner").clone();
         prepare_actor_transport(effect, result, work, VecDeque::new(), self.observer, |_| {
-            ActorTransportWork::Qa(BoundAttemptQa(bridge))
+            ActorTransportWork::Call(BoundAttemptCall(owner))
         })
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
     }
@@ -255,35 +306,35 @@ impl AttemptQaSource {
             || closing
                 && self.pending.is_none()
                 && self.live.is_none()
-                && self.bridge.is_some()
+                && self.owner.is_some()
                 && (self.idle.is_some() || self.failures.is_empty())
     }
 
     pub(crate) fn accept(
         &mut self,
         mut original: ReturnedActorTransportResult,
-    ) -> Result<(), AttemptQaResultRefusal> {
+    ) -> Result<(), AttemptCallResultRefusal> {
         let live = self
             .live
             .as_mut()
             .expect("original QA result has a live role");
         assert!(Arc::ptr_eq(&original.effect, &live.effect));
-        if !matches!(&original.outcome, Some(BodyOutcome::Qa(_))) {
-            return Err(AttemptQaResultRefusal {
+        if !matches!(&original.outcome, Some(BodyOutcome::Call(_))) {
+            return Err(AttemptCallResultRefusal {
                 original,
                 publication: None,
             });
         }
-        let Some(BodyOutcome::Qa(AttemptQaReply { reply, failure })) = original.outcome.take()
+        let Some(BodyOutcome::Call(AttemptCallReply { input, failure })) = original.outcome.take()
         else {
             unreachable!("validated original QA outcome");
         };
         if let Some((reference, failure)) = failure {
             assert!(self.failures.insert(reference, failure).is_none());
         }
-        let input = FrontendInput::Attempt(Box::new(AttemptInput::Port(reply)));
+        let input = FrontendInput::Attempt(Box::new(input));
         if let Err(publication) = original.original.fill_with_receipt(None, input) {
-            return Err(AttemptQaResultRefusal {
+            return Err(AttemptCallResultRefusal {
                 original,
                 publication: Some(publication),
             });
@@ -329,19 +380,19 @@ impl AttemptQaSource {
         Ok(true)
     }
 
-    pub(crate) fn take_drained_bridge(&mut self) -> Option<Arc<Mutex<AttemptQaBridge>>> {
+    pub(crate) fn take_drained_owner(&mut self) -> Option<AttemptCallOwner> {
         if self.idle.is_none()
             && self.pending.is_none()
             && self.live.is_none()
             && self.failures.is_empty()
         {
-            self.bridge.take()
+            self.owner.take()
         } else {
             None
         }
     }
 
     pub(super) fn is_drained(&self) -> bool {
-        self.bridge.is_none()
+        self.owner.is_none()
     }
 }

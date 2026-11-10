@@ -557,6 +557,10 @@ impl WithdrawalInbox {
     }
 
     fn try_commit_attempt(&self) -> Option<(InputId, AttemptInput)> {
+        self.try_commit_attempt_from(self.source)
+    }
+
+    fn try_commit_attempt_from(&self, source: ActorId) -> Option<(InputId, AttemptInput)> {
         if self.observed.lock().unwrap().is_empty() {
             self.runtime.poll_one(Tick(1)).unwrap();
         }
@@ -565,7 +569,7 @@ impl WithdrawalInbox {
             return None;
         }
         let (envelope, fact) = observed.remove(0);
-        assert_eq!(envelope.source, self.source);
+        assert_eq!(envelope.source, source);
         assert_eq!(envelope.class, InputClass::Lifecycle);
         Some((envelope.input, fact))
     }
@@ -758,6 +762,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
                 EffectSource, FrontendLanePolicy, HostBinding, HostRegistry, PendingHandoff,
                 PreparedEffectJob, SourceProgress,
             },
+            membership::FrozenMember,
             metrics::FrontendHostObservations,
             transport_withdrawal::AttemptEffectEnvelope,
         },
@@ -765,23 +770,26 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         task_execution::{
             actor_gate::tests::logical_execution,
             bridge::qa::AttemptQaBridge,
-            host::transport::{ActorTransportExecutor, AttemptEstablishMaterial, AttemptQaSource},
+            host::transport::{
+                ActorTransportExecutor, AttemptCallOwner, AttemptCallSource,
+                AttemptEstablishMaterial, AttemptProcessObserver,
+            },
             sources::AttemptEstablishFacts,
         },
     };
     use novarocks_attempt_protocol::effect::{
         AttemptEffect, EffectBody, EffectClass, OperationIntent,
     };
-    use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket, ProcessClock};
+    use novarocks_control_runtime::actor_turn::{ActorHostTurn, Clock, EffectTicket, ProcessClock};
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
         AttemptAuthorizationRef, AttemptIssueSettlement, AttemptRequestToken, AttemptToLogical,
-        AttemptToLogicalBody, LogicalToAttemptBody,
+        AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
         LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind, OperationOutcome,
-        ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId,
+        ParticipationAdmissionTicketReceipt, ParticipationRef, RuntimeEndpoint, TaskOperationId,
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
@@ -789,13 +797,15 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     };
     use std::{num::NonZeroU64, time::Duration};
 
-    struct QaOnly {
-        source: Arc<Mutex<AttemptQaSource>>,
+    struct Calls {
+        source: Arc<Mutex<AttemptCallSource>>,
+        process: Arc<Mutex<AttemptCallSource>>,
+        process_pending: bool,
         scope: ScopeHandle,
         published: Arc<AtomicUsize>,
         closed: bool,
     }
-    impl EffectSource for QaOnly {
+    impl EffectSource for Calls {
         fn prepay_result(
             &mut self,
             effect: &FrontendEffect,
@@ -803,7 +813,13 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             let FrontendEffect::Attempt(effect) = effect else {
                 unreachable!()
             };
-            self.source.lock().unwrap().prepay(effect).unwrap()
+            self.process_pending = effect.is_process_call();
+            let source = if self.process_pending {
+                &self.process
+            } else {
+                &self.source
+            };
+            source.lock().unwrap().prepay(effect).unwrap()
         }
         fn bind_job(
             &mut self,
@@ -812,14 +828,29 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             ticket: &EffectTicket<FrontendEffect>,
             result: CausalInputObligation<FrontendActor>,
         ) -> PreparedEffectJob {
-            self.source.lock().unwrap().bind(ticket, result)
+            let source = if self.process_pending {
+                &self.process
+            } else {
+                &self.source
+            };
+            source.lock().unwrap().bind(ticket, result)
         }
         fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
-            self.source.lock().unwrap().return_unclaimed(result);
+            let source = if self.process_pending {
+                &self.process
+            } else {
+                &self.source
+            };
+            source.lock().unwrap().return_unclaimed(result);
         }
         fn core_consumed(&mut self, _: &[InputId]) {}
         fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
-            let mut source = self.source.lock().unwrap();
+            let source = if effect.get() == 6 {
+                &self.process
+            } else {
+                &self.source
+            };
+            let mut source = source.lock().unwrap();
             match event {
                 TransportSourceEvent::Result(original) => {
                     source
@@ -848,13 +879,47 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             _: Tick,
             budget: usize,
         ) -> SourceProgress {
-            let progressed = budget != 0 && self.source.lock().unwrap().retire_result().unwrap();
+            let mut progressed = false;
+            let mut units = 0;
+            for source in [&self.source, &self.process].into_iter().take(budget) {
+                units += 1;
+                progressed |= source.lock().unwrap().retire_result().unwrap();
+            }
             SourceProgress {
-                units: usize::from(budget != 0),
+                units,
                 progressed,
                 more: false,
                 retired: self.closed && self.scope.join_ready().unwrap(),
             }
+        }
+    }
+
+    use novarocks_query_application::api::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    };
+
+    struct FrozenProcess {
+        original: ParticipationRef,
+        endpoint: RuntimeEndpoint,
+        replacement: BackendProcessId,
+    }
+    impl BackendProcessObservationPort for FrozenProcess {
+        fn observe_process_at_endpoint(
+            &self,
+            expected: BackendProcessId,
+            endpoint: &RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, BackendTopologyError> {
+            assert_eq!(expected, self.original.backend_process_id());
+            assert_eq!(endpoint, &self.endpoint);
+            Ok(BackendProcessObservation::Replaced {
+                current_process: self.replacement,
+            })
+        }
+    }
+    struct SampleClock;
+    impl Clock for SampleClock {
+        fn now(&self) -> Tick {
+            Tick(1)
         }
     }
 
@@ -990,14 +1055,75 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             .into_iter()
             .all(|effect| effect.handoff().is_none())
     );
-    let inbox = WithdrawalInbox::with_effect(&fixture.scope, [begin, grant, first, second]);
-    let source = Arc::new(Mutex::new(AttemptQaSource::new(
+    let permission = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(id(5)),
+        class: EffectClass::Settlement,
+        body: EffectBody::Port(port(5, AttemptToLogicalBody::PreReadyReplacementQuery {
+            token: token(5),
+            refusal: novarocks_attempt_protocol::failure::AttemptFailure::TaskProtocol(Box::new(
+                novarocks_attempt_protocol::error::TaskExecutionError::PreReadyEstablishRejected {
+                    participation, operation_id,
+                    rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                        outcome: OperationOutcome::IdentityMismatch, detail: None, acknowledgement: None,
+                    },
+                },
+            )),
+        })),
+    });
+    let sample = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(id(6)),
+        class: EffectClass::Settlement,
+        body: EffectBody::ObserveProcess {
+            request: token(6),
+            participation,
+        },
+    });
+    let mailbox = [8; 4];
+    let inbox = WithdrawalInbox::with_commands(
+        &fixture.scope,
+        [begin, grant, first, second, permission, sample].map(|effect| (effect, None)),
+        mailbox,
+    );
+    let source = Arc::new(Mutex::new(AttemptCallSource::new(
         &parent,
         &payer,
         generation,
         observer(),
-        AttemptQaBridge::new(Arc::new(drive), compatibility, Arc::new(material)),
+        AttemptCallOwner::Qa(Arc::new(tokio::sync::Mutex::new(AttemptQaBridge::new(
+            Arc::new(drive),
+            compatibility,
+            Arc::new(material),
+        )))),
         inbox.reserve_result(&parent),
+    )));
+    let endpoint = RuntimeEndpoint::new("127.0.0.1", 1701).unwrap();
+    let replacement = BackendProcessId::new_v7();
+    let process_source = ActorId::new(3).unwrap();
+    let process = Arc::new(Mutex::new(AttemptCallSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer(),
+        AttemptCallOwner::Process(Arc::new(AttemptProcessObserver::new(
+            Arc::new(FrozenProcess {
+                original: participation,
+                endpoint: endpoint.clone(),
+                replacement,
+            }),
+            Arc::from([FrozenMember {
+                participation,
+                endpoint,
+            }]),
+            Arc::new(SampleClock),
+        ))),
+        CausalInputObligation::reserve_admitted(
+            &inbox.runtime,
+            &inbox.registration,
+            process_source,
+            InputClass::Lifecycle,
+            &parent,
+        )
+        .unwrap(),
     )));
     let published = Arc::new(AtomicUsize::new(0));
     let host = HostRegistry::new(
@@ -1012,13 +1138,18 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         scope: fixture.scope.clone(),
         registration: inbox.registration.clone(),
         kind: FrontendActorKind::Test,
-        config: WithdrawalInbox::CONFIG,
+        config: ActorConfig {
+            mailbox,
+            ..WithdrawalInbox::CONFIG
+        },
         policy: FrontendLanePolicy::attempt(1),
         executor: Arc::new(ActorTransportExecutor(handle.clone())),
-        source: Box::new(QaOnly {
+        source: Box::new(Calls {
             scope: fixture.scope.clone(),
             source: source.clone(),
             published: published.clone(),
+            process: process.clone(),
+            process_pending: false,
             closed: false,
         }),
         transport: Some(TransportRetirements::new(
@@ -1101,11 +1232,44 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     );
     retire_commands(commands);
     drive_host();
+    // QA permission and the independent residual convergence process read
+    // have different source authors and neither can stand in for the other.
+    let permission_command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    await_reply(5).await;
+    assert!(
+        matches!(commit_reply(), LogicalToAttemptBody::PreReadyReplacementReply {
+        token: reply_token, may_observe: false,
+    } if reply_token == token(5))
+    );
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), permission_command)
+        .unwrap();
+    let sample_command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    await_reply(6).await;
+    assert!(matches!(inbox.try_commit_attempt_from(process_source),
+        Some((_, AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+            request, participation: exact, sampled_at,
+            observation: novarocks_attempt_protocol::input::MembershipObservation::ExactReplacement(observed),
+        }))) if request == token(6) && exact == participation && observed == replacement
+            && sampled_at == MonotonicInstant::from_origin(Duration::from_nanos(1))));
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), sample_command)
+        .unwrap();
+    drive_host();
+    let mut sample_owner = process.lock().unwrap();
+    assert!(sample_owner.close_idle().unwrap());
+    let process_owner = sample_owner
+        .take_drained_owner()
+        .expect("original Process owner retired");
+    drop(sample_owner);
+    drop(process_owner);
     let mut qa = source.lock().unwrap();
     assert!(qa.close_idle().unwrap());
-    let bridge = qa
-        .take_drained_bridge()
-        .expect("original QA bridge retired");
+    let bridge = qa.take_drained_owner().expect("original QA bridge retired");
     drop(qa);
     drop(bridge);
     parent.body_exited().unwrap();

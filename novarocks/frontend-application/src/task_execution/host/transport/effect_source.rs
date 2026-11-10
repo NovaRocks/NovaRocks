@@ -18,7 +18,7 @@
 //! Composition of the original admission and SendBatch Sources.
 
 use super::{
-    ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptQaSource, BodyOutcome,
+    ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource, BodyOutcome,
     FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
     SendKey, SendMemberReport, SendReportRows, send_reports::close_unlaunched,
 };
@@ -87,7 +87,7 @@ pub(crate) struct AttemptSendSource {
 
 enum Prepaid {
     Admission,
-    Qa,
+    Call(usize),
     Send(usize, Box<PreparedActorSend>),
     Other,
 }
@@ -122,7 +122,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    qa: Option<AttemptQaSource>,
+    calls: [Option<AttemptCallSource>; 2],
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -133,6 +133,7 @@ pub(crate) struct AttemptTransportSource {
     send_ready: VecDeque<AttemptActionId>,
     send_scan: usize,
     admission_scan: usize,
+    call_scan: usize,
     pending: Option<Prepaid>,
     failure: Option<FailureContext>,
     supervisor: Option<Supervisor>,
@@ -148,13 +149,18 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        qa: Option<AttemptQaSource>,
+        calls: [Option<AttemptCallSource>; 2],
         send: AttemptSendSource,
         failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
-        assert!(qa.as_ref().is_none_or(|qa| qa.matches_scope(&scope)));
+        assert!(
+            calls
+                .iter()
+                .flatten()
+                .all(|source| source.matches_scope(&scope))
+        );
         assert!(scope.same_scope(send.report_author.work().scope()));
         let capacity = send.idle.iter().map(VecDeque::len).sum();
         Self {
@@ -163,7 +169,7 @@ impl AttemptTransportSource {
             native_source,
             scope,
             admission,
-            qa,
+            calls,
             requests: send.requests,
             contexts: send.contexts,
             report_references: send.report_references,
@@ -174,6 +180,7 @@ impl AttemptTransportSource {
             send_ready: VecDeque::with_capacity(capacity),
             send_scan: 0,
             admission_scan: 0,
+            call_scan: 0,
             pending: None,
             failure: Some(failure.0),
             supervisor: Some(Supervisor::Armed(failure.1)),
@@ -185,7 +192,11 @@ impl AttemptTransportSource {
 
     fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
         let closing = self.result_admission_closed()
-            && self.qa.as_ref().is_none_or(AttemptQaSource::is_drained);
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_drained);
         match self.supervisor.as_mut() {
             Some(Supervisor::Armed(_)) if closing => {
                 let actor = self.registration.actor();
@@ -392,14 +403,14 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
-            if original.is_qa_call() {
-                let result = self
-                    .qa
+            if original.is_qa_call() || original.is_process_call() {
+                let lane = usize::from(original.is_process_call());
+                let result = self.calls[lane]
                     .as_mut()
-                    .expect("original Establish QA Source")
+                    .expect("original attempt call Source")
                     .prepay(original)
-                    .expect("original QA prepayment")?;
-                self.pending = Some(Prepaid::Qa);
+                    .expect("original call prepayment")?;
+                self.pending = Some(Prepaid::Call(lane));
                 return Some(result);
             }
             match original.protocol.body {
@@ -444,12 +455,12 @@ impl EffectSource for AttemptTransportSource {
         result: Position,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::Qa => {
+            Prepaid::Call(lane) => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
                 };
                 assert!(self.in_flight.insert(effect.protocol.id));
-                Ok(self.qa.as_mut().unwrap().bind(ticket, result))
+                Ok(self.calls[lane].as_mut().unwrap().bind(ticket, result))
             }
             Prepaid::Admission => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
@@ -515,7 +526,7 @@ impl EffectSource for AttemptTransportSource {
 
     fn return_unclaimed_result(&mut self, result: Position) {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::Qa => self.qa.as_mut().unwrap().return_unclaimed(result),
+            Prepaid::Call(lane) => self.calls[lane].as_mut().unwrap().return_unclaimed(result),
             Prepaid::Admission => self.admission.return_unclaimed(result),
             Prepaid::Other => self.other.return_unclaimed_result(result),
             Prepaid::Send(lane, prepared) => {
@@ -530,16 +541,21 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
-        if let Some(qa) = self.qa.as_mut().filter(|qa| qa.owns(effect)) {
+        if let Some(source) = self
+            .calls
+            .iter_mut()
+            .flatten()
+            .find(|source| source.owns(effect))
+        {
             match event {
                 TransportSourceEvent::Result(original) => {
-                    if let Err(refused) = qa.accept(original) {
+                    if let Err(refused) = source.accept(original) {
                         self.other.retain_transport_failure(Box::new(refused));
                     }
                 }
                 TransportSourceEvent::Retired => {
                     assert!(self.in_flight.remove(&effect));
-                    qa.transport_retired(effect);
+                    source.transport_retired(effect);
                 }
                 original => self.other.transport_event(effect, original),
             }
@@ -644,14 +660,23 @@ impl EffectSource for AttemptTransportSource {
         let mut units = 0;
         let mut progressed = false;
         let closing = self.result_admission_closed();
-        if units < budget
-            && let Some(qa) = self.qa.as_mut().filter(|qa| qa.needs_progress(closing))
-        {
+        for _ in 0..self.calls.len() {
+            if units == budget {
+                break;
+            }
+            let lane = self.call_scan;
+            self.call_scan = (lane + 1) % self.calls.len();
+            let Some(source) = self.calls[lane]
+                .as_mut()
+                .filter(|source| source.needs_progress(closing))
+            else {
+                continue;
+            };
             units += 1;
-            progressed |= qa.retire_result().expect("original QA result");
+            progressed |= source.retire_result().expect("original call result");
             if closing {
-                progressed |= qa.close_idle().expect("original idle QA role");
-                if let Some(original) = qa.take_drained_bridge() {
+                progressed |= source.close_idle().expect("original idle call role");
+                if let Some(original) = source.take_drained_owner() {
                     self.other.retain_transport_release(Box::new(original));
                     progressed = true;
                 }
@@ -744,7 +769,11 @@ impl EffectSource for AttemptTransportSource {
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
         progress.retired &= self.supervisor.is_none()
-            && self.qa.as_ref().is_none_or(AttemptQaSource::is_drained)
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_drained)
             && self.report_author.is_none()
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()

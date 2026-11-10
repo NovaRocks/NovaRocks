@@ -49,8 +49,11 @@ pub(crate) mod metrics;
 use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
-use crate::task_execution::host::adapter::{AttemptStartup, PreparedAttemptHost};
+use crate::task_execution::host::adapter::{
+    AttemptActorRegistration, AttemptRegistrationError, AttemptStartup, PreparedAttemptHost,
+};
 use crate::task_execution::host::failure_bridge::{FailureBridge, PendingFailureBridge};
+use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
 use membership::{
@@ -111,6 +114,7 @@ pub(crate) struct FrontendControlRuntime {
     members: Arc<MembershipRegistry>,
     member_observer: MembershipObserver,
     backend_processes: Arc<dyn BackendProcessObservationPort>,
+    clock: Arc<dyn Clock>,
     pollers: Option<PollerPool<FrontendActor>>,
     membership_joined: bool,
     observation: RuntimeObservation,
@@ -184,7 +188,7 @@ impl FrontendControlRuntime {
         let dispatch = host.clone();
         let pollers = PollerPool::start_with_host(
             runtime.clone(),
-            clock,
+            clock.clone(),
             config.pollers.get(),
             move |now, turn| dispatch.drive(now, turn),
         )
@@ -202,12 +206,30 @@ impl FrontendControlRuntime {
             members,
             member_observer,
             backend_processes,
+            clock,
             pollers: Some(pollers),
             membership_joined: false,
             observation,
             host_observation,
         })
     }
+    pub(crate) fn prepare_attempt_process_source(
+        &self,
+        registration: &AttemptActorRegistration,
+        parent: &novarocks_control_runtime::obligation::WorkObligation,
+        payer: &novarocks_control_runtime::obligation::ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+    ) -> Result<AttemptCallSource, AttemptRegistrationError> {
+        registration.prepare_process_source(
+            &self.runtime,
+            parent,
+            payer,
+            observer,
+            self.backend_processes.clone(),
+            self.clock.clone(),
+        )
+    }
+
     pub(crate) fn actor_runtime(&self) -> &ActorRuntime<FrontendActor> {
         &self.runtime
     }

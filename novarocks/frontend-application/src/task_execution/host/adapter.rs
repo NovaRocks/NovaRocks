@@ -92,6 +92,7 @@ pub(crate) struct AttemptActorRegistration {
     scope: ScopeHandle,
     native_source: ActorId,
     qa_source: ActorId,
+    process_source: ActorId,
     capacity_source: ActorId,
     observation_source: ActorId,
     membership_source: ActorId,
@@ -131,7 +132,8 @@ pub(crate) struct PreparedAttemptHost {
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
-    pub(crate) qa: super::transport::AttemptQaSource,
+    pub(crate) qa: super::transport::AttemptCallSource,
+    pub(crate) process: super::transport::AttemptCallSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -261,35 +263,82 @@ impl AttemptActorRegistration {
         payer: &ReservationObligation,
         observer: novarocks_control_runtime_core::identity::ConsumerId,
         bridge: crate::task_execution::bridge::qa::AttemptQaBridge,
-    ) -> Result<super::transport::AttemptQaSource, AttemptRegistrationError> {
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
+        if bridge.activation() != self.root_control.activation() {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "QA Source belongs to another original activation",
+            ));
+        }
+        self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.qa_source,
+            super::transport::AttemptCallOwner::Qa(Arc::new(tokio::sync::Mutex::new(bridge))),
+        )
+    }
+
+    pub(crate) fn prepare_process_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        source: novarocks_query_application::api::BackendProcessObservationService,
+        clock: Arc<dyn novarocks_control_runtime::actor_turn::Clock>,
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
+        let original = super::transport::AttemptProcessObserver::new(
+            source,
+            self.failure_members.clone(),
+            clock,
+        );
+        self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.process_source,
+            super::transport::AttemptCallOwner::Process(Arc::new(original)),
+        )
+    }
+
+    fn prepare_call_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        source: ActorId,
+        owner: super::transport::AttemptCallOwner,
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
         let binding = self
             .binding
             .get()
             .ok_or(AttemptRegistrationError::InvalidConfig(
-                "Establish QA Source requires its original attempt binding",
+                "call Source requires its original attempt binding",
             ))?;
-        if bridge.activation() != self.root_control.activation()
-            || !self.scope.same_scope(parent.scope())
+        if !self.scope.same_scope(parent.scope())
             || !payer.belongs_to_bound_work(&self.scope, parent.id())
         {
             return Err(AttemptRegistrationError::InvalidConfig(
-                "Establish QA Source belongs to another original attempt",
+                "call Source belongs to another original attempt",
             ));
         }
         let position = CausalInputObligation::reserve_admitted(
             runtime,
             &self.original,
-            self.qa_source,
+            source,
             InputClass::Lifecycle,
             parent,
         )
         .map_err(AttemptRegistrationError::Runtime)?;
-        Ok(super::transport::AttemptQaSource::new(
+        Ok(super::transport::AttemptCallSource::new(
             parent,
             payer,
             binding.generation,
             observer,
-            bridge,
+            owner,
             position,
         ))
     }
@@ -406,6 +455,7 @@ impl AttemptActorRegistration {
             retirement,
             admission,
             qa,
+            process,
             send,
             executor: native,
             failure,
@@ -435,7 +485,7 @@ impl AttemptActorRegistration {
                     self.native_source,
                     self.scope.clone(),
                     admission,
-                    Some(qa),
+                    [Some(qa), Some(process)],
                     send,
                     (
                         FailureContext {
@@ -714,6 +764,7 @@ impl AttemptActor {
         let actor = runtime_source(start.sources.actor);
         let native = runtime_source(start.sources.native);
         let qa_source = runtime_source(start.sources.qa);
+        let process_source = runtime_source(start.sources.process);
         let capacity_source = runtime_source(start.sources.capacity);
         let observation_source = runtime_source(start.sources.observation);
         let membership_source = runtime_source(start.sources.membership);
@@ -764,6 +815,7 @@ impl AttemptActor {
             scope,
             native_source: native,
             qa_source,
+            process_source,
             capacity_source,
             observation_source,
             membership_source,

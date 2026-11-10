@@ -19,7 +19,7 @@
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
     ActorSendReports,
-    qa_source::BoundAttemptQa,
+    call_source::BoundAttemptCall,
     queued_job::{BoundQueue, QueueJob, run as run_queue},
     send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
@@ -74,7 +74,7 @@ pub(crate) struct BoundActorTransport {
 pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
     Admit(Box<BoundQueue>),
-    Qa(BoundAttemptQa),
+    Call(BoundAttemptCall),
 }
 impl ActorTransportWork {
     fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
@@ -110,7 +110,7 @@ impl ActorTransportWork {
                     && bound.key.generation == *generation
                     && bound.control == operation.requires_control_progress()
             }
-            (Self::Qa(_), _) => effect.is_qa_call(),
+            (Self::Call(call), _) => call.matches(effect),
             _ => false,
         }
     }
@@ -118,7 +118,7 @@ impl ActorTransportWork {
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
             Self::Send(send) => send.reports.actor().cloned(),
-            Self::Admit(_) | Self::Qa(_) => None,
+            Self::Admit(_) | Self::Call(_) => None,
         }
     }
 }
@@ -283,11 +283,11 @@ pub(crate) fn handoff_actor_transport(
                 bound,
             })
         }),
-        ActorTransportWork::Qa(bound) => {
+        ActorTransportWork::Call(bound) => {
             launch.spawn(runtime, exit, |exit, registration| async move {
                 let outcome = match run_future(exit, bound.run(effect), panic).await {
-                    Ok(Ok(reply)) => BodyOutcome::Qa(reply),
-                    Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
+                    Ok(Ok(reply)) => BodyOutcome::Call(reply),
+                    Ok(Err(error)) => BodyOutcome::RawFailure(error),
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };
                 if let Err(original) = registration.stage_actor_outcome(outcome) {

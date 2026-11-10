@@ -57,6 +57,7 @@ impl AttemptEffectEnvelope {
                 port.body,
                 AttemptToLogicalBody::EstablishSettlement { .. }
                     | AttemptToLogicalBody::DetachEstablish { .. }
+                    | AttemptToLogicalBody::PreReadyReplacementQuery { .. }
                     | AttemptToLogicalBody::AuthorizationRequest {
                         request: AttemptAuthorization::BeginAdmission(_)
                             | AttemptAuthorization::SettleAdmission { .. }
@@ -69,7 +70,11 @@ impl AttemptEffectEnvelope {
     }
 
     pub(crate) fn uses_join_custody(&self) -> bool {
-        self.handoff.is_some() || self.is_qa_call()
+        self.handoff.is_some() || self.is_qa_call() || self.is_process_call()
+    }
+
+    pub(crate) fn is_process_call(&self) -> bool {
+        matches!(self.protocol.body, EffectBody::ObserveProcess { .. })
     }
 
     pub(crate) fn retire_handoff(&self) {
