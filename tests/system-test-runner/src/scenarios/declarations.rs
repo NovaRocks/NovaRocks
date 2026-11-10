@@ -729,32 +729,11 @@ pub(super) fn for_module(
             ("AWS_S3_ACCESS_KEY_ID", "value"),
             ("AWS_S3_SECRET_ACCESS_KEY", "value"),
         ],
-        "uea4_range_reads" => &[
-            ("NOVAROCKS_UEA4A2_FIXTURE_MANIFEST", "file-content"),
-            ("NOVAROCKS_ICEBERG_SHORT_FIXTURE_MANIFEST", "file-content"),
-            ("NOVAROCKS_UEA4A2_S3_ACCESS_KEY_ID", "value"),
-            ("NOVAROCKS_UEA4A2_S3_SECRET_ACCESS_KEY", "value"),
-            ("AWS_S3_ACCESS_KEY_ID", "value"),
-            ("AWS_S3_SECRET_ACCESS_KEY", "value"),
-        ],
         "uea4_catalog_planning" => &[
             ("NOVAROCKS_UEA4A4_ICEBERG_FIXTURE_MANIFEST", "file-content"),
             ("NOVAROCKS_UEA4A4_PAIMON_FIXTURE_MANIFEST", "file-content"),
             ("NOVAROCKS_UEA4A4_S3_ACCESS_KEY_ID", "value"),
             ("NOVAROCKS_UEA4A4_S3_SECRET_ACCESS_KEY", "value"),
-            ("AWS_S3_ACCESS_KEY_ID", "value"),
-            ("AWS_S3_SECRET_ACCESS_KEY", "value"),
-        ],
-        "iceberg_delete_applicability" => &[
-            ("NOVAROCKS_UEA4G_NATIVE_MANIFEST", "file-content"),
-            ("AWS_S3_ACCESS_KEY_ID", "value"),
-            ("AWS_S3_SECRET_ACCESS_KEY", "value"),
-        ],
-        "iceberg_delete_warm" => &[
-            ("NOVAROCKS_ICEBERG_DELETE_CORPUS_RECEIPT", "file-content"),
-            ("NOVAROCKS_ICEBERG_REST_URI", "value"),
-            ("NOVAROCKS_ICEBERG_REST_WAREHOUSE", "value"),
-            ("AWS_S3_ENDPOINT", "value"),
             ("AWS_S3_ACCESS_KEY_ID", "value"),
             ("AWS_S3_SECRET_ACCESS_KEY", "value"),
         ],
@@ -772,7 +751,13 @@ pub(super) fn for_module(
     if module.starts_with("mv_")
         || matches!(
             module,
-            "catalog_publication" | "sql_client_ctas" | "table_maintenance" | "listing_real_rest"
+            "catalog_publication"
+                | "sql_client_ctas"
+                | "table_maintenance"
+                | "listing_real_rest"
+                | "uea4_range_reads"
+                | "iceberg_delete_applicability"
+                | "iceberg_delete_warm"
         )
         || name.contains("vended-")
     {
@@ -797,23 +782,34 @@ pub(super) fn for_module(
     }
     if matches!(
         module,
-        "paimon"
-            | "uea4_scan_readiness"
-            | "uea4_range_reads"
-            | "uea4_catalog_planning"
-            | "iceberg_delete_applicability"
-            | "frontend_lifecycle"
+        "paimon" | "uea4_scan_readiness" | "uea4_catalog_planning" | "frontend_lifecycle"
     ) {
         declaration.initial_state = None;
         declaration.basis = Some(
             "Uses externally prepared or shared provider state; an invocation-wide reset or immutability contract has not been established.",
         );
     }
-    if module == "iceberg_delete_warm" {
-        declaration.initial_state = Some("reset");
+    if matches!(
+        module,
+        "uea4_range_reads" | "iceberg_delete_applicability" | "iceberg_delete_warm"
+    ) {
+        declaration.initial_state = Some("isolated");
         declaration.basis = Some(
-            "Reads independently verified corpus snapshots; writes only an invocation-derived namespace and removes its table and namespace before completion.",
+            "Creates and verifies deterministic fixture data inside the scenario's private REST, object-store and Spark lifecycle before using it on 1FE+3BE.",
         );
+        declaration
+            .impact
+            .paths
+            .push("docker/iceberg-rest/**".into());
+        if matches!(
+            module,
+            "iceberg_delete_applicability" | "iceberg_delete_warm"
+        ) {
+            declaration
+                .impact
+                .paths
+                .push("tests/sql/fixtures/iceberg-delete-applicability/**".into());
+        }
     }
     if explicit {
         let (reason, detail) = if compatibility {
@@ -823,16 +819,19 @@ pub(super) fn for_module(
             )
         } else if matches!(
             module,
-            "iceberg_delete_applicability"
-                | "iceberg_delete_warm"
-                | "uea4_catalog_planning"
-                | "uea4_range_reads"
-                | "uea4_scan_readiness"
-                | "paimon"
+            "uea4_catalog_planning" | "uea4_scan_readiness" | "paimon"
         ) {
             (
                 "dataset",
                 "Requires an explicitly prepared provider dataset or independently generated oracle receipt.",
+            )
+        } else if matches!(
+            module,
+            "uea4_range_reads" | "iceberg_delete_applicability" | "iceberg_delete_warm"
+        ) {
+            (
+                "fixture",
+                "Requires private Docker REST, object store and Spark to generate and verify deterministic data within the invocation.",
             )
         } else if matches!(
             module,

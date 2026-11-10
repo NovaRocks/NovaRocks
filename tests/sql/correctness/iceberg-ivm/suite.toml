@@ -23,6 +23,7 @@ paths = [
     "novarocks/execution/src/exec/mv/**",
     "docker/iceberg-rest/spark-sql.sh",
     "docker/iceberg-rest/spark-shell.sh",
+    "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
     "novarocks/result-contract/**",
     "novarocks/execution/src/exec/operators/logical_change_summary.rs",
     "novarocks/execution/src/exec/operators/compiled_change_router.rs",

@@ -15,82 +15,148 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native replay of independently published Iceberg delete fixtures.
+//! Native verification of independently generated Iceberg delete fixtures.
 
 use super::connector::{
     await_resource_convergence, connector_reader_environment, require_three_backends,
     resource_baseline,
 };
-use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
-use crate::actors::sql::{SqlSession, StatementFailure, StatementResult, TrinoValue};
+use crate::actors::sql::{SqlSession, StatementResult, TrinoValue};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
+use novarocks_cluster_harness::CrossProcessConfigOverlay;
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
-use novarocks_cluster_harness::{CrossProcessConfigOverlay, TestClusterOwner};
-use serde::Deserialize;
+use novarocks_cluster_harness::fixture_run::{RUN_CONTEXT_ENV, RUN_STORAGE_ENV, RunBudget};
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const MANIFEST_ENV: &str = "NOVAROCKS_UEA4G_NATIVE_MANIFEST";
 const ACCESS_ENV: &str = "NOVAROCKS_UEA4G_FIXTURE_ACCESS";
 const SECRET_ENV: &str = "NOVAROCKS_UEA4G_FIXTURE_SECRET";
 pub(super) const CATALOG: &str = "uea4g_native";
 const CACHE: &str = "[runtime.cache]\npage_cache_enable = false\nparquet_page_cache_enable = false\ndatacache_enable = false\n";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Manifest {
-    pub(super) version: u32,
-    pub(super) corpus: PathBuf,
-    pub(super) corpus_sha256: String,
-    pub(super) anomaly: PathBuf,
-    pub(super) anomaly_sha256: String,
-    pub(super) scale: PathBuf,
-    pub(super) scale_sha256: String,
-    pub(super) scale_artifacts_sha256: String,
-    pub(super) scale_java_plans_sha256: String,
-    pub(super) scale_java_delete_members_sha256: String,
-    pub(super) scale_cases: Vec<String>,
-    pub(super) rest_uri: String,
-    pub(super) warehouse: String,
-    pub(super) s3_endpoint: String,
+pub(super) struct GeneratedDeleteReceipt {
+    pub(super) path: PathBuf,
+    pub(super) sha256: String,
+    pub(super) value: Value,
 }
 
-pub(super) struct Fixture {
-    pub(super) manifest: Manifest,
-    pub(super) manifest_sha256: String,
-    pub(super) corpus: Value,
-    pub(super) anomaly: Value,
-    pub(super) scale: Value,
-    pub(super) corpus_path: PathBuf,
-    pub(super) anomaly_path: PathBuf,
-    pub(super) scale_path: PathBuf,
-    pub(super) scale_artifacts: Vec<Value>,
-    pub(super) proxy: DelayedS3Proxy,
+struct Fixture {
+    rest: IsolatedIcebergRestFixture,
+    input: Option<PreparedInput>,
+}
+
+struct PreparedInput {
+    corpus: GeneratedDeleteReceipt,
+    anomaly: GeneratedDeleteReceipt,
+    proxy: DelayedS3Proxy,
 }
 
 #[derive(Default)]
 pub(super) struct IcebergDeleteApplicability {
-    pub(super) fixture: Mutex<Option<Fixture>>,
-    intent: SqlIntentOwner,
+    fixture: Mutex<Option<Fixture>>,
 }
 
-fn checked_json(path: &Path, expected: &str) -> Result<Value> {
-    let bytes =
-        fs::read(path).with_context(|| format!("read immutable fixture {}", path.display()))?;
+/// Invoke the existing Java producer against the exact private publication.
+/// On failure, the caller settles the private project before returning.
+pub(super) fn produce_delete_receipt(
+    rest: &IsolatedIcebergRestFixture,
+    root: &Path,
+    budget: &RunBudget,
+    mode: &str,
+) -> Result<GeneratedDeleteReceipt> {
+    use novarocks_test_support::{ManagedCommand, capture_command_until};
+    budget.check_work()?;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let program = repo.join("tests/sql/fixtures/iceberg-delete-applicability/run.sh");
+    let output = root.join(format!("delete-{mode}-input"));
+    let env_file = rest.runtime_env_file()?;
+    let namespace = format!("uea4g_{mode}");
+    let mut command = ManagedCommand::new("bash");
+    command
+        .arg(&program)
+        .args(["--mode", mode, "--namespace", &namespace, "--output"])
+        .arg(&output)
+        .env("NOVA_ENV_REST_ENV_FILE", &env_file)
+        .env("NOVAROCKS_WORKSPACE_ROOT", rest.workspace_root())
+        .env_remove(RUN_CONTEXT_ENV)
+        .env_remove(RUN_STORAGE_ENV)
+        .env_remove("NOVA_FIXTURE_CLEANUP_MODE")
+        .env_remove("NOVAROCKS_SPARK_EXTRA_DEFAULTS");
+    fs::write(
+        root.join(format!("delete-{mode}-producer-command.json")),
+        serde_json::to_vec_pretty(&json!({
+            "script": program, "mode": mode, "namespace": namespace, "output": output,
+            "private_environment": env_file,
+            "workspace": rest.workspace_root(),
+        }))?,
+    )?;
+    let outcome = capture_command_until(
+        command,
+        fs::File::create(root.join(format!("delete-{mode}-producer.stdout")))?,
+        fs::File::create(root.join(format!("delete-{mode}-producer.stderr")))?,
+        budget.work_deadline(),
+    )?;
+    fs::write(
+        root.join(format!("delete-{mode}-producer-exit.json")),
+        serde_json::to_vec_pretty(&json!({
+            "exit": outcome.output.status.code(),
+            "timed_out": outcome.timed_out,
+            "group_exit_observed": outcome.group_exit_observed(),
+            "failures": outcome.failures,
+        }))?,
+    )?;
     ensure!(
-        format!("{:x}", Sha256::digest(&bytes)) == expected,
-        "immutable fixture checksum changed: {}",
-        path.display()
+        outcome.output.status.success()
+            && !outcome.timed_out
+            && outcome.group_exit_observed()
+            && outcome.failures.is_empty(),
+        "private delete {mode} producer failed; diagnostics={}",
+        outcome.diagnostic_root().display(),
     );
-    Ok(serde_json::from_slice(&bytes)?)
+    let path = output.join("receipt.json");
+    let bytes = fs::read(&path)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        value["mode"] == mode
+            && value
+                .pointer("/runtime/requested_warehouse")
+                .and_then(Value::as_str)
+                == Some(rest.endpoints().rest_warehouse.as_str()),
+        "delete receipt is from a different producer or warehouse"
+    );
+    outcome.release_diagnostics()?;
+    Ok(GeneratedDeleteReceipt {
+        path,
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        value,
+    })
 }
+
+pub(super) fn delete_launch_config(
+    rest: &IsolatedIcebergRestFixture,
+    cache: bool,
+) -> ScenarioLaunchConfig {
+    let identity = rest.static_s3_identity();
+    let mut child = connector_reader_environment();
+    for role in [&mut child.fe, &mut child.be] {
+        role.insert(ACCESS_ENV.to_owned(), identity.access_key_id.clone());
+        role.insert(SECRET_ENV.to_owned(), identity.secret_access_key.clone());
+    }
+    ScenarioLaunchConfig {
+        child_environment: child,
+        config_overlay: credential_overlay_with_cache(cache),
+        ..Default::default()
+    }
+}
+
 fn escaped(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -99,7 +165,7 @@ pub(super) fn table_name(raw: &str) -> Result<String> {
     ensure!(parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')), "fixture table must contain three exact identifiers");
     Ok(format!("{CATALOG}.{}.{}", parts[1], parts[2]))
 }
-pub(super) fn credential_overlay_with_cache(enabled: bool) -> CrossProcessConfigOverlay {
+fn credential_overlay_with_cache(enabled: bool) -> CrossProcessConfigOverlay {
     let cache = if enabled {
         "[runtime.cache]\npage_cache_enable = true\nparquet_page_cache_enable = true\ndatacache_enable = true\n"
     } else {
@@ -116,14 +182,6 @@ pub(super) fn credential_overlay_with_cache(enabled: bool) -> CrossProcessConfig
         ..Default::default()
     }
 }
-pub(super) fn create_catalog_sql(fixture: &Fixture) -> String {
-    create_catalog_sql_from_parts(
-        &fixture.manifest.rest_uri,
-        &fixture.manifest.warehouse,
-        fixture.proxy.endpoint(),
-    )
-}
-
 pub(super) fn create_catalog_sql_from_parts(
     rest_uri: &str,
     warehouse: &str,
@@ -149,33 +207,23 @@ fn row_bag(case: &Value) -> Result<Vec<ExpectedRow>> {
     )?)
 }
 
-fn scale_read_sql(case: &Value) -> Result<String> {
-    let table = table_name(case["table"].as_str().context("scale table missing")?)?;
-    let snapshot = case["snapshot"]
-        .as_i64()
-        .context("scale snapshot missing")?;
-    Ok(format!(
-        "SELECT row_id,eq_key,partition_key,payload FROM {table} FOR VERSION AS OF {snapshot} ORDER BY row_id"
-    ))
-}
-
-pub(super) async fn immutable_artifacts(
-    fixture: &Fixture,
+async fn immutable_artifacts(
+    rest: &IsolatedIcebergRestFixture,
+    input: &PreparedInput,
 ) -> Result<novarocks_connector_iceberg::iceberg::io::FileIO> {
     use novarocks_fs::{
         FileCancellation, FileIdentity, FileReadRange, FsAccessResolver, ObjectStoreAccessContext,
         ObjectStoreConfig, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
     };
     use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
-    let access = env::var("AWS_S3_ACCESS_KEY_ID").context("missing fixture access credential")?;
-    let secret =
-        env::var("AWS_S3_SECRET_ACCESS_KEY").context("missing fixture secret credential")?;
+    let identity = rest.static_s3_identity();
+    let endpoint = &rest.endpoints().minio_endpoint;
     let io = novarocks_connector_iceberg::iceberg::io::FileIO::new_with_memory();
     let provider_pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())?;
     let config = ObjectStoreConfig {
-        endpoint: fixture.manifest.s3_endpoint.clone(),
-        access_key_id: SecretValue::new(access),
-        access_key_secret: SecretValue::new(secret),
+        endpoint: endpoint.clone(),
+        access_key_id: SecretValue::new(identity.access_key_id),
+        access_key_secret: SecretValue::new(identity.secret_access_key),
         session_token: None,
         enable_path_style_access: Some(true),
         region: Some("us-east-1".to_owned()),
@@ -187,20 +235,17 @@ pub(super) async fn immutable_artifacts(
     };
     let credential_reference = StaticCredentialReference::try_new("uea4g-immutable-fixture", "v1")?;
     // Fixture access identity is independent of execution fault-domain admission.
-    let domain = StorageAccessDomainId::from_bytes(
-        Sha256::digest(fixture.manifest.s3_endpoint.as_bytes()).into(),
-    );
+    let domain = StorageAccessDomainId::from_bytes(Sha256::digest(endpoint.as_bytes()).into());
     let mut verified = std::collections::BTreeMap::new();
-    for artifact in fixture.corpus["artifacts"]
+    for artifact in input.corpus.value["artifacts"]
         .as_array()
         .context("corpus inventory absent")?
         .iter()
         .chain(
-            fixture.anomaly["artifacts"]
+            input.anomaly.value["artifacts"]
                 .as_array()
                 .context("anomaly inventory absent")?,
         )
-        .chain(&fixture.scale_artifacts)
     {
         let path = artifact["path"].as_str().context("artifact path absent")?;
         let size = artifact["size"].as_u64().context("artifact size absent")?;
@@ -259,195 +304,59 @@ impl Scenario for IcebergDeleteApplicability {
         true
     }
 
-    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let path = PathBuf::from(
-            env::var(MANIFEST_ENV)
-                .context("delete scenario requires its immutable native manifest")?,
-        );
-        let bytes = fs::read(&path)?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    fn launch_config_with_fixture_run(
+        &self,
+        root: &Path,
+        budget: &RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("delete fixture lock poisoned"))?;
+        ensure!(slot.is_none(), "delete fixture launched more than once");
+        let (rest, _) = IsolatedIcebergRestFixture::start_private_with_budget(root, budget, false)?;
+        let fixture = slot.insert(Fixture { rest, input: None });
+        let rest = &fixture.rest;
+        fs::write(
+            root.join("delete-fixture-runtime.json"),
+            serde_json::to_vec_pretty(&rest.runtime_identity()?)?,
+        )?;
+        let corpus = produce_delete_receipt(rest, root, budget, "corpus")?;
+        let anomaly = produce_delete_receipt(rest, root, budget, "anomalies")?;
+        let cases = corpus.value["cases"]
+            .as_array()
+            .context("missing corpus cases")?;
         ensure!(
-            manifest.version == 1,
-            "unsupported native fixture manifest version"
-        );
-        ensure!(
-            manifest.rest_uri.starts_with("http://127.0.0.1:")
-                || manifest.rest_uri.starts_with("http://localhost:"),
-            "fixture REST must be loopback"
-        );
-        ensure!(
-            manifest.s3_endpoint.starts_with("http://127.0.0.1:")
-                || manifest.s3_endpoint.starts_with("http://localhost:"),
-            "fixture S3 must be loopback"
-        );
-        let base = path.parent().context("manifest has no parent")?;
-        let corpus = checked_json(&base.join(&manifest.corpus), &manifest.corpus_sha256)?;
-        let anomaly = checked_json(&base.join(&manifest.anomaly), &manifest.anomaly_sha256)?;
-        let scale = checked_json(&base.join(&manifest.scale), &manifest.scale_sha256)?;
-        let scale_dir = base.join(&manifest.scale);
-        let scale_dir = scale_dir.parent().context("scale receipt has no parent")?;
-        for (name, expected) in [
-            ("java-plans.jsonl", &manifest.scale_java_plans_sha256),
-            (
-                "java-delete-members.jsonl",
-                &manifest.scale_java_delete_members_sha256,
-            ),
-        ] {
-            ensure!(
-                format!("{:x}", Sha256::digest(fs::read(scale_dir.join(name))?)) == *expected,
-                "immutable Java sidecar checksum changed: {name}"
-            );
-        }
-        let corpus_cases = corpus["cases"].as_array().context("missing corpus cases")?;
-        ensure!(
-            corpus_cases.len() == 23
-                && corpus_cases
+            cases.len() == 23
+                && cases
                     .iter()
-                    .all(|c| c["independent_oracle_matched"] == true
-                        && c["java_row_read"]["status"] == "success"),
+                    .all(|case| case["independent_oracle_matched"] == true
+                        && case["java_row_read"]["status"] == "success"),
             "corpus must publish all 23 independently verified cases"
         );
-        ensure!(
-            !manifest.scale_cases.is_empty()
-                && manifest.scale_cases.iter().collect::<BTreeSet<_>>().len()
-                    == manifest.scale_cases.len(),
-            "scale selectors must be nonempty and unique"
-        );
-        let scale_cases = scale["cases"].as_array().context("missing scale cases")?;
-        for name in &manifest.scale_cases {
-            let case = scale_cases
-                .iter()
-                .find(|c| c["case"] == name.as_str())
-                .context("missing selected scale case")?;
-            ensure!(
-                case["exact_bag_checked"] == true
-                    && case["java_oracle"] == case["independent_oracle"]
-                    && case["plan_file_count"].as_u64().is_some_and(|n| n >= 100),
-                "native distribution requires verified scale input with at least 100 real files"
-            );
-        }
         let proxy = DelayedS3Proxy::start(DelayedS3Config {
-            downstream: manifest.s3_endpoint.clone(),
+            downstream: rest.endpoints().minio_endpoint.clone(),
             delay: Duration::ZERO,
         })?;
-        // Publish opaque labels, never credential-bearing request headers.
-        for (i, artifact) in corpus["artifacts"]
+        for (index, artifact) in corpus.value["artifacts"]
             .as_array()
             .context("missing corpus artifacts")?
             .iter()
             .enumerate()
         {
-            let raw = artifact["path"].as_str().context("artifact path absent")?;
-            let key = raw
+            let path = artifact["path"].as_str().context("artifact path absent")?;
+            let key = path
                 .strip_prefix("s3://")
                 .context("fixture object must be S3")?;
-            proxy.label_object(&format!("/{key}"), &format!("corpus_{i}"))?;
+            proxy.label_object(&format!("/{key}"), &format!("corpus_{index}"))?;
         }
-        let scale_inventory = fs::read(
-            base.join(&manifest.scale)
-                .parent()
-                .unwrap()
-                .join("artifacts.jsonl"),
-        )?;
-        ensure!(
-            format!("{:x}", Sha256::digest(&scale_inventory)) == manifest.scale_artifacts_sha256,
-            "scale artifact inventory checksum changed"
-        );
-        let scale_objects = std::str::from_utf8(&scale_inventory)?;
-        let mut scale_artifacts = Vec::new();
-        for (i, line) in scale_objects.lines().enumerate() {
-            let artifact: Value = serde_json::from_str(line)?;
-            let raw = artifact["path"]
-                .as_str()
-                .context("scale artifact path absent")?;
-            proxy.label_object(
-                &format!(
-                    "/{}",
-                    raw.strip_prefix("s3://")
-                        .context("scale object must be S3")?
-                ),
-                &format!("scale_{i}"),
-            )?;
-            scale_artifacts.push(artifact);
-        }
-        let mut child = connector_reader_environment();
-        let access =
-            env::var("AWS_S3_ACCESS_KEY_ID").context("fixture requires S3 access identity")?;
-        let secret =
-            env::var("AWS_S3_SECRET_ACCESS_KEY").context("fixture requires S3 secret material")?;
-        ensure!(
-            !access.is_empty() && !secret.is_empty(),
-            "fixture credentials must be present"
-        );
-        for role in [&mut child.fe, &mut child.be] {
-            role.insert(ACCESS_ENV.to_owned(), access.clone());
-            role.insert(SECRET_ENV.to_owned(), secret.clone());
-        }
-        let mut slot = self
-            .fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
-        ensure!(slot.is_none(), "fixture launched more than once");
-        *slot = Some(Fixture {
-            corpus_path: base.join(&manifest.corpus),
-            anomaly_path: base.join(&manifest.anomaly),
-            scale_path: base.join(&manifest.scale),
-            manifest,
-            manifest_sha256: format!("{:x}", Sha256::digest(bytes)),
+        let launch = delete_launch_config(rest, false);
+        fixture.input = Some(PreparedInput {
             corpus,
             anomaly,
-            scale,
-            scale_artifacts,
             proxy,
         });
-        Ok(ScenarioLaunchConfig {
-            child_environment: child,
-            config_overlay: credential_overlay_with_cache(false),
-            ..Default::default()
-        })
-    }
-
-    fn test_session_plan(
-        &self,
-        _: &ScenarioLaunchConfig,
-        _: &Path,
-        cluster_size: usize,
-        binary: &Path,
-        deadline: Instant,
-    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        let slot = self
-            .fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
-        let fixture = slot.as_ref().context("missing prepared fixture")?;
-        let cases = fixture.scale["cases"]
-            .as_array()
-            .context("missing scale cases")?;
-        let specs = fixture
-            .manifest
-            .scale_cases
-            .iter()
-            .map(|name| {
-                let case = cases
-                    .iter()
-                    .find(|case| case["case"] == name.as_str())
-                    .context("missing selected scale case")?;
-                Ok(StatementSpec {
-                    sql: scale_read_sql(case)?,
-                    faults: vec![],
-                    observations: (0..cluster_size)
-                        .map(|index| (index, novarocks_failpoint::observation_marker::ObservationAction::ReaderMarker.as_str(), None))
-                        .collect(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(self.intent.freeze(
-            specs,
-            &[],
-            cluster_size,
-            binary,
-            deadline,
-        )?))
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -457,40 +366,45 @@ impl Scenario for IcebergDeleteApplicability {
             .fixture
             .lock()
             .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
-        let fixture = slot.as_ref().context("missing prepared fixture")?;
+        let fixture = slot.as_ref().context("missing delete fixture")?;
+        let input = fixture
+            .input
+            .as_ref()
+            .context("missing prepared delete input")?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let (closure_summary, anomaly_closure_summary, scale_closure_summary) =
-            runtime.block_on(async {
-                let file_io = immutable_artifacts(fixture).await?;
-                let corpus = super::iceberg_delete_oracle::verify_receipt(
-                    &fixture.corpus_path,
-                    file_io.clone(),
-                    &context.scenario_root().join("closure-corpus"),
-                )
-                .await?;
-                let anomaly = super::iceberg_delete_oracle::verify_receipt(
-                    &fixture.anomaly_path,
-                    file_io.clone(),
-                    &context.scenario_root().join("closure-anomaly"),
-                )
-                .await?;
-                let scale = super::iceberg_delete_oracle::verify_scale_receipt(
-                    &fixture.scale_path,
-                    file_io,
-                    &context.scenario_root().join("closure-scale"),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((corpus, anomaly, scale))
-            })?;
+        let (closure_summary, anomaly_closure_summary) = runtime.block_on(async {
+            let file_io = immutable_artifacts(&fixture.rest, input).await?;
+            let corpus = super::iceberg_delete_oracle::verify_receipt(
+                &input.corpus.path,
+                file_io.clone(),
+                &context.scenario_root().join("closure-corpus"),
+            )
+            .await?;
+            let anomaly = super::iceberg_delete_oracle::verify_receipt(
+                &input.anomaly.path,
+                file_io,
+                &context.scenario_root().join("closure-anomaly"),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((corpus, anomaly))
+        })?;
         context.remaining("connect delete oracle session")?;
         let mut connection =
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
-        connection.execute(create_catalog_sql(fixture))?;
+        let endpoints = fixture.rest.endpoints();
+        connection.execute(create_catalog_sql_from_parts(
+            &endpoints.rest_uri,
+            &endpoints.rest_warehouse,
+            input.proxy.endpoint(),
+        ))?;
         connection.execute("SET enable_scan_datacache = false")?;
         let mut observations = Vec::new();
-        for case in fixture.corpus["cases"].as_array().unwrap() {
+        for case in input.corpus.value["cases"]
+            .as_array()
+            .context("missing corpus cases")?
+        {
             let table = table_name(case["table"].as_str().context("case table missing")?)?;
             let snapshot = case["snapshot"].as_i64().context("snapshot missing")?;
             let query = format!("SELECT id,p,value FROM {table} FOR VERSION AS OF {snapshot}");
@@ -505,145 +419,40 @@ impl Scenario for IcebergDeleteApplicability {
             );
             observations.push(json!({"case":case["case"],"snapshot":snapshot,"metadata":case["metadata"],"row_bag":actual}));
         }
-        let before_logs = (0..3)
-            .map(|i| context.handle().be_current_log_contents(i))
-            .collect::<Result<Vec<_>>>()?;
-        for (index, name) in fixture.manifest.scale_cases.iter().enumerate() {
-            let case = fixture.scale["cases"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|c| c["case"] == name.as_str())
-                .unwrap();
-            let snapshot = case["snapshot"]
-                .as_i64()
-                .context("scale snapshot missing")?;
-            let query = scale_read_sql(case)?;
-            let selected = self.intent.take(index)?;
-            let pending = connection.submit(&query)?;
-            let (pending, observation) = selected.arm_pending(context, pending, &query)?;
-            let cancel = pending.cancel_handle();
-            let mut terminal_sql = false;
-            let phase = (|| -> Result<Value> {
-                let executed = connection.run_pending(pending);
-                terminal_sql = matches!(&executed, Ok(_) | Err(StatementFailure::Trino(_)));
-                let result = executed?;
-                require_integer_columns(&result, 4)?;
-                let mut hash = Sha256::new();
-                let mut count = 0_i64;
-                let mut sums = [0_i64; 4];
-                let mut last = None;
-                for cells in result.rows {
-                    let [
-                        TrinoValue::Integer(row_id),
-                        TrinoValue::Integer(eq_key),
-                        TrinoValue::Integer(partition_key),
-                        TrinoValue::Integer(payload),
-                    ] = cells.as_slice()
-                    else {
-                        anyhow::bail!("scale row is not four non-null integer values: {cells:?}");
-                    };
-                    let row = (*row_id, *eq_key, *partition_key, *payload);
-                    ensure!(
-                        last.is_none_or(|old| old < row.0),
-                        "scale rows repeat or violate row_id order"
-                    );
-                    last = Some(row.0);
-                    for (i, value) in [row.0, row.1, row.2, row.3].into_iter().enumerate() {
-                        hash.update(value.to_be_bytes());
-                        sums[i] = sums[i].checked_add(value).context("scale sum overflow")?;
-                    }
-                    count += 1;
-                }
-                let observed = json!({"row_count":count,"sum_row_id":sums[0],"sum_eq_key":sums[1],"sum_partition_key":sums[2],"sum_payload":sums[3],"sorted_row_sha256":format!("{:x}",hash.finalize())});
-                ensure!(
-                    observed == case["independent_oracle"],
-                    "native exact scale bag differs for {name}: {observed}"
-                );
-                Ok(observed)
-            })();
-            let cancelled = if phase.is_err() && !terminal_sql {
-                cancel
-                    .delete(selected.deadline)
-                    .map_err(anyhow::Error::from)
-            } else {
-                Ok(())
-            };
-            let drained = context
-                .handle()
-                .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
-            let observed = with_cleanup(with_cleanup(phase, cancelled), drained)?;
-            observations.push(json!({"case":name,"snapshot":snapshot,"metadata":case["metadata"],"exact_bag":observed}));
-        }
         await_resource_convergence(context, &baseline, "native delete applicability reads")?;
-        let mut placements = Vec::new();
-        for (index, before) in before_logs.iter().enumerate() {
-            let log = context.handle().be_current_log_contents(index)?;
-            let added = log
-                .get(before.len()..)
-                .context("BE log truncated during exact placement observation")?;
-            let accepted = added
-                .matches(novarocks_failpoint::observation_marker::TASK_SPLIT_ASSIGNMENT_ACCEPTED)
-                .count();
-            let opened = added
-                .matches(novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_OPEN)
-                .count();
-            let closed = added
-                .matches(novarocks_failpoint::observation_marker::CONNECTOR_PAGE_SOURCE_CLOSE)
-                .count();
-            ensure!(
-                accepted > 0
-                    && opened > 0
-                    && opened == closed
-                    && added.contains(novarocks_failpoint::observation_marker::TASK_SPLIT_NO_MORE),
-                "BE[{index}] has no complete distributed read evidence: accepted={accepted}, open={opened}, close={closed}"
-            );
-            placements
-                .push(json!({"backend":index,"accepted":accepted,"opened":opened,"closed":closed}));
-        }
-        let events = fixture.proxy.take_event_log()?.into_iter().map(|e| json!({"kind":format!("{:?}",e.kind),"request_id":e.request_id,"connection_id":e.connection_id,"elapsed_ms":e.elapsed_millis,"method":e.method.as_str(),"object_id":e.object_id,"range":e.range,"bytes":e.bytes})).collect::<Vec<_>>();
+        let events = input.proxy.take_event_log()?.into_iter().map(|e| json!({"kind":format!("{:?}",e.kind),"request_id":e.request_id,"connection_id":e.connection_id,"elapsed_ms":e.elapsed_millis,"method":e.method.as_str(),"object_id":e.object_id,"range":e.range,"bytes":e.bytes})).collect::<Vec<_>>();
         ensure!(
-            fixture.proxy.snapshot().event_overflow == 0,
+            input.proxy.snapshot().event_overflow == 0,
             "proxy object evidence overflowed"
         );
         fs::write(
             context.scenario_root().join("delete-oracle.json"),
-            serde_json::to_vec_pretty(
-                &json!({"manifest_sha256":fixture.manifest_sha256,"corpus_sha256":fixture.manifest.corpus_sha256,"scale_sha256":fixture.manifest.scale_sha256,"scale_artifacts_sha256":fixture.manifest.scale_artifacts_sha256,"closure_oracle":closure_summary,"anomaly_closure_oracle":anomaly_closure_summary,"scale_closure_oracle":scale_closure_summary,"observations":observations,"placements":placements,"resource_converged":true,"object_reads":events}),
-            )?,
+            serde_json::to_vec_pretty(&json!({
+                "corpus_receipt": input.corpus.path, "corpus_sha256": input.corpus.sha256,
+                "anomaly_receipt": input.anomaly.path, "anomaly_sha256": input.anomaly.sha256,
+                "closure_oracle": closure_summary, "anomaly_closure_oracle": anomaly_closure_summary,
+                "observations": observations, "resource_converged": true, "object_reads": events,
+            }))?,
         )?;
         connection.execute(format!("DROP CATALOG {CATALOG}"))?;
-        context.action("verified 23 immutable delete row bags and selected scale bags on all three BEs, with object-range and resource-exit evidence");
+        context.action("verified 23 independently generated delete row bags with object-range and resource-exit evidence");
         Ok(())
     }
 
     fn teardown(&self) -> Result<()> {
-        self.fixture
+        let fixture = self
+            .fixture
             .lock()
-            .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("delete fixture lock poisoned"))?
             .take();
+        if let Some(Fixture { mut rest, input }) = fixture {
+            drop(input);
+            rest.shutdown()?;
+        }
         Ok(())
     }
 }
 
-// These local row shapes belong to the immutable delete oracle. They are not
-// a client-wide SQL conversion or a replacement for provider schema authority.
-fn require_integer_columns(result: &StatementResult, count: usize) -> Result<()> {
-    ensure!(
-        result.is_result_set() && result.columns.len() == count,
-        "delete oracle expected {count} integer columns: {result:?}"
-    );
-    for column in &result.columns {
-        ensure!(
-            matches!(
-                column.type_signature.raw_type.as_str(),
-                "tinyint" | "smallint" | "integer" | "bigint"
-            ) && column.type_signature.arguments.is_empty(),
-            "delete oracle expected a declared integer column: {column:?}"
-        );
-    }
-    Ok(())
-}
 fn read_row_bag(result: &StatementResult) -> Result<Vec<ExpectedRow>> {
     ensure!(
         result.is_result_set() && result.columns.len() == 3,
@@ -686,7 +495,7 @@ fn read_row_bag(result: &StatementResult) -> Result<Vec<ExpectedRow>> {
         })
         .collect()
 }
-fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+pub(super) fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
     match (primary, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),

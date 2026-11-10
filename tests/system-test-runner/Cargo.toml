@@ -107,10 +107,7 @@ env-inputs = [
     { name = "XDG_CACHE_HOME", kind = "value" },
     { name = "XDG_STATE_HOME", kind = "value" },
     { name = "NOVA_FIXTURE_STORE", kind = "value" },
-    { name = "NOVAROCKS_UEA4G_ORACLE_RECEIPT", kind = "file-content" },
-    { name = "NOVAROCKS_UEA4G_ORACLE_OUTPUT", kind = "value" },
 ]
 ignored = [
     { filter = "test(=actors::catalog::tests::reads_live_fixture_trace_and_metrics)", class = "heavy", requires = ["fixture:docker"], reason = "Owns an isolated publication-hook fixture; requires Docker and locally provisioned fixture inputs" },
-    { filter = "test(=scenarios::iceberg_delete_oracle::tests::frozen_receipt_replay_without_native)", class = "heavy", requires = ["dataset:iceberg-java-oracle"], reason = "Requires an independently prepared frozen Java oracle receipt and captured output" },
 ]

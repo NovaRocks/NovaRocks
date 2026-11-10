@@ -23,9 +23,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(test)]
+use crate::iceberg::spec::FormatVersion;
 use crate::iceberg::spec::{
-    DataContentType, FormatVersion, ManifestContentType, ManifestFile, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary,
+    DataContentType, ManifestContentType, ManifestFile, Operation, Snapshot, SnapshotReference,
+    SnapshotRetention, Summary,
 };
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
@@ -45,24 +47,21 @@ impl super::staging::Preparer for OverwritePreparer {
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         validate_added_data(intent)?;
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
-        let removed: Vec<_> = inputs.live_set().await?.values().cloned().collect();
+        let (sources, live) = view.observe_live_sources().await?;
+        let removed = live.values().collect::<Vec<_>>();
         if removed.is_empty() && intent.changes().added.is_empty() && intent.summary().is_empty() {
             return Ok(super::staging::PreparedChange::default());
         }
         let snapshot_id = super::staging::new_snapshot_id(view.metadata());
-        let mut manifests = write_live_entry_groups(
+        let added = write_added_intent_data(view, intent, snapshot_id).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
             view,
             snapshot_id,
-            removed.iter().cloned().map(|e| (e, true)).collect(),
+            sources.as_ref(),
+            &removed,
+            added,
         )
         .await?;
-        manifests.extend(write_added_intent_data(view, intent, snapshot_id).await?);
         let operation = match (intent.changes().added.is_empty(), removed.is_empty()) {
             (true, true) | (false, true) => Operation::Append,
             (true, false) => Operation::Delete,
@@ -158,88 +157,6 @@ pub(crate) async fn write_added_intent_data(
             )
             .await?,
         );
-    }
-    Ok(manifests)
-}
-
-/// Carry true entry facts under their original partition spec. Assigned and
-/// unassigned data groups stay separate so historic first assignment cannot
-/// consume a second range for entries whose row IDs already exist.
-pub(crate) async fn write_live_entry_groups(
-    view: &super::staging::StagedView<'_>,
-    snapshot_id: i64,
-    entries: Vec<(super::dependency::LiveEntry, bool)>,
-) -> crate::iceberg::Result<Vec<ManifestFile>> {
-    let mut groups: BTreeMap<(i32, bool, bool, bool), Vec<super::dependency::LiveEntry>> =
-        BTreeMap::new();
-    for (entry, deleted) in entries {
-        let is_data = entry.file.content_type() == DataContentType::Data;
-        let assigned = !deleted && is_data && entry.frozen.facts().first_row_id.is_some();
-        groups
-            .entry((
-                entry.frozen.facts().partition_spec_id,
-                is_data,
-                deleted,
-                assigned,
-            ))
-            .or_default()
-            .push(entry);
-    }
-    let mut manifests = Vec::new();
-    let metadata = view.metadata();
-    for ((spec_id, is_data, deleted, assigned), entries) in groups {
-        let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-            crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                format!("Live entry references missing partition spec {spec_id}"),
-            )
-        })?;
-        let first = if assigned {
-            entries
-                .iter()
-                .filter_map(|e| e.frozen.facts().first_row_id)
-                .min()
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Assigned row ID is negative",
-                    )
-                })?
-        } else {
-            None
-        };
-        let mut manifest = super::staging::write_manifest(
-            view.artifacts(),
-            metadata.format_version(),
-            snapshot_id,
-            metadata.current_schema().clone(),
-            spec.as_ref().clone(),
-            if is_data {
-                ManifestContentType::Data
-            } else {
-                ManifestContentType::Deletes
-            },
-            entries.into_iter().map(|entry| {
-                if deleted {
-                    super::staging::ManifestEntryWrite::Deleted {
-                        file: entry.file,
-                        frozen: entry.frozen,
-                    }
-                } else {
-                    super::staging::ManifestEntryWrite::Existing {
-                        file: entry.file,
-                        frozen: entry.frozen,
-                    }
-                }
-            }),
-        )
-        .await?;
-        if metadata.format_version() == FormatVersion::V3 && assigned {
-            manifest.first_row_id = first;
-        }
-        manifests.push(manifest);
     }
     Ok(manifests)
 }
@@ -362,34 +279,24 @@ pub(crate) fn set_physical_rows_after_removal(
 /// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
 pub(crate) fn snapshot_file_summary(
     added: &[super::model::AddedContent],
-    removed: &[super::dependency::LiveEntry],
+    removed: &[&super::manifest_sources::LocatedEntry],
 ) -> crate::iceberg::Result<HashMap<String, String>> {
     let mut counters = BTreeMap::<&str, u64>::new();
-    for (file, is_added) in added
-        .iter()
-        .map(|a| (a.file(), true))
-        .chain(removed.iter().map(|e| (&e.file, false)))
-    {
-        let size = if file.content_type() == DataContentType::PositionDeletes
-            && file.file_format() == crate::iceberg::spec::DataFileFormat::Puffin
-        {
-            file.content_size_in_bytes()
-                .ok_or_else(|| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Deletion vector has no blob size",
-                    )
-                })?
-                .try_into()
-                .map_err(|_| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Deletion vector blob size is negative",
-                    )
-                })?
-        } else {
-            file.file_size_in_bytes()
-        };
+    let additions = added.iter().map(|added| {
+        let file = added.file();
+        super::row_delta_dv_metadata::logical_file_size(file)
+            .map(|size| (file.content_type(), file.record_count(), size, true))
+    });
+    let removals = removed.iter().map(|entry| {
+        Ok((
+            entry.content_type,
+            entry.frozen.facts().record_count,
+            entry.logical_size,
+            false,
+        ))
+    });
+    for effect in additions.chain(removals) {
+        let (content, records, size, is_added) = effect?;
         let mut bump = |key, value| -> crate::iceberg::Result<()> {
             let total = counters.entry(key).or_default();
             *total = total.checked_add(value).ok_or_else(|| {
@@ -408,7 +315,7 @@ pub(crate) fn snapshot_file_summary(
             },
             size,
         )?;
-        match file.content_type() {
+        match content {
             DataContentType::Data => {
                 bump(
                     if is_added {
@@ -424,7 +331,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "deleted-records"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
             DataContentType::PositionDeletes => {
@@ -450,7 +357,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "removed-position-deletes"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
             DataContentType::EqualityDeletes => {
@@ -476,7 +383,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "removed-equality-deletes"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
         }
@@ -1563,7 +1470,20 @@ pub(crate) mod preparer_tests {
             .find(|e| e.data_file().file_path() == "s3://b/p2.parquet")
             .unwrap();
         assert_eq!(survivor.status, ManifestStatus::Existing);
-        assert_eq!(survivor.data_file().first_row_id(), Some(0));
+        assert_eq!(survivor.data_file().first_row_id(), None);
+        let read = fixture.operation.begin_attempt().unwrap();
+        let mut inputs = super::super::dependency::ValidationInputs::new(
+            &after,
+            after.current_snapshot_id(),
+            &read,
+        );
+        let live = inputs.live_set().await.unwrap();
+        let survivor_id = super::super::model::EntryIdentity::DataFile {
+            path: "s3://b/p2.parquet".into(),
+        };
+        // The retained V2 object still has null on disk. The first V3 list
+        // allocated the two new rows before the five historical survivors.
+        assert_eq!(live[&survivor_id].frozen.facts().first_row_id, Some(2));
         assert_eq!(survivor.sequence_number, Some(1));
         assert_eq!(survivor.file_sequence_number, Some(1));
     }

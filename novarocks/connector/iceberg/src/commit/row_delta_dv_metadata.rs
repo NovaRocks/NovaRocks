@@ -58,13 +58,20 @@ pub struct LiveFile {
 }
 
 pub fn validate_delete_file_for_row_lineage(file: &DataFile) -> Result<(), String> {
-    if file.content_type() == DataContentType::EqualityDeletes {
+    validate_delete_format_for_row_lineage(file.content_type(), file.file_format())
+}
+
+fn validate_delete_format_for_row_lineage(
+    content: DataContentType,
+    format: DataFileFormat,
+) -> Result<(), String> {
+    if content == DataContentType::EqualityDeletes {
         return Err(
             "row-lineage DELETE does not support equality-delete files; compact them away first"
                 .to_string(),
         );
     }
-    if file.file_format() != DataFileFormat::Puffin {
+    if format != DataFileFormat::Puffin {
         return Err(
             "row-lineage DELETE found v2 position-delete files; compact them away before writing Puffin deletion vectors"
                 .to_string(),
@@ -88,12 +95,24 @@ pub fn partition_spec_by_id(
 }
 
 pub fn dv_data_file(written: &WrittenDvFile, referenced: &LiveFile) -> Result<DataFile, String> {
+    dv_data_file_for_partition(
+        written,
+        referenced.partition_spec_id,
+        referenced.data_file.partition(),
+    )
+}
+
+pub(super) fn dv_data_file_for_partition(
+    written: &WrittenDvFile,
+    spec_id: i32,
+    partition: &crate::iceberg::spec::Struct,
+) -> Result<DataFile, String> {
     DataFileBuilder::default()
         .content(DataContentType::PositionDeletes)
         .file_path(written.path.clone())
         .file_format(DataFileFormat::Puffin)
-        .partition(referenced.data_file.partition().clone())
-        .partition_spec_id(referenced.partition_spec_id)
+        .partition(partition.clone())
+        .partition_spec_id(spec_id)
         .record_count(written.cardinality)
         .file_size_in_bytes(written.file_size_in_bytes)
         .referenced_data_file(Some(written.referenced_data_file.clone()))
@@ -125,34 +144,42 @@ pub fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
 
 /// Attempt-local row mutation input keyed by full logical entry identity.
 pub(crate) struct RowLiveIndex {
-    pub live: crate::commit::dependency::LiveSet,
+    pub live: BTreeMap<crate::commit::model::EntryIdentity, super::manifest_sources::LocatedEntry>,
     pub dvs_by_data: BTreeMap<String, crate::commit::model::EntryIdentity>,
 }
 
 impl RowLiveIndex {
-    pub async fn load(
-        view: &crate::commit::staging::StagedView<'_>,
-    ) -> crate::iceberg::Result<Self> {
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(view.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs = crate::commit::dependency::ValidationInputs::new(
-            view.metadata(),
-            parent,
-            view.artifacts(),
-        );
-        Self::from_live(inputs.live_set().await?.clone())
+    #[cfg(test)]
+    fn from_live(live: crate::commit::dependency::LiveSet) -> crate::iceberg::Result<Self> {
+        let entries = live
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (identity, entry))| {
+                let located = super::manifest_sources::LocatedEntry {
+                    frozen: entry.frozen,
+                    ordinal,
+                    source_index: 0,
+                    content_type: entry.file.content_type(),
+                    file_format: entry.file.file_format(),
+                    logical_size: logical_file_size(&entry.file)?,
+                };
+                Ok((identity, located))
+            })
+            .collect::<crate::iceberg::Result<_>>()?;
+        Self::from_entries(entries)
     }
 
-    fn from_live(live: crate::commit::dependency::LiveSet) -> crate::iceberg::Result<Self> {
+    pub(super) fn from_entries(
+        live: BTreeMap<crate::commit::model::EntryIdentity, super::manifest_sources::LocatedEntry>,
+    ) -> crate::iceberg::Result<Self> {
         use crate::commit::model::EntryIdentity;
         let mut dvs_by_data = BTreeMap::new();
         for (identity, entry) in &live {
-            if entry.file.content_type() == DataContentType::Data {
+            if entry.content_type == DataContentType::Data {
                 continue;
             }
-            validate_delete_file_for_row_lineage(&entry.file).map_err(to_iceberg_unexpected)?;
+            validate_delete_format_for_row_lineage(entry.content_type, entry.file_format)
+                .map_err(to_iceberg_unexpected)?;
             let EntryIdentity::DeletionVector {
                 referenced_data_file,
                 ..
@@ -718,7 +745,7 @@ mod t8b_tests {
             })
             .collect::<Vec<_>>();
         ranges.sort();
-        assert_eq!(ranges, vec![(0, 3), (3, 3), (6, 1)]);
+        assert_eq!(ranges, vec![(0, 1), (1, 3), (4, 3)]);
     }
     #[tokio::test]
     async fn t8b_data_only_mor_is_append_and_allocates_new_rows() {
@@ -877,7 +904,7 @@ mod t8b_tests {
                 .frozen
                 .facts()
                 .first_row_id,
-            Some(3)
+            Some(5)
         );
         assert_eq!(
             after[&EntryIdentity::DataFile {
@@ -886,7 +913,7 @@ mod t8b_tests {
                 .frozen
                 .facts()
                 .first_row_id,
-            Some(6)
+            Some(3)
         );
         assert_eq!(engine.metadata().next_row_id(), 8);
     }

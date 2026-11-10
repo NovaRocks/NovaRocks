@@ -25,7 +25,6 @@ use std::collections::HashSet;
 use crate::iceberg::spec::{DataContentType, FormatVersion, Operation};
 use async_trait::async_trait;
 
-use super::helpers::target_ref_snapshot_id;
 use crate::commit::WrittenFile;
 
 // `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
@@ -138,13 +137,7 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
                     .into(),
             ));
         }
-        let parent = target_ref_snapshot_id(view.metadata(), view.target_ref());
-        let mut inputs = crate::commit::dependency::ValidationInputs::new(
-            view.metadata(),
-            parent,
-            view.artifacts(),
-        );
-        let live = inputs.live_set().await?;
+        let (sources, live) = view.observe_live_sources().await?;
         let removed = intent
             .changes()
             .removed
@@ -222,25 +215,21 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
                 "Copy-on-write frozen additions omit a declared output file".into(),
             ));
         }
-        let removed_entries = removed
-            .iter()
-            .map(|id| live[id].clone())
-            .collect::<Vec<_>>();
+        let removed_entries = removed.iter().map(|id| &live[id]).collect::<Vec<_>>();
         let mut summary =
             super::overwrite::snapshot_file_summary(&intent.changes().added, &removed_entries)?;
         super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
-        let mut manifests = super::overwrite::write_live_entry_groups(
+        let added =
+            write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
             view,
             snapshot_id,
-            live.iter()
-                .map(|(id, e)| (e.clone(), removed.contains(id)))
-                .collect(),
+            sources.as_ref(),
+            &removed_entries,
+            added,
         )
         .await?;
-        manifests.extend(
-            write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?,
-        );
         super::overwrite::prepare_snapshot_change(
             view,
             intent,

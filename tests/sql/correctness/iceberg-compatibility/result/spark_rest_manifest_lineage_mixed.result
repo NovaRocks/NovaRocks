@@ -1,0 +1,13 @@
+-- query 3
+-- types	varchar	bigint	bigint	bigint	bigint
+value	rows_in_file	first_id	last_id	sequence_number
+a	50	1000	1049	4
+b	10	1050	1059	4
+x	25	800	824	2
+
+-- query 4
+-- types	integer	bigint	bigint	bigint	bigint
+status	record_count	first_row_id	sequence_number	file_sequence_number
+1	10	NULL	4	4
+0	25	800	2	2
+1	50	NULL	4	4

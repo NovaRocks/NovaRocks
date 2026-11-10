@@ -28,7 +28,9 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
 };
 
-use super::dependency::{self, ValidationInputs, Verdict};
+#[cfg(test)]
+use super::dependency::ValidationInputs;
+use super::dependency::{self, Verdict};
 use super::model::{
     ArtifactClass, ArtifactWriter, CleanupScope, FrozenRequest, IcebergCleanupReport,
     ObjectIdentity, OperationIntent, PublicationOutcome, PublicationReport, RequestShape,
@@ -358,6 +360,7 @@ async fn run_in_phase(
         return rejected(operation, before_dispatch_failure(&error)).await;
     }
     let mut attempt_number = 0;
+    let mut captured_merge_policy = None;
     loop {
         // This segment covers only preparation. Returning from the helper
         // releases its observation guard before dispatch or rejected cleanup.
@@ -385,8 +388,15 @@ async fn run_in_phase(
                     let base = loaded.map_err(|error| before_dispatch_failure(&error))?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
-                    let (request, retained) =
-                        prepare(&attempt, intent, base, prefix, preparers).await?;
+                    let (request, retained) = prepare(
+                        &attempt,
+                        intent,
+                        base,
+                        prefix,
+                        preparers,
+                        &mut captured_merge_policy,
+                    )
+                    .await?;
                     check_window(operation, started, policy)
                         .map_err(|error| before_dispatch_failure(&error))?;
                     let mut original_request = Some(request);
@@ -560,6 +570,7 @@ async fn prepare(
     base: StagingBase,
     prefix: &PreparedChange,
     preparers: &[&dyn Preparer],
+    captured_merge_policy: &mut Option<super::preparation::CapturedMergePolicy>,
 ) -> std::result::Result<(FrozenRequest, Vec<ObjectIdentity>), ConnectorMutationFailure> {
     if let StagingBase::Existing { metadata, .. } = &base {
         if intent.target().uuid != Some(metadata.uuid()) {
@@ -584,8 +595,14 @@ async fn prepare(
             }
         }
     }
-    let mut engine =
-        StagingEngine::begin(base, intent, attempt).map_err(|e| before_dispatch_failure(&e))?;
+    let mut engine = StagingEngine::begin_attempt(
+        base,
+        intent,
+        attempt,
+        attempt.io_window_width(),
+        captured_merge_policy,
+    )
+    .map_err(|e| before_dispatch_failure(&e))?;
     engine
         .stage_change(prefix.clone())
         .map_err(|e| before_dispatch_failure(&e))?;
@@ -643,17 +660,14 @@ async fn prepare(
                     "Staged publication snapshot is missing",
                 )
             })?;
-            let list = crate::manifest::load_manifest_list(
-                snapshot_ref,
-                attempt.file_io(),
-                engine.metadata(),
-            )
-            .await
-            .map_err(|error| before_dispatch_failure(&error))?;
+            let sources = engine
+                .snapshot_sources(snapshot_ref)
+                .await
+                .map_err(|error| before_dispatch_failure(&error))?;
             for path in std::iter::once(snapshot_ref.manifest_list()).chain(
-                list.entries()
-                    .iter()
-                    .map(|manifest| manifest.manifest_path.as_str()),
+                sources
+                    .sources()
+                    .map(|source| source.descriptor.manifest_path.as_str()),
             ) {
                 let object =
                     ObjectIdentity::new(path).map_err(|error| before_dispatch_failure(&error))?;
@@ -661,18 +675,29 @@ async fn prepare(
                     references.insert(object);
                 }
             }
-            let mut inputs = ValidationInputs::new(engine.metadata(), Some(snapshot), attempt);
-            for identity in inputs
-                .live_set()
+            let mut observed = BTreeSet::new();
+            sources
+                .fold(
+                    attempt.file_io(),
+                    || attempt.check_active(),
+                    |_| true,
+                    |entry| {
+                        if entry.raw.is_alive() {
+                            let identity =
+                                super::model::EntryIdentity::try_from(entry.raw.data_file())?;
+                            let object = identity.object();
+                            if !observed.insert(identity.clone()) {
+                                return Err(super::manifest_sources::duplicate_identity(&identity));
+                            }
+                            if cross_attempt.contains(&object) {
+                                references.insert(object);
+                            }
+                        }
+                        Ok(())
+                    },
+                )
                 .await
-                .map_err(|e| before_dispatch_failure(&e))?
-                .keys()
-            {
-                let object = identity.object();
-                if cross_attempt.contains(&object) {
-                    references.insert(object);
-                }
-            }
+                .map_err(|error| before_dispatch_failure(&error))?;
         }
     }
     let request = engine
@@ -984,14 +1009,20 @@ mod tests {
         use super::super::model::{ArtifactClass, ArtifactKind, ArtifactWriter, StartSnapshot};
         use super::super::row_delta_dv_metadata::{LiveFile, WrittenDvFile, dv_data_file};
         use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+        let source_fixture = Fixture::new();
+        let source = append_state(
+            &source_fixture,
+            source_fixture.metadata(FormatVersion::V3),
+            4,
+        )
+        .await;
         let fixture = Fixture::new();
-        let source = append_state(&fixture, fixture.metadata(FormatVersion::V3), 4).await;
         let source_id = source.current_snapshot_id().unwrap();
         let source_sequence = source.snapshot_by_id(source_id).unwrap().sequence_number();
         let source_data = data(
             &format!(
                 "file://{}/race-4.parquet",
-                fixture.directory.path().display()
+                source_fixture.directory.path().display()
             ),
             4,
             Struct::empty(),
@@ -1062,7 +1093,7 @@ mod tests {
             .build()
             .unwrap()
             .metadata;
-        let branch_intent = fixture.intent(
+        let branch_intent = source_fixture.intent(
             &branched,
             "audit",
             vec![
@@ -1080,7 +1111,7 @@ mod tests {
                 .unwrap(),
             ],
         );
-        let after_branch = fixture
+        let after_branch = source_fixture
             .stage(branched, &branch_intent, &FastAppendPreparer)
             .await
             .0;
@@ -1932,6 +1963,7 @@ mod tests {
             },
             &PreparedChange::default(),
             &[&preparer],
+            &mut None,
         )
         .await
         .unwrap();
@@ -1960,6 +1992,7 @@ mod tests {
             },
             &PreparedChange::default(),
             &[&preparer],
+            &mut None,
         )
         .await
         .unwrap();
@@ -1988,6 +2021,7 @@ mod tests {
             },
             &PreparedChange::default(),
             &[&ReusedManifest(selected), &RemoveAfterAppend],
+            &mut None,
         )
         .await
         .unwrap();

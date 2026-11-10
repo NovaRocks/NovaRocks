@@ -164,13 +164,7 @@ impl super::staging::Preparer for RewriteDataFilesPreparer {
         view: &super::staging::StagedView<'_>,
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(view.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
-        let live = inputs.live_set().await?;
+        let (sources, live) = view.observe_live_sources().await?;
         let removed = intent
             .changes()
             .removed
@@ -182,7 +176,7 @@ impl super::staging::Preparer for RewriteDataFilesPreparer {
                 "Whole-data rewrite frozen set does not equal the target-ref live set",
             ));
         }
-        prepare_physical_rewrite(view, intent, live, &removed, true).await
+        prepare_physical_rewrite(view, intent, (sources.as_ref(), &live), &removed, true).await
     }
 }
 
@@ -191,13 +185,17 @@ impl super::staging::Preparer for RewriteDataFilesPreparer {
 pub(crate) async fn prepare_physical_rewrite(
     view: &super::staging::StagedView<'_>,
     intent: &super::model::OperationIntent,
-    live: &super::dependency::LiveSet,
+    observation: (
+        Option<&super::manifest_sources::SnapshotSources<'_>>,
+        &BTreeMap<super::model::EntryIdentity, super::manifest_sources::LocatedEntry>,
+    ),
     removed: &std::collections::BTreeSet<super::model::EntryIdentity>,
     data_rewrite: bool,
 ) -> crate::iceberg::Result<super::staging::PreparedChange> {
     use super::model::{EntryIdentity, SeqField};
     use super::staging::{ManifestEntryWrite, write_manifest};
     let metadata = view.metadata();
+    let (sources, live) = observation;
     if metadata.format_version() == FormatVersion::V1 {
         return Err(rewrite_invalid(
             "Physical rewrite does not support V1 tables",
@@ -252,7 +250,7 @@ pub(crate) async fn prepare_physical_rewrite(
                         "Replacement DV references a data file absent from the target ref",
                     )
                 })?;
-            if data.file.partition() != added.file().partition() {
+            if &data.frozen.facts().partition != added.file().partition() {
                 return Err(rewrite_invalid(
                     "Replacement DV partition differs from its exact referenced data file",
                 ));
@@ -273,12 +271,7 @@ pub(crate) async fn prepare_physical_rewrite(
             .push(added.clone());
     }
     let snapshot_id = super::staging::new_snapshot_id(metadata);
-    let entries = live
-        .iter()
-        .map(|(identity, entry)| (entry.clone(), removed.contains(identity)))
-        .collect();
-    let mut manifests =
-        super::overwrite::write_live_entry_groups(view, snapshot_id, entries).await?;
+    let mut additions = Vec::new();
     for ((spec_id, assigned), added) in added_groups {
         let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
             rewrite_invalid(format!("Rewrite partition spec {spec_id} is absent"))
@@ -312,13 +305,21 @@ pub(crate) async fn prepare_physical_rewrite(
                     .map_err(|_| rewrite_invalid("Assigned rewrite row ID must be nonnegative"))?,
             );
         }
-        manifests.push(manifest);
+        additions.push(manifest);
     }
     let deleted = live
         .iter()
         .filter(|(identity, _)| removed.contains(*identity))
-        .map(|(_, entry)| entry.clone())
+        .map(|(_, entry)| entry)
         .collect::<Vec<_>>();
+    let manifests = super::manifest_transform::ordinary_manifests(
+        view,
+        snapshot_id,
+        sources,
+        &deleted,
+        additions,
+    )
+    .await?;
     let mut summary = super::overwrite::snapshot_file_summary(&intent.changes().added, &deleted)?;
     if data_rewrite {
         summary.insert("total-records".into(), summary["added-records"].clone());

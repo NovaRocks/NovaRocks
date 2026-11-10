@@ -32,51 +32,20 @@
 //! * ADDED + EXISTING entries become EXISTING in the merged manifest
 
 use std::collections::{BTreeMap, HashMap};
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::iceberg::io::FileIO;
-use crate::iceberg::spec::{
-    DataFile, DataFileBuilder, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
-    ManifestStatus, ManifestWriterBuilder, Operation, Summary,
-};
+use super::super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
+use super::super::model::{ArtifactClass, ArtifactWriter, FrozenEntry};
+use super::super::staging::{ManifestEntryWrite, write_sourced_manifest_with_class};
+use crate::iceberg::spec::{ManifestContentType, ManifestFile, Operation, Snapshot, Summary};
 use crate::iceberg::{TableRequirement, TableUpdate};
-
-fn clone_data_file_with_first_row_id(
-    source: &DataFile,
-    partition_spec_id: i32,
-    first_row_id: Option<i64>,
-) -> Result<DataFile, String> {
-    let mut builder = DataFileBuilder::default();
-    builder
-        .content(source.content_type())
-        .file_path(source.file_path().to_string())
-        .file_format(source.file_format())
-        .partition(source.partition().clone())
-        .partition_spec_id(partition_spec_id)
-        .record_count(source.record_count())
-        .file_size_in_bytes(source.file_size_in_bytes())
-        .column_sizes(source.column_sizes().clone())
-        .value_counts(source.value_counts().clone())
-        .null_value_counts(source.null_value_counts().clone())
-        .nan_value_counts(source.nan_value_counts().clone())
-        .lower_bounds(source.lower_bounds().clone())
-        .upper_bounds(source.upper_bounds().clone())
-        .key_metadata(source.key_metadata().map(|bytes| bytes.to_vec()))
-        .split_offsets(source.split_offsets().map(|offsets| offsets.to_vec()))
-        .equality_ids(source.equality_ids())
-        .first_row_id(first_row_id)
-        .referenced_data_file(source.referenced_data_file())
-        .content_offset(source.content_offset())
-        .content_size_in_bytes(source.content_size_in_bytes());
-    if let Some(sort_order_id) = source.sort_order_id() {
-        builder.sort_order_id(sort_order_id);
-    }
-    builder
-        .build()
-        .map_err(|error| format!("clone Iceberg data file for manifest rewrite: {error}"))
-}
+#[cfg(test)]
+use crate::iceberg::{
+    io::FileIO,
+    spec::{DataFileBuilder, FormatVersion, ManifestEntry, ManifestStatus, ManifestWriterBuilder},
+};
+use crate::manifest::source::ManifestSource;
 
 fn finalize_snapshot_summary(
     mut properties: HashMap<String, String>,
@@ -184,131 +153,59 @@ pub(crate) fn group_manifests_by_spec_and_content(
 /// to EXISTING (round-tripping snapshot_id, sequence_number, file_sequence_number
 /// and all DataFile v3 row-lineage fields via ManifestWriter::add_existing_file).
 async fn merge_manifest_group(
-    file_io: &FileIO,
-    table_metadata: &crate::iceberg::spec::TableMetadata,
+    artifacts: &dyn ArtifactWriter,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    parent: &Snapshot,
     group: &[ManifestFile],
-    new_manifest_path: &str,
-    new_snapshot_id: i64,
-    format_version: FormatVersion,
-) -> Result<ManifestFile, crate::iceberg::Error> {
+    snapshot_id: i64,
+) -> crate::iceberg::Result<ManifestFile> {
     let first = group
         .first()
         .ok_or_else(|| rewrite_error("Manifest merge requires a nonempty input group"))?;
     let spec_id = first.partition_spec_id;
     let content = first.content;
-    if group
-        .iter()
-        .any(|manifest| manifest.partition_spec_id != spec_id || manifest.content != content)
-    {
-        return Err(rewrite_error(
-            "Manifest merge input group has conflicting spec or content identities",
-        ));
-    }
-    if format_version == FormatVersion::V1 && content == ManifestContentType::Deletes {
-        return Err(crate::iceberg::Error::new(
-            crate::iceberg::ErrorKind::FeatureUnsupported,
-            "V1 tables cannot contain delete manifests",
-        ));
-    }
-
-    // Look up partition spec and schema from the table metadata.
-    let partition_spec = table_metadata
+    let spec = metadata
         .partition_spec_by_id(spec_id)
-        .ok_or_else(|| {
-            crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                format!("partition_spec_id {spec_id} not found in table metadata"),
-            )
-        })?
-        .as_ref()
-        .clone();
-
-    let schema = table_metadata.current_schema().clone();
-
-    let output_file = file_io.new_output(new_manifest_path)?;
-    let builder =
-        ManifestWriterBuilder::new(output_file, Some(new_snapshot_id), schema, partition_spec);
-
-    let mut writer = match (format_version, content) {
-        (FormatVersion::V1, ManifestContentType::Data) => builder.build_v1(),
-        (FormatVersion::V2, ManifestContentType::Data) => builder.build_v2_data(),
-        (FormatVersion::V2, ManifestContentType::Deletes) => builder.build_v2_deletes(),
-        (FormatVersion::V3, ManifestContentType::Data) => builder.build_v3_data(),
-        (FormatVersion::V3, ManifestContentType::Deletes) => builder.build_v3_deletes(),
-        (FormatVersion::V1, ManifestContentType::Deletes) => {
-            unreachable!("V1 delete manifests were rejected before output construction")
-        }
-    };
-
-    // Collect all live entries from all manifests in the group.
-    for manifest_file in group {
-        let manifest = crate::manifest::load_manifest(manifest_file, file_io).await?;
-        if manifest.metadata().partition_spec().spec_id() != spec_id
-            || *manifest.metadata().content() != content
-        {
+        .ok_or_else(|| rewrite_error("Manifest merge references a missing partition spec"))?;
+    let mut entries = Vec::new();
+    for descriptor in group {
+        if descriptor.partition_spec_id != spec_id || descriptor.content != content {
             return Err(rewrite_error(
-                "Manifest header contradicts its frozen list descriptor",
+                "Manifest merge input group has conflicting spec or content identities",
             ));
         }
-
-        // For V3 row-lineage: stamp an explicit first_row_id on each data file
-        // so that the value is preserved after merge. When INSERT writes data
-        // files with first_row_id=None, the manifest-list writer assigns the
-        // manifest-level first_row_id. After merging, the new merged manifest
-        // would get a fresh manifest-level first_row_id from next_row_id(),
-        // causing _row_id values to shift. By stamping at the data-file level,
-        // the read path (read.rs:338: df.first_row_id().or(manifest fallback))
-        // uses the explicit per-file value, preserving the §5.4 invariant.
-        //
-        // Reuse the IRU-5 inheritance cursor. Explicit file IDs do not
-        // consume a manifest range; absent IDs use only real list assignment.
-        let manifest_first_row_id: Option<i64> = manifest_file
-            .first_row_id
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| rewrite_error("Manifest first_row_id exceeds i64"))?;
-        let mut row_ids = crate::commit::staging::FirstRowIdInheritance::new(manifest_first_row_id);
-
-        for entry_ref in manifest.entries() {
-            let entry: &ManifestEntry = entry_ref.as_ref();
-            if entry.status == ManifestStatus::Deleted {
-                // Spec §5.2 Step 3: discard DELETED entries.
-                continue;
+        artifacts.check_active()?;
+        let source =
+            ManifestSource::committed(parent.snapshot_id(), parent.manifest_list(), descriptor);
+        let raw = source.load(artifacts.file_io()).await?;
+        let encoding = Arc::new(ManifestWriteSource::from_header(raw.metadata())?);
+        for bound in source.bind(&raw)? {
+            artifacts.check_active()?;
+            let entry = bound?;
+            if entry.raw.is_alive() {
+                entries.push(SourcedManifestEntry {
+                    source: Arc::clone(&encoding),
+                    entry: ManifestEntryWrite::Existing {
+                        file: entry.raw.data_file().clone(),
+                        frozen: FrozenEntry::from_bound_entry(&entry)?,
+                    },
+                });
             }
-
-            // Round-trip the entry as EXISTING, preserving all DataFile fields
-            // (including v3 row-lineage: first_row_id, referenced_data_file,
-            // content_offset, content_size_in_bytes) via the data_file clone.
-            // The sequence numbers and snapshot_id from the original entry are
-            // preserved to maintain the causal ordering invariants.
-            //
-            // load_manifest applies only the protocol's explicit inheritance.
-            // Carried files require those actual facts, never guessed defaults.
-            let (snap_id, seq, file_seq) = carried_identity(entry)?;
-
-            let orig_df = &entry.data_file;
-            // Explicit file IDs do not consume inherited row-ID space. The
-            // same staging resolver owns data/delete and overflow semantics.
-            let stamped_first_row_id = row_ids.resolve(orig_df, entry.status)?;
-
-            let data_file =
-                clone_data_file_with_first_row_id(orig_df, spec_id, stamped_first_row_id).map_err(
-                    |e| crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, e),
-                )?;
-            writer
-                .add_existing_file(data_file, snap_id, seq, file_seq)
-                .map_err(|e| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        format!("ManifestWriter::add_existing_file: {e}"),
-                    )
-                })?;
         }
     }
-
-    writer.write_manifest_file().await
+    write_sourced_manifest_with_class(
+        artifacts,
+        ArtifactClass::Operation,
+        metadata,
+        snapshot_id,
+        spec,
+        content,
+        entries,
+    )
+    .await
 }
 
+#[cfg(test)]
 fn carried_identity(
     entry: &ManifestEntry,
 ) -> Result<(i64, i64, Option<i64>), crate::iceberg::Error> {
@@ -337,6 +234,25 @@ fn carried_identity(
 struct ReusableRewrite {
     sources: Vec<ManifestFile>,
     outputs: Vec<ManifestFile>,
+    encoding_basis: Vec<u8>,
+}
+
+fn encoding_basis(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> crate::iceberg::Result<Vec<u8>> {
+    let mut schemas = metadata.schemas_iter().collect::<Vec<_>>();
+    schemas.sort_by_key(|schema| schema.schema_id());
+    let mut specs = metadata.partition_specs_iter().collect::<Vec<_>>();
+    specs.sort_by_key(|spec| spec.spec_id());
+    serde_json::to_vec(&(
+        metadata.format_version(),
+        metadata.current_schema_id(),
+        schemas,
+        specs,
+    ))
+    .map_err(|error| {
+        rewrite_error("Cannot encode manifest rewrite dependencies").with_source(error)
+    })
 }
 
 pub(crate) struct RewriteManifestsPreparer {
@@ -366,7 +282,6 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
         view: &crate::commit::staging::StagedView<'_>,
         intent: &crate::commit::model::OperationIntent,
     ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
-        use crate::commit::model::{ArtifactClass, ArtifactKind};
         use crate::commit::staging::PreparedChange;
         let metadata = view.metadata();
         view.artifacts().check_active()?;
@@ -387,6 +302,7 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                 .await?;
         view.artifacts().check_active()?;
         let latest = latest.entries();
+        let encoding_basis = encoding_basis(metadata)?;
         if let Some(request) = &self.request {
             // These are actual borrowed descriptor facts, not compressed-file
             // bytes or an invented bound for the SDK's decoded DataFile graph.
@@ -401,6 +317,9 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                         descriptor_owned_bytes(&c.sources).and_then(|a| {
                             descriptor_owned_bytes(&c.outputs).and_then(|b| {
                                 a.checked_add(b)
+                                    .and_then(|value| {
+                                        value.checked_add(c.encoding_basis.capacity() as u64)
+                                    })
                                     .ok_or_else(|| rewrite_error("manifest backing overflow"))
                             })
                         })
@@ -408,7 +327,7 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
                     .transpose()?
                     .unwrap_or(0)
             };
-            let required=descriptor_owned_bytes(latest)?.checked_add(old).and_then(|v|v.checked_mul(8)).and_then(|v|v.checked_add(2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64)).and_then(std::num::NonZeroU64::new).ok_or_else(||rewrite_error("manifest backing overflow"))?;
+            let required=descriptor_owned_bytes(latest)?.checked_add(old).and_then(|value| value.checked_add(encoding_basis.capacity() as u64)).and_then(|v|v.checked_mul(8)).and_then(|v|v.checked_add(2*(novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES+novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES) as u64)).and_then(std::num::NonZeroU64::new).ok_or_else(||rewrite_error("manifest backing overflow"))?;
             request
                 .reserve_owned_metadata(required)
                 .await
@@ -421,45 +340,47 @@ impl crate::commit::staging::Preparer for RewriteManifestsPreparer {
             .lock()
             .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))?
             .clone();
-        let reusable =
-            match cached.filter(|cache| rewrite_sources_are_current(&cache.sources, latest)) {
-                Some(cache) => cache,
-                None => {
-                    // This is a policy operation: invalidated selections are
-                    // replanned, rather than treated as an explicit-input promise.
-                    let groups = group_manifests_by_spec_and_content(latest);
-                    if groups.values().all(|group| group.len() <= 1) {
-                        return Ok(no_op());
-                    }
-                    let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
-                    let mut sources = Vec::new();
-                    let mut outputs = Vec::new();
-                    for group in groups.values().filter(|group| group.len() > 1) {
-                        let object = view
-                            .artifacts()
-                            .allocate(ArtifactClass::Operation, ArtifactKind::Manifest)?;
-                        let output = merge_manifest_group(
-                            view.artifacts().file_io(),
-                            metadata,
-                            group,
-                            object.path(),
-                            snapshot_id,
-                            metadata.format_version(),
-                        )
-                        .await?;
-                        view.artifacts().check_active()?;
-                        sources.extend(group.iter().cloned());
-                        outputs.push(output);
-                    }
-                    let cache = ReusableRewrite { sources, outputs };
-                    *self
-                        .reusable
-                        .lock()
-                        .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))? =
-                        Some(cache.clone());
-                    cache
+        let reusable = match cached.filter(|cache| {
+            cache.encoding_basis == encoding_basis
+                && rewrite_sources_are_current(&cache.sources, latest)
+        }) {
+            Some(cache) => cache,
+            None => {
+                // This is a policy operation: invalidated selections are
+                // replanned, rather than treated as an explicit-input promise.
+                let groups = group_manifests_by_spec_and_content(latest);
+                if groups.values().all(|group| group.len() <= 1) {
+                    return Ok(no_op());
                 }
-            };
+                let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
+                let mut sources = Vec::new();
+                let mut outputs = Vec::new();
+                for group in groups.values().filter(|group| group.len() > 1) {
+                    let output = merge_manifest_group(
+                        view.artifacts(),
+                        metadata,
+                        parent,
+                        group,
+                        snapshot_id,
+                    )
+                    .await?;
+                    view.artifacts().check_active()?;
+                    sources.extend(group.iter().cloned());
+                    outputs.push(output);
+                }
+                let cache = ReusableRewrite {
+                    sources,
+                    outputs,
+                    encoding_basis,
+                };
+                *self
+                    .reusable
+                    .lock()
+                    .map_err(|_| rewrite_error("Manifest reuse state is poisoned"))? =
+                    Some(cache.clone());
+                cache
+            }
+        };
         let snapshot_id = crate::commit::staging::new_snapshot_id(metadata);
         let mut manifests = latest
             .iter()
@@ -898,7 +819,14 @@ mod row_id_rewrite_tests {
     }
     #[tokio::test]
     async fn explicit_rows_do_not_shift_the_next_inherited_file_during_real_v3_merge() {
-        let io = FileIO::new_with_memory();
+        let artifacts = crate::commit::staging::TestWriter::new();
+        let io = artifacts.file_io();
+        let input = artifacts
+            .allocate(
+                ArtifactClass::Operation,
+                crate::commit::model::ArtifactKind::Manifest,
+            )
+            .unwrap();
         let schema = Schema::builder()
             .with_fields(vec![Arc::new(NestedField::required(
                 1,
@@ -920,7 +848,7 @@ mod row_id_rewrite_tests {
         .unwrap()
         .metadata;
         let mut writer = ManifestWriterBuilder::new(
-            io.new_output("memory://rewrite/source.avro").unwrap(),
+            io.new_output(input.path()).unwrap(),
             Some(11),
             metadata.current_schema().clone(),
             metadata.default_partition_spec().as_ref().clone(),
@@ -953,17 +881,20 @@ mod row_id_rewrite_tests {
         let mut source = writer.write_manifest_file().await.unwrap();
         source.first_row_id = Some(100);
         source.sequence_number = 10;
-        let merged = merge_manifest_group(
-            &io,
-            &metadata,
-            &[source],
-            "memory://rewrite/merged.avro",
-            22,
-            FormatVersion::V3,
-        )
-        .await
-        .unwrap();
-        let actual = crate::manifest::load_manifest(&merged, &io).await.unwrap();
+        let parent = Snapshot::builder()
+            .with_snapshot_id(11)
+            .with_sequence_number(10)
+            .with_timestamp_ms(1)
+            .with_manifest_list("memory://rewrite/parent-list.avro".to_owned())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        let merged = merge_manifest_group(&artifacts, &metadata, &parent, &[source], 22)
+            .await
+            .unwrap();
+        let actual = crate::manifest::load_manifest(&merged, io).await.unwrap();
         let actual = actual
             .entries()
             .iter()

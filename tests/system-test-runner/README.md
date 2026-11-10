@@ -253,11 +253,11 @@ pass and transport supervisor composition tests, not by these scenarios.
 |---|---|---|
 | 慢读与完全不读客户端 | `result-delivery/slow-client-progress`、`result-delivery/unread-client-progress` | 真实 Trino body 慢读/不读与暂停 GET 分开，独立行/字节预期，进展/取消与 owner 收敛分开 |
 | 独立并发结果 | `result-delivery/concurrent-results-drain` | 有限actors，失败取消其他live peers、实际join，保留primary及cleanup错误 |
-| range/短查询 | `uea4/iceberg-range-functional`、`connector/iceberg-short-range-concurrent` | 多文件A4及独立4096行单文件manifest；准确行序/算术、LIMIT后退出、并发结果 |
+| range/短查询 | `uea4/iceberg-range-functional`、`connector/iceberg-short-range-concurrent` | 私有 REST/MinIO/Spark 在运行内生成 24 文件和 4096 行单文件；核对准确行序、算术、LIMIT、并发、持有 GET 与退出 |
 | 同provider排队进展 | `catalog/provider-read-queued-progress` | held真实Parquet读、同provider waiting，释放后两个查询正确并退出 |
 | planning责任与取消 | `uea4/catalog-planning-responsibility`、`uea4/catalog-planning-no-fe-quota`、`uea4/iceberg-held-read-cancellation`、`uea4/catalog-planning-smoke` | Iceberg/Paimon真实READY；FE/BE责任、held请求精确终态及公开收敛 |
-| warm异质delete | `connector/iceberg-delete-warm-concurrent` | typed独立Java corpus receipt，固定旧/latest snapshot及私有mutation，有限并发和真实退出 |
-| cold delete | `connector/iceberg-delete-applicability` | 完整冻结native manifest包含corpus/anomaly/scale；真实多文件与split/page-source退出 |
+| warm异质delete | `connector/iceberg-delete-warm-concurrent` | 私有 Spark 现场生成 typed Java corpus；核对固定旧/latest snapshot、私有 DELETE、有限并发及真实退出 |
+| cold delete | `connector/iceberg-delete-applicability` | 私有 Spark 现场生成 corpus/anomaly，核对独立 Java 行袋、适用性、原始 manifest 与实际退出。旧手工规模矩阵退役 |
 
 range/planning输入准备与校验见保留的 [range fixture](../benchmarks/uea4a2/README.md) 和 [planning fixture](../benchmarks/uea4a4/README.md)。原目录名不赋予测量责任。正常held转发仍要求真正forward完成；取消路径按同request精确connection的上游终态观察，不能把其他连接关闭或ERR当退出。
 

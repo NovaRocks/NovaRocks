@@ -31,29 +31,17 @@ impl super::staging::Preparer for FastAppendPreparer {
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         super::overwrite::validate_added_data(intent)?;
-        let metadata = view.metadata();
-        let parent = metadata
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut manifests = if let Some(id) = parent {
-            view.artifacts().check_active()?;
-            let snapshot = metadata.snapshot_by_id(id).ok_or_else(|| {
-                crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::DataInvalid,
-                    "Append target ref snapshot is absent",
-                )
-            })?;
-            let list =
-                crate::manifest::load_manifest_list(snapshot, view.artifacts().file_io(), metadata)
-                    .await?;
-            view.artifacts().check_active()?;
-            list.entries().to_vec()
-        } else {
-            Vec::new()
-        };
-        let snapshot_id = super::staging::new_snapshot_id(metadata);
-        manifests
-            .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
+        let sources = view.target_sources().await?;
+        let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let added = super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
+            view,
+            snapshot_id,
+            sources.as_ref(),
+            &[],
+            added,
+        )
+        .await?;
         super::overwrite::prepare_snapshot_change(
             view,
             intent,

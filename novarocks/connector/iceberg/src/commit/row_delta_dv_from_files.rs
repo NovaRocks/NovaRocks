@@ -56,7 +56,8 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
                 requirements: vec![],
             });
         }
-        let index = RowLiveIndex::load(view).await?;
+        let (sources, live) = view.observe_live_sources().await?;
+        let index = RowLiveIndex::from_entries(live)?;
         let mut data = Vec::new();
         let mut dvs = Vec::new();
         let mut identities = HashSet::new();
@@ -93,7 +94,7 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
                                 "Deletion vector references absent data file {referenced_data_file}"
                             ))
                         })?;
-                    if added.file().partition() != source.file.partition()
+                    if added.file().partition() != &source.frozen.facts().partition
                         || added.partition_spec_id() != source.frozen.facts().partition_spec_id
                     {
                         return Err(to_iceberg_unexpected(
@@ -145,7 +146,7 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
                 .ok_or_else(|| to_iceberg_unexpected("DV cardinality overflow".into()))
         })?;
         let removed_records = replaced.iter().try_fold(0u64, |sum, id| {
-            sum.checked_add(index.live[id].file.record_count())
+            sum.checked_add(index.live[id].frozen.facts().record_count)
                 .ok_or_else(|| to_iceberg_unexpected("Removed DV cardinality overflow".into()))
         })?;
         new_dv_records.checked_sub(removed_records).ok_or_else(|| {
@@ -184,7 +185,7 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
                 removed_records.to_string(),
             );
             let removed_size = replaced.iter().try_fold(0u64, |sum, id| {
-                sum.checked_add(logical_file_size(&index.live[id].file)?)
+                sum.checked_add(index.live[id].logical_size)
                     .ok_or_else(|| to_iceberg_unexpected("Removed DV size overflow".into()))
             })?;
             summary.insert("removed-files-size".into(), removed_size.to_string());
@@ -198,16 +199,6 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
             summary.insert("total-records".into(), total.to_string());
         }
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
-        let mut manifests = super::overwrite::write_live_entry_groups(
-            view,
-            snapshot_id,
-            index
-                .live
-                .into_iter()
-                .map(|(identity, live)| (live, replaced.contains(&identity)))
-                .collect(),
-        )
-        .await?;
         let operation = if data.is_empty() {
             Operation::Delete
         } else if dvs.is_empty() {
@@ -215,9 +206,20 @@ impl crate::commit::staging::Preparer for RowDeltaDvFromFilesPreparer {
         } else {
             Operation::Overwrite
         };
-        manifests.extend(
-            write_added_entry_groups(view, snapshot_id, dvs.into_iter().chain(data)).await?,
-        );
+        let removed = replaced
+            .iter()
+            .map(|id| &index.live[id])
+            .collect::<Vec<_>>();
+        let added =
+            write_added_entry_groups(view, snapshot_id, dvs.into_iter().chain(data)).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
+            view,
+            snapshot_id,
+            sources.as_ref(),
+            &removed,
+            added,
+        )
+        .await?;
         // The preparer never deletes a superseded BE object: another logical DV
         // may still use the same physical Puffin. Finalization owns reachability.
         super::overwrite::prepare_snapshot_change(
@@ -280,20 +282,18 @@ async fn coalesce_intent_dvs(
         .map_err(|e| to_iceberg_unexpected(format!("Write coalesced DV failed: {e}")))?;
         let source = &index.live[&EntryIdentity::DataFile { path: referenced }];
         let facts = source.frozen.facts();
-        let live = super::row_delta_dv_metadata::LiveFile {
-            data_file: source.file.clone(),
-            partition_spec_id: facts.partition_spec_id,
-            snapshot_id: facts
-                .added_snapshot_id
-                .ok_or_else(|| to_iceberg_unexpected("Data source has no added snapshot".into()))?,
-            sequence_number: facts.data_sequence.ok_or_else(|| {
-                to_iceberg_unexpected("Data source has no assigned sequence".into())
-            })?,
-            file_sequence_number: facts.file_sequence,
-        };
+        if facts.added_snapshot_id.is_none() || facts.data_sequence.is_none() {
+            return Err(to_iceberg_unexpected(
+                "Data source has no assigned snapshot or sequence".into(),
+            ));
+        }
         out.push(AddedContent::new_logical_data(
-            super::row_delta_dv_metadata::dv_data_file(&WrittenDvFile::from(written), &live)
-                .map_err(to_iceberg_unexpected)?,
+            super::row_delta_dv_metadata::dv_data_file_for_partition(
+                &WrittenDvFile::from(written),
+                facts.partition_spec_id,
+                &facts.partition,
+            )
+            .map_err(to_iceberg_unexpected)?,
             facts.partition_spec_id,
         )?);
     }
