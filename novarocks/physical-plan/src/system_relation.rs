@@ -21,6 +21,7 @@ use arrow_schema::FieldRef;
 use novarocks_type_contract::{CompileControlError, ValueTypeStorageLifetime};
 use std::sync::Arc;
 
+// Design: ADR-0226 (docs/adr/ADR-0226-engine-metadata-through-typed-system-relations.md)
 #[derive(Clone, Debug)]
 pub enum SystemRelationData {
     /// Display-only relation; execution encoders must refuse it.

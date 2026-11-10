@@ -1065,6 +1065,7 @@ where
         config.native_ingress,
     )?;
     let exchange_port = report_server.bound_addr().port();
+    // Design: ADR-0226 (docs/adr/ADR-0226-engine-metadata-through-typed-system-relations.md)
     let system_catalog: Arc<novarocks_query_application::system_tables::SystemTableRegistry> =
         Arc::new(
             novarocks_query_application::system_tables::SystemTableRegistry::try_new([])

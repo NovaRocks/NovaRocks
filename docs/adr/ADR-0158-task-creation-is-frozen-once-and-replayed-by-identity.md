@@ -5,6 +5,10 @@ domain: [distributed-query-lifecycle, sql-compiler]
 status: superseded
 supersedes: []
 superseded-by: ADR-0161
+partially-superseded-by:
+  - id: ADR-0227
+    scope: "Background assertion that descriptor and single-operation fixed limits are intrinsic request limits; identity replay and the existing supersession by ADR-0161 remain unchanged"
+    link: "ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md"
 date: 2026-09-24
 provenance:
   - "discussion: 2026-09-20 to 2026-09-23 frozen task creation carriers and identity replay"

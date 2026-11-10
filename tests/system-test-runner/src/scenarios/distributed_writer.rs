@@ -907,8 +907,7 @@ task_dispatch_update_permits = 12
 task_dispatch_lifecycle_permits = 4
 task_dispatch_control_permits = 4
 task_operation_max_batch_items = 32
-task_operation_max_batch_encoded_bytes = 50331648
-task_descriptor_max_encoded_bytes = 16777216
+task_operation_batch_target_encoded_bytes = 50331648
 task_query_backend_max_queued_operations = 4096
 task_query_backend_max_queued_bytes = 268435456
 task_backend_max_queued_operations = 16384
@@ -934,10 +933,9 @@ const CONCURRENT_CAPACITY_EXPECTED: &[(&[&str], i64)] = &[
     (&["runtime", "task_dispatch_control_permits"], 4),
     (&["runtime", "task_operation_max_batch_items"], 32),
     (
-        &["runtime", "task_operation_max_batch_encoded_bytes"],
+        &["runtime", "task_operation_batch_target_encoded_bytes"],
         50331648,
     ),
-    (&["runtime", "task_descriptor_max_encoded_bytes"], 16777216),
     (
         &["runtime", "task_query_backend_max_queued_operations"],
         4096,

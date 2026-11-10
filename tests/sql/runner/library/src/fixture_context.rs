@@ -888,14 +888,14 @@ pub(crate) fn render_expected(value: &str, variables: &HashMap<String, String>) 
     rendered
 }
 fn metadata_projection(sql: &str) -> Option<String> {
-    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|materialized_views|task_runs)\b").ok()?;
+    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|task_runs)|system\.metadata\.materialized_views)\b").ok()?;
     re.captures(sql).map(|c| c[1].to_string())
 }
 fn metadata_columns(sql: &str) -> BTreeSet<String> {
     let Some(projection) = metadata_projection(sql) else {
         return BTreeSet::new();
     };
-    let re = Regex::new(r"(?i)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(schema_name|table_schema|database|db_name)`?(?:\s+(?:AS\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?\s*$").unwrap();
+    let re = Regex::new(r"(?i)^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)?`?(schema_name|table_schema|storage_schema|database|db_name)`?(?:\s+(?:AS\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?)?\s*$").unwrap();
     projection
         .split(',')
         .filter_map(|part| {
@@ -913,7 +913,7 @@ pub(crate) fn rewrite_metadata_filters(sql: &str, mapping: &BTreeMap<String, Str
         return sql.to_string();
     }
     let re = Regex::new(
-        r#"(?i)(\b(?:table_schema|schema_name|database|db_name)`?\s*=\s*)(['"])([^'"]+)(['"])"#,
+        r#"(?i)(\b(?:table_schema|schema_name|storage_schema|database|db_name)`?\s*=\s*)(['"])([^'"]+)(['"])"#,
     )
     .unwrap();
     re.replace_all(sql, |c: &regex::Captures<'_>| {
@@ -2120,6 +2120,27 @@ print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id
         };
         render_expected_result(&actual, &mut result, &HashMap::new(), &mapping).unwrap();
         assert_eq!(result.rows[0], vec!["new_ns", "old_ns"]);
+    }
+    #[test]
+    fn standard_mv_metadata_maps_schema_and_storage_schema_without_changing_data() {
+        let mapping = BTreeMap::from([("old_ns".into(), "new_ns".into())]);
+        let sql = "SELECT schema_name, storage_schema AS stored_db, 'old_ns' AS business FROM system.metadata.materialized_views WHERE schema_name = 'old_ns' AND storage_schema = 'old_ns'";
+        let actual = rewrite_metadata_filters(sql, &mapping);
+        assert!(actual.contains("schema_name = 'new_ns'"));
+        assert!(actual.contains("storage_schema = 'new_ns'"));
+        assert!(actual.contains("'old_ns' AS business"));
+        let mut result = crate::types::ResultSet {
+            golden: None,
+            header: vec!["schema_name".into(), "stored_db".into(), "business".into()],
+            rows: vec![vec!["old_ns".into(); 3]],
+        };
+        render_expected_result(&actual, &mut result, &HashMap::new(), &mapping).unwrap();
+        assert_eq!(result.rows[0], vec!["new_ns", "new_ns", "old_ns"]);
+        let ordinary = "SELECT 'old_ns' FROM ordinary WHERE storage_schema = 'old_ns'";
+        assert_eq!(rewrite_metadata_filters(ordinary, &mapping), ordinary);
+        assert!(
+            metadata_projection("SELECT name FROM information_schema.materialized_views").is_none()
+        );
     }
     #[test]
     fn namespace_metadata_and_data_projection_ambiguity_rejects_before_scratch() {

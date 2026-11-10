@@ -789,6 +789,7 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
     }
 }
 #[async_trait]
+// Design: ADR-0226 (docs/adr/ADR-0226-engine-metadata-through-typed-system-relations.md)
 impl SystemTableSnapshotFactPort for FrontendSystemTableFacts {
     async fn resolve_system_tables(
         &self,

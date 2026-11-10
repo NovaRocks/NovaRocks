@@ -183,6 +183,11 @@ SQL client
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
 
+- `novarocks/sql/src/system_table.rs` 与 `novarocks/query-application/src/system_tables/**`
+  系统表纯声明、catalog 绑定、注册表、请求与类型化批快照契约。SQL 先完成名称/声明补全，
+  再按所需列与保守键约束请求快照；普通 EXPLAIN 不获取快照。注册表不保管某句的 pin、IO 或 CPU。
+  `system` 与各 catalog 的 `information_schema` 保持只读，见 ADR-0226。
+
 - `novarocks/parser/src/**`
   Hand-written lexer, parser and AST, including the StarRocks-compatible
   surface for catalogs, tables, materialized views, Iceberg refs and drops.
@@ -301,6 +306,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 仍须清零修复账、相关登记及 pure 排除清单，并完成原生 1FE+3BE 与全部约定 CI 的最终验证。
 
 ### 4.4 Local Program and Operators
+
+- `novarocks/physical-plan/src/system_relation.rs`、
+  `novarocks/plan-codec/src/physical_package_v2/system_relation.rs`、
+  `novarocks/local-compiler/src/system_relation.rs` 与
+  `novarocks/execution/src/exec/pipeline/builder/compiled_system_relation.rs`
+  拥有独立系统关系的批序列、编解码、降级与 BE 游标源；每次消费批次，不整份拼接，
+  不登记为 SQL 常量或借用 `StaticValues`。类型、几何和实际存储责任仍由原作者核对，见 ADR-0226/0227。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
@@ -478,6 +490,14 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   和 unsafe 地址/生命周期要求。smoke 不证明性能或所有生产调用面已接线。
 
 ### 4.8 Connectors / Catalog Backends / Filesystem
+
+- `novarocks/frontend-application/src/system_tables/**` 与
+  `novarocks/frontend-application/src/query_execution/completion_facts/system_source.rs`
+  分别拥有系统表 Provider 与原语句快照 Source。目录行来自原 catalog generation，MV 行来自原产品事实；
+  Source 保留原 typed pin、IO、CPU、Root 与结果窗口，借用取消后继续等真实退出。
+  `novarocks/frontend-application/src/server.rs` 组合静态注册表；`mv/domain/freshness.rs` 区分基表缺失、
+  对象/版本变化和其它类型化读取失败。SHOW MATERIALIZED VIEWS、SHOW BACKENDS、SHOW TABLE STATS 保留。
+  元数据列举与任务传输的固定额度退役范围见 ADR-0227；Joint 只记责，不提供回复总字节容量。
 
 - `novarocks/types/src/{naming,schema}.rs`
   Neutral catalog naming and schema vocabulary. It contains no catalog runtime
