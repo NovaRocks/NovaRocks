@@ -584,9 +584,12 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
 async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing() {
     use super::actor_result::AdmissionPublicationError;
     use crate::{
-        control_runtime::{host::PreparedEffectJob, transport_withdrawal::AttemptEffectEnvelope},
+        control_runtime::{
+            host::{EffectExecutor, PreparedEffectJob},
+            transport_withdrawal::AttemptEffectEnvelope,
+        },
         task_execution::host::transport::{
-            self, ActorTransportHandoff, ActorTransportWork, BoundActorTransport, BoundQueue,
+            self, ActorTransportExecutor, ActorTransportWork, BoundActorTransport, BoundQueue,
             GrantedInputs, SendKey, SourceLayouts,
         },
     };
@@ -638,7 +641,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         },
     });
     let panic = PanicSink::new();
-    let (mut owner, exit, launch) =
+    let (owner, exit, launch) =
         OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
             .unwrap_or_else(|e| panic!("{}", e.error));
     let layouts = transport::actor_transport_layouts(false).unwrap();
@@ -662,17 +665,16 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             result_author,
         }),
     };
-    assert!(matches!(
-        transport::handoff_actor_transport(&Handle::current(), job),
-        Ok(ActorTransportHandoff::Spawned)
-    ));
-    assert!(owner.take_actor_result().is_none());
+    let handle = Handle::current();
+    let mut reaper = super::TransportRetirement::new(owner, Default::default(), observer());
+    assert!(ActorTransportExecutor(handle.clone()).handoff(job).is_ok());
+    assert!(reaper.take_actor_result().is_none());
     inbox.assert_no_result();
     let joined = tokio::time::timeout(
         Duration::from_secs(2),
         poll_fn(|cx| {
             wc.progress();
-            let result = owner.poll_shared_completion(cx);
+            let result = reaper.poll_step(&handle, cx);
             if result.is_pending() {
                 cx.waker().wake_by_ref();
             }
@@ -681,9 +683,9 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     )
     .await
     .unwrap()
-    .unwrap();
-    assert!(joined.is_none());
-    let mut result = owner.take_actor_result().unwrap();
+    .unwrap_or_else(|_| panic!("original admission Join"));
+    assert_eq!(joined, super::TransportRetirementStep::Advanced);
+    let mut result = reaper.take_actor_result().unwrap();
     assert!(result.withdrawal.is_none());
     let mut inputs = GrantedInputs::default();
     assert!(matches!(
@@ -730,7 +732,12 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     drop(original_grant);
     drop(payload_retention);
     result.original.close_after_exit().unwrap();
-    assert!(owner.try_retire().unwrap());
+    assert_eq!(
+        poll_fn(|cx| reaper.poll_step(&handle, cx))
+            .await
+            .unwrap_or_else(|_| panic!("original admission retirement")),
+        super::TransportRetirementStep::Retired,
+    );
     fixture.scope.close_external().unwrap();
     fixture
         .ledger

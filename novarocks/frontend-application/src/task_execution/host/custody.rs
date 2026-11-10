@@ -1176,3 +1176,8 @@ mod actor_result;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+mod transport_retirement;
+pub(crate) use transport_retirement::{
+    TransportRetirement, TransportRetirementError, TransportRetirementStep,
+};

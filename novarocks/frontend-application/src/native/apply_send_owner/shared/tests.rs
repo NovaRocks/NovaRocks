@@ -469,6 +469,7 @@ fn source_layouts() -> Vec<Layout> {
             .unwrap(),
         Layout::new::<AfterOriginalDrop>(),
         Layout::new::<Row>(),
+        custody::TransportRetirement::wake_layout(),
         Layout::array::<ReportedWork>(4).unwrap(),
         Layout::array::<OriginalDisposalObligation>(4).unwrap(),
     ];
@@ -516,7 +517,20 @@ struct Row {
     completed: Vec<OriginalDisposalObligation>,
     settlement: Option<PhysicalInputRetirementObligation>,
 }
-async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mode: Mode) -> Row {
+struct PendingRow {
+    source: OriginalTransportJoinObligation,
+    publisher: OriginalReplyPublisher,
+    operation: OperationIntent,
+    cleanup: VecDeque<ReportedWork>,
+    legacy_queue: Option<ReservationObligation>,
+    encoded: Arc<Mutex<Option<EncodingChild>>>,
+}
+fn pending_row(
+    roles: &Roles,
+    runtime: &FrontendDataRuntime,
+    wc: &mut Governed,
+    mode: Mode,
+) -> PendingRow {
     let backend = BackendProcessId::new_v7();
     let operation = cancel(backend);
     let mut layouts = source_layouts();
@@ -658,6 +672,24 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
             )
         })
         .unwrap();
+    PendingRow {
+        source,
+        publisher,
+        operation,
+        cleanup,
+        legacy_queue,
+        encoded,
+    }
+}
+async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mode: Mode) -> Row {
+    let PendingRow {
+        mut source,
+        publisher,
+        cleanup,
+        legacy_queue,
+        encoded,
+        ..
+    } = pending_row(roles, runtime, wc, mode);
     let completion = poll_fn(|cx| source.poll_shared_completion(cx))
         .await
         .unwrap()
@@ -1055,6 +1087,7 @@ async fn encoded_local_join_precedes_child_exit_and_foreign_disposal_keeps_same_
         .retirement
         .complete_disposal(completion)
         .unwrap_or_else(|_| panic!("actual physical completion"));
+    oracles.push(encoded.retirement.take_physical_return().is_none());
     let oracles = finish_row(encoded, &roles, &mut wc, oracles, &[DisposalPhase::Action]).await;
     let oracles = finish_row(
         other,
@@ -1389,6 +1422,107 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         .reap_scope_ready(roles.scope.id(), 128)
         .unwrap();
     inbox.finish();
+    roles.finish();
+    assert!(wc.finish());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_aliases() {
+    use custody::{TransportRetirement, TransportRetirementStep};
+
+    #[derive(Default)]
+    struct ReplyWake(AtomicUsize);
+    impl Wake for ReplyWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let roles = Roles::new();
+    let mut wc = Governed::new();
+    let mut runtime = FrontendDataRuntime::new(Handle::current());
+    let PendingRow {
+        source,
+        publisher,
+        operation,
+        cleanup,
+        legacy_queue,
+        encoded,
+    } = pending_row(
+        &roles,
+        &runtime,
+        &mut wc,
+        Mode::InlineEncoded { fail_scope: false },
+    );
+    assert!(legacy_queue.is_none());
+    let reply = publisher.canonicalize(
+        crate::task_execution::intent::OperationAcknowledgement::transport_unknown(
+            operation.operation_id(),
+            operation.kind(),
+        ),
+    );
+    drop(publisher);
+    let mut reaper = TransportRetirement::new(source, cleanup, observer());
+    let handle = Handle::current();
+    let used = || async {
+        loop {
+            if let Some(capacity) = roles
+                .ledger
+                .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+                .unwrap()
+            {
+                break capacity.used;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        assert_eq!(used().await[0], 1);
+        while used().await != [0, 0] {
+            let step = poll_fn(|cx| reaper.poll_step(&handle, cx))
+                .await
+                .unwrap_or_else(|_| panic!("original Native cleanup must advance"));
+            assert_eq!(step, TransportRetirementStep::Advanced);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(encoded.lock().unwrap().is_none());
+    let wake = Arc::new(ReplyWake::default());
+    let waker = Waker::from(wake.clone());
+    assert!(
+        reaper
+            .poll_step(&handle, &mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let before = wake.0.load(Ordering::SeqCst);
+    drop(reply);
+    assert!(wake.0.load(Ordering::SeqCst) > before);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let step = poll_fn(|cx| reaper.poll_step(&handle, cx))
+                .await
+                .unwrap_or_else(|_| panic!("original reply cleanup must advance"));
+            if step == TransportRetirementStep::Retired {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    runtime
+        .drain_original_apply_until(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    runtime
+        .drain_original_subscriptions_until(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    runtime.close_native_outgoing().unwrap();
+    runtime
+        .drain_native_outgoing_until(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
     roles.finish();
     assert!(wc.finish());
 }

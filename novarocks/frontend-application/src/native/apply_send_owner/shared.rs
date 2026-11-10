@@ -673,7 +673,8 @@ impl SharedApplyRetirement {
         Ok(())
     }
     /// Callback publication alone is insufficient: this exposes the same
-    /// packet only after its physical completion has been consumed above.
+    /// packet only after its physical completion and any original action
+    /// grant disposal. Reply aliases have their own later lifetime.
     pub(crate) fn take_physical_return(&mut self) -> Option<SharedPhysicalReturn> {
         let state = self
             .core
@@ -687,8 +688,10 @@ impl SharedApplyRetirement {
         if !Arc::ptr_eq(&self.origin, &shared.origin) {
             return None;
         }
-        if matches!(shared.stage, SharedStage::AwaitTransport)
-            || matches!(&shared.stage,SharedStage::Disposing {input,..} if input.phase == DisposalPhase::Native || input.phase == DisposalPhase::Physical)
+        if !matches!(
+            shared.stage,
+            SharedStage::ReplyAliases | SharedStage::Retired
+        ) && !matches!(&shared.stage, SharedStage::Disposing { input, .. } if input.phase == DisposalPhase::Reply)
         {
             return None;
         }

@@ -25,7 +25,9 @@ use super::{
 };
 use crate::{
     control_runtime::{
-        actor::FrontendEffect, host::PreparedEffectJob, transport_withdrawal::AttemptEffectEnvelope,
+        actor::FrontendEffect,
+        host::{EffectExecutor, PreparedEffectJob},
+        transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::host::custody::{
         CustodyError, TransportJoinHandoff, TransportJoinRegistration,
@@ -132,6 +134,15 @@ pub(crate) fn actor_transport_layouts(
 pub(crate) enum ActorTransportHandoff {
     Spawned,
     Failed(CustodyError),
+}
+
+pub(crate) struct ActorTransportExecutor(pub(crate) Handle);
+impl EffectExecutor for ActorTransportExecutor {
+    fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
+        // A failed launch has transferred the original result position. The
+        // Source receives that same raw failure through the original owner.
+        handoff_actor_transport(&self.0, job).map(|_| ())
+    }
 }
 
 /// Type/origin refusal retains the entire original job. Spawned proves only

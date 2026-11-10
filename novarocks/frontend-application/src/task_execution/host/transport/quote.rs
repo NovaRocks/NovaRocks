@@ -109,6 +109,11 @@ pub(crate) fn original_run(
         .checked_add(preparation.max(transition).max(encoded))
         .and_then(|peak| peak.checked_add(attached_inputs))
         .and_then(|peak| peak.checked_add(reports))
+        .and_then(|peak| {
+            peak.checked_add(
+                crate::task_execution::host::custody::TransportRetirement::wake_layout().size(),
+            )
+        })
         .ok_or(WorkError::ArithmeticOverflow)?;
     original_run_inventory(
         operations,
