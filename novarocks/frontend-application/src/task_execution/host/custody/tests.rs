@@ -300,12 +300,11 @@ use novarocks_control_runtime_core::{
 };
 
 type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, ExecutorFact)>>>;
-struct WithdrawalTarget(
-    ObservedWithdrawals,
-    std::collections::VecDeque<
-        Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
-    >,
+type TransportCommand = (
+    Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+    Option<novarocks_control_runtime::obligation::StepRegistration>,
 );
+struct WithdrawalTarget(ObservedWithdrawals, VecDeque<TransportCommand>);
 impl TestActor for WithdrawalTarget {
     fn handle(
         &mut self,
@@ -315,13 +314,32 @@ impl TestActor for WithdrawalTarget {
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
         if matches!(value, FrontendInput::Test(_)) {
-            let effect = self.1.pop_front().expect("one original transport command");
-            let work = step.input_work().expect("original admission author");
+            let (effect, guard) = self.1.pop_front().expect("one original transport command");
+            let work = match guard {
+                Some(guard) => {
+                    let work = novarocks_control_runtime_core::identity::ScopedWorkRef {
+                        scope: guard.scope().id(),
+                        work: guard.work_id(),
+                    };
+                    assert!(step.reservation(guard).is_ok());
+                    work
+                }
+                None => step.input_work().expect("original admission author"),
+            };
+            let kind = match effect.protocol.class {
+                novarocks_attempt_protocol::effect::EffectClass::Business => {
+                    novarocks_control_runtime_core::effect::EffectKind::Business
+                }
+                novarocks_attempt_protocol::effect::EffectClass::Settlement => {
+                    novarocks_control_runtime_core::effect::EffectKind::Settlement
+                }
+                _ => unreachable!("original transport command"),
+            };
             step.effect(
                 crate::task_execution::host::adapter::descriptor(
                     effect.protocol.id.get(),
                     work,
-                    novarocks_control_runtime_core::effect::EffectKind::Business,
+                    kind,
                 ),
                 FrontendEffect::Attempt(effect),
             )
@@ -363,6 +381,18 @@ impl WithdrawalInbox {
             Item = Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
         >,
     ) -> Self {
+        Self::with_commands(
+            scope,
+            effects.into_iter().map(|effect| (effect, None)),
+            Self::CONFIG.mailbox,
+        )
+    }
+
+    pub(crate) fn with_commands(
+        scope: &ScopeHandle,
+        commands: impl IntoIterator<Item = TransportCommand>,
+        mailbox: [usize; 4],
+    ) -> Self {
         let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
         let source = ActorId::new(2).unwrap();
@@ -373,9 +403,12 @@ impl WithdrawalInbox {
                 scope.clone(),
                 FrontendActor::Test(Box::new(WithdrawalTarget(
                     observed.clone(),
-                    effects.into_iter().collect(),
+                    commands.into_iter().collect(),
                 ))),
-                Self::CONFIG,
+                ActorConfig {
+                    mailbox,
+                    ..Self::CONFIG
+                },
                 source,
             )
             .unwrap_or_else(|(error, _)| panic!("{error}"));
@@ -387,14 +420,55 @@ impl WithdrawalInbox {
         }
     }
     pub(crate) fn reserve(&self, work: &ReportedWork) -> CausalInputObligation<FrontendActor> {
+        self.reserve_result(work.work())
+    }
+
+    pub(crate) fn reserve_result(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> CausalInputObligation<FrontendActor> {
         CausalInputObligation::reserve_admitted(
             &self.runtime,
             &self.registration,
             self.source,
             InputClass::Lifecycle,
-            work.work(),
+            work,
         )
         .unwrap()
+    }
+
+    pub(crate) fn registration(&self) -> &ActorRegistration {
+        &self.registration
+    }
+
+    pub(crate) fn runtime(&self) -> &ActorRuntime<FrontendActor> {
+        &self.runtime
+    }
+
+    pub(crate) fn command(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+        action: novarocks_coordination_contract::AttemptActionId,
+    ) -> novarocks_control_runtime::actor_turn::EffectTicket<FrontendEffect> {
+        let input = self
+            .runtime
+            .reserve_admitted_input_for(
+                &self.registration,
+                self.source,
+                InputClass::Lifecycle,
+                work,
+            )
+            .unwrap()
+            .fill(FrontendInput::Test(1))
+            .unwrap();
+        assert!(self.runtime.poll_one(Tick(1)).unwrap());
+        self.runtime
+            .take_effect(
+                self.registration.actor(),
+                input,
+                novarocks_control_runtime_core::identity::ActionId::new(action.get()).unwrap(),
+            )
+            .unwrap()
     }
     pub(crate) fn reserve_standing(
         &self,

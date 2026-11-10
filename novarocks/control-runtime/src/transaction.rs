@@ -1139,6 +1139,10 @@ impl ScopeHandle {
         Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
     }
 
+    pub fn belongs_to_ledger(&self, ledger: &RuntimeLedger) -> bool {
+        Arc::ptr_eq(&self.runtime.shared, &ledger.shared)
+    }
+
     pub(crate) fn attach_actor(&self, slot: SlotId) -> Result<(), RuntimeError> {
         let mut state = self
             .runtime

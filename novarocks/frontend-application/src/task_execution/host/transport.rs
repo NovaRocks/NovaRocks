@@ -41,6 +41,7 @@ mod release_wake;
 mod send;
 mod send_binding;
 mod send_reports;
+mod send_source;
 mod settlement;
 mod source_ports;
 
@@ -70,4 +71,5 @@ pub(crate) use send_reports::{
     ActorSendReports, NativeProgressInput, SendMemberReport, SendReportRetirement,
     SendReportRetirementStep, SendReportReturn, SendReportRows, actor_send_report_layouts,
 };
+pub(crate) use send_source::{PreparedActorSend, SendContext, send_queue_resources};
 pub(crate) use source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg};

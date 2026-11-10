@@ -26,7 +26,9 @@ use novarocks_attempt_protocol::{
     input::{AttemptInput, ExecutorFact},
     start::PayloadRef,
 };
-use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
+use novarocks_control_runtime::actor_turn::{
+    ActorRegistration, ActorTurnError, StandingInputObligation,
+};
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_execution_contract::OperationKind;
 use std::task::Poll;
@@ -81,6 +83,12 @@ pub(crate) struct NativeReceiptInput {
     receipt: Option<Receipt>,
 }
 impl NativeReceiptInput {
+    pub(super) fn matches_receiver(&self, registration: &ActorRegistration) -> bool {
+        self.position
+            .author()
+            .is_ok_and(|author| registration.matches_input_author(&author))
+    }
+
     pub(super) fn key(&self) -> SendKey {
         self.key
     }

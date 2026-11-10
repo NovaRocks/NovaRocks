@@ -31,7 +31,9 @@ use novarocks_attempt_protocol::{
     input::{AttemptInput, ExecutorFact},
     start::PayloadRef,
 };
-use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
+use novarocks_control_runtime::actor_turn::{
+    ActorRegistration, ActorTurnError, StandingInputObligation,
+};
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
@@ -155,6 +157,31 @@ impl Drop for RowLoan<'_> {
 }
 
 impl ActorSendReports {
+    pub(super) fn matches_receiver(&self, registration: &ActorRegistration) -> bool {
+        let matches = |input: &NativeProgressInput| {
+            input
+                .position
+                .author()
+                .is_ok_and(|author| registration.matches_input_author(&author))
+        };
+        self.rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|rows| {
+                matches(&rows.started)
+                    && rows.members.iter().all(|row| {
+                        row.receipt
+                            .as_ref()
+                            .is_some_and(|input| input.matches_receiver(registration))
+                            && row
+                                .first_poll
+                                .as_ref()
+                                .is_none_or(|(_, input)| matches(input))
+                    })
+            })
+    }
+
     pub(crate) fn new(effect: AttemptActionId, rows: SendReportRows) -> Self {
         let mut index = rows
             .members

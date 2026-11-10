@@ -1656,3 +1656,256 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
     roles.finish();
     assert!(wc.finish());
 }
+
+#[tokio::test]
+async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal() {
+    use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
+    use crate::task_execution::clock::ProcessMonotonicClock;
+    use novarocks_attempt_protocol::{
+        capacity::ReservationToken,
+        effect::{
+            AttemptEffect, DispatchBatch, EffectBody, EffectClass,
+            OperationIntent as ProtocolIntent, QueuedInputPayload,
+        },
+        input::{ExecutorFact, QueuedInputGrantRef, WithdrawalOutcome},
+    };
+    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+
+    let roles = Roles::new();
+    let mut wc = Governed::new();
+    let handle = Handle::current();
+    let runtime = FrontendDataRuntime::new(handle.clone());
+    let (mut parent, mut payer) = roles
+        .scope
+        .reserve_next(
+            generation(),
+            ReservationResources::work_only(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let backend = BackendProcessId::new_v7();
+    let operation = cancel(backend);
+    let key = send_key(&operation);
+    let reference = QueuedInputGrantRef::new(NonZeroU64::MIN, key.generation);
+    let OperationIntent::CancelTask(cancel) = &operation else {
+        unreachable!()
+    };
+    let protocol = ProtocolIntent::CancelTask(cancel.clone());
+    let admit_id = key.generation.admission_effect();
+    let admit = AttemptEffectEnvelope::new(AttemptEffect {
+        id: admit_id,
+        class: EffectClass::Settlement,
+        body: EffectBody::AdmitQueuedInput {
+            lane: protocol.lane(),
+            operation: protocol.clone(),
+            generation: key.generation,
+            payload: QueuedInputPayload::AlreadyRetained,
+        },
+    });
+    let queue = roles
+        .scope
+        .reserve_child_next(
+            generation(),
+            payer.id(),
+            transport::send_queue_resources(
+                &roles.layout,
+                backend,
+                TransportCapacityLane::Control,
+                1,
+                operation.queued_bytes(),
+            )
+            .unwrap(),
+            WorkKind::Settlement,
+        )
+        .unwrap();
+    let reservation = queue.reservation_id();
+    let send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let send = AttemptEffectEnvelope::new(AttemptEffect {
+        id: send_id,
+        class: EffectClass::Settlement,
+        body: EffectBody::SendBatch {
+            batch: DispatchBatch {
+                backend,
+                lane: protocol.lane(),
+                control_progress: true,
+                operations: Box::new([protocol]),
+                queued_bytes: operation.queued_bytes(),
+                queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                queued_inputs: Box::new([reference]),
+            },
+            reservation: ReservationToken(NonZeroU64::new(reservation.get()).unwrap()),
+        },
+    });
+    let inbox = custody::tests::WithdrawalInbox::with_commands(
+        &roles.scope,
+        [(admit.clone(), None), (send.clone(), Some(queue))],
+        [5; 4],
+    );
+    let mut source = transport::AdmissionSource::new(
+        &parent,
+        &payer,
+        generation(),
+        observer(),
+        wc.authority(),
+        [
+            VecDeque::new(),
+            VecDeque::from([inbox.reserve_result(&parent)]),
+        ],
+    )
+    .unwrap_or_else(|_| panic!("original source payer"));
+    let admit_ticket = inbox.command(&parent, admit_id);
+    let result = source.prepay(&admit).unwrap().expect("control position");
+    let mut job = source.bind(&admit_ticket, result);
+    let admit_input = admit_ticket.input;
+    let actor = admit_ticket.actor;
+    let mut reaper = job.transport.take().unwrap();
+    let executor = transport::ActorTransportExecutor(handle.clone());
+    assert!(crate::control_runtime::host::EffectExecutor::handoff(&executor, job).is_ok());
+    inbox.runtime().effect_completed(admit_ticket).unwrap();
+    inbox.runtime().retire_input(actor, admit_input).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            drive(&mut wc.driver);
+            let result = reaper.take_actor_result().unwrap_or_else(|_| panic!("same original result"));
+            if let Some(result) = result {
+                let input = source.accept(result).unwrap_or_else(|_| panic!("same original WC grant"));
+                assert!(matches!(inbox.commit(input), ExecutorFact::QueuedInputGranted { grant, .. } if grant == reference));
+                break;
+            }
+            assert!(!matches!(
+                reaper.poll_step(&handle, &mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(_))
+            ));
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let step = poll_fn(|cx| reaper.poll_step(&handle, cx))
+        .await
+        .unwrap_or_else(|_| panic!("original admission exit"));
+    assert!(matches!(step, custody::TransportRetirementStep::Retired));
+    assert!(source.transport_retired(admit_id));
+    assert!(source.retire_result().unwrap());
+    assert!(source.close_one_idle().unwrap());
+
+    let result = inbox.reserve_result(&parent);
+    let reports = Arc::new(transport::ActorSendReports::new(
+        send_id,
+        transport::SendReportRows {
+            started: transport::NativeProgressInput::new(inbox.reserve_standing(&parent)),
+            members: Box::new([transport::SendMemberReport::new(
+                inbox.reserve_native_receipt(&parent, key, operation.kind()),
+                None,
+                None,
+                None,
+            )]),
+        },
+    ));
+    let mut requests = transport::FrozenSendRequests::default();
+    assert!(requests.install(operation).is_ok());
+    let endpoint =
+        novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap());
+    let context = transport::SendContext {
+        registration: inbox.registration().clone(),
+        ledger: roles.ledger.clone(),
+        scope: roles.scope.clone(),
+        layout: roles.layout.clone(),
+        transport: TransportBudget::DEFAULT,
+        authority: wc.authority(),
+        wire: crate::native::task_transport::wire::AttemptWireFacts {
+            native_compatibility_id: novarocks_types::NativeCompatibilityId::new([1; 32]),
+        },
+        client: Client::for_endpoint(
+            endpoint,
+            NativeEndpointDomain::BackendControl,
+            backend,
+            runtime.clone(),
+        ),
+        apply: runtime.apply_send_port().clone(),
+        clock: Arc::new(ProcessMonotonicClock::default()),
+        observer: observer(),
+    };
+    let send_ticket = inbox.command(&parent, send_id);
+    let send_input = send_ticket.input;
+    let original =
+        transport::PreparedActorSend::prepare(send.clone(), &requests, &source, context, reports)
+            .unwrap_or_else(|(error, _, _)| panic!("{error:?}"));
+    assert_eq!(
+        inbox
+            .runtime()
+            .step_reservations(actor, send_input, None, 1)
+            .unwrap()[0]
+            .0,
+        reservation
+    );
+    let mut job = original
+        .bind(inbox.runtime(), &send_ticket, result, &mut source)
+        .unwrap_or_else(|refused| panic!("{:?}", refused.error));
+    assert!(
+        inbox
+            .runtime()
+            .step_reservations(actor, send_input, None, 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(source.take_grant(reference, key).is_none());
+    let mut reaper = job.transport.take().unwrap();
+    assert_eq!(
+        send.handoff().unwrap().withdraw(),
+        novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
+    );
+    assert!(crate::control_runtime::host::EffectExecutor::handoff(&executor, job).is_ok());
+    inbox.runtime().effect_completed(send_ticket).unwrap();
+    inbox.runtime().retire_input(actor, send_input).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(mut result) = reaper
+                .take_actor_result()
+                .unwrap_or_else(|_| panic!("same original send result"))
+            {
+                let input = result
+                    .withdrawal
+                    .take()
+                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{:?}", error.error));
+                assert!(matches!(inbox.consume(input), ExecutorFact::Withdrawn {
+                    effect, outcome: WithdrawalOutcome::DefinitelyUnsent,
+                } if effect == send_id));
+                assert!(result.close_result_after_exit().unwrap());
+                assert_eq!(
+                    roles
+                        .ledger
+                        .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+                        .unwrap()
+                        .unwrap()
+                        .used,
+                    [0, 0]
+                );
+            }
+            match poll_fn(|cx| reaper.poll_step(&handle, cx))
+                .await
+                .unwrap_or_else(|_| panic!("same original retirement"))
+            {
+                custody::TransportRetirementStep::Advanced
+                | custody::TransportRetirementStep::Scanned => {}
+                custody::TransportRetirementStep::Retired => break,
+                custody::TransportRetirementStep::Report(_) => {
+                    panic!("withdrawn send cannot report an RPC receipt")
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    roles.scope.reap_ready(128).unwrap();
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    roles.scope.close_external().unwrap();
+    roles.scope.reap_ready(128).unwrap();
+    inbox.finish();
+    roles.finish();
+    assert!(wc.finish());
+}

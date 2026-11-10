@@ -176,6 +176,23 @@ impl AdmissionSource {
         self.grants.take(grant, key)
     }
 
+    pub(super) fn grants(&self) -> &GrantedInputs {
+        &self.grants
+    }
+
+    pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
+        self.scope.same_scope(scope)
+    }
+
+    pub(super) fn bind_send(
+        &mut self,
+        batch: super::PreparedSendBatch,
+        window: super::QueueWindow,
+        registration: crate::task_execution::host::custody::TransportJoinRegistration,
+    ) -> Result<(super::QueueCustody, super::ResolvedBatch), super::SendBindingRefusal> {
+        batch.bind(&mut self.grants, window, registration)
+    }
+
     pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<WorkError> {
         self.failures.remove(&failure)
     }

@@ -854,9 +854,9 @@ impl AttemptBinding {
         } else {
             (TransportCapacityLane::Ordinary, WorkKind::Business)
         };
-        let resources = capacity
-            .queue_resources(target, lane, records, queued_bytes)
-            .expect("Core queues only validated Native resources");
+        let resources =
+            super::transport::send_queue_resources(capacity, target, lane, records, queued_bytes)
+                .expect("Core queues only validated Native resources");
         match scope.reserve_child_next_or_wait(
             self.generation,
             self.queue_parent,

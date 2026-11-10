@@ -122,6 +122,25 @@ impl PreparedSendBatch {
         &self.operations
     }
 
+    pub(super) fn keys(&self) -> &[SendKey] {
+        &self.keys
+    }
+
+    pub(super) fn check_grants(&self, inputs: &GrantedInputs) -> Result<(), SendBindingError> {
+        let EffectBody::SendBatch { batch, .. } = &self.effect.protocol.body else {
+            unreachable!("prepared original send");
+        };
+        if batch
+            .queued_inputs
+            .iter()
+            .zip(self.keys.iter())
+            .any(|(grant, key)| !inputs.matches(*grant, *key))
+        {
+            return Err(SendBindingError::MissingGrant);
+        }
+        Ok(())
+    }
+
     /// All exact original inputs must be present before any row moves. This
     /// exclusive Source borrow also prevents a concurrent ReleaseQueuedInput
     /// from consuming a checked row in the middle of the transfer.
@@ -188,15 +207,7 @@ impl PreparedSendBatch {
         {
             return Err(SendBindingError::WrongWindow);
         }
-        if batch
-            .queued_inputs
-            .iter()
-            .zip(self.keys.iter())
-            .any(|(grant, key)| !inputs.matches(*grant, *key))
-        {
-            return Err(SendBindingError::MissingGrant);
-        }
-        Ok(())
+        self.check_grants(inputs)
     }
 }
 
