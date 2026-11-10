@@ -107,7 +107,7 @@ pub(crate) struct AttemptActorRegistration {
     root_control: RootControlBinding,
     ordered_host: Option<OrderedObservationHost>,
     ordered_bound: bool,
-    read_progress_bound: bool,
+    read_progress_roles: Option<Vec<ReadProgressInput>>,
     startup_reserved: bool,
     abort_bound: bool,
     config: ActorConfig,
@@ -521,6 +521,7 @@ impl AttemptActorRegistration {
     > {
         if self.startup_reserved
             || !self.ordered_bound
+            || self.read_progress_roles.is_none()
             || self.binding.get().is_none()
             || !self.scope.same_scope(startup_work.scope())
             || !transport
@@ -592,6 +593,15 @@ impl AttemptActorRegistration {
             residual,
         )
         .with_abort_drain(abort, abort_drain);
+        let ordered_host = self
+            .ordered_host
+            .take()
+            .expect("original ordered writer was bound")
+            .with_read_progress(
+                self.read_progress_roles
+                    .take()
+                    .expect("original progress roles"),
+            );
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -599,7 +609,7 @@ impl AttemptActorRegistration {
                 kind: FrontendActorKind::Attempt,
                 config: self.config,
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
-                ordered_observations: self.ordered_host.take(),
+                ordered_observations: Some(ordered_host),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),
                     self.original.clone(),
@@ -678,7 +688,7 @@ impl AttemptActorRegistration {
         runtime: &ActorRuntime<FrontendActor>,
         observation_work: &WorkObligation,
     ) -> Result<BTreeMap<ParticipationRef, ReadProgressInput>, ObservationError> {
-        if self.read_progress_bound {
+        if self.read_progress_roles.is_some() || self.startup_reserved {
             return Err(ObservationError::Busy);
         }
         if !self.scope.same_scope(observation_work.scope()) {
@@ -704,10 +714,10 @@ impl AttemptActorRegistration {
             };
             roles.insert(
                 member.participation,
-                ReadProgressInput::new(member.participation, standing),
+                ReadProgressInput::new(&self.original, member.participation, standing),
             );
         }
-        self.read_progress_bound = true;
+        self.read_progress_roles = Some(roles.values().cloned().collect());
         Ok(roles)
     }
 
@@ -1003,7 +1013,7 @@ impl AttemptActor {
             root_control,
             ordered_host: None,
             ordered_bound: false,
-            read_progress_bound: false,
+            read_progress_roles: None,
             startup_reserved: false,
             abort_bound: false,
             config,

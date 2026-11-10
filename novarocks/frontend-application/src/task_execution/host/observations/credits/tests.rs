@@ -289,7 +289,7 @@ fn read_progress_retires_only_the_generations_covered_by_each_actual_occurrence(
         .unwrap()
         .into_standing_input()
         .unwrap();
-    let progress = ReadProgressInput::new(old.participation, standing);
+    let progress = ReadProgressInput::new(&registration, old.participation, standing);
     let report = |key: StreamKey, revision| ReadProgressSnapshot {
         participation: key.participation,
         generation: key.generation,
@@ -318,8 +318,14 @@ fn read_progress_retires_only_the_generations_covered_by_each_actual_occurrence(
     assert!(runtime.poll_one(Tick(1)).unwrap());
     assert_eq!(*seen.lock().unwrap(), vec![report(old, 1)]);
     assert!(!credits.stream_claims_exited(old));
-    assert_eq!(runtime.committed_batches(actor, None, 4).unwrap().len(), 1);
-    assert!(progress.retire_ready().unwrap());
+    let old_batch = runtime.committed_batches(actor, None, 4).unwrap();
+    assert_eq!(old_batch.len(), 1);
+    let (_, old_input) = old_batch[0];
+    assert!(progress.retire_indexed(old_input).unwrap());
+    assert_eq!(
+        progress.retire_indexed(old_input),
+        Err(novarocks_control_runtime::actor_turn::ActorTurnError::InputAuthorMismatch)
+    );
     credits.retire_stream(old).unwrap();
     assert!(!credits.stream_claims_exited(replacement));
 

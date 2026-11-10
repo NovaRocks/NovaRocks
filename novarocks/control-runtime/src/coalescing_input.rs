@@ -243,13 +243,27 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
     /// Retire at most one actual occurrence on this original standing role.
     /// The owner has indexed the runtime input and released its captures.
     pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        self.retire_current(None)
+    }
+
+    /// The original host has indexed this exact occurrence. An old receipt
+    /// cannot retire a later fill of the same reusable standing role.
+    pub fn retire_indexed_after_exit(&self, input: InputId) -> Result<bool, ActorTurnError> {
+        self.retire_current(Some(input))
+    }
+
+    fn retire_current(&self, expected: Option<InputId>) -> Result<bool, ActorTurnError> {
         {
             let standing = self
                 .0
                 .standing
                 .lock()
                 .expect("coalescing standing input lock");
-            if standing.in_flight()?.is_none() || !standing.retire_ready_after_exit()? {
+            let current = standing.in_flight()?;
+            if expected.is_some() && expected != current {
+                return Err(ActorTurnError::InputAuthorMismatch);
+            }
+            if current.is_none() || !standing.retire_ready_after_exit()? {
                 return Ok(false);
             }
         }

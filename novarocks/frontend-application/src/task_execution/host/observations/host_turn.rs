@@ -17,18 +17,21 @@
 
 //! The original FE host indexes and retires the ordered writer's occurrence.
 
-use super::{ObservationError, OrderedObservationInput};
+use super::{ObservationError, OrderedObservationInput, read_progress::ReadProgressInput};
 use crate::control_runtime::actor::FrontendActor;
 use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorRuntime, ActorTurnError, StandingInputId,
 };
 use novarocks_control_runtime_core::identity::InputId;
+use std::collections::{BTreeMap, VecDeque};
 
 pub(crate) struct OrderedObservationHost {
     ingress: OrderedObservationInput<FrontendActor>,
     registration: ActorRegistration,
     roles: [StandingInputId; 2],
     indexed: Option<IndexedObservation>,
+    progress_roles: BTreeMap<StandingInputId, ReadProgressInput>,
+    indexed_progress: VecDeque<(StandingInputId, InputId)>,
 }
 
 struct IndexedObservation {
@@ -46,7 +49,29 @@ impl OrderedObservationHost {
             registration,
             roles,
             indexed: None,
+            progress_roles: BTreeMap::new(),
+            indexed_progress: VecDeque::new(),
         }
+    }
+
+    pub(crate) fn with_read_progress(
+        mut self,
+        roles: impl IntoIterator<Item = ReadProgressInput>,
+    ) -> Self {
+        assert!(self.progress_roles.is_empty());
+        for role in roles {
+            let id = role.standing_id();
+            assert!(role.matches(&self.registration) && !self.roles.contains(&id));
+            assert!(self.progress_roles.insert(id, role).is_none());
+        }
+        self.indexed_progress = VecDeque::with_capacity(self.progress_roles.len());
+        self
+    }
+
+    /// At most one indexed occurrence per paid role plus the ordered writer.
+    /// Leave a further unit for the independent Native retirement visit.
+    pub(crate) fn fits_host_turn(&self, turn_budget: usize) -> bool {
+        self.progress_roles.len() <= turn_budget.saturating_sub(2)
     }
 
     pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
@@ -66,10 +91,18 @@ impl OrderedObservationHost {
             let Some(role) = runtime
                 .input_custody(self.registration.actor(), input)?
                 .and_then(|custody| custody.standing_input_id)
-                .filter(|role| self.roles.contains(role))
             else {
                 continue;
             };
+            if self.progress_roles.contains_key(&role) {
+                assert!(self.indexed_progress.len() < self.progress_roles.len());
+                self.indexed_progress.push_back((role, input));
+                advanced = true;
+                continue;
+            }
+            if !self.roles.contains(&role) {
+                continue;
+            }
             assert!(
                 self.indexed
                     .replace(IndexedObservation {
@@ -132,7 +165,37 @@ impl OrderedObservationHost {
         self.ingress.input_retired(input)
     }
 
+    /// Visit each indexed progress role once under the registered host
+    /// allowance. An outstanding effect can keep one occurrence live without
+    /// preventing the other participants' actual returns.
+    pub(crate) fn retire_read_progress(
+        &mut self,
+        budget: &mut usize,
+    ) -> Result<(), ObservationError> {
+        let visits = self.indexed_progress.len();
+        assert!(
+            visits <= *budget,
+            "original host allowance covers the frozen roster"
+        );
+        for _ in 0..visits {
+            *budget -= 1;
+            let (role, input) = self.indexed_progress[0];
+            let original = self
+                .progress_roles
+                .get(&role)
+                .expect("indexed original role");
+            let retired = original
+                .retire_indexed(input)
+                .map_err(ObservationError::Runtime)?;
+            self.indexed_progress.pop_front();
+            if !retired {
+                self.indexed_progress.push_back((role, input));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_retired(&self) -> bool {
-        self.indexed.is_none() && self.ingress.is_retired()
+        self.indexed.is_none() && self.indexed_progress.is_empty() && self.ingress.is_retired()
     }
 }

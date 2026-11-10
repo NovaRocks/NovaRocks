@@ -2305,7 +2305,8 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
         metrics::FrontendHostObservations,
     };
     use crate::task_execution::host::{
-        adapter::descriptor, observations::host_turn::OrderedObservationHost,
+        adapter::descriptor,
+        observations::{host_turn::OrderedObservationHost, read_progress::ReadProgressInput},
     };
     use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket, ProcessClock};
     use novarocks_control_runtime_core::effect::EffectKind;
@@ -2335,6 +2336,16 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
                         };
                         seen.push(if sequence == 1 { "prefix" } else { "suffix" });
                     }
+                }
+                AttemptInput::Executor(ExecutorFact::ReadProgress(progress)) => {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(match progress.resume_revision.get() {
+                            1 => "first resume",
+                            2 => "coalesced resume",
+                            _ => panic!("unexpected read resume"),
+                        });
                 }
                 AttemptInput::Port(LogicalToAttempt {
                     body: LogicalToAttemptBody::SealRequest { .. },
@@ -2499,6 +2510,11 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
         Waker::noop().clone(),
     )
     .unwrap();
+    let read_progress = ReadProgressInput::new(
+        &registration,
+        key.participation,
+        standing(InputClass::Ordinary),
+    );
     let host = HostRegistry::new(
         runtime.clone(),
         ledger.clone(),
@@ -2516,7 +2532,10 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
             source: Box::new(Source(false)),
             executor: Arc::new(NoJobs),
             transport: None,
-            ordered_observations: Some(OrderedObservationHost::new(ingress.clone())),
+            ordered_observations: Some(
+                OrderedObservationHost::new(ingress.clone())
+                    .with_read_progress([read_progress.clone()]),
+            ),
         })
         .unwrap_or_else(|_| panic!("original observation host"));
     let drive = || {
@@ -2584,6 +2603,32 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
         ["prefix", "first seal decision", "suffix"]
     );
     drive();
+
+    let publish_resume = |revision| {
+        read_progress
+            .publish(ReadProgressSnapshot {
+                participation: key.participation,
+                generation: key.generation,
+                resumed_at: MonotonicInstant::from_origin(Duration::from_millis(revision)),
+                resume_revision: NonZeroU64::new(revision).unwrap(),
+            })
+            .unwrap()
+    };
+    let first = publish_resume(1);
+    let coalesced = publish_resume(2);
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(seen.lock().unwrap().last(), Some(&"first resume"));
+    assert!(!first.retired());
+    drive();
+    assert!(first.retired());
+    assert!(!coalesced.retired());
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(seen.lock().unwrap().last(), Some(&"coalesced resume"));
+    assert!(!coalesced.retired());
+    drive();
+    assert!(coalesced.retired());
+    drop((first, coalesced));
+    read_progress.close_after_exit().unwrap();
 
     ingress.job_closed(key).unwrap();
     ingress.retire_stream(key).unwrap();

@@ -21,9 +21,10 @@ use super::ObservationError;
 use crate::control_runtime::actor::{FrontendActor, FrontendInput};
 use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact, ReadProgressSnapshot};
 use novarocks_control_runtime::{
-    actor_turn::{ActorTurnError, StandingInputObligation},
+    actor_turn::{ActorRegistration, ActorTurnError, StandingInputId, StandingInputObligation},
     coalescing_input::{CoalescedReceipt, CoalescingInput, Merge},
 };
+use novarocks_control_runtime_core::identity::InputId;
 use novarocks_execution_contract::ParticipationRef;
 
 pub(super) struct ReadProgressUpdate(Option<ReadProgressSnapshot>);
@@ -46,17 +47,28 @@ impl Merge for ReadProgressUpdate {
 
 pub(super) type ReadProgressReceipt = CoalescedReceipt<FrontendActor, ReadProgressUpdate>;
 
+#[derive(Clone)]
 pub(crate) struct ReadProgressInput {
+    registration: ActorRegistration,
     participation: ParticipationRef,
     role: CoalescingInput<FrontendActor, ReadProgressUpdate>,
 }
 
 impl ReadProgressInput {
     pub(crate) fn new(
+        registration: &ActorRegistration,
         participation: ParticipationRef,
         standing: StandingInputObligation<FrontendActor>,
     ) -> Self {
+        assert!(
+            registration.matches_input_author(
+                &standing
+                    .author()
+                    .expect("original admitted read progress author")
+            )
+        );
         Self {
+            registration: registration.clone(),
             participation,
             role: CoalescingInput::new(standing, |update: &ReadProgressUpdate| {
                 FrontendInput::Attempt(Box::new(AttemptInput::Executor(
@@ -64,6 +76,14 @@ impl ReadProgressInput {
                 )))
             }),
         }
+    }
+
+    pub(super) fn standing_id(&self) -> StandingInputId {
+        self.role.id()
+    }
+
+    pub(super) fn matches(&self, registration: &ActorRegistration) -> bool {
+        self.registration.same_registration(registration)
     }
 
     pub(super) fn publish(
@@ -80,8 +100,13 @@ impl ReadProgressInput {
 
     /// The original host drives this after indexing the real runtime input.
     /// Each visit retires at most one occurrence, then admits a coalesced hint.
+    #[cfg(test)]
     pub(crate) fn retire_ready(&self) -> Result<bool, ActorTurnError> {
         self.role.retire_ready_after_exit()
+    }
+
+    pub(super) fn retire_indexed(&self, input: InputId) -> Result<bool, ActorTurnError> {
+        self.role.retire_indexed_after_exit(input)
     }
 
     /// This role is stable across generations. Only the original Source

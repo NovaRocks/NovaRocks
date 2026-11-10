@@ -435,6 +435,17 @@ impl HostRegistry {
                 binding,
             });
         };
+        if binding
+            .ordered_observations
+            .as_ref()
+            .is_some_and(|observations| !observations.fits_host_turn(binding.config.turn_budget))
+        {
+            return Err(HostRegistrationRefusal {
+                reason: "host turn cannot visit the original observation roles",
+                runtime_error: None,
+                binding,
+            });
+        }
         let mut state = self.state.lock().expect("frontend host registry lock");
         if !state.open || state.entries.contains_key(&binding.scope.id()) {
             return Err(HostRegistrationRefusal {
@@ -726,13 +737,15 @@ impl HostRegistry {
         if let Some(transport) = &transport {
             budget -= transport.units;
         }
-        if !failed
-            && budget != 0
-            && let Some(observations) = &mut machine.ordered_observations
-            && observations.has_indexed()
-        {
-            budget -= 1;
-            match observations.retire_ready(&self.runtime) {
+        if !failed && let Some(observations) = &mut machine.ordered_observations {
+            let progress = (|| {
+                if observations.has_indexed() {
+                    budget -= 1;
+                    observations.retire_ready(&self.runtime)?;
+                }
+                observations.retire_read_progress(&mut budget)
+            })();
+            match progress {
                 Ok(()) => {}
                 Err(ObservationError::Runtime(
                     ActorTurnError::ActorFailed | ActorTurnError::Closed,
