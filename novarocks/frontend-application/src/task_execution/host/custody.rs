@@ -1165,4 +1165,4 @@ pub(crate) use encoding::{EncodingBinding, EncodingJob, owned_layouts as encodin
 mod actor_result;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -20,10 +20,21 @@ use super::{
     TransportRegistrationState,
 };
 use crate::{
-    control_runtime::{actor::FrontendActor, transport_withdrawal::AttemptEffectEnvelope},
+    control_runtime::{
+        actor::{FrontendActor, FrontendInput},
+        transport_withdrawal::AttemptEffectEnvelope,
+    },
     task_execution::host::transport::BodyOutcome,
 };
-use novarocks_control_runtime::{actor_turn::InputAuthor, causal_input::CausalInputObligation};
+use novarocks_attempt_protocol::{
+    effect::EffectBody,
+    input::{AttemptInput, ExecutorFact, WithdrawalOutcome},
+};
+use novarocks_control_runtime::{
+    actor_turn::InputAuthor,
+    causal_input::{CausalFillFailure, CausalInputObligation},
+};
+use novarocks_control_runtime_core::identity::InputId;
 use std::sync::Arc;
 
 /// The original result position is held independently of the worker future.
@@ -34,6 +45,9 @@ pub(crate) struct ReturnedActorTransportResult {
     pub(crate) effect: Arc<AttemptEffectEnvelope>,
     pub(crate) original: CausalInputObligation<FrontendActor>,
     pub(crate) outcome: Option<BodyOutcome>,
+    /// On refusal the same prepared event and original position remain
+    /// available to the Source's failure/retirement path.
+    pub(crate) withdrawal: Option<Result<InputId, CausalFillFailure<FrontendInput>>>,
 }
 pub(super) enum ActorResultState {
     Unbound,
@@ -52,9 +66,10 @@ impl TransportJoinHandoff {
         let Some(record) = self.registration.original.upgrade() else {
             return Err(original);
         };
-        if !original
-            .event_author()
-            .is_ok_and(|author| author.same_binding(expected))
+        if effect.handoff().is_none()
+            || !original
+                .event_author()
+                .is_ok_and(|author| author.same_binding(expected))
         {
             return Err(original);
         }
@@ -69,6 +84,7 @@ impl TransportJoinHandoff {
             effect,
             original,
             outcome: None,
+            withdrawal: None,
         });
         Ok(())
     }
@@ -95,6 +111,8 @@ impl TransportJoinRegistration {
 impl OriginalTransportJoinObligation {
     /// For a send, this is after the final original WC queue exit. An input
     /// admission without a Native row uses its own actual Join and report.
+    /// Positive unused evidence is published here using the same original
+    /// position. A missing outcome or raw failure never certifies withdrawal.
     pub(crate) fn take_actor_result(&self) -> Option<ReturnedActorTransportResult> {
         if !matches!(
             *self.native.state.lock().unwrap_or_else(|e| e.into_inner()),
@@ -110,13 +128,14 @@ impl OriginalTransportJoinObligation {
         if !matches!(*state, ActorResultState::Held(_)) {
             return None;
         }
-        let ActorResultState::Held(original) =
+        let ActorResultState::Held(mut original) =
             std::mem::replace(&mut *state, ActorResultState::Taken)
         else {
             unreachable!("qualified original result");
         };
         drop(state);
         original.effect.retire_handoff();
+        original.publish_withdrawal();
         Some(original)
     }
 
@@ -129,5 +148,35 @@ impl OriginalTransportJoinObligation {
                 .unwrap_or_else(|e| e.into_inner()),
             ActorResultState::Held(_)
         )
+    }
+}
+
+impl ReturnedActorTransportResult {
+    fn publish_withdrawal(&mut self) {
+        if !matches!(&self.outcome, Some(BodyOutcome::Unused(_))) {
+            return;
+        }
+        let fact = match &self.effect.protocol.body {
+            EffectBody::SendBatch { .. } => ExecutorFact::Withdrawn {
+                effect: self.effect.protocol.id,
+                outcome: WithdrawalOutcome::DefinitelyUnsent,
+            },
+            EffectBody::AdmitQueuedInput {
+                operation,
+                generation,
+                ..
+            } => ExecutorFact::QueuedInputWithdrawn {
+                operation: operation.operation_id(),
+                generation: *generation,
+            },
+            _ => unreachable!("only original send and admission jobs bind transport results"),
+        };
+        // There is no preceding receipt for a never-started operation.
+        let event = FrontendInput::Attempt(Box::new(AttemptInput::Executor(fact)));
+        self.withdrawal = Some(
+            self.original
+                .fill_with_receipt(None, event)
+                .map(|(_, input)| input),
+        );
     }
 }

@@ -286,81 +286,171 @@ async fn invalid_observer_returns_original_reported_work_before_factory_runs() {
     assert_eq!(ran.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn actor_transport_keeps_the_original_result_position_through_join() {
-    use crate::{
-        control_runtime::actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor},
-        task_execution::host::transport::BodyOutcome,
-    };
-    use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody, EffectClass};
-    use novarocks_control_runtime::{
-        actor::{ActorConfig, ActorStep},
-        actor_turn::ActorRuntime,
-        causal_input::CausalInputObligation,
-        exit_work::GatedNotStarted,
-    };
-    use novarocks_control_runtime_core::{
-        identity::{ActorId, Tick},
-        mailbox::{InputClass, InputEnvelope},
-    };
-    use novarocks_coordination_contract::AttemptActionId;
-    use std::num::NonZeroU64;
+use crate::control_runtime::actor::{FrontendActor, FrontendEffect, FrontendInput, TestActor};
+use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact};
+use novarocks_control_runtime::{
+    actor::{ActorConfig, ActorStep},
+    actor_turn::{ActorRegistration, ActorRuntime},
+    causal_input::CausalInputObligation,
+};
+use novarocks_control_runtime_core::{
+    identity::{ActorId, InputId, Tick},
+    mailbox::{InputClass, InputEnvelope},
+};
 
-    struct Target;
-    impl TestActor for Target {
-        fn handle(
-            &mut self,
-            _: Tick,
-            _: InputEnvelope,
-            _: FrontendInput,
-            _: &mut ActorStep<'_, FrontendEffect>,
-        ) {
-            panic!("this test only supervises the original input position");
+type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, ExecutorFact)>>>;
+struct WithdrawalTarget(ObservedWithdrawals);
+impl TestActor for WithdrawalTarget {
+    fn handle(
+        &mut self,
+        _: Tick,
+        envelope: InputEnvelope,
+        value: FrontendInput,
+        _: &mut ActorStep<'_, FrontendEffect>,
+    ) {
+        let FrontendInput::Attempt(value) = value else {
+            panic!("expected an original attempt input");
+        };
+        let AttemptInput::Executor(fact) = *value else {
+            panic!("expected an original executor fact");
+        };
+        self.0.lock().unwrap().push((envelope, fact));
+    }
+}
+
+pub(crate) struct WithdrawalInbox {
+    runtime: ActorRuntime<FrontendActor>,
+    registration: ActorRegistration,
+    source: ActorId,
+    observed: ObservedWithdrawals,
+}
+impl WithdrawalInbox {
+    pub(crate) fn new(scope: &ScopeHandle) -> Self {
+        let runtime = ActorRuntime::new();
+        let actor = ActorId::new(1).unwrap();
+        let source = ActorId::new(2).unwrap();
+        let observed: ObservedWithdrawals = Arc::default();
+        let registration = runtime
+            .register_bound_with_source_cut(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(WithdrawalTarget(observed.clone()))),
+                ActorConfig {
+                    mailbox: [4; 4],
+                    max_batches: 4,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+                source,
+            )
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        Self {
+            runtime,
+            registration,
+            source,
+            observed,
         }
     }
-
-    let fixture = Fixture::new();
-    let runtime = ActorRuntime::new();
-    let actor = ActorId::new(1).unwrap();
-    let source = ActorId::new(2).unwrap();
-    let registration = runtime
-        .register_bound_with_source_cut(
-            actor,
-            fixture.scope.clone(),
-            FrontendActor::Test(Box::new(Target)),
-            ActorConfig {
-                mailbox: [4; 4],
-                max_batches: 4,
-                max_effects_per_step: 1,
-                max_dependencies_per_effect: 0,
-                turn_budget: 8,
-                max_step_work: 1,
-            },
-            source,
-        )
-        .unwrap_or_else(|(error, _)| panic!("{error}"));
-    let original = fixture.reported(None);
-    let reserve = |work: &ReportedWork| {
+    pub(crate) fn reserve(&self, work: &ReportedWork) -> CausalInputObligation<FrontendActor> {
         CausalInputObligation::reserve_admitted(
-            &runtime,
-            &registration,
-            source,
+            &self.runtime,
+            &self.registration,
+            self.source,
             InputClass::Lifecycle,
             work.work(),
         )
         .unwrap()
+    }
+    pub(crate) fn assert_no_result(&self) {
+        assert_eq!(
+            self.runtime
+                .snapshot(self.registration.actor())
+                .unwrap()
+                .inputs,
+            0
+        );
+    }
+    pub(crate) fn consume(&self, input: InputId) -> ExecutorFact {
+        assert!(self.runtime.poll_one(Tick(1)).unwrap());
+        let mut observed = self.observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        let (envelope, fact) = observed.pop().unwrap();
+        assert_eq!(envelope.source, self.source);
+        assert_eq!(envelope.class, InputClass::Lifecycle);
+        assert_eq!(envelope.input, input);
+        self.runtime
+            .retire_input(self.registration.actor(), input)
+            .unwrap();
+        fact
+    }
+    pub(crate) fn finish(self) {
+        while let Some(turn) = self.runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        self.runtime
+            .remove_actor(self.registration.actor())
+            .unwrap();
+        assert!(self.runtime.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn withdrawn_admission_publishes_the_original_generation_after_join() {
+    assert_withdrawn_admission_result(false).await;
+    assert_withdrawn_admission_result(true).await;
+}
+
+async fn assert_withdrawn_admission_result(fail_scope: bool) {
+    use crate::{
+        control_runtime::transport_withdrawal::AttemptEffectEnvelope,
+        task_execution::host::transport::BodyOutcome,
     };
-    let result = reserve(&original);
+    use novarocks_attempt_protocol::{
+        effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
+        input::SendGeneration,
+    };
+    use novarocks_control_runtime::exit_work::{GatedNotStarted, GatedOutcome, GatedWork};
+    use novarocks_coordination_contract::AttemptActionId;
+    use novarocks_execution_contract::{CancelReason, CancelTask, TaskIdentity, TaskOperationId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::num::NonZeroU64;
+
+    let fixture = Fixture::new();
+    let inbox = WithdrawalInbox::new(&fixture.scope);
+    let original = fixture.reported(None);
+    let result = inbox.reserve(&original);
     let author = result.event_author().unwrap();
-    let foreign_result = reserve(&original);
+    let foreign_result = inbox.reserve(&original);
     let foreign_author = foreign_result.event_author().unwrap();
     let id = AttemptActionId::new(NonZeroU64::MIN);
-    let effect =
-        crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope::new(AttemptEffect {
-            id,
-            class: EffectClass::Cleanup,
-            body: EffectBody::Withdraw { effect: id },
-        });
+    let send_generation = SendGeneration::new(id);
+    let operation_id = TaskOperationId::new_v7();
+    let operation = OperationIntent::CancelTask(CancelTask::new(
+        operation_id,
+        TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        ),
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id,
+        class: EffectClass::Settlement,
+        body: EffectBody::AdmitQueuedInput {
+            lane: operation.lane(),
+            operation,
+            generation: send_generation,
+            payload: QueuedInputPayload::AlreadyRetained,
+        },
+    });
+    let arbitration = effect.handoff().unwrap().clone();
+    arbitration.withdraw();
     let panic = PanicSink::new();
     let (mut owner, exit, handoff) =
         OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
@@ -375,7 +465,6 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
             .unwrap()
             .same_binding(&foreign_author)
     );
-
     assert!(
         handoff
             .bind_actor_result(effect.clone(), &author, result)
@@ -385,9 +474,21 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
     let (release, wait) = tokio::sync::oneshot::channel();
     handoff
         .spawn(&Handle::current(), exit, |exit, port| async move {
-            exit.revoke_unused_and_exit().unwrap();
+            let outcome = GatedWork::new(exit, (), arbitration, panic)
+                .run(
+                    Generation::new(1).unwrap(),
+                    ready(()),
+                    |(), ()| -> Ready<()> {
+                        panic!("withdrawn admission must not start");
+                    },
+                )
+                .await
+                .unwrap();
+            let GatedOutcome::NotStarted(reason) = outcome else {
+                panic!("original admission gate must report unused");
+            };
             assert!(
-                port.stage_actor_outcome(BodyOutcome::Unused(GatedNotStarted::Withdrawn))
+                port.stage_actor_outcome(BodyOutcome::Unused(reason))
                     .is_ok()
             );
             assert!(
@@ -400,6 +501,7 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
         .unwrap();
     observe.await.unwrap();
     assert!(owner.take_actor_result().is_none());
+    inbox.assert_no_result();
     assert!(!owner.try_retire().unwrap());
     release.send(()).unwrap();
     assert!(
@@ -409,6 +511,9 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
             .is_none()
     );
     assert!(!owner.try_retire().unwrap());
+    if fail_scope {
+        fixture.scope.fail().unwrap();
+    }
     let mut returned = owner.take_actor_result().expect("actual original result");
     assert!(Arc::ptr_eq(&returned.effect, &effect));
     assert!(
@@ -423,6 +528,31 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
         Some(BodyOutcome::Unused(GatedNotStarted::Withdrawn))
     ));
     assert!(owner.take_actor_result().is_none());
+    let fact = match returned.withdrawal.take().unwrap() {
+        Ok(input) if !fail_scope => inbox.consume(input),
+        Err(failure) if fail_scope => {
+            assert_eq!(
+                failure.error,
+                novarocks_control_runtime::actor_turn::ActorTurnError::ActorFailed
+            );
+            assert!(failure.predecessor.is_none() && failure.predecessor_input.is_none());
+            inbox.assert_no_result();
+            let FrontendInput::Attempt(value) = failure.event else {
+                panic!("refusal returns the exact original attempt event");
+            };
+            let AttemptInput::Executor(fact) = *value else {
+                panic!("refusal returns the exact original executor fact");
+            };
+            fact
+        }
+        Ok(_) => panic!("failed Scope must refuse the original event"),
+        Err(failure) => panic!("{}", failure.error),
+    };
+    assert!(matches!(
+        fact,
+        ExecutorFact::QueuedInputWithdrawn { operation, generation }
+            if operation == operation_id && generation == send_generation
+    ));
     returned.original.close_after_exit().unwrap();
     foreign_result.close_after_exit().unwrap();
     assert!(owner.try_retire().unwrap());
@@ -431,9 +561,6 @@ async fn actor_transport_keeps_the_original_result_position_through_join() {
         .ledger
         .reap_scope_ready(fixture.scope.id(), 128)
         .unwrap();
-    while let Some(turn) = runtime.claim_host_actor() {
-        turn.release(false).unwrap();
-    }
-    runtime.remove_actor(actor).unwrap();
+    inbox.finish();
     fixture.finish();
 }

@@ -1193,19 +1193,57 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
+    use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
+    use novarocks_attempt_protocol::{
+        effect::{
+            AttemptEffect, DispatchBatch, EffectBody, EffectClass,
+            OperationIntent as ProtocolIntent,
+        },
+        input::{ExecutorFact, QueuedInputGrantRef, WithdrawalOutcome},
+    };
     use novarocks_control_runtime::exit_work::{GatedNotStarted, GatedOutcome, Withdrawal};
+    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
 
     let roles = Roles::new();
+    let inbox = custody::tests::WithdrawalInbox::new(&roles.scope);
     let mut wc = transport::GovernedQueuedInputFixture::new();
     let operation = cancel(BackendProcessId::new_v7());
     let key = send_key(&operation);
     let input = wc.admit(key, 0);
     let (parent, queue, _) = roles.parent(operation.backend_process_id(), operation.queued_bytes());
+    let result = inbox.reserve(&parent);
+    let author = result.event_author().unwrap();
+    let OperationIntent::CancelTask(cancel) = &operation else {
+        unreachable!()
+    };
+    let protocol = ProtocolIntent::CancelTask(cancel.clone());
+    let effect_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id: effect_id,
+        class: EffectClass::Settlement,
+        body: EffectBody::SendBatch {
+            batch: DispatchBatch {
+                backend: operation.backend_process_id(),
+                lane: protocol.lane(),
+                control_progress: true,
+                operations: Box::new([protocol]),
+                queued_bytes: operation.queued_bytes(),
+                queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                queued_inputs: Box::new([QueuedInputGrantRef::new(
+                    NonZeroU64::MIN,
+                    key.generation,
+                )]),
+            },
+            reservation: novarocks_attempt_protocol::capacity::ReservationToken(NonZeroU64::MIN),
+        },
+    });
+    let withdrawal = effect.handoff().unwrap().clone();
     let panic = PanicSink::new();
     let inner = panic.clone();
     let (mut source, exit, launch) =
         OriginalTransportJoinObligation::prepare(parent, observer(), panic)
             .unwrap_or_else(|error| panic!("{}", error.error));
+    assert!(launch.bind_actor_result(effect, &author, result).is_ok());
     let registration = source.registration();
     let keys: Arc<[transport::SendKey]> = Arc::from([key]);
     let queue = transport::QueueCustody::new(queue, registration.clone(), keys.clone());
@@ -1217,7 +1255,6 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         .bind_send(registration.clone(), 0)
         .unwrap_or_else(|_| panic!("same original input"));
     assert!(!registration.claim_input(0, key));
-    let withdrawal = Arc::new(HandoffCell::new());
     let arbitration = withdrawal.clone();
     let (entered, waiting) = tokio::sync::oneshot::channel();
     launch
@@ -1240,11 +1277,20 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
                     outcome,
                     GatedOutcome::NotStarted(GatedNotStarted::Withdrawn)
                 );
+                assert!(
+                    registration
+                        .stage_actor_outcome(transport::BodyOutcome::Unused(
+                            GatedNotStarted::Withdrawn
+                        ))
+                        .is_ok()
+                );
             },
         )
         .unwrap();
     waiting.await.unwrap();
     assert!(source.take_unattached_retirement().unwrap().is_none());
+    assert!(source.take_actor_result().is_none());
+    inbox.assert_no_result();
     assert_eq!(withdrawal.withdraw(), Withdrawal::Withdrawn);
     assert!(
         poll_fn(|cx| source.poll_shared_completion(cx))
@@ -1257,6 +1303,8 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         .unwrap()
         .expect("actual Join and original loan return qualify retirement");
     assert!(error.is_none());
+    assert!(source.take_actor_result().is_none());
+    inbox.assert_no_result();
     assert!(!source.try_retire().unwrap());
     assert_eq!(
         roles
@@ -1268,6 +1316,20 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         1
     );
     assert!(retirement.finish_one().unwrap());
+    let mut result = source
+        .take_actor_result()
+        .expect("actual queue exit releases original result");
+    let input = result
+        .withdrawal
+        .take()
+        .unwrap()
+        .unwrap_or_else(|failure| panic!("{}", failure.error));
+    assert!(matches!(inbox.consume(input),
+        ExecutorFact::Withdrawn { effect, outcome: WithdrawalOutcome::DefinitelyUnsent }
+            if effect == effect_id
+    ));
+    assert!(source.take_actor_result().is_none());
+    result.original.close_after_exit().unwrap();
     assert!(source.try_retire().unwrap());
     assert_eq!(
         roles
@@ -1278,6 +1340,12 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             .used,
         [0, 0]
     );
+    roles.scope.close_external().unwrap();
+    roles
+        .ledger
+        .reap_scope_ready(roles.scope.id(), 128)
+        .unwrap();
+    inbox.finish();
     roles.finish();
     assert!(wc.finish());
 }
