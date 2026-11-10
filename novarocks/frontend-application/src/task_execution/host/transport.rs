@@ -30,6 +30,7 @@ mod actor_adapter;
 mod admission_source;
 mod capacity;
 mod effect_source;
+mod establish_material;
 mod execute;
 mod failure_abort;
 mod granted_inputs;
@@ -60,6 +61,7 @@ pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
     FailedSendResult, NativeReportReferences,
 };
+pub(crate) use establish_material::AttemptEstablishMaterial;
 pub(crate) use failure_abort::{FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup};
 pub(crate) use granted_inputs::GrantedInputs;
 #[cfg(test)]

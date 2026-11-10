@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{GrantedInputs, QueueCustody, QueueWindow, SendInputLoan, SendKey};
+use super::{
+    AttemptEstablishMaterial, GrantedInputs, QueueCustody, QueueWindow, SendInputLoan, SendKey,
+};
 use crate::{
     control_runtime::transport_withdrawal::AttemptEffectEnvelope,
     task_execution::{
@@ -39,8 +41,16 @@ use std::{
 pub(crate) struct FrozenSendRequests {
     originals: BTreeMap<TaskOperationId, OperationIntent>,
     creation_payloads: BTreeMap<PayloadRef, TaskOperationId>,
+    establish: Option<Arc<AttemptEstablishMaterial>>,
 }
 impl FrozenSendRequests {
+    pub(crate) fn with_establish(establish: Arc<AttemptEstablishMaterial>) -> Self {
+        Self {
+            establish: Some(establish),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn install(&mut self, original: OperationIntent) -> Result<(), OperationIntent> {
         let std::collections::btree_map::Entry::Vacant(record) =
             self.originals.entry(original.operation_id())
@@ -96,7 +106,7 @@ impl FrozenSendRequests {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.originals.is_empty()
+        self.originals.is_empty() && self.establish.is_none()
     }
 
     /// These lifecycle commands already carry the complete immutable
@@ -120,6 +130,14 @@ impl FrozenSendRequests {
             ProtocolIntent::ReleaseParticipation(request) => {
                 OperationIntent::ReleaseParticipation(*request)
             }
+            ProtocolIntent::EstablishParticipation { .. } => {
+                OperationIntent::EstablishParticipation(
+                    self.establish
+                        .as_ref()
+                        .ok_or(SendBindingError::MissingRequest)?
+                        .resolve(passive)?,
+                )
+            }
             _ => {
                 let operation = passive.operation_id();
                 let original = self
@@ -140,23 +158,6 @@ impl FrozenSendRequests {
                             && request.envelope() == *envelope
                             && request.identity() == *identity
                             && request.queued_bytes() == *queued_bytes
-                    }
-                    (
-                        ProtocolIntent::EstablishParticipation {
-                            envelope,
-                            participation,
-                            ticket,
-                            initial_lease_sequence,
-                            initial_lease_valid_for,
-                            ..
-                        },
-                        OperationIntent::EstablishParticipation(request),
-                    ) => {
-                        request.envelope() == *envelope
-                            && request.participation() == *participation
-                            && request.admission_ticket_id() == *ticket
-                            && request.initial_lease_sequence() == *initial_lease_sequence
-                            && request.initial_lease_valid_for() == *initial_lease_valid_for
                     }
                     (
                         ProtocolIntent::UpdateTask { identity, .. },
@@ -385,15 +386,116 @@ mod tests {
     use crate::native::task_transport::wire::{
         AttemptWireFacts, encode_operation, is_lease_renewal,
     };
+    use crate::{
+        query_execution::lifecycle_plan::QueryCredentialLeases,
+        task_execution::sources::AttemptEstablishFacts,
+    };
+    use novarocks_coordination_contract::AttemptAuthorization;
     use novarocks_execution_contract::{
-        LeaseSequence, LeaseValidFor, ParticipationRef, RenewParticipationLease,
-        UpdateParticipation,
+        AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind,
+        ParticipationRef, RenewParticipationLease, UpdateParticipation,
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
         QueryId,
     };
     use std::time::Duration;
+
+    #[test]
+    fn establish_authorization_and_send_share_one_frozen_request() {
+        use novarocks_proto_models::novarocks::{
+            RuntimeFilterContribution, task_operation::Operation,
+            update_participation_request::Command,
+        };
+        let execution =
+            QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap();
+        let frontend = FrontendProcessId::new_v7();
+        let first = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+        let second = ParticipationRef::new(execution, frontend, BackendProcessId::new_v7());
+        let original_facts = AttemptEstablishFacts::freeze(
+            Default::default(),
+            [(first, 11), (second, 22)].map(|(participation, participant_id)| {
+                (
+                    participation.backend_process_id(),
+                    RuntimeFilterContribution {
+                        participant_id,
+                        ..Default::default()
+                    },
+                )
+            }),
+            Default::default(),
+            &QueryCredentialLeases::empty(),
+        )
+        .unwrap();
+        let mut next_payload = std::num::NonZeroU64::new(12).unwrap();
+        let (quotes, material) =
+            AttemptEstablishMaterial::project(&original_facts, [first, second], &mut next_payload)
+                .unwrap();
+        assert_eq!(next_payload.get(), 14);
+        let material = Arc::new(material);
+        let requests = FrozenSendRequests::with_establish(material.clone());
+        let operation_id = TaskOperationId::new_v7();
+        let intent = |payload: PayloadRef, ticket: u8| ProtocolIntent::EstablishParticipation {
+            envelope: OperationEnvelope::with_default_wait(
+                operation_id,
+                OperationKind::UpdateParticipation,
+            ),
+            participation: first,
+            ticket: AdmissionTicketId::try_from_bytes([ticket; 16]).unwrap(),
+            initial_lease_sequence: LeaseSequence::INITIAL,
+            initial_lease_valid_for: LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+            material: payload,
+            queued_bytes: quotes[&first].queued_bytes,
+        };
+        let initial = AttemptAuthorization::Establish {
+            participation: first,
+            operation_id,
+        };
+        let replay = AttemptAuthorization::ReauthorizeEstablish {
+            participation: first,
+            operation_id,
+        };
+        let passive = intent(quotes[&first].material, 41);
+        assert!(matches!(
+            requests.resolve(&passive),
+            Err(SendBindingError::MissingRequest)
+        ));
+        assert!(matches!(
+            material.for_authorization(&passive, replay),
+            Err(SendBindingError::MissingRequest)
+        ));
+        assert!(matches!(
+            material.for_authorization(&intent(quotes[&second].material, 41), initial),
+            Err(SendBindingError::WrongRequest)
+        ));
+        let authorized = material.for_authorization(&passive, initial).unwrap();
+        let replayed = material.for_authorization(&passive, replay).unwrap();
+        assert!(Arc::ptr_eq(&authorized, &replayed));
+        assert!(matches!(
+            requests.resolve(&intent(quotes[&first].material, 42)),
+            Err(SendBindingError::WrongRequest)
+        ));
+        let projected = requests.resolve(&passive).unwrap();
+        let OperationIntent::EstablishParticipation(ref sent) = projected else {
+            panic!("the exact original Establish");
+        };
+        assert!(Arc::ptr_eq(sent, &authorized));
+        assert_eq!(projected.queued_bytes(), quotes[&first].queued_bytes);
+        let encoded = encode_operation(
+            &projected,
+            &AttemptWireFacts {
+                native_compatibility_id: NativeCompatibilityId::new([1; 32]),
+            },
+        )
+        .unwrap();
+        let Some(Operation::UpdateParticipation(request)) = encoded.operation else {
+            panic!("the original participation request");
+        };
+        let Some(Command::Establish(request)) = request.command else {
+            panic!("the original Establish command");
+        };
+        assert_eq!(request.initial_runtime_filter.unwrap().participant_id, 11);
+    }
 
     #[test]
     fn core_renewal_projects_inline_with_its_exact_wire_identity() {
