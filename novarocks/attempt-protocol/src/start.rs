@@ -22,6 +22,7 @@ use crate::config::{CoordinationBudgets, FrozenTransportLimits, TaskUpdateRetryP
 use crate::ids::IdSeed;
 use crate::input::AttemptSourceId;
 use novarocks_coordination_contract::{AttemptActivation, MonotonicInstant};
+use novarocks_execution_contract::descriptor::FragmentNodeId;
 use novarocks_execution_contract::{
     AdmissionEpochCapability, ExchangeDeliveryRequirement, ExchangeEdgeId, ParticipationRef,
     PlanNodeId, TaskIdentity,
@@ -49,7 +50,7 @@ pub struct FrozenTask {
     pub identity: TaskIdentity,
     pub participation: ParticipationRef,
     pub task_key: UniqueId,
-    pub fragment_id: i32,
+    pub fragment_id: u32,
     pub split_plan_nodes: Box<[PlanNodeId]>,
     pub creation: FrozenCreation,
 }
@@ -59,7 +60,7 @@ pub struct FrozenExchangeEdge {
     pub edge: ExchangeEdgeId,
     pub producer_stage: StageId,
     pub consumer_stage: StageId,
-    pub destination_node: PlanNodeId,
+    pub destination_node: FragmentNodeId,
     pub delivery: ExchangeDeliveryRequirement,
     pub producers: Box<[TaskIdentity]>,
     pub destinations: Box<[TaskIdentity]>,

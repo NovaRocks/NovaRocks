@@ -863,6 +863,59 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
 }
 
 #[test]
+fn manifest_projection_keeps_creation_seeds_with_their_exact_quotes() {
+    use novarocks_execution_contract::operation::OperationEnvelope;
+
+    let schedule = chain_schedule(&[0, 1], &[1]);
+    let graph = build_graph(&schedule, &chain_edges(), &backends(2), 64).expect("manifest graph");
+    let root = graph.root_identity();
+    let edges = graph.edges().cloned().collect::<Vec<_>>();
+    let mut next = NonZeroU64::new(10).unwrap();
+    let (frozen, mut originals) = graph
+        .into_attempt_graph(&mut next)
+        .expect("Core projection");
+    assert_eq!(frozen.root, root);
+    assert_eq!(frozen.edges.len(), edges.len());
+    assert_eq!(next.get(), 10 + frozen.tasks.len() as u64);
+    for edge in edges {
+        let projected = &frozen.edges[&edge.edge_id()];
+        assert_eq!(projected.destination_node, edge.destination_node_id());
+        assert_eq!(&*projected.producers, edge.producers());
+        assert_eq!(&*projected.destinations, edge.destinations());
+        assert_eq!(projected.delivery, edge.delivery());
+    }
+    for task in frozen.tasks.values() {
+        let original = originals
+            .remove(&task.creation.resource)
+            .expect("one original per Task");
+        assert_eq!(original.seed.identity(), task.identity);
+        assert_eq!(original.seed.participation(), task.participation);
+        assert_eq!(original.seed.split_plan_nodes(), &*task.split_plan_nodes);
+        assert_eq!(
+            task.creation.descriptor_encoded_bytes,
+            encode_task_descriptor(&original.seed.descriptor().unwrap()).encoded_len()
+        );
+        let parts = original
+            .seed
+            .freeze(original.sizing.lengths)
+            .expect("same priced creation");
+        let envelope = OperationEnvelope::with_default_wait(
+            TaskOperationId::new_v7(),
+            OperationKind::CreateTask,
+        );
+        let intent = super::creation::CreateTaskIntent::new(envelope, task.identity, parts, None);
+        assert_eq!(task.creation.queued_bytes, intent.queued_bytes());
+        assert_eq!(
+            task.creation.plan_carrier_bytes,
+            intent.plan_carrier_bytes()
+        );
+    }
+    assert!(originals.is_empty());
+    novarocks_attempt_protocol::graph::TaskGraph::from_frozen(frozen)
+        .expect("Core accepts the exact manifest topology");
+}
+
+#[test]
 fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata() {
     let processes = backends(3);
     let schedule = chain_schedule(&[0, 1], &[1]);

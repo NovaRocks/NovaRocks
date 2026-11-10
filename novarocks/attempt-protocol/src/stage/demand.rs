@@ -252,9 +252,8 @@ pub(crate) mod tests {
         config::DispatchLane,
         start::{FrozenCreation, FrozenExchangeEdge, FrozenTask, FrozenTaskGraph, PayloadRef},
     };
-    use novarocks_execution_contract::{
-        ExchangeDeliveryRequirement, ExchangeEdgeId, PlanNodeId, TaskIdentity,
-    };
+    use novarocks_execution_contract::descriptor::FragmentNodeId;
+    use novarocks_execution_contract::{ExchangeDeliveryRequirement, ExchangeEdgeId, TaskIdentity};
     use novarocks_types::{BackendProcessId, TaskId, UniqueId};
     use std::num::NonZeroU64;
     struct Turn(usize);
@@ -319,7 +318,7 @@ pub(crate) mod tests {
                     identity,
                     participation: sample.participation(),
                     task_key: UniqueId::new(i64::from(n), 1),
-                    fragment_id: n as i32,
+                    fragment_id: n,
                     split_plan_nodes: Box::new([]),
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(n)).unwrap()),
@@ -350,7 +349,7 @@ pub(crate) mod tests {
                     edge,
                     producer_stage: stage(producer),
                     consumer_stage: stage(consumer),
-                    destination_node: PlanNodeId::new(n as i32).unwrap(),
+                    destination_node: FragmentNodeId::new(n as i32),
                     delivery: if n == 4 && strict_producer {
                         ExchangeDeliveryRequirement::MustDrain
                     } else {

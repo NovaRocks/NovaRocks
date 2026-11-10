@@ -22,11 +22,15 @@
 //! protocol values and creation seeds that retain those same frozen facts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
 use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::artifact::NativePlacementAssignment;
+use novarocks_attempt_protocol::start::{
+    FrozenExchangeEdge, FrozenTask, FrozenTaskGraph, PayloadRef,
+};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::task_execution::{
@@ -37,8 +41,8 @@ use novarocks_types::UniqueId;
 use novarocks_types::identity::{QueryExecutionId, StageId, TaskId};
 
 use super::creation::{
-    AttemptTopology, EdgeDestination, EdgeProducer, SharedEdge, TaskCreationFacts,
-    TaskCreationSeed, TaskTopologyView,
+    AttemptTopology, EdgeDestination, EdgeProducer, PricedTaskCreation, SharedEdge,
+    TaskCreationFacts, TaskCreationSeed, TaskTopologyView,
 };
 use super::error::{CapacityBound, TaskExecutionError};
 use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestBinding};
@@ -333,6 +337,79 @@ impl TaskGraph {
     pub(crate) fn into_seeds(mut self) -> (Self, BTreeMap<TaskId, TaskCreationSeed>) {
         let seeds = std::mem::take(&mut self.seeds);
         (self, seeds)
+    }
+
+    /// Move the exact manifest-derived creation seeds to the host payload
+    /// store. Core receives only the topology and allocation-free quotes.
+    pub(crate) fn into_attempt_graph(
+        mut self,
+        next_payload: &mut NonZeroU64,
+    ) -> Result<(FrozenTaskGraph, BTreeMap<PayloadRef, PricedTaskCreation>), TaskExecutionError>
+    {
+        let root = self.root_identity();
+        let mut next = *next_payload;
+        let mut creations = BTreeMap::new();
+        let mut tasks = BTreeMap::new();
+        let mut stages = BTreeMap::<StageId, Vec<TaskIdentity>>::new();
+        for (id, node) in self.tasks {
+            let seed = self
+                .seeds
+                .remove(&id)
+                .expect("original manifest creation seed");
+            let resource = PayloadRef(next);
+            next = next.checked_add(1).ok_or_else(|| {
+                TaskExecutionError::Schedule("attempt payload identity space exhausted".into())
+            })?;
+            let (creation, original) = PricedTaskCreation::quote(seed, resource)?;
+            creations.insert(resource, original);
+            stages
+                .entry(node.stage_id())
+                .or_default()
+                .push(node.identity);
+            tasks.insert(
+                id,
+                FrozenTask {
+                    identity: node.identity,
+                    participation: node.participation,
+                    task_key: node.task_key,
+                    fragment_id: node.fragment_id,
+                    split_plan_nodes: node.split_plan_nodes.into_boxed_slice(),
+                    creation,
+                },
+            );
+        }
+        let stages = stages
+            .into_iter()
+            .map(|(stage, tasks)| (stage, tasks.into_boxed_slice()))
+            .collect();
+        let edges = self
+            .edges
+            .into_iter()
+            .map(|(id, edge)| {
+                (
+                    id,
+                    FrozenExchangeEdge {
+                        edge: edge.edge_id,
+                        producer_stage: edge.producer_stage,
+                        consumer_stage: edge.consumer_stage,
+                        destination_node: edge.destination_node_id,
+                        delivery: edge.delivery,
+                        producers: edge.producers.into_boxed_slice(),
+                        destinations: edge.destinations.into_boxed_slice(),
+                    },
+                )
+            })
+            .collect();
+        *next_payload = next;
+        Ok((
+            FrozenTaskGraph {
+                root,
+                tasks,
+                stages,
+                edges,
+            },
+            creations,
+        ))
     }
 
     /// The creation seed of one task, while the graph still owns it.

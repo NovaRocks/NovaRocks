@@ -59,8 +59,9 @@ pub(crate) fn remote(value: u32) -> crate::remote_task::RemoteTask {
 use crate::graph::TaskGraph;
 use crate::start::{FrozenCreation, FrozenExchangeEdge, FrozenTask, FrozenTaskGraph, PayloadRef};
 use novarocks_coordination_contract::AttemptActivationIdentity;
+use novarocks_execution_contract::descriptor::FragmentNodeId;
 use novarocks_execution_contract::{
-    ExchangeDeliveryRequirement, ExchangeEdgeId, ParticipationRef, PlanNodeId, TaskIdentity,
+    ExchangeDeliveryRequirement, ExchangeEdgeId, ParticipationRef, TaskIdentity,
 };
 use novarocks_types::{
     AttemptId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
@@ -95,7 +96,7 @@ pub(crate) fn frozen_graph_with_strict_input(
                 identity,
                 participation: ParticipationRef::new(execution, frontend, backend),
                 task_key: UniqueId::new(i64::from(index), 1),
-                fragment_id: index as i32,
+                fragment_id: index,
                 split_plan_nodes: Box::new([]),
                 creation: FrozenCreation {
                     resource: PayloadRef(NonZeroU64::new(u64::from(index)).unwrap()),
@@ -129,7 +130,7 @@ pub(crate) fn frozen_graph_with_strict_input(
                 edge,
                 producer_stage: producer.stage_id(),
                 consumer_stage: destination.stage_id(),
-                destination_node: PlanNodeId::new(n as i32).unwrap(),
+                destination_node: FragmentNodeId::new(n as i32),
                 delivery,
                 producers: Box::from([producer]),
                 destinations: Box::from([destination]),

@@ -74,7 +74,7 @@ fn start() -> AttemptStart {
                         identity: root,
                         participation,
                         task_key: original.task_key(),
-                        fragment_id: i32::try_from(original.fragment_id()).unwrap(),
+                        fragment_id: original.fragment_id(),
                         split_plan_nodes: Box::new([]),
                         creation: FrozenCreation {
                             resource: PayloadRef(positive(1)),

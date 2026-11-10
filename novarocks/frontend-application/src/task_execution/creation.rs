@@ -311,6 +311,7 @@ pub(crate) struct CreationLengths {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreationSizing {
     pub(crate) lengths: CreationLengths,
+    pub(crate) descriptor_encoded_bytes: usize,
     /// All newly requested descriptor/projection buffers plus the final
     /// encoded metadata buffer; original borrowed source backing is excluded.
     pub(crate) new_backing_bytes: usize,
@@ -607,6 +608,7 @@ impl TaskCreationSeed {
                 metadata,
                 assignment,
             },
+            descriptor_encoded_bytes: descriptor,
             new_backing_bytes: requested,
         })
     }
@@ -657,6 +659,34 @@ impl TaskCreationSeed {
             assignment_len,
             _retained: retained,
         }))
+    }
+}
+
+/// A host-owned Create seed and the invoice fixed before admission.
+pub(crate) struct PricedTaskCreation {
+    pub(crate) seed: TaskCreationSeed,
+    pub(crate) sizing: CreationSizing,
+}
+
+impl PricedTaskCreation {
+    pub(crate) fn quote(
+        seed: TaskCreationSeed,
+        resource: novarocks_attempt_protocol::start::PayloadRef,
+    ) -> Result<(novarocks_attempt_protocol::start::FrozenCreation, Self), TaskExecutionError> {
+        let sizing = seed.size_without_projection()?;
+        let fragment = seed.fragment();
+        let metadata = novarocks_attempt_protocol::start::FrozenCreation {
+            resource,
+            queued_bytes:
+                novarocks_task_codec::creation::default_create_task_operation_encoded_len(
+                    fragment.content().len(),
+                    sizing.lengths.metadata,
+                )
+                .saturating_add(OPERATION_FIXED_BYTES),
+            plan_carrier_bytes: plan_carrier_bytes(fragment, sizing.lengths),
+            descriptor_encoded_bytes: sizing.descriptor_encoded_bytes,
+        };
+        Ok((metadata, Self { seed, sizing }))
     }
 }
 

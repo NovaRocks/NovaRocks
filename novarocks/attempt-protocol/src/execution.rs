@@ -3231,6 +3231,7 @@ mod bounded_drain_tests {
         effect::FrozenContentRef,
         start::{FrozenCreation, FrozenExchangeEdge, FrozenTask, FrozenTaskGraph},
     };
+    use novarocks_execution_contract::descriptor::FragmentNodeId;
     use novarocks_execution_contract::{
         AbortCause, AbortParticipation, ContentFingerprint, DomainVersion,
         ExchangeDeliveryRequirement, ExchangeEdgeId, PlanNodeId, TaskOutputFacts,
@@ -3292,7 +3293,7 @@ mod bounded_drain_tests {
                     identity,
                     participation: seed.participation(),
                     task_key: UniqueId::new(i64::from(n), 1),
-                    fragment_id: n as i32,
+                    fragment_id: n,
                     split_plan_nodes: node.into_iter().collect(),
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(n)).unwrap()),
@@ -3313,7 +3314,7 @@ mod bounded_drain_tests {
                     edge,
                     producer_stage: identities[1].stage_id(),
                     consumer_stage: identities[0].stage_id(),
-                    destination_node: PlanNodeId::new(1).unwrap(),
+                    destination_node: FragmentNodeId::new(1),
                     delivery: ExchangeDeliveryRequirement::DemandDriven,
                     producers: Box::from([identities[1]]),
                     destinations: Box::from([identities[0]]),
@@ -4847,7 +4848,7 @@ mod bounded_drain_tests {
                     identity,
                     participation,
                     task_key: UniqueId::new(i64::from(value), 1),
-                    fragment_id: stage_value as i32,
+                    fragment_id: stage_value,
                     split_plan_nodes: Box::new([]),
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),

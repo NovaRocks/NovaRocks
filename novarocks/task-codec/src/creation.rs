@@ -40,7 +40,9 @@ use std::collections::BTreeSet;
 use novarocks_execution_contract::task_execution::creation::{CreationContent, FrozenBytes};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::identity::ParticipationRef;
-use novarocks_execution_contract::task_execution::operation::OperationEnvelope;
+use novarocks_execution_contract::task_execution::operation::{
+    MaxWait, OperationEnvelope, OperationKind,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 use novarocks_proto_models::novarocks;
 use prost::Message;
@@ -48,7 +50,6 @@ use prost::encoding::{encoded_len_varint, key_len};
 
 use crate::descriptor::{MAX_TOPOLOGY_ENTRIES, encode_task_descriptor};
 use crate::identity::encode_participation_ref;
-use crate::operation::encode_envelope;
 use crate::{duplicate, inconsistent, invalid, missing, out_of_range};
 
 /// Largest number of scan plan nodes one task's initial assignment may name.
@@ -282,17 +283,41 @@ pub fn encode_creation_metadata(
 /// The exact encoded size of one create operation built from frozen
 /// carriers, computed from their lengths without touching either.
 ///
-/// Only the envelope is encoded, and it is a few bytes: an operation id and a
-/// wait. That is what lets a sender price a resend whose envelope changed
-/// without walking or re-encoding the carriers it reuses.
+/// The envelope contains a fixed-width operation id and a variable-width wait.
 pub fn create_task_operation_encoded_len(
     envelope: OperationEnvelope,
     frozen_fragment_len: usize,
     creation_metadata_len: usize,
 ) -> usize {
+    create_operation_len(
+        envelope.max_wait(),
+        frozen_fragment_len,
+        creation_metadata_len,
+    )
+}
+
+/// Exact quote for a Create whose operation identity will be issued by Core.
+pub fn default_create_task_operation_encoded_len(
+    frozen_fragment_len: usize,
+    creation_metadata_len: usize,
+) -> usize {
+    create_operation_len(
+        MaxWait::default_for(OperationKind::CreateTask),
+        frozen_fragment_len,
+        creation_metadata_len,
+    )
+}
+
+fn create_operation_len(
+    max_wait: MaxWait,
+    frozen_fragment_len: usize,
+    creation_metadata_len: usize,
+) -> usize {
+    let id = bytes_field_len(1, std::mem::size_of::<[u8; 16]>());
+    let envelope = message_field_len(1, id) + size::uint(2, max_wait.get().as_millis() as u64);
     let create =
         bytes_field_len(4, frozen_fragment_len) + bytes_field_len(5, creation_metadata_len);
-    message_field_len(1, encode_envelope(envelope).encoded_len()) + message_field_len(2, create)
+    message_field_len(1, envelope) + message_field_len(2, create)
 }
 
 fn bytes_field_len(tag: u32, len: usize) -> usize {
@@ -487,6 +512,10 @@ mod tests {
                 create_task_operation_encoded_len(envelope, fragment, metadata),
                 operation.encoded_len(),
                 "fragment {fragment} metadata {metadata}"
+            );
+            assert_eq!(
+                default_create_task_operation_encoded_len(fragment, metadata),
+                operation.encoded_len(),
             );
         }
     }

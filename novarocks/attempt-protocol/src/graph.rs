@@ -19,6 +19,7 @@
 
 use crate::error::TaskExecutionError;
 use crate::start::{FrozenCreation, FrozenTaskGraph};
+use novarocks_execution_contract::descriptor::FragmentNodeId;
 use novarocks_execution_contract::{
     ExchangeDeliveryRequirement, ExchangeEdgeId, ParticipationRef, PlanNodeId, StageRef,
     TaskIdentity,
@@ -30,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct TaskNode {
     identity: TaskIdentity,
     participation: ParticipationRef,
-    fragment_id: i32,
+    fragment_id: u32,
     task_key: UniqueId,
     split_plan_nodes: Box<[PlanNodeId]>,
 }
@@ -47,7 +48,7 @@ impl TaskNode {
     pub const fn stage_id(&self) -> StageId {
         self.identity.stage_id()
     }
-    pub const fn fragment_id(&self) -> i32 {
+    pub const fn fragment_id(&self) -> u32 {
         self.fragment_id
     }
     pub const fn task_key(&self) -> UniqueId {
@@ -76,7 +77,7 @@ pub struct EdgeNode {
     edge_id: ExchangeEdgeId,
     producer_stage: StageId,
     consumer_stage: StageId,
-    destination_node_id: PlanNodeId,
+    destination_node_id: FragmentNodeId,
     delivery: ExchangeDeliveryRequirement,
     producers: Box<[TaskIdentity]>,
     destinations: Box<[TaskIdentity]>,
@@ -91,7 +92,7 @@ impl EdgeNode {
     pub const fn consumer_stage(&self) -> StageId {
         self.consumer_stage
     }
-    pub const fn destination_node_id(&self) -> PlanNodeId {
+    pub const fn destination_node_id(&self) -> FragmentNodeId {
         self.destination_node_id
     }
     pub const fn delivery(&self) -> ExchangeDeliveryRequirement {

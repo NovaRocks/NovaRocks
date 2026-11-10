@@ -204,7 +204,8 @@ mod tests {
         graph::TaskGraph,
         start::{FrozenCreation, FrozenExchangeEdge, FrozenTask, FrozenTaskGraph, PayloadRef},
     };
-    use novarocks_execution_contract::{ExchangeDeliveryRequirement, ParticipationRef, PlanNodeId};
+    use novarocks_execution_contract::descriptor::FragmentNodeId;
+    use novarocks_execution_contract::{ExchangeDeliveryRequirement, ParticipationRef};
     use novarocks_types::{BackendProcessId, StageId, TaskId, UniqueId};
     use std::num::NonZeroU64;
     struct Turn(usize);
@@ -255,7 +256,7 @@ mod tests {
                         identity.backend_process_id(),
                     ),
                     task_key: UniqueId::new(i64::from(value), 1),
-                    fragment_id: stage.get() as i32,
+                    fragment_id: stage.get(),
                     split_plan_nodes: Box::new([]),
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),
@@ -276,7 +277,7 @@ mod tests {
                     edge,
                     producer_stage: ids[2].stage_id(),
                     consumer_stage: ids[0].stage_id(),
-                    destination_node: PlanNodeId::new(value as i32).unwrap(),
+                    destination_node: FragmentNodeId::new(value as i32),
                     delivery: ExchangeDeliveryRequirement::DemandDriven,
                     producers: ids[2..].into(),
                     destinations: Box::from([ids[value as usize - 1]]),
