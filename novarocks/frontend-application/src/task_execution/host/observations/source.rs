@@ -149,6 +149,10 @@ impl ObservationSourcePool for BoundObservationSource {
         self.binding.clone()
     }
 
+    fn close_root_controls(&self) -> Result<(), ObservationError> {
+        self.requests.close_after_exit()
+    }
+
     fn retain_metadata(
         &self,
         required: ObservationMetadataLayout,

@@ -234,7 +234,9 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     };
     use novarocks_attempt_protocol::{
         effect::{AttemptEffect, EffectBody, EffectClass},
-        input::{AttemptInput, ExecutorFact},
+        input::{
+            AttemptInput, ExecutorFact, ObservationEvent, ObservationFact, ObservationFailure,
+        },
     };
     use novarocks_control_runtime::{
         actor::{ActorConfig, ActorStep},
@@ -256,7 +258,24 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     use novarocks_execution_contract::ParticipationRef;
     use novarocks_query_application::coordination::accepted_root_status_projection_with_control_port;
     use novarocks_types::FrontendProcessId;
-    use std::{num::NonZeroU64, sync::Mutex, task::Waker};
+    use std::{
+        future::ready,
+        num::NonZeroU64,
+        pin::Pin,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    #[derive(Default)]
+    struct CloseWakes(AtomicUsize);
+    impl Wake for CloseWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     // The test supplies a real Capture obligation as the fixture's original
     // metadata backing. It deliberately refuses its first retirement.
@@ -307,7 +326,9 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             };
             if matches!(
                 *input,
-                AttemptInput::Executor(ExecutorFact::ReadProgress(_))
+                AttemptInput::Executor(
+                    ExecutorFact::ReadProgress(_) | ExecutorFact::Observations(_)
+                )
             ) {
                 return;
             }
@@ -446,6 +467,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     );
     let control_position = reserve(InputClass::Control, &control);
     binding.bind_reply_author(control_position.author().unwrap());
+    let wakes = Arc::new(CloseWakes::default());
     let ingress = OrderedObservationInput::new(
         reserve(InputClass::Lifecycle, &observations),
         control_position,
@@ -453,7 +475,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         binding,
         Arc::new(ManualClock::default()),
         |input| FrontendInput::Attempt(Box::new(input)),
-        Waker::noop().clone(),
+        Waker::from(wakes.clone()),
     )
     .unwrap_or_else(|_| panic!("original ordered root Source"));
     requests.bind_ingress(&ingress);
@@ -508,6 +530,45 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     publication.root = Some(sender);
 
     for seal in [false, true] {
+        let prefix_key = StreamKey {
+            generation: NonZeroU64::new(2).unwrap(),
+            ..key
+        };
+        if seal {
+            ingress.register_stream(prefix_key).unwrap();
+            let mut credit = Some(ingress.reserve_read(prefix_key).await.unwrap());
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            assert!(progress.retire_ready().unwrap());
+            let mut opened = ready(Ok::<(), ObservationFailure>(()));
+            assert!(matches!(
+                ingress
+                    .poll_open(
+                        prefix_key,
+                        &mut credit,
+                        Pin::new(&mut opened),
+                        &mut Context::from_waker(Waker::noop()),
+                    )
+                    .unwrap()
+                    .result,
+                Poll::Ready(Ok(()))
+            ));
+            ingress
+                .accept(
+                    prefix_key,
+                    ObservationEvent::Fact {
+                        source_revision: None,
+                        fact: ObservationFact::Bookmark {
+                            generation: prefix_key.generation.get(),
+                            sequence: 1,
+                            covered_prefix: 1,
+                            source_cut: 1,
+                        },
+                    },
+                    32,
+                    credit.take().unwrap(),
+                )
+                .unwrap();
+        }
         let mut reply = if seal {
             status.begin_success_seal_request()
         } else {
@@ -515,6 +576,26 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         }
         .unwrap();
         assert!(status.begin_terminal_control_request().is_err());
+        if seal {
+            // This Seal has been accepted behind an actual observation. A
+            // close request must fence new QA calls while leaving this FIFO
+            // prefix and the already accepted Seal runnable.
+            assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            let batches = runtime.committed_batches(actor, None, 4).unwrap();
+            assert_eq!(batches.len(), 1);
+            let prefix = batches[0].1;
+            assert!(
+                runtime
+                    .effect_inventory(actor, prefix, None, 1)
+                    .unwrap()
+                    .is_empty()
+            );
+            runtime.retire_input(actor, prefix).unwrap();
+            ingress.input_retired(prefix).unwrap();
+            ingress.job_closed(prefix_key).unwrap();
+            ingress.retire_stream(prefix_key).unwrap();
+        }
         assert!(runtime.poll_one(Tick(1)).unwrap());
         let batches = runtime.committed_batches(actor, None, 4).unwrap();
         assert_eq!(batches.len(), 1);
@@ -544,8 +625,18 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         runtime.retire_input(actor, input).unwrap();
         ingress.root_control_processed(input).unwrap();
         ingress.input_retired(input).unwrap();
+        let wake_count = wakes.0.load(Ordering::SeqCst);
+        if seal {
+            let retained = scope.snapshot().unwrap().storage;
+            assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+            assert_eq!(scope.snapshot().unwrap().storage, retained);
+        }
         requests.deliver(token, &mut publication).unwrap();
         reply.await.unwrap().unwrap();
+        if seal {
+            assert!(wakes.0.load(Ordering::SeqCst) > wake_count);
+            assert!(status.begin_terminal_control_request().is_err());
+        }
     }
     assert!(
         publication.root.is_none(),

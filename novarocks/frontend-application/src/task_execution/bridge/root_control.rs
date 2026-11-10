@@ -58,7 +58,9 @@ struct Request {
 struct Requests {
     next: u64,
     original: Option<Request>,
+    submitting: bool,
     delivering: bool,
+    closed: bool,
     writer_error: Option<ObservationError>,
 }
 
@@ -81,7 +83,9 @@ impl RootControlRequests {
             state: Mutex::new(Requests {
                 next: 1,
                 original: None,
+                submitting: false,
                 delivering: false,
+                closed: false,
                 writer_error: None,
             }),
         });
@@ -130,6 +134,18 @@ impl RootControlRequests {
         assert!(self.ingress.set(ingress.weak()).is_ok());
     }
 
+    /// Fence new QA requests without blocking the already accepted writer
+    /// or reply carrier. An active submission or reply retains its original
+    /// custody even if the runtime has already retired its control input.
+    pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
+        let mut state = self.state.lock().expect("original root-control request");
+        state.closed = true;
+        if state.submitting || state.original.is_some() || state.delivering {
+            return Err(ObservationError::Busy);
+        }
+        Ok(())
+    }
+
     fn reserve_request(
         &self,
         request: AcceptedRootControlRequest,
@@ -143,7 +159,12 @@ impl RootControlRequests {
             _ => return Err(request),
         };
         let mut state = self.state.lock().expect("original root-control request");
-        if state.original.is_some() || state.delivering || state.writer_error.is_some() {
+        if state.closed
+            || state.submitting
+            || state.original.is_some()
+            || state.delivering
+            || state.writer_error.is_some()
+        {
             return Err(request);
         }
         let Some(next) = state.next.checked_add(1) else {
@@ -154,6 +175,7 @@ impl RootControlRequests {
             return Err(request);
         };
         state.next = next;
+        state.submitting = true;
         state.original = Some(Request {
             token,
             kind,
@@ -252,24 +274,28 @@ impl RootControlRequests {
         let Some((request, reply)) = self.take_committed(token) else {
             return Err(PublicationError::MissingRootControlReply);
         };
+        let Request {
+            original,
+            reply: reply_slot,
+            failure_projection,
+            ..
+        } = request;
         let result = match &reply.body {
             AttemptToLogicalBody::SealResult {
                 result: Ok(withdrawals),
                 ..
             } => match publication.take_root_for_seal() {
-                Ok(sender) => request
-                    .original
+                Ok(sender) => original
                     .accept(sender, withdrawals.as_ref().to_vec())
                     .map_err(PublicationError::Root),
                 Err(error) => {
-                    request.original.reject(root_protocol_error(
+                    original.reject(root_protocol_error(
                         "original root success publisher is unavailable",
                     ));
                     Err(error)
                 }
             },
-            AttemptToLogicalBody::TerminalControlResult { result: Ok(()), .. } => request
-                .original
+            AttemptToLogicalBody::TerminalControlResult { result: Ok(()), .. } => original
                 .accept_terminal_control()
                 .map_err(PublicationError::Root),
             AttemptToLogicalBody::SealResult {
@@ -281,8 +307,7 @@ impl RootControlRequests {
                 ..
             } => {
                 let mut resolve_host = |reference| {
-                    request
-                        .failure_projection
+                    failure_projection
                         .as_ref()
                         .filter(|(original, _)| *original == reference)
                         .map(|(_, input)| input.clone())
@@ -294,11 +319,12 @@ impl RootControlRequests {
                             "original root-control failure projection is unavailable",
                         )
                     });
-                request.original.reject(error);
+                original.reject(error);
                 Ok(())
             }
             _ => unreachable!("the root-control gate preserves the original reply kind"),
         };
+        drop((reply, reply_slot, failure_projection));
         self.finish_delivery(token);
         result
     }
@@ -315,9 +341,14 @@ impl RootControlRequests {
                     ..
                 }
             ));
-            request
-                .original
-                .reject(QueryExecutionError::from_execution(owner_failure()));
+            let Request {
+                original,
+                reply: reply_slot,
+                failure_projection,
+                ..
+            } = request;
+            original.reject(QueryExecutionError::from_execution(owner_failure()));
+            drop((reply, reply_slot, failure_projection));
             self.finish_delivery(token);
         }
     }
@@ -339,10 +370,32 @@ impl RootControlRequests {
 
     fn finish_delivery(&self, token: AttemptRequestToken) {
         self.failure.release_reply(token);
-        self.state
-            .lock()
-            .expect("original root-control request")
-            .delivering = false;
+        let closed = {
+            let mut state = self.state.lock().expect("original root-control request");
+            state.delivering = false;
+            state.closed
+        };
+        self.notify_close(closed);
+    }
+
+    fn finish_submission(&self) {
+        let closed = {
+            let mut state = self.state.lock().expect("original root-control request");
+            state.submitting = false;
+            state.closed
+        };
+        self.notify_close(closed);
+    }
+
+    fn notify_close(&self, closed: bool) {
+        if closed
+            && let Some(ingress) = self
+                .ingress
+                .get()
+                .and_then(WeakOrderedObservationInput::upgrade)
+        {
+            ingress.notify_source_progress();
+        }
     }
 }
 
@@ -368,25 +421,30 @@ impl AcceptedRootControlPort for RootControlRequests {
         };
         let reference = self.reserve_request(request)?;
         let token = reference.token();
-        if ingress.queue_root_control(reference).is_err() {
+        let result = if ingress.queue_root_control(reference).is_err() {
             let mut state = self.state.lock().expect("original root-control request");
             if self.failure.cancel_unpublished_reply(token) {
-                return Err(state
+                Err(state
                     .original
                     .take()
                     .expect("refused original control")
-                    .original);
+                    .original)
+            } else {
+                // The failure gate already owns this exact request.
+                Ok(())
             }
-            // The failure gate already owns this exact request.
-            return Ok(());
-        }
-        if let Err(error) = ingress.drive() {
-            self.state
-                .lock()
-                .expect("original root-control request")
-                .writer_error = Some(error);
-        }
-        Ok(())
+        } else {
+            if let Err(error) = ingress.drive() {
+                self.state
+                    .lock()
+                    .expect("original root-control request")
+                    .writer_error = Some(error);
+            }
+            Ok(())
+        };
+        drop(ingress);
+        self.finish_submission();
+        result
     }
 }
 

@@ -320,6 +320,9 @@ impl Drop for ObservationCredit {
 pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
     fn budget(&self) -> ObservationBudget;
     fn fixed_root_control_binding(&self) -> RootControlBinding;
+    /// Fence new root controls and retain the original writer until all
+    /// already admitted requests have actually left canonical custody.
+    fn close_root_controls(&self) -> Result<(), ObservationError>;
     /// Retain the SAME already-admitted metadata author/backing for this real
     /// layout and its containers. No new quota/wallet or descriptor-only grant.
     /// P10a must supply this actual author; P10c provides no fallback.
@@ -1641,9 +1644,14 @@ impl<A: Actor> OrderedObservationInput<A> {
             .metadata_retired
     }
 
+    pub(crate) fn notify_source_progress(&self) {
+        self.0.progress.wake_by_ref();
+    }
+
     /// Call only after original stream/bridge holders actually exited and all
     /// in-flight inputs retired. Refusal preserves every original loan/standing.
     pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
+        self.0.source.close_root_controls()?;
         let (retired, streams) = {
             let mut state = self.0.state.lock().expect("ordered observation state");
             state.closed = true;

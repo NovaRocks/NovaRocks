@@ -409,6 +409,9 @@ impl ObservationSourcePool for Bank {
     fn fixed_root_control_binding(&self) -> RootControlBinding {
         self.binding.clone()
     }
+    fn close_root_controls(&self) -> Result<(), ObservationError> {
+        Ok(())
+    }
     fn retain_metadata(
         &self,
         required: ObservationMetadataLayout,
