@@ -1703,11 +1703,14 @@ async fn run_actor_send(
         transport_withdrawal::AttemptEffectEnvelope,
     };
     use crate::task_execution::clock::ProcessMonotonicClock;
-    use crate::task_execution::host::failure_bridge::PendingFailureBridge;
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
     use crate::task_execution::host::failure_supervisor::{
         FailureCleanupRequest, FailureSupervisor,
+    };
+    use crate::task_execution::{
+        bridge::terminal::{RegisteredAttemptTerminal, TerminalOutbox},
+        host::failure_bridge::PendingFailureBridge,
     };
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
@@ -2175,7 +2178,10 @@ async fn run_actor_send(
             )),
         })
         .unwrap_or_else(|_| panic!("same host registration"));
-    let mut bridge = failure_bridge.bind(exit, processes.clone());
+    let mut terminal_owner = RegisteredAttemptTerminal::new(
+        TerminalOutbox::new(activation),
+        failure_bridge.bind(exit, processes.clone()),
+    );
     let advance_host = || {
         while let Some(turn) = actor_runtime.claim_host_actor() {
             host.drive(Tick(1), turn);
@@ -2283,6 +2289,10 @@ async fn run_actor_send(
     );
     actor_runtime.retire_input(actor, send_input).unwrap();
     if fail_core {
+        {
+            let mut waiting = Box::pin(terminal_owner.terminal());
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+        }
         let failed = actor_runtime
             .reserve_input(actor, actor, InputClass::Lifecycle)
             .unwrap()
@@ -2290,13 +2300,15 @@ async fn run_actor_send(
             .unwrap();
         assert!(actor_runtime.poll_one(Tick(2)).unwrap());
         advance_host();
-        let terminal = tokio::time::timeout(Duration::from_secs(1), bridge.terminal())
+        let terminal = tokio::time::timeout(Duration::from_secs(1), terminal_owner.terminal())
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(terminal_owner.terminal().await.unwrap(), terminal);
         assert!(
             matches!(terminal, NativeAttemptTerminal::Failed(error) if error.class() == novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure)
         );
-        let lost = bridge.original_loss();
+        let lost = terminal_owner.failure_bridge_mut().original_loss();
         assert!(
             matches!(&lost.body, AttemptToLogicalBody::AttemptLost { unknown_participations, unresolved_actions, .. }
             if &**unknown_participations == &[participation] && &**unresolved_actions == &[send_id])
@@ -2335,10 +2347,9 @@ async fn run_actor_send(
         } else {
             Instant::now() + Duration::from_secs(5)
         };
-        let mut waiting = Box::pin(bridge.converge(NativeActiveConvergenceRequest::new(
-            cancellation.as_ref().unwrap().clone(),
-            deadline,
-        )));
+        let mut waiting = Box::pin(terminal_owner.failure_bridge_mut().converge(
+            NativeActiveConvergenceRequest::new(cancellation.as_ref().unwrap().clone(), deadline),
+        ));
         assert!(
             futures::poll!(waiting.as_mut()).is_pending(),
             "remote deadline cannot settle original local work"
@@ -2362,7 +2373,7 @@ async fn run_actor_send(
     assert!(cleanup.lock().unwrap().dropped);
     if fail_core {
         let cancellation = cancellation.unwrap();
-        let (residual, attempts) = bridge.original_residual();
+        let (residual, attempts) = terminal_owner.failure_bridge_mut().original_residual();
         let [abort] = attempts else {
             panic!("one frozen failure abort")
         };
@@ -2391,10 +2402,12 @@ async fn run_actor_send(
         }
         let closure = tokio::time::timeout(
             Duration::from_secs(1),
-            bridge.converge(NativeActiveConvergenceRequest::new(
-                cancellation.clone(),
-                Instant::now() + Duration::from_secs(5),
-            )),
+            terminal_owner
+                .failure_bridge_mut()
+                .converge(NativeActiveConvergenceRequest::new(
+                    cancellation.clone(),
+                    Instant::now() + Duration::from_secs(5),
+                )),
         )
         .await
         .unwrap()
@@ -2404,7 +2417,8 @@ async fn run_actor_send(
                 matches!(closure, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if &*exact_participations == &[participation])
             );
             processes.changed.send_replace(1);
-            let original = bridge
+            let original = terminal_owner
+                .failure_bridge_mut()
                 .converge(NativeActiveConvergenceRequest::new(
                     cancellation,
                     Instant::now() + Duration::from_secs(5),

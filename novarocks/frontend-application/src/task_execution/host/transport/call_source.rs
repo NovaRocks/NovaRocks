@@ -28,15 +28,16 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::{
-        bridge::{qa::AttemptQaBridge, terminal::TerminalOutbox},
+        bridge::{
+            qa::AttemptQaBridge,
+            terminal::{TerminalOutbox, TerminalPublication},
+        },
         error::TaskExecutionError,
         host::custody::ReturnedActorTransportResult,
     },
 };
 use novarocks_attempt_protocol::{
-    effect::EffectBody,
-    failure::{AttemptFailure, HostFailureRef},
-    input::AttemptInput,
+    effect::EffectBody, failure::HostFailureRef, input::AttemptInput,
 };
 use novarocks_control_runtime::{
     actor_turn::{ActorTurnError, EffectTicket},
@@ -85,7 +86,7 @@ pub(crate) enum AttemptCallReply {
         input: AttemptInput,
         failure: Option<(HostFailureRef, TaskExecutionError)>,
     },
-    Terminal(AttemptToLogical<AttemptFailure>),
+    Terminal(Box<TerminalPublication>),
 }
 
 pub(crate) struct BoundAttemptCall(AttemptCallOwner);
@@ -109,7 +110,9 @@ impl BoundAttemptCall {
                             crate::task_execution::bridge::qa::AttemptQaPortError::WrongRequest,
                         ));
                     }
-                    return Ok(AttemptCallReply::Terminal(port.clone()));
+                    return Ok(AttemptCallReply::Terminal(Box::new(
+                        TerminalPublication::new(port.clone()),
+                    )));
                 }
                 let reply = match &effect.protocol.body {
                     EffectBody::EstablishAuthorization { operation, request } => {

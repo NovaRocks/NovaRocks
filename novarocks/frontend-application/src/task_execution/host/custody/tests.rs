@@ -1281,7 +1281,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
     await_reply(7).await;
     let novarocks_query_application::api::NativeAttemptTerminal::Failed(failure) =
-        terminal.terminal(|_| None).await.unwrap()
+        terminal.terminal().await.unwrap()
     else {
         panic!("the original refusal was delivered");
     };

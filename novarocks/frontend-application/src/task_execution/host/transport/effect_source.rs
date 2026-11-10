@@ -20,7 +20,8 @@
 use super::{
     ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource, BodyOutcome,
     FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
-    SendKey, SendMemberReport, SendReportRows, send_reports::close_unlaunched,
+    SendKey, SendMemberReport, SendReportRows, call_source::AttemptCallReply,
+    send_reports::close_unlaunched,
 };
 use crate::{
     control_runtime::{
@@ -541,21 +542,33 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
-        if let Some(source) = self
+        if let Some(lane) = self
             .calls
-            .iter_mut()
-            .flatten()
-            .find(|source| source.owns(effect))
+            .iter()
+            .position(|source| source.as_ref().is_some_and(|source| source.owns(effect)))
         {
             match event {
-                TransportSourceEvent::Result(original) => {
-                    if let Err(refused) = source.accept(original) {
+                TransportSourceEvent::Result(mut original) => {
+                    if let Some(BodyOutcome::Call(AttemptCallReply::Terminal(publication))) =
+                        &mut original.outcome
+                        && let Some(reference) = publication.host_reference()
+                        && let Some(failure) =
+                            self.admission.take_failure(reference).or_else(|| {
+                                self.calls
+                                    .iter_mut()
+                                    .flatten()
+                                    .find_map(|source| source.take_failure(reference))
+                            })
+                    {
+                        publication.attach_host_failure(reference, failure);
+                    }
+                    if let Err(refused) = self.calls[lane].as_mut().unwrap().accept(original) {
                         self.other.retain_transport_failure(Box::new(refused));
                     }
                 }
                 TransportSourceEvent::Retired => {
                     assert!(self.in_flight.remove(&effect));
-                    source.transport_retired(effect);
+                    self.calls[lane].as_mut().unwrap().transport_retired(effect);
                 }
                 original => self.other.transport_event(effect, original),
             }

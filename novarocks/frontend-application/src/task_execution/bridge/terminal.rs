@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Normal terminal delivery to the original logical attempt.
+//! Terminal delivery to the original logical attempt.
 
-use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::{error::TaskExecutionError, host::failure_bridge::FailureBridge};
 use novarocks_attempt_protocol::{
     error::{ParticipantObservationFailure, TaskExecutionError as ProtocolError},
     failure::{AttemptFailure, AttemptFailureSite, HostFailureRef, ProtocolFailure},
@@ -36,9 +36,59 @@ use novarocks_query_application::{
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 
+/// The selected raw host error travels with the normal terminal that names it.
+pub(crate) struct TerminalPublication {
+    port: AttemptToLogical<AttemptFailure>,
+    failure: Option<(HostFailureRef, TaskExecutionError)>,
+}
+
+impl TerminalPublication {
+    pub(crate) fn new(port: AttemptToLogical<AttemptFailure>) -> Self {
+        Self {
+            port,
+            failure: None,
+        }
+    }
+
+    pub(crate) fn host_reference(&self) -> Option<HostFailureRef> {
+        let AttemptToLogicalBody::AttemptTerminal(
+            AttemptTerminal::Failed(failure) | AttemptTerminal::Stopped { failure, .. },
+        ) = &self.port.body
+        else {
+            return None;
+        };
+        match failure {
+            AttemptFailure::Host(host)
+            | AttemptFailure::EstablishReplayExhausted { original: host, .. } => {
+                Some(host.original)
+            }
+            AttemptFailure::TaskProtocol(original) => match original.as_ref() {
+                ProtocolError::Workload(host)
+                | ProtocolError::HostExecution(host)
+                | ProtocolError::SplitAssignment(host)
+                | ProtocolError::Actor(host)
+                | ProtocolError::NativeTransport(host)
+                | ProtocolError::Establish(host) => Some(host.original),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub(crate) fn attach_host_failure(
+        &mut self,
+        reference: HostFailureRef,
+        failure: TaskExecutionError,
+    ) {
+        assert_eq!(self.host_reference(), Some(reference));
+        assert!(self.failure.is_none());
+        self.failure = Some((reference, failure));
+    }
+}
+
 pub(crate) struct TerminalOutbox {
     activation: AttemptActivationIdentity,
-    terminal: OnceLock<AttemptToLogical<AttemptFailure>>,
+    terminal: OnceLock<Box<TerminalPublication>>,
     ready: Notify,
 }
 
@@ -53,10 +103,10 @@ impl TerminalOutbox {
 
     pub(crate) fn publish(
         &self,
-        original: AttemptToLogical<AttemptFailure>,
-    ) -> Result<(), AttemptToLogical<AttemptFailure>> {
-        if original.activation != self.activation
-            || !matches!(original.body, AttemptToLogicalBody::AttemptTerminal(_))
+        original: Box<TerminalPublication>,
+    ) -> Result<(), Box<TerminalPublication>> {
+        if original.port.activation != self.activation
+            || !matches!(original.port.body, AttemptToLogicalBody::AttemptTerminal(_))
         {
             return Err(original);
         }
@@ -66,26 +116,71 @@ impl TerminalOutbox {
     }
 
     /// Borrowing the outbox across a cancelled wait keeps the original result.
-    /// The logical owner resolves any host reference against its original
-    /// typed failure records before it asks QA to choose a recovery action.
-    pub(crate) async fn terminal(
-        &self,
-        resolve_host: impl FnMut(HostFailureRef) -> Option<ExecutionFailureInput>,
-    ) -> Result<NativeAttemptTerminal, TerminalProjectionError> {
-        let port = loop {
-            if let Some(port) = self.terminal.get() {
-                break port;
+    pub(crate) async fn terminal(&self) -> Result<NativeAttemptTerminal, TerminalProjectionError> {
+        let publication = loop {
+            if let Some(publication) = self.terminal.get() {
+                break publication;
             }
             self.ready.notified().await;
         };
-        let AttemptToLogicalBody::AttemptTerminal(terminal) = &port.body else {
+        let AttemptToLogicalBody::AttemptTerminal(terminal) = &publication.port.body else {
             unreachable!("validated original terminal publication");
         };
-        project_terminal(terminal, resolve_host)
+        if let Some(reference) = publication.host_reference()
+            && !publication
+                .failure
+                .as_ref()
+                .is_some_and(|(original, _)| *original == reference)
+        {
+            return Err(TerminalProjectionError::MissingOriginalHostFailure(
+                reference,
+            ));
+        }
+        project_terminal(terminal, |reference| {
+            let (original, failure) = publication.failure.as_ref()?;
+            (*original == reference).then(|| failure.preparation_input())
+        })
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+/// One logical receiver selects a terminal while retaining the original
+/// failure-convergence bridge even when a normal result arrives first.
+pub(crate) struct RegisteredAttemptTerminal {
+    normal: Arc<TerminalOutbox>,
+    failure: FailureBridge,
+    selected: Option<Result<NativeAttemptTerminal, TerminalProjectionError>>,
+}
+
+impl RegisteredAttemptTerminal {
+    pub(crate) fn new(normal: Arc<TerminalOutbox>, failure: FailureBridge) -> Self {
+        Self {
+            normal,
+            failure,
+            selected: None,
+        }
+    }
+
+    pub(crate) async fn terminal(
+        &mut self,
+    ) -> Result<NativeAttemptTerminal, TerminalProjectionError> {
+        if let Some(original) = &self.selected {
+            return original.clone();
+        }
+        let terminal = tokio::select! {
+            biased;
+            normal = self.normal.terminal() => normal,
+            lost = self.failure.terminal() => Ok(lost),
+        };
+        self.selected = Some(terminal.clone());
+        terminal
+    }
+
+    pub(crate) fn failure_bridge_mut(&mut self) -> &mut FailureBridge {
+        &mut self.failure
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalProjectionError {
     MissingOriginalHostFailure(HostFailureRef),
     MissingSelectedTaskCause,
@@ -505,7 +600,8 @@ mod tests {
         let activation =
             AttemptActivationIdentity::from_parts(1, participation().query_execution_id(), 1);
         let reference = HostFailureRef(NonZeroU64::MIN);
-        let input = owner_failure();
+        let raw = TaskExecutionError::Schedule("original frozen schedule failure".into());
+        let input = raw.preparation_input();
         let outbox = TerminalOutbox::new(activation);
         let port = AttemptToLogical {
             activation,
@@ -519,19 +615,29 @@ mod tests {
                 }),
             )),
         };
-        assert!(outbox.publish(port.clone()).is_ok());
-        assert!(outbox.publish(port).is_err());
+        let missing = TerminalOutbox::new(activation);
         assert!(
-            matches!(outbox.terminal(|_| None).await, Err(TerminalProjectionError::MissingOriginalHostFailure(original)) if original == reference)
+            missing
+                .publish(Box::new(TerminalPublication::new(port.clone())))
+                .is_ok()
         );
-        let NativeAttemptTerminal::Failed(actual) = outbox
-            .terminal(|original| {
-                assert_eq!(original, reference);
-                Some(input.clone())
-            })
-            .await
-            .unwrap()
-        else {
+        assert_eq!(
+            missing.terminal().await,
+            Err(TerminalProjectionError::MissingOriginalHostFailure(
+                reference
+            )),
+        );
+
+        let mut publication = Box::new(TerminalPublication::new(port.clone()));
+        assert_eq!(publication.host_reference(), Some(reference));
+        publication.attach_host_failure(reference, raw);
+        assert!(outbox.publish(publication).is_ok());
+        assert!(
+            outbox
+                .publish(Box::new(TerminalPublication::new(port)))
+                .is_err()
+        );
+        let NativeAttemptTerminal::Failed(actual) = outbox.terminal().await.unwrap() else {
             panic!("the exact typed original failure");
         };
         assert_eq!(actual.input(), &input);

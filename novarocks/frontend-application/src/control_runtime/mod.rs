@@ -49,11 +49,11 @@ pub(crate) mod metrics;
 use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
-use crate::task_execution::bridge::terminal::TerminalOutbox;
+use crate::task_execution::bridge::terminal::{RegisteredAttemptTerminal, TerminalOutbox};
 use crate::task_execution::host::adapter::{
     AttemptActorRegistration, AttemptRegistrationError, AttemptStartup, PreparedAttemptHost,
 };
-use crate::task_execution::host::failure_bridge::{FailureBridge, PendingFailureBridge};
+use crate::task_execution::host::failure_bridge::PendingFailureBridge;
 use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
@@ -128,7 +128,7 @@ impl FrontendControlRuntime {
         &self,
         prepared: PreparedAttemptHost,
     ) -> Result<
-        (AttemptStartup, FailureBridge, Arc<TerminalOutbox>),
+        (AttemptStartup, RegisteredAttemptTerminal),
         (
             HostRegistrationRefusal,
             AttemptStartup,
@@ -145,8 +145,10 @@ impl FrontendControlRuntime {
         match self.register(binding) {
             Ok(exit) => Ok((
                 startup,
-                failure.bind(exit, self.backend_processes.clone()),
-                terminal,
+                RegisteredAttemptTerminal::new(
+                    terminal,
+                    failure.bind(exit, self.backend_processes.clone()),
+                ),
             )),
             Err(refusal) => Err((refusal, startup, failure, terminal)),
         }
