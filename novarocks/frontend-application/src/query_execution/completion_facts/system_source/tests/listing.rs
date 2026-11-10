@@ -146,7 +146,12 @@ impl Fixture {
             capacity,
         )
         .unwrap()
-        .with_snapshot_planning_owned(compile, cancellation, None);
+        .with_snapshot_planning(
+            compile,
+            cancellation,
+            None,
+            FrontendPlanningCpuSource::new(blocking.clone()),
+        );
         let source = super::source_in(blocking, scope).await;
         let pin = crate::connector::metadata_binding_typed(provider.registry.as_ref(), "catalog")
             .unwrap();
@@ -174,6 +179,17 @@ impl Fixture {
         .await
         .unwrap()
         .unwrap();
+        if let Some(cpu) = source
+            .scope
+            .planning
+            .as_ref()
+            .and_then(|planning| planning.cpu.as_ref())
+        {
+            tokio::time::timeout(Duration::from_secs(5), cpu.close())
+                .await
+                .unwrap()
+                .unwrap();
+        }
         drop(source);
         drop(self.window.take());
         assert_eq!(
@@ -347,3 +363,5 @@ async fn original_metadata_cpu_footer_precedes_source_close_and_window_retiremen
     drop(source);
     fixture.finish(true).await;
 }
+
+mod completion;

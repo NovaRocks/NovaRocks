@@ -260,6 +260,68 @@ fn query_rows_at(result: &QueryResult, column: usize) -> Vec<String> {
 }
 
 #[test]
+fn virtual_view_mutations_refuse_before_analysis_or_external_changes() {
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    engine.insert_view(
+        ViewTarget {
+            catalog: "system".into(),
+            database: "metadata".into(),
+            view: "v".into(),
+        },
+        "SELECT 1 AS a",
+        "metadata",
+    );
+    for (catalog, database, name) in [
+        (None, "db", "system.metadata.v"),
+        (None, "db", "system.information_schema.v"),
+        (None, "db", "warehouse.information_schema.v"),
+        (None, "db", "information_schema.v"),
+        (Some("system"), "metadata", "v"),
+        (Some("warehouse"), "information_schema", "v"),
+        (Some("warehouse"), "db", "information_schema.v"),
+        (Some("DEFAULT_CATALOG"), "INFORMATION_SCHEMA", "v"),
+    ] {
+        for sql in [
+            format!("CREATE VIEW {name} AS SELECT 1 AS a"),
+            format!("CREATE VIEW IF NOT EXISTS {name} AS SELECT 1 AS a"),
+            format!("DROP VIEW {name}"),
+            format!("DROP VIEW IF EXISTS {name}"),
+        ] {
+            let statements = novarocks_parser::parse(&sql).unwrap();
+            let [ParsedStatement::View(statement)] = statements.as_slice() else {
+                panic!("view command")
+            };
+            let error =
+                match service.execute_statement(&engine, statement, context(catalog, database)) {
+                    Err(error) => error,
+                    Ok(_) => panic!("virtual view mutation succeeded: {sql}"),
+                };
+            assert_eq!(
+                error.kind(),
+                crate::api::CommandErrorKind::Unsupported,
+                "{sql}"
+            );
+            assert_eq!(*engine.analyzed_count.lock().unwrap(), 0);
+            assert!(engine.created.lock().unwrap().is_empty());
+            assert_eq!(
+                engine.views.lock().unwrap().len(),
+                1,
+                "read-only rejection precedes conditional DROP"
+            );
+        }
+    }
+    assert_eq!(
+        service
+            .catalog_snapshot()
+            .unwrap()
+            .names_in_namespace("default_catalog", "information_schema")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn session_view_ddl_and_show_preserve_registry_behavior() {
     let service = QueryViewService::new();
     let engine = FakeViewEngine {
