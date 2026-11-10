@@ -756,7 +756,14 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             metrics::FrontendHostObservations,
             transport_withdrawal::AttemptEffectEnvelope,
         },
-        task_execution::host::transport::{self, ActorTransportExecutor, AdmissionSource, SendKey},
+        task_execution::{
+            creation::{
+                PricedTaskCreation, creation_owner_header_bytes, tests::original_creation_seed,
+            },
+            host::transport::{
+                self, ActorTransportExecutor, AdmissionSource, FrozenSendRequests, SendKey,
+            },
+        },
     };
     use novarocks_attempt_protocol::{
         effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
@@ -764,12 +771,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         start::PayloadRef,
     };
     use novarocks_coordination_contract::AttemptActionId;
-    use novarocks_execution_contract::{
-        OperationEnvelope, OperationKind, TaskIdentity, TaskOperationId,
-    };
-    use novarocks_types::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
-    };
+    use novarocks_execution_contract::{OperationEnvelope, OperationKind, TaskOperationId};
     use std::{num::NonZeroU64, time::Duration};
 
     let fixture = Fixture::new();
@@ -792,19 +794,23 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         generation: SendGeneration::new(id),
     };
     let payload = PayloadRef(NonZeroU64::MIN);
+    let seed = original_creation_seed();
+    let task = seed.identity();
+    let (quote, original) = PricedTaskCreation::quote(seed, payload).unwrap();
+    let backing_bytes = creation_owner_header_bytes().unwrap() + original.sizing.new_backing_bytes;
     let operation = OperationIntent::CreateTask {
         envelope: OperationEnvelope::with_default_wait(key.operation, OperationKind::CreateTask),
-        identity: TaskIdentity::new(
-            QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
-            StageId::new(1).unwrap(),
-            TaskId::new(1).unwrap(),
-            BackendProcessId::new_v7(),
-        ),
+        identity: task,
         creation: payload,
-        queued_bytes: 8192,
+        queued_bytes: quote.queued_bytes,
+    };
+    let withdrawn = key;
+    let key = SendKey {
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(2).unwrap())),
+        ..key
     };
     let replay = SendKey {
-        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(2).unwrap())),
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(3).unwrap())),
         ..key
     };
     let effect = |send: SendKey, payload| {
@@ -822,6 +828,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     struct Source {
         scope: ScopeHandle,
         admission: Arc<Mutex<AdmissionSource>>,
+        requests: Arc<Mutex<FrozenSendRequests>>,
         completed: Arc<Mutex<VecDeque<InputId>>>,
         retired: Arc<AtomicUsize>,
         closing: bool,
@@ -861,7 +868,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
                         .admission
                         .lock()
                         .unwrap()
-                        .accept(result)
+                        .accept(result, &mut self.requests.lock().unwrap())
                         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
                     self.completed.lock().unwrap().push_back(input);
                 }
@@ -914,9 +921,11 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             }
         }
     }
+    let refused = effect(withdrawn, QueuedInputPayload::NewCreation(payload));
     let inbox = WithdrawalInbox::with_effect(
         &fixture.scope,
         [
+            refused.clone(),
             effect(key, QueuedInputPayload::NewCreation(payload)),
             effect(replay, QueuedInputPayload::AlreadyRetained),
         ],
@@ -952,7 +961,10 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         [VecDeque::from([position]), VecDeque::new()],
     )
     .unwrap_or_else(|_| panic!("original admission payer"));
-    assert!(admission.install_payload(payload, 8192));
+    admission
+        .install_creation(payload, original)
+        .unwrap_or_else(|_| panic!("original creation"));
+    let requests = Arc::new(Mutex::new(FrozenSendRequests::default()));
     let admission = Arc::new(Mutex::new(admission));
     let completed = Arc::new(Mutex::new(VecDeque::new()));
     let retired = Arc::new(AtomicUsize::new(0));
@@ -974,6 +986,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         source: Box::new(Source {
             scope: fixture.scope.clone(),
             admission: admission.clone(),
+            requests: requests.clone(),
             completed: completed.clone(),
             retired: retired.clone(),
             closing: false,
@@ -1001,6 +1014,8 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         .retire_input(inbox.registration.actor(), first_command)
         .unwrap();
     inbox.assert_no_result();
+    assert!(!admission.lock().unwrap().can_release_creation(payload));
+    refused.handoff().unwrap().withdraw();
 
     let drive = |wc: &mut transport::GovernedQueuedInputFixture| {
         wc.progress();
@@ -1019,10 +1034,40 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     })
     .await
     .unwrap();
+    assert!(matches!(
+        inbox.commit(input),
+        ExecutorFact::QueuedInputWithdrawn { operation, generation }
+            if operation == withdrawn.operation && generation == withdrawn.generation
+    ));
+    assert!(admission.lock().unwrap().can_release_creation(payload));
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .creation_for_test(key.operation)
+            .is_none()
+    );
+    let create_command = command();
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let input = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(input) = drive(&mut wc) {
+                break input;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(
         !admission.lock().unwrap().retire_result().unwrap(),
         "uncommitted result still owns its paid role"
     );
+    let frozen = requests
+        .lock()
+        .unwrap()
+        .creation_for_test(key.operation)
+        .expect("the frozen request is installed before Core consumes the grant");
     let ExecutorFact::QueuedInputGranted {
         operation,
         grant,
@@ -1033,8 +1078,12 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     };
     assert_eq!(
         (operation, queued_bytes, grant.generation()),
-        (key.operation, 8192, key.generation)
+        (key.operation, quote.queued_bytes, key.generation)
     );
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), create_command)
+        .unwrap();
     let second_command = command();
     assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
     let input = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1057,7 +1106,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         .retire_input(inbox.registration.actor(), second_command)
         .unwrap();
     assert!(drive(&mut wc).is_none());
-    assert_eq!(retired.load(Ordering::SeqCst), 2);
+    assert_eq!(retired.load(Ordering::SeqCst), 3);
     {
         let mut admission = admission.lock().unwrap();
         assert!(admission.take_grant(grant, replay).is_none());
@@ -1066,10 +1115,32 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         let replay = admission
             .take_grant(second, replay)
             .expect("same replay grant");
-        let pin = admission
-            .take_payload(payload)
-            .expect("only first grant retained original payload");
-        drop((first, replay, pin));
+        assert_eq!(
+            first.retain_payload().unwrap().capacity_bytes().unwrap(),
+            backing_bytes as u64
+        );
+        assert_eq!(
+            replay.retain_payload().unwrap().capacity_bytes().unwrap(),
+            0
+        );
+        drop((first, replay));
+        let seed = admission
+            .take_creation(task, payload)
+            .expect("original source row");
+        assert!(
+            seed.lock().unwrap().is_none(),
+            "the seed was frozen exactly once"
+        );
+        let Some(crate::task_execution::intent::OperationIntent::CreateTask(original)) =
+            requests.lock().unwrap().retire_creation(task, payload)
+        else {
+            panic!("publication installed the frozen request");
+        };
+        assert_eq!(original.envelope().operation_id(), key.operation);
+        assert_eq!(original.plan_carrier_bytes(), quote.plan_carrier_bytes);
+        assert_eq!(original.queued_bytes(), quote.queued_bytes);
+        assert!(original.same_original(&frozen));
+        drop((original, frozen));
     }
     fixture.scope.reap_ready(128).unwrap();
     parent.body_exited().unwrap();

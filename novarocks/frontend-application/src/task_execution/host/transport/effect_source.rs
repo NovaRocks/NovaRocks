@@ -38,7 +38,7 @@ use crate::{
     },
 };
 use novarocks_attempt_protocol::{
-    effect::{EffectBody, OperationIntent, QueuedInputPayload},
+    effect::{EffectBody, OperationIntent},
     failure::HostFailureRef,
     input::SendGeneration,
     start::PayloadRef,
@@ -396,6 +396,11 @@ impl EffectSource for AttemptTransportSource {
                     return Some(result);
                 }
                 EffectBody::SendBatch { .. } => return self.prepare_send(original),
+                EffectBody::ReleaseCreationPayload { payload, .. }
+                    if !self.admission.can_release_creation(payload) =>
+                {
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -442,11 +447,12 @@ impl EffectSource for AttemptTransportSource {
                             }
                         }
                         EffectBody::ReleaseCreationPayload { task, payload } => {
-                            if let Some(original) = self.requests.retire_creation(task, payload) {
+                            if let Some(seed) = self.admission.take_creation(task, payload) {
+                                let original = self.requests.retire_creation(task, payload);
                                 self.other.retain_transport_release(Box::new((
                                     effect.protocol.id,
                                     original,
-                                    self.admission.take_payload(payload),
+                                    seed,
                                 )));
                             }
                         }
@@ -522,40 +528,8 @@ impl EffectSource for AttemptTransportSource {
                             }));
                     }
                 } else {
-                    let creation = match (&result.outcome, &result.effect.protocol.body) {
-                        (
-                            Some(BodyOutcome::InputAdmitted(_)),
-                            EffectBody::AdmitQueuedInput {
-                                operation:
-                                    OperationIntent::CreateTask {
-                                        envelope,
-                                        identity,
-                                        creation,
-                                        ..
-                                    },
-                                payload: QueuedInputPayload::NewCreation(payload),
-                                ..
-                            },
-                        ) if creation == payload => {
-                            Some((envelope.operation_id(), *identity, *payload))
-                        }
-                        _ => None,
-                    };
-                    match self.admission.accept(result) {
-                        Err(refused) => self.other.retain_transport_failure(Box::new(refused)),
-                        Ok(_) => {
-                            if let Some((operation, task, payload)) = creation {
-                                let pin = self
-                                    .admission
-                                    .clone_payload_pin(payload)
-                                    .expect("published creation keeps its original payload");
-                                self.requests
-                                    .bind_creation(operation, task, payload, pin)
-                                    .unwrap_or_else(|original| {
-                                        std::panic::resume_unwind(Box::new(original))
-                                    });
-                            }
-                        }
+                    if let Err(refused) = self.admission.accept(result, &mut self.requests) {
+                        self.other.retain_transport_failure(Box::new(refused));
                     }
                 }
             }

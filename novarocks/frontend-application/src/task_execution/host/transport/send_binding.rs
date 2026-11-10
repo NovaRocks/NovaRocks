@@ -18,11 +18,13 @@
 use super::{GrantedInputs, QueueCustody, QueueWindow, SendInputLoan, SendKey};
 use crate::{
     control_runtime::transport_withdrawal::AttemptEffectEnvelope,
-    task_execution::{host::custody::TransportJoinRegistration, intent::OperationIntent},
+    task_execution::{
+        creation::CreateTaskIntent, host::custody::TransportJoinRegistration,
+        intent::OperationIntent,
+    },
 };
 use novarocks_attempt_protocol::{effect::EffectBody, start::PayloadRef};
 use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
-use novarocks_resource_contract::ExistingOwnerRetentionPin;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -50,25 +52,33 @@ impl FrozenSendRequests {
         self.originals
     }
 
-    pub(super) fn bind_creation(
-        &mut self,
-        operation: TaskOperationId,
-        task: TaskIdentity,
-        payload: PayloadRef,
-        pin: ExistingOwnerRetentionPin,
-    ) -> Result<(), ExistingOwnerRetentionPin> {
-        let Some(OperationIntent::CreateTask(original)) = self.originals.get_mut(&operation) else {
-            return Err(pin);
-        };
-        if original.identity() != task || self.creation_payloads.contains_key(&payload) {
-            return Err(pin);
+    #[cfg(test)]
+    pub(crate) fn creation_for_test(&self, operation: TaskOperationId) -> Option<CreateTaskIntent> {
+        match self.originals.get(&operation)? {
+            OperationIntent::CreateTask(original) => Some(original.clone()),
+            _ => None,
         }
-        original.bind_admitted_payload(pin)?;
-        self.creation_payloads.insert(payload, operation);
-        Ok(())
     }
 
-    pub(super) fn retire_creation(
+    pub(super) fn install_creation(
+        &mut self,
+        payload: PayloadRef,
+        operation: TaskOperationId,
+        creation: &mut Option<CreateTaskIntent>,
+    ) -> bool {
+        if self.originals.contains_key(&operation) || self.creation_payloads.contains_key(&payload)
+        {
+            return false;
+        }
+        let original = creation.take().expect("original admitted creation");
+        assert_eq!(original.envelope().operation_id(), operation);
+        self.originals
+            .insert(operation, OperationIntent::CreateTask(original));
+        self.creation_payloads.insert(payload, operation);
+        true
+    }
+
+    pub(crate) fn retire_creation(
         &mut self,
         task: TaskIdentity,
         payload: PayloadRef,

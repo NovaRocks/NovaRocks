@@ -1173,7 +1173,7 @@ pub(crate) use physical_return::{PhysicalInputRetirementObligation, PhysicalRetu
 mod encoding;
 pub(crate) use encoding::{EncodingBinding, EncodingJob, owned_layouts as encoding_owned_layouts};
 mod actor_result;
-pub(crate) use actor_result::{AdmissionPublicationError, ReturnedActorTransportResult};
+pub(crate) use actor_result::ReturnedActorTransportResult;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -19,13 +19,17 @@
 //! alternate protocol owners, result stores, Work factories or quota wallets.
 
 use super::queue_input::OriginalQueuedInput;
+use crate::task_execution::{creation::CreateTaskIntent, error::TaskExecutionError};
 use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
 
 pub(crate) enum BodyOutcome {
     /// The same real WC grant moves to its original Join owner.
-    InputAdmitted(OriginalQueuedInput),
+    InputAdmitted {
+        creation: Option<CreateTaskIntent>,
+        input: OriginalQueuedInput,
+    },
     /// Individual original ACK cells contain every exact operation result.
     ReceiptsRecorded,
     /// GatedWork destroyed pre-handoff, captures and unused original authority.
@@ -33,6 +37,7 @@ pub(crate) enum BodyOutcome {
     /// Original first-party cause; the Source pins this same cause through its
     /// final logical/error consumer, independently of Core input consumption.
     LocalFailure(WorkError),
+    CreationFailed(TaskExecutionError),
     RawFailure(Box<dyn Any + Send>),
 }
 

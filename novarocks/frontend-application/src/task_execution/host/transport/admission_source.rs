@@ -17,9 +17,11 @@
 
 //! Attempt-owned queued input preparation, publication and paid result roles.
 
+use super::queued_job::{CreationAdmission, CreationSeed};
 use super::{
-    ActorTransportWork, BodyOutcome, BoundQueue, GrantedInputs, OriginalQueuedInput, SendKey,
-    SourceLayouts, actor_transport_layouts, prepare_actor_transport, queued_input_quote,
+    ActorTransportWork, BodyOutcome, BoundQueue, FrozenSendRequests, GrantedInputs,
+    OriginalQueuedInput, SendKey, SourceLayouts, actor_transport_layouts, prepare_actor_transport,
+    queued_input_quote,
 };
 use crate::{
     control_runtime::{
@@ -27,10 +29,14 @@ use crate::{
         host::PreparedEffectJob,
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::{error::TaskExecutionError, host::custody::ReturnedActorTransportResult},
+    task_execution::{
+        creation::{PricedTaskCreation, creation_owner_header_bytes},
+        error::TaskExecutionError,
+        host::custody::ReturnedActorTransportResult,
+    },
 };
 use novarocks_attempt_protocol::{
-    effect::{EffectBody, QueuedInputPayload},
+    effect::{EffectBody, OperationIntent, QueuedInputPayload},
     failure::{
         AttemptFailure, AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure,
     },
@@ -55,12 +61,13 @@ use novarocks_control_runtime_core::{
     scope::{ScopeError, WorkKind},
 };
 use novarocks_coordination_contract::AttemptActionId;
-use novarocks_resource_contract::ExistingOwnerRetentionPin;
-use novarocks_workload_control::{WorkError, joint_admission::NativeAsyncActionAuthority};
+use novarocks_execution_contract::TaskIdentity;
+use novarocks_resource_contract::{ExistingOwnerRetentionPin, RetentionPinError};
+use novarocks_workload_control::joint_admission::NativeAsyncActionAuthority;
 use std::{
     collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 type Position = CausalInputObligation<FrontendActor>;
@@ -69,6 +76,8 @@ struct PayloadCharge {
     backing_bytes: usize,
     pin: Option<ExistingOwnerRetentionPin>,
     claimed: Option<AttemptActionId>,
+    creation: Option<(TaskIdentity, CreationSeed)>,
+    price_reported: bool,
 }
 
 struct AdmissionHeader {
@@ -94,7 +103,9 @@ pub(crate) enum AdmissionResultError {
     WrongEffect,
     MissingOutcome,
     MissingPayload,
-    Publication(crate::task_execution::host::custody::AdmissionPublicationError),
+    DuplicateGrant,
+    DuplicateCreation,
+    PayloadRetention(RetentionPinError),
     Fill(CausalFillFailure<FrontendInput>),
 }
 
@@ -113,7 +124,7 @@ pub(crate) struct AdmissionSource {
     headers: BTreeMap<AttemptActionId, AdmissionHeader>,
     payloads: BTreeMap<PayloadRef, PayloadCharge>,
     grants: GrantedInputs,
-    failures: BTreeMap<HostFailureRef, WorkError>,
+    failures: BTreeMap<HostFailureRef, TaskExecutionError>,
 }
 
 impl AdmissionSource {
@@ -157,26 +168,51 @@ impl AdmissionSource {
             backing_bytes,
             pin: None,
             claimed: None,
+            creation: None,
+            price_reported: false,
         });
         true
     }
 
-    pub(crate) fn take_payload(
+    pub(crate) fn install_creation(
         &mut self,
         payload: PayloadRef,
-    ) -> Option<ExistingOwnerRetentionPin> {
-        self.payloads.remove(&payload)?.pin
+        original: PricedTaskCreation,
+    ) -> Result<(), PricedTaskCreation> {
+        let Some(backing_bytes) = creation_owner_header_bytes()
+            .ok()
+            .and_then(|headers| headers.checked_add(original.sizing.new_backing_bytes))
+        else {
+            return Err(original);
+        };
+        if !self.install_payload(payload, backing_bytes) {
+            return Err(original);
+        }
+        let task = original.seed.identity();
+        self.payloads.get_mut(&payload).unwrap().creation =
+            Some((task, Arc::new(Mutex::new(Some(original)))));
+        Ok(())
     }
 
-    pub(super) fn clone_payload_pin(
-        &self,
-        payload: PayloadRef,
-    ) -> Option<ExistingOwnerRetentionPin> {
+    pub(crate) fn can_release_creation(&self, payload: PayloadRef) -> bool {
         self.payloads
-            .get(&payload)?
-            .pin
-            .as_ref()
-            .map(|pin| pin.try_clone().expect("same original admitted payload"))
+            .get(&payload)
+            .is_none_or(|row| row.claimed.is_none())
+    }
+
+    pub(crate) fn take_creation(
+        &mut self,
+        task: TaskIdentity,
+        payload: PayloadRef,
+    ) -> Option<CreationSeed> {
+        let row = self.payloads.get(&payload)?;
+        let (original_task, _) = row.creation.as_ref()?;
+        assert_eq!(*original_task, task);
+        assert!(row.claimed.is_none());
+        self.payloads
+            .remove(&payload)?
+            .creation
+            .map(|(_, seed)| seed)
     }
 
     pub(crate) fn take_grant(
@@ -220,7 +256,7 @@ impl AdmissionSource {
         batch.bind(&mut self.grants, window, registration)
     }
 
-    pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<WorkError> {
+    pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<TaskExecutionError> {
         self.failures.remove(&failure)
     }
 
@@ -255,18 +291,37 @@ impl AdmissionSource {
         if self.idle[lane].is_empty() {
             return Ok(None);
         }
-        let payload_ref = Self::payload_ref(*payload);
-        let payload_bytes = payload_ref.map_or(0, |payload| {
-            let original = self
-                .payloads
-                .get(&payload)
-                .expect("original frozen payload was installed");
+        let withdrawn = effect.handoff().unwrap().state() == HandoffState::Withdrawn;
+        let payload_ref = (!withdrawn).then(|| Self::payload_ref(*payload)).flatten();
+        let mut creation = None;
+        let mut payload_bytes = 0;
+        if let Some(payload_ref) = payload_ref {
+            let Some(original) = self.payloads.get(&payload_ref) else {
+                // Cleanup can overtake an unclaimed Create admission. The
+                // same host will rescan when its Withdraw is processed.
+                assert!(matches!(payload, QueuedInputPayload::NewCreation(_)));
+                return Ok(None);
+            };
             assert!(
                 original.pin.is_none() && original.claimed.is_none(),
                 "one original physical generation may price new payload backing"
             );
-            original.backing_bytes
-        });
+            if let OperationIntent::CreateTask {
+                envelope,
+                identity,
+                creation: reference,
+                ..
+            } = operation
+            {
+                let (task, seed) = original.creation.as_ref().expect("original creation seed");
+                assert_eq!((*identity, *reference), (*task, payload_ref));
+                creation = Some(CreationAdmission {
+                    envelope: *envelope,
+                    seed: seed.clone(),
+                });
+            }
+            payload_bytes = original.backing_bytes;
+        }
         let [effect_layout, gate, bound, result, retirement, queue] =
             actor_transport_layouts(false).expect("original admission layout");
         let custody = crate::task_execution::host::custody::storage_layouts()
@@ -340,7 +395,7 @@ impl AdmissionSource {
             control,
             quote,
             authority: self.authority.clone(),
-            original_captures: Box::new(()),
+            creation,
         };
         self.pending = Some(Pending {
             effect: effect.clone(),
@@ -349,7 +404,12 @@ impl AdmissionSource {
             bound,
         });
         if let Some(payload) = payload_ref {
-            self.payloads.get_mut(&payload).unwrap().claimed = Some(effect.protocol.id);
+            let original = self.payloads.get_mut(&payload).unwrap();
+            original.claimed = Some(effect.protocol.id);
+            if original.creation.is_some() && !original.price_reported {
+                crate::metrics::task_creation::create_priced();
+                original.price_reported = true;
+            }
         }
         Ok(self.idle[lane].pop_front())
     }
@@ -406,6 +466,7 @@ impl AdmissionSource {
     pub(crate) fn accept(
         &mut self,
         mut result: ReturnedActorTransportResult,
+        requests: &mut FrozenSendRequests,
     ) -> Result<InputId, AdmissionResultRefusal> {
         if !self
             .headers
@@ -420,7 +481,6 @@ impl AdmissionSource {
         let EffectBody::AdmitQueuedInput {
             operation,
             generation,
-            payload,
             ..
         } = &result.effect.protocol.body
         else {
@@ -430,52 +490,41 @@ impl AdmissionSource {
             });
         };
         let lane = usize::from(operation.requires_control_progress());
+        let operation = operation.operation_id();
+        let generation = *generation;
         let publication = match result.outcome.as_ref() {
-            Some(BodyOutcome::InputAdmitted(_)) => {
-                let original = match Self::payload_ref(*payload) {
-                    Some(payload) => {
-                        let Some(original) = self.payloads.get_mut(&payload) else {
-                            return Err(AdmissionResultRefusal {
-                                result,
-                                cause: AdmissionResultError::MissingPayload,
-                            });
-                        };
-                        Some(&mut original.pin)
-                    }
-                    None => None,
-                };
-                match result.publish_admission(&mut self.grants, original) {
-                    Ok(Some(published)) => published.delivery,
-                    Ok(None) => unreachable!("same original admitted result"),
-                    Err(cause) => {
-                        return Err(AdmissionResultRefusal {
-                            result,
-                            cause: AdmissionResultError::Publication(cause),
-                        });
-                    }
+            Some(BodyOutcome::InputAdmitted { .. }) => {
+                match self.publish_grant(&mut result, requests) {
+                    Ok(published) => published,
+                    Err(cause) => return Err(AdmissionResultRefusal { result, cause }),
                 }
             }
             Some(BodyOutcome::Unused(_)) => result
                 .withdrawal
                 .take()
                 .expect("original withdrawal delivery"),
-            Some(BodyOutcome::LocalFailure(error)) => {
+            Some(BodyOutcome::LocalFailure(_) | BodyOutcome::CreationFailed(_)) => {
+                let (error, kind) = match result.outcome.take().unwrap() {
+                    BodyOutcome::LocalFailure(error) => (
+                        TaskExecutionError::Workload(error),
+                        HostFailureKind::Workload,
+                    ),
+                    BodyOutcome::CreationFailed(error) => (error, HostFailureKind::Execution),
+                    _ => unreachable!(),
+                };
                 let original =
                     HostFailureRef(NonZeroU64::new(result.effect.protocol.id.get()).unwrap());
-                let input = TaskExecutionError::Workload(error.clone()).preparation_input();
+                let input = error.preparation_input();
                 let failure = AttemptFailure::Host(HostProjectedFailure {
                     original,
-                    kind: HostFailureKind::Workload,
+                    kind,
                     class: input.attempt_class(),
                     site: AttemptFailureSite::Attempt,
                 });
                 let fact = ExecutorFact::QueuedInputFailed {
-                    operation: operation.operation_id(),
-                    generation: *generation,
+                    operation,
+                    generation,
                     failure,
-                };
-                let Some(BodyOutcome::LocalFailure(error)) = result.outcome.take() else {
-                    unreachable!()
                 };
                 assert!(self.failures.insert(original, error).is_none());
                 result
@@ -507,14 +556,96 @@ impl AdmissionSource {
         Ok(input)
     }
 
+    fn publish_grant(
+        &mut self,
+        result: &mut ReturnedActorTransportResult,
+        requests: &mut FrozenSendRequests,
+    ) -> Result<Result<InputId, CausalFillFailure<FrontendInput>>, AdmissionResultError> {
+        let EffectBody::AdmitQueuedInput {
+            operation,
+            generation,
+            payload,
+            ..
+        } = &result.effect.protocol.body
+        else {
+            unreachable!("same original admission effect");
+        };
+        let Some(BodyOutcome::InputAdmitted { creation, input }) = result.outcome.as_mut() else {
+            unreachable!("same original admission outcome");
+        };
+        let key = SendKey {
+            operation: operation.operation_id(),
+            generation: *generation,
+        };
+        if input.key() != key || generation.admission_effect() != result.effect.protocol.id {
+            return Err(AdmissionResultError::WrongEffect);
+        }
+        let grant = QueuedInputGrantRef::new(
+            NonZeroU64::new(result.effect.protocol.id.get()).unwrap(),
+            *generation,
+        );
+        if self.grants.contains(grant) {
+            return Err(AdmissionResultError::DuplicateGrant);
+        }
+        match *payload {
+            QueuedInputPayload::NewCreation(reference) => {
+                let Some(original) = creation.as_ref() else {
+                    return Err(AdmissionResultError::MissingPayload);
+                };
+                if !matches!(operation, OperationIntent::CreateTask { envelope, identity, creation, .. }
+                    if *envelope == original.envelope() && *identity == original.identity()
+                        && *creation == reference && operation.queued_bytes() == original.queued_bytes())
+                {
+                    return Err(AdmissionResultError::WrongEffect);
+                }
+                if !requests.install_creation(reference, key.operation, creation) {
+                    return Err(AdmissionResultError::DuplicateCreation);
+                }
+            }
+            QueuedInputPayload::NewTaskUpdate(reference) => {
+                let row = self
+                    .payloads
+                    .get_mut(&reference)
+                    .filter(|row| row.pin.is_none())
+                    .ok_or(AdmissionResultError::MissingPayload)?;
+                row.pin = Some(
+                    input
+                        .retain_payload()
+                        .map_err(AdmissionResultError::PayloadRetention)?,
+                );
+            }
+            QueuedInputPayload::AlreadyRetained => {}
+        }
+        let Some(BodyOutcome::InputAdmitted {
+            input,
+            creation: None,
+        }) = result.outcome.take()
+        else {
+            unreachable!("same original grant after transferring its payload");
+        };
+        self.grants.install(grant, input);
+        let event = FrontendInput::Attempt(Box::new(AttemptInput::Executor(
+            ExecutorFact::QueuedInputGranted {
+                operation: key.operation,
+                grant,
+                queued_bytes: operation.queued_bytes(),
+            },
+        )));
+        Ok(result
+            .original
+            .fill_with_receipt(None, event)
+            .map(|(_, input)| input))
+    }
+
     fn return_payload_claim(&mut self, effect: &AttemptEffectEnvelope) {
         let EffectBody::AdmitQueuedInput { payload, .. } = effect.protocol.body else {
             unreachable!("same queued input effect");
         };
         if let Some(payload) = Self::payload_ref(payload)
             && let Some(original) = self.payloads.get_mut(&payload)
+            && original.claimed == Some(effect.protocol.id)
         {
-            assert_eq!(original.claimed.take(), Some(effect.protocol.id));
+            original.claimed = None;
         }
     }
 

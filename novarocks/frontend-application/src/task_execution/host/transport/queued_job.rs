@@ -20,12 +20,21 @@ use super::{
     queue_input::{AdmitQueuedInput, OriginalQueuedInput, SendKey},
     source_ports::{BodyOutcome, TransportLeg},
 };
+use crate::task_execution::creation::{CreateTaskIntent, PricedTaskCreation};
 use novarocks_control_runtime::exit_work::{GatedOutcome, GatedWork};
 use novarocks_control_runtime_core::identity::Generation;
+use novarocks_execution_contract::OperationEnvelope;
 use novarocks_workload_control::joint_admission::{
     NativeAsyncActionAuthority, NativeQueuedInputQuote,
 };
-use std::any::Any;
+use std::sync::{Arc, Mutex};
+
+pub(super) type CreationSeed = Arc<Mutex<Option<PricedTaskCreation>>>;
+
+pub(super) struct CreationAdmission {
+    pub(super) envelope: OperationEnvelope,
+    pub(super) seed: CreationSeed,
+}
 /// The same Source prepaid its canonical input/result cells before publishing
 /// a passive request. The neutral kernel issues no author from identities.
 pub(crate) struct BoundQueue {
@@ -34,7 +43,7 @@ pub(crate) struct BoundQueue {
     pub(crate) control: bool,
     pub(crate) quote: NativeQueuedInputQuote,
     pub(crate) authority: NativeAsyncActionAuthority,
-    pub(crate) original_captures: Box<dyn Any + Send>,
+    pub(super) creation: Option<CreationAdmission>,
 }
 pub(crate) struct QueueJob {
     pub(crate) leg: TransportLeg,
@@ -51,13 +60,13 @@ pub(crate) fn future_layout() -> std::alloc::Layout {
 pub(crate) fn owned_preparation_layouts() -> [std::alloc::Layout; 5] {
     fn of<P, F>(
         _: fn(SendKey, NativeAsyncActionAuthority, bool, NativeQueuedInputQuote) -> P,
-        body: fn(Box<dyn Any + Send>, P::Output) -> F,
+        body: fn(Option<CreationAdmission>, P::Output) -> F,
     ) -> [std::alloc::Layout; 4]
     where
         P: std::future::Future,
         F: std::future::Future,
     {
-        GatedWork::<Box<dyn Any + Send>>::backing_layouts::<P, F>(body)
+        GatedWork::<Option<CreationAdmission>>::backing_layouts::<P, F>(body)
     }
     let gated = of(prepare_input, return_input);
     [
@@ -93,15 +102,14 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
         control,
         quote,
         authority,
-        original_captures,
+        creation,
     } = *bound;
     let pre = prepare_input(key, authority, control, quote);
     let body: fn(
-        Box<dyn Any + Send>,
+        Option<CreationAdmission>,
         Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
     ) -> _ = return_input;
-    let running =
-        GatedWork::new(exit, original_captures, handoff, panic).run(scope_generation, pre, body);
+    let running = GatedWork::new(exit, creation, handoff, panic).run(scope_generation, pre, body);
     async move {
         let outcome = match running.await {
             Ok(GatedOutcome::Completed(outcome)) => outcome,
@@ -113,11 +121,31 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
 }
 
 async fn return_input(
-    _captures: Box<dyn Any + Send>,
+    creation: Option<CreationAdmission>,
     prepared: Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
 ) -> BodyOutcome {
-    match prepared {
-        Ok(input) => BodyOutcome::InputAdmitted(input),
-        Err(error) => BodyOutcome::LocalFailure(error),
-    }
+    let input = match prepared {
+        Ok(input) => input,
+        Err(error) => return BodyOutcome::LocalFailure(error),
+    };
+    let creation = if let Some(CreationAdmission { envelope, seed }) = creation {
+        let pin = match input.retain_payload() {
+            Ok(pin) => pin,
+            Err(error) => return BodyOutcome::RawFailure(Box::new((error, input))),
+        };
+        let original = seed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("same first creation seed");
+        let identity = original.seed.identity();
+        let parts = match original.seed.freeze(original.sizing.lengths) {
+            Ok(parts) => parts,
+            Err(error) => return BodyOutcome::CreationFailed(error),
+        };
+        Some(CreateTaskIntent::new(envelope, identity, parts, Some(pin)))
+    } else {
+        None
+    };
+    BodyOutcome::InputAdmitted { creation, input }
 }
