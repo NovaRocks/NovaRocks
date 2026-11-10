@@ -49,7 +49,10 @@ pub(crate) mod metrics;
 use crate::native::{
     data_runtime::FrontendDataRuntime, transport_capacity::NativeTransportCapacity,
 };
-use crate::task_execution::bridge::terminal::{RegisteredAttemptTerminal, TerminalOutbox};
+use crate::task_execution::bridge::{
+    control::AttemptOwnerControls,
+    terminal::{RegisteredAttemptTerminal, TerminalOutbox},
+};
 use crate::task_execution::host::adapter::{
     AttemptActorRegistration, AttemptRegistrationError, AttemptStartup, PreparedAttemptHost,
 };
@@ -128,10 +131,15 @@ impl FrontendControlRuntime {
         &self,
         prepared: PreparedAttemptHost,
     ) -> Result<
-        (AttemptStartup, RegisteredAttemptTerminal),
+        (
+            AttemptStartup,
+            AttemptOwnerControls,
+            RegisteredAttemptTerminal,
+        ),
         (
             HostRegistrationRefusal,
             AttemptStartup,
+            AttemptOwnerControls,
             PendingFailureBridge,
             Arc<TerminalOutbox>,
         ),
@@ -139,18 +147,20 @@ impl FrontendControlRuntime {
         let PreparedAttemptHost {
             binding,
             startup,
+            controls,
             failure,
             terminal,
         } = prepared;
         match self.register(binding) {
             Ok(exit) => Ok((
                 startup,
+                controls,
                 RegisteredAttemptTerminal::new(
                     terminal,
                     failure.bind(exit, self.backend_processes.clone()),
                 ),
             )),
-            Err(refusal) => Err((refusal, startup, failure, terminal)),
+            Err(refusal) => Err((refusal, startup, controls, failure, terminal)),
         }
     }
 

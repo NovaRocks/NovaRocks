@@ -158,6 +158,37 @@ impl FailureBridge {
         ))
     }
 
+    pub(crate) fn request_host_close(
+        &self,
+    ) -> Result<(), novarocks_control_runtime::actor_turn::ActorTurnError> {
+        self.exit.request_close()
+    }
+
+    /// A late original Core loss still owns residual convergence, even if
+    /// the normal protocol reports were already delivered.
+    pub(crate) async fn normal_host_exit(&mut self) -> Result<bool, StatementNativeHealthFailure> {
+        if self.loss.is_some() {
+            return Ok(false);
+        }
+        if let Some(original) = &self.failure {
+            return Err(original.clone());
+        }
+        let exited = tokio::select! {
+            biased;
+            lost = self.publications.take_lost() => {
+                self.loss = Some(lost);
+                return Ok(false);
+            }
+            exited = self.exit.wait() => exited,
+        };
+        if let Err(error) = exited {
+            return Err(
+                self.retain_failure("Native normal host exit was not observed", Arc::new(error))
+            );
+        }
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn original_loss(&self) -> &AttemptToLogical<AttemptFailure> {
         self.loss.as_ref().expect("original terminal observed")

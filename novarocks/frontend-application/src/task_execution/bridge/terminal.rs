@@ -24,13 +24,15 @@ use novarocks_attempt_protocol::{
     operation::OperationDispatchResult,
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptConvergenceClosure, AttemptTerminal,
-    AttemptToLogical, AttemptToLogicalBody,
+    AttemptActionId, AttemptActivationIdentity, AttemptConvergenceClosure,
+    AttemptParticipationConvergence, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::{
     api::{
-        NativeAttemptPreparationFailure, NativeAttemptTerminal, PreReadyProcessReplacementWitness,
+        NativeActiveConvergenceClosure, NativeAttemptConvergence, NativeAttemptPreparationFailure,
+        NativeAttemptTerminal, NativeParticipationConvergence, PreReadyProcessReplacementWitness,
+        StatementNativeHealthFailure,
     },
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
@@ -121,12 +123,15 @@ impl ConvergenceOutbox {
         Ok(())
     }
 
+    fn report(&self) -> Option<&Arc<AttemptConvergenceClosure>> {
+        self.local.get()?;
+        self.remote.get()
+    }
+
     /// The Core cut is separate from removal of the actual Host registration.
     async fn wait(&self) -> Arc<AttemptConvergenceClosure> {
         loop {
-            if self.local.get().is_some()
-                && let Some(closure) = self.remote.get()
-            {
+            if let Some(closure) = self.report() {
                 return Arc::clone(closure);
             }
             self.ready.notified().await;
@@ -239,12 +244,84 @@ impl RegisteredAttemptTerminal {
         terminal
     }
 
-    pub(crate) async fn normal_convergence(&self) -> Arc<AttemptConvergenceClosure> {
-        self.normal.normal_convergence().await
+    /// Wait for both protocol reports, or yield to the original loss path.
+    /// This observation still leaves the caller-held positions live.
+    pub(crate) async fn normal_convergence_ready(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.failure.terminal() => false,
+            _ = self.normal.normal_convergence() => true,
+        }
+    }
+
+    /// The application returns the original caller-held positions before
+    /// asking this exact host to finish its Source and Scope retirement.
+    pub(crate) fn request_host_close(
+        &self,
+    ) -> Result<(), novarocks_control_runtime::actor_turn::ActorTurnError> {
+        self.failure.request_host_close()
+    }
+
+    /// Use the failure bridge's residual path when the original Core loses
+    /// ownership before the actual host exits.
+    pub(crate) async fn normal_closure_after_exit(
+        &mut self,
+    ) -> Result<Option<NativeActiveConvergenceClosure>, StatementNativeHealthFailure> {
+        if !self.failure.normal_host_exit().await? {
+            return Ok(None);
+        }
+        let remote = self.normal.convergence.report().ok_or_else(|| {
+            StatementNativeHealthFailure::actual_exit_unproven(
+                "Native host exited without its original normal convergence reports",
+                Arc::new(MissingNormalConvergence),
+            )
+        })?;
+        Ok(Some(project_convergence(remote)))
     }
 
     pub(crate) fn failure_bridge_mut(&mut self) -> &mut FailureBridge {
         &mut self.failure
+    }
+}
+
+#[derive(Debug)]
+struct MissingNormalConvergence;
+
+impl std::fmt::Display for MissingNormalConvergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("missing normal convergence reports at actual Host exit")
+    }
+}
+
+impl std::error::Error for MissingNormalConvergence {}
+
+fn project_convergence(original: &AttemptConvergenceClosure) -> NativeActiveConvergenceClosure {
+    use AttemptParticipationConvergence as Fact;
+    match original {
+        AttemptConvergenceClosure::Evidence(rows) => {
+            NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::participations(
+                rows.iter()
+                    .map(|&(participation, fact)| match fact {
+                        Fact::NeverEstablished => {
+                            NativeParticipationConvergence::never_established(participation)
+                        }
+                        Fact::WorkerStoppedAndParticipationFenced => {
+                            NativeParticipationConvergence::worker_stopped_and_participation_fenced(
+                                participation,
+                            )
+                        }
+                        Fact::WorkerProcessReplaced => {
+                            NativeParticipationConvergence::worker_process_replaced(participation)
+                        }
+                    })
+                    .collect::<Box<[_]>>(),
+            ))
+        }
+        AttemptConvergenceClosure::RemoteTrackingEnded {
+            exact_participations,
+        } => NativeActiveConvergenceClosure::RemoteTrackingEnded {
+            exact_participations: exact_participations.as_ref().into(),
+        },
     }
 }
 

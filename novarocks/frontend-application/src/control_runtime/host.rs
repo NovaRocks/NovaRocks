@@ -47,7 +47,7 @@ use std::{
     any::Any,
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -271,14 +271,43 @@ struct HostEntry {
     machine: Mutex<Option<HostMachine>>,
 }
 
+impl HostEntry {
+    fn request_close(&self, runtime: &ActorRuntime<FrontendActor>) -> Result<(), ActorTurnError> {
+        self.close_requested.store(true, Ordering::Release);
+        match runtime.notify_host_actor(&self.registration) {
+            // The matching registration can disappear between the close mark
+            // and the wake. Only the exit receipt proves actual removal.
+            Ok(())
+            | Err(ActorTurnError::UnknownActor | ActorTurnError::EffectTicketOriginMismatch) => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Observation of one installed host's actual Actor and Scope removal.
 pub(crate) struct HostExit {
     registration: ActorRegistration,
+    runtime: ActorRuntime<FrontendActor>,
+    original: Weak<HostEntry>,
     exited: watch::Receiver<bool>,
 }
 impl HostExit {
     pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
         self.registration.same_registration(registration)
+    }
+
+    /// Request closure of this attempt alone. The borrowed wait below
+    /// remains the only proof that the original actor and Scope are gone.
+    pub(crate) fn request_close(&self) -> Result<(), ActorTurnError> {
+        if let Some(original) = self.original.upgrade() {
+            original.request_close(&self.runtime)
+        } else if *self.exited.borrow() {
+            Ok(())
+        } else {
+            Err(ActorTurnError::Closed)
+        }
     }
 
     pub(crate) async fn wait(&mut self) -> Result<(), watch::error::RecvError> {
@@ -412,34 +441,34 @@ impl HostRegistry {
             binding.policy,
         );
         let (exit, exited) = watch::channel(false);
+        let original = Arc::new(HostEntry {
+            scope: binding.scope,
+            registration: binding.registration,
+            kind: binding.kind,
+            budget,
+            close_requested: AtomicBool::new(false),
+            exit,
+            machine: Mutex::new(Some(HostMachine {
+                withdrawals: Arc::default(),
+                dispatch,
+                policy: binding.policy,
+                source: binding.source,
+                executor: binding.executor,
+                transport: binding.transport,
+                scan_remaining: None,
+                rescan_requested: false,
+                pending: None,
+                failure_handed_off: false,
+                external_closed: false,
+            })),
+        });
         let observed = HostExit {
-            registration: binding.registration.clone(),
+            registration: original.registration.clone(),
+            runtime: self.runtime.clone(),
+            original: Arc::downgrade(&original),
             exited,
         };
-        state.entries.insert(
-            binding.scope.id(),
-            Arc::new(HostEntry {
-                scope: binding.scope,
-                registration: binding.registration,
-                kind: binding.kind,
-                budget,
-                close_requested: AtomicBool::new(false),
-                exit,
-                machine: Mutex::new(Some(HostMachine {
-                    withdrawals: Arc::default(),
-                    dispatch,
-                    policy: binding.policy,
-                    source: binding.source,
-                    executor: binding.executor,
-                    transport: binding.transport,
-                    scan_remaining: None,
-                    rescan_requested: false,
-                    pending: None,
-                    failure_handed_off: false,
-                    external_closed: false,
-                })),
-            }),
-        );
+        state.entries.insert(original.scope.id(), original);
         drop(state);
         self.changed.notify_waiters();
         Ok(observed)
@@ -522,9 +551,8 @@ impl HostRegistry {
             state.entries.values().cloned().collect::<Vec<_>>()
         };
         for entry in entries {
-            entry.close_requested.store(true, Ordering::Release);
-            self.runtime
-                .notify_host_actor(&entry.registration)
+            entry
+                .request_close(&self.runtime)
                 .expect("actual closing actor registration");
         }
         self.changed.notify_waiters();

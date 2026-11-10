@@ -772,10 +772,16 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::{
             actor_gate::tests::logical_execution,
-            bridge::{qa::AttemptQaBridge, terminal::TerminalOutbox},
+            bridge::{
+                qa::AttemptQaBridge,
+                terminal::{RegisteredAttemptTerminal, TerminalOutbox},
+            },
             host::transport::{
                 ActorTransportExecutor, AttemptCallOwner, AttemptCallSource,
                 AttemptEstablishMaterial, AttemptProcessObserver,
+            },
+            host::{
+                failure_bridge::PendingFailureBridge, failure_publication::FailurePublications,
             },
             sources::AttemptEstablishFacts,
         },
@@ -900,6 +906,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
 
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+        NativeActiveConvergenceClosure, NativeAttemptConvergence, NativeParticipationConvergence,
     };
 
     struct FrozenProcess {
@@ -1141,6 +1148,15 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     source.lock().unwrap().install_terminal(terminal.clone());
     let endpoint = RuntimeEndpoint::new("127.0.0.1", 1701).unwrap();
     let replacement = BackendProcessId::new_v7();
+    let processes = Arc::new(FrozenProcess {
+        original: participation,
+        endpoint: endpoint.clone(),
+        replacement,
+    });
+    let members: Arc<[FrozenMember]> = Arc::from([FrozenMember {
+        participation,
+        endpoint,
+    }]);
     let process_source = ActorId::new(3).unwrap();
     let process = Arc::new(Mutex::new(AttemptCallSource::new(
         &parent,
@@ -1148,15 +1164,8 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         generation,
         observer(),
         AttemptCallOwner::Process(Arc::new(AttemptProcessObserver::new(
-            Arc::new(FrozenProcess {
-                original: participation,
-                endpoint: endpoint.clone(),
-                replacement,
-            }),
-            Arc::from([FrozenMember {
-                participation,
-                endpoint,
-            }]),
+            processes.clone(),
+            members.clone(),
             Arc::new(SampleClock),
         ))),
         CausalInputObligation::reserve_admitted(
@@ -1177,32 +1186,45 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         ))),
     );
     let handle = Handle::current();
-    host.register(HostBinding {
-        scope: fixture.scope.clone(),
-        registration: inbox.registration.clone(),
-        kind: FrontendActorKind::Test,
-        config: ActorConfig {
-            mailbox,
-            ..WithdrawalInbox::CONFIG
-        },
-        policy: FrontendLanePolicy::attempt(1),
-        executor: Arc::new(ActorTransportExecutor(handle.clone())),
-        source: Box::new(Calls {
+    let host_exit = host
+        .register(HostBinding {
             scope: fixture.scope.clone(),
-            source: source.clone(),
-            published: published.clone(),
-            process: process.clone(),
-            process_pending: false,
-            closed: false,
-        }),
-        transport: Some(TransportRetirements::new(
-            inbox.runtime.clone(),
+            registration: inbox.registration.clone(),
+            kind: FrontendActorKind::Test,
+            config: ActorConfig {
+                mailbox,
+                ..WithdrawalInbox::CONFIG
+            },
+            policy: FrontendLanePolicy::attempt(1),
+            executor: Arc::new(ActorTransportExecutor(handle.clone())),
+            source: Box::new(Calls {
+                scope: fixture.scope.clone(),
+                source: source.clone(),
+                published: published.clone(),
+                process: process.clone(),
+                process_pending: false,
+                closed: false,
+            }),
+            transport: Some(TransportRetirements::new(
+                inbox.runtime.clone(),
+                inbox.registration.clone(),
+                handle,
+                1,
+            )),
+        })
+        .unwrap_or_else(|_| panic!("original QA host registration"));
+    let (failure, _residual_port) = PendingFailureBridge::new(
+        inbox.registration.clone(),
+        activation,
+        members,
+        Arc::new(FailurePublications::new(
             inbox.registration.clone(),
-            handle,
-            1,
+            activation,
+            &fixture.scope,
         )),
-    })
-    .unwrap_or_else(|_| panic!("original QA host registration"));
+    );
+    let mut registered_terminal =
+        RegisteredAttemptTerminal::new(terminal.clone(), failure.bind(host_exit, processes));
     let submit_pair = || {
         let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
         assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
@@ -1339,6 +1361,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     await_reply(9).await;
     assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
     assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
+    assert!(registered_terminal.normal_convergence_ready().await);
     retire_commands(&[local_command]);
     drive_host();
     inbox.assert_no_result();
@@ -1354,12 +1377,35 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     let bridge = qa.take_drained_owner().expect("original QA bridge retired");
     drop(qa);
     drop(bridge);
+    registered_terminal.request_host_close().unwrap();
+    drive_host();
+    {
+        let mut waiting = Box::pin(registered_terminal.normal_closure_after_exit());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+    }
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
     payer.finish().unwrap();
     fixture.scope.reap_ready(128).unwrap();
-    host.close_registration();
+    inbox
+        .runtime
+        .notify_host_actor(&inbox.registration)
+        .unwrap();
     drive_host();
+    let closure = tokio::time::timeout(
+        Duration::from_secs(1),
+        registered_terminal.normal_closure_after_exit(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        closure,
+        Some(NativeActiveConvergenceClosure::Evidence(
+            NativeAttemptConvergence::Participations(rows),
+        )) if rows.as_ref() == [NativeParticipationConvergence::never_established(participation)]
+    ));
+    registered_terminal.request_host_close().unwrap();
     assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
     logical.abandon_running_attempt();
     tokio::time::timeout(Duration::from_secs(2), async {

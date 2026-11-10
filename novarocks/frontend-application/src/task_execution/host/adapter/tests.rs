@@ -326,6 +326,21 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     assert_eq!(lifecycle.class, InputClass::Lifecycle);
     assert_eq!(control.class, InputClass::Control);
 
+    let before_owner_controls = inventory();
+    let mut owner_controls = registered
+        .prepare_owner_controls(&runtime, &original_work)
+        .unwrap();
+    let owner_controls_inventory: Vec<_> = inventory()
+        .into_iter()
+        .filter(|row| !before_owner_controls.contains(row))
+        .collect();
+    assert_eq!(owner_controls_inventory.len(), 2);
+    assert!(
+        owner_controls_inventory
+            .iter()
+            .all(|row| { row.source == actor && row.class == InputClass::Control })
+    );
+
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
     let mut startup = AttemptStartup {
         registration: registration.clone(),
@@ -550,6 +565,8 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
             if observation.generation == key.generation))
     );
     startup.close_after_exit().unwrap();
+    owner_controls.close_after_exit().unwrap();
+    owner_controls.close_after_exit().unwrap();
     membership.close_after_exit().unwrap();
     observation_work.body_exited().unwrap();
     observation_work.captures_exited().unwrap();

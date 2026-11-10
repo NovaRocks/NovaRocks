@@ -35,7 +35,7 @@ use crate::{
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
     },
-    task_execution::host::custody::TransportRetirements,
+    task_execution::{bridge::control::AttemptOwnerControls, host::custody::TransportRetirements},
 };
 use novarocks_attempt_protocol::{
     AttemptCore, Core, InputSelection,
@@ -127,6 +127,7 @@ struct AttemptBinding {
 pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
+    pub(crate) controls: AttemptOwnerControls,
     pub(crate) failure: PendingFailureBridge,
     pub(crate) terminal: Arc<crate::task_execution::bridge::terminal::TerminalOutbox>,
 }
@@ -406,6 +407,32 @@ impl AttemptActorRegistration {
         .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original))))
     }
 
+    fn prepare_owner_controls(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+    ) -> Result<AttemptOwnerControls, ActorTurnError> {
+        let mut stop =
+            self.reserve_standing(runtime, self.original.actor(), InputClass::Control, work)?;
+        let convergence = match self.reserve_standing(
+            runtime,
+            self.original.actor(),
+            InputClass::Control,
+            work,
+        ) {
+            Ok(position) => position,
+            Err(error) => {
+                stop.close_after_exit().expect("unpublished Stop position");
+                return Err(error);
+            }
+        };
+        Ok(AttemptOwnerControls::new(
+            self.root_control.activation(),
+            stop,
+            convergence,
+        ))
+    }
+
     pub(crate) fn prepare_host(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -440,7 +467,7 @@ impl AttemptActorRegistration {
                 transport,
             ));
         }
-        let input = match self.reserve_standing(
+        let mut input = match self.reserve_standing(
             runtime,
             self.original.actor(),
             InputClass::Lifecycle,
@@ -448,6 +475,15 @@ impl AttemptActorRegistration {
         ) {
             Ok(input) => input,
             Err(error) => {
+                return Err((AttemptRegistrationError::Runtime(error), source, transport));
+            }
+        };
+        let controls = match self.prepare_owner_controls(runtime, startup_work) {
+            Ok(controls) => controls,
+            Err(error) => {
+                input
+                    .close_after_exit()
+                    .expect("unpublished startup position");
                 return Err((AttemptRegistrationError::Runtime(error), source, transport));
             }
         };
@@ -518,6 +554,7 @@ impl AttemptActorRegistration {
                 input,
                 next: Some(AttemptInput::Bootstrap),
             },
+            controls,
             failure: failure_bridge,
             terminal,
         })
