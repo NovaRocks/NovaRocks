@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/sql/src/admission.rs", "novarocks/user-error/**"]
+paths = ["novarocks/sql/src/admission.rs", "novarocks/user-error/**", "novarocks/sql/src/system_table.rs", "novarocks/query-application/src/system_tables/**", "novarocks/frontend-application/src/system_tables/**"]
 
 [reuse]
 scope = "suite"
