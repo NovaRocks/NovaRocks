@@ -19,6 +19,7 @@
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
     ActorSendReports,
+    establish_qa::BoundEstablishQa,
     queued_job::{BoundQueue, QueueJob, run as run_queue},
     send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
@@ -36,7 +37,9 @@ use crate::{
 };
 use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::{
-    actor_turn::InputAuthor, causal_input::CausalInputObligation, exit_work::PanicSink,
+    actor_turn::InputAuthor,
+    causal_input::CausalInputObligation,
+    exit_work::{PanicSink, run_future},
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::identity::ConsumerId;
@@ -71,6 +74,7 @@ pub(crate) struct BoundActorTransport {
 pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
     Admit(Box<BoundQueue>),
+    EstablishQa(BoundEstablishQa),
 }
 impl ActorTransportWork {
     fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
@@ -106,6 +110,7 @@ impl ActorTransportWork {
                     && bound.key.generation == *generation
                     && bound.control == operation.requires_control_progress()
             }
+            (Self::EstablishQa(_), _) => effect.is_establish_qa(),
             _ => false,
         }
     }
@@ -113,7 +118,7 @@ impl ActorTransportWork {
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
             Self::Send(send) => send.reports.actor().cloned(),
-            Self::Admit(_) => None,
+            Self::Admit(_) | Self::EstablishQa(_) => None,
         }
     }
 }
@@ -255,30 +260,43 @@ pub(crate) fn handoff_actor_transport(
     } = *captures
         .downcast::<BoundActorTransport>()
         .expect("checked actor transport binding");
-    let handoff = effect
-        .handoff()
-        .expect("committed transport handoff")
-        .clone();
-    let leg = |exit, registration| TransportLeg {
+    let leg = |exit, registration, panic| TransportLeg {
         exit,
-        handoff,
+        handoff: effect
+            .handoff()
+            .expect("committed transport handoff")
+            .clone(),
         panic,
         result: Box::new(ActorResultObligation(registration)),
     };
     let spawned = match work {
         ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_send(SendJob {
-                leg: leg(exit, registration.clone()),
+                leg: leg(exit, registration.clone(), panic),
                 registration,
                 bound,
             })
         }),
         ActorTransportWork::Admit(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_queue(QueueJob {
-                leg: leg(exit, registration),
+                leg: leg(exit, registration, panic),
                 bound,
             })
         }),
+        ActorTransportWork::EstablishQa(bound) => {
+            launch.spawn(runtime, exit, |exit, registration| async move {
+                let outcome = match run_future(exit, bound.run(effect), panic).await {
+                    Ok(Ok(reply)) => BodyOutcome::EstablishQa(reply),
+                    Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
+                    Err(error) => BodyOutcome::RawFailure(Box::new(error)),
+                };
+                if let Err(original) = registration.stage_actor_outcome(outcome) {
+                    std::panic::resume_unwind(Box::new(UnprovenBodyOutcome {
+                        _original: original,
+                    }));
+                }
+            })
+        }
     };
     Ok(match spawned {
         Ok(()) => ActorTransportHandoff::Spawned,

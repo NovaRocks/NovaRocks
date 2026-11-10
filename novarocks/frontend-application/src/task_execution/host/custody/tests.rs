@@ -299,7 +299,7 @@ use novarocks_control_runtime_core::{
     mailbox::{InputClass, InputEnvelope},
 };
 
-type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, ExecutorFact)>>>;
+type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, AttemptInput)>>>;
 type TransportCommand = (
     Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
     Option<novarocks_control_runtime::obligation::StepRegistration>,
@@ -350,10 +350,7 @@ impl TestActor for WithdrawalTarget {
         let FrontendInput::Attempt(value) = value else {
             panic!("expected an original attempt input");
         };
-        let AttemptInput::Executor(fact) = *value else {
-            panic!("expected an original executor fact");
-        };
-        self.0.lock().unwrap().push((envelope, fact));
+        self.0.lock().unwrap().push((envelope, *value));
     }
 }
 
@@ -552,6 +549,14 @@ impl WithdrawalInbox {
     }
 
     pub(crate) fn try_commit_next(&self) -> Option<(InputId, ExecutorFact)> {
+        let (input, value) = self.try_commit_attempt()?;
+        let AttemptInput::Executor(fact) = value else {
+            panic!("expected an original executor fact");
+        };
+        Some((input, fact))
+    }
+
+    fn try_commit_attempt(&self) -> Option<(InputId, AttemptInput)> {
         if self.observed.lock().unwrap().is_empty() {
             self.runtime.poll_one(Tick(1)).unwrap();
         }
@@ -742,6 +747,350 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
         .unwrap();
     inbox.finish();
     fixture.finish();
+}
+
+#[tokio::test]
+async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
+    use crate::{
+        control_runtime::{
+            actor::FrontendActorKind,
+            host::{
+                EffectSource, FrontendLanePolicy, HostBinding, HostRegistry, PendingHandoff,
+                PreparedEffectJob, SourceProgress,
+            },
+            metrics::FrontendHostObservations,
+            transport_withdrawal::AttemptEffectEnvelope,
+        },
+        query_execution::lifecycle_plan::QueryCredentialLeases,
+        task_execution::{
+            actor_gate::tests::logical_execution,
+            bridge::establish::EstablishQaBridge,
+            host::transport::{
+                ActorTransportExecutor, AttemptEstablishMaterial, EstablishQaSource,
+            },
+            sources::AttemptEstablishFacts,
+        },
+    };
+    use novarocks_attempt_protocol::effect::{
+        AttemptEffect, EffectBody, EffectClass, OperationIntent,
+    };
+    use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket, ProcessClock};
+    use novarocks_coordination_contract::{
+        AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
+        AttemptAuthorizationRef, AttemptIssueSettlement, AttemptRequestToken, AttemptToLogical,
+        AttemptToLogicalBody, LogicalToAttemptBody,
+    };
+    use novarocks_execution_contract::{
+        AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+        LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind, OperationOutcome,
+        ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId,
+    };
+    use novarocks_query_application::coordination::AdmissionIssueSettlement;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
+        QueryId,
+    };
+    use std::{num::NonZeroU64, time::Duration};
+
+    struct QaOnly {
+        source: Arc<Mutex<EstablishQaSource>>,
+        scope: ScopeHandle,
+        published: Arc<AtomicUsize>,
+        closed: bool,
+    }
+    impl EffectSource for QaOnly {
+        fn prepay_result(
+            &mut self,
+            effect: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            let FrontendEffect::Attempt(effect) = effect else {
+                unreachable!()
+            };
+            self.source.lock().unwrap().prepay(effect).unwrap()
+        }
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            ticket: &EffectTicket<FrontendEffect>,
+            result: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            self.source.lock().unwrap().bind(ticket, result)
+        }
+        fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
+            self.source.lock().unwrap().return_unclaimed(result);
+        }
+        fn core_consumed(&mut self, _: &[InputId]) {}
+        fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+            let mut source = self.source.lock().unwrap();
+            match event {
+                TransportSourceEvent::Result(original) => {
+                    source
+                        .accept(original)
+                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+                    self.published.fetch_add(1, Ordering::SeqCst);
+                }
+                TransportSourceEvent::Retired => source.transport_retired(effect),
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
+        }
+        fn owner_failed_pending(&mut self, pending: PendingHandoff) {
+            std::panic::resume_unwind(Box::new(pending));
+        }
+        fn close_external(&mut self) {
+            self.closed = true;
+            self.scope.close_external().unwrap();
+        }
+        fn result_admission_closed(&self) -> bool {
+            self.closed
+        }
+        fn progress_retirement(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: Tick,
+            budget: usize,
+        ) -> SourceProgress {
+            let progressed = budget != 0 && self.source.lock().unwrap().retire_result().unwrap();
+            SourceProgress {
+                units: usize::from(budget != 0),
+                progressed,
+                more: false,
+                retired: self.closed && self.scope.join_ready().unwrap(),
+            }
+        }
+    }
+
+    let fixture = Fixture::new();
+    let generation = Generation::new(1).unwrap();
+    let (mut parent, mut payer) = fixture
+        .scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let participation = ParticipationRef::new(
+        QueryExecutionId::new(QueryId::new(9, 11), AttemptId::new(1).unwrap()).unwrap(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let (mut logical, drive, _abort_intake) = logical_execution(participation).await;
+    let compatibility = NativeCompatibilityId::new([31; 32]);
+    let lease = LeaseValidFor::new(Duration::from_secs(30)).unwrap();
+    let admission = AcquireParticipationAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        participation,
+        lease,
+        compatibility,
+        AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
+    );
+    let issue = drive.begin_admission_issue(admission).await.unwrap();
+    let ticket = AdmissionTicketId::try_from_bytes([31; 16]).unwrap();
+    drive
+        .settle_admission_issue(
+            issue,
+            AdmissionIssueSettlement::applied(
+                admission.envelope().operation_id(),
+                OperationOutcome::Accepted,
+                ParticipationAdmissionTicketReceipt::new(ticket, participation, lease),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let facts = AttemptEstablishFacts::freeze(
+        Default::default(),
+        [(participation.backend_process_id(), Default::default())],
+        Default::default(),
+        &QueryCredentialLeases::empty(),
+    )
+    .unwrap();
+    let mut next_payload = NonZeroU64::MIN;
+    let (quotes, material) =
+        AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
+    let operation_id = TaskOperationId::new_v7();
+    let quote = quotes[&participation];
+    let activation = drive.identity();
+    let id = |number| NonZeroU64::new(number).unwrap();
+    let port = |number, body| AttemptToLogical {
+        activation,
+        action: AttemptActionId::new(id(number)),
+        body,
+    };
+    let authorization = AttemptAuthorizationRef::new(id(1));
+    let token = |number| AttemptRequestToken::new(id(number));
+    let first = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(id(1)),
+        class: EffectClass::Business,
+        body: EffectBody::EstablishAuthorization {
+            operation: OperationIntent::EstablishParticipation {
+                envelope: OperationEnvelope::with_default_wait(
+                    operation_id,
+                    OperationKind::UpdateParticipation,
+                ),
+                participation,
+                ticket,
+                initial_lease_sequence: LeaseSequence::INITIAL,
+                initial_lease_valid_for: lease,
+                material: quote.material,
+                queued_bytes: quote.queued_bytes,
+            },
+            request: port(
+                1,
+                AttemptToLogicalBody::AuthorizationRequest {
+                    token: token(1),
+                    request: AttemptAuthorization::Establish {
+                        participation,
+                        operation_id,
+                    },
+                },
+            ),
+        },
+    });
+    let second = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(id(2)),
+        class: EffectClass::Settlement,
+        body: EffectBody::Port(port(
+            2,
+            AttemptToLogicalBody::EstablishSettlement {
+                token: token(2),
+                authorization,
+                participation,
+                operation_id,
+                settlement: AttemptIssueSettlement::DefinitelyUnsent,
+            },
+        )),
+    });
+    assert!(first.handoff().is_none() && second.handoff().is_none());
+    let inbox = WithdrawalInbox::with_effect(&fixture.scope, [first, second]);
+    let source = Arc::new(Mutex::new(EstablishQaSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer(),
+        EstablishQaBridge::new(Arc::new(drive), compatibility, Arc::new(material)),
+        inbox.reserve_result(&parent),
+    )));
+    let published = Arc::new(AtomicUsize::new(0));
+    let host = HostRegistry::new(
+        inbox.runtime.clone(),
+        fixture.ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            ProcessClock::default(),
+        ))),
+    );
+    let handle = Handle::current();
+    host.register(HostBinding {
+        scope: fixture.scope.clone(),
+        registration: inbox.registration.clone(),
+        kind: FrontendActorKind::Test,
+        config: WithdrawalInbox::CONFIG,
+        policy: FrontendLanePolicy::attempt(1),
+        executor: Arc::new(ActorTransportExecutor(handle.clone())),
+        source: Box::new(QaOnly {
+            scope: fixture.scope.clone(),
+            source: source.clone(),
+            published: published.clone(),
+            closed: false,
+        }),
+        transport: Some(TransportRetirements::new(
+            inbox.runtime.clone(),
+            inbox.registration.clone(),
+            handle,
+            1,
+        )),
+    })
+    .unwrap_or_else(|_| panic!("original QA host registration"));
+    let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let drive_host = || {
+        while let Some(turn) = inbox.runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+    };
+    let await_reply = |count| {
+        let published = &published;
+        let drive_host = &drive_host;
+        async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while published.load(Ordering::SeqCst) < count {
+                    drive_host();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    };
+    await_reply(1).await;
+    drive_host();
+    assert_eq!(published.load(Ordering::SeqCst), 1);
+    assert!(!source.lock().unwrap().retire_result().unwrap());
+    let (_, AttemptInput::Port(first)) = inbox.try_commit_attempt().unwrap() else {
+        panic!("same original QA authorization reply");
+    };
+    assert!(
+        matches!(first.body, LogicalToAttemptBody::AuthorizationReply {
+        token: reply_token, decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
+    } if reply_token == token(1) && guard == authorization)
+    );
+    await_reply(2).await;
+    let (_, AttemptInput::Port(second)) = inbox.try_commit_attempt().unwrap() else {
+        panic!("same original QA settlement reply");
+    };
+    assert!(
+        matches!(second.body, LogicalToAttemptBody::EstablishSettlementReply {
+        token: reply_token, authorization: guard, result: Ok(()),
+    } if reply_token == token(2) && guard == authorization)
+    );
+
+    for input in commands {
+        inbox
+            .runtime
+            .retire_input(inbox.registration.actor(), input)
+            .unwrap();
+    }
+    drive_host();
+    let mut qa = source.lock().unwrap();
+    assert!(qa.close_idle().unwrap());
+    let bridge = qa
+        .take_drained_bridge()
+        .expect("original QA bridge retired");
+    drop(qa);
+    drop(bridge);
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    fixture.scope.reap_ready(128).unwrap();
+    host.close_registration();
+    drive_host();
+    assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
+    logical.abandon_running_attempt();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while logical
+            .stand_down_snapshot(participation)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    logical
+        .observe_worker_process_replaced(participation)
+        .await
+        .unwrap();
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

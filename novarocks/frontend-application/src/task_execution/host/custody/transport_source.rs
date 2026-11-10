@@ -152,7 +152,7 @@ impl TransportRetirements {
         retirement: Box<TransportRetirement>,
     ) -> Result<(), (Arc<AttemptEffectEnvelope>, Box<TransportRetirement>)> {
         if !self.has_room()
-            || effect.handoff().is_none()
+            || !effect.uses_join_custody()
             || !self.wake.registration.matches_scope(retirement.scope())
         {
             return Err((effect, retirement));

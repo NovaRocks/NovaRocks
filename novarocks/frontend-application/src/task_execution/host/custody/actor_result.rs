@@ -68,7 +68,7 @@ impl TransportJoinHandoff {
         let Some(record) = self.registration.original.upgrade() else {
             return Err(original);
         };
-        if effect.handoff().is_none()
+        if !effect.uses_join_custody()
             || !original
                 .event_author()
                 .is_ok_and(|author| author.same_binding(expected))

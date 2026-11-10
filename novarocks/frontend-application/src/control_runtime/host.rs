@@ -833,7 +833,7 @@ impl HostRegistry {
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 }
-                if matches!(metadata, FrontendEffect::Attempt(effect) if effect.handoff().is_some())
+                if matches!(metadata, FrontendEffect::Attempt(effect) if effect.uses_join_custody())
                     && machine
                         .transport
                         .as_ref()

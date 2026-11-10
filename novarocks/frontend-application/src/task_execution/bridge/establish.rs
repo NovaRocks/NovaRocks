@@ -59,13 +59,13 @@ impl Guard {
 }
 
 #[must_use = "publish the original reply and retain its typed failure if present"]
-pub(in crate::task_execution) struct EstablishQaReply {
+pub(crate) struct EstablishQaReply {
     pub(in crate::task_execution) reply: LogicalToAttempt<AttemptFailure>,
     pub(in crate::task_execution) failure: Option<(HostFailureRef, TaskExecutionError)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(in crate::task_execution) enum EstablishPortError {
+pub(crate) enum EstablishPortError {
     WrongRequest,
     WrongGuard,
     DuplicateAuthorization,
@@ -74,7 +74,7 @@ pub(in crate::task_execution) enum EstablishPortError {
 /// One original activation owns this inventory. Its credentialed executor
 /// serializes the QA calls. A reference points to a real guard only after the
 /// original QA issue successfully crosses the transport fence.
-pub(in crate::task_execution) struct EstablishQaBridge {
+pub(crate) struct EstablishQaBridge {
     drive: Arc<NativeAttemptDrive>,
     compatibility: NativeCompatibilityId,
     material: Arc<AttemptEstablishMaterial>,
@@ -82,6 +82,12 @@ pub(in crate::task_execution) struct EstablishQaBridge {
 }
 
 impl EstablishQaBridge {
+    pub(in crate::task_execution) fn activation(
+        &self,
+    ) -> novarocks_coordination_contract::AttemptActivationIdentity {
+        self.drive.identity()
+    }
+
     pub(in crate::task_execution) fn new(
         drive: Arc<NativeAttemptDrive>,
         compatibility: NativeCompatibilityId,

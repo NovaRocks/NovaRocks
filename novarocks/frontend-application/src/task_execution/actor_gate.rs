@@ -748,7 +748,7 @@ fn actor_establish_error(error: EstablishIssueError) -> TaskExecutionError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::future::Future;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -844,7 +844,7 @@ mod tests {
         )
     }
 
-    async fn logical_execution(
+    pub(crate) async fn logical_execution(
         participation: ParticipationRef,
     ) -> (
         LogicalExecutionTestHarness,

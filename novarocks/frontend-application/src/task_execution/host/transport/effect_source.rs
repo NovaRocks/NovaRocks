@@ -18,9 +18,9 @@
 //! Composition of the original admission and SendBatch Sources.
 
 use super::{
-    ActorSendReports, ActorTransportExecutor, AdmissionSource, BodyOutcome, FrozenSendRequests,
-    NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext, SendKey,
-    SendMemberReport, SendReportRows, send_reports::close_unlaunched,
+    ActorSendReports, ActorTransportExecutor, AdmissionSource, BodyOutcome, EstablishQaSource,
+    FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
+    SendKey, SendMemberReport, SendReportRows, send_reports::close_unlaunched,
 };
 use crate::{
     control_runtime::{
@@ -87,6 +87,7 @@ pub(crate) struct AttemptSendSource {
 
 enum Prepaid {
     Admission,
+    EstablishQa,
     Send(usize, Box<PreparedActorSend>),
     Other,
 }
@@ -121,6 +122,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
+    qa: Option<EstablishQaSource>,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -146,11 +148,13 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
+        qa: Option<EstablishQaSource>,
         send: AttemptSendSource,
         failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
+        assert!(qa.as_ref().is_none_or(|qa| qa.matches_scope(&scope)));
         assert!(scope.same_scope(send.report_author.work().scope()));
         let capacity = send.idle.iter().map(VecDeque::len).sum();
         Self {
@@ -159,6 +163,7 @@ impl AttemptTransportSource {
             native_source,
             scope,
             admission,
+            qa,
             requests: send.requests,
             contexts: send.contexts,
             report_references: send.report_references,
@@ -179,7 +184,8 @@ impl AttemptTransportSource {
     }
 
     fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
-        let closing = self.result_admission_closed();
+        let closing = self.result_admission_closed()
+            && self.qa.as_ref().is_none_or(EstablishQaSource::is_drained);
         match self.supervisor.as_mut() {
             Some(Supervisor::Armed(_)) if closing => {
                 let actor = self.registration.actor();
@@ -386,6 +392,16 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
+            if original.is_establish_qa() {
+                let result = self
+                    .qa
+                    .as_mut()
+                    .expect("original Establish QA Source")
+                    .prepay(original)
+                    .expect("original QA prepayment")?;
+                self.pending = Some(Prepaid::EstablishQa);
+                return Some(result);
+            }
             match original.protocol.body {
                 EffectBody::AdmitQueuedInput { .. } => {
                     let result = self
@@ -428,6 +444,13 @@ impl EffectSource for AttemptTransportSource {
         result: Position,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         match self.pending.take().expect("same original prepayment") {
+            Prepaid::EstablishQa => {
+                let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                    unreachable!()
+                };
+                assert!(self.in_flight.insert(effect.protocol.id));
+                Ok(self.qa.as_mut().unwrap().bind(ticket, result))
+            }
             Prepaid::Admission => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
@@ -492,6 +515,7 @@ impl EffectSource for AttemptTransportSource {
 
     fn return_unclaimed_result(&mut self, result: Position) {
         match self.pending.take().expect("same original prepayment") {
+            Prepaid::EstablishQa => self.qa.as_mut().unwrap().return_unclaimed(result),
             Prepaid::Admission => self.admission.return_unclaimed(result),
             Prepaid::Other => self.other.return_unclaimed_result(result),
             Prepaid::Send(lane, prepared) => {
@@ -506,6 +530,21 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        if let Some(qa) = self.qa.as_mut().filter(|qa| qa.owns(effect)) {
+            match event {
+                TransportSourceEvent::Result(original) => {
+                    if let Err(refused) = qa.accept(original) {
+                        self.other.retain_transport_failure(Box::new(refused));
+                    }
+                }
+                TransportSourceEvent::Retired => {
+                    assert!(self.in_flight.remove(&effect));
+                    qa.transport_retired(effect);
+                }
+                original => self.other.transport_event(effect, original),
+            }
+            return;
+        }
         match event {
             TransportSourceEvent::Result(result) => {
                 if self.send_live.contains_key(&effect) {
@@ -604,7 +643,21 @@ impl EffectSource for AttemptTransportSource {
     ) -> SourceProgress {
         let mut units = 0;
         let mut progressed = false;
-        let supervisor_advanced = if budget != 0 && self.supervisor.is_some() {
+        let closing = self.result_admission_closed();
+        if units < budget
+            && let Some(qa) = self.qa.as_mut().filter(|qa| qa.needs_progress(closing))
+        {
+            units += 1;
+            progressed |= qa.retire_result().expect("original QA result");
+            if closing {
+                progressed |= qa.close_idle().expect("original idle QA role");
+                if let Some(original) = qa.take_drained_bridge() {
+                    self.other.retain_transport_release(Box::new(original));
+                    progressed = true;
+                }
+            }
+        }
+        let supervisor_advanced = if units < budget && self.supervisor.is_some() {
             units += 1;
             self.advance_supervisor(turn)
         } else {
@@ -691,6 +744,7 @@ impl EffectSource for AttemptTransportSource {
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
         progress.retired &= self.supervisor.is_none()
+            && self.qa.as_ref().is_none_or(EstablishQaSource::is_drained)
             && self.report_author.is_none()
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()
@@ -706,7 +760,7 @@ pub(crate) struct AttemptTransportExecutor {
 }
 impl EffectExecutor for AttemptTransportExecutor {
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
-        if matches!(&job.effect, FrontendEffect::Attempt(effect) if effect.handoff().is_some()) {
+        if matches!(&job.effect, FrontendEffect::Attempt(effect) if effect.uses_join_custody()) {
             self.native.handoff(job)
         } else {
             self.other.handoff(job)

@@ -17,7 +17,7 @@
 
 use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody};
 use novarocks_control_runtime::exit_work::HandoffCell;
-use novarocks_coordination_contract::AttemptActionId;
+use novarocks_coordination_contract::{AttemptActionId, AttemptToLogicalBody};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock, Weak},
@@ -46,6 +46,22 @@ impl AttemptEffectEnvelope {
 
     pub(crate) fn handoff(&self) -> Option<&Arc<HandoffCell>> {
         self.handoff.as_ref()
+    }
+
+    pub(crate) fn is_establish_qa(&self) -> bool {
+        match &self.protocol.body {
+            EffectBody::EstablishAuthorization { .. } => true,
+            EffectBody::Port(port) => matches!(
+                port.body,
+                AttemptToLogicalBody::EstablishSettlement { .. }
+                    | AttemptToLogicalBody::DetachEstablish { .. }
+            ),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn uses_join_custody(&self) -> bool {
+        self.handoff.is_some() || self.is_establish_qa()
     }
 
     pub(crate) fn retire_handoff(&self) {

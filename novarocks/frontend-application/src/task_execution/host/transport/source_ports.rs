@@ -38,6 +38,7 @@ pub(crate) enum BodyOutcome {
     /// final logical/error consumer, independently of Core input consumption.
     LocalFailure(WorkError),
     CreationFailed(TaskExecutionError),
+    EstablishQa(crate::task_execution::bridge::establish::EstablishQaReply),
     RawFailure(Box<dyn Any + Send>),
 }
 

@@ -91,6 +91,7 @@ pub(crate) struct AttemptActorRegistration {
     pub(crate) original: ActorRegistration,
     scope: ScopeHandle,
     native_source: ActorId,
+    qa_source: ActorId,
     capacity_source: ActorId,
     observation_source: ActorId,
     membership_source: ActorId,
@@ -130,6 +131,7 @@ pub(crate) struct PreparedAttemptHost {
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
+    pub(crate) qa: super::transport::EstablishQaSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -250,6 +252,48 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    /// The original QA reply position is separate from Native admission and
+    /// observation credits. Only one original QA request can be in flight.
+    pub(crate) fn prepare_establish_qa_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        bridge: crate::task_execution::bridge::establish::EstablishQaBridge,
+    ) -> Result<super::transport::EstablishQaSource, AttemptRegistrationError> {
+        let binding = self
+            .binding
+            .get()
+            .ok_or(AttemptRegistrationError::InvalidConfig(
+                "Establish QA Source requires its original attempt binding",
+            ))?;
+        if bridge.activation() != self.root_control.activation()
+            || !self.scope.same_scope(parent.scope())
+            || !payer.belongs_to_bound_work(&self.scope, parent.id())
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "Establish QA Source belongs to another original attempt",
+            ));
+        }
+        let position = CausalInputObligation::reserve_admitted(
+            runtime,
+            &self.original,
+            self.qa_source,
+            InputClass::Lifecycle,
+            parent,
+        )
+        .map_err(AttemptRegistrationError::Runtime)?;
+        Ok(super::transport::EstablishQaSource::new(
+            parent,
+            payer,
+            binding.generation,
+            observer,
+            bridge,
+            position,
+        ))
+    }
+
     /// Pay the two independent admission result inventories against the
     /// original Native mailbox before opening the attempt. The Source may
     /// later derive fresh per-generation Work from the same bound payer.
@@ -361,6 +405,7 @@ impl AttemptActorRegistration {
         let AttemptTransportBinding {
             retirement,
             admission,
+            qa,
             send,
             executor: native,
             failure,
@@ -390,6 +435,7 @@ impl AttemptActorRegistration {
                     self.native_source,
                     self.scope.clone(),
                     admission,
+                    Some(qa),
                     send,
                     (
                         FailureContext {
@@ -667,6 +713,7 @@ impl AttemptActor {
         }
         let actor = runtime_source(start.sources.actor);
         let native = runtime_source(start.sources.native);
+        let qa_source = runtime_source(start.sources.qa);
         let capacity_source = runtime_source(start.sources.capacity);
         let observation_source = runtime_source(start.sources.observation);
         let membership_source = runtime_source(start.sources.membership);
@@ -716,6 +763,7 @@ impl AttemptActor {
             original,
             scope,
             native_source: native,
+            qa_source,
             capacity_source,
             observation_source,
             membership_source,
