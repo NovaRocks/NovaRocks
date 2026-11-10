@@ -1078,6 +1078,19 @@ impl ScopeHandle {
     pub fn reap_ready(&self, budget: usize) -> Result<usize, RuntimeError> {
         self.runtime.reap_scope_ready(self.id, budget)
     }
+    /// Reap the observed original header only within this same Scope.
+    pub fn reap_observed_header(
+        &self,
+        observer: &crate::obligation::WorkRetirementObserver,
+    ) -> Result<bool, RuntimeError> {
+        if !observer
+            .for_ledger(&self.runtime)
+            .is_some_and(|(scope, _)| scope == self.id)
+        {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        self.runtime.reap_observed_header(observer)
+    }
     /// Observe one original Work record through its actual owning Scope.
     /// This neither recreates a retired header nor authorizes new input/work.
     pub fn work_lifecycle(

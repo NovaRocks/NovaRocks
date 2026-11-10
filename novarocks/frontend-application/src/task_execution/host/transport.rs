@@ -27,6 +27,7 @@
 //! kernel neither creates a second transport window nor certifies those exits.
 
 mod actor_adapter;
+mod admission_source;
 mod capacity;
 mod execute;
 mod granted_inputs;
@@ -48,6 +49,7 @@ pub(crate) use actor_adapter::{
     ActorTransportExecutor, ActorTransportHandoff, ActorTransportWork, BoundActorTransport,
     actor_transport_layouts, handoff_actor_transport, prepare_actor_transport,
 };
+pub(crate) use admission_source::{AdmissionResultRefusal, AdmissionSource};
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};

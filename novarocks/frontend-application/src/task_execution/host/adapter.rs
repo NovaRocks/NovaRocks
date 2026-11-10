@@ -51,6 +51,7 @@ use novarocks_control_runtime::{
         ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, StandingInputObligation,
     },
     capacity_notification::CapacityRegistrant,
+    causal_input::CausalInputObligation,
     coalescing_input::{CoalescingInput, Merge},
     obligation::{ReservationObligation, StepRegistration, WorkObligation},
     transaction::{RuntimeError, ScopeHandle},
@@ -233,6 +234,68 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    /// Pay the two independent admission result inventories against the
+    /// original Native mailbox before opening the attempt. The Source may
+    /// later derive fresh per-generation Work from the same bound payer.
+    pub(crate) fn prepare_admission_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+        counts: [usize; 2],
+    ) -> Result<super::transport::AdmissionSource, AttemptRegistrationError> {
+        use std::collections::VecDeque;
+        let binding = self
+            .binding
+            .get()
+            .ok_or(AttemptRegistrationError::InvalidConfig(
+                "admission Source requires its original attempt binding",
+            ))?;
+        if !self.scope.same_scope(parent.scope())
+            || !payer.belongs_to_bound_work(&self.scope, parent.id())
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "admission Source payer belongs to another original Work",
+            ));
+        }
+        let mut positions = counts.map(VecDeque::with_capacity);
+        for (lane, count) in counts.into_iter().enumerate() {
+            for _ in 0..count {
+                match CausalInputObligation::reserve_admitted(
+                    runtime,
+                    &self.original,
+                    self.native_source,
+                    InputClass::Lifecycle,
+                    parent,
+                ) {
+                    Ok(position) => positions[lane].push_back(position),
+                    Err(error) => {
+                        for mut original in positions
+                            .iter_mut()
+                            .flat_map(|positions| positions.drain(..))
+                        {
+                            original
+                                .close_after_exit()
+                                .expect("unpublished admission position");
+                        }
+                        return Err(AttemptRegistrationError::Runtime(error));
+                    }
+                }
+            }
+        }
+        Ok(super::transport::AdmissionSource::new(
+            parent,
+            payer,
+            binding.generation,
+            observer,
+            authority,
+            positions,
+        )
+        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original))))
+    }
+
     pub(crate) fn prepare_host(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,

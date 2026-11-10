@@ -28,6 +28,7 @@ use novarocks_control_runtime_core::{
     scope::{WorkAdmission, WorkKind},
 };
 use std::{
+    collections::VecDeque,
     future::{Ready, poll_fn, ready},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -301,7 +302,9 @@ use novarocks_control_runtime_core::{
 type ObservedWithdrawals = Arc<Mutex<Vec<(InputEnvelope, ExecutorFact)>>>;
 struct WithdrawalTarget(
     ObservedWithdrawals,
-    Option<Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>>,
+    std::collections::VecDeque<
+        Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+    >,
 );
 impl TestActor for WithdrawalTarget {
     fn handle(
@@ -312,7 +315,7 @@ impl TestActor for WithdrawalTarget {
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
         if matches!(value, FrontendInput::Test(_)) {
-            let effect = self.1.take().expect("one original transport command");
+            let effect = self.1.pop_front().expect("one original transport command");
             let work = step.input_work().expect("original admission author");
             step.effect(
                 crate::task_execution::host::adapter::descriptor(
@@ -356,7 +359,9 @@ impl WithdrawalInbox {
 
     fn with_effect(
         scope: &ScopeHandle,
-        effect: Option<Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>>,
+        effects: impl IntoIterator<
+            Item = Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+        >,
     ) -> Self {
         let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
@@ -366,7 +371,10 @@ impl WithdrawalInbox {
             .register_bound_with_source_cut(
                 actor,
                 scope.clone(),
-                FrontendActor::Test(Box::new(WithdrawalTarget(observed.clone(), effect))),
+                FrontendActor::Test(Box::new(WithdrawalTarget(
+                    observed.clone(),
+                    effects.into_iter().collect(),
+                ))),
                 Self::CONFIG,
                 source,
             )
@@ -624,7 +632,6 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
 
 #[tokio::test]
 async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing() {
-    use super::actor_result::AdmissionPublicationError;
     use crate::{
         control_runtime::{
             actor::FrontendActorKind,
@@ -635,10 +642,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             metrics::FrontendHostObservations,
             transport_withdrawal::AttemptEffectEnvelope,
         },
-        task_execution::host::transport::{
-            self, ActorTransportExecutor, ActorTransportWork, BoundQueue, GrantedInputs, SendKey,
-            SourceLayouts,
-        },
+        task_execution::host::transport::{self, ActorTransportExecutor, AdmissionSource, SendKey},
     };
     use novarocks_attempt_protocol::{
         effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
@@ -656,7 +660,18 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
 
     let fixture = Fixture::new();
     let mut wc = transport::GovernedQueuedInputFixture::new();
-    let original = fixture.reported(None);
+    let generation = Generation::new(1).unwrap();
+    let (mut parent, mut payer) = fixture
+        .scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
     let id = AttemptActionId::new(NonZeroU64::MIN);
     let key = SendKey {
         operation: TaskOperationId::new_v7(),
@@ -674,30 +689,38 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         creation: payload,
         queued_bytes: 8192,
     };
-    let effect = AttemptEffectEnvelope::new(AttemptEffect {
-        id,
-        class: EffectClass::Business,
-        body: EffectBody::AdmitQueuedInput {
-            lane: operation.lane(),
-            operation,
-            generation: key.generation,
-            payload: QueuedInputPayload::NewCreation(payload),
-        },
-    });
+    let replay = SendKey {
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(2).unwrap())),
+        ..key
+    };
+    let effect = |send: SendKey, payload| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id: send.generation.admission_effect(),
+            class: EffectClass::Business,
+            body: EffectBody::AdmitQueuedInput {
+                lane: operation.lane(),
+                operation: operation.clone(),
+                generation: send.generation,
+                payload,
+            },
+        })
+    };
     struct Source {
         scope: ScopeHandle,
-        result: Option<CausalInputObligation<FrontendActor>>,
-        original: Option<ReportedWork>,
-        bound: Option<BoundQueue>,
-        completed: Arc<Mutex<Option<actor_result::ReturnedActorTransportResult>>>,
+        admission: Arc<Mutex<AdmissionSource>>,
+        completed: Arc<Mutex<VecDeque<InputId>>>,
+        retired: Arc<AtomicUsize>,
         closing: bool,
     }
     impl EffectSource for Source {
         fn prepay_result(
             &mut self,
-            _: &FrontendEffect,
+            effect: &FrontendEffect,
         ) -> Option<CausalInputObligation<FrontendActor>> {
-            self.result.take()
+            let FrontendEffect::Attempt(effect) = effect else {
+                unreachable!()
+            };
+            self.admission.lock().unwrap().prepay(effect).unwrap()
         }
         fn bind_job(
             &mut self,
@@ -706,21 +729,10 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             ticket: &novarocks_control_runtime::actor_turn::EffectTicket<FrontendEffect>,
             result: CausalInputObligation<FrontendActor>,
         ) -> PreparedEffectJob {
-            let FrontendEffect::Attempt(effect) = &ticket.effect else {
-                unreachable!()
-            };
-            transport::prepare_actor_transport(
-                effect.clone(),
-                result,
-                self.original.take().unwrap(),
-                Default::default(),
-                observer(),
-                |_| ActorTransportWork::Admit(Box::new(self.bound.take().unwrap())),
-            )
-            .unwrap_or_else(|_| panic!("same original transport role"))
+            self.admission.lock().unwrap().bind(ticket, result)
         }
         fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>) {
-            assert!(self.result.replace(result).is_none());
+            self.admission.lock().unwrap().return_unclaimed(result);
         }
         fn core_consumed(&mut self, _: &[InputId]) {}
         fn transport_event(
@@ -731,9 +743,18 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             match original {
                 super::TransportSourceEvent::Result(result) => {
                     assert_eq!(result.effect.protocol.id, effect);
-                    assert!(self.completed.lock().unwrap().replace(result).is_none());
+                    let input = self
+                        .admission
+                        .lock()
+                        .unwrap()
+                        .accept(result)
+                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+                    self.completed.lock().unwrap().push_back(input);
                 }
-                super::TransportSourceEvent::Retired => {}
+                super::TransportSourceEvent::Retired => {
+                    assert!(self.admission.lock().unwrap().transport_retired(effect));
+                    self.retired.fetch_add(1, Ordering::SeqCst);
+                }
                 original => std::panic::resume_unwind(Box::new(original)),
             }
         }
@@ -754,37 +775,73 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             _: Tick,
             budget: usize,
         ) -> SourceProgress {
-            let units = if self.closing {
-                self.scope.reap_ready(budget).unwrap()
-            } else {
-                0
-            };
+            let mut admission = self.admission.lock().unwrap();
+            let mut units = 0;
+            let mut progressed = false;
+            if budget != 0 && admission.awaiting_result_retirement() != 0 {
+                progressed = admission.retire_result().unwrap();
+                units += 1;
+            }
+            if self.closing {
+                if units < budget && admission.close_one_idle().unwrap() {
+                    units += 1;
+                    progressed = true;
+                }
+                let reaped = self.scope.reap_ready(budget - units).unwrap();
+                units += reaped;
+                progressed |= reaped != 0;
+            }
             let retired = self.closing && self.scope.join_ready().unwrap();
             SourceProgress {
                 units,
-                progressed: units != 0,
-                more: units != 0 && !retired,
+                progressed,
+                more: progressed && self.closing && !retired,
                 retired,
             }
         }
     }
-
-    let inbox = WithdrawalInbox::with_effect(&fixture.scope, Some(effect));
-    let result = inbox.reserve(&original);
-    let command = inbox
-        .runtime
-        .reserve_admitted_input_for(
-            &inbox.registration,
-            inbox.source,
-            InputClass::Lifecycle,
-            original.work(),
-        )
-        .unwrap()
-        .fill(FrontendInput::Test(1))
-        .unwrap();
-    let layouts = transport::actor_transport_layouts(false).unwrap();
-    let quote = transport::queued_input_quote(8192, SourceLayouts { original: &layouts }).unwrap();
-    let completed = Arc::new(Mutex::new(None));
+    let inbox = WithdrawalInbox::with_effect(
+        &fixture.scope,
+        [
+            effect(key, QueuedInputPayload::NewCreation(payload)),
+            effect(replay, QueuedInputPayload::AlreadyRetained),
+        ],
+    );
+    let position = CausalInputObligation::reserve_admitted(
+        &inbox.runtime,
+        &inbox.registration,
+        inbox.source,
+        InputClass::Lifecycle,
+        &parent,
+    )
+    .unwrap();
+    let command = || {
+        inbox
+            .runtime
+            .reserve_admitted_input_for(
+                &inbox.registration,
+                inbox.source,
+                InputClass::Lifecycle,
+                &parent,
+            )
+            .unwrap()
+            .fill(FrontendInput::Test(1))
+            .unwrap()
+    };
+    let first_command = command();
+    let mut admission = AdmissionSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer(),
+        wc.authority(),
+        [VecDeque::from([position]), VecDeque::new()],
+    )
+    .unwrap_or_else(|_| panic!("original admission payer"));
+    assert!(admission.install_payload(payload, 8192));
+    let admission = Arc::new(Mutex::new(admission));
+    let completed = Arc::new(Mutex::new(VecDeque::new()));
+    let retired = Arc::new(AtomicUsize::new(0));
     let handle = Handle::current();
     let host = HostRegistry::new(
         inbox.runtime.clone(),
@@ -802,17 +859,9 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         executor: Arc::new(ActorTransportExecutor(handle.clone())),
         source: Box::new(Source {
             scope: fixture.scope.clone(),
-            result: Some(result),
-            original: Some(original),
-            bound: Some(BoundQueue {
-                key,
-                scope_generation: Generation::new(1).unwrap(),
-                control: false,
-                quote,
-                authority: wc.authority(),
-                original_captures: Box::new(()),
-            }),
+            admission: admission.clone(),
             completed: completed.clone(),
+            retired: retired.clone(),
             closing: false,
         }),
         transport: Some(super::TransportRetirements::new(
@@ -832,74 +881,86 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         assert!(first_turns <= 4, "a pending Join must let the host sleep");
     }
     assert!(first_turns > 0);
-    assert!(completed.lock().unwrap().is_none());
+    assert!(completed.lock().unwrap().is_empty());
     inbox
         .runtime
-        .retire_input(inbox.registration.actor(), command)
+        .retire_input(inbox.registration.actor(), first_command)
         .unwrap();
     inbox.assert_no_result();
 
-    let mut result = tokio::time::timeout(Duration::from_secs(2), async {
+    let drive = |wc: &mut transport::GovernedQueuedInputFixture| {
+        wc.progress();
+        while let Some(turn) = inbox.runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+        completed.lock().unwrap().pop_front()
+    };
+    let input = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            wc.progress();
-            while let Some(turn) = inbox.runtime.claim_host_actor() {
-                host.drive(Tick(1), turn);
-            }
-            if let Some(result) = completed.lock().unwrap().take() {
-                break result;
+            if let Some(input) = drive(&mut wc) {
+                break input;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(result.withdrawal.is_none());
-    let mut inputs = GrantedInputs::default();
-    assert!(matches!(
-        result.publish_admission(&mut inputs, None),
-        Err(AdmissionPublicationError::MissingPayloadRetention)
-    ));
-    inbox.assert_no_result();
-    let mut payload_retention = None;
-    let published = result
-        .publish_admission(&mut inputs, Some(&mut payload_retention))
-        .unwrap()
-        .unwrap();
-    assert!(payload_retention.is_some());
-    assert!(inputs.contains(published.grant));
     assert!(
-        result
-            .publish_admission(&mut inputs, None)
-            .unwrap()
-            .is_none()
+        !admission.lock().unwrap().retire_result().unwrap(),
+        "uncommitted result still owns its paid role"
     );
-    let input = published
-        .delivery
-        .unwrap_or_else(|failure| panic!("{}", failure.error));
-    assert!(!result.close_result_after_exit().unwrap());
-    assert!(matches!(
-        inbox.commit(input),
-        ExecutorFact::QueuedInputGranted { operation, grant, queued_bytes: 8192 }
-            if operation == key.operation && grant == published.grant && grant.generation() == key.generation
-    ));
-    let wrong = SendKey {
-        operation: TaskOperationId::new_v7(),
-        ..key
+    let ExecutorFact::QueuedInputGranted {
+        operation,
+        grant,
+        queued_bytes,
+    } = inbox.commit(input)
+    else {
+        panic!("same queued input grant");
     };
-    assert!(inputs.take(published.grant, wrong).is_none());
-    let replay = SendKey {
-        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(2).unwrap())),
-        ..key
+    assert_eq!(
+        (operation, queued_bytes, grant.generation()),
+        (key.operation, 8192, key.generation)
+    );
+    let second_command = command();
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let input = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(input) = drive(&mut wc) {
+                break input;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let ExecutorFact::QueuedInputGranted { grant: second, .. } = inbox.commit(input) else {
+        panic!("same paid result role admitted a fresh send generation");
     };
-    assert!(inputs.take(published.grant, replay).is_none());
-    let original_grant = inputs
-        .take(published.grant, key)
-        .expect("same original WC grant");
-    assert_eq!(original_grant.key(), key);
-    assert!(inputs.take(published.grant, key).is_none());
-    drop(original_grant);
-    drop(payload_retention);
-    assert!(result.close_result_after_exit().unwrap());
+    assert_eq!(second.generation(), replay.generation);
+    assert_ne!(grant, second);
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), second_command)
+        .unwrap();
+    assert!(drive(&mut wc).is_none());
+    assert_eq!(retired.load(Ordering::SeqCst), 2);
+    {
+        let mut admission = admission.lock().unwrap();
+        assert!(admission.take_grant(grant, replay).is_none());
+        assert!(admission.take_grant(second, key).is_none());
+        let first = admission.take_grant(grant, key).expect("same first grant");
+        let replay = admission
+            .take_grant(second, replay)
+            .expect("same replay grant");
+        let pin = admission
+            .take_payload(payload)
+            .expect("only first grant retained original payload");
+        drop((first, replay, pin));
+    }
+    fixture.scope.reap_ready(128).unwrap();
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
     host.close_registration();
     while let Some(turn) = inbox.runtime.claim_host_actor() {
         host.drive(Tick(1), turn);
