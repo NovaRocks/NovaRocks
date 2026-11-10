@@ -313,7 +313,8 @@ impl TestActor for WithdrawalTarget {
         value: FrontendInput,
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
-        if matches!(value, FrontendInput::Test(_)) {
+        if let FrontendInput::Test(value) = value {
+            assert_ne!(value, u64::MAX, "transport fixture Core failure");
             let (effect, guard) = self.1.pop_front().expect("one original transport command");
             let work = match guard {
                 Some(guard) => {
@@ -393,25 +394,41 @@ impl WithdrawalInbox {
         commands: impl IntoIterator<Item = TransportCommand>,
         mailbox: [usize; 4],
     ) -> Self {
+        Self::with_failure_work(scope, commands, mailbox, None)
+    }
+
+    pub(crate) fn with_failure_work(
+        scope: &ScopeHandle,
+        commands: impl IntoIterator<Item = TransportCommand>,
+        mailbox: [usize; 4],
+        failure: Option<&novarocks_control_runtime::obligation::WorkObligation>,
+    ) -> Self {
         let runtime = ActorRuntime::new();
         let actor = ActorId::new(1).unwrap();
         let source = ActorId::new(2).unwrap();
         let observed: ObservedWithdrawals = Arc::default();
-        let registration = runtime
-            .register_bound_with_source_cut(
+        let target = FrontendActor::Test(Box::new(WithdrawalTarget(
+            observed.clone(),
+            commands.into_iter().collect(),
+        )));
+        let config = ActorConfig {
+            mailbox,
+            ..Self::CONFIG
+        };
+        let registration = match failure {
+            Some(work) => runtime.register_supervised_bound_with_source_cut(
                 actor,
                 scope.clone(),
-                FrontendActor::Test(Box::new(WithdrawalTarget(
-                    observed.clone(),
-                    commands.into_iter().collect(),
-                ))),
-                ActorConfig {
-                    mailbox,
-                    ..Self::CONFIG
-                },
+                target,
+                config,
+                work,
                 source,
-            )
-            .unwrap_or_else(|(error, _)| panic!("{error}"));
+            ),
+            None => {
+                runtime.register_bound_with_source_cut(actor, scope.clone(), target, config, source)
+            }
+        }
+        .unwrap_or_else(|(error, _)| panic!("{error}"));
         Self {
             runtime,
             registration,

@@ -878,6 +878,11 @@ impl<A: Actor> ActorHostTurn<A> {
             && Arc::ptr_eq(&self.node.scope, &registration.scope)
             && Arc::ptr_eq(&self.node.origin, &registration.origin)
     }
+    /// Seal drained ingress while this original host still holds its turn.
+    /// The Core scheduler must be idle, including any concurrent claim.
+    pub fn seal_drained(&self) -> Result<(), ActorTurnError> {
+        self.runtime.seal_actor_node(&self.node, true)
+    }
     /// Unload execution only after its actual custody retires. The same
     /// actor registration, scheduler address and builtin timer survive.
     pub fn detach_execution(&mut self, process: &ScopeHandle) -> Result<(), ActorTurnError> {
@@ -2943,6 +2948,14 @@ impl<A: Actor> ActorRuntime<A> {
     /// Work remains counted and remove_actor still independently requires join.
     pub fn seal_actor(&self, actor: ActorId) -> Result<(), ActorTurnError> {
         let node = self.node(actor)?;
+        self.seal_actor_node(&node, false)
+    }
+    fn seal_actor_node(
+        &self,
+        node: &ActorCell<A>,
+        host_claimed: bool,
+    ) -> Result<(), ActorTurnError> {
+        let actor = node.id;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         if inbox.external_open
             || !inbox.inputs.is_empty()
@@ -2952,18 +2965,30 @@ impl<A: Actor> ActorRuntime<A> {
         {
             return Err(ActorTurnError::ActorNotRetired);
         }
-        if self.close_metadata_waiters_locked(&node, &mut inbox) {
+        if self.close_metadata_waiters_locked(node, &mut inbox) {
             return Err(ActorTurnError::ActorNotRetired);
         }
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
-        if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
+        if !state
+            .actors
+            .get(&actor)
+            .is_some_and(|actual| std::ptr::eq(actual.as_ref(), node))
+        {
+            return Err(ActorTurnError::EffectTicketOriginMismatch);
+        }
+        let host_ready = if host_claimed {
+            state.effect_ready.is_claimed(actor)?
+        } else {
+            state.effect_ready.is_idle(actor)?
+        };
+        if !state.ready.is_idle(actor)? || !host_ready {
             return Err(SchedulerError::Busy.into());
         }
         inbox.sealed = true;
         inbox.timer_closed = true;
         inbox.failed_custodian_timer = None;
-        // All actual inputs and scheduler claims are empty under these same
-        // locks. Withdrawing the unused builtin cannot race a later Core turn.
+        // Input custody and the Core queue are empty under these same locks.
+        // Withdrawing the unused builtin cannot race a later Core turn.
         inbox.failure_position = None;
         state.timers.cancel(actor);
         state.timers.acknowledge_tick(actor);

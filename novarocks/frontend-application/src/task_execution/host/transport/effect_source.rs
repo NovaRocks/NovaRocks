@@ -33,6 +33,9 @@ use crate::{
     },
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
+    task_execution::host::failure_supervisor::{
+        FailureCleanupPort, FailureSupervisor, RunningFailureSupervisor,
+    },
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent, QueuedInputPayload},
@@ -41,7 +44,10 @@ use novarocks_attempt_protocol::{
     start::PayloadRef,
 };
 use novarocks_control_runtime::{
-    actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
+    actor_turn::{
+        ActorHostTurn, ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket,
+        TimerSourceState,
+    },
     causal_input::CausalInputObligation,
     exit_custody::ExitCustody,
     obligation::WorkRetirementObserver,
@@ -51,6 +57,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::{
     identity::{ActorId, InputId, Tick},
     mailbox::InputClass,
+    scheduler::SchedulerError,
 };
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::TaskOperationId;
@@ -58,6 +65,7 @@ use novarocks_types::BackendProcessId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
+    task::Poll,
 };
 
 type Position = CausalInputObligation<FrontendActor>;
@@ -90,6 +98,16 @@ struct SendInFlight {
     retired: bool,
 }
 
+pub(crate) struct AttemptFailureBinding {
+    pub(crate) supervisor: FailureSupervisor,
+    pub(crate) port: Box<dyn FailureCleanupPort>,
+}
+
+enum Supervisor {
+    Armed(AttemptFailureBinding),
+    Running(RunningFailureSupervisor),
+}
+
 #[must_use = "the failure custodian owns the original send result and header"]
 pub(crate) struct FailedSendResult {
     pub(crate) effect: AttemptActionId,
@@ -115,6 +133,9 @@ pub(crate) struct AttemptTransportSource {
     admission_scan: usize,
     pending: Option<Prepaid>,
     failure: Option<FailureContext>,
+    supervisor: Option<Supervisor>,
+    in_flight: BTreeSet<AttemptActionId>,
+    external_closed: bool,
     other: Box<dyn EffectSource>,
 }
 
@@ -126,7 +147,7 @@ impl AttemptTransportSource {
         scope: ScopeHandle,
         admission: AdmissionSource,
         send: AttemptSendSource,
-        failure: FailureContext,
+        failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
@@ -149,8 +170,61 @@ impl AttemptTransportSource {
             send_scan: 0,
             admission_scan: 0,
             pending: None,
-            failure: Some(failure),
+            failure: Some(failure.0),
+            supervisor: Some(Supervisor::Armed(failure.1)),
+            in_flight: BTreeSet::new(),
+            external_closed: false,
             other,
+        }
+    }
+
+    fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
+        let closing = self.result_admission_closed();
+        match self.supervisor.as_mut() {
+            Some(Supervisor::Armed(_)) if closing => {
+                let actor = self.registration.actor();
+                if self
+                    .runtime
+                    .snapshot(actor)
+                    .expect("original attempt")
+                    .failed
+                    || !matches!(
+                        self.runtime.timer_source_state(actor),
+                        Ok(TimerSourceState::ClosedDrained)
+                    )
+                {
+                    return false;
+                }
+                match turn.seal_drained() {
+                    Ok(()) => {}
+                    Err(
+                        ActorTurnError::ActorNotRetired
+                        | ActorTurnError::Scheduler(SchedulerError::Busy),
+                    ) => return false,
+                    Err(error) => std::panic::resume_unwind(Box::new(error)),
+                }
+                let Some(Supervisor::Armed(original)) = self.supervisor.take() else {
+                    unreachable!()
+                };
+                self.supervisor = Some(Supervisor::Running(
+                    original.supervisor.close_unused(original.port),
+                ));
+                // Poll the new Join on the next turn to register this host's wake.
+                true
+            }
+            Some(Supervisor::Running(running)) => match running.progress() {
+                Poll::Pending => false,
+                Poll::Ready(Ok(())) => {
+                    self.supervisor.take();
+                    true
+                }
+                Poll::Ready(Err(error)) => {
+                    self.other
+                        .retain_transport_failure(Box::new((error, running.panic().clone())));
+                    false
+                }
+            },
+            _ => false,
         }
     }
 
@@ -349,7 +423,13 @@ impl EffectSource for AttemptTransportSource {
         result: Position,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::Admission => Ok(self.admission.bind(ticket, result)),
+            Prepaid::Admission => {
+                let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                    unreachable!()
+                };
+                assert!(self.in_flight.insert(effect.protocol.id));
+                Ok(self.admission.bind(ticket, result))
+            }
             Prepaid::Other => {
                 if let FrontendEffect::Attempt(effect) = &ticket.effect {
                     match effect.protocol.body {
@@ -379,6 +459,7 @@ impl EffectSource for AttemptTransportSource {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
                 };
+                assert!(self.in_flight.insert(effect.protocol.id));
                 let (job, header) = prepared
                     .bind_tracked(runtime, ticket, result, &mut self.admission)
                     .map_err(|original| EffectBindRefusal {
@@ -479,6 +560,7 @@ impl EffectSource for AttemptTransportSource {
                 }
             }
             TransportSourceEvent::Retired => {
+                self.in_flight.remove(&effect);
                 if let Some(row) = self.send_live.get_mut(&effect) {
                     row.retired = true;
                 } else if self.failed_sends.remove(&effect) {
@@ -511,11 +593,28 @@ impl EffectSource for AttemptTransportSource {
     ) {
         assert!(context.is_none());
         let original = self.failure.take().expect("one original failure lifecycle");
-        self.other.owner_failed_cleanup(ticket, Some(original));
+        match self.supervisor.take() {
+            Some(Supervisor::Armed(binding)) => {
+                self.close_external();
+                self.supervisor = Some(Supervisor::Running(binding.supervisor.start(
+                    ticket,
+                    original,
+                    std::mem::take(&mut self.in_flight),
+                    binding.port,
+                )));
+            }
+            None => std::panic::resume_unwind(Box::new((ticket, original))),
+            Some(Supervisor::Running(running)) => {
+                std::panic::resume_unwind(Box::new((ticket, original, running)))
+            }
+        }
     }
 
     fn close_external(&mut self) {
-        self.other.close_external();
+        if !self.external_closed {
+            self.other.close_external();
+            self.external_closed = true;
+        }
     }
 
     fn result_admission_closed(&self) -> bool {
@@ -531,10 +630,16 @@ impl EffectSource for AttemptTransportSource {
     ) -> SourceProgress {
         let mut units = 0;
         let mut progressed = false;
+        let supervisor_advanced = if budget != 0 && self.supervisor.is_some() {
+            units += 1;
+            self.advance_supervisor(turn)
+        } else {
+            false
+        };
         if self.admission_scan == 0 {
             self.admission_scan = self.admission.awaiting_result_retirement();
         }
-        if budget != 0 && self.admission_scan != 0 {
+        if units < budget && self.admission_scan != 0 {
             self.admission_scan -= 1;
             units += 1;
             progressed |= self
@@ -606,11 +711,13 @@ impl EffectSource for AttemptTransportSource {
             .other
             .progress_retirement(runtime, turn, now, budget - units);
         progress.units += units;
-        progress.progressed |= progressed;
-        progress.more |= self.admission_scan != 0
+        progress.progressed |= progressed || supervisor_advanced;
+        progress.more |= supervisor_advanced
+            || self.admission_scan != 0
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
-        progress.retired &= self.report_author.is_none()
+        progress.retired &= self.supervisor.is_none()
+            && self.report_author.is_none()
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()
             && self.requests.is_empty()

@@ -28,10 +28,14 @@ use novarocks_control_runtime::{
     reported_work::ReportedWork,
     transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::{completion::ConsumerKind, identity::ConsumerId};
+use novarocks_control_runtime_core::{
+    completion::ConsumerKind,
+    identity::{ConsumerId, ScopedWorkRef},
+};
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::{AbortParticipation, ParticipationRef};
 use std::{
+    collections::BTreeSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -111,11 +115,22 @@ impl FailureSupervisor {
         }
     }
 
+    pub(crate) fn matches(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        registration: &ActorRegistration,
+        work: ScopedWorkRef,
+    ) -> bool {
+        self.runtime.same_runtime(runtime)
+            && self.registration.same_registration(registration)
+            && self.original.work().reference() == work
+    }
+
     pub(crate) fn start(
         self,
         ticket: EffectTicket<FrontendEffect>,
         context: FailureContext,
-        unresolved_actions: Box<[AttemptActionId]>,
+        unresolved_actions: BTreeSet<AttemptActionId>,
         mut port: Box<dyn FailureCleanupPort>,
     ) -> RunningFailureSupervisor {
         assert_eq!(ticket.actor, self.registration.actor());
@@ -123,16 +138,15 @@ impl FailureSupervisor {
         self.runtime
             .validate_failure_effect_ticket(&ticket)
             .expect("original supervisor ticket");
-        let scope = self.original.work().scope().clone();
-        let header = self.original.work().retirement_observer();
-        let report = self.original.report().clone();
-        let (custody, exit) = ExitCustody::from_admitted(self.original);
         let ticket = Arc::new(ticket);
         let body_ticket = ticket.clone();
         let runtime = self.runtime.clone();
-        let panic = PanicSink::new();
         let body = async move {
-            let publication = context.publish(&runtime, &body_ticket, unresolved_actions);
+            let publication = context.publish(
+                &runtime,
+                &body_ticket,
+                unresolved_actions.into_iter().collect(),
+            );
             let aborts = context.lifecycle.started_aborts().await;
             for &request in &aborts {
                 port.abort_once(request).await;
@@ -154,6 +168,33 @@ impl FailureSupervisor {
             })
             .await;
         };
+        self.launch(Some(ticket), body)
+    }
+
+    pub(crate) fn close_unused(
+        self,
+        port: Box<dyn FailureCleanupPort>,
+    ) -> RunningFailureSupervisor {
+        let state = self
+            .runtime
+            .snapshot(self.registration.actor())
+            .expect("original attempt registration");
+        assert!(state.sealed && !state.failed);
+        self.launch(None, async move {
+            drop(port);
+        })
+    }
+
+    fn launch(
+        self,
+        ticket: Option<Arc<EffectTicket<FrontendEffect>>>,
+        body: impl Future<Output = ()> + Send + 'static,
+    ) -> RunningFailureSupervisor {
+        let scope = self.original.work().scope().clone();
+        let header = self.original.work().retirement_observer();
+        let report = self.original.report().clone();
+        let (custody, exit) = ExitCustody::from_admitted(self.original);
+        let panic = PanicSink::new();
         let join = self.executor.spawn(run_future(exit, body, panic.clone()));
         let waker = Waker::from(Arc::new(SupervisorWake {
             runtime: self.runtime.clone(),
@@ -167,10 +208,11 @@ impl FailureSupervisor {
             custody,
             report,
             observer: self.observer,
-            ticket: Some(ticket),
+            ticket,
             join: Some(join),
             panic,
             waker,
+            finished: false,
         }
     }
 }
@@ -194,6 +236,7 @@ pub(crate) struct RunningFailureSupervisor {
     join: Option<JoinHandle<Result<(), ExitWorkError>>>,
     panic: PanicSink,
     waker: Waker,
+    finished: bool,
 }
 
 impl RunningFailureSupervisor {
@@ -205,7 +248,7 @@ impl RunningFailureSupervisor {
     /// the actual carrier. Publication and a failed Join leave the ticket live.
     pub(crate) fn progress(&mut self) -> Poll<Result<(), FailureSupervisorError>> {
         let Some(join) = self.join.as_mut() else {
-            return if self.ticket.is_none() {
+            return if self.finished {
                 Poll::Ready(Ok(()))
             } else {
                 Poll::Pending
@@ -231,20 +274,22 @@ impl RunningFailureSupervisor {
                 .try_retire()
                 .expect("supervisor actual retirement")
         );
-        let ticket =
-            Arc::into_inner(self.ticket.take().unwrap()).expect("supervisor capture exited");
-        let input = ticket.input;
-        self.runtime
-            .effect_completed_for(&self.registration, ticket)
-            .expect("original supervisor completion");
-        self.runtime
-            .retire_input(self.registration.actor(), input)
-            .expect("original supervisor input");
+        if let Some(ticket) = self.ticket.take() {
+            let ticket = Arc::into_inner(ticket).expect("supervisor capture exited");
+            let input = ticket.input;
+            self.runtime
+                .effect_completed_for(&self.registration, ticket)
+                .expect("original supervisor completion");
+            self.runtime
+                .retire_input(self.registration.actor(), input)
+                .expect("original supervisor input");
+        }
         assert!(
             self.scope
                 .reap_observed_header(&self.header)
                 .expect("original supervisor header")
         );
+        self.finished = true;
         Poll::Ready(Ok(()))
     }
 }

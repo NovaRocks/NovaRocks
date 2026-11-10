@@ -56,8 +56,8 @@ pub(crate) use admission_source::{AdmissionResultRefusal, AdmissionSource};
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
 pub(crate) use effect_source::{
-    AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource, FailedSendResult,
-    NativeReportReferences,
+    AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
+    FailedSendResult, NativeReportReferences,
 };
 pub(crate) use granted_inputs::GrantedInputs;
 #[cfg(test)]

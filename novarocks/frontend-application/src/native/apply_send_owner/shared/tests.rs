@@ -1665,15 +1665,20 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
 
 #[tokio::test]
 async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal() {
-    run_actor_send(true).await;
+    run_actor_send(true, false).await;
 }
 
 #[tokio::test]
 async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
-    run_actor_send(false).await;
+    run_actor_send(false, false).await;
 }
 
-async fn run_actor_send(withdraw: bool) {
+#[tokio::test]
+async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
+    run_actor_send(false, true).await;
+}
+
+async fn run_actor_send(withdraw: bool, fail_core: bool) {
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{
@@ -1686,6 +1691,9 @@ async fn run_actor_send(withdraw: bool) {
     use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
+    use crate::task_execution::host::failure_supervisor::{
+        FailureCleanupPort, FailureCleanupRequest, FailureSupervisor,
+    };
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
         effect::{
@@ -1701,8 +1709,10 @@ async fn run_actor_send(withdraw: bool) {
         obligation::WorkObligation,
         transaction::RuntimeError,
     };
-    use novarocks_control_runtime_core::{identity::Tick, scope::ScopeError};
-    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+    use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass, scope::ScopeError};
+    use novarocks_coordination_contract::{
+        AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody, MonotonicInstant,
+    };
     use novarocks_execution_contract::{AbortCause, AbortParticipation, ParticipationRef};
     use novarocks_types::FrontendProcessId;
 
@@ -1906,10 +1916,43 @@ async fn run_actor_send(withdraw: bool) {
         }
     }
 
-    let inbox = custody::tests::WithdrawalInbox::with_commands(
+    #[derive(Default)]
+    struct CleanupState {
+        aborts: Vec<AbortParticipation>,
+        residual: Option<FailureCleanupRequest>,
+        dropped: bool,
+    }
+    struct CleanupPort(Arc<Mutex<CleanupState>>);
+    impl FailureCleanupPort for CleanupPort {
+        fn abort_once(
+            &mut self,
+            request: AbortParticipation,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().aborts.push(request);
+            })
+        }
+        fn finish(
+            self: Box<Self>,
+            original: FailureCleanupRequest,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                assert!(self.0.lock().unwrap().residual.replace(original).is_none());
+            })
+        }
+    }
+    impl Drop for CleanupPort {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().dropped = true;
+        }
+    }
+
+    let failure_work = roles.cleanup(parent.id());
+    let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
         [(admit, None), (send.clone(), Some(queue))],
         [8; 4],
+        Some(failure_work.work()),
     );
     let admit_command = inbox.reserve_command(&parent);
     let send_command = inbox.reserve_command(&parent);
@@ -1966,6 +2009,19 @@ async fn run_actor_send(withdraw: bool) {
         ))),
     );
     let receipt = Arc::new(Mutex::new(None));
+    let publications = Arc::new(FailurePublications::new(
+        inbox.registration().clone(),
+        AttemptActivationIdentity::from_parts(1, execution, 1),
+        &roles.scope,
+    ));
+    let cleanup = Arc::new(Mutex::new(CleanupState::default()));
+    let supervisor = FailureSupervisor::new(
+        actor_runtime.clone(),
+        inbox.registration().clone(),
+        failure_work,
+        observer(),
+        handle.clone(),
+    );
     host.register(HostBinding {
         scope: roles.scope.clone(),
         registration: inbox.registration().clone(),
@@ -1992,16 +2048,16 @@ async fn run_actor_send(withdraw: bool) {
                 report_author,
                 idle: send_idle,
             },
-            FailureContext {
-                lifecycle,
-                publications: Arc::new(FailurePublications::new(
-                    inbox.registration().clone(),
-                    novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
-                        1, execution, 1,
-                    ),
-                    &roles.scope,
-                )),
-            },
+            (
+                FailureContext {
+                    lifecycle,
+                    publications: publications.clone(),
+                },
+                transport::AttemptFailureBinding {
+                    supervisor,
+                    port: Box::new(CleanupPort(cleanup.clone())),
+                },
+            ),
             Box::new(ScopeOwner {
                 scope: roles.scope.clone(),
                 parent,
@@ -2098,6 +2154,7 @@ async fn run_actor_send(withdraw: bool) {
     .await
     .unwrap();
     assert_eq!(starts.was_started(participation), !withdraw);
+    drop(starts);
     if !withdraw {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -2129,6 +2186,25 @@ async fn run_actor_send(withdraw: bool) {
             .is_empty()
     );
     actor_runtime.retire_input(actor, send_input).unwrap();
+    if fail_core {
+        let failed = actor_runtime
+            .reserve_input(actor, actor, InputClass::Lifecycle)
+            .unwrap()
+            .fill(FrontendInput::Test(u64::MAX))
+            .unwrap();
+        assert!(actor_runtime.poll_one(Tick(2)).unwrap());
+        advance_host();
+        let lost = tokio::time::timeout(Duration::from_secs(1), publications.take_lost())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&lost.body, AttemptToLogicalBody::AttemptLost { unknown_participations, unresolved_actions, .. }
+            if &**unknown_participations == &[participation] && &**unresolved_actions == &[send_id])
+        );
+        actor_runtime.retire_input(actor, failed).unwrap();
+    }
+    actor_runtime.close_actor_admission(actor).unwrap();
+    actor_runtime.close_timer_source(actor).unwrap();
     host.close_registration();
     advance_host();
     if !withdraw {
@@ -2142,16 +2218,30 @@ async fn run_actor_send(withdraw: bool) {
             Some(novarocks_execution_contract::OperationOutcome::Accepted)
         );
         drop(original);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !host.is_empty() {
-                drive(&mut wc.driver);
-                advance_host();
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
     }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.is_empty() {
+            drive(&mut wc.driver);
+            advance_host();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let cleanup = cleanup.lock().unwrap();
+    assert!(cleanup.dropped);
+    if fail_core {
+        let [abort] = cleanup.aborts.as_slice() else {
+            panic!("one frozen failure abort")
+        };
+        assert_eq!(abort.participation(), participation);
+        let residual = cleanup.residual.as_ref().unwrap();
+        assert_eq!(&*residual.unknown_participations, &[participation]);
+        residual.publication.unwrap();
+    } else {
+        assert!(cleanup.aborts.is_empty() && cleanup.residual.is_none());
+    }
+    drop(cleanup);
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
     let deadline = Instant::now() + Duration::from_secs(3);
     runtime.drain_original_apply_until(deadline).await.unwrap();

@@ -949,7 +949,7 @@ impl EffectSource for SupervisorSource {
                 .is_none()
         );
         let (supervisor, context, port) = self.setup.take().unwrap();
-        self.running = Some(supervisor.start(ticket, context, Box::new([self.unresolved]), port));
+        self.running = Some(supervisor.start(ticket, context, [self.unresolved].into(), port));
     }
 
     fn close_external(&mut self) {}

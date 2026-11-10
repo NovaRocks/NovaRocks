@@ -95,6 +95,7 @@ pub(crate) struct AttemptActorRegistration {
     members: Option<Arc<[FrozenMember]>>,
     failure_lifecycle: Option<FailureLifecycle>,
     failure_publications: Arc<FailurePublications>,
+    failure_work: ScopedWorkRef,
     root_control: RootControlBinding,
     ordered_bound: bool,
     startup_reserved: bool,
@@ -127,6 +128,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) admission: super::transport::AdmissionSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
+    pub(crate) failure: super::transport::AttemptFailureBinding,
 }
 
 /// One paid original Lifecycle position, reused only after actual input
@@ -328,6 +330,10 @@ impl AttemptActorRegistration {
             || !transport
                 .retirement
                 .matches_registration(runtime, &self.original)
+            || !transport
+                .failure
+                .supervisor
+                .matches(runtime, &self.original, self.failure_work)
         {
             return Err((
                 AttemptRegistrationError::InvalidConfig(
@@ -354,6 +360,7 @@ impl AttemptActorRegistration {
             admission,
             send,
             executor: native,
+            failure,
         } = transport;
         Ok(PreparedAttemptHost {
             binding: HostBinding {
@@ -369,13 +376,16 @@ impl AttemptActorRegistration {
                     self.scope.clone(),
                     admission,
                     send,
-                    FailureContext {
-                        lifecycle: self
-                            .failure_lifecycle
-                            .take()
-                            .expect("original failure lifecycle"),
-                        publications: self.failure_publications.clone(),
-                    },
+                    (
+                        FailureContext {
+                            lifecycle: self
+                                .failure_lifecycle
+                                .take()
+                                .expect("original failure lifecycle"),
+                            publications: self.failure_publications.clone(),
+                        },
+                        failure,
+                    ),
                     source,
                 )),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
@@ -695,6 +705,7 @@ impl AttemptActor {
                 members.iter().map(|member| member.participation),
             )),
             failure_publications,
+            failure_work: failure_work.reference(),
             root_control,
             ordered_bound: false,
             startup_reserved: false,
