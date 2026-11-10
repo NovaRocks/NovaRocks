@@ -142,7 +142,7 @@ pub(crate) use sink::{
 pub(crate) use wire::AttemptWireFacts;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[path = "task_transport/action_input.rs"]
 mod action_input;

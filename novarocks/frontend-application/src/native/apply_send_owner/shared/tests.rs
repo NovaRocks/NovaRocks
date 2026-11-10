@@ -90,6 +90,12 @@ struct Governed {
 }
 impl Governed {
     fn new() -> Self {
+        Self::for_control_origin(None)
+    }
+
+    fn for_control_origin(
+        peer_endpoint: Option<&novarocks_execution_contract::RuntimeEndpoint>,
+    ) -> Self {
         // Use the existing Native author's actual proposal-observer geometry;
         // this fixture creates no alternate WC grant or process quota wallet.
         let source =
@@ -133,7 +139,7 @@ impl Governed {
             listener.local_addr().unwrap(),
         );
         let origin = novarocks_native_adapter::FrontendNativeTransport::plaintext()
-            .selected_network_origin(endpoint.native_endpoint())
+            .selected_network_origin(peer_endpoint.unwrap_or(&endpoint).native_endpoint())
             .unwrap()
             .into_owned();
         let mut binding = scope.begin_control_binding().unwrap();
@@ -1659,6 +1665,15 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
 
 #[tokio::test]
 async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal() {
+    run_actor_send(true).await;
+}
+
+#[tokio::test]
+async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
+    run_actor_send(false).await;
+}
+
+async fn run_actor_send(withdraw: bool) {
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{
@@ -1688,9 +1703,14 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
     use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
 
     let roles = Roles::new();
-    let mut wc = Governed::new();
+    let mut peer = if withdraw {
+        None
+    } else {
+        Some(crate::native::task_transport::tests::Loopback::start().await)
+    };
+    let mut wc = Governed::for_control_origin(peer.as_ref().map(|peer| &peer.control_endpoint));
     let handle = Handle::current();
-    let runtime = FrontendDataRuntime::new(handle.clone());
+    let mut runtime = FrontendDataRuntime::new(handle.clone());
     let (parent, payer) = roles
         .scope
         .reserve_next(
@@ -1762,6 +1782,7 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
         closing: bool,
         exited: bool,
         finished: bool,
+        receipt: Arc<Mutex<Option<crate::task_execution::intent::OperationAcknowledgement>>>,
     }
     impl EffectSource for ScopeOwner {
         fn prepay_result(
@@ -1793,6 +1814,26 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
                 originals.into_values().next(),
                 Some(OperationIntent::CancelTask(_))
             ));
+        }
+        fn transport_event(&mut self, _: AttemptActionId, original: custody::TransportSourceEvent) {
+            match original {
+                custody::TransportSourceEvent::Report(transport::SendReportReturn::Receipt {
+                    key,
+                    delivery_error: None,
+                    receipt,
+                }) => {
+                    assert_eq!(key.operation, receipt.original.operation_id());
+                    assert!(receipt.unpublished.is_none());
+                    assert!(
+                        self.receipt
+                            .lock()
+                            .unwrap()
+                            .replace(receipt.original)
+                            .is_none()
+                    );
+                }
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
         }
         fn owner_failed_pending(&mut self, original: PendingHandoff) {
             std::panic::resume_unwind(Box::new(original));
@@ -1877,8 +1918,10 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
     let report_author = roles.cleanup(parent.id());
     let mut requests = transport::FrozenSendRequests::default();
     assert!(requests.install(operation).is_ok());
-    let endpoint =
-        novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap());
+    let endpoint = peer.as_ref().map_or_else(
+        || novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()),
+        |peer| peer.control_endpoint.native_endpoint().clone(),
+    );
     let context = transport::SendContext {
         registration: inbox.registration().clone(),
         ledger: roles.ledger.clone(),
@@ -1908,6 +1951,7 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
             ProcessClock::default(),
         ))),
     );
+    let receipt = Arc::new(Mutex::new(None));
     host.register(HostBinding {
         scope: roles.scope.clone(),
         registration: inbox.registration().clone(),
@@ -1941,6 +1985,7 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
                 closing: false,
                 exited: false,
                 finished: false,
+                receipt: receipt.clone(),
             }),
         )),
         executor: Arc::new(transport::AttemptTransportExecutor {
@@ -1976,10 +2021,12 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
             tokio::task::yield_now().await;
         }
     }).await.unwrap();
-    assert_eq!(
-        send.handoff().unwrap().withdraw(),
-        novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
-    );
+    if withdraw {
+        assert_eq!(
+            send.handoff().unwrap().withdraw(),
+            novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
+        );
+    }
     let send_input = send_command.fill(FrontendInput::Test(1)).unwrap();
     assert!(actor_runtime.poll_one(Tick(1)).unwrap());
     assert_eq!(
@@ -1989,29 +2036,67 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
             .0,
         reservation
     );
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut started = false;
         loop {
+            drive(&mut wc.driver);
             advance_host();
             if let Some((_, fact)) = inbox.try_commit_next() {
-                assert!(matches!(fact, ExecutorFact::Withdrawn {
-                    effect, outcome: WithdrawalOutcome::DefinitelyUnsent,
-                } if effect == send_id));
-                assert_eq!(
-                    roles
-                        .ledger
-                        .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
-                        .unwrap()
-                        .unwrap()
-                        .used,
-                    [0, 0]
-                );
-                break;
+                match fact {
+                    ExecutorFact::Withdrawn {
+                        effect,
+                        outcome: WithdrawalOutcome::DefinitelyUnsent,
+                    } if withdraw => {
+                        assert_eq!(effect, send_id);
+                        break;
+                    }
+                    ExecutorFact::SendStarted { effect, .. } if !withdraw => {
+                        assert_eq!(effect, send_id);
+                        assert!(!started);
+                        started = true;
+                    }
+                    ExecutorFact::Operation(observed) if !withdraw => {
+                        assert!(started);
+                        assert_eq!(observed.generation, key.generation);
+                        assert_eq!(observed.reply.operation_id(), key.operation);
+                        assert_eq!(
+                            observed.reply.worker_outcome(),
+                            Some(novarocks_execution_contract::OperationOutcome::Accepted)
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected composed send fact: {other:?}"),
+                }
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
+    if !withdraw {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                drive(&mut wc.driver);
+                advance_host();
+                if receipt.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peer.as_ref().unwrap().control_requests(), 1);
+    }
+    assert_eq!(
+        roles
+            .ledger
+            .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+            .unwrap()
+            .unwrap()
+            .used,
+        [0, 0]
+    );
     assert!(
         actor_runtime
             .step_reservations(actor, send_input, None, 1)
@@ -2021,6 +2106,37 @@ async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal
     actor_runtime.retire_input(actor, send_input).unwrap();
     host.close_registration();
     advance_host();
+    if !withdraw {
+        assert!(
+            !host.is_empty(),
+            "the original Native row still has a reply alias"
+        );
+        let original = receipt.lock().unwrap().take().unwrap();
+        assert_eq!(
+            original.worker_outcome(),
+            Some(novarocks_execution_contract::OperationOutcome::Accepted)
+        );
+        drop(original);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !host.is_empty() {
+                drive(&mut wc.driver);
+                advance_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    runtime.drain_original_apply_until(deadline).await.unwrap();
+    runtime
+        .drain_original_subscriptions_until(deadline)
+        .await
+        .unwrap();
+    runtime.drain_native_outgoing_until(deadline).await.unwrap();
+    if let Some(peer) = peer.as_mut() {
+        assert!(peer.settle().await);
+    }
     assert!(wc.finish());
 }

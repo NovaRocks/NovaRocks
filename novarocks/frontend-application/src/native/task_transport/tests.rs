@@ -911,10 +911,10 @@ impl NovaRocksGrpc for TaskWirePeer {
 }
 
 /// Two independent sockets for one shared process fixture.
-struct Loopback {
+pub(in crate::native) struct Loopback {
     peer: TaskWirePeer,
     endpoint: RuntimeEndpoint,
-    control_endpoint: RuntimeEndpoint,
+    pub(in crate::native) control_endpoint: RuntimeEndpoint,
     shutdown: [Option<tokio::sync::oneshot::Sender<()>>; 2],
     served: [tokio::task::JoinHandle<()>; 2],
 }
@@ -953,7 +953,7 @@ impl Loopback {
         )
     }
 
-    async fn start() -> Self {
+    pub(in crate::native) async fn start() -> Self {
         let peer = TaskWirePeer::default();
         let (endpoint, data_shutdown, data_served) = Self::serve(peer.clone()).await;
         let mut control_peer = peer.clone();
@@ -977,7 +977,11 @@ impl Loopback {
         )
     }
 
-    async fn settle(&mut self) -> bool {
+    pub(in crate::native) fn control_requests(&self) -> usize {
+        self.peer.control_requests()
+    }
+
+    pub(in crate::native) async fn settle(&mut self) -> bool {
         for shutdown in &mut self.shutdown {
             if let Some(shutdown) = shutdown.take() {
                 let _ = shutdown.send(());
