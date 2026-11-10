@@ -244,20 +244,37 @@ impl Roles {
             layout,
         }
     }
-    fn bind(
+    fn parent(
         &self,
-        guard: StepRegistration,
-    ) -> (ReportedWork, ReservationObligation, ReservationId) {
+        backend: BackendProcessId,
+        bytes: usize,
+    ) -> (ReportedWork, transport::QueueWindow, ReservationId) {
+        let lane = TransportCapacityLane::Control;
+        let mut resources = self
+            .layout
+            .queue_resources(backend, lane, 1, bytes)
+            .unwrap();
+        resources.owned_slots = role_slots();
+        let guard = self
+            .scope
+            .reserve_next(
+                generation(),
+                resources,
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap();
         let (work, mut capacity) = guard.bind(WorkKind::Cleanup).unwrap();
         let principal = capacity.id();
-        let resources = capacity.resources().unwrap();
-        let quota = capacity
-            .split_next(&ReservationResources {
-                quota: resources.quota,
-                keyed: resources.keyed,
-                owned_slots: Default::default(),
-            })
-            .unwrap();
+        let queue = transport::QueueWindow::split(
+            &mut capacity,
+            self.layout.clone(),
+            backend,
+            lane,
+            1,
+            bytes,
+        )
+        .unwrap();
         let report = ReportSlot::reserve_next(
             &mut capacity,
             generation(),
@@ -267,29 +284,8 @@ impl Roles {
         .unwrap();
         (
             ReportedWork::try_new(work, capacity, report).unwrap(),
-            quota,
+            queue,
             principal,
-        )
-    }
-    fn parent(
-        &self,
-        backend: BackendProcessId,
-        bytes: usize,
-    ) -> (ReportedWork, ReservationObligation, ReservationId) {
-        let mut resources = self
-            .layout
-            .queue_resources(backend, TransportCapacityLane::Control, 1, bytes)
-            .unwrap();
-        resources.owned_slots = role_slots();
-        self.bind(
-            self.scope
-                .reserve_next(
-                    generation(),
-                    resources,
-                    WorkKind::Cleanup,
-                    WorkAdmission::External,
-                )
-                .unwrap(),
         )
     }
     fn cleanup(&self, parent: WorkId) -> ReportedWork {
@@ -352,6 +348,7 @@ struct Captures {
     encoded: Arc<Mutex<Option<EncodingChild>>>,
     inline: Option<(custody::TransportJoinRegistration, custody::EncodingBinding)>,
     fail_scope: Option<ScopeHandle>,
+    _queue: Option<transport::QueueCustody>,
     panic: PanicSink,
 }
 fn transport_factory(
@@ -494,6 +491,14 @@ fn cancel(backend: BackendProcessId) -> OperationIntent {
         CancelReason::UpstreamNoLongerNeeded,
     ))
 }
+fn send_key(operation: &OperationIntent) -> transport::SendKey {
+    use novarocks_attempt_protocol::input::SendGeneration;
+    use novarocks_coordination_contract::AttemptActionId;
+    transport::SendKey {
+        operation: operation.operation_id(),
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+    }
+}
 struct Row {
     source: OriginalTransportJoinObligation,
     retirement: SharedApplyRetirement,
@@ -559,6 +564,18 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
         OriginalTransportJoinObligation::prepare(parent, observer(), panic)
             .unwrap_or_else(|e| panic!("{}", e.error));
     let registration = source.registration();
+    let (queue_capture, legacy_queue) = if !matches!(mode, Mode::Encoded) {
+        (
+            Some(transport::QueueCustody::new(
+                queue,
+                registration.clone(),
+                Arc::from([send_key(&operation)]),
+            )),
+            None,
+        )
+    } else {
+        (None, Some(queue.into_original()))
+    };
     let encoding_id = encoding.reservation_id();
     let (slot, encoding) = match registration.attach_shared(slot, Vec::new(), encoding) {
         Err((RegistrationFailure::MissingOriginalCharge, slot, inputs, guard)) => {
@@ -626,6 +643,7 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
                     encoded: cell,
                     inline: inline.map(|binding| (source, binding)),
                     fail_scope,
+                    _queue: queue_capture,
                     panic: inner.clone(),
                 },
                 inner,
@@ -637,47 +655,69 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
         .unwrap()
         .expect("actual same row Join");
     let bound = encoded.lock().unwrap().take();
-    let (encoding, child) = if let Some(original) = bound {
-        (
-            Some(original.quota),
-            Some((original.custody, original.exit)),
-        )
-    } else {
-        let original = source.take_encoding_return().unwrap();
+    let (retirement, child) = if matches!(mode, Mode::InlineEncoded { .. }) {
+        assert!(bound.is_none());
+        let SharedApplyFunding::Encoded(mut original) =
+            source.take_apply_funding(&completion).unwrap()
+        else {
+            panic!("inline encoding returns its exact typed funding");
+        };
         assert_eq!(
-            original.is_some(),
-            matches!(mode, Mode::InlineEncoded { .. })
+            original
+                .encoding
+                .resources()
+                .unwrap()
+                .quota
+                .get(TOTAL_BYTES),
+            1
         );
-        if let Some(ref original) = original {
-            assert_eq!(original.resources().unwrap().quota.get(TOTAL_BYTES), 1);
-            assert!(matches!(
-                source.take_encoding_return(),
-                Err(custody::CustodyError::CompletionAlreadyIssued)
-            ));
-        }
-        (original, None)
-    };
-    let retirement = if let Some(encoding) = encoding {
+        assert!(source.take_apply_funding(&completion).is_err());
+        std::mem::swap(&mut original.queue, &mut original.encoding);
+        let (completion, funding) =
+            match complete_shared_join(completion, SharedApplyFunding::Encoded(original)) {
+                Err(original) => original,
+                Ok(_) => panic!("same-scope encoding and queue partitions cannot be interchanged"),
+            };
+        let SharedApplyFunding::Encoded(mut original) = funding else {
+            panic!("refusal retains both originals");
+        };
+        std::mem::swap(&mut original.queue, &mut original.encoding);
+        let retirement = complete_shared_join(completion, SharedApplyFunding::Encoded(original))
+            .unwrap_or_else(|_| panic!("same source supplies both original partitions"));
+        (retirement, None)
+    } else if matches!(mode, Mode::Unused) {
+        assert!(bound.is_none());
+        let funding = source.take_apply_funding(&completion).unwrap();
+        assert!(matches!(funding, SharedApplyFunding::UnusedQueue(_)));
+        let retirement = complete_shared_join(completion, funding)
+            .unwrap_or_else(|_| panic!("same unused queue partition"));
+        (retirement, None)
+    } else {
+        let queue = legacy_queue.expect("legacy disposal fixture owns this queue");
+        let original = bound.expect("disposal fixture holds the unexited child");
         let facts = completion.join_facts();
         let queue_id = queue.id();
-        let (completion, funds) =
-            match complete_shared_join(completion, SharedApplyFunding::UnusedQueue(queue)) {
-                Err(original) => original,
-                Ok(_) => panic!("Taken guard rejects unused funding"),
-            };
+        let (completion, funds) = match complete_shared_join_with_funding(
+            completion,
+            SharedApplyFunding::UnusedQueue(queue),
+        ) {
+            Err(original) => original,
+            Ok(_) => panic!("Taken guard rejects unused funding"),
+        };
         assert_eq!(completion.join_facts(), facts);
         let SharedApplyFunding::UnusedQueue(queue) = funds else {
             panic!("same funding returned")
         };
         assert_eq!(queue.id(), queue_id);
-        complete_shared_join(
+        let retirement = complete_shared_join_with_funding(
             completion,
-            SharedApplyFunding::Encoded(ReturnedQuota { queue, encoding }),
+            SharedApplyFunding::Encoded(ReturnedQuota {
+                queue,
+                encoding: original.quota,
+            }),
         )
-        .unwrap_or_else(|_| panic!("same encoded proof accepted"))
-    } else {
-        complete_shared_join(completion, SharedApplyFunding::UnusedQueue(queue))
-            .unwrap_or_else(|_| panic!("same unused proof accepted"))
+        .unwrap_or_else(|_| panic!("same encoded proof accepted"));
+        (retirement, Some((original.custody, original.exit)))
     };
     Row {
         source,
@@ -1057,7 +1097,6 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     let backend = BackendProcessId::new_v7();
     let operation = cancel(backend);
     let (parent, queue, principal) = roles.parent(backend, operation.queued_bytes());
-    let queue_id = queue.id();
     let encoding = roles.encoding(principal, backend, 64, WorkKind::Cleanup);
     let input = wc.admit(NativeQueuedInputQuote::for_original_native_input(
         NonZeroU64::new(Layout::new::<NativeQueuedInputGrant>().size() as u64).unwrap(),
@@ -1070,6 +1109,11 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     let (mut source, exit, launch) =
         OriginalTransportJoinObligation::prepare(parent, observer(), panic)
             .unwrap_or_else(|error| panic!("{}", error.error));
+    let queue = transport::QueueCustody::new(
+        queue,
+        source.registration(),
+        Arc::from([send_key(&operation)]),
+    );
     let withdrawal = Arc::new(HandoffCell::new());
     let arbitration = withdrawal.clone();
     let (entered, refusal_observed) = tokio::sync::oneshot::channel();
@@ -1080,14 +1124,14 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
             move |exit, registration| async move {
                 let before_handoff = async move {
                     assert!(matches!(
-                        registration.attach_send(slot, vec![input], encoding, queue_id),
+                        registration.attach_send(slot, vec![input], encoding),
                         Err(RegistrationFailure::Closed)
                     ));
                     entered.send(()).unwrap();
                     std::future::pending::<()>().await;
                 };
-                let outcome = GatedWork::new(exit, (), arbitration, inner)
-                    .run(generation(), before_handoff, |(), ()| ready(()))
+                let outcome = GatedWork::new(exit, queue, arbitration, inner)
+                    .run(generation(), before_handoff, |_, ()| ready(()))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1098,10 +1142,7 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
         )
         .unwrap();
     refusal_observed.await.unwrap();
-    let queue = match source.retire_refused_attachment(queue) {
-        Err(original) => original,
-        Ok(_) => panic!("a prepared refusal does not prove the original Join"),
-    };
+    assert!(source.take_unattached_retirement().unwrap().is_none());
     assert!(!source.try_retire().unwrap());
     assert_eq!(withdrawal.withdraw(), Withdrawal::Withdrawn);
     assert!(
@@ -1112,9 +1153,10 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     );
     assert!(!source.try_retire().unwrap());
     let (error, mut retirement) = source
-        .retire_refused_attachment(queue)
-        .unwrap_or_else(|_| panic!("joined original refusal retains the same partition"));
-    assert_eq!(error, RegistrationFailure::Closed);
+        .take_unattached_retirement()
+        .unwrap()
+        .expect("joined original refusal retains the same partition");
+    assert_eq!(error, Some(RegistrationFailure::Closed));
     assert!(!source.try_retire().unwrap());
     assert!(matches!(
         apply
@@ -1151,17 +1193,12 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
-    use novarocks_attempt_protocol::input::SendGeneration;
     use novarocks_control_runtime::exit_work::{GatedNotStarted, GatedOutcome, Withdrawal};
-    use novarocks_coordination_contract::AttemptActionId;
 
     let roles = Roles::new();
     let mut wc = transport::GovernedQueuedInputFixture::new();
     let operation = cancel(BackendProcessId::new_v7());
-    let key = transport::SendKey {
-        operation: operation.operation_id(),
-        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
-    };
+    let key = send_key(&operation);
     let input = wc.admit(key, 0);
     let (parent, queue, _) = roles.parent(operation.backend_process_id(), operation.queued_bytes());
     let panic = PanicSink::new();
@@ -1171,7 +1208,7 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             .unwrap_or_else(|error| panic!("{}", error.error));
     let registration = source.registration();
     let keys: Arc<[transport::SendKey]> = Arc::from([key]);
-    registration.register_send(&queue, keys.clone());
+    let queue = transport::QueueCustody::new(queue, registration.clone(), keys.clone());
     let input = match input.bind_send(registration.clone(), 1) {
         Err(original) => original,
         Ok(_) => panic!("the original loan requires its exact registered position"),
@@ -1183,21 +1220,20 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
     let withdrawal = Arc::new(HandoffCell::new());
     let arbitration = withdrawal.clone();
     let (entered, waiting) = tokio::sync::oneshot::channel();
-    let queue_id = queue.id();
     launch
         .spawn(
             &Handle::current(),
             exit,
             move |exit, registration| async move {
-                assert!(registration.matches_send(queue_id, &keys));
+                assert!(queue.matches_send(&registration, &keys));
                 assert!(loan.matches_send(&registration, 0, key));
                 let before_handoff = async move {
                     entered.send(()).unwrap();
                     std::future::pending::<()>().await;
                     drop(loan);
                 };
-                let outcome = GatedWork::new(exit, (), arbitration, inner)
-                    .run(generation(), before_handoff, |(), ()| ready(()))
+                let outcome = GatedWork::new(exit, queue, arbitration, inner)
+                    .run(generation(), before_handoff, |_, ()| ready(()))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1208,10 +1244,7 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         )
         .unwrap();
     waiting.await.unwrap();
-    let queue = match source.retire_unattached_send(queue) {
-        Err(original) => original,
-        Ok(_) => panic!("waiting for Apply cannot prove original Join"),
-    };
+    assert!(source.take_unattached_retirement().unwrap().is_none());
     assert_eq!(withdrawal.withdraw(), Withdrawal::Withdrawn);
     assert!(
         poll_fn(|cx| source.poll_shared_completion(cx))
@@ -1219,9 +1252,11 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
             .unwrap()
             .is_none()
     );
-    let mut retirement = source
-        .retire_unattached_send(queue)
-        .unwrap_or_else(|_| panic!("actual Join and original loan return qualify retirement"));
+    let (error, mut retirement) = source
+        .take_unattached_retirement()
+        .unwrap()
+        .expect("actual Join and original loan return qualify retirement");
+    assert!(error.is_none());
     assert!(!source.try_retire().unwrap());
     assert_eq!(
         roles

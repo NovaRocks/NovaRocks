@@ -47,9 +47,7 @@ pub(crate) use actor_adapter::{
 };
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
-pub(crate) use capacity::{
-    EncodingWindow, QueueCustody, QueueWindow, QuotaLeg, ReturnedPhysical, ReturnedQuota,
-};
+pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
 #[cfg(test)]
 pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;
 pub(crate) use queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey};

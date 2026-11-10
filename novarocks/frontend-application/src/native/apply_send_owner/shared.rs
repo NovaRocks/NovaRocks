@@ -21,7 +21,10 @@
 //! backing locks; no callback or opaque destructor runs under either lock.
 
 use super::*;
-use crate::task_execution::host::{custody::TransportPhysicalRetirement, transport::ReturnedQuota};
+use crate::task_execution::host::{
+    custody::{SharedApplyJoinCompletion, TransportPhysicalRetirement},
+    transport::ReturnedQuota,
+};
 use novarocks_control_runtime::obligation::{ReservationObligation, StepRegistration};
 use novarocks_workload_control::joint_admission::NativeQueuedInputGrant;
 use std::mem::ManuallyDrop;
@@ -421,15 +424,19 @@ impl SharedRecord {
 /// Refusal returns the whole original completion and its unchanged funding;
 /// validation never strips the Source-only Join facts or move-only proof.
 pub(crate) fn complete_shared_join(
-    completion: crate::task_execution::host::custody::SharedApplyJoinCompletion,
+    completion: SharedApplyJoinCompletion,
     physical: SharedApplyFunding,
-) -> Result<
-    SharedApplyRetirement,
-    (
-        crate::task_execution::host::custody::SharedApplyJoinCompletion,
-        SharedApplyFunding,
-    ),
-> {
+) -> Result<SharedApplyRetirement, (SharedApplyJoinCompletion, SharedApplyFunding)> {
+    if !completion.matches_funding(&physical) {
+        return Err((completion, physical));
+    }
+    complete_shared_join_with_funding(completion, physical)
+}
+
+fn complete_shared_join_with_funding(
+    completion: SharedApplyJoinCompletion,
+    physical: SharedApplyFunding,
+) -> Result<SharedApplyRetirement, (SharedApplyJoinCompletion, SharedApplyFunding)> {
     let join_facts = completion.join_facts();
     let original = completion.original();
     let mut state = original

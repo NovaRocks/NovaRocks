@@ -28,7 +28,9 @@ use novarocks_control_runtime::{
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::{
-    completion::SlotState, identity::ConsumerId, scope::WorkKind,
+    completion::SlotState,
+    identity::{ConsumerId, ReservationId},
+    scope::WorkKind,
 };
 use novarocks_types::BackendProcessId;
 
@@ -37,11 +39,11 @@ pub(super) struct EncodingChild {
     returned: OwnedReturnReader<ReservationObligation>,
     observer: ConsumerId,
     observed: bool,
-    partition_taken: bool,
+    pub(super) taken_partition: Option<ReservationId>,
 }
 impl EncodingChild {
     pub(super) fn take_partition(&mut self) -> Result<ReservationObligation, CustodyError> {
-        if self.partition_taken {
+        if self.taken_partition.is_some() {
             return Err(CustodyError::CompletionAlreadyIssued);
         }
         if !self.custody.actual_exit_ready()? {
@@ -60,7 +62,7 @@ impl EncodingChild {
             .returned
             .try_take()?
             .ok_or(CustodyError::OriginalCapturesUnresolved)?;
-        self.partition_taken = true;
+        self.taken_partition = Some(partition.id());
         Ok(partition)
     }
 
@@ -125,7 +127,7 @@ impl TransportJoinRegistration {
             returned: reader,
             observer,
             observed: false,
-            partition_taken: false,
+            taken_partition: None,
         });
         Ok(EncodingJob {
             exit,

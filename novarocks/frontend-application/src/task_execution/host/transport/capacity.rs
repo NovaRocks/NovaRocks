@@ -18,14 +18,19 @@
 //! Actual process/keyed capacity travels in original reservation partitions.
 //! These wrappers contain no usage counter, limit, waiter cap or new Work.
 
-use crate::native::transport_capacity::{
-    NativeTransportCapacity, TOTAL_BYTES, TransportCapacityError, TransportCapacityLane,
+use super::queue_input::SendKey;
+use crate::{
+    native::transport_capacity::{
+        NativeTransportCapacity, TOTAL_BYTES, TransportCapacityError, TransportCapacityLane,
+    },
+    task_execution::host::custody::TransportJoinRegistration,
 };
 use novarocks_control_runtime::{
     obligation::ReservationObligation, owned_return::OwnedReturnSender, transaction::RuntimeError,
 };
 use novarocks_control_runtime_core::{capacity::ReservationResources, identity::ReservationId};
 use novarocks_types::BackendProcessId;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) enum CapacityFailure {
@@ -105,12 +110,6 @@ impl QueueWindow {
     pub(crate) fn parent_reservation(&self) -> ReservationId {
         self.quota.parent
     }
-    /// After actual encoding and immediately before RPC use. Only the original
-    /// queue-window shares return; total item/byte and encoded shares remain.
-    pub(crate) fn partition_obligation(&self) -> &ReservationObligation {
-        &self.quota.original
-    }
-
     pub(crate) fn mark_in_flight(&mut self) -> Result<(), CapacityFailure> {
         self.quota.refund(self.layout.in_flight_release(
             self.backend,
@@ -173,36 +172,8 @@ pub(crate) struct ReturnedQuota {
     pub(crate) queue: ReservationObligation,
     pub(crate) encoding: ReservationObligation,
 }
-/// Only Native's private actual-disposal continuation can construct this final
-/// packet. Its Encoded/Unused funding distinction is data, not an exit grant.
-/// Both variants return the same WC inputs without implicit Drop refunds;
-/// Source must finish all actual financial legs before WC queue_exited_in.
-pub(crate) type ReturnedPhysical = crate::native::apply_send_owner::SharedPhysicalReturn;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QuotaLeg {
-    Queue,
-}
-struct ReturnQuota {
-    leg: QuotaLeg,
-    source: std::sync::Weak<dyn super::source_ports::TransportReports>,
-}
 struct UnprovenQuotaReturn {
     _original: ReservationObligation,
-}
-impl ReturnQuota {
-    fn stage(&self, original: ReservationObligation) {
-        let Some(source) = self.source.upgrade() else {
-            std::panic::resume_unwind(Box::new(UnprovenQuotaReturn {
-                _original: original,
-            }));
-        };
-        if let Err(original) = source.stage_quota(self.leg, original) {
-            std::panic::resume_unwind(Box::new(UnprovenQuotaReturn {
-                _original: original,
-            }));
-        }
-    }
 }
 /// GatedWork destroys this capture on accepted exit AND every unused path.
 /// Only its financial object moves back to Source staging. No refund, finish,
@@ -210,31 +181,38 @@ impl ReturnQuota {
 /// call it final physical return until the same actual Join/reaper cut wins.
 pub(crate) struct QueueCustody {
     window: Option<QueueWindow>,
-    returned: ReturnQuota,
+    source: TransportJoinRegistration,
 }
 impl QueueCustody {
     pub(crate) fn new(
         window: QueueWindow,
-        source: std::sync::Weak<dyn super::source_ports::TransportReports>,
+        source: TransportJoinRegistration,
+        keys: Arc<[SendKey]>,
     ) -> Self {
+        source.register_send(&window.quota.original, keys);
         Self {
             window: Some(window),
-            returned: ReturnQuota {
-                leg: QuotaLeg::Queue,
-                source,
-            },
+            source,
         }
     }
     pub(crate) fn parent_reservation(&self) -> ReservationId {
         self.window.as_ref().unwrap().parent_reservation()
     }
-    pub(crate) fn partition(&self) -> ReservationId {
-        self.window
-            .as_ref()
-            .expect("original queue custody")
-            .quota
-            .original
-            .id()
+    pub(crate) fn matches_send(
+        &self,
+        source: &TransportJoinRegistration,
+        keys: &Arc<[SendKey]>,
+    ) -> bool {
+        self.source.same_send_owner(source)
+            && source.matches_send(
+                self.window
+                    .as_ref()
+                    .expect("original queue custody")
+                    .quota
+                    .original
+                    .id(),
+                keys,
+            )
     }
     pub(crate) fn mark_in_flight(&mut self) -> Result<(), CapacityFailure> {
         self.window.as_mut().unwrap().mark_in_flight()
@@ -242,8 +220,12 @@ impl QueueCustody {
 }
 impl Drop for QueueCustody {
     fn drop(&mut self) {
-        if let Some(window) = self.window.take() {
-            self.returned.stage(window.into_original());
+        if let Some(window) = self.window.take()
+            && let Err(original) = self.source.stage_queue(window.into_original())
+        {
+            std::panic::resume_unwind(Box::new(UnprovenQuotaReturn {
+                _original: original,
+            }));
         }
     }
 }

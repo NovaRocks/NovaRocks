@@ -119,7 +119,6 @@ pub(crate) struct PrepareSend {
     apply: ApplySendPort,
     inputs: Option<Vec<SendInputLoan>>,
     registration: TransportJoinRegistration,
-    queue: ReservationId,
     registrant: Option<CapacityRegistrant>,
     items: usize,
     channel_source: Option<NativeChannelSource>,
@@ -161,7 +160,6 @@ impl PrepareSend {
         apply: ApplySendPort,
         inputs: Vec<SendInputLoan>,
         registration: TransportJoinRegistration,
-        queue: ReservationId,
     ) -> Result<Self, PreparationFailure> {
         let admission = authority
             .action_source(
@@ -196,7 +194,6 @@ impl PrepareSend {
             apply,
             inputs: Some(inputs),
             registration,
-            queue,
             registrant: None,
             items,
             channel_source: None,
@@ -522,10 +519,7 @@ impl Future for PrepareSend {
             .into_iter()
             .map(SendInputLoan::into_original)
             .collect();
-        let row = match this
-            .registration
-            .attach_send(slot, inputs, encoding, this.queue)
-        {
+        let row = match this.registration.attach_send(slot, inputs, encoding) {
             Ok(row) => row,
             Err(error) => {
                 let notification = offer

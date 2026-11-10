@@ -18,10 +18,7 @@
 //! Seams implemented only by P10a's original per-attempt Source. They are not
 //! alternate protocol owners, result stores, Work factories or quota wallets.
 
-use super::{
-    capacity::ReturnedPhysical,
-    queue_input::{OriginalQueuedInput, SendInputLoan, SendKey},
-};
+use super::queue_input::{OriginalQueuedInput, SendInputLoan, SendKey};
 use crate::task_execution::intent::{OperationAcknowledgement, OperationIntent};
 use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_coordination_contract::MonotonicInstant;
@@ -65,24 +62,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
     /// Consume the original WC input and bind its actual host record before
     /// exposing the passive reference. Ordinary refusal returns the full input.
     fn install_input(&self, input: OriginalQueuedInput) -> Result<(), OriginalQueuedInput>;
-    /// Gated capture teardown parks ONLY the same financial partition here.
-    /// This is not physical-return/actual-exit evidence. Source retains it and
-    /// its original report/Join obligations. Once its unique Join truly exits,
-    /// Source transfers the staged bundle to that same Native row's protected
-    /// physical retirement; only return_physical marks that later boundary.
-    fn stage_quota(
-        &self,
-        leg: super::capacity::QuotaLeg,
-        original: novarocks_control_runtime::obligation::ReservationObligation,
-    ) -> Result<(), novarocks_control_runtime::obligation::ReservationObligation>;
-    /// Only the original Apply reaper may call this AFTER consuming the same
-    /// credentialed physical-cleanup report AND its actual unique Join. The
-    /// opaque destructor/body returning is insufficient and never invokes this.
-    /// Source retains these obligations independently of the destroyed opaque
-    /// value, until original report/custody/child facts permit release/finish.
-    /// Return failure
-    /// preserves every original object and remains UNKNOWN, never fake exit.
-    fn return_physical(&self, physical: ReturnedPhysical) -> Result<(), ReturnedPhysical>;
 }
 
 /// Rich requests are resolved by the same canonical host record. In particular
