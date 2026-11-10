@@ -334,6 +334,9 @@ impl TestActor for WithdrawalTarget {
                 novarocks_attempt_protocol::effect::EffectClass::Settlement => {
                     novarocks_control_runtime_core::effect::EffectKind::Settlement
                 }
+                novarocks_attempt_protocol::effect::EffectClass::Reply => {
+                    novarocks_control_runtime_core::effect::EffectKind::Reply
+                }
                 _ => unreachable!("original transport command"),
             };
             step.effect(
@@ -783,8 +786,9 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use novarocks_control_runtime::actor_turn::{ActorHostTurn, Clock, EffectTicket, ProcessClock};
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
-        AttemptAuthorizationRef, AttemptIssueSettlement, AttemptRequestToken, AttemptTerminal,
-        AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+        AttemptAuthorizationRef, AttemptConvergenceClosure, AttemptIssueSettlement,
+        AttemptParticipationConvergence, AttemptRequestToken, AttemptTerminal, AttemptToLogical,
+        AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
@@ -1093,10 +1097,32 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(refusal)),
         )),
     });
+    let closure = Arc::new(AttemptConvergenceClosure::Evidence(vec![(
+        participation,
+        AttemptParticipationConvergence::NeverEstablished,
+    )]));
+    let progress = |id, local_exited, closure| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id: AttemptActionId::new(NonZeroU64::new(id).unwrap()),
+            class: EffectClass::Reply,
+            body: EffectBody::Port(port(
+                id,
+                AttemptToLogicalBody::ConvergenceProgress {
+                    local_exited,
+                    closure,
+                },
+            )),
+        })
+    };
+    let remote = progress(8, false, Some(closure.clone()));
+    let local = progress(9, true, None);
     let mailbox = [8; 4];
     let inbox = WithdrawalInbox::with_commands(
         &fixture.scope,
-        [begin, grant, first, second, permission, sample, terminal].map(|effect| (effect, None)),
+        [
+            begin, grant, first, second, permission, sample, terminal, remote, local,
+        ]
+        .map(|effect| (effect, None)),
         mailbox,
     );
     let source = Arc::new(Mutex::new(AttemptCallSource::new(
@@ -1182,11 +1208,11 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
         commands
     };
-    let retire_commands = |commands| {
+    let retire_commands = |commands: &[InputId]| {
         for input in commands {
             inbox
                 .runtime
-                .retire_input(inbox.registration.actor(), input)
+                .retire_input(inbox.registration.actor(), *input)
                 .unwrap();
         }
     };
@@ -1231,7 +1257,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         token: reply_token, decision: Ok(AttemptAuthorizationDecision::AdmissionGranted),
     } if reply_token == token(2))
     );
-    retire_commands(commands);
+    retire_commands(&commands);
     drive_host();
 
     let commands = submit_pair();
@@ -1247,7 +1273,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         token: reply_token, authorization: guard, result: Ok(()),
     } if reply_token == token(4) && guard == authorization)
     );
-    retire_commands(commands);
+    retire_commands(&commands);
     drive_host();
     // QA permission and the independent residual convergence process read
     // have different source authors and neither can stand in for the other.
@@ -1298,6 +1324,22 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         .runtime
         .retire_input(inbox.registration.actor(), terminal_command)
         .unwrap();
+    drive_host();
+    inbox.assert_no_result();
+    let remote_command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    await_reply(8).await;
+    {
+        let mut waiting = Box::pin(terminal.normal_convergence());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+    }
+    retire_commands(&[remote_command]);
+    let local_command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    await_reply(9).await;
+    assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
+    assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
+    retire_commands(&[local_command]);
     drive_host();
     inbox.assert_no_result();
     let mut sample_owner = process.lock().unwrap();

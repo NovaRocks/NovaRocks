@@ -59,6 +59,7 @@ impl AttemptEffectEnvelope {
                     | AttemptToLogicalBody::DetachEstablish { .. }
                     | AttemptToLogicalBody::PreReadyReplacementQuery { .. }
                     | AttemptToLogicalBody::AttemptTerminal(_)
+                    | AttemptToLogicalBody::ConvergenceProgress { .. }
                     | AttemptToLogicalBody::AuthorizationRequest {
                         request: AttemptAuthorization::BeginAdmission(_)
                             | AttemptAuthorization::SettleAdmission { .. }

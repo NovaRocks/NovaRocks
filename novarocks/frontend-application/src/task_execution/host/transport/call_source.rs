@@ -30,7 +30,7 @@ use crate::{
     task_execution::{
         bridge::{
             qa::AttemptQaBridge,
-            terminal::{TerminalOutbox, TerminalPublication},
+            terminal::{ConvergencePublication, TerminalOutbox, TerminalPublication},
         },
         error::TaskExecutionError,
         host::custody::ReturnedActorTransportResult,
@@ -87,6 +87,7 @@ pub(crate) enum AttemptCallReply {
         failure: Option<(HostFailureRef, TaskExecutionError)>,
     },
     Terminal(Box<TerminalPublication>),
+    Convergence(ConvergencePublication),
 }
 
 pub(crate) struct BoundAttemptCall(AttemptCallOwner);
@@ -103,16 +104,32 @@ impl BoundAttemptCall {
             AttemptCallOwner::Qa(bridge) => {
                 let mut bridge = bridge.lock().await;
                 if let EffectBody::Port(port) = &effect.protocol.body
-                    && matches!(port.body, AttemptToLogicalBody::AttemptTerminal(_))
+                    && matches!(
+                        port.body,
+                        AttemptToLogicalBody::AttemptTerminal(_)
+                            | AttemptToLogicalBody::ConvergenceProgress { .. }
+                    )
                 {
                     if port.activation != bridge.activation() || port.action != effect.protocol.id {
                         return Err(Box::new(
                             crate::task_execution::bridge::qa::AttemptQaPortError::WrongRequest,
                         ));
                     }
-                    return Ok(AttemptCallReply::Terminal(Box::new(
-                        TerminalPublication::new(port.clone()),
-                    )));
+                    return Ok(match &port.body {
+                        AttemptToLogicalBody::AttemptTerminal(_) => AttemptCallReply::Terminal(
+                            Box::new(TerminalPublication::new(port.clone())),
+                        ),
+                        AttemptToLogicalBody::ConvergenceProgress {
+                            local_exited,
+                            closure,
+                        } => AttemptCallReply::Convergence(ConvergencePublication {
+                            activation: port.activation,
+                            action: port.action,
+                            local_exited: *local_exited,
+                            closure: closure.clone(),
+                        }),
+                        _ => unreachable!("validated original logical publication"),
+                    });
                 }
                 let reply = match &effect.protocol.body {
                     EffectBody::EstablishAuthorization { operation, request } => {
@@ -375,6 +392,21 @@ impl AttemptCallSource {
                 };
                 if let Err(refused) = publication {
                     original.outcome = Some(BodyOutcome::Call(AttemptCallReply::Terminal(refused)));
+                    return Err(AttemptCallResultRefusal {
+                        original,
+                        publication: None,
+                    });
+                }
+            }
+            AttemptCallReply::Convergence(progress) => {
+                let publication = if let Some(outbox) = self.terminal.as_ref() {
+                    outbox.publish_convergence(progress)
+                } else {
+                    Err(progress)
+                };
+                if let Err(refused) = publication {
+                    original.outcome =
+                        Some(BodyOutcome::Call(AttemptCallReply::Convergence(refused)));
                     return Err(AttemptCallResultRefusal {
                         original,
                         publication: None,

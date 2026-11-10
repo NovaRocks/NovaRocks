@@ -24,7 +24,8 @@ use novarocks_attempt_protocol::{
     operation::OperationDispatchResult,
 };
 use novarocks_coordination_contract::{
-    AttemptActivationIdentity, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
+    AttemptActionId, AttemptActivationIdentity, AttemptConvergenceClosure, AttemptTerminal,
+    AttemptToLogical, AttemptToLogicalBody,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::{
@@ -86,9 +87,57 @@ impl TerminalPublication {
     }
 }
 
+/// The Core reports its local convergence cut independently of remote facts.
+pub(crate) struct ConvergencePublication {
+    pub(crate) activation: AttemptActivationIdentity,
+    pub(crate) action: AttemptActionId,
+    pub(crate) local_exited: bool,
+    pub(crate) closure: Option<Arc<AttemptConvergenceClosure>>,
+}
+
+#[derive(Default)]
+struct ConvergenceOutbox {
+    local: OnceLock<AttemptActionId>,
+    remote: OnceLock<Arc<AttemptConvergenceClosure>>,
+    ready: Notify,
+}
+
+impl ConvergenceOutbox {
+    fn publish(&self, original: ConvergencePublication) -> Result<(), ConvergencePublication> {
+        if (!original.local_exited && original.closure.is_none())
+            || (original.closure.is_none() && self.local.get().is_some())
+        {
+            return Err(original);
+        }
+        if let Some(closure) = &original.closure
+            && self.remote.set(Arc::clone(closure)).is_err()
+        {
+            return Err(original);
+        }
+        if original.local_exited {
+            self.local.get_or_init(|| original.action);
+        }
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// The Core cut is separate from removal of the actual Host registration.
+    async fn wait(&self) -> Arc<AttemptConvergenceClosure> {
+        loop {
+            if self.local.get().is_some()
+                && let Some(closure) = self.remote.get()
+            {
+                return Arc::clone(closure);
+            }
+            self.ready.notified().await;
+        }
+    }
+}
+
 pub(crate) struct TerminalOutbox {
     activation: AttemptActivationIdentity,
     terminal: OnceLock<Box<TerminalPublication>>,
+    convergence: ConvergenceOutbox,
     ready: Notify,
 }
 
@@ -97,6 +146,7 @@ impl TerminalOutbox {
         Arc::new(Self {
             activation,
             terminal: OnceLock::new(),
+            convergence: ConvergenceOutbox::default(),
             ready: Notify::new(),
         })
     }
@@ -113,6 +163,20 @@ impl TerminalOutbox {
         self.terminal.set(original)?;
         self.ready.notify_one();
         Ok(())
+    }
+
+    pub(crate) fn publish_convergence(
+        &self,
+        original: ConvergencePublication,
+    ) -> Result<(), ConvergencePublication> {
+        if original.activation != self.activation {
+            return Err(original);
+        }
+        self.convergence.publish(original)
+    }
+
+    pub(crate) async fn normal_convergence(&self) -> Arc<AttemptConvergenceClosure> {
+        self.convergence.wait().await
     }
 
     /// Borrowing the outbox across a cancelled wait keeps the original result.
@@ -173,6 +237,10 @@ impl RegisteredAttemptTerminal {
         };
         self.selected = Some(terminal.clone());
         terminal
+    }
+
+    pub(crate) async fn normal_convergence(&self) -> Arc<AttemptConvergenceClosure> {
+        self.normal.normal_convergence().await
     }
 
     pub(crate) fn failure_bridge_mut(&mut self) -> &mut FailureBridge {
