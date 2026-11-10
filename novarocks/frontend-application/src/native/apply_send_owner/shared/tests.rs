@@ -363,6 +363,7 @@ fn transport_factory(
     exit: ExitObligation,
     captures: Captures,
     panic: PanicSink,
+    actor_result: Option<custody::TransportJoinRegistration>,
 ) -> impl Future<Output = ()> {
     let handoff = Arc::new(HandoffCell::new());
     if matches!(captures.mode, Mode::Unused) {
@@ -372,6 +373,13 @@ fn transport_factory(
     let future = work.run(generation(), ready(()), fixture_body);
     async move {
         future.await.unwrap();
+        if let Some(actor_result) = actor_result {
+            assert!(
+                actor_result
+                    .stage_actor_outcome(transport::BodyOutcome::ReceiptsRecorded)
+                    .is_ok()
+            );
+        }
     }
 }
 fn fixture_body(captures: Captures, (): ()) -> impl Future<Output = ()> {
@@ -439,7 +447,7 @@ fn actual_gated_backing<F: Future<Output = ()>>(body: fn(Captures, ()) -> F) -> 
     GatedWork::<Captures>::backing_layouts::<std::future::Ready<()>, F>(body)
 }
 fn actual_future_layout<F: Future<Output = ()>>(
-    _: fn(ExitObligation, Captures, PanicSink) -> F,
+    _: fn(ExitObligation, Captures, PanicSink, Option<custody::TransportJoinRegistration>) -> F,
 ) -> Layout {
     Layout::new::<F>()
 }
@@ -520,7 +528,7 @@ struct Row {
 struct PendingRow {
     source: OriginalTransportJoinObligation,
     publisher: OriginalReplyPublisher,
-    operation: OperationIntent,
+    reply_input: Option<novarocks_control_runtime_core::identity::InputId>,
     cleanup: VecDeque<ReportedWork>,
     legacy_queue: Option<ReservationObligation>,
     encoded: Arc<Mutex<Option<EncodingChild>>>,
@@ -530,6 +538,7 @@ fn pending_row(
     runtime: &FrontendDataRuntime,
     wc: &mut Governed,
     mode: Mode,
+    actor: Option<&custody::tests::WithdrawalInbox>,
 ) -> PendingRow {
     let backend = BackendProcessId::new_v7();
     let operation = cancel(backend);
@@ -537,6 +546,10 @@ fn pending_row(
     if matches!(mode, Mode::InlineEncoded { .. }) {
         layouts.extend(custody::encoding_owned_layouts().unwrap());
         layouts.push(inline_encoding_layout(inline_encoding_body));
+    }
+    if actor.is_some() {
+        layouts.extend(transport::actor_send_report_layouts(1, 0).unwrap());
+        layouts.push(Layout::new::<custody::TransportRetirement>());
     }
     let (quote, plan) = transport::original_run_for_factory(
         &[operation.clone()],
@@ -557,6 +570,13 @@ fn pending_row(
         );
     let input = wc.admit(input_quote);
     let (parent, queue, principal) = roles.parent(backend, operation.queued_bytes());
+    let positions = actor.map(|inbox| {
+        (
+            inbox.reserve(&parent),
+            inbox.reserve_standing(parent.work()),
+            inbox.reserve_native_receipt(parent.work(), send_key(&operation), operation.kind()),
+        )
+    });
     let parent_id = parent.work().id();
     let cleanup = (0..4).map(|_| roles.cleanup(parent_id)).collect();
     let mut action = wc
@@ -641,6 +661,69 @@ fn pending_row(
     a.notify();
     r.notify();
     drop(action);
+    let reply_input = positions.map(|(result, start, mut receipt)| {
+        use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
+        use crate::task_execution::intent::OperationAcknowledgement;
+        use novarocks_attempt_protocol::{
+            capacity::ReservationToken,
+            effect::{AttemptEffect, DispatchBatch, EffectBody, EffectClass},
+            input::QueuedInputGrantRef,
+        };
+        use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+
+        let key = send_key(&operation);
+        let OperationIntent::CancelTask(original) = &operation else {
+            unreachable!()
+        };
+        let protocol =
+            novarocks_attempt_protocol::effect::OperationIntent::CancelTask(original.clone());
+        let id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+        let effect = AttemptEffectEnvelope::new(AttemptEffect {
+            id,
+            class: EffectClass::Settlement,
+            body: EffectBody::SendBatch {
+                batch: DispatchBatch {
+                    backend,
+                    lane: protocol.lane(),
+                    control_progress: true,
+                    operations: Box::new([protocol]),
+                    queued_bytes: operation.queued_bytes(),
+                    queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                    queued_inputs: Box::new([QueuedInputGrantRef::new(
+                        NonZeroU64::MIN,
+                        key.generation,
+                    )]),
+                },
+                reservation: ReservationToken(NonZeroU64::new(principal.get()).unwrap()),
+            },
+        });
+        receipt
+            .record(
+                key,
+                publisher.canonicalize(OperationAcknowledgement::transport_unknown(
+                    key.operation,
+                    operation.kind(),
+                )),
+                None,
+                None,
+            )
+            .unwrap();
+        let input = receipt.submit().unwrap();
+        let reports = Arc::new(transport::ActorSendReports::new(
+            id,
+            transport::SendReportRows {
+                started: transport::NativeProgressInput::new(start),
+                members: Box::new([transport::SendMemberReport::new(receipt, None, None, None)]),
+            },
+        ));
+        let author = result.event_author().unwrap();
+        assert!(
+            launch
+                .bind_actor_result(effect, &author, result, Some(reports))
+                .is_ok()
+        );
+        input
+    });
     let encoded = Arc::new(Mutex::new(None));
     let cell = Arc::clone(&encoded);
     let inline = matches!(mode, Mode::InlineEncoded { .. }).then(|| custody::EncodingBinding {
@@ -663,19 +746,20 @@ fn pending_row(
                     preparation,
                     mode,
                     encoded: cell,
-                    inline: inline.map(|binding| (source, binding)),
+                    inline: inline.map(|binding| (source.clone(), binding)),
                     fail_scope,
                     _queue: queue_capture,
                     panic: inner.clone(),
                 },
                 inner,
+                reply_input.map(|_| source),
             )
         })
         .unwrap();
     PendingRow {
         source,
         publisher,
-        operation,
+        reply_input,
         cleanup,
         legacy_queue,
         encoded,
@@ -689,7 +773,7 @@ async fn row(roles: &Roles, runtime: &FrontendDataRuntime, wc: &mut Governed, mo
         legacy_queue,
         encoded,
         ..
-    } = pending_row(roles, runtime, wc, mode);
+    } = pending_row(roles, runtime, wc, mode, None);
     let completion = poll_fn(|cx| source.poll_shared_completion(cx))
         .await
         .unwrap()
@@ -1429,6 +1513,7 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
 #[tokio::test(flavor = "multi_thread")]
 async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_aliases() {
     use custody::{TransportRetirement, TransportRetirementStep};
+    use novarocks_attempt_protocol::input::ExecutorFact;
 
     #[derive(Default)]
     struct ReplyWake(AtomicUsize);
@@ -1439,12 +1524,13 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
     }
 
     let roles = Roles::new();
+    let inbox = custody::tests::WithdrawalInbox::new(&roles.scope);
     let mut wc = Governed::new();
     let mut runtime = FrontendDataRuntime::new(Handle::current());
     let PendingRow {
         source,
         publisher,
-        operation,
+        reply_input,
         cleanup,
         legacy_queue,
         encoded,
@@ -1453,14 +1539,9 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
         &runtime,
         &mut wc,
         Mode::InlineEncoded { fail_scope: false },
+        Some(&inbox),
     );
     assert!(legacy_queue.is_none());
-    let reply = publisher.canonicalize(
-        crate::task_execution::intent::OperationAcknowledgement::transport_unknown(
-            operation.operation_id(),
-            operation.kind(),
-        ),
-    );
     drop(publisher);
     let mut reaper = TransportRetirement::new(source, cleanup, observer());
     let handle = Handle::current();
@@ -1482,12 +1563,58 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
             let step = poll_fn(|cx| reaper.poll_step(&handle, cx))
                 .await
                 .unwrap_or_else(|_| panic!("original Native cleanup must advance"));
-            assert_eq!(step, TransportRetirementStep::Advanced);
+            assert!(matches!(step, TransportRetirementStep::Advanced));
         }
     })
     .await
     .unwrap();
     assert!(encoded.lock().unwrap().is_none());
+    let mut returned = reaper
+        .take_actor_result()
+        .unwrap_or_else(|_| panic!("same report ledger has exited the actual job"))
+        .expect("WC queue exit makes the original actor result available");
+    assert!(matches!(
+        returned.outcome,
+        Some(transport::BodyOutcome::ReceiptsRecorded)
+    ));
+    assert!(returned.close_result_after_exit().unwrap());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        reaper.poll_step(&handle, &mut context),
+        Poll::Ready(Ok(TransportRetirementStep::Advanced))
+    ));
+    assert!(matches!(
+        reaper.poll_step(&handle, &mut context),
+        Poll::Ready(Ok(TransportRetirementStep::Scanned))
+    ));
+    assert!(reaper.poll_step(&handle, &mut context).is_pending());
+    let fact = inbox.commit(reply_input.unwrap());
+    let ExecutorFact::Operation(observed) = fact else {
+        panic!("the committed original acknowledgement");
+    };
+    let reply = loop {
+        match reaper.poll_step(&handle, &mut context) {
+            Poll::Ready(Ok(TransportRetirementStep::Report(
+                transport::SendReportReturn::Receipt {
+                    key,
+                    delivery_error: None,
+                    receipt,
+                },
+            ))) => {
+                assert_eq!(key.generation, observed.generation);
+                assert_eq!(key.operation, observed.reply.operation_id());
+                assert!(receipt.unpublished.is_none());
+                break receipt.original;
+            }
+            Poll::Ready(Ok(TransportRetirementStep::Scanned)) => {}
+            _ => panic!("the committed exact report can retire"),
+        }
+    };
+    assert!(matches!(
+        reaper.poll_step(&handle, &mut context),
+        Poll::Ready(Ok(TransportRetirementStep::Advanced))
+    ));
+    inbox.assert_no_result();
     let wake = Arc::new(ReplyWake::default());
     let waker = Waker::from(wake.clone());
     assert!(
@@ -1503,7 +1630,7 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
             let step = poll_fn(|cx| reaper.poll_step(&handle, cx))
                 .await
                 .unwrap_or_else(|_| panic!("original reply cleanup must advance"));
-            if step == TransportRetirementStep::Retired {
+            if matches!(step, TransportRetirementStep::Retired) {
                 break;
             }
         }
@@ -1523,6 +1650,9 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
         .drain_native_outgoing_until(Instant::now() + Duration::from_secs(2))
         .await
         .unwrap();
+    roles.scope.close_external().unwrap();
+    roles.scope.reap_ready(128).unwrap();
+    inbox.finish();
     roles.finish();
     assert!(wc.finish());
 }

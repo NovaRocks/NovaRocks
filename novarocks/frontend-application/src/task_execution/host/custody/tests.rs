@@ -378,6 +378,18 @@ impl WithdrawalInbox {
             .into_standing_input()
             .unwrap()
     }
+    pub(crate) fn reserve_native_receipt(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+        key: crate::task_execution::host::transport::SendKey,
+        kind: novarocks_execution_contract::OperationKind,
+    ) -> crate::task_execution::host::transport::NativeReceiptInput {
+        crate::task_execution::host::transport::NativeReceiptInput::new(
+            key,
+            kind,
+            self.reserve_standing(work),
+        )
+    }
     pub(crate) fn assert_no_result(&self) {
         assert_eq!(
             self.runtime
@@ -388,16 +400,21 @@ impl WithdrawalInbox {
         );
     }
     pub(crate) fn consume(&self, input: InputId) -> ExecutorFact {
-        assert!(self.runtime.poll_one(Tick(1)).unwrap());
-        let mut observed = self.observed.lock().unwrap();
-        assert_eq!(observed.len(), 1);
-        let (envelope, fact) = observed.pop().unwrap();
-        assert_eq!(envelope.source, self.source);
-        assert_eq!(envelope.class, InputClass::Lifecycle);
-        assert_eq!(envelope.input, input);
+        let fact = self.commit(input);
         self.runtime
             .retire_input(self.registration.actor(), input)
             .unwrap();
+        fact
+    }
+    pub(crate) fn commit(&self, input: InputId) -> ExecutorFact {
+        if self.observed.lock().unwrap().is_empty() {
+            assert!(self.runtime.poll_one(Tick(1)).unwrap());
+        }
+        let mut observed = self.observed.lock().unwrap();
+        let (envelope, fact) = observed.remove(0);
+        assert_eq!(envelope.source, self.source);
+        assert_eq!(envelope.class, InputClass::Lifecycle);
+        assert_eq!(envelope.input, input);
         fact
     }
     pub(crate) fn finish(self) {
@@ -668,7 +685,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     let handle = Handle::current();
     let mut reaper = super::TransportRetirement::new(owner, Default::default(), observer());
     assert!(ActorTransportExecutor(handle.clone()).handoff(job).is_ok());
-    assert!(reaper.take_actor_result().is_none());
+    assert!(matches!(reaper.take_actor_result(), Ok(None)));
     inbox.assert_no_result();
     let joined = tokio::time::timeout(
         Duration::from_secs(2),
@@ -684,8 +701,11 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     .await
     .unwrap()
     .unwrap_or_else(|_| panic!("original admission Join"));
-    assert_eq!(joined, super::TransportRetirementStep::Advanced);
-    let mut result = reaper.take_actor_result().unwrap();
+    assert!(matches!(joined, super::TransportRetirementStep::Advanced));
+    let mut result = reaper
+        .take_actor_result()
+        .unwrap_or_else(|_| panic!("admission has no send reports"))
+        .unwrap();
     assert!(result.withdrawal.is_none());
     let mut inputs = GrantedInputs::default();
     assert!(matches!(
@@ -709,8 +729,9 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     let input = published
         .delivery
         .unwrap_or_else(|failure| panic!("{}", failure.error));
+    assert!(!result.close_result_after_exit().unwrap());
     assert!(matches!(
-        inbox.consume(input),
+        inbox.commit(input),
         ExecutorFact::QueuedInputGranted { operation, grant, queued_bytes: 8192 }
             if operation == key.operation && grant == published.grant && grant.generation() == key.generation
     ));
@@ -731,13 +752,13 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
     assert!(inputs.take(published.grant, key).is_none());
     drop(original_grant);
     drop(payload_retention);
-    result.original.close_after_exit().unwrap();
-    assert_eq!(
+    assert!(result.close_result_after_exit().unwrap());
+    assert!(matches!(
         poll_fn(|cx| reaper.poll_step(&handle, cx))
             .await
             .unwrap_or_else(|_| panic!("original admission retirement")),
         super::TransportRetirementStep::Retired,
-    );
+    ));
     fixture.scope.close_external().unwrap();
     fixture
         .ledger

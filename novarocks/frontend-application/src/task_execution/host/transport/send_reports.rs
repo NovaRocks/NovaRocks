@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{NativeReceiptInput, SendKey, receipt_input::NativeReceiptError};
+use super::{
+    NativeReceiptInput, SendKey,
+    receipt_input::{NativeReceiptError, RetiredNativeReceipt},
+};
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
     task_execution::{
@@ -35,6 +38,7 @@ use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::{
     alloc::Layout,
     sync::{Arc, Mutex},
+    task::Poll,
 };
 
 pub(crate) struct NativeProgressInput {
@@ -57,10 +61,21 @@ impl NativeProgressInput {
             AttemptInput::Executor(fact),
         ))));
     }
+
+    fn retire_after_exit(&mut self) -> Result<Poll<Option<SendReportReturn>>, ActorTurnError> {
+        if !self.position.retire_ready_after_exit()? {
+            return Ok(Poll::Pending);
+        }
+        self.position.close_after_exit()?;
+        Ok(Poll::Ready(match self.delivery.take() {
+            Some(Err((error, value))) => Some(SendReportReturn::ProgressRefused { error, value }),
+            _ => None,
+        }))
+    }
 }
 
 pub(crate) struct SendMemberReport {
-    pub(crate) receipt: NativeReceiptInput,
+    receipt: Option<NativeReceiptInput>,
     filter: Option<PayloadRef>,
     workload: Option<HostFailureRef>,
     pub(crate) first_poll: Option<(ParticipationRef, NativeProgressInput)>,
@@ -75,7 +90,7 @@ impl SendMemberReport {
         first_poll: Option<(ParticipationRef, NativeProgressInput)>,
     ) -> Self {
         Self {
-            receipt,
+            receipt: Some(receipt),
             filter,
             workload,
             first_poll,
@@ -104,8 +119,12 @@ impl SendMemberReport {
         } else {
             None
         };
-        match self.receipt.record(key, ack, filter, workload) {
-            Ok(()) => self.receipt_delivery = Some(self.receipt.submit()),
+        let receipt = self
+            .receipt
+            .as_mut()
+            .expect("live original receipt position");
+        match receipt.record(key, ack, filter, workload) {
+            Ok(()) => self.receipt_delivery = Some(receipt.submit()),
             Err(refusal) => self.refused_receipt = Some(refusal),
         }
     }
@@ -141,7 +160,7 @@ impl ActorSendReports {
             .members
             .iter()
             .enumerate()
-            .map(|(index, row)| (row.receipt.key().operation, index))
+            .map(|(index, row)| (row.receipt.as_ref().unwrap().key().operation, index))
             .collect::<Vec<_>>();
         index.sort_unstable_by_key(|&(operation, _)| operation);
         assert!(index.windows(2).all(|pair| pair[0].0 != pair[1].0));
@@ -175,8 +194,9 @@ impl ActorSendReports {
                                     }
                                     _ => None,
                                 };
-                                row.receipt.key() == *key
-                                    && row.receipt.kind() == operation.kind()
+                                let receipt = row.receipt.as_ref().expect("live original receipt");
+                                receipt.key() == *key
+                                    && receipt.kind() == operation.kind()
                                     && row
                                         .first_poll
                                         .as_ref()
@@ -187,7 +207,7 @@ impl ActorSendReports {
                 })
     }
 
-    pub(crate) fn into_rows(self) -> SendReportRows {
+    fn into_rows(self) -> SendReportRows {
         self.rows
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -260,6 +280,115 @@ impl ActorSendReports {
     }
 }
 
+/// Original values for the Source's domain or failure consumer. The
+/// canonical Native reply remains live through that consumer's actual exit.
+#[must_use = "transfer the original report to its final consumer"]
+pub(crate) enum SendReportReturn {
+    Receipt {
+        key: SendKey,
+        delivery_error: Option<ActorTurnError>,
+        receipt: RetiredNativeReceipt,
+    },
+    ReceiptRefused {
+        key: SendKey,
+        error: NativeReceiptError,
+        receipt: OperationAcknowledgement,
+    },
+    ProgressRefused {
+        error: ActorTurnError,
+        value: FrontendInput,
+    },
+}
+
+pub(crate) enum SendReportRetirementStep {
+    Advanced(Option<SendReportReturn>),
+    Pending,
+    Retired,
+}
+
+/// Bounded walk of the same original send's paid positions. Core commits
+/// and effect completions wake the host when a position can be revisited.
+pub(crate) struct SendReportRetirement {
+    started: Option<NativeProgressInput>,
+    members: Box<[SendMemberReport]>,
+    next: usize,
+    remaining: usize,
+}
+
+impl SendReportRetirement {
+    pub(crate) fn after_join(
+        reports: Arc<ActorSendReports>,
+    ) -> Result<Self, Arc<ActorSendReports>> {
+        let SendReportRows { started, members } = Arc::try_unwrap(reports)?.into_rows();
+        let remaining = members.len() + 1;
+        Ok(Self {
+            started: Some(started),
+            members,
+            next: 0,
+            remaining,
+        })
+    }
+
+    pub(crate) fn positions(&self) -> usize {
+        self.members.len() + 1
+    }
+
+    /// Visit one member or the batch-start role. A visit advances at most
+    /// one actual position and returns at most one original value.
+    pub(crate) fn advance(&mut self) -> Result<SendReportRetirementStep, ActorTurnError> {
+        use SendReportRetirementStep::{Advanced, Pending, Retired};
+        if self.remaining == 0 {
+            return Ok(Retired);
+        }
+        let index = self.next;
+        self.next = (index + 1) % self.positions();
+        if index == 0 {
+            let Some(started) = &mut self.started else {
+                return Ok(Pending);
+            };
+            return match started.retire_after_exit()? {
+                Poll::Pending => Ok(Pending),
+                Poll::Ready(returned) => {
+                    self.started = None;
+                    self.remaining -= 1;
+                    Ok(Advanced(returned))
+                }
+            };
+        }
+        let member = &mut self.members[index - 1];
+        if let Some((_, first_poll)) = &mut member.first_poll
+            && let Poll::Ready(returned) = first_poll.retire_after_exit()?
+        {
+            member.first_poll = None;
+            self.remaining -= usize::from(member.receipt.is_none());
+            return Ok(Advanced(returned));
+        }
+        let Some(receipt) = &mut member.receipt else {
+            return Ok(Pending);
+        };
+        let key = receipt.key();
+        let Poll::Ready(returned) = receipt.retire_ready_after_exit()? else {
+            return Ok(Pending);
+        };
+        member.receipt = None;
+        self.remaining -= usize::from(member.first_poll.is_none());
+        let delivery_error = member.receipt_delivery.take().and_then(Result::err);
+        let returned = match member.refused_receipt.take() {
+            Some((error, receipt)) => Some(SendReportReturn::ReceiptRefused {
+                key,
+                error,
+                receipt,
+            }),
+            None => returned.map(|receipt| SendReportReturn::Receipt {
+                key,
+                delivery_error,
+                receipt,
+            }),
+        };
+        Ok(Advanced(returned))
+    }
+}
+
 pub(crate) fn actor_send_report_layouts(
     items: usize,
     establishes: usize,
@@ -325,7 +454,7 @@ mod tests {
             BackendProcessId::new_v7(),
         );
         let progress = || NativeProgressInput::new(inbox.reserve_standing(&work));
-        let reports = ActorSendReports::new(
+        let reports = Arc::new(ActorSendReports::new(
             effect,
             SendReportRows {
                 started: progress(),
@@ -352,7 +481,7 @@ mod tests {
                     ),
                 ]),
             },
-        );
+        ));
         let at = MonotonicInstant::from_origin(Duration::from_millis(3));
         reports.send_started(at);
         let started = reports
@@ -367,9 +496,6 @@ mod tests {
             .as_ref()
             .copied()
             .unwrap();
-        assert!(
-            matches!(inbox.consume(started), ExecutorFact::SendStarted { effect: id, started_at } if id == effect && started_at == at)
-        );
         let rpc_at = at.saturating_add(Duration::from_millis(1));
         reports.establish_rpc_started(establish.operation, participation, rpc_at);
         let first_poll = reports.loan().rows.as_ref().unwrap().members[0]
@@ -383,10 +509,6 @@ mod tests {
             .as_ref()
             .copied()
             .unwrap();
-        assert!(matches!(inbox.consume(first_poll),
-            ExecutorFact::EstablishRpcStarted { effect: id, operation, participation: observed, started_at }
-                if id == effect && operation == establish.operation && observed == participation && started_at == rpc_at
-        ));
         let original = OperationAcknowledgement::transport_unknown(
             establish.operation,
             OperationKind::UpdateParticipation,
@@ -399,10 +521,6 @@ mod tests {
             .as_ref()
             .copied()
             .unwrap();
-        assert!(
-            matches!(inbox.consume(acknowledged), ExecutorFact::Operation(observation)
-            if observation.generation == establish.generation && observation.reply.operation_id() == establish.operation)
-        );
         let refused = OperationAcknowledgement::transport_unknown(
             cancel.operation,
             OperationKind::CancelTask,
@@ -414,41 +532,49 @@ mod tests {
             },
             refused.clone(),
         );
-        inbox.assert_no_result();
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        let mut rows = reports.into_rows();
-        rows.started.position.close_after_exit().unwrap();
-        let [mut established, mut cancelled]: [SendMemberReport; 2] = rows
-            .members
-            .into_vec()
-            .try_into()
-            .unwrap_or_else(|_| panic!("same two members"));
-        established
-            .first_poll
-            .take()
-            .unwrap()
-            .1
-            .position
-            .close_after_exit()
-            .unwrap();
-        let retired = established
-            .receipt
-            .retire_after_exit()
-            .unwrap_or_else(|(error, _)| panic!("{error}"))
-            .unwrap();
-        assert_eq!(retired.original, original);
-        assert!(retired.unpublished.is_none());
-        let (error, raw) = cancelled.refused_receipt.take().unwrap();
-        assert!(matches!(error, NativeReceiptError::WrongSend));
-        assert_eq!(raw, refused);
-        assert!(
-            cancelled
-                .receipt
-                .retire_after_exit()
-                .unwrap_or_else(|(error, _)| panic!("{error}"))
-                .is_none()
-        );
+        use SendReportRetirementStep::{Advanced, Pending, Retired};
+        let alias = reports.clone();
+        let reports = SendReportRetirement::after_join(reports)
+            .err()
+            .expect("another holder retains the original report ledger");
+        assert!(Arc::ptr_eq(&reports, &alias));
+        drop(alias);
+        let mut retirement = SendReportRetirement::after_join(reports)
+            .unwrap_or_else(|_| panic!("same report ledger after producer exit"));
+        assert!(matches!(retirement.advance().unwrap(), Pending));
+        assert!(matches!(retirement.advance().unwrap(), Pending));
+        assert!(matches!(
+            retirement.advance().unwrap(),
+            Advanced(Some(SendReportReturn::ReceiptRefused {
+                key,
+                error: NativeReceiptError::WrongSend,
+                receipt,
+            })) if key == cancel && receipt == refused
+        ));
+        assert!(matches!(inbox.commit(started),
+            ExecutorFact::SendStarted { effect: id, started_at } if id == effect && started_at == at));
+        assert!(matches!(retirement.advance().unwrap(), Advanced(None)));
+        assert!(matches!(inbox.commit(first_poll),
+            ExecutorFact::EstablishRpcStarted { effect: id, operation, participation: observed, started_at }
+                if id == effect && operation == establish.operation && observed == participation && started_at == rpc_at));
+        assert!(matches!(retirement.advance().unwrap(), Advanced(None)));
+        assert!(matches!(inbox.commit(acknowledged),
+            ExecutorFact::Operation(observation) if observation.generation == establish.generation
+                && observation.reply.operation_id() == establish.operation));
+        assert!(matches!(retirement.advance().unwrap(), Pending));
+        assert!(matches!(retirement.advance().unwrap(), Pending));
+        assert!(matches!(
+            retirement.advance().unwrap(),
+            Advanced(Some(SendReportReturn::Receipt {
+                key,
+                delivery_error: None,
+                receipt: RetiredNativeReceipt { original: receipt, unpublished: None },
+            })) if key == establish && receipt == original
+        ));
+        assert!(matches!(retirement.advance().unwrap(), Retired));
+        inbox.assert_no_result();
         capacity.finish().unwrap();
         scope.close_external().unwrap();
         ledger.reap_scope_ready(scope.id(), 128).unwrap();

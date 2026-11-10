@@ -540,10 +540,9 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
 
     original_work.body_exited().unwrap();
     original_work.captures_exited().unwrap();
-    let retained = receipt
-        .retire_after_exit()
-        .unwrap_or_else(|(error, _)| panic!("{error}"))
-        .expect("the failure owner retains the raw acknowledgement");
+    let std::task::Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap() else {
+        panic!("the failure owner retains the raw acknowledgement");
+    };
     assert_eq!(retained.original, original_ack);
     assert!(
         matches!(retained.unpublished, Some(FrontendInput::Attempt(input))

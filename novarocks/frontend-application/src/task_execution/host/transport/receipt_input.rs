@@ -29,6 +29,7 @@ use novarocks_attempt_protocol::{
 use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_execution_contract::OperationKind;
+use std::task::Poll;
 
 #[derive(Debug)]
 pub(crate) enum NativeReceiptError {
@@ -162,13 +163,14 @@ impl NativeReceiptInput {
     /// The caller already owns proof of producer and capture exit. The
     /// original standing position independently requires input retirement.
     /// The raw ACK can outlive this mailbox role in the original error owner.
-    pub(crate) fn retire_after_exit(
-        mut self,
-    ) -> Result<Option<RetiredNativeReceipt>, (ActorTurnError, Self)> {
-        if let Err(error) = self.position.close_after_exit() {
-            return Err((error, self));
+    pub(in crate::task_execution::host) fn retire_ready_after_exit(
+        &mut self,
+    ) -> Result<Poll<Option<RetiredNativeReceipt>>, ActorTurnError> {
+        if !self.position.retire_ready_after_exit()? {
+            return Ok(Poll::Pending);
         }
-        Ok(self.receipt.take().map(Receipt::into_retired))
+        self.position.close_after_exit()?;
+        Ok(Poll::Ready(self.receipt.take().map(Receipt::into_retired)))
     }
 }
 
@@ -298,10 +300,7 @@ mod tests {
         assert_ne!(latest_input, old_input);
         work.body_exited().unwrap();
         work.captures_exited().unwrap();
-        let latest = match latest.retire_after_exit() {
-            Err((ActorTurnError::StandingInputBusy, retained)) => retained,
-            _ => panic!("producer exit leaves the queued original input live"),
-        };
+        assert!(latest.retire_ready_after_exit().unwrap().is_pending());
         assert!(runtime.poll_one(Tick(1)).unwrap());
         {
             let seen = observed.lock().unwrap();
@@ -323,13 +322,10 @@ mod tests {
                 assert_eq!((*generation, *verdict), (exact_generation, exact_verdict));
             }
         }
-        runtime.retire_input(actor, latest_input).unwrap();
-        runtime.retire_input(actor, old_input).unwrap();
-        for (receipt, expected) in [(latest, positive), (old, unknown)] {
-            let retired = receipt
-                .retire_after_exit()
-                .unwrap_or_else(|(error, _)| panic!("{error}"))
-                .expect("the same original acknowledgement");
+        for (mut receipt, expected) in [(latest, positive), (old, unknown)] {
+            let Poll::Ready(Some(retired)) = receipt.retire_ready_after_exit().unwrap() else {
+                panic!("the same committed original acknowledgement");
+            };
             assert_eq!(retired.original, expected);
             assert!(retired.unpublished.is_none());
         }

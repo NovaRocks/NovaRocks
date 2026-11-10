@@ -24,14 +24,16 @@ use crate::{
         actor::{FrontendActor, FrontendInput},
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::host::transport::{ActorSendReports, BodyOutcome, GrantedInputs, SendKey},
+    task_execution::host::transport::{
+        ActorSendReports, BodyOutcome, GrantedInputs, SendKey, SendReportRetirement,
+    },
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, QueuedInputPayload},
     input::{AttemptInput, ExecutorFact, QueuedInputGrantRef, WithdrawalOutcome},
 };
 use novarocks_control_runtime::{
-    actor_turn::InputAuthor,
+    actor_turn::{ActorTurnError, InputAuthor},
     causal_input::{CausalFillFailure, CausalInputObligation},
 };
 use novarocks_control_runtime_core::identity::InputId;
@@ -156,6 +158,30 @@ impl OriginalTransportJoinObligation {
 }
 
 impl ReturnedActorTransportResult {
+    /// This result only leaves the actual Join owner after the producer and
+    /// captures exit. Keep the same report ledger if a foreign holder remains.
+    pub(crate) fn take_send_report_retirement(
+        &mut self,
+    ) -> Result<Option<SendReportRetirement>, SendReportHolderError> {
+        let Some(reports) = self.send_reports.take() else {
+            return Ok(None);
+        };
+        match SendReportRetirement::after_join(reports) {
+            Ok(retirement) => Ok(Some(retirement)),
+            Err(reports) => {
+                self.send_reports = Some(reports);
+                Err(SendReportHolderError)
+            }
+        }
+    }
+
+    pub(crate) fn close_result_after_exit(&mut self) -> Result<bool, ActorTurnError> {
+        if !self.original.retire_ready_after_exit()? {
+            return Ok(false);
+        }
+        self.original.close_after_exit()?;
+        Ok(true)
+    }
     fn publish_withdrawal(&mut self) {
         if !matches!(&self.outcome, Some(BodyOutcome::Unused(_))) {
             return;
@@ -248,6 +274,9 @@ impl ReturnedActorTransportResult {
         Ok(Some(AdmissionPublication { grant, delivery }))
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct SendReportHolderError;
 
 #[must_use = "retain the original refused event or retire the delivered input"]
 pub(crate) struct AdmissionPublication {

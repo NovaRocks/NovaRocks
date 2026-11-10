@@ -65,7 +65,7 @@ pub(crate) use send_binding::{
     FrozenSendRequests, PreparedSendBatch, ResolvedBatch, SendBindingError, SendBindingRefusal,
 };
 pub(crate) use send_reports::{
-    ActorSendReports, NativeProgressInput, SendMemberReport, SendReportRows,
-    actor_send_report_layouts,
+    ActorSendReports, NativeProgressInput, SendMemberReport, SendReportRetirement,
+    SendReportRetirementStep, SendReportReturn, SendReportRows, actor_send_report_layouts,
 };
 pub(crate) use source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg};

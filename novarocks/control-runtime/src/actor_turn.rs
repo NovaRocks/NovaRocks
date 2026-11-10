@@ -1262,6 +1262,24 @@ impl<A: Actor> StandingInputObligation<A> {
             .ok_or(ActorTurnError::UnknownStandingInput)?
             .in_flight)
     }
+    /// The original producer's owner may retire its submitted occurrence
+    /// after its captures have exited. A Core commit alone is insufficient:
+    /// the same occurrence's effects and reservations must also be terminal.
+    pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        let Some(input) = self.in_flight()? else {
+            return Ok(true);
+        };
+        match self.runtime.retire_input(self.actor, input) {
+            Ok(()) => Ok(true),
+            Err(
+                ActorTurnError::InputStillQueued
+                | ActorTurnError::EffectsRemain
+                | ActorTurnError::ReservationsRemain
+                | ActorTurnError::MetadataStillPending,
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
     /// Fills only an idle, already paid position, including during process drain.
     /// Every occurrence receives a fresh monotonic InputId; a prior effect ticket
     /// can never identify this new batch. Error returns the original neutral value.

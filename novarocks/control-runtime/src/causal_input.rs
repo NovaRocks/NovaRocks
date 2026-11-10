@@ -127,6 +127,13 @@ impl<A: Actor> CausalInputObligation<A> {
     pub fn in_flight(&self) -> Result<[Option<InputId>; 2], ActorTurnError> {
         Ok([self.predecessor.in_flight()?, self.event.in_flight()?])
     }
+    /// Called by the original result owner after actual producer exit.
+    /// A busy predecessor does not authorize closing either paid position.
+    pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        let predecessor = self.predecessor.retire_ready_after_exit()?;
+        let event = self.event.retire_ready_after_exit()?;
+        Ok(predecessor && event)
+    }
     pub fn fill_with_receipt(
         &mut self,
         predecessor: Option<A::Input>,

@@ -20,11 +20,18 @@ use super::{
     OriginalTransportJoinObligation, PhysicalInputRetirementObligation, PhysicalReturnError,
     SharedApplyJoinCompletion, actor_result::ReturnedActorTransportResult,
 };
-use crate::native::apply_send_owner::{
-    NativeDisposalRequest, RegistrationFailure, SharedApplyFunding, SharedApplyRetirement,
-    complete_shared_join,
+use crate::{
+    native::apply_send_owner::{
+        NativeDisposalRequest, RegistrationFailure, SharedApplyFunding, SharedApplyRetirement,
+        complete_shared_join,
+    },
+    task_execution::host::transport::{
+        SendReportRetirement, SendReportRetirementStep, SendReportReturn,
+    },
 };
-use novarocks_control_runtime::{exit_custody::ExitCustody, reported_work::ReportedWork};
+use novarocks_control_runtime::{
+    actor_turn::ActorTurnError, exit_custody::ExitCustody, reported_work::ReportedWork,
+};
 use novarocks_control_runtime_core::identity::ConsumerId;
 use std::{
     collections::VecDeque,
@@ -43,11 +50,14 @@ pub(crate) enum TransportRetirementError {
     StartCleanup(CustodyRefusal, NativeDisposalRequest),
     NativeCleanup(NativeDisposalCompletion),
     Physical(PhysicalReturnError),
+    ReportInput(ActorTurnError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
 pub(crate) enum TransportRetirementStep {
     Advanced,
+    Scanned,
+    Report(SendReportReturn),
     Retired,
 }
 
@@ -65,6 +75,8 @@ pub(crate) struct TransportRetirement {
     disposal: Option<OriginalDisposalObligation>,
     unused: Option<ExitCustody>,
     physical: Option<PhysicalInputRetirementObligation>,
+    reports: Option<SendReportRetirement>,
+    report_scan_remaining: usize,
     rejected_attachment: Option<RegistrationFailure>,
     failed: bool,
     retired: bool,
@@ -89,6 +101,8 @@ impl TransportRetirement {
             disposal: None,
             unused: None,
             physical: None,
+            reports: None,
+            report_scan_remaining: 0,
             rejected_attachment: None,
             failed: false,
             retired: false,
@@ -107,8 +121,23 @@ impl TransportRetirement {
         self.rejected_attachment.take()
     }
 
-    pub(crate) fn take_actor_result(&self) -> Option<ReturnedActorTransportResult> {
-        self.original.take_actor_result()
+    pub(crate) fn take_actor_result(
+        &mut self,
+    ) -> Result<Option<ReturnedActorTransportResult>, ReturnedActorTransportResult> {
+        let Some(mut result) = self.original.take_actor_result() else {
+            return Ok(None);
+        };
+        match result.take_send_report_retirement() {
+            Ok(reports) => {
+                self.report_scan_remaining = reports.as_ref().map_or(0, |r| r.positions());
+                self.reports = reports;
+                Ok(Some(result))
+            }
+            Err(_) => {
+                self.failed = true;
+                Err(result)
+            }
+        }
     }
 
     /// One charged continuation. Pending depends on original Join/Native
@@ -177,6 +206,29 @@ impl TransportRetirement {
             self.disposal = None;
             return Poll::Ready(Ok(Advanced));
         }
+        if let Some(reports) = &mut self.reports {
+            self.report_scan_remaining -= 1;
+            match reports.advance().map_err(Error::ReportInput)? {
+                SendReportRetirementStep::Advanced(returned) => {
+                    self.report_scan_remaining = reports.positions();
+                    return Poll::Ready(Ok(
+                        returned.map_or(Advanced, TransportRetirementStep::Report)
+                    ));
+                }
+                SendReportRetirementStep::Pending if self.report_scan_remaining != 0 => {
+                    return Poll::Ready(Ok(TransportRetirementStep::Scanned));
+                }
+                SendReportRetirementStep::Pending => {
+                    // This pass only inspected busy or closed positions.
+                    // Check Native readiness, then wait for an actual wake.
+                    self.report_scan_remaining = reports.positions();
+                }
+                SendReportRetirementStep::Retired => {
+                    self.reports = None;
+                    return Poll::Ready(Ok(Advanced));
+                }
+            }
+        }
         if let Some(native) = self.native.as_mut() {
             let wait = self
                 .native_wake
@@ -224,7 +276,7 @@ impl TransportRetirement {
                 .map_err(CustodyError::from)
                 .map_err(Error::Custody)?;
             return Poll::Ready(Ok(Advanced));
-        } else if self.original.try_retire().map_err(Error::Custody)? {
+        } else if self.reports.is_none() && self.original.try_retire().map_err(Error::Custody)? {
             return Poll::Ready(Ok(Retired));
         }
         let reaped = self
