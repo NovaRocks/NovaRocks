@@ -263,17 +263,8 @@ impl AbortParticipationEffectReservation for NativeAbortEffectReservation {
             self.identity,
             "an Abort effect reservation may accept only its exact actor-owned identity"
         );
-        let identity = submission.request().identity();
-        let request = AbortParticipation::new(
-            identity.operation_id(),
-            identity.participation(),
-            native_cause(identity.cause()),
-        );
-        let effect = NativeAbortEffect {
-            intent: OperationIntent::AbortParticipation(request),
-            submission: Some(submission),
-            worker_closed: self.worker_closed.clone(),
-        };
+        let effect = NativeAbortEffect::from_submission(submission, self.worker_closed.clone());
+        let intent = effect.intent().clone();
         let mut order = self
             .submission_order
             .lock()
@@ -282,7 +273,7 @@ impl AbortParticipationEffectReservation for NativeAbortEffectReservation {
             .take()
             .expect("a live Abort reservation retains its bounded slot")
             .send(effect);
-        order.push_back(OperationIntent::AbortParticipation(request));
+        order.push_back(intent);
         drop(order);
         self.wake.wake();
     }
@@ -355,6 +346,25 @@ impl Drop for NativeAbortEffect {
 }
 
 impl NativeAbortEffect {
+    pub(crate) fn from_submission(
+        submission: AbortParticipationEffectSubmission,
+        worker_closed: Option<
+            Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>,
+        >,
+    ) -> Self {
+        let identity = submission.request().identity();
+        let request = AbortParticipation::new(
+            identity.operation_id(),
+            identity.participation(),
+            native_cause(identity.cause()),
+        );
+        Self {
+            intent: OperationIntent::AbortParticipation(request),
+            submission: Some(submission),
+            worker_closed,
+        }
+    }
+
     pub(crate) fn intent(&self) -> &OperationIntent {
         &self.intent
     }
@@ -816,6 +826,248 @@ mod tests {
             intake.front_intent(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
+    }
+
+    #[tokio::test]
+    async fn attempt_abort_rearms_only_after_its_original_control_input_retires() {
+        use crate::{
+            control_runtime::actor::FrontendActor,
+            task_execution::{
+                bridge::abort::AttemptAbortIngress, host::custody::tests::WithdrawalInbox,
+            },
+        };
+        use novarocks_attempt_protocol::input::AttemptInput;
+        use novarocks_control_runtime::transaction::RuntimeLedger;
+        use novarocks_control_runtime_core::{
+            capacity::{ReservationResources, ResourceVector},
+            identity::Generation,
+            mailbox::InputClass,
+            scope::{WorkAdmission, WorkKind},
+        };
+        use novarocks_coordination_contract::{AttemptActionId, LogicalToAttemptBody};
+        use novarocks_query_application::coordination::AbortParticipationIssueState;
+        use std::num::NonZeroU64;
+
+        #[derive(Debug)]
+        struct Route {
+            port: Mutex<Option<Arc<AttemptAbortIngress>>>,
+            capacity: watch::Sender<u64>,
+        }
+
+        impl AbortParticipationEffectPort for Route {
+            fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+                self.capacity.subscribe()
+            }
+
+            fn try_reserve(
+                &self,
+                identity: AbortParticipationIssueIdentity,
+            ) -> AbortParticipationEffectAdmission {
+                self.port
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(AbortParticipationEffectAdmission::Backpressured, |port| {
+                        port.try_reserve(identity)
+                    })
+            }
+        }
+
+        let exact = participation(BackendProcessId::new_v7());
+        let route = Arc::new(Route {
+            port: Mutex::new(None),
+            capacity: watch::channel(0).0,
+        });
+        let (work_owner, execution_stage) = governed_execution();
+        let limit = NonZeroUsize::new(2).unwrap();
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            execution(),
+            ExecutionEffect::None,
+            limit,
+            vec![exact],
+            limit,
+            limit,
+            work_owner,
+            execution_stage,
+        )
+        .unwrap()
+        .with_abort_participation_effect_port(route.clone(), limit);
+        let mut logical = LogicalExecutionTestHarness::install(
+            tokio::runtime::Handle::current(),
+            config,
+            execution(),
+            vec![exact],
+        )
+        .unwrap();
+        let activation = logical.activate_initial().await.unwrap();
+
+        let generation = Generation::new(1).unwrap();
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let inbox = WithdrawalInbox::new(&scope);
+        let (mut work, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let actor = inbox.registration().actor();
+        let runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<FrontendActor> =
+            inbox.runtime();
+        let position = runtime
+            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &work)
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        let port = Arc::new(AttemptAbortIngress::new(
+            activation,
+            [(exact, position)],
+            route.capacity.clone(),
+            None,
+        ));
+        route.port.lock().unwrap().replace(port.clone());
+        let admission = AcquireParticipationAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            exact,
+            LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            NativeCompatibilityId::new([7; 32]),
+            AdmissionEpochCapability::try_from_bytes([7; 16]).unwrap(),
+        );
+        let (admission_activation, pending) = logical
+            .begin_admission_issue_and_abandon(admission)
+            .await
+            .unwrap();
+        logical
+            .settle_late_admission_issue(
+                admission_activation,
+                pending,
+                AdmissionIssueSettlement::applied(
+                    pending.operation_id(),
+                    OperationOutcome::Accepted,
+                    ParticipationAdmissionTicketReceipt::new(
+                        AdmissionTicketId::try_from_bytes([9; 16]).unwrap(),
+                        exact,
+                        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+                    ),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let first = AttemptActionId::new(NonZeroU64::MIN);
+        let second = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+        let identity = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(snapshot) = logical.stand_down_snapshot(exact).await.unwrap()
+                    && snapshot.issue_state() == Some(AbortParticipationIssueState::TransportOwned)
+                {
+                    break snapshot.identity().unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let operation = identity.operation_id();
+        assert!(port.take_submission(second, exact, operation).is_none());
+        let (original, mut retirement) = port.take_submission(first, exact, operation).unwrap();
+        let mut capacity = port.subscribe_capacity();
+        assert!(!retirement.retire_ready().unwrap());
+        assert!(matches!(
+            port.try_reserve(identity),
+            AbortParticipationEffectAdmission::Backpressured
+        ));
+        assert!(!capacity.has_changed().unwrap());
+        let (_, AttemptInput::Port(original_input)) = inbox.try_commit_owner_control().unwrap()
+        else {
+            panic!("original Abort Control input");
+        };
+        assert_eq!(original_input.activation, activation);
+        let LogicalToAttemptBody::Abort { action, request } = original_input.body else {
+            panic!("original Abort request");
+        };
+        assert_eq!(action, first);
+        assert_eq!(request.envelope().operation_id(), operation);
+        assert_eq!(request.participation(), exact);
+        let NativeAbortEffectSettlement::TransportUnknown(late) = original
+            .settle(&OperationAcknowledgement::transport_unknown(
+                operation,
+                OperationKind::AbortParticipation,
+            ))
+            .unwrap()
+        else {
+            panic!("retain the exact old QA authority");
+        };
+        assert!(retirement.retire_ready().unwrap());
+        capacity.changed().await.unwrap();
+        drop(retirement);
+        let (_, AttemptInput::Port(replay_input)) =
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(input) = inbox.try_commit_owner_control() {
+                        break input;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("original Abort replay Control input");
+        };
+        let LogicalToAttemptBody::Abort {
+            action,
+            request: replay_request,
+        } = replay_input.body
+        else {
+            panic!("original Abort replay request");
+        };
+        assert_eq!(action, second);
+        assert_eq!(replay_request.envelope(), request.envelope());
+        assert_eq!(replay_request.participation(), request.participation());
+        assert_eq!(replay_request.cause(), request.cause());
+        let (replay, mut retirement) = port.take_submission(second, exact, operation).unwrap();
+        settle_late_abort_receipt(
+            late,
+            &OperationAcknowledgement::worker_receipt(
+                operation,
+                OperationKind::AbortParticipation,
+                OperationOutcome::ParticipationTerminalReceipt,
+                AckPayload::Participation(ParticipationReceipt::new(
+                    exact,
+                    ParticipationState::TerminalRetained,
+                )),
+            ),
+        )
+        .unwrap();
+        replay.resolved_by_other_generation();
+        assert!(retirement.retire_ready().unwrap());
+        drop(retirement);
+        logical
+            .observe_worker_stopped_and_participation_fenced(exact)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        route.port.lock().unwrap().take();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        Arc::try_unwrap(port).unwrap().close_after_exit().unwrap();
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        inbox.finish();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
     }
 
     #[tokio::test]

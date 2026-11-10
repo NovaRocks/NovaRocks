@@ -105,6 +105,7 @@ pub(crate) struct AttemptActorRegistration {
     root_control: RootControlBinding,
     ordered_bound: bool,
     startup_reserved: bool,
+    abort_bound: bool,
     config: ActorConfig,
     binding: Arc<OnceLock<AttemptBinding>>,
 }
@@ -430,6 +431,42 @@ impl AttemptActorRegistration {
             positions,
         )
         .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original))))
+    }
+
+    pub(crate) fn prepare_abort_ingress(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+        capacity: tokio::sync::watch::Sender<u64>,
+        worker_closed: Option<
+            Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>,
+        >,
+    ) -> Result<crate::task_execution::bridge::abort::AttemptAbortIngress, ActorTurnError> {
+        if self.abort_bound || !self.scope.same_scope(work.scope()) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        let mut positions = Vec::with_capacity(self.failure_members.len());
+        for member in &*self.failure_members {
+            match self.reserve_standing(runtime, self.original.actor(), InputClass::Control, work) {
+                Ok(position) => positions.push((member.participation, position)),
+                Err(error) => {
+                    for (_, mut position) in positions {
+                        position
+                            .close_after_exit()
+                            .expect("unpublished Abort Control position");
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(
+            crate::task_execution::bridge::abort::AttemptAbortIngress::new(
+                self.root_control.activation(),
+                positions,
+                capacity,
+                worker_closed,
+            ),
+        )
     }
 
     fn prepare_owner_controls(
@@ -900,6 +937,7 @@ impl AttemptActor {
             root_control,
             ordered_bound: false,
             startup_reserved: false,
+            abort_bound: false,
             config,
             binding,
         })

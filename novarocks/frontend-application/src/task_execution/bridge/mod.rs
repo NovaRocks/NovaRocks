@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod abort;
 pub(crate) mod control;
 pub(super) mod qa;
 pub(crate) mod terminal;

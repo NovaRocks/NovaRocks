@@ -567,6 +567,18 @@ impl WithdrawalInbox {
     }
 
     fn try_commit_attempt_from(&self, source: ActorId) -> Option<(InputId, AttemptInput)> {
+        self.try_commit_from(source, InputClass::Lifecycle)
+    }
+
+    pub(crate) fn try_commit_owner_control(&self) -> Option<(InputId, AttemptInput)> {
+        self.try_commit_from(self.registration.actor(), InputClass::Control)
+    }
+
+    fn try_commit_from(
+        &self,
+        source: ActorId,
+        class: InputClass,
+    ) -> Option<(InputId, AttemptInput)> {
         if self.observed.lock().unwrap().is_empty() {
             self.runtime.poll_one(Tick(1)).unwrap();
         }
@@ -576,7 +588,7 @@ impl WithdrawalInbox {
         }
         let (envelope, fact) = observed.remove(0);
         assert_eq!(envelope.source, source);
-        assert_eq!(envelope.class, InputClass::Lifecycle);
+        assert_eq!(envelope.class, class);
         Some((envelope.input, fact))
     }
     pub(crate) fn finish(self) {
