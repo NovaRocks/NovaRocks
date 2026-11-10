@@ -18,14 +18,14 @@
 //! The original queued-input job has one gate and one paid result leg.
 use super::{
     queue_input::{AdmitQueuedInput, OriginalQueuedInput, SendKey},
-    source_ports::{BodyOutcome, TransportLeg, TransportReports},
+    source_ports::{BodyOutcome, TransportLeg},
 };
 use novarocks_control_runtime::exit_work::{GatedOutcome, GatedWork};
 use novarocks_control_runtime_core::identity::Generation;
 use novarocks_workload_control::joint_admission::{
     NativeAsyncActionAuthority, NativeQueuedInputQuote,
 };
-use std::{any::Any, sync::Arc};
+use std::any::Any;
 /// The same Source prepaid its canonical input/result cells before publishing
 /// a passive request. The neutral kernel issues no author from identities.
 pub(crate) struct BoundQueue {
@@ -34,7 +34,6 @@ pub(crate) struct BoundQueue {
     pub(crate) control: bool,
     pub(crate) quote: NativeQueuedInputQuote,
     pub(crate) authority: NativeAsyncActionAuthority,
-    pub(crate) reports: Arc<dyn TransportReports>,
     pub(crate) original_captures: Box<dyn Any + Send>,
 }
 pub(crate) struct QueueJob {
@@ -47,25 +46,20 @@ pub(crate) fn future_layout() -> std::alloc::Layout {
     }
     of(run)
 }
-struct QueueCaptures {
-    // Preserve the old unused-body closure-before-original-captures order.
-    reports: Arc<dyn TransportReports>,
-    original: Box<dyn Any + Send>,
-}
 /// Actual generic GatedWork allocations plus this queue's one WC wait F.
 /// Its inline values are included in the outer factory and tuple layouts.
 pub(crate) fn owned_preparation_layouts() -> [std::alloc::Layout; 5] {
     fn of<P, F>(
         _: fn(SendKey, NativeAsyncActionAuthority, bool, NativeQueuedInputQuote) -> P,
-        body: fn(QueueCaptures, P::Output) -> F,
+        body: fn(Box<dyn Any + Send>, P::Output) -> F,
     ) -> [std::alloc::Layout; 4]
     where
         P: std::future::Future,
         F: std::future::Future,
     {
-        GatedWork::<QueueCaptures>::backing_layouts::<P, F>(body)
+        GatedWork::<Box<dyn Any + Send>>::backing_layouts::<P, F>(body)
     }
-    let gated = of(prepare_input, install_input);
+    let gated = of(prepare_input, return_input);
     [
         gated[0],
         gated[1],
@@ -99,19 +93,15 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
         control,
         quote,
         authority,
-        reports,
         original_captures,
     } = *bound;
     let pre = prepare_input(key, authority, control, quote);
-    let captures = QueueCaptures {
-        reports,
-        original: original_captures,
-    };
     let body: fn(
-        QueueCaptures,
+        Box<dyn Any + Send>,
         Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
-    ) -> _ = install_input;
-    let running = GatedWork::new(exit, captures, handoff, panic).run(scope_generation, pre, body);
+    ) -> _ = return_input;
+    let running =
+        GatedWork::new(exit, original_captures, handoff, panic).run(scope_generation, pre, body);
     async move {
         let outcome = match running.await {
             Ok(GatedOutcome::Completed(outcome)) => outcome,
@@ -122,22 +112,12 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
     }
 }
 
-async fn install_input(
-    captures: QueueCaptures,
+async fn return_input(
+    _captures: Box<dyn Any + Send>,
     prepared: Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
 ) -> BodyOutcome {
-    let QueueCaptures {
-        reports,
-        original: _captures,
-    } = captures;
     match prepared {
-        Ok(original) => match reports.install_input(original) {
-            Ok(()) => BodyOutcome::InputInstalled,
-            Err(original) => {
-                drop(original);
-                BodyOutcome::LocalFailure(novarocks_workload_control::WorkError::Closed)
-            }
-        },
+        Ok(input) => BodyOutcome::InputAdmitted(input),
         Err(error) => BodyOutcome::LocalFailure(error),
     }
 }

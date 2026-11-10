@@ -124,11 +124,14 @@ impl Governed {
             listener,
         }
     }
-    fn authority(&self) -> NativeAsyncActionAuthority {
+    pub(crate) fn authority(&self) -> NativeAsyncActionAuthority {
         self.window
             .retain_alias()
             .native_action_authority()
             .unwrap()
+    }
+    pub(crate) fn progress(&mut self) {
+        drive(&mut self.driver);
     }
     pub(crate) fn admit(&mut self, key: SendKey, new_backing: usize) -> OriginalQueuedInput {
         let quote = crate::task_execution::host::transport::queued_input_quote(

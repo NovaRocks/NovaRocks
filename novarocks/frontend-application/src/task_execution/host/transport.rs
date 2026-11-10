@@ -29,6 +29,7 @@
 mod actor_adapter;
 mod capacity;
 mod execute;
+mod granted_inputs;
 mod prepare;
 mod proposal_wait;
 mod queue_input;
@@ -48,6 +49,7 @@ pub(crate) use actor_adapter::{
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
+pub(crate) use granted_inputs::GrantedInputs;
 #[cfg(test)]
 pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;
 pub(crate) use queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey};

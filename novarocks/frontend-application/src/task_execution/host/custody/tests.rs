@@ -492,7 +492,7 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
                     .is_ok()
             );
             assert!(
-                port.stage_actor_outcome(BodyOutcome::InputInstalled)
+                port.stage_actor_outcome(BodyOutcome::ReceiptsRecorded)
                     .is_err()
             );
             staged.send(()).unwrap();
@@ -563,4 +563,165 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
         .unwrap();
     inbox.finish();
     fixture.finish();
+}
+
+#[tokio::test]
+async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing() {
+    use super::actor_result::AdmissionPublicationError;
+    use crate::{
+        control_runtime::{host::PreparedEffectJob, transport_withdrawal::AttemptEffectEnvelope},
+        task_execution::host::transport::{
+            self, ActorTransportHandoff, ActorTransportWork, BoundActorTransport, BoundQueue,
+            GrantedInputs, SendKey, SourceLayouts,
+        },
+    };
+    use novarocks_attempt_protocol::{
+        effect::{AttemptEffect, EffectBody, EffectClass, OperationIntent, QueuedInputPayload},
+        input::SendGeneration,
+        start::PayloadRef,
+    };
+    use novarocks_coordination_contract::AttemptActionId;
+    use novarocks_execution_contract::{
+        OperationEnvelope, OperationKind, TaskIdentity, TaskOperationId,
+    };
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::{num::NonZeroU64, time::Duration};
+
+    let fixture = Fixture::new();
+    let inbox = WithdrawalInbox::new(&fixture.scope);
+    let mut wc = transport::GovernedQueuedInputFixture::new();
+    let original = fixture.reported(None);
+    let result = inbox.reserve(&original);
+    let result_author = result.event_author().unwrap();
+    let id = AttemptActionId::new(NonZeroU64::MIN);
+    let key = SendKey {
+        operation: TaskOperationId::new_v7(),
+        generation: SendGeneration::new(id),
+    };
+    let payload = PayloadRef(NonZeroU64::MIN);
+    let operation = OperationIntent::CreateTask {
+        envelope: OperationEnvelope::with_default_wait(key.operation, OperationKind::CreateTask),
+        identity: TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        ),
+        creation: payload,
+        queued_bytes: 8192,
+    };
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id,
+        class: EffectClass::Business,
+        body: EffectBody::AdmitQueuedInput {
+            lane: operation.lane(),
+            operation,
+            generation: key.generation,
+            payload: QueuedInputPayload::NewCreation(payload),
+        },
+    });
+    let panic = PanicSink::new();
+    let (mut owner, exit, launch) =
+        OriginalTransportJoinObligation::prepare(original, observer(), panic.clone())
+            .unwrap_or_else(|e| panic!("{}", e.error));
+    let layouts = transport::actor_transport_layouts(false).unwrap();
+    let quote = transport::queued_input_quote(8192, SourceLayouts { original: &layouts }).unwrap();
+    let job = PreparedEffectJob {
+        effect: FrontendEffect::Attempt(effect.clone()),
+        exit,
+        result,
+        captures: Box::new(BoundActorTransport {
+            effect,
+            work: ActorTransportWork::Admit(Box::new(BoundQueue {
+                key,
+                scope_generation: Generation::new(1).unwrap(),
+                control: false,
+                quote,
+                authority: wc.authority(),
+                original_captures: Box::new(()),
+            })),
+            launch,
+            panic,
+            result_author,
+        }),
+    };
+    assert!(matches!(
+        transport::handoff_actor_transport(&Handle::current(), job),
+        Ok(ActorTransportHandoff::Spawned)
+    ));
+    assert!(owner.take_actor_result().is_none());
+    inbox.assert_no_result();
+    let joined = tokio::time::timeout(
+        Duration::from_secs(2),
+        poll_fn(|cx| {
+            wc.progress();
+            let result = owner.poll_shared_completion(cx);
+            if result.is_pending() {
+                cx.waker().wake_by_ref();
+            }
+            result
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(joined.is_none());
+    let mut result = owner.take_actor_result().unwrap();
+    assert!(result.withdrawal.is_none());
+    let mut inputs = GrantedInputs::default();
+    assert!(matches!(
+        result.publish_admission(&mut inputs, None),
+        Err(AdmissionPublicationError::MissingPayloadRetention)
+    ));
+    inbox.assert_no_result();
+    let mut payload_retention = None;
+    let published = result
+        .publish_admission(&mut inputs, Some(&mut payload_retention))
+        .unwrap()
+        .unwrap();
+    assert!(payload_retention.is_some());
+    assert!(inputs.contains(published.grant));
+    assert!(
+        result
+            .publish_admission(&mut inputs, None)
+            .unwrap()
+            .is_none()
+    );
+    let input = published
+        .delivery
+        .unwrap_or_else(|failure| panic!("{}", failure.error));
+    assert!(matches!(
+        inbox.consume(input),
+        ExecutorFact::QueuedInputGranted { operation, grant, queued_bytes: 8192 }
+            if operation == key.operation && grant == published.grant && grant.generation() == key.generation
+    ));
+    let wrong = SendKey {
+        operation: TaskOperationId::new_v7(),
+        ..key
+    };
+    assert!(inputs.take(published.grant, wrong).is_none());
+    let replay = SendKey {
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::new(2).unwrap())),
+        ..key
+    };
+    assert!(inputs.take(published.grant, replay).is_none());
+    let original_grant = inputs
+        .take(published.grant, key)
+        .expect("same original WC grant");
+    assert_eq!(original_grant.key(), key);
+    assert!(inputs.take(published.grant, key).is_none());
+    drop(original_grant);
+    drop(payload_retention);
+    result.original.close_after_exit().unwrap();
+    assert!(owner.try_retire().unwrap());
+    fixture.scope.close_external().unwrap();
+    fixture
+        .ledger
+        .reap_scope_ready(fixture.scope.id(), 128)
+        .unwrap();
+    inbox.finish();
+    fixture.finish();
+    assert!(wc.finish());
 }

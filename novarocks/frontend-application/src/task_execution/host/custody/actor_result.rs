@@ -24,18 +24,19 @@ use crate::{
         actor::{FrontendActor, FrontendInput},
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::host::transport::BodyOutcome,
+    task_execution::host::transport::{BodyOutcome, GrantedInputs, SendKey},
 };
 use novarocks_attempt_protocol::{
-    effect::EffectBody,
-    input::{AttemptInput, ExecutorFact, WithdrawalOutcome},
+    effect::{EffectBody, QueuedInputPayload},
+    input::{AttemptInput, ExecutorFact, QueuedInputGrantRef, WithdrawalOutcome},
 };
 use novarocks_control_runtime::{
     actor_turn::InputAuthor,
     causal_input::{CausalFillFailure, CausalInputObligation},
 };
 use novarocks_control_runtime_core::identity::InputId;
-use std::sync::Arc;
+use novarocks_resource_contract::{ExistingOwnerRetentionPin, RetentionPinError};
+use std::{num::NonZeroU64, sync::Arc};
 
 /// The original result position is held independently of the worker future.
 /// A missing outcome after a positively observed exit is left to failure
@@ -179,4 +180,82 @@ impl ReturnedActorTransportResult {
                 .map(|(_, input)| input),
         );
     }
+
+    /// Install the actual original WC object before exposing its passive
+    /// address. For a first payload the caller supplies the canonical
+    /// operation's retention cell, which outlives this send's queue record.
+    pub(crate) fn publish_admission(
+        &mut self,
+        inputs: &mut GrantedInputs,
+        payload_retention: Option<&mut Option<ExistingOwnerRetentionPin>>,
+    ) -> Result<Option<AdmissionPublication>, AdmissionPublicationError> {
+        let Some(BodyOutcome::InputAdmitted(original)) = self.outcome.as_ref() else {
+            return Ok(None);
+        };
+        let EffectBody::AdmitQueuedInput {
+            operation,
+            generation,
+            payload,
+            ..
+        } = &self.effect.protocol.body
+        else {
+            return Err(AdmissionPublicationError::WrongAdmission);
+        };
+        let key = SendKey {
+            operation: operation.operation_id(),
+            generation: *generation,
+        };
+        if original.key() != key || generation.admission_effect() != self.effect.protocol.id {
+            return Err(AdmissionPublicationError::WrongAdmission);
+        }
+        let record =
+            NonZeroU64::new(self.effect.protocol.id.get()).expect("original nonzero effect");
+        let grant = QueuedInputGrantRef::new(record, *generation);
+        if inputs.contains(grant) {
+            return Err(AdmissionPublicationError::DuplicateGrant);
+        }
+        if matches!(
+            payload,
+            QueuedInputPayload::NewCreation(_) | QueuedInputPayload::NewTaskUpdate(_)
+        ) {
+            let slot = payload_retention
+                .filter(|slot| slot.is_none())
+                .ok_or(AdmissionPublicationError::MissingPayloadRetention)?;
+            *slot = Some(
+                original
+                    .retain_payload()
+                    .map_err(AdmissionPublicationError::PayloadRetention)?,
+            );
+        }
+        let Some(BodyOutcome::InputAdmitted(original)) = self.outcome.take() else {
+            unreachable!("qualified original grant");
+        };
+        inputs.install(grant, original);
+        let event = FrontendInput::Attempt(Box::new(AttemptInput::Executor(
+            ExecutorFact::QueuedInputGranted {
+                operation: key.operation,
+                grant,
+                queued_bytes: operation.queued_bytes(),
+            },
+        )));
+        let delivery = self
+            .original
+            .fill_with_receipt(None, event)
+            .map(|(_, input)| input);
+        Ok(Some(AdmissionPublication { grant, delivery }))
+    }
+}
+
+#[must_use = "retain the original refused event or retire the delivered input"]
+pub(crate) struct AdmissionPublication {
+    pub(crate) grant: QueuedInputGrantRef,
+    pub(crate) delivery: Result<InputId, CausalFillFailure<FrontendInput>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum AdmissionPublicationError {
+    WrongAdmission,
+    DuplicateGrant,
+    MissingPayloadRetention,
+    PayloadRetention(RetentionPinError),
 }

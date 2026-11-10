@@ -27,8 +27,8 @@ use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
 
 pub(crate) enum BodyOutcome {
-    /// The same real WC grant is installed in the canonical Source record.
-    InputInstalled,
+    /// The same real WC grant moves to its original Join owner.
+    InputAdmitted(OriginalQueuedInput),
     /// Individual original ACK cells contain every exact operation result.
     ReceiptsRecorded,
     /// GatedWork destroyed pre-handoff, captures and unused original authority.
@@ -59,9 +59,6 @@ pub(crate) trait TransportReports: Send + Sync + 'static {
         participation: ParticipationRef,
         at: MonotonicInstant,
     );
-    /// Consume the original WC input and bind its actual host record before
-    /// exposing the passive reference. Ordinary refusal returns the full input.
-    fn install_input(&self, input: OriginalQueuedInput) -> Result<(), OriginalQueuedInput>;
 }
 
 /// Rich requests are resolved by the same canonical host record. In particular
