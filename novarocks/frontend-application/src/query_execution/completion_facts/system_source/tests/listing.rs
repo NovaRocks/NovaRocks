@@ -86,6 +86,18 @@ impl Fixture {
         capacity_config: ResultCapacityConfig,
         compile_duration: Duration,
     ) -> Self {
+        let pin = crate::connector::metadata_binding_typed(provider.registry.as_ref(), "catalog")
+            .unwrap();
+        Self::new_with_pin(pin, class, registry, capacity_config, compile_duration).await
+    }
+    async fn new_with_pin(
+        pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+        class: ResultWindowClass,
+        registry: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+        capacity_config: ResultCapacityConfig,
+        compile_duration: Duration,
+    ) -> Self {
+        let catalog = pin.binding().descriptor().instance_id.as_str().to_owned();
         let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 8,
             business_limit: 8,
@@ -158,7 +170,7 @@ impl Fixture {
         let scope = StatementFactScope::binding_only(
             Arc::new(QueryTableBindingStore::try_new().unwrap()),
             context.clone(),
-            Some("catalog"),
+            Some(&catalog),
             &scope,
             capacity,
         )
@@ -170,10 +182,8 @@ impl Fixture {
             FrontendPlanningCpuSource::new(blocking.clone()),
         );
         let source = super::source_in_registry(blocking, scope, registry).await;
-        let pin = crate::connector::metadata_binding_typed(provider.registry.as_ref(), "catalog")
-            .unwrap();
         let pin = Arc::new(PinnedCatalogListing::new(pin, context).unwrap());
-        source.io.lock().unwrap().pins.insert("catalog".into(), pin);
+        source.io.lock().unwrap().pins.insert(catalog, pin);
         Self {
             source: Some(source),
             cpu,
@@ -187,8 +197,10 @@ impl Fixture {
     fn source(&self) -> Arc<FrontendSystemTableFacts> {
         self.source.as_ref().unwrap().clone()
     }
-    async fn finish(mut self, cancelled: bool) {
-        let source = self.source.take().unwrap();
+    async fn retire_source(&mut self) {
+        let Some(source) = self.source.take() else {
+            return;
+        };
         tokio::time::timeout(
             Duration::from_secs(5),
             driven(&self.control, &mut self.driver, source.close()),
@@ -208,6 +220,9 @@ impl Fixture {
                 .unwrap();
         }
         drop(source);
+    }
+    async fn finish(mut self, cancelled: bool) {
+        self.retire_source().await;
         drop(self.window.take());
         assert_eq!(
             self.control.snapshot().result_windows.held_positions,
@@ -386,3 +401,7 @@ mod completion;
 mod scale;
 
 mod dml;
+
+mod current;
+
+mod inventory_store;

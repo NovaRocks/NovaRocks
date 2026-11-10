@@ -2145,7 +2145,7 @@ pub(crate) async fn admit_mv_publication_async_in(
 
 #[cfg(test)]
 #[path = "staged_create/admitted_current_tests.rs"]
-mod admitted_current_tests;
+pub(crate) mod admitted_current_tests;
 
 #[cfg(test)]
 mod tests {

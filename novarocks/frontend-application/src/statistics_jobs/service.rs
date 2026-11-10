@@ -1061,6 +1061,172 @@ mod admission_and_conclusion_tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct UnusedSystemStatisticsPorts(std::sync::atomic::AtomicUsize);
+    impl application::StatisticsTargetResolver for UnusedSystemStatisticsPorts {
+        fn planning_pin(
+            &self,
+            _: &application::StatisticsTableTarget,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorControlPlanningPin,
+            application::StatisticsApplicationError,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("system ANALYZE must refuse before provider selection")
+        }
+        fn capture_table_object_async<'a>(
+            &'a self,
+            _: &'a application::StatisticsTableTarget,
+            _: novarocks_spi::connector::ConnectorRequestContext,
+            _: &'a novarocks_spi::connector::ConnectorControlPlanningPin,
+            _: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            application::StatisticsTargetCapture,
+                            application::StatisticsApplicationError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("system ANALYZE must refuse before capture")
+        }
+    }
+    impl StatisticsJobRootScopeSource for UnusedSystemStatisticsPorts {
+        fn begin_statistics_job(&self) -> Result<PendingQueryRoot, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("system ANALYZE must refuse before job Root admission")
+        }
+    }
+    impl StatisticsAttemptExecutor for UnusedSystemStatisticsPorts {
+        fn execute<'a>(
+            &'a self,
+            _: StatisticsJob,
+            _: StatisticsJobAdmission,
+            _: novarocks_statistics_application::StatisticsJobProgress,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), StatisticsAttemptError>> + Send + 'a>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("system ANALYZE must not create a background attempt")
+        }
+    }
+    #[tokio::test]
+    async fn system_analyze_preserves_unsupported_before_capacity_provider_io_and_job_admission() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::{
+            admitted_query_context::QueryExecutionContext, api::BackendTopologySnapshot,
+            cancellation::QueryCancellationSource,
+        };
+        let service = StatisticsJobService::new();
+        let unused = Arc::new(UnusedSystemStatisticsPorts::default());
+        let runtime = tokio::runtime::Handle::current();
+        let application = Arc::new(FrontendStatisticsApplicationPort::new(
+            service.clone(),
+            unused.clone(),
+            unused.clone(),
+            unused.clone(),
+            runtime.clone(),
+            crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(runtime),
+        ));
+        let executor =
+            crate::statistics::command::StatisticsCommandExecutor::new(application.clone());
+        // Deliberately no result capacity, Provider CPU or I/O admission. The
+        // real application must select the system-target refusal before any
+        // of them; this is not a successful-query topology fixture.
+        let execution = QueryExecutionContext::new(
+            novarocks_types::ClusterRole::Fe,
+            BackendTopologySnapshot::empty(0),
+            None,
+            QueryCancellationSource::new().view(),
+            Default::default(),
+            Default::default(),
+        );
+        let context = crate::connector::test_request_context();
+        let family =
+            novarocks_result_contract::ClientPresentationFamily::TrinoJson(Default::default());
+        for (sql, catalog, namespace) in [
+            (
+                "ANALYZE TABLE system.metadata.materialized_views",
+                None,
+                "db",
+            ),
+            ("ANALYZE TABLE SYSTEM.INFORMATION_SCHEMA.TABLES", None, "db"),
+            (
+                "ANALYZE TABLE catalog.information_schema.tables",
+                None,
+                "db",
+            ),
+            (
+                "ANALYZE TABLE tables",
+                Some("catalog"),
+                "information_schema",
+            ),
+        ] {
+            let statement = novarocks_query_application::sql::parse_single_statement(sql).unwrap();
+            let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
+                novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
+            else {
+                panic!("ANALYZE semantic command")
+            };
+            let error = executor
+                .prepare_statement_action(
+                    &command, catalog, namespace, &execution, &context, family,
+                )
+                .err()
+                .expect("system target refusal");
+            let cause = error.failure_cause().expect("original provider refusal");
+            let original = cause
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .unwrap();
+            assert_eq!(
+                original.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            );
+            assert_eq!(cause.failure_fact(), original.failure_fact());
+            let error = crate::query::product_command_service_error(error);
+            // The protocol consumes the exact execution descriptor before
+            // the coarse service kind. Preserve that input through routing.
+            assert_eq!(
+                error
+                    .execution_failure()
+                    .unwrap()
+                    .descriptor()
+                    .descriptor
+                    .code
+                    .as_str(),
+                "query.execution.unsupported",
+            );
+            assert!(error.failure_cause().is_some());
+        }
+        let statement = novarocks_query_application::sql::parse_single_statement(
+            "ANALYZE TABLE catalog.db.orders",
+        )
+        .unwrap();
+        let Some(novarocks_query_application::sql::ProductSqlCommand::Statistics(command)) =
+            novarocks_query_application::sql::lower_product_sql_command(&statement).unwrap()
+        else {
+            panic!("ANALYZE semantic command")
+        };
+        let ordinary = executor
+            .prepare_statement_action(&command, None, "db", &execution, &context, family)
+            .err()
+            .expect("fixture has no result capacity");
+        assert!(
+            ordinary
+                .to_string()
+                .contains("statistics submission has no original capacity")
+        );
+        assert_eq!(unused.0.load(Ordering::SeqCst), 0);
+        assert!(service.list().await.unwrap().is_empty());
+        application
+            .shutdown_worker_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
     fn control() -> WorkloadControl {
         let control = WorkloadControl::try_new(
             WorkloadConfig {

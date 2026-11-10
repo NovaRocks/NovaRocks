@@ -144,7 +144,7 @@ impl StatisticsCommandExecutor {
         family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        novarocks_query_application::api::CommandError,
     > {
         self.application
             .prepare_statement_action(
@@ -153,7 +153,9 @@ impl StatisticsCommandExecutor {
                 context,
                 family,
             )
-            .map_err(|e| e.to_string())
+            .map_err(
+                crate::statistics_jobs::application::StatisticsApplicationError::into_command_error,
+            )
     }
 
     /// Executes the complete semantic command admitted by Query Application.

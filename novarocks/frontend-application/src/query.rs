@@ -359,25 +359,23 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         CommandError,
     > {
-        self.statistics
-            .prepare_statement_action(
-                &command,
-                request_context.session().current_catalog(),
-                request_context.session().current_database(),
-                request_context.execution(),
-                command_context.connector_context(),
-                request_context
-                    .session()
-                    .presentation()
-                    .copied()
-                    .ok_or_else(|| {
-                        CommandError::new(
-                            CommandErrorKind::Rejected,
-                            "statistics client result requires an explicit presentation",
-                        )
-                    })?,
-            )
-            .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))
+        self.statistics.prepare_statement_action(
+            &command,
+            request_context.session().current_catalog(),
+            request_context.session().current_database(),
+            request_context.execution(),
+            command_context.connector_context(),
+            request_context
+                .session()
+                .presentation()
+                .copied()
+                .ok_or_else(|| {
+                    CommandError::new(
+                        CommandErrorKind::Rejected,
+                        "statistics client result requires an explicit presentation",
+                    )
+                })?,
+        )
     }
 
     fn execute(

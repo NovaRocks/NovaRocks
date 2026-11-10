@@ -451,6 +451,17 @@ pub(super) fn prepare_statistics_scan(
     ),
     DistributedQueryError,
 > {
+    if novarocks_sql::system_table::is_system_table_name(&identity.catalog, &identity.namespace) {
+        return Err(DistributedQueryError::from_source(
+            DistributedQueryErrorKind::Rejected,
+            novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                    "statistics collection on system tables is unsupported",
+                ),
+            ),
+        ));
+    }
     let live = execution.topology().targets().len();
     if live == 0 {
         return Err(DistributedQueryError::new(
@@ -629,6 +640,143 @@ fn finish_statistics_assembly(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixed_scan_input(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> (
+        StatisticsRelationIdentity,
+        StatisticsCollectionProgram,
+        ConnectorControlPlanningPin,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use arrow::datatypes::DataType;
+        use novarocks_spi::connector::{
+            ConnectorInstanceId, ConnectorTableHandle, StatisticsArtifactIdentity,
+        };
+        use novarocks_spi::connector::{StatisticsRequiredAggregation, StatisticsScanColumn};
+        let instance = ConnectorInstanceId::parse(catalog).unwrap();
+        let program = StatisticsCollectionProgram::try_new(
+            ConnectorTableHandle::try_new(
+                instance.clone(),
+                bytes::Bytes::copy_from_slice(table.as_bytes()),
+            )
+            .unwrap(),
+            Some(7),
+            vec![
+                StatisticsRequiredAggregation::try_new(
+                    StatisticsScanColumn::try_new(
+                        0,
+                        "k",
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    )
+                    .unwrap(),
+                    "$test_stat",
+                    StatisticsArtifactIdentity::try_new(vec![1], "test/blob").unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let released = releases.clone();
+        let pin = ConnectorControlPlanningPin::new(
+            Arc::new(
+                novarocks_catalog_application::test_support::test_control_binding_for(instance, 7),
+            ),
+            move || {
+                released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        (
+            StatisticsRelationIdentity::try_new(catalog, namespace, table).unwrap(),
+            program,
+            pin,
+            releases,
+        )
+    }
+    fn fixed_scan_execution(live: bool) -> QueryExecutionContext {
+        use novarocks_execution_contract::{
+            AdmissionEpochCapability, BackendProcessDescriptor, RuntimeEndpoint,
+        };
+        use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
+        let topology = if live {
+            BackendTopologySnapshot::try_new(
+                1,
+                vec![LiveBackendTarget::new(
+                    0,
+                    BackendProcessDescriptor::try_new(
+                        novarocks_types::BackendProcessId::new_v7(),
+                        RuntimeEndpoint::new("127.0.0.1", 19010).unwrap(),
+                        RuntimeEndpoint::new("control.test.invalid", 19061).unwrap(),
+                        "test-deployment",
+                        "test-build",
+                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        4096,
+                    )
+                    .unwrap(),
+                    AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
+                )],
+            )
+            .unwrap()
+        } else {
+            BackendTopologySnapshot::empty(1)
+        };
+        QueryExecutionContext::new(
+            novarocks_types::ClusterRole::Fe,
+            topology,
+            None,
+            novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+    #[test]
+    fn fixed_statistics_scan_refuses_system_targets_before_topology_and_binding() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use std::error::Error;
+        for live in [false, true] {
+            for (catalog, namespace, table) in [
+                ("system", "metadata", "materialized_views"),
+                ("catalog.analytics", "information_schema", "tables"),
+            ] {
+                let (identity, program, pin, releases) =
+                    fixed_scan_input(catalog, namespace, table);
+                let Err(error) =
+                    prepare_statistics_scan(&fixed_scan_execution(live), &identity, &program, pin)
+                else {
+                    panic!("system statistics scan must be refused")
+                };
+                let cause = error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<SharedFailureCause>()
+                    .unwrap();
+                assert_eq!(
+                    cause.downcast_ref::<ConnectorError>().unwrap().kind(),
+                    ConnectorErrorKind::Unsupported
+                );
+                assert_eq!(cause.failure_fact().class(), FailureClass::Unsupported);
+                assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+    }
+    #[test]
+    fn ordinary_fixed_statistics_scan_preserves_identity_version_and_pin() {
+        let (identity, program, pin, releases) =
+            fixed_scan_input("catalog.analytics", "db", "orders");
+        let (bindings, scan) =
+            prepare_statistics_scan(&fixed_scan_execution(true), &identity, &program, pin).unwrap();
+        assert_eq!(scan.catalog, "catalog.analytics");
+        assert_eq!(scan.namespace, "db");
+        assert_eq!(scan.table, "orders");
+        assert_eq!(scan.version_ordinal, 7);
+        assert_eq!(scan.columns.len(), 1);
+        assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(bindings);
+        assert_eq!(releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn statistics_preparation_rejects_a_legacy_window_without_the_original_computation() {
