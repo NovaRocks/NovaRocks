@@ -1684,6 +1684,7 @@ async fn run_actor_send(withdraw: bool) {
         transport_withdrawal::AttemptEffectEnvelope,
     };
     use crate::task_execution::clock::ProcessMonotonicClock;
+    use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
         effect::{
@@ -1701,6 +1702,8 @@ async fn run_actor_send(withdraw: bool) {
     };
     use novarocks_control_runtime_core::{identity::Tick, scope::ScopeError};
     use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+    use novarocks_execution_contract::{AbortCause, AbortParticipation, ParticipationRef};
+    use novarocks_types::FrontendProcessId;
 
     let roles = Roles::new();
     let mut peer = if withdraw {
@@ -1723,13 +1726,23 @@ async fn run_actor_send(withdraw: bool) {
         .bind(WorkKind::Cleanup)
         .unwrap();
     let backend = BackendProcessId::new_v7();
-    let operation = cancel(backend);
+    let execution =
+        QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap();
+    let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let lifecycle = FailureLifecycle::freeze([participation].into_iter());
+    let starts = lifecycle.starts();
+    if let Some(peer) = &peer {
+        peer.accept_abort(participation);
+    }
+    let abort = AbortParticipation::new(
+        TaskOperationId::new_v7(),
+        participation,
+        AbortCause::QueryFailed,
+    );
+    let operation = OperationIntent::AbortParticipation(abort);
     let key = send_key(&operation);
     let reference = QueuedInputGrantRef::new(NonZeroU64::MIN, key.generation);
-    let OperationIntent::CancelTask(cancel) = &operation else {
-        unreachable!()
-    };
-    let protocol = ProtocolIntent::CancelTask(cancel.clone());
+    let protocol = ProtocolIntent::AbortParticipation(abort);
     let admit_id = key.generation.admission_effect();
     let admit = AttemptEffectEnvelope::new(AttemptEffect {
         id: admit_id,
@@ -1812,7 +1825,7 @@ async fn run_actor_send(withdraw: bool) {
             assert_eq!(originals.len(), 1);
             assert!(matches!(
                 originals.into_values().next(),
-                Some(OperationIntent::CancelTask(_))
+                Some(OperationIntent::AbortParticipation(_))
             ));
         }
         fn transport_event(&mut self, _: AttemptActionId, original: custody::TransportSourceEvent) {
@@ -1978,6 +1991,7 @@ async fn run_actor_send(withdraw: bool) {
                 report_author,
                 idle: send_idle,
             },
+            lifecycle,
             Box::new(ScopeOwner {
                 scope: roles.scope.clone(),
                 parent,
@@ -2073,6 +2087,7 @@ async fn run_actor_send(withdraw: bool) {
     })
     .await
     .unwrap();
+    assert_eq!(starts.was_started(participation), !withdraw);
     if !withdraw {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {

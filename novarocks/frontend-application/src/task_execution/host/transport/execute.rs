@@ -19,7 +19,7 @@
 //! and local call custody stay on the same authenticated role client stack.
 //! P05 classifies wire evidence; this module makes no retry/terminal decision.
 
-use super::send_reports::ActorSendReports;
+use super::settlement::AcceptedReceipts;
 use crate::native::{
     task_transport::{
         NativeCallSource,
@@ -27,9 +27,10 @@ use crate::native::{
     },
     transport::{ChannelAcquisitionError, Client},
 };
-use crate::task_execution::operation::OperationDispatchResult;
+use crate::task_execution::{
+    host::failure_lifecycle::LifecycleStarts, operation::OperationDispatchResult,
+};
 use novarocks_coordination_contract::MonotonicClock;
-use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::novarocks as proto;
 use std::{future::Future, task::Poll};
@@ -42,13 +43,38 @@ fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchR
 fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
     wire::classify_apply_status(status)
 }
+async fn observe_first_poll<F: Future>(
+    rpc: F,
+    receipts: &AcceptedReceipts,
+    clock: &dyn MonotonicClock,
+    lifecycle: Option<&LifecycleStarts>,
+) -> F::Output {
+    tokio::pin!(rpc);
+    let mut started = false;
+    std::future::poll_fn(|cx| {
+        if started {
+            return rpc.as_mut().poll(cx);
+        }
+        // Record the possibly transmitted operation even if the first poll
+        // panics or the Core no longer accepts its progress input.
+        if let Some(starts) = lifecycle {
+            receipts.record_lifecycle_starts(starts);
+        }
+        let result = rpc.as_mut().poll(cx);
+        receipts.report_establish_starts(clock);
+        started = true;
+        result
+    })
+    .await
+}
+
 pub(crate) async fn send_operations_in(
     client: &Client,
     request: EncodedMethodRequest,
     expires_at: tokio::time::Instant,
-    reports: &ActorSendReports,
+    receipts: &AcceptedReceipts,
     clock: &dyn MonotonicClock,
-    establishes: &[(TaskOperationId, ParticipationRef)],
+    lifecycle: Option<&LifecycleStarts>,
     selected: &mut Option<NativeCallSource>,
     action_tail: &mut Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
     reply_plan: novarocks_task_codec::resource_preflight::OperationReplyDecodePlan,
@@ -122,19 +148,7 @@ pub(crate) async fn send_operations_in(
                     ),
                     codec,
                 );
-                tokio::pin!(rpc);
-                let mut started = false;
-                std::future::poll_fn(|cx| {
-                    let result = rpc.as_mut().poll(cx);
-                    if !started {
-                        started = true;
-                        for &(operation_id, participation) in establishes {
-                            reports.establish_rpc_started(operation_id, participation, clock.now());
-                        }
-                    }
-                    result
-                })
-                .await
+                observe_first_poll(rpc, receipts, clock, lifecycle).await
             }
             EncodedMethodRequest::Control(request) => {
                 let mut wire = tonic::Request::new(request);
@@ -149,19 +163,7 @@ pub(crate) async fn send_operations_in(
                     ),
                     codec,
                 );
-                tokio::pin!(rpc);
-                let mut started = false;
-                std::future::poll_fn(|cx| {
-                    let result = rpc.as_mut().poll(cx);
-                    if !started {
-                        started = true;
-                        for &(operation_id, participation) in establishes {
-                            reports.establish_rpc_started(operation_id, participation, clock.now());
-                        }
-                    }
-                    result
-                })
-                .await
+                observe_first_poll(rpc, receipts, clock, lifecycle).await
             }
         }
     };

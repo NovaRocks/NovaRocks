@@ -981,6 +981,19 @@ impl Loopback {
         self.peer.control_requests()
     }
 
+    pub(in crate::native) fn accept_abort(&self, participation: ParticipationRef) {
+        self.peer.expect_apply(ApplyAnswer::WithAck(vec![(
+            OperationOutcome::Accepted,
+            Some(proto::task_operation_verdict::Ack::Participation(
+                encode_participation_ack(
+                    &ParticipationReceipt::new(participation, ParticipationState::Aborting),
+                    Some(AbortCause::QueryFailed),
+                )
+                .unwrap(),
+            )),
+        )]));
+    }
+
     pub(in crate::native) async fn settle(&mut self) -> bool {
         for shutdown in &mut self.shutdown {
             if let Some(shutdown) = shutdown.take() {

@@ -36,7 +36,7 @@ use crate::{
             NativeTransportCapacity, TransportCapacityError, TransportCapacityLane,
         },
     },
-    task_execution::host::custody::storage_layouts,
+    task_execution::host::{custody::storage_layouts, failure_lifecycle::LifecycleStarts},
 };
 use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::{
@@ -126,6 +126,7 @@ pub(crate) struct PreparedActorSend {
     quote: NativeAsyncActionQuote,
     encoding: NativeUnaryEncodingPlan,
     reports: Arc<ActorSendReports>,
+    lifecycle: Option<LifecycleStarts>,
 }
 
 impl PreparedActorSend {
@@ -180,9 +181,15 @@ impl PreparedActorSend {
                 quote,
                 encoding,
                 reports,
+                lifecycle: None,
             }),
             Err(error) => Err((error, context, reports)),
         }
+    }
+
+    pub(super) fn with_lifecycle(mut self, original: LifecycleStarts) -> Self {
+        self.lifecycle = Some(original);
+        self
     }
 
     pub(crate) fn bind(
@@ -300,6 +307,7 @@ impl PreparedActorSend {
                     apply: context.apply,
                     reports: self.reports,
                     clock: context.clock,
+                    lifecycle: self.lifecycle,
                     original_captures: Box::new(()),
                 }))
             },

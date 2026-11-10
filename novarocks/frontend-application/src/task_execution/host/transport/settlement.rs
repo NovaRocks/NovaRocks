@@ -21,14 +21,15 @@ use super::{queue_input::SendKey, send_reports::ActorSendReports};
 use crate::{
     native::{
         apply_send_owner::OriginalReplyPublisher,
-        task_transport::wire::{self, SentOperation},
+        task_transport::wire::{self, AckAddress, SentOperation},
     },
     task_execution::{
+        host::failure_lifecycle::LifecycleStarts,
         intent::{AckPayload, OperationAcknowledgement},
         operation::OperationDispatchResult,
     },
 };
-use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
+use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_models::novarocks as proto;
 use std::{collections::VecDeque, sync::Arc};
 
@@ -59,15 +60,24 @@ impl AcceptedReceipts {
             reports,
         }
     }
-    pub(crate) fn establishes(&self) -> Vec<(TaskOperationId, ParticipationRef)> {
-        self.pending
-            .iter()
-            .filter_map(|item| {
-                item.sent
-                    .establish_participation
-                    .map(|participation| (item.key.operation, participation))
-            })
-            .collect()
+    pub(super) fn record_lifecycle_starts(&self, starts: &LifecycleStarts) {
+        for item in &self.pending {
+            let participation = match item.sent.address {
+                AckAddress::Admission(request) => request.participation(),
+                AckAddress::Participation(participation) => participation,
+                AckAddress::Task(_) | AckAddress::None => continue,
+            };
+            starts.record(participation);
+        }
+    }
+
+    pub(super) fn report_establish_starts(&self, clock: &dyn MonotonicClock) {
+        for item in &self.pending {
+            if let Some(participation) = item.sent.establish_participation {
+                self.reports
+                    .establish_rpc_started(item.key.operation, participation, clock.now());
+            }
+        }
     }
     pub(crate) async fn freeze_dispatch(&mut self, expires_at: tokio::time::Instant) -> bool {
         if self.publisher.freeze_dispatch(expires_at).await.is_err() {

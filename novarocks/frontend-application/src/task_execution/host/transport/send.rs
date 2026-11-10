@@ -33,8 +33,8 @@ use crate::{
         transport_capacity::{NativeTransportCapacity, TransportCapacityLane},
     },
     task_execution::{
-        host::custody::TransportJoinRegistration, intent::OperationAcknowledgement,
-        operation::OperationDispatchResult,
+        host::custody::TransportJoinRegistration, host::failure_lifecycle::LifecycleStarts,
+        intent::OperationAcknowledgement, operation::OperationDispatchResult,
     },
 };
 use novarocks_control_runtime::{
@@ -71,6 +71,7 @@ pub(crate) struct BoundSend {
     pub(crate) apply: ApplySendPort,
     pub(crate) reports: Arc<ActorSendReports>,
     pub(crate) clock: Arc<dyn MonotonicClock>,
+    pub(crate) lifecycle: Option<LifecycleStarts>,
     pub(crate) original_captures: Box<dyn Any + Send>,
 }
 pub(crate) struct SendJob {
@@ -87,6 +88,7 @@ struct Captures {
     client: Client,
     reports: Arc<ActorSendReports>,
     clock: Arc<dyn MonotonicClock>,
+    lifecycle: Option<LifecycleStarts>,
     _original: Box<dyn Any + Send>,
     panic: novarocks_control_runtime::exit_work::PanicSink,
 }
@@ -152,6 +154,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         apply,
         reports,
         clock,
+        lifecycle,
         original_captures,
     } = *bound;
     let lane = if control_progress {
@@ -196,6 +199,7 @@ pub(crate) fn run(job: SendJob) -> impl std::future::Future<Output = ()> {
         client,
         reports: reports.clone(),
         clock: clock.clone(),
+        lifecycle,
         _original: original_captures,
         panic: panic.clone(),
     };
@@ -308,14 +312,13 @@ async fn encode_and_send(
     if !receipts.freeze_dispatch(expires).await {
         return BodyOutcome::ReceiptsRecorded;
     }
-    let establishes = receipts.establishes();
     let response = super::execute::send_operations_in(
         &captures.client,
         request.request,
         expires,
-        captures.reports.as_ref(),
+        &receipts,
         captures.clock.as_ref(),
-        &establishes,
+        captures.lifecycle.as_ref(),
         &mut ready.call,
         &mut action_tail,
         novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(

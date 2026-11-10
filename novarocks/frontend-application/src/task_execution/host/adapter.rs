@@ -17,6 +17,7 @@
 
 //! Bind the pure AttemptCore to the original FE actor turn and work authors.
 
+use super::failure_lifecycle::FailureLifecycle;
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
@@ -91,6 +92,7 @@ pub(crate) struct AttemptActorRegistration {
     observation_source: ActorId,
     membership_source: ActorId,
     members: Option<Arc<[FrozenMember]>>,
+    failure_lifecycle: Option<FailureLifecycle>,
     root_control: RootControlBinding,
     ordered_bound: bool,
     startup_reserved: bool,
@@ -365,6 +367,9 @@ impl AttemptActorRegistration {
                     self.scope.clone(),
                     admission,
                     send,
+                    self.failure_lifecycle
+                        .take()
+                        .expect("original failure lifecycle"),
                     source,
                 )),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
@@ -671,6 +676,9 @@ impl AttemptActor {
             observation_source,
             membership_source,
             members: Some(members.clone()),
+            failure_lifecycle: Some(FailureLifecycle::freeze(
+                members.iter().map(|member| member.participation),
+            )),
             root_control,
             ordered_bound: false,
             startup_reserved: false,

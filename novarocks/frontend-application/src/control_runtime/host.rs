@@ -30,6 +30,7 @@ use super::{
 use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
+use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
 use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{
@@ -142,8 +143,12 @@ pub(crate) trait EffectSource: Send + 'static {
     /// Transfer the one supervisor effect to its original cleanup owner.
     /// The owner launches its prepaid Work off the poller and retains the
     /// ticket until publication and actual exit allow the input to retire.
-    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
-        std::panic::resume_unwind(Box::new(ticket));
+    fn owner_failed_cleanup(
+        &mut self,
+        ticket: EffectTicket<FrontendEffect>,
+        lifecycle: Option<FailureLifecycle>,
+    ) {
+        std::panic::resume_unwind(Box::new((ticket, lifecycle)));
     }
     /// Stop new external admission while draining already admitted effects.
     fn close_external(&mut self);
@@ -637,7 +642,7 @@ impl HostRegistry {
                         if let [(descriptor, _)] = effects.as_slice() {
                             let ticket = self.runtime.take_effect(actor, input, descriptor.id)?;
                             self.runtime.validate_failure_effect_ticket(&ticket)?;
-                            machine.source.owner_failed_cleanup(ticket);
+                            machine.source.owner_failed_cleanup(ticket, None);
                             machine.failure_handed_off = true;
                             handoffs += 1;
                         }

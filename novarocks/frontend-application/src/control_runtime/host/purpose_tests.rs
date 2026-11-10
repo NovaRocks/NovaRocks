@@ -921,7 +921,12 @@ impl EffectSource for SupervisorSource {
         unreachable!();
     }
 
-    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
+    fn owner_failed_cleanup(
+        &mut self,
+        ticket: EffectTicket<FrontendEffect>,
+        lifecycle: Option<FailureLifecycle>,
+    ) {
+        assert!(lifecycle.is_none());
         assert!(self.cleanup.lock().unwrap().replace(ticket).is_none());
     }
 

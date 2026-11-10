@@ -32,6 +32,7 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
+    task_execution::host::failure_lifecycle::FailureLifecycle,
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent, QueuedInputPayload},
@@ -113,6 +114,7 @@ pub(crate) struct AttemptTransportSource {
     send_scan: usize,
     admission_scan: usize,
     pending: Option<Prepaid>,
+    lifecycle: Option<FailureLifecycle>,
     other: Box<dyn EffectSource>,
 }
 
@@ -124,6 +126,7 @@ impl AttemptTransportSource {
         scope: ScopeHandle,
         admission: AdmissionSource,
         send: AttemptSendSource,
+        lifecycle: FailureLifecycle,
         other: Box<dyn EffectSource>,
     ) -> Self {
         assert!(registration.matches_scope(&scope) && admission.matches_scope(&scope));
@@ -146,6 +149,7 @@ impl AttemptTransportSource {
             send_scan: 0,
             admission_scan: 0,
             pending: None,
+            lifecycle: Some(lifecycle),
             other,
         }
     }
@@ -264,7 +268,13 @@ impl AttemptTransportSource {
             context,
             reports,
         )
-        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
+        .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)))
+        .with_lifecycle(
+            self.lifecycle
+                .as_ref()
+                .expect("live attempt lifecycle")
+                .starts(),
+        );
         self.pending = Some(Prepaid::Send(lane, Box::new(prepared)));
         self.send_idle[lane].pop_front()
     }
@@ -493,8 +503,17 @@ impl EffectSource for AttemptTransportSource {
         self.other.owner_failed_pending(pending);
     }
 
-    fn owner_failed_cleanup(&mut self, ticket: EffectTicket<FrontendEffect>) {
-        self.other.owner_failed_cleanup(ticket);
+    fn owner_failed_cleanup(
+        &mut self,
+        ticket: EffectTicket<FrontendEffect>,
+        lifecycle: Option<FailureLifecycle>,
+    ) {
+        assert!(lifecycle.is_none());
+        let original = self
+            .lifecycle
+            .take()
+            .expect("one original failure lifecycle");
+        self.other.owner_failed_cleanup(ticket, Some(original));
     }
 
     fn close_external(&mut self) {
