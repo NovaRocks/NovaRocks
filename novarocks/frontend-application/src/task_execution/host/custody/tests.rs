@@ -750,7 +750,7 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
 }
 
 #[tokio::test]
-async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
+async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use crate::{
         control_runtime::{
             actor::FrontendActorKind,
@@ -764,10 +764,8 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         query_execution::lifecycle_plan::QueryCredentialLeases,
         task_execution::{
             actor_gate::tests::logical_execution,
-            bridge::establish::EstablishQaBridge,
-            host::transport::{
-                ActorTransportExecutor, AttemptEstablishMaterial, EstablishQaSource,
-            },
+            bridge::qa::AttemptQaBridge,
+            host::transport::{ActorTransportExecutor, AttemptEstablishMaterial, AttemptQaSource},
             sources::AttemptEstablishFacts,
         },
     };
@@ -785,7 +783,6 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         LeaseSequence, LeaseValidFor, OperationEnvelope, OperationKind, OperationOutcome,
         ParticipationAdmissionTicketReceipt, ParticipationRef, TaskOperationId,
     };
-    use novarocks_query_application::coordination::AdmissionIssueSettlement;
     use novarocks_types::{
         AttemptId, BackendProcessId, FrontendProcessId, NativeCompatibilityId, QueryExecutionId,
         QueryId,
@@ -793,7 +790,7 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
     use std::{num::NonZeroU64, time::Duration};
 
     struct QaOnly {
-        source: Arc<Mutex<EstablishQaSource>>,
+        source: Arc<Mutex<AttemptQaSource>>,
         scope: ScopeHandle,
         published: Arc<AtomicUsize>,
         closed: bool,
@@ -889,20 +886,7 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         compatibility,
         AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
     );
-    let issue = drive.begin_admission_issue(admission).await.unwrap();
     let ticket = AdmissionTicketId::try_from_bytes([31; 16]).unwrap();
-    drive
-        .settle_admission_issue(
-            issue,
-            AdmissionIssueSettlement::applied(
-                admission.envelope().operation_id(),
-                OperationOutcome::Accepted,
-                ParticipationAdmissionTicketReceipt::new(ticket, participation, lease),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
     let facts = AttemptEstablishFacts::freeze(
         Default::default(),
         [(participation.backend_process_id(), Default::default())],
@@ -922,10 +906,45 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         action: AttemptActionId::new(id(number)),
         body,
     };
-    let authorization = AttemptAuthorizationRef::new(id(1));
+    let admission_issue = AttemptAuthorizationRef::new(id(1));
+    let authorization = AttemptAuthorizationRef::new(id(3));
     let token = |number| AttemptRequestToken::new(id(number));
+    let admission_effect = |number, class, request| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id: AttemptActionId::new(id(number)),
+            class,
+            body: EffectBody::Port(port(
+                number,
+                AttemptToLogicalBody::AuthorizationRequest {
+                    token: token(number),
+                    request,
+                },
+            )),
+        })
+    };
+    let begin = admission_effect(
+        1,
+        EffectClass::Business,
+        AttemptAuthorization::BeginAdmission(admission),
+    );
+    let grant = admission_effect(
+        2,
+        EffectClass::Settlement,
+        AttemptAuthorization::SettleAdmission {
+            issue: admission_issue,
+            participation,
+            operation_id: admission.envelope().operation_id(),
+            outcome: Some(OperationOutcome::Accepted),
+            receipt: Some(ParticipationAdmissionTicketReceipt::new(
+                ticket,
+                participation,
+                lease,
+            )),
+            prior_transport_unknown: false,
+        },
+    );
     let first = AttemptEffectEnvelope::new(AttemptEffect {
-        id: AttemptActionId::new(id(1)),
+        id: AttemptActionId::new(id(3)),
         class: EffectClass::Business,
         body: EffectBody::EstablishAuthorization {
             operation: OperationIntent::EstablishParticipation {
@@ -941,9 +960,9 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
                 queued_bytes: quote.queued_bytes,
             },
             request: port(
-                1,
+                3,
                 AttemptToLogicalBody::AuthorizationRequest {
-                    token: token(1),
+                    token: token(3),
                     request: AttemptAuthorization::Establish {
                         participation,
                         operation_id,
@@ -953,12 +972,12 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         },
     });
     let second = AttemptEffectEnvelope::new(AttemptEffect {
-        id: AttemptActionId::new(id(2)),
+        id: AttemptActionId::new(id(4)),
         class: EffectClass::Settlement,
         body: EffectBody::Port(port(
-            2,
+            4,
             AttemptToLogicalBody::EstablishSettlement {
-                token: token(2),
+                token: token(4),
                 authorization,
                 participation,
                 operation_id,
@@ -966,14 +985,18 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
             },
         )),
     });
-    assert!(first.handoff().is_none() && second.handoff().is_none());
-    let inbox = WithdrawalInbox::with_effect(&fixture.scope, [first, second]);
-    let source = Arc::new(Mutex::new(EstablishQaSource::new(
+    assert!(
+        [&begin, &grant, &first, &second]
+            .into_iter()
+            .all(|effect| effect.handoff().is_none())
+    );
+    let inbox = WithdrawalInbox::with_effect(&fixture.scope, [begin, grant, first, second]);
+    let source = Arc::new(Mutex::new(AttemptQaSource::new(
         &parent,
         &payer,
         generation,
         observer(),
-        EstablishQaBridge::new(Arc::new(drive), compatibility, Arc::new(material)),
+        AttemptQaBridge::new(Arc::new(drive), compatibility, Arc::new(material)),
         inbox.reserve_result(&parent),
     )));
     let published = Arc::new(AtomicUsize::new(0));
@@ -1006,8 +1029,25 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
         )),
     })
     .unwrap_or_else(|_| panic!("original QA host registration"));
-    let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
-    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    let submit_pair = || {
+        let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
+        assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+        commands
+    };
+    let retire_commands = |commands| {
+        for input in commands {
+            inbox
+                .runtime
+                .retire_input(inbox.registration.actor(), input)
+                .unwrap();
+        }
+    };
+    let commit_reply = || {
+        let (_, AttemptInput::Port(reply)) = inbox.try_commit_attempt().unwrap() else {
+            panic!("same original QA reply");
+        };
+        reply.body
+    };
     let drive_host = || {
         while let Some(turn) = inbox.runtime.claim_host_actor() {
             host.drive(Tick(1), turn);
@@ -1027,34 +1067,39 @@ async fn establish_qa_host_reuses_reply_credit_only_after_core_consumes_it() {
             .unwrap();
         }
     };
+    let commands = submit_pair();
     await_reply(1).await;
     drive_host();
     assert_eq!(published.load(Ordering::SeqCst), 1);
     assert!(!source.lock().unwrap().retire_result().unwrap());
-    let (_, AttemptInput::Port(first)) = inbox.try_commit_attempt().unwrap() else {
-        panic!("same original QA authorization reply");
-    };
     assert!(
-        matches!(first.body, LogicalToAttemptBody::AuthorizationReply {
-        token: reply_token, decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
-    } if reply_token == token(1) && guard == authorization)
+        matches!(commit_reply(), LogicalToAttemptBody::AuthorizationReply {
+        token: reply_token, decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
+    } if reply_token == token(1) && issue == admission_issue)
     );
     await_reply(2).await;
-    let (_, AttemptInput::Port(second)) = inbox.try_commit_attempt().unwrap() else {
-        panic!("same original QA settlement reply");
-    };
     assert!(
-        matches!(second.body, LogicalToAttemptBody::EstablishSettlementReply {
-        token: reply_token, authorization: guard, result: Ok(()),
-    } if reply_token == token(2) && guard == authorization)
+        matches!(commit_reply(), LogicalToAttemptBody::AuthorizationReply {
+        token: reply_token, decision: Ok(AttemptAuthorizationDecision::AdmissionGranted),
+    } if reply_token == token(2))
     );
+    retire_commands(commands);
+    drive_host();
 
-    for input in commands {
-        inbox
-            .runtime
-            .retire_input(inbox.registration.actor(), input)
-            .unwrap();
-    }
+    let commands = submit_pair();
+    await_reply(3).await;
+    assert!(
+        matches!(commit_reply(), LogicalToAttemptBody::AuthorizationReply {
+        token: reply_token, decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
+    } if reply_token == token(3) && guard == authorization)
+    );
+    await_reply(4).await;
+    assert!(
+        matches!(commit_reply(), LogicalToAttemptBody::EstablishSettlementReply {
+        token: reply_token, authorization: guard, result: Ok(()),
+    } if reply_token == token(4) && guard == authorization)
+    );
+    retire_commands(commands);
     drive_host();
     let mut qa = source.lock().unwrap();
     assert!(qa.close_idle().unwrap());

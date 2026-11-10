@@ -30,6 +30,7 @@ use novarocks_attempt_protocol::{
 use novarocks_coordination_contract::AttemptAuthorization;
 use novarocks_execution_contract::{
     EstablishParticipation, LeaseSequence, OperationEnvelope, OperationKind, ParticipationRef,
+    TaskOperationId,
 };
 use std::{
     collections::BTreeMap,
@@ -51,6 +52,22 @@ pub(crate) struct AttemptEstablishMaterial {
 }
 
 impl AttemptEstablishMaterial {
+    pub(crate) fn for_reauthorization(
+        &self,
+        participation: ParticipationRef,
+        operation: TaskOperationId,
+    ) -> Result<Arc<EstablishParticipation>, SendBindingError> {
+        let original = self
+            .rows
+            .get(&participation)
+            .and_then(|row| row.original.get())
+            .ok_or(SendBindingError::MissingRequest)?;
+        if original.envelope().operation_id() != operation {
+            return Err(SendBindingError::WrongRequest);
+        }
+        Ok(original.clone())
+    }
+
     pub(crate) fn project(
         source: &dyn ParticipationEstablishSource,
         participations: impl IntoIterator<Item = ParticipationRef>,

@@ -19,7 +19,7 @@
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
     ActorSendReports,
-    establish_qa::BoundEstablishQa,
+    qa_source::BoundAttemptQa,
     queued_job::{BoundQueue, QueueJob, run as run_queue},
     send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
@@ -74,7 +74,7 @@ pub(crate) struct BoundActorTransport {
 pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
     Admit(Box<BoundQueue>),
-    EstablishQa(BoundEstablishQa),
+    Qa(BoundAttemptQa),
 }
 impl ActorTransportWork {
     fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
@@ -110,7 +110,7 @@ impl ActorTransportWork {
                     && bound.key.generation == *generation
                     && bound.control == operation.requires_control_progress()
             }
-            (Self::EstablishQa(_), _) => effect.is_establish_qa(),
+            (Self::Qa(_), _) => effect.is_qa_call(),
             _ => false,
         }
     }
@@ -118,7 +118,7 @@ impl ActorTransportWork {
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
             Self::Send(send) => send.reports.actor().cloned(),
-            Self::Admit(_) | Self::EstablishQa(_) => None,
+            Self::Admit(_) | Self::Qa(_) => None,
         }
     }
 }
@@ -283,10 +283,10 @@ pub(crate) fn handoff_actor_transport(
                 bound,
             })
         }),
-        ActorTransportWork::EstablishQa(bound) => {
+        ActorTransportWork::Qa(bound) => {
             launch.spawn(runtime, exit, |exit, registration| async move {
                 let outcome = match run_future(exit, bound.run(effect), panic).await {
-                    Ok(Ok(reply)) => BodyOutcome::EstablishQa(reply),
+                    Ok(Ok(reply)) => BodyOutcome::Qa(reply),
                     Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };

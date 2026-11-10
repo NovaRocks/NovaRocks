@@ -18,7 +18,7 @@
 //! Composition of the original admission and SendBatch Sources.
 
 use super::{
-    ActorSendReports, ActorTransportExecutor, AdmissionSource, BodyOutcome, EstablishQaSource,
+    ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptQaSource, BodyOutcome,
     FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
     SendKey, SendMemberReport, SendReportRows, send_reports::close_unlaunched,
 };
@@ -87,7 +87,7 @@ pub(crate) struct AttemptSendSource {
 
 enum Prepaid {
     Admission,
-    EstablishQa,
+    Qa,
     Send(usize, Box<PreparedActorSend>),
     Other,
 }
@@ -122,7 +122,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    qa: Option<EstablishQaSource>,
+    qa: Option<AttemptQaSource>,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -148,7 +148,7 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        qa: Option<EstablishQaSource>,
+        qa: Option<AttemptQaSource>,
         send: AttemptSendSource,
         failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
@@ -185,7 +185,7 @@ impl AttemptTransportSource {
 
     fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
         let closing = self.result_admission_closed()
-            && self.qa.as_ref().is_none_or(EstablishQaSource::is_drained);
+            && self.qa.as_ref().is_none_or(AttemptQaSource::is_drained);
         match self.supervisor.as_mut() {
             Some(Supervisor::Armed(_)) if closing => {
                 let actor = self.registration.actor();
@@ -392,14 +392,14 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
-            if original.is_establish_qa() {
+            if original.is_qa_call() {
                 let result = self
                     .qa
                     .as_mut()
                     .expect("original Establish QA Source")
                     .prepay(original)
                     .expect("original QA prepayment")?;
-                self.pending = Some(Prepaid::EstablishQa);
+                self.pending = Some(Prepaid::Qa);
                 return Some(result);
             }
             match original.protocol.body {
@@ -444,7 +444,7 @@ impl EffectSource for AttemptTransportSource {
         result: Position,
     ) -> Result<PreparedEffectJob, EffectBindRefusal> {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::EstablishQa => {
+            Prepaid::Qa => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()
                 };
@@ -515,7 +515,7 @@ impl EffectSource for AttemptTransportSource {
 
     fn return_unclaimed_result(&mut self, result: Position) {
         match self.pending.take().expect("same original prepayment") {
-            Prepaid::EstablishQa => self.qa.as_mut().unwrap().return_unclaimed(result),
+            Prepaid::Qa => self.qa.as_mut().unwrap().return_unclaimed(result),
             Prepaid::Admission => self.admission.return_unclaimed(result),
             Prepaid::Other => self.other.return_unclaimed_result(result),
             Prepaid::Send(lane, prepared) => {
@@ -744,7 +744,7 @@ impl EffectSource for AttemptTransportSource {
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
         progress.retired &= self.supervisor.is_none()
-            && self.qa.as_ref().is_none_or(EstablishQaSource::is_drained)
+            && self.qa.as_ref().is_none_or(AttemptQaSource::is_drained)
             && self.report_author.is_none()
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()

@@ -131,7 +131,7 @@ pub(crate) struct PreparedAttemptHost {
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
-    pub(crate) qa: super::transport::EstablishQaSource,
+    pub(crate) qa: super::transport::AttemptQaSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -254,14 +254,14 @@ pub(crate) enum AttemptRegistrationError {
 impl AttemptActorRegistration {
     /// The original QA reply position is separate from Native admission and
     /// observation credits. Only one original QA request can be in flight.
-    pub(crate) fn prepare_establish_qa_source(
+    pub(crate) fn prepare_qa_source(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
         parent: &WorkObligation,
         payer: &ReservationObligation,
         observer: novarocks_control_runtime_core::identity::ConsumerId,
-        bridge: crate::task_execution::bridge::establish::EstablishQaBridge,
-    ) -> Result<super::transport::EstablishQaSource, AttemptRegistrationError> {
+        bridge: crate::task_execution::bridge::qa::AttemptQaBridge,
+    ) -> Result<super::transport::AttemptQaSource, AttemptRegistrationError> {
         let binding = self
             .binding
             .get()
@@ -284,7 +284,7 @@ impl AttemptActorRegistration {
             parent,
         )
         .map_err(AttemptRegistrationError::Runtime)?;
-        Ok(super::transport::EstablishQaSource::new(
+        Ok(super::transport::AttemptQaSource::new(
             parent,
             payer,
             binding.generation,

@@ -38,7 +38,7 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_types::NativeCompatibilityId;
 
-use super::bridge::establish::EstablishSubmissionCapture;
+use super::bridge::qa::EstablishSubmissionCapture;
 use super::error::TaskExecutionError;
 use super::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
@@ -906,7 +906,7 @@ pub(crate) mod tests {
         use crate::{
             query_execution::lifecycle_plan::QueryCredentialLeases,
             task_execution::{
-                bridge::establish::{EstablishPortError, EstablishQaBridge},
+                bridge::qa::{AttemptQaBridge, AttemptQaPortError},
                 host::transport::AttemptEstablishMaterial,
                 sources::AttemptEstablishFacts,
             },
@@ -972,7 +972,7 @@ pub(crate) mod tests {
             queued_bytes: quotes[&participation].queued_bytes,
         };
         let activation = drive.identity();
-        let mut bridge = EstablishQaBridge::new(Arc::new(drive), compatibility, Arc::new(material));
+        let mut bridge = AttemptQaBridge::new(Arc::new(drive), compatibility, Arc::new(material));
         let token = |id| AttemptRequestToken::new(NonZeroU64::new(id).unwrap());
         let port = |id, body| AttemptToLogical {
             activation,
@@ -1030,16 +1030,13 @@ pub(crate) mod tests {
         ));
 
         let replay = bridge
-            .authorize(
-                &original,
-                &authorize(
-                    3,
-                    AttemptAuthorization::ReauthorizeEstablish {
-                        participation,
-                        operation_id,
-                    },
-                ),
-            )
+            .handle_port(&authorize(
+                3,
+                AttemptAuthorization::ReauthorizeEstablish {
+                    participation,
+                    operation_id,
+                },
+            ))
             .await
             .unwrap();
         let LogicalToAttemptBody::AuthorizationReply {
@@ -1052,7 +1049,7 @@ pub(crate) mod tests {
         assert_ne!(first, replay);
         assert!(matches!(
             bridge.settle(&settle(4, first, AttemptIssueSettlement::DefinitelyUnsent)),
-            Err(EstablishPortError::WrongGuard)
+            Err(AttemptQaPortError::WrongGuard)
         ));
         assert!(matches!(
             bridge.settle(&port(
@@ -1064,7 +1061,7 @@ pub(crate) mod tests {
                     operation_id,
                 }
             )),
-            Err(EstablishPortError::WrongGuard)
+            Err(AttemptQaPortError::WrongGuard)
         ));
         assert!(matches!(
             bridge

@@ -31,12 +31,12 @@ mod admission_source;
 mod capacity;
 mod effect_source;
 mod establish_material;
-mod establish_qa;
 mod execute;
 mod failure_abort;
 mod granted_inputs;
 mod prepare;
 mod proposal_wait;
+mod qa_source;
 mod queue_input;
 mod queued_job;
 mod quote;
@@ -63,9 +63,9 @@ pub(crate) use effect_source::{
     FailedSendResult, NativeReportReferences,
 };
 pub(crate) use establish_material::AttemptEstablishMaterial;
-pub(crate) use establish_qa::EstablishQaSource;
 pub(crate) use failure_abort::{FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup};
 pub(crate) use granted_inputs::GrantedInputs;
+pub(crate) use qa_source::AttemptQaSource;
 #[cfg(test)]
 pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;
 pub(crate) use queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey};

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The credentialed caller of the original QA Establish issue protocol.
+//! The credentialed caller of the original QA attempt issue protocol.
 
 use std::{
     collections::BTreeMap,
@@ -32,11 +32,13 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
-    AttemptAuthorizationFailure, AttemptAuthorizationRef, AttemptIssueSettlement, AttemptToLogical,
-    AttemptToLogicalBody, LogicalToAttempt, LogicalToAttemptBody,
+    AttemptAuthorizationFailure, AttemptAuthorizationRef, AttemptIssueSettlement,
+    AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody, LogicalToAttempt,
+    LogicalToAttemptBody,
 };
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use novarocks_query_application::coordination::{
+    AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
     EstablishIssueError, EstablishIssueSubmit, EstablishTransportAdmission,
     EstablishTransportReservation, EstablishTransportSink, EstablishTransportSubmission,
     LateEstablishWorkerSettlement, LogicalExecutionActorError, NativeAttemptDrive,
@@ -59,13 +61,13 @@ impl Guard {
 }
 
 #[must_use = "publish the original reply and retain its typed failure if present"]
-pub(crate) struct EstablishQaReply {
+pub(crate) struct AttemptQaReply {
     pub(in crate::task_execution) reply: LogicalToAttempt<AttemptFailure>,
     pub(in crate::task_execution) failure: Option<(HostFailureRef, TaskExecutionError)>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum EstablishPortError {
+pub(crate) enum AttemptQaPortError {
     WrongRequest,
     WrongGuard,
     DuplicateAuthorization,
@@ -74,14 +76,15 @@ pub(crate) enum EstablishPortError {
 /// One original activation owns this inventory. Its credentialed executor
 /// serializes the QA calls. A reference points to a real guard only after the
 /// original QA issue successfully crosses the transport fence.
-pub(crate) struct EstablishQaBridge {
+pub(crate) struct AttemptQaBridge {
     drive: Arc<NativeAttemptDrive>,
     compatibility: NativeCompatibilityId,
     material: Arc<AttemptEstablishMaterial>,
+    admissions: BTreeMap<ParticipationRef, (AttemptAuthorizationRef, AdmissionIssueReceipt)>,
     guards: BTreeMap<AttemptAuthorizationRef, Guard>,
 }
 
-impl EstablishQaBridge {
+impl AttemptQaBridge {
     pub(in crate::task_execution) fn activation(
         &self,
     ) -> novarocks_coordination_contract::AttemptActivationIdentity {
@@ -97,6 +100,7 @@ impl EstablishQaBridge {
             drive,
             compatibility,
             material,
+            admissions: BTreeMap::new(),
             guards: BTreeMap::new(),
         }
     }
@@ -105,21 +109,155 @@ impl EstablishQaBridge {
         &mut self,
         operation: &OperationIntent,
         port: &AttemptToLogical<AttemptFailure>,
-    ) -> Result<EstablishQaReply, EstablishPortError> {
+    ) -> Result<AttemptQaReply, AttemptQaPortError> {
         if port.activation != self.drive.identity() {
-            return Err(EstablishPortError::WrongRequest);
+            return Err(AttemptQaPortError::WrongRequest);
         }
         let AttemptToLogicalBody::AuthorizationRequest { token, request } = port.body else {
-            return Err(EstablishPortError::WrongRequest);
+            return Err(AttemptQaPortError::WrongRequest);
         };
-        let reference = AttemptAuthorizationRef::new(NonZeroU64::new(token.get()).unwrap());
-        if self.guards.contains_key(&reference) {
-            return Err(EstablishPortError::DuplicateAuthorization);
+        if !matches!(request, AttemptAuthorization::Establish { .. }) {
+            return Err(AttemptQaPortError::WrongRequest);
         }
         let original = self
             .material
             .for_authorization(operation, request)
-            .map_err(|_| EstablishPortError::WrongRequest)?;
+            .map_err(|_| AttemptQaPortError::WrongRequest)?;
+        self.issue_establish(port, token, request, original).await
+    }
+
+    pub(in crate::task_execution) async fn handle_port(
+        &mut self,
+        port: &AttemptToLogical<AttemptFailure>,
+    ) -> Result<AttemptQaReply, AttemptQaPortError> {
+        if port.activation != self.drive.identity() {
+            return Err(AttemptQaPortError::WrongRequest);
+        }
+        let AttemptToLogicalBody::AuthorizationRequest { token, request } = port.body else {
+            return self.settle(port);
+        };
+        let decision = match request {
+            AttemptAuthorization::BeginAdmission(original) => {
+                let participation = original.participation();
+                if original.native_compatibility_id() != self.compatibility {
+                    return Err(AttemptQaPortError::WrongRequest);
+                }
+                if self.admissions.contains_key(&participation) {
+                    return Err(AttemptQaPortError::DuplicateAuthorization);
+                }
+                let reference = AttemptAuthorizationRef::new(NonZeroU64::new(token.get()).unwrap());
+                self.drive
+                    .begin_admission_issue(original)
+                    .await
+                    .map(|issued| {
+                        assert_eq!(issued.participation(), participation);
+                        assert_eq!(issued.operation_id(), original.envelope().operation_id());
+                        assert!(
+                            self.admissions
+                                .insert(participation, (reference, issued))
+                                .is_none()
+                        );
+                        AttemptAuthorizationDecision::AdmissionStarted(reference)
+                    })
+            }
+            AttemptAuthorization::SettleAdmission {
+                issue,
+                participation,
+                operation_id,
+                outcome,
+                receipt,
+                prior_transport_unknown,
+            } => {
+                let &(reference, original) = self
+                    .admissions
+                    .get(&participation)
+                    .filter(|(reference, original)| {
+                        *reference == issue && original.operation_id() == operation_id
+                    })
+                    .ok_or(AttemptQaPortError::WrongGuard)?;
+                let settlement = match (outcome, receipt, prior_transport_unknown) {
+                    (Some(outcome), Some(receipt), false) => {
+                        AdmissionIssueSettlement::applied(operation_id, outcome, receipt)
+                    }
+                    (Some(outcome), None, false) => {
+                        AdmissionIssueSettlement::rejected(operation_id, outcome)
+                    }
+                    (None, None, unknown) => Ok(
+                        AdmissionIssueSettlement::pre_worker_rejected_with_prior_unknown(
+                            operation_id,
+                            unknown,
+                        ),
+                    ),
+                    _ => return Err(AttemptQaPortError::WrongRequest),
+                };
+                match settlement {
+                    Ok(settlement) => self
+                        .drive
+                        .settle_admission_issue(original, settlement)
+                        .await
+                        .map(|disposition| {
+                            assert_eq!(
+                                self.admissions.remove(&participation),
+                                Some((reference, original))
+                            );
+                            match disposition {
+                                AdmissionIssueDisposition::Granted => {
+                                    AttemptAuthorizationDecision::AdmissionGranted
+                                }
+                                AdmissionIssueDisposition::Retryable => {
+                                    AttemptAuthorizationDecision::AdmissionRetryable
+                                }
+                            }
+                        }),
+                    Err(error) => Err(LogicalExecutionActorError::Establish(error)),
+                }
+            }
+            AttemptAuthorization::ReauthorizeEstablish {
+                participation,
+                operation_id,
+            } => {
+                let original = self
+                    .material
+                    .for_reauthorization(participation, operation_id)
+                    .map_err(|_| AttemptQaPortError::WrongRequest)?;
+                return self.issue_establish(port, token, request, original).await;
+            }
+            AttemptAuthorization::Establish { .. } => return Err(AttemptQaPortError::WrongRequest),
+        };
+        let (decision, failure) = match decision {
+            Ok(decision) => (Ok(decision), None),
+            Err(error) => {
+                let (failure, original) = Self::project_failure(
+                    port.action,
+                    HostFailureKind::LogicalActor,
+                    TaskExecutionError::Actor(error),
+                );
+                (
+                    Err(AttemptAuthorizationFailure::Rejected(failure)),
+                    Some(original),
+                )
+            }
+        };
+        Ok(AttemptQaReply {
+            reply: LogicalToAttempt {
+                activation: port.activation,
+                body: LogicalToAttemptBody::AuthorizationReply { token, decision },
+            },
+            failure,
+        })
+    }
+
+    async fn issue_establish(
+        &mut self,
+        port: &AttemptToLogical<AttemptFailure>,
+        token: AttemptRequestToken,
+        request: AttemptAuthorization,
+        original: Arc<novarocks_execution_contract::EstablishParticipation>,
+    ) -> Result<AttemptQaReply, AttemptQaPortError> {
+        let reference = AttemptAuthorizationRef::new(NonZeroU64::new(token.get()).unwrap());
+        if self.guards.contains_key(&reference) {
+            return Err(AttemptQaPortError::DuplicateAuthorization);
+        }
         let permitted = match request {
             AttemptAuthorization::Establish { .. } => {
                 self.drive
@@ -141,7 +279,7 @@ impl EstablishQaBridge {
                     || identity.semantics() != original.semantic_identity()
                     || identity.native_compatibility_id() != self.compatibility
                 {
-                    return Err(EstablishPortError::WrongGuard);
+                    return Err(AttemptQaPortError::WrongGuard);
                 }
                 let capture = EstablishSubmissionCapture::default();
                 match permit.try_submit(&capture) {
@@ -169,7 +307,7 @@ impl EstablishQaBridge {
             }
             Err(error) => self.authorization_failure(port.action, error),
         };
-        Ok(EstablishQaReply {
+        Ok(AttemptQaReply {
             reply: LogicalToAttempt {
                 activation: port.activation,
                 body: LogicalToAttemptBody::AuthorizationReply { token, decision },
@@ -181,9 +319,9 @@ impl EstablishQaBridge {
     pub(in crate::task_execution) fn settle(
         &mut self,
         port: &AttemptToLogical<AttemptFailure>,
-    ) -> Result<EstablishQaReply, EstablishPortError> {
+    ) -> Result<AttemptQaReply, AttemptQaPortError> {
         if port.activation != self.drive.identity() {
-            return Err(EstablishPortError::WrongRequest);
+            return Err(AttemptQaPortError::WrongRequest);
         }
         let body = match port.body {
             AttemptToLogicalBody::EstablishSettlement {
@@ -196,7 +334,7 @@ impl EstablishQaBridge {
                 let guard = self
                     .guards
                     .get(&authorization)
-                    .ok_or(EstablishPortError::WrongGuard)?;
+                    .ok_or(AttemptQaPortError::WrongGuard)?;
                 if !guard.matches(participation, operation_id)
                     || settlement == AttemptIssueSettlement::TransportOwned
                     || matches!(guard, Guard::Late(_))
@@ -206,7 +344,7 @@ impl EstablishQaBridge {
                                 | AttemptIssueSettlement::Worker(_)
                         )
                 {
-                    return Err(EstablishPortError::WrongGuard);
+                    return Err(AttemptQaPortError::WrongGuard);
                 }
                 let guard = self.guards.remove(&authorization).unwrap();
                 let settled = match (guard, settlement) {
@@ -241,12 +379,13 @@ impl EstablishQaBridge {
                     Err(error) => {
                         let (failure, original) = Self::project_failure(
                             port.action,
+                            HostFailureKind::EstablishAuthorization,
                             TaskExecutionError::Establish(error),
                         );
                         (Err(failure), Some(original))
                     }
                 };
-                return Ok(EstablishQaReply {
+                return Ok(AttemptQaReply {
                     reply: LogicalToAttempt {
                         activation: port.activation,
                         body: LogicalToAttemptBody::EstablishSettlementReply {
@@ -266,7 +405,7 @@ impl EstablishQaBridge {
             } => {
                 if !matches!(self.guards.get(&authorization), Some(guard @ Guard::Late(_)) if guard.matches(participation, operation_id))
                 {
-                    return Err(EstablishPortError::WrongGuard);
+                    return Err(AttemptQaPortError::WrongGuard);
                 }
                 drop(self.guards.remove(&authorization));
                 LogicalToAttemptBody::EstablishDetachReply {
@@ -275,9 +414,9 @@ impl EstablishQaBridge {
                     result: Ok(()),
                 }
             }
-            _ => return Err(EstablishPortError::WrongRequest),
+            _ => return Err(AttemptQaPortError::WrongRequest),
         };
-        Ok(EstablishQaReply {
+        Ok(AttemptQaReply {
             reply: LogicalToAttempt {
                 activation: port.activation,
                 body,
@@ -294,7 +433,11 @@ impl EstablishQaBridge {
         Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<AttemptFailure>>,
         Option<(HostFailureRef, TaskExecutionError)>,
     ) {
-        let (failure, original) = Self::project_failure(action, TaskExecutionError::Actor(error));
+        let (failure, original) = Self::project_failure(
+            action,
+            HostFailureKind::EstablishAuthorization,
+            TaskExecutionError::Actor(error),
+        );
         let disposition = match error {
             LogicalExecutionActorError::Establish(
                 EstablishIssueError::AuthorizationBudgetExhausted,
@@ -306,13 +449,14 @@ impl EstablishQaBridge {
 
     fn project_failure(
         action: AttemptActionId,
+        kind: HostFailureKind,
         error: TaskExecutionError,
     ) -> (AttemptFailure, (HostFailureRef, TaskExecutionError)) {
         let original = HostFailureRef(NonZeroU64::new(action.get()).unwrap());
         let class = error.preparation_input().attempt_class();
         let failure = AttemptFailure::Host(HostProjectedFailure {
             original,
-            kind: HostFailureKind::EstablishAuthorization,
+            kind,
             class,
             site: AttemptFailureSite::Attempt,
         });
