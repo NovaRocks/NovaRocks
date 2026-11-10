@@ -32,6 +32,7 @@ pub(crate) mod prune_project;
 pub(crate) mod prune_repeat;
 pub(crate) mod prune_scan;
 pub(crate) mod prune_sort;
+pub(crate) mod prune_system_table;
 pub(crate) mod prune_table_function;
 pub(crate) mod prune_union;
 pub(crate) mod prune_values;
@@ -52,6 +53,7 @@ pub(crate) fn all_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(prune_scan::PruneScanColumns),
         Box::new(prune_values::PruneValuesColumns),
+        Box::new(prune_system_table::PruneSystemTableColumns),
         Box::new(prune_project::PruneProjectColumns),
         Box::new(prune_filter::PruneFilterColumns),
         Box::new(prune_aggregate::PruneAggregateColumns),

@@ -20,10 +20,8 @@ use crate::planning::catalog::MetadataTableKind;
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::CatalogTable;
 
-mod inline;
 pub(crate) mod memory;
 mod view;
-pub use inline::{SqlInlineColumn, SqlInlineRelation};
 pub use view::{SqlViewColumn, SqlViewDefinition};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,21 +120,30 @@ pub trait PlannerTableProvider {
     ) -> Result<Option<&SqlViewDefinition>, crate::analyze_error::AnalyzeError> {
         self.resolve_view_for_analysis(catalog, database, view)
     }
-    fn resolve_inline_relation_for_analysis(
+    /// Returns only the immutable declaration; never performs metadata I/O.
+    fn resolve_system_table_for_analysis(
         &self,
         _catalog: Option<&str>,
         _database: &str,
         _table: &str,
-    ) -> Result<Option<&SqlInlineRelation>, crate::analyze_error::AnalyzeError> {
+        _version: Option<&novarocks_parser::ast::TableVersion>,
+    ) -> Result<
+        Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
+        crate::analyze_error::AnalyzeError,
+    > {
         Ok(None)
     }
-    fn resolve_definition_inline_relation_for_analysis(
+    fn resolve_definition_system_table_for_analysis(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-    ) -> Result<Option<&SqlInlineRelation>, crate::analyze_error::AnalyzeError> {
-        self.resolve_inline_relation_for_analysis(catalog, database, table)
+        version: Option<&novarocks_parser::ast::TableVersion>,
+    ) -> Result<
+        Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
+        crate::analyze_error::AnalyzeError,
+    > {
+        self.resolve_system_table_for_analysis(catalog, database, table, version)
     }
 
     /// A replacement definition's target; absent relations still resolve Missing.

@@ -343,6 +343,9 @@ fn to_optimizer_expr_unchecked(
             OptExpr::new(op, children)
         }
 
+        LogicalPlanKind::SystemTable(node) => {
+            OptExpr::leaf(Operator::LogicalSystemTable(node.clone()))
+        }
         LogicalPlanKind::Values(node) => {
             let op = Operator::LogicalValues(ValuesOp {
                 rows: {
@@ -653,6 +656,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
             all: op.all,
             output_columns: op.output_columns,
         }),
+        Operator::LogicalSystemTable(op) => LogicalPlanKind::SystemTable(op),
         Operator::LogicalValues(op) => LogicalPlanKind::Values(PlanValuesNode {
             rows: op
                 .rows

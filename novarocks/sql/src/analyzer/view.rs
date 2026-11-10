@@ -404,18 +404,22 @@ impl PlannerTableProvider for SavedViewCatalog<'_> {
             view,
         )
     }
-    fn resolve_inline_relation_for_analysis(
+    fn resolve_system_table_for_analysis(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, AnalyzeError> {
-        self.inner.resolve_definition_inline_relation_for_analysis(
+        version: Option<&novarocks_parser::ast::TableVersion>,
+    ) -> Result<Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>, AnalyzeError>
+    {
+        self.inner.resolve_definition_system_table_for_analysis(
             Some(catalog.unwrap_or(self.catalog)),
             database,
             table,
+            version,
         )
     }
+
     fn view_definition_target(&self) -> Option<&novarocks_types::naming::TableIdentity> {
         self.inner.view_definition_target()
     }

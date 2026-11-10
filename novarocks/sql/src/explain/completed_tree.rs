@@ -1484,11 +1484,27 @@ impl TreeContext<'_> {
                 ))?;
             }
             NodeKind::SystemRelation { data, .. } => {
-                let relation = self.node_annotation(fragment.id(), node.id, "sql.relation").unwrap_or("system relation");
+                let relation = self
+                    .node_annotation(fragment.id(), node.id, "sql.relation")
+                    .unwrap_or("system relation");
                 out.push(format_args!("{prefix}SYSTEM RELATION {relation}{stats}"))?;
+                for (key, label) in [
+                    ("sql.system.required_columns", "required columns"),
+                    ("sql.system.key_constraint", "key constraint"),
+                ] {
+                    if let Some(value) = self.node_annotation(fragment.id(), node.id, key) {
+                        out.push(format_args!("{pad}  {label}: {value}"))?;
+                    }
+                }
                 match data {
-                    novarocks_physical_plan::SystemRelationData::Deferred => out.push(format_args!("{pad}     data deferred"))?,
-                    novarocks_physical_plan::SystemRelationData::Batches { batches, .. } => out.push(format_args!("{pad}     snapshot batches: {}", batches.len()))?,
+                    novarocks_physical_plan::SystemRelationData::Deferred => {
+                        out.push(format_args!("{pad}     data deferred"))?
+                    }
+                    novarocks_physical_plan::SystemRelationData::Batches { batches, .. } => out
+                        .push(format_args!(
+                            "{pad}     snapshot batches: {}",
+                            batches.len()
+                        ))?,
                 }
             }
             NodeKind::Values { rows } => {

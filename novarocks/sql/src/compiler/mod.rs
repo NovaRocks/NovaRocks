@@ -3905,6 +3905,7 @@ mod completion_predicate;
 pub(crate) mod root_output;
 mod root_render_type;
 mod root_scalar_type;
+mod system_table_completion;
 pub use completion::*;
 pub use root_render_type::{
     ClientRenderSchemaError, RenderFamilyRequest, client_render_schema,
@@ -4008,6 +4009,3 @@ mod binding_value_type_source_properties {
 
 #[cfg(test)]
 mod decimal_largeint_refusal_tests;
-
-#[cfg(test)]
-mod inline_relation_tests;

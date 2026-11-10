@@ -695,6 +695,11 @@ fn available_output_ids(node: &OptimizedOperatorNode) -> HashSet<ColumnId> {
                 .map(|column| column.column_id)
                 .collect()
         }
+        Operator::PhysicalSystemTable(table) => table
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
         Operator::PhysicalValues(values) => values
             .columns
             .iter()

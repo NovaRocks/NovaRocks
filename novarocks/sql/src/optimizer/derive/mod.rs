@@ -172,6 +172,7 @@ pub(crate) fn derive_output(
     match op {
         Operator::PhysicalScan(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalValues(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalSystemTable(_) => PhysicalPropertySet::any(),
         Operator::PhysicalGenerateSeries(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalCTEConsume(o) => o.derive_output(scalars, children_outputs),
         Operator::PhysicalUnion(o) => o.derive_output(scalars, children_outputs),
@@ -227,6 +228,7 @@ pub(crate) fn derive_required(
     match op {
         Operator::PhysicalScan(o) => o.derive_required(scalars, parent_required, num_children),
         Operator::PhysicalValues(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalSystemTable(_) => vec![],
         Operator::PhysicalGenerateSeries(o) => {
             o.derive_required(scalars, parent_required, num_children)
         }

@@ -56,6 +56,7 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::IntersectToPhysical),
         Box::new(implement::ExceptToPhysical),
         Box::new(implement::ValuesToPhysical),
+        Box::new(implement::SystemTableToPhysical),
         Box::new(implement::GenerateSeriesToPhysical),
         Box::new(implement::TableFunctionToPhysical),
         Box::new(split_distinct_agg::SplitDistinctAgg),

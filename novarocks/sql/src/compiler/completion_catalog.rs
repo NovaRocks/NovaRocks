@@ -726,6 +726,20 @@ impl<'a> CatalogNeedCollector<'a> {
                     }
                     Err(error) => return Err(error),
                 };
+                let system_table = crate::system_table::is_system_table_name(
+                    &relation.catalog,
+                    &relation.namespace,
+                );
+                if system_table && (version.is_some() || metadata.is_some()) {
+                    if self.defer_semantic_refusals {
+                        return self.collect_table_decorations(version.as_ref(), scope);
+                    }
+                    return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                        "system tables do not support time travel or metadata suffixes",
+                        name.span,
+                    )
+                    .into());
+                }
                 let target = match metadata {
                     Some(metadata) => {
                         let kind = match SqlMetadataTableKind::parse(&metadata.value) {
@@ -744,6 +758,7 @@ impl<'a> CatalogNeedCollector<'a> {
                             },
                         }
                     }
+                    None if system_table => CatalogLookupTarget::SystemTable,
                     None => CatalogLookupTarget::Table {
                         mode: self.lookup_mode,
                     },
@@ -773,7 +788,8 @@ impl<'a> CatalogNeedCollector<'a> {
                 self.add_need_qualified(
                     relation,
                     target,
-                    !self.exact_catalog
+                    !system_table
+                        && !self.exact_catalog
                         && metadata.is_none()
                         && version.is_none()
                         && name.parts.len() < 3,
@@ -1002,6 +1018,7 @@ impl CatalogFactKey {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum CatalogTargetKey {
+    SystemTable,
     TableSchemaOnly,
     TableExplainStats,
     IcebergMetadata(SqlMetadataTableKind),
@@ -1010,6 +1027,7 @@ enum CatalogTargetKey {
 impl From<CatalogLookupTarget> for CatalogTargetKey {
     fn from(value: CatalogLookupTarget) -> Self {
         match value {
+            CatalogLookupTarget::SystemTable => Self::SystemTable,
             CatalogLookupTarget::Table {
                 mode: TableLookupMode::SchemaOnly,
             } => Self::TableSchemaOnly,
@@ -1022,7 +1040,12 @@ impl From<CatalogLookupTarget> for CatalogTargetKey {
 }
 
 enum CatalogEntry {
-    Inline(std::sync::Arc<crate::catalog::SqlInlineRelation>),
+    SystemTable(
+        Result<
+            std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+            crate::system_table::SystemTableLookupError,
+        >,
+    ),
     Resolved(Box<ResolvedAnalyzerTable>),
     View(std::sync::Arc<crate::catalog::SqlViewDefinition>),
     Missing(Box<str>),
@@ -1072,7 +1095,9 @@ impl FactBackedCatalog {
             }
             let key = CatalogFactKey::from_fact(fact);
             let entry = match fact.outcome() {
-                CatalogRelationOutcome::Inline(relation) => CatalogEntry::Inline(relation.clone()),
+                CatalogRelationOutcome::SystemTable(result) => {
+                    CatalogEntry::SystemTable(result.clone())
+                }
                 CatalogRelationOutcome::Resolved(table) => {
                     validate_resolved_target(fact, table)?;
                     CatalogEntry::Resolved(table.clone())
@@ -1186,8 +1211,8 @@ impl FactBackedCatalog {
             CatalogEntry::View(_) => Err(format!(
                 "catalog relation '{table}' requires stored-view declaration analysis"
             )),
-            CatalogEntry::Inline(_) => Err(format!(
-                "catalog relation '{table}' requires inline value analysis"
+            CatalogEntry::SystemTable(_) => Err(format!(
+                "catalog relation '{table}' requires system table declaration analysis"
             )),
             CatalogEntry::SelectionRefused(_) => {
                 Err("historical selection cannot answer a Current lookup".into())
@@ -1226,7 +1251,7 @@ impl FactBackedCatalog {
                 reason.to_string(),
                 version.span,
             )),
-            CatalogEntry::View(_) | CatalogEntry::Inline(_) => {
+            CatalogEntry::View(_) | CatalogEntry::SystemTable(_) => {
                 Err(AnalyzeError::unsupported_query_shape(
                     "time travel is not supported on a stored view",
                     version.span,
@@ -1268,7 +1293,9 @@ impl FactBackedCatalog {
             .map_err(crate::analyze_error::AnalyzeError::internal)?;
         Ok(match entry {
             CatalogEntry::View(view) => Some(view.as_ref()),
-            CatalogEntry::Resolved(_) | CatalogEntry::Missing(_) | CatalogEntry::Inline(_) => None,
+            CatalogEntry::Resolved(_) | CatalogEntry::Missing(_) | CatalogEntry::SystemTable(_) => {
+                None
+            }
             CatalogEntry::SelectionRefused(_) => {
                 return Err(crate::analyze_error::AnalyzeError::internal(
                     "historical selection cannot answer a Current view lookup",
@@ -1277,30 +1304,52 @@ impl FactBackedCatalog {
         })
     }
 
-    fn inline_in_context(
+    fn system_table_in_context(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-        definition_context: bool,
-    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
-    {
+        version: Option<&novarocks_parser::ast::TableVersion>,
+    ) -> Result<
+        Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
+        crate::analyze_error::AnalyzeError,
+    > {
+        let catalog_name = catalog
+            .or(self.current_catalog.as_deref())
+            .unwrap_or(novarocks_types::naming::DEFAULT_CATALOG);
+        if !crate::system_table::is_system_table_name(catalog_name, database) {
+            return Ok(None);
+        }
+        if let Some(version) = version {
+            return Err(crate::analyze_error::AnalyzeError::unsupported_query_shape(
+                "time travel is not supported on a system table",
+                version.span,
+            ));
+        }
         let entry = self
             .entry_selected_in_context(
-                catalog,
+                Some(catalog_name),
                 database,
                 table,
-                CatalogLookupTarget::Table {
-                    mode: self.lookup_mode,
-                },
+                CatalogLookupTarget::SystemTable,
                 None,
-                definition_context,
+                false,
             )
             .map_err(crate::analyze_error::AnalyzeError::internal)?;
-        Ok(match entry {
-            CatalogEntry::Inline(values) => Some(values.as_ref()),
-            _ => None,
-        })
+        match entry {
+            CatalogEntry::SystemTable(Ok(declaration)) => Ok(Some(declaration)),
+            CatalogEntry::SystemTable(Err(failure)) => {
+                Err(crate::analyze_error::AnalyzeError::system_table_lookup(
+                    *failure,
+                    catalog_name,
+                    database,
+                    table,
+                ))
+            }
+            _ => Err(crate::analyze_error::AnalyzeError::internal(
+                "system table lookup returned another fact kind",
+            )),
+        }
     }
 }
 
@@ -1390,24 +1439,19 @@ impl PlannerTableProvider for FactBackedCatalog {
     {
         self.resolve_view_for_analysis_in_context(catalog, database, view, true)
     }
-    fn resolve_inline_relation_for_analysis(
+    fn resolve_system_table_for_analysis(
         &self,
         catalog: Option<&str>,
         database: &str,
         table: &str,
-    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
-    {
-        self.inline_in_context(catalog, database, table, !self.root_local_view_shadow)
+        version: Option<&novarocks_parser::ast::TableVersion>,
+    ) -> Result<
+        Option<&std::sync::Arc<crate::system_table::SystemTableDeclaration>>,
+        crate::analyze_error::AnalyzeError,
+    > {
+        self.system_table_in_context(catalog, database, table, version)
     }
-    fn resolve_definition_inline_relation_for_analysis(
-        &self,
-        catalog: Option<&str>,
-        database: &str,
-        table: &str,
-    ) -> Result<Option<&crate::catalog::SqlInlineRelation>, crate::analyze_error::AnalyzeError>
-    {
-        self.inline_in_context(catalog, database, table, true)
-    }
+
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
         Some(self)
     }
@@ -1472,7 +1516,9 @@ fn validate_resolved_target(
             CatalogLookupTarget::IcebergMetadata { kind: expected },
             SqlScanKind::Metadata { kind: actual, .. },
         ) => expected == *actual,
-        (CatalogLookupTarget::IcebergMetadata { .. }, _) => false,
+        (CatalogLookupTarget::IcebergMetadata { .. } | CatalogLookupTarget::SystemTable, _) => {
+            false
+        }
     };
     if !matches_target {
         return Err(SqlCompileError::Compilation(format!(

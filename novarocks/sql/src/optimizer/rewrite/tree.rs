@@ -559,6 +559,8 @@ mod tests {
                 | Operator::PhysicalIntersect(_)
                 | Operator::PhysicalExcept(_)
                 | Operator::PhysicalValues(_)
+                | Operator::LogicalSystemTable(_)
+                | Operator::PhysicalSystemTable(_)
                 | Operator::PhysicalGenerateSeries(_)
                 | Operator::PhysicalTableFunction(_)
                 | Operator::PhysicalAssertOneRow(_) => {}

@@ -4195,7 +4195,8 @@ fn relation_node_references_outer_scope(
             .args
             .iter()
             .any(|arg| expr_references_outer_scope(arg, inner_scope, outer_scope)),
-        Relation::Scan(_)
+        Relation::SystemTable { .. }
+        | Relation::Scan(_)
         | Relation::IcebergMetadataScan(_)
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
@@ -4631,6 +4632,7 @@ fn dummy_relation() -> Relation {
 /// shape-specific error.
 fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option<OutputColumn> {
     match rel {
+        Relation::SystemTable { output_columns, .. } => output_columns.first().cloned(),
         Relation::CTEConsume { output_columns, .. } => output_columns.first().cloned(),
         Relation::Subquery { output_columns, .. } => output_columns.first().cloned(),
         Relation::Unnest(u) => u.output_columns.first().cloned(),
@@ -5043,6 +5045,7 @@ fn expr_contains_placeholder(expr: &TypedExpr, placeholder_id: usize) -> bool {
 /// should host an auxiliary correlated subquery join.
 fn relation_exposes_qualifier(rel: &Relation, qual_lower: &str) -> bool {
     match rel {
+        Relation::SystemTable { alias, .. } => alias.eq_ignore_ascii_case(qual_lower),
         Relation::Scan(s) => {
             let name = s.alias.as_deref().unwrap_or(&s.table.name);
             name.eq_ignore_ascii_case(qual_lower)
@@ -5079,6 +5082,9 @@ fn relation_exposes_qualifier(rel: &Relation, qual_lower: &str) -> bool {
 /// when the rewritten expression carries unqualified ColumnRefs.
 fn relation_exposes_column(rel: &Relation, col_lower: &str) -> bool {
     match rel {
+        Relation::SystemTable { output_columns, .. } => output_columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(col_lower)),
         Relation::Scan(s) => s
             .table
             .columns

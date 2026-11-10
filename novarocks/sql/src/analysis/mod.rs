@@ -186,6 +186,12 @@ pub(crate) struct ProjectItem {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Relation {
+    /// A declaration-only system relation, with analyzer-owned output identities.
+    SystemTable {
+        declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+        alias: String,
+        output_columns: Vec<AnalyzedOutputField>,
+    },
     /// A base table scan.
     Scan(ScanRelation),
     /// An Iceberg metadata table scan: `t$snapshots`, `t$history`, etc.

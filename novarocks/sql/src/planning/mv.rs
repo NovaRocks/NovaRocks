@@ -5496,7 +5496,8 @@ fn derive_from_relation(
                 aggregate_input_shape: None,
             })
         }
-        Relation::IcebergMetadataScan(_)
+        Relation::SystemTable { .. }
+        | Relation::IcebergMetadataScan(_)
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)

@@ -26,6 +26,30 @@ use std::sync::Arc;
 use novarocks_type_contract::FunctionValueType;
 use novarocks_types::naming::SYSTEM_CATALOG;
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SystemTableOccurrenceId(u32);
+impl SystemTableOccurrenceId {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Closed declaration-lookup failures, separate from provider execution errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SystemTableLookupError {
+    CatalogNotFound,
+    SchemaNotFound,
+    TableNotFound,
+}
+
+/// The reserved catalog wins over the catalog-local information schema.
+pub fn is_system_table_name(catalog: &str, schema: &str) -> bool {
+    catalog == SYSTEM_CATALOG || schema == novarocks_types::naming::INFORMATION_SCHEMA
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SystemTableBinding {
     System,
