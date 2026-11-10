@@ -115,6 +115,8 @@ impl OriginalTransportJoinObligation {
         else {
             unreachable!("qualified original result");
         };
+        drop(state);
+        original.effect.retire_handoff();
         Some(original)
     }
 

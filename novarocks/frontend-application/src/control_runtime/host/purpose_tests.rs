@@ -272,11 +272,15 @@ impl EffectSource for PurposeSource {
 }
 #[derive(Default)]
 struct HoldingExecutor {
+    refusing: AtomicBool,
     jobs: Mutex<Vec<PreparedEffectJob>>,
     values: Mutex<Vec<u64>>,
 }
 impl EffectExecutor for HoldingExecutor {
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
+        if self.refusing.load(Ordering::Acquire) {
+            return Err(job);
+        }
         self.values.lock().unwrap().push(value(&job.effect));
         self.jobs.lock().unwrap().push(job);
         Ok(())
@@ -913,6 +917,15 @@ fn inactive_financial_author_without_core_failure_preserves_the_original_typed_e
 
 #[test]
 fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
+    assert_withdrawal_reaches_the_original_send(false);
+}
+
+#[test]
+fn committed_withdrawal_reaches_the_send_held_by_executor_refusal() {
+    assert_withdrawal_reaches_the_original_send(true);
+}
+
+fn assert_withdrawal_reaches_the_original_send(executor_refuses: bool) {
     use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
@@ -946,9 +959,14 @@ fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
         class: EffectClass::Cleanup,
         body: EffectBody::Withdraw { effect: send_id },
     });
+    let unavailable = if executor_refuses {
+        [].as_slice()
+    } else {
+        [1].as_slice()
+    };
     let f = Fixture::with_effects(
         vec![vec![(1, 1, vec![])], vec![(2, 2, vec![])]],
-        &[1],
+        unavailable,
         |value| {
             FrontendEffect::Attempt(if value == 1 {
                 send.clone()
@@ -957,6 +975,9 @@ fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
             })
         },
     );
+    f.executor
+        .refusing
+        .store(executor_refuses, Ordering::Release);
     f.send(0);
     let (_, idle_before) = f.to_idle();
     let pending_before = send.handoff().unwrap().state();
@@ -965,7 +986,12 @@ fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
     let (_, idle_after) = f.to_idle();
     let (blocked, handed_off) = f.captured();
     let withdrawn = send.handoff().unwrap().state();
-    f.release_credit(1);
+    if executor_refuses {
+        f.executor.refusing.store(false, Ordering::Release);
+        f.runtime.notify_host_actor(&f.registration).unwrap();
+    } else {
+        f.release_credit(1);
+    }
     let (_, idle_after_credit) = f.to_idle();
     let (released, handed_off_after_credit) = f.captured();
     let same_cell = f.executor.jobs.lock().unwrap().iter().any(|job| {
@@ -978,7 +1004,8 @@ fn committed_withdrawal_reaches_a_full_send_before_it_can_bind() {
     assert!(idle_before && idle_after && idle_after_credit && empty);
     assert_eq!(pending_before, HandoffState::Pending);
     assert_eq!(withdrawn, HandoffState::Withdrawn);
-    assert!(blocked.bound.is_empty() && handed_off.is_empty());
+    assert_eq!(blocked.bound.len(), usize::from(executor_refuses));
+    assert!(handed_off.is_empty());
     assert_eq!(released.bound, [1]);
     assert_eq!(handed_off_after_credit, [1]);
     assert!(same_cell);

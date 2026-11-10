@@ -47,14 +47,8 @@ impl AttemptEffectEnvelope {
     pub(crate) fn handoff(&self) -> Option<&Arc<HandoffCell>> {
         self.handoff.as_ref()
     }
-}
-impl std::fmt::Debug for AttemptEffectEnvelope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.protocol.fmt(f)
-    }
-}
-impl Drop for AttemptEffectEnvelope {
-    fn drop(&mut self) {
+
+    pub(crate) fn retire_handoff(&self) {
         if let Some(routes) = self.routes.get().and_then(Weak::upgrade) {
             let mut originals = routes.originals.lock().unwrap_or_else(|e| e.into_inner());
             if originals
@@ -64,6 +58,16 @@ impl Drop for AttemptEffectEnvelope {
                 originals.remove(&self.protocol.id);
             }
         }
+    }
+}
+impl std::fmt::Debug for AttemptEffectEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.protocol.fmt(f)
+    }
+}
+impl Drop for AttemptEffectEnvelope {
+    fn drop(&mut self) {
+        self.retire_handoff();
     }
 }
 

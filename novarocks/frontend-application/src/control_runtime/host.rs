@@ -603,7 +603,7 @@ impl HostRegistry {
                 retired: false,
             });
         }
-        let mut blocked = false;
+        let mut handoff_refused = false;
         if budget != 0 {
             let indexed = original_dispatch!(machine.dispatch.index_committed_with(
                 &self.runtime,
@@ -621,7 +621,7 @@ impl HostRegistry {
             machine.source.core_consumed(&indexed.inputs);
         }
         while budget != 0 {
-            if machine.pending.is_none() {
+            if machine.pending.is_none() || handoff_refused {
                 let remaining = machine
                     .scan_remaining
                     .get_or_insert_with(|| machine.dispatch.ready_positions());
@@ -670,9 +670,8 @@ impl HostRegistry {
                         machine.dispatch.claim_candidate(&self.runtime, &candidate)
                     ) {
                         machine.withdrawals.withdraw(effect);
-                        let _ = self
-                            .runtime
-                            .effect_completed_with_receipt(ticket)
+                        self.runtime
+                            .effect_completed(ticket)
                             .map_err(|refusal| HostError::Runtime(refusal.error))?;
                         machine.rescan_requested = true;
                     } else {
@@ -680,7 +679,7 @@ impl HostRegistry {
                     }
                     continue;
                 }
-                if machine.source.result_admission_closed() {
+                if machine.pending.is_some() || machine.source.result_admission_closed() {
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 }
@@ -733,8 +732,9 @@ impl HostRegistry {
                         ticket: pending.ticket,
                         job,
                     });
-                    blocked = true;
-                    break;
+                    // Preserve this single prepared carrier and give the
+                    // remaining bounded scan to host-local withdrawal.
+                    handoff_refused = true;
                 }
                 Ok(()) => {
                     let lane = machine.policy.classify(&pending.ticket.effect);
@@ -764,16 +764,13 @@ impl HostRegistry {
         if machine.scan_remaining == Some(0) {
             machine.scan_remaining = None;
             rescan = std::mem::take(&mut machine.rescan_requested);
-            // An exhausted pass is not work. In particular, all-Full must
-            // await actual purpose-credit change rather than restarting a lap.
-            blocked |= machine.pending.is_none() && !rescan;
         }
         let more = retired.more
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
-            || (!blocked
-                && budget == 0
-                && (machine.pending.is_some() || machine.scan_remaining.is_some_and(|n| n != 0)));
+            || (budget == 0
+                && (machine.scan_remaining.is_some_and(|n| n != 0)
+                    || machine.pending.is_some() && !handoff_refused));
         Ok(HostProgress {
             units: entry.budget - budget,
             handoffs,
