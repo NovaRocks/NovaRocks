@@ -45,14 +45,18 @@ pub(super) fn resolve_target(
     stmt: &AddEqualityDelete,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let table = sql_object_name(&stmt.target);
     let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     Ok((target, "main".to_string()))
 }

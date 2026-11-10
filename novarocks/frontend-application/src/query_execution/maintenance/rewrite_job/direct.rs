@@ -100,7 +100,7 @@ pub(crate) fn prepare(
         RequestScopedMaintenanceEngine::new(kernel.clone(), execution.clone(), connector.clone());
     let target = engine
         .resolve_target(names, context)
-        .map_err(TerminalError::pre_dispatch_failed)?;
+        .map_err(TerminalError::from)?;
     let capacity = execution.result_capacity().ok_or_else(|| {
         TerminalError::pre_dispatch_failed("direct Rewrite has no original SQL Root capacity")
     })?;

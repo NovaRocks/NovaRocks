@@ -156,6 +156,7 @@ impl QueryViewService {
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let local_views = self.catalog_snapshot()?;
         let parts = view_object_name_parts(&create_view.name);
+        crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
@@ -212,6 +213,7 @@ impl QueryViewService {
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let parts = view_object_name_parts(&drop_view.name);
+        crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {

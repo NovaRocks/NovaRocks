@@ -41,6 +41,27 @@ async fn source(
     blocking: ConnectorBlockingIoSupervisor,
     capacity: QueryResultCapacityBinding,
 ) -> Arc<FrontendSystemTableFacts> {
+    let context = ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    let scope = StatementFactScope::binding_only(
+        Arc::new(QueryTableBindingStore::try_new().unwrap()),
+        context,
+        Some("default_catalog"),
+        capacity.scope(),
+        capacity.clone(),
+    )
+    .unwrap();
+    source_in(blocking, scope).await
+}
+async fn source_in(
+    blocking: ConnectorBlockingIoSupervisor,
+    scope: StatementFactScope,
+) -> Arc<FrontendSystemTableFacts> {
     let (product, _repository) = crate::mv::domain::test_admission::keyed_product().await;
     let readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
         product.keyed_readiness_service().unwrap(),
@@ -61,23 +82,9 @@ async fn source(
         ),
         readiness,
     );
-    let context = ConnectorRequestContext::try_new(
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-        novarocks_spi::connector::ConnectorStopOwner::new().view(),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .unwrap();
-    let scope = StatementFactScope::binding_only(
-        Arc::new(QueryTableBindingStore::try_new().unwrap()),
-        context,
-        Some("default_catalog"),
-        capacity.scope(),
-        capacity.clone(),
-    )
-    .unwrap();
     FrontendSystemTableFacts::new(owners, scope).unwrap()
 }
+mod listing;
 #[tokio::test]
 async fn cancelled_inventory_borrow_and_cancelled_close_keep_the_same_cursor_until_actual_exit() {
     let (mut executors, supervisor) = crate::task_execution::blocking_io::tests::original_executors(

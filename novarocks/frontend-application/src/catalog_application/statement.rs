@@ -83,7 +83,7 @@ pub(crate) fn execute_create_database_statement(
     if_not_exists: bool,
     current_catalog: Option<&str>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_namespace_target(
         context,
         name,
@@ -491,13 +491,16 @@ pub(crate) fn execute_drop_catalog_statement(
     context: &impl CatalogDropContext,
     catalog_name: &str,
     if_exists: bool,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let normalized_catalog = normalize_identifier(catalog_name)?;
+    let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
+        .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+    novarocks_catalog_application::validate_catalog_drop_name(&instance_id).map_err(|error| {
+        CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(error))
+    })?;
     let application = context.catalog_application().ok_or_else(|| {
         "catalog statements require a configured frontend catalog application".to_string()
     })?;
-    let instance_id = ConnectorInstanceId::parse(&normalized_catalog)
-        .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     // The Frontend application owns the exact-version delete and the MV
     // dependency scan that fences it, both inside one serializable StateStore
     // transaction. Core must not pre-check dependencies outside that fence.
@@ -506,7 +509,11 @@ pub(crate) fn execute_drop_catalog_statement(
             instance_id,
             if_exists,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+                error,
+            ))
+        })?;
     Ok(StatementResult::Ok)
 }
 
@@ -517,7 +524,7 @@ pub(crate) fn execute_drop_database_statement(
     if_exists: bool,
     force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_namespace_target(
         context,
         name,
@@ -691,7 +698,7 @@ pub(crate) fn execute_drop_table_statement(
     if_exists: bool,
     _force: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = match crate::catalog_application::resolver::resolve_existing_table_target(
         context,
         name,
@@ -699,13 +706,15 @@ pub(crate) fn execute_drop_table_statement(
         current_database,
     ) {
         Ok(target) => target,
-        Err(_) if current_catalog.is_none() && name.parts.len() <= 2 => {
+        Err(crate::catalog_application::resolver::TargetResolutionError::Message(_))
+            if current_catalog.is_none() && name.parts.len() <= 2 =>
+        {
             // External parquet tables registered through the embedding API are
             // still catalog-only entries. Dropping them does not involve a
             // connector backend.
             return drop_local_catalog_table(context, name, current_database, if_exists);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err((err).into()),
     };
     match crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         context.connector_control(),
@@ -723,7 +732,7 @@ pub(crate) fn execute_drop_table_statement(
             cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             return Ok(StatementResult::Ok);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err((err).into()),
     }
     let exact_lease = crate::connector::acquire_metadata_planning_pin(
         context.connector_control(),
@@ -784,7 +793,7 @@ pub(crate) fn execute_drop_table_statement(
             if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
                 completed.finalization
             {
-                return Err(novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(failure.to_string()).to_string());
+                return Err((novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(failure.to_string()).to_string()).into());
             }
             if target.provider_id.as_str() == "iceberg" {
                 context.catalog_service().invalidate_table(
@@ -842,13 +851,14 @@ pub(crate) fn execute_drop_table_statement(
             })
         }
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => Err(
-            novarocks_query_application::engine_error::EngineError::commit_unknown(
+            (novarocks_query_application::engine_error::EngineError::commit_unknown(
                 failure.to_string(),
             )
-            .to_bracketed_user_message(),
+            .to_bracketed_user_message())
+            .into(),
         ),
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
-            Err(error.to_string())
+            Err((error.to_string()).into())
         }
     }
 }
@@ -856,17 +866,18 @@ pub(crate) fn execute_drop_table_statement(
 fn drop_table_failure_with_view_check(
     failure: novarocks_spi::connector::ConnectorMutationFailure,
     view_error: impl FnOnce() -> Result<Option<String>, String>,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::NotFound
         && let Some(error) = view_error()?
     {
-        return Err(error);
+        return Err((error).into());
     }
     Err(
-        novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
+        (novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
             failure.to_string(),
         )
-        .to_string(),
+        .to_string())
+        .into(),
     )
 }
 
@@ -897,7 +908,7 @@ fn drop_local_catalog_table(
     name: &ObjectName,
     current_database: &str,
     if_exists: bool,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let resolved = resolve_local_table_name(name.parts.as_slice(), current_database)?;
     let mut guard = context
         .catalog_service()
@@ -907,7 +918,7 @@ fn drop_local_catalog_table(
     match guard.drop_table(&resolved.database, &resolved.table) {
         Ok(()) => Ok(StatementResult::Ok),
         Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
-        Err(err) => Err(err),
+        Err(err) => Err((err).into()),
     }
 }
 
@@ -1810,6 +1821,76 @@ mod force_drop_admission_tests {
 
 #[cfg(test)]
 mod drop_table_if_exists_tests {
+    struct RefuseBeforeExternalAdmission;
+    impl crate::catalog_application::resolver::CatalogAdmission for RefuseBeforeExternalAdmission {
+        fn catalog_application(
+            &self,
+        ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
+            panic!("virtual DROP must not request external catalog admission")
+        }
+    }
+    impl crate::catalog_application::query_catalog::CatalogServiceSource
+        for RefuseBeforeExternalAdmission
+    {
+        fn catalog_service(
+            &self,
+        ) -> &std::sync::Arc<crate::catalog_application::query_catalog::QueryCatalogService>
+        {
+            panic!("virtual DROP must not enter the local table fallback")
+        }
+    }
+    impl super::CatalogDropContext for RefuseBeforeExternalAdmission {
+        fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
+            panic!("virtual DROP must not enter a connector")
+        }
+        fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
+            panic!("virtual DROP must not enter MV readiness")
+        }
+        fn mv_storage_observation(
+            &self,
+        ) -> &dyn novarocks_spi::connector::MvStorageObservationPort {
+            panic!("virtual DROP must not observe MV storage")
+        }
+    }
+    #[test]
+    fn conditional_drop_cannot_hide_virtual_targets_in_the_local_fallback() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for if_exists in [false, true] {
+            for parts in [
+                vec!["information_schema", "tables"],
+                vec!["system", "metadata", "materialized_views"],
+            ] {
+                let name = novarocks_sql::semantic::ObjectName {
+                    parts: parts.into_iter().map(str::to_owned).collect(),
+                };
+                let error = super::execute_drop_table_statement(
+                    &RefuseBeforeExternalAdmission,
+                    &name,
+                    None,
+                    "db",
+                    if_exists,
+                    false,
+                    &crate::connector::test_request_context(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.failure_cause().unwrap().failure_fact().class(),
+                    FailureClass::Unsupported
+                );
+            }
+            let error = super::execute_drop_catalog_statement(
+                &RefuseBeforeExternalAdmission,
+                "SYSTEM",
+                if_exists,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.failure_cause().unwrap().failure_fact().class(),
+                FailureClass::Unsupported
+            );
+        }
+    }
+
     #[test]
     fn non_missing_mutation_failures_preserve_the_error_without_view_io() {
         use novarocks_spi::connector::{ConnectorMutationFailure, ConnectorMutationFailureKind};
@@ -1823,7 +1904,7 @@ mod drop_table_if_exists_tests {
                 ConnectorMutationFailure::new(kind, message),
                 || panic!("non-NotFound failure must not query a view"),
             );
-            assert!(result.unwrap_err().contains(message));
+            assert!(result.unwrap_err().to_string().contains(message));
         }
     }
 
@@ -1834,12 +1915,15 @@ mod drop_table_if_exists_tests {
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
             || Ok(Some("target is a view, use DROP VIEW".into())),
         );
-        assert_eq!(result.unwrap_err(), "target is a view, use DROP VIEW");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "target is a view, use DROP VIEW"
+        );
         let result = super::drop_table_failure_with_view_check(
             ConnectorMutationFailure::new(ConnectorMutationFailureKind::NotFound, "table missing"),
             || Ok(None),
         );
-        assert!(result.unwrap_err().contains("table missing"));
+        assert!(result.unwrap_err().to_string().contains("table missing"));
     }
 
     #[test]
@@ -2652,7 +2736,7 @@ pub(crate) mod external_listing_tests {
                     &crate::connector::test_request_context(),
                 );
                 assert_eq!(
-                    result.err(),
+                    result.err().map(|error| error.to_string()),
                     Some(fixture.expected_error()),
                     "{point:?}, {kind:?}"
                 );

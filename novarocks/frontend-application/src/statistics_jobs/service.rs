@@ -128,6 +128,16 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
                 "only ANALYZE has a statistics submission source",
             ));
         };
+        if novarocks_sql::system_table::is_system_table_name(&target.catalog, &target.namespace) {
+            return Err(
+                application::StatisticsApplicationError::from_connector_error(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "statistics collection on system tables is unsupported",
+                    ),
+                ),
+            );
+        }
         let fail = |error: novarocks_workload_control::WorkError| {
             application::StatisticsApplicationError::new(error.to_string())
         };

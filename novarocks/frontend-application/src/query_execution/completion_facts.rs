@@ -140,6 +140,12 @@ impl CompletionFactOwners {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemTableSourcePolicy {
+    Query,
+    Mutation,
+}
+
 /// What one statement adds to those owners.
 ///
 /// The binding store is the statement's own: every fact about a relation is
@@ -148,6 +154,7 @@ impl CompletionFactOwners {
 #[derive(Clone)]
 pub(crate) struct StatementFactScope {
     state_store: StatementStateStore,
+    system_table_sources: SystemTableSourcePolicy,
     creator_mode: ProviderCreatorMode,
     bindings: Arc<QueryTableBindingStore>,
     connector_context: ConnectorRequestContext,
@@ -184,6 +191,7 @@ impl StatementFactScope {
         Ok(Self {
             creator_mode: ProviderCreatorMode::BindingOnly,
             state_store: StatementStateStore::Legacy,
+            system_table_sources: SystemTableSourcePolicy::Query,
             bindings,
             connector_context,
             current_catalog: current_catalog.map(Arc::from),
@@ -269,6 +277,13 @@ impl StatementFactScope {
         });
         self
     }
+    pub(crate) fn with_system_table_source_policy(
+        mut self,
+        policy: SystemTableSourcePolicy,
+    ) -> Self {
+        self.system_table_sources = policy;
+        self
+    }
     pub(crate) fn with_query_local_overlays(
         mut self,
         overlays: Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
@@ -320,6 +335,21 @@ impl CatalogFactPort for FrontendCatalogFacts {
         needs: &[CatalogRelationNeed],
     ) -> Result<Vec<CatalogRelationFact>, novarocks_sql::compiler::SqlCompileError> {
         let _round = self.resolving.lock().await;
+        if self.scope.system_table_sources == SystemTableSourcePolicy::Mutation
+            && needs.iter().any(|need| {
+                need.target() == novarocks_sql::compiler::CatalogLookupTarget::SystemTable
+            })
+        {
+            return Err(novarocks_sql::compiler::SqlCompileError::CompilationSource(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "system tables are unsupported in DELETE, UPDATE and MERGE sources",
+                    ),
+                ),
+            ));
+        }
+
         let loader = iceberg_table_binding_loader(
             self.owners.connector_control.as_ref(),
             self.scope.connector_context.clone(),

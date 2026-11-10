@@ -758,7 +758,10 @@ impl SessionCatalogPort for SessionCatalogResolver {
             return Ok(self
                 .system_relations
                 .schemas(&novarocks_sql::system_table::SystemTableBinding::System)
-                .iter()
+                .into_iter()
+                .chain(self.system_relations.schemas(
+                    &novarocks_sql::system_table::SystemTableBinding::Catalog(catalog_name.into()),
+                ))
                 .any(|schema| schema == namespace_name));
         }
         if namespace_name == novarocks_types::naming::INFORMATION_SCHEMA {

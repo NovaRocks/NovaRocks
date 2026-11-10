@@ -312,8 +312,16 @@ impl FrontendSystemTableFacts {
         &self,
     ) -> Result<Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>, SystemTableError>
     {
-        if let StatementStateStore::Governed(Some(requests)) = &self.scope.state_store {
-            return Ok(Arc::clone(requests));
+        match &self.scope.state_store {
+            StatementStateStore::Governed(Some(requests)) => return Ok(Arc::clone(requests)),
+            StatementStateStore::Governed(None) => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "system materialized-view listing has no original StateStore execution",
+                )
+                .into());
+            }
+            StatementStateStore::Legacy => {}
         }
         let mut slot = self.store.lock().unwrap_or_else(|p| p.into_inner());
         let body = slot

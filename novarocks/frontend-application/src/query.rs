@@ -1923,7 +1923,7 @@ impl FrontendQuerySession {
             ) {
                 Ok(action) => action,
                 Err(error) => {
-                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                    return Ok(self.governed_typed_error(error.into_service(), statement));
                 }
             };
             return self
@@ -1959,7 +1959,7 @@ impl FrontendQuerySession {
                 ) {
                     Ok(action) => action,
                     Err(error) => {
-                        return Ok(self.governed_typed_error(internal_error(error), statement));
+                        return Ok(self.governed_typed_error(error.into_service(), statement));
                     }
                 };
                 return self
@@ -2038,7 +2038,7 @@ impl FrontendQuerySession {
             ) {
                 Ok(action) => action,
                 Err(error) => {
-                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                    return Ok(self.governed_typed_error(error.into_service(), statement));
                 }
             };
             return self

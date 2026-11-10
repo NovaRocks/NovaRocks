@@ -136,7 +136,10 @@ struct PreparationInput {
 pub(crate) fn prepare(
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
     input: InsertStatementInput,
-) -> Result<Box<dyn GovernedStatementAction>, String> {
+) -> Result<
+    Box<dyn GovernedStatementAction>,
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let root_capacity = input
         .context
         .execution()

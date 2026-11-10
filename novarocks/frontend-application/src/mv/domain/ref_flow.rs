@@ -43,13 +43,14 @@ pub(crate) fn execute_with_ports(
     _current_database: &str,
     stmt: &AlterIcebergTableSqlCommand,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
     crate::connector::validate_request_context(connector_context)?;
     // 1. Resolve qualified name — must be 3-part (catalog.namespace.table).
     let IcebergTableSqlAction::Reference(action) = &stmt.action else {
-        return Err("Iceberg ref executor received a non-reference action".to_string());
+        return Err(("Iceberg ref executor received a non-reference action".to_string()).into());
     };
     let (catalog_name, namespace, table_name) = resolve_table_parts(&stmt.table)?;
+    crate::catalog_application::resolver::require_external_target(&catalog_name, &namespace)?;
 
     // Retain one exact generation across MV admission and the ref mutation.
     // The application never decodes the provider-owned table handle.
@@ -74,7 +75,9 @@ pub(crate) fn execute_with_ports(
     let instance_id =
         ConnectorInstanceId::parse(&catalog_name).map_err(|error| error.to_string())?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
-        return Err("connector planning pin identity changed during ALTER TABLE ref".to_string());
+        return Err(
+            ("connector planning pin identity changed during ALTER TABLE ref".to_string()).into(),
+        );
     }
     let mutation_lease = exact_lease
         .derive_mutation_lease()
@@ -95,12 +98,11 @@ pub(crate) fn execute_with_ports(
     match outcome {
         crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
-                return Err(
+                return Err((
                     novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(
                         failure.to_string(),
                     )
-                    .to_string(),
-                );
+                    .to_string()).into());
             }
         }
         crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted {
@@ -108,22 +110,24 @@ pub(crate) fn execute_with_ports(
             cleanup,
         } => {
             return Err(
-                novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
+                (novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
                     crate::connector::mutation::known_uncommitted_message(failure, &cleanup),
                 )
-                .to_string(),
+                .to_string())
+                .into(),
             );
         }
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
             return Err(
-                novarocks_query_application::engine_error::EngineError::commit_unknown(
+                (novarocks_query_application::engine_error::EngineError::commit_unknown(
                     failure.to_string(),
                 )
-                .to_string(),
+                .to_string())
+                .into(),
             );
         }
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
-            return Err(error.to_string());
+            return Err((error.to_string()).into());
         }
     }
 

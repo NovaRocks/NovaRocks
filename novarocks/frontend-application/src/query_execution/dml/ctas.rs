@@ -888,6 +888,18 @@ fn connector_original_cause(
     }
     SharedFailureCause::new(error)
 }
+fn target_failure(
+    error: crate::catalog_application::resolver::TargetResolutionError,
+) -> CtasFailure {
+    match error {
+        crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
+            internal_failure(message)
+        }
+        crate::catalog_application::resolver::TargetResolutionError::Unsupported(error) => {
+            connector_failure(error)
+        }
+    }
+}
 fn connector_failure(error: novarocks_spi::connector::ConnectorError) -> CtasFailure {
     use novarocks_spi::connector::ConnectorErrorKind;
     let kind = match error.kind() {
@@ -1137,6 +1149,11 @@ async fn plan_query_for_ctas_source_async(
         )
         .await
         .map_err(|error| match error {
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Source(
+                source,
+            ) => CtasFailure::from_compile(
+                novarocks_sql::compiler::SqlCompileError::CompilationSource(source),
+            ),
             crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
                 error,
             ) => internal_failure(error),
@@ -1498,7 +1515,7 @@ impl DmlExecutionKernel {
             current_catalog,
             current_database,
         )
-        .map_err(internal_failure)?;
+        .map_err(target_failure)?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| connector_failure(error.into()))?;
         let planning = self
@@ -1571,7 +1588,7 @@ impl DmlExecutionKernel {
             request.current_catalog.as_deref(),
             &request.current_database,
         )
-        .map_err(internal_failure)?;
+        .map_err(target_failure)?;
         if target != preflight.target {
             return Err(CtasFailure {
                 kind: CtasFailureKind::InvalidRequest,

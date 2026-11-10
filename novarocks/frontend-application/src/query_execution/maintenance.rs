@@ -233,7 +233,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String>;
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>;
 
     /// Capture the provider-owned physical identity together with submission
     /// target resolution. Durable callers persist this value with the logical
@@ -793,7 +793,8 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String> {
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
+    {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
             &novarocks_sql::semantic::ObjectName {
@@ -1015,7 +1016,8 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String> {
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
+    {
         self.request_engine()?.resolve_target(name_parts, context)
     }
 

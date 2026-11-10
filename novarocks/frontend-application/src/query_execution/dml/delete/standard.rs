@@ -57,16 +57,17 @@ pub(super) fn resolve_target(
     stmt: &Delete,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(TargetBackend, String), String> {
+) -> Result<(TargetBackend, String), crate::catalog_application::resolver::TargetResolutionError> {
     // Detect branch/tag suffix in the target table name.
     let target_name = sql_object_name(&stmt.target);
     let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
     let effective_name;
     let table_name: &SqlObjectName = match ref_suffix {
         Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err(format!(
+            return Err((format!(
                 "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ));
+            ))
+            .into());
         }
         Some(IcebergRefSuffix::Branch(_)) => {
             effective_name = SqlObjectName {
@@ -85,10 +86,11 @@ pub(super) fn resolve_target(
     let target =
         resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "phase 1 DELETE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     Ok((target, target_ref))
 }

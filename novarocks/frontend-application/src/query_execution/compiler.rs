@@ -1002,6 +1002,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+    system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding_async(
         state,
@@ -1019,6 +1020,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         None,
         &[],
         provider_source,
+        system_table_sources,
     )
     .await
 }
@@ -1064,6 +1066,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_at_write_target_async(
         Some(ordinal),
         overlays,
         provider_source,
+        crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
     )
     .await
 }
@@ -1088,6 +1091,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
     overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+    system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let query_opts = Some(query_opts.unwrap_or_else(|| {
         crate::query_execution::contract::synthetic_statement_query_options(execution)
@@ -1104,7 +1108,8 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         capacity.clone(),
     )
     .map_err(|error| error.to_string())?
-    .with_query_local_overlays(overlays.to_vec());
+    .with_query_local_overlays(overlays.to_vec())
+    .with_system_table_source_policy(system_table_sources);
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners()?,
