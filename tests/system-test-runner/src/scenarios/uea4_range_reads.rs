@@ -39,8 +39,8 @@ use std::time::Duration;
 
 // Actual range/cancellation probes require object reads rather than cached pages.
 const FUNCTIONAL_CACHE_OVERLAY: &str = "[runtime.cache]\npage_cache_enable = false\nparquet_page_cache_enable = false\ndatacache_enable = false\n";
-const ACCESS_KEY_ENV: &str = "NOVAROCKS_RANGE_FIXTURE_ACCESS_KEY_ID";
-const SECRET_KEY_ENV: &str = "NOVAROCKS_RANGE_FIXTURE_SECRET_ACCESS_KEY";
+const ACCESS_KEY_ENV: &str = "NOVAROCKS_UEA4A2_S3_ACCESS_KEY_ID";
+const SECRET_KEY_ENV: &str = "NOVAROCKS_UEA4A2_S3_SECRET_ACCESS_KEY";
 const CREDENTIAL_NAME: &str = "range-fixture";
 const CREDENTIAL_GENERATION: &str = "v1";
 const CATALOG: &str = "range_fixture";

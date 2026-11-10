@@ -89,7 +89,8 @@ pub(super) fn produce_delete_receipt(
         .env_remove(RUN_CONTEXT_ENV)
         .env_remove(RUN_STORAGE_ENV)
         .env_remove("NOVA_FIXTURE_CLEANUP_MODE")
-        .env_remove("NOVAROCKS_SPARK_EXTRA_DEFAULTS");
+        .env_remove("NOVAROCKS_SPARK_EXTRA_DEFAULTS")
+        .terminate_at(budget.work_deadline(), budget.deadline());
     fs::write(
         root.join(format!("delete-{mode}-producer-command.json")),
         serde_json::to_vec_pretty(&json!({
