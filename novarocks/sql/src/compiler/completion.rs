@@ -1233,16 +1233,15 @@ impl CatalogRelationFact {
         if need.target != CatalogLookupTarget::SystemTable || need.version().is_some() {
             return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
         }
-        if let Ok(declaration) = &declaration {
-            if declaration.binding.catalog_name() != need.relation.catalog
+        if let Ok(declaration) = &declaration
+            && (declaration.binding.catalog_name() != need.relation.catalog
                 || declaration.schema != need.relation.namespace
-                || declaration.table != need.relation.table
-            {
-                return Err(CompletionProtocolError::InvalidFact {
-                    id: need.id,
-                    reason: "system table declaration differs from exact relation need",
-                });
-            }
+                || declaration.table != need.relation.table)
+        {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "system table declaration differs from exact relation need",
+            });
         }
         Ok(Self {
             id: need.id,

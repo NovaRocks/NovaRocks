@@ -961,6 +961,12 @@ fn provider_or_ready_step(
     ))
 }
 
+type CollectedProviderInputs = (
+    PhysicalPlanNode,
+    Box<[ProviderReadNeed]>,
+    Box<[super::completion::SystemTableSnapshotNeed]>,
+);
+
 /// State every provider read one physical plan performs, and address each of
 /// its scans by the occurrence that read will be accounted for under.
 ///
@@ -974,14 +980,7 @@ pub(crate) fn collect_provider_inputs(
     offer_predicates: bool,
     materialize_system_tables: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<
-    (
-        PhysicalPlanNode,
-        Box<[ProviderReadNeed]>,
-        Box<[super::completion::SystemTableSnapshotNeed]>,
-    ),
-    SqlCompileError,
-> {
+) -> Result<CollectedProviderInputs, SqlCompileError> {
     let (physical, reads, mut next_need) =
         collect_provider_needs_with_next(plan, next_need_ordinal, offer_predicates, control)?;
     let (physical, system_tables) = super::system_table_completion::collect(

@@ -492,18 +492,6 @@ impl FsAccessHandle {
         })))
     }
 
-    /// One explicitly bounded catalog metadata probe over the authorized
-    /// client. It creates no BoundFile, paths-inventory clone or size cache.
-    /// The same <2MiB source auxiliary covers both listing and sequential
-    /// schema probes; this does not allocate a second workspace allowance.
-
-    /// Bounded local-catalog listing over this same authorized client.
-    ///
-    /// Checks borrowed inputs before URI/identity/relative-path growth, avoids
-    /// cloning the handle's entire paths inventory, and requests finite pages.
-    /// OpenDAL's received page and XML decoder remain third-party internals;
-    /// this entrypoint does not claim to bound that response body.
-
     /// Atomically create one authorized path without replacing an existing file.
     ///
     /// Design: ADR-0077 makes native conditional storage creation the publication

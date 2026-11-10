@@ -361,14 +361,14 @@ impl<H> UnitObserver for Observer<'_, '_, '_, '_, H> {
         dictionaries: &HashMap<i64, ArrayRef>,
         kind: DecodeKind,
     ) -> Result<(), Self::Error> {
-        if let DecodeKind::Dictionary { id } = kind {
-            if !dictionaries.contains_key(&id) {
-                let n=novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64,ArrayRef,Failure<H>>(dictionaries.len(),dictionaries.capacity(),||self.checkpoint()).map_err(|_|invalid("system relation dictionary allocation geometry is invalid"))?;
-                self.creation
-                    .borrow_mut()
-                    .observe_opaque_upper_bound(n)
-                    .map_err(ProjectionFailure::Host)?;
-            }
+        if let DecodeKind::Dictionary { id } = kind
+            && !dictionaries.contains_key(&id)
+        {
+            let n=novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<i64,ArrayRef,Failure<H>>(dictionaries.len(),dictionaries.capacity(),||self.checkpoint()).map_err(|_|invalid("system relation dictionary allocation geometry is invalid"))?;
+            self.creation
+                .borrow_mut()
+                .observe_opaque_upper_bound(n)
+                .map_err(ProjectionFailure::Host)?;
         }
         let creation = &self.creation;
         let work = &self.work;
