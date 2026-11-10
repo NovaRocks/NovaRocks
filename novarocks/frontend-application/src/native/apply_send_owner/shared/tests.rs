@@ -2207,6 +2207,7 @@ async fn run_actor_send(
                 handle,
                 1,
             )),
+            ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("same host registration"));
     let mut terminal_owner = RegisteredAttemptTerminal::new(

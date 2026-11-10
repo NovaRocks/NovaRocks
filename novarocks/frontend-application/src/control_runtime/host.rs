@@ -30,7 +30,10 @@ use super::{
 use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
-use crate::task_execution::host::failure_publication::FailureContext;
+use crate::task_execution::host::{
+    failure_publication::FailureContext,
+    observations::{ObservationError, host_turn::OrderedObservationHost},
+};
 use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{
@@ -250,6 +253,7 @@ struct HostMachine {
     source: Box<dyn EffectSource>,
     executor: Arc<dyn EffectExecutor>,
     transport: Option<TransportRetirements>,
+    ordered_observations: Option<OrderedObservationHost>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -323,6 +327,7 @@ pub(crate) struct HostBinding {
     pub(crate) source: Box<dyn EffectSource>,
     pub(crate) executor: Arc<dyn EffectExecutor>,
     pub(crate) transport: Option<TransportRetirements>,
+    pub(crate) ordered_observations: Option<OrderedObservationHost>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -365,6 +370,10 @@ impl HostRegistry {
             || binding.transport.as_ref().is_some_and(|transport| {
                 !transport.matches_registration(&self.runtime, &binding.registration)
             })
+            || binding
+                .ordered_observations
+                .as_ref()
+                .is_some_and(|observations| !observations.matches(&binding.registration))
         {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
@@ -455,6 +464,7 @@ impl HostRegistry {
                 source: binding.source,
                 executor: binding.executor,
                 transport: binding.transport,
+                ordered_observations: binding.ordered_observations,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -716,6 +726,22 @@ impl HostRegistry {
         if let Some(transport) = &transport {
             budget -= transport.units;
         }
+        if !failed
+            && budget != 0
+            && let Some(observations) = &mut machine.ordered_observations
+            && observations.has_indexed()
+        {
+            budget -= 1;
+            match observations.retire_ready(&self.runtime) {
+                Ok(()) => {}
+                Err(ObservationError::Runtime(
+                    ActorTurnError::ActorFailed | ActorTurnError::Closed,
+                )) if self.runtime.snapshot(entry.registration.actor())?.failed => {
+                    // The original failure fence marks this host again.
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         let mut retired = machine
             .source
             .progress_retirement(&self.runtime, turn, now, budget);
@@ -729,6 +755,10 @@ impl HostRegistry {
             retired.more |= transport.more;
             retired.retired &= machine.transport.as_ref().unwrap().is_empty();
         }
+        retired.retired &= machine
+            .ordered_observations
+            .as_ref()
+            .is_none_or(OrderedObservationHost::is_retired);
         if retired.retired
             && matches!(
                 self.runtime
@@ -774,6 +804,7 @@ impl HostRegistry {
             });
         }
         let mut handoff_refused = false;
+        let mut observation_advanced = false;
         if budget != 0 {
             let indexed = original_dispatch!(machine.dispatch.index_committed_with(
                 &self.runtime,
@@ -787,6 +818,10 @@ impl HostRegistry {
             budget -= indexed.units;
             if !indexed.inputs.is_empty() && machine.scan_remaining.is_some() {
                 machine.rescan_requested = true;
+            }
+            if let Some(observations) = &mut machine.ordered_observations {
+                observation_advanced =
+                    observations.index_committed(&self.runtime, &indexed.inputs)?;
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -837,6 +872,25 @@ impl HostRegistry {
                     original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     continue;
                 };
+                if let FrontendEffect::AttemptRootControlProcessed(input) = metadata {
+                    if let Some(ticket) = original_dispatch!(
+                        machine.dispatch.claim_candidate(&self.runtime, &candidate)
+                    ) {
+                        assert_eq!(*input, ticket.input, "original root-control step");
+                        let observations = machine
+                            .ordered_observations
+                            .as_mut()
+                            .ok_or(ObservationError::InvalidRootControl)?;
+                        observations.root_control_processed(ticket.input)?;
+                        self.runtime
+                            .effect_completed(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        observation_advanced = true;
+                    } else {
+                        original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    }
+                    continue;
+                }
                 if let FrontendEffect::Attempt(effect) = metadata
                     && let novarocks_attempt_protocol::effect::EffectBody::Withdraw { effect } =
                         effect.protocol.body
@@ -984,6 +1038,7 @@ impl HostRegistry {
             rescan = std::mem::take(&mut machine.rescan_requested);
         }
         let more = retired.more
+            || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
             || (budget == 0
@@ -1025,6 +1080,7 @@ struct HostProgress {
 enum HostError {
     Runtime(ActorTurnError),
     Dispatch(DispatchError),
+    Observation(ObservationError),
 }
 impl From<ActorTurnError> for HostError {
     fn from(error: ActorTurnError) -> Self {
@@ -1034,6 +1090,12 @@ impl From<ActorTurnError> for HostError {
 impl From<DispatchError> for HostError {
     fn from(error: DispatchError) -> Self {
         Self::Dispatch(error)
+    }
+}
+
+impl From<ObservationError> for HostError {
+    fn from(error: ObservationError) -> Self {
+        Self::Observation(error)
     }
 }
 
@@ -1274,6 +1336,7 @@ mod tests {
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
+                ordered_observations: None,
             })
             .is_ok()
         );
@@ -1651,6 +1714,7 @@ mod tests {
                 }),
                 executor: executor.clone(),
                 transport: None,
+                ordered_observations: None,
             })
             .is_ok()
         );
@@ -1890,6 +1954,7 @@ mod tests {
                     }),
                     executor: Arc::new(NoExecutor),
                     transport: None,
+                    ordered_observations: None,
                 })
                 .is_ok()
         );

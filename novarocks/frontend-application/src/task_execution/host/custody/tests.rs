@@ -974,6 +974,7 @@ async fn publication_host_returns_original_result_and_typed_failure() {
                 handle,
                 1,
             )),
+            ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original publication host"));
     let drive_host = || {
@@ -1408,6 +1409,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
                 handle,
                 1,
             )),
+            ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original QA host registration"));
     let (failure, _residual_port) = PendingFailureBridge::new(
@@ -1884,6 +1886,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             handle,
             1,
         )),
+        ordered_observations: None,
     })
     .unwrap_or_else(|_| panic!("same original host route"));
 

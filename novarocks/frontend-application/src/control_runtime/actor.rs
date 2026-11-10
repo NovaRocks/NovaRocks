@@ -27,7 +27,7 @@ use novarocks_control_runtime::{
 };
 use novarocks_control_runtime_core::{
     effect::EffectKind,
-    identity::{Generation, ScopeId, Tick},
+    identity::{Generation, InputId, ScopeId, Tick},
     mailbox::InputEnvelope,
 };
 use novarocks_coordination_contract::MonotonicClock;
@@ -69,6 +69,7 @@ pub(crate) enum FrontendEffect {
     // a batch's operation list or publication rows.
     Attempt(Arc<AttemptEffectEnvelope>),
     AttemptNotice(Arc<AttemptNotice>),
+    AttemptRootControlProcessed(InputId),
     AttemptOwnerFailed {
         scope: ScopeId,
         generation: Generation,

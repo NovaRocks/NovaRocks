@@ -2293,3 +2293,315 @@ fn closed_confirmation_waits_for_ordered_marker_and_eof_before_retry_settlement(
     );
     f.finish();
 }
+
+#[test]
+fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
+    use crate::control_runtime::{
+        actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput, TestActor},
+        host::{
+            EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding, HostRegistry,
+            PendingHandoff, PreparedEffectJob, SourceProgress,
+        },
+        metrics::FrontendHostObservations,
+    };
+    use crate::task_execution::host::{
+        adapter::descriptor, observations::host_turn::OrderedObservationHost,
+    };
+    use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket, ProcessClock};
+    use novarocks_control_runtime_core::effect::EffectKind;
+
+    struct Core(Arc<Mutex<Vec<&'static str>>>);
+    impl TestActor for Core {
+        fn handle(
+            &mut self,
+            _: Tick,
+            claim: InputEnvelope,
+            input: FrontendInput,
+            step: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            let FrontendInput::Attempt(input) = input else {
+                panic!("original attempt input");
+            };
+            match *input {
+                AttemptInput::Executor(ExecutorFact::Observations(batch)) => {
+                    let mut seen = self.0.lock().unwrap();
+                    for frame in batch.into_items() {
+                        let ObservationEvent::Fact {
+                            fact: ObservationFact::Bookmark { sequence, .. },
+                            ..
+                        } = frame.event
+                        else {
+                            panic!("original bookmark");
+                        };
+                        seen.push(if sequence == 1 { "prefix" } else { "suffix" });
+                    }
+                }
+                AttemptInput::Port(LogicalToAttempt {
+                    body: LogicalToAttemptBody::SealRequest { .. },
+                    ..
+                }) => {
+                    self.0.lock().unwrap().push("first seal decision");
+                    let author = step.input_author().unwrap().clone();
+                    step.effect_from_author(
+                        &author,
+                        descriptor(1, author.work(), EffectKind::Settlement),
+                        FrontendEffect::AttemptRootControlProcessed(claim.input),
+                    )
+                    .unwrap();
+                }
+                _ => panic!("unexpected attempt input"),
+            }
+        }
+    }
+
+    struct Source(bool);
+    impl EffectSource for Source {
+        fn prepay_result(
+            &mut self,
+            _: &FrontendEffect,
+        ) -> Option<CausalInputObligation<FrontendActor>> {
+            panic!("a control processing notice needs no job or result loan");
+        }
+
+        fn bind_job(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: &EffectTicket<FrontendEffect>,
+            _: CausalInputObligation<FrontendActor>,
+        ) -> PreparedEffectJob {
+            unreachable!()
+        }
+
+        fn return_unclaimed_result(&mut self, _: CausalInputObligation<FrontendActor>) {
+            unreachable!()
+        }
+
+        fn core_consumed(&mut self, _: &[InputId]) {}
+
+        fn owner_failed_pending(&mut self, _: PendingHandoff) {
+            unreachable!()
+        }
+
+        fn close_external(&mut self) {
+            self.0 = true;
+        }
+
+        fn result_admission_closed(&self) -> bool {
+            self.0
+        }
+
+        fn progress_retirement(
+            &mut self,
+            _: &ActorRuntime<FrontendActor>,
+            _: &ActorHostTurn<FrontendActor>,
+            _: Tick,
+            _: usize,
+        ) -> SourceProgress {
+            SourceProgress {
+                units: 0,
+                progressed: false,
+                more: false,
+                retired: self.0,
+            }
+        }
+    }
+
+    struct NoJobs;
+    impl EffectExecutor for NoJobs {
+        fn handoff(&self, _: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
+            panic!("ordered observations need no job handoff");
+        }
+    }
+
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let generation = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let runtime = ActorRuntime::new();
+    let source = ActorId::new(2).unwrap();
+    let config = ActorConfig {
+        mailbox: [4; 4],
+        max_batches: 4,
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: 8,
+        max_step_work: 1,
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let registration = runtime
+        .register_bound(
+            actor(),
+            scope.clone(),
+            FrontendActor::Test(Box::new(Core(seen.clone()))),
+            config,
+        )
+        .unwrap_or_else(|_| panic!("original ordered actor"));
+    let budget = ObservationBudget {
+        queued_frames: 3,
+        total_positions: 5,
+        max_frame_bytes: 1024,
+        total_bytes: 4608,
+        control_bytes: 512,
+    };
+    let (mut work, mut reservation) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    work.start().unwrap();
+    let positions = (0..budget.total_positions)
+        .map(|_| {
+            let mut original = reservation.take_position(OwnedSlotKind::Input).unwrap();
+            original.bind().unwrap();
+            original
+        })
+        .collect();
+    let key = key();
+    let query = key.participation.query_execution_id();
+    let binding = RootControlBinding::for_registered_source(
+        registration.clone(),
+        AttemptActivationIdentity::from_parts(1, query, 1),
+        TaskIdentity::new(
+            query,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            key.participation.backend_process_id(),
+        ),
+    )
+    .unwrap();
+    let bank = Bank::make(budget, positions, binding.clone());
+    let standing = |class| {
+        runtime
+            .reserve_admitted_input_for(&registration, source, class, &work)
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    };
+    let ingress = OrderedObservationInput::new(
+        standing(InputClass::Lifecycle),
+        standing(InputClass::Control),
+        bank.clone(),
+        binding,
+        Arc::new(ManualClock::default()),
+        |input| FrontendInput::Attempt(Box::new(input)),
+        Waker::noop().clone(),
+    )
+    .unwrap();
+    let host = HostRegistry::new(
+        runtime.clone(),
+        ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            ProcessClock::default(),
+        ))),
+    );
+    let exit = host
+        .register(HostBinding {
+            scope: scope.clone(),
+            registration: registration.clone(),
+            kind: FrontendActorKind::Test,
+            config,
+            policy: FrontendLanePolicy::attempt(1),
+            source: Box::new(Source(false)),
+            executor: Arc::new(NoJobs),
+            transport: None,
+            ordered_observations: Some(OrderedObservationHost::new(ingress.clone())),
+        })
+        .unwrap_or_else(|_| panic!("original observation host"));
+    let drive = || {
+        let mut turns = 0;
+        while let Some(turn) = runtime.claim_host_actor() {
+            turns += 1;
+            assert!(turns < 16, "ordered host progress must be finite");
+            host.drive(Tick(1), turn);
+        }
+    };
+    ingress.register_stream(key).unwrap();
+    let mut credit = Some(bank.credit(false, Some(key)).unwrap());
+    let mut opened = ready(Ok::<(), ObservationFailure>(()));
+    assert!(matches!(
+        ingress
+            .poll_open(
+                key,
+                &mut credit,
+                Pin::new(&mut opened),
+                &mut Context::from_waker(Waker::noop()),
+            )
+            .unwrap()
+            .result,
+        Poll::Ready(Ok(()))
+    ));
+    drop(credit);
+    let accept = |sequence| {
+        ingress
+            .accept(
+                key,
+                bookmark(key, sequence),
+                32,
+                bank.credit(false, Some(key)).unwrap(),
+            )
+            .unwrap();
+    };
+    accept(1);
+    ingress.root_control(bank.seal()).unwrap();
+    accept(2);
+
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(*seen.lock().unwrap(), ["prefix"]);
+    drive();
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(*seen.lock().unwrap(), ["prefix", "first seal decision"]);
+    let root_input = runtime.committed_batches(actor(), None, 4).unwrap()[0].1;
+    assert!(
+        runtime
+            .input_custody(actor(), root_input)
+            .unwrap()
+            .is_some()
+    );
+    assert!(!runtime.poll_one(Tick(1)).unwrap());
+    drive();
+    assert!(
+        runtime
+            .input_custody(actor(), root_input)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*seen.lock().unwrap(), ["prefix", "first seal decision"]);
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["prefix", "first seal decision", "suffix"]
+    );
+    drive();
+
+    ingress.job_closed(key).unwrap();
+    ingress.retire_stream(key).unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    reservation.finish().unwrap();
+    scope.close_external().unwrap();
+    bank.metadata.lock().unwrap().refuse_once = true;
+    assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+    scope.reap_ready(8).unwrap();
+    assert!(scope.join_ready().unwrap());
+    exit.request_close().unwrap();
+    drive();
+    assert!(!host.is_empty());
+    ingress.close_after_exit().unwrap();
+    bank.retire_positions();
+    scope.reap_ready(8).unwrap();
+    runtime.notify_host_actor(&registration).unwrap();
+    drive();
+    assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+}

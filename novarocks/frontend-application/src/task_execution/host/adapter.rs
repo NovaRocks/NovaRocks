@@ -23,7 +23,7 @@ use super::failure_publication::{FailureContext, FailurePublications};
 use super::failure_supervisor::FailureSupervisor;
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
-    read_progress::ReadProgressInput,
+    host_turn::OrderedObservationHost, read_progress::ReadProgressInput,
 };
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
@@ -105,6 +105,7 @@ pub(crate) struct AttemptActorRegistration {
     failure_publications: Arc<FailurePublications>,
     failure_work: ScopedWorkRef,
     root_control: RootControlBinding,
+    ordered_host: Option<OrderedObservationHost>,
     ordered_bound: bool,
     read_progress_bound: bool,
     startup_reserved: bool,
@@ -249,7 +250,6 @@ impl AttemptCapacitySource {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptNotice {
-    pub(crate) root_control_processed: Option<AttemptInputId>,
     pub(crate) definitely_unsent_abort: Option<TaskOperationId>,
     pub(crate) retired_authorization: Option<TaskOperationId>,
     pub(crate) diagnostic_failure: Option<AttemptFailure>,
@@ -599,6 +599,7 @@ impl AttemptActorRegistration {
                 kind: FrontendActorKind::Attempt,
                 config: self.config,
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
+                ordered_observations: self.ordered_host.take(),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),
                     self.original.clone(),
@@ -776,6 +777,7 @@ impl AttemptActorRegistration {
             error
         })?;
         self.root_control.bind_reply_author(reply_author);
+        self.ordered_host = Some(OrderedObservationHost::new(ingress.clone()));
         self.ordered_bound = true;
         Ok(ingress)
     }
@@ -999,6 +1001,7 @@ impl AttemptActor {
             failure_publications,
             failure_work: failure_work.reference(),
             root_control,
+            ordered_host: None,
             ordered_bound: false,
             read_progress_bound: false,
             startup_reserved: false,
@@ -1088,11 +1091,24 @@ impl AttemptActor {
         );
         if let Some(action) = result.notice_action {
             let notice = AttemptNotice {
-                root_control_processed: result.root_control_processed,
                 definitely_unsent_abort: result.definitely_unsent_abort,
                 retired_authorization: result.retired_authorization,
                 diagnostic_failure: result.diagnostic_failure,
                 round_failure: result.round_result.and_then(Result::err),
+            };
+            let metadata = if let Some(processed) = result.root_control_processed {
+                assert!(
+                    notice.definitely_unsent_abort.is_none()
+                        && notice.retired_authorization.is_none()
+                        && notice.diagnostic_failure.is_none()
+                        && notice.round_failure.is_none(),
+                    "the root-control turn owns only its original processing notice"
+                );
+                FrontendEffect::AttemptRootControlProcessed(
+                    InputId::new(processed.0.get()).expect("original input id"),
+                )
+            } else {
+                FrontendEffect::AttemptNotice(Arc::new(notice))
             };
             let binding = context
                 .binding
@@ -1103,7 +1119,7 @@ impl AttemptActor {
                 .effect_from_author(
                     author,
                     descriptor(action.get(), author.work(), EffectKind::Settlement),
-                    FrontendEffect::AttemptNotice(Arc::new(notice)),
+                    metadata,
                 )
                 .unwrap();
         }

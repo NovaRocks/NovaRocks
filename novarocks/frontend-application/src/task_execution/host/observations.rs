@@ -20,6 +20,7 @@
 //! classes. Rich storage/byte loans stay here until the runtime input retires.
 
 pub(crate) mod credits;
+pub(crate) mod host_turn;
 pub(crate) mod read_progress;
 
 use novarocks_attempt_protocol::{
@@ -586,6 +587,7 @@ struct State<I> {
     failed_control: Option<FailedControlProjection>,
     observations_closed: bool,
     controls_closed: bool,
+    metadata_retired: bool,
     closed: bool,
 }
 struct Inner<A: Actor> {
@@ -697,6 +699,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                 failed_control: None,
                 observations_closed: false,
                 controls_closed: false,
+                metadata_retired: false,
                 closed: false,
             }),
             observations: Mutex::new(observations),
@@ -1629,6 +1632,14 @@ impl<A: Actor> OrderedObservationInput<A> {
             .closed = true;
         self.0.changed.notify_waiters();
     }
+    fn is_retired(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .expect("ordered observation state")
+            .metadata_retired
+    }
+
     /// Call only after original stream/bridge holders actually exited and all
     /// in-flight inputs retired. Refusal preserves every original loan/standing.
     pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
@@ -1746,16 +1757,27 @@ impl<A: Actor> OrderedObservationInput<A> {
             .lock()
             .expect("original observation metadata")
             .take();
-        if let Some(original) = metadata {
-            if let Err(refused) = original.retire_after_exit() {
-                *self
-                    .0
-                    .metadata
-                    .lock()
-                    .expect("original observation metadata") = Some(refused.original);
-                return Err(refused.error);
-            }
+        let Some(original) = metadata else {
+            return if self.is_retired() {
+                Ok(())
+            } else {
+                Err(ObservationError::Busy)
+            };
+        };
+        if let Err(refused) = original.retire_after_exit() {
+            *self
+                .0
+                .metadata
+                .lock()
+                .expect("original observation metadata") = Some(refused.original);
+            return Err(refused.error);
         }
+        self.0
+            .state
+            .lock()
+            .expect("ordered observation state")
+            .metadata_retired = true;
+        self.0.progress.wake_by_ref();
         Ok(())
     }
 }
