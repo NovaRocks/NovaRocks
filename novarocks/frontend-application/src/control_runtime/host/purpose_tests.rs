@@ -937,6 +937,7 @@ impl EffectSource for SupervisorSource {
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         context: Option<FailureContext>,
+        observations: Option<OrderedObservationFailure>,
     ) {
         assert!(context.is_none());
         let FrontendEffect::AttemptOwnerFailed { failed_input, .. } = &ticket.effect else {
@@ -950,7 +951,13 @@ impl EffectSource for SupervisorSource {
                 .is_none()
         );
         let (supervisor, context, port) = self.setup.take().unwrap();
-        self.running = Some(supervisor.start(ticket, context, [self.unresolved].into(), port));
+        self.running = Some(supervisor.start(
+            ticket,
+            context,
+            [self.unresolved].into(),
+            port,
+            observations,
+        ));
     }
 
     fn close_external(&mut self) {}

@@ -32,7 +32,10 @@ use crate::task_execution::host::custody::{
 };
 use crate::task_execution::host::{
     failure_publication::FailureContext,
-    observations::{ObservationError, host_turn::OrderedObservationHost},
+    observations::{
+        ObservationError,
+        host_turn::{OrderedObservationFailure, OrderedObservationHost},
+    },
 };
 use novarocks_control_runtime::{
     actor::ActorConfig,
@@ -150,8 +153,9 @@ pub(crate) trait EffectSource: Send + 'static {
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         context: Option<FailureContext>,
+        observations: Option<OrderedObservationFailure>,
     ) {
-        std::panic::resume_unwind(Box::new((ticket, context)));
+        std::panic::resume_unwind(Box::new((ticket, context, observations)));
     }
     /// Stop new external admission while draining already admitted effects.
     fn close_external(&mut self);
@@ -717,7 +721,13 @@ impl HostRegistry {
                         if let [(descriptor, _)] = effects.as_slice() {
                             let ticket = self.runtime.take_effect(actor, input, descriptor.id)?;
                             self.runtime.validate_failure_effect_ticket(&ticket)?;
-                            machine.source.owner_failed_cleanup(ticket, None);
+                            let observations = machine
+                                .ordered_observations
+                                .as_ref()
+                                .map(OrderedObservationHost::fence_failed);
+                            machine
+                                .source
+                                .owner_failed_cleanup(ticket, None, observations);
                             machine.failure_handed_off = true;
                             handoffs += 1;
                         }

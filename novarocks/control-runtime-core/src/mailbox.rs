@@ -85,6 +85,10 @@ impl MailboxState {
     pub fn tail_from(&self, source: ActorId) -> Option<InputId> {
         self.sources.get(&source)?.back().map(|input| input.input)
     }
+    /// Read this source's current FIFO head without changing its priority.
+    pub fn head_from(&self, source: ActorId) -> Option<InputEnvelope> {
+        self.sources.get(&source)?.front().copied()
+    }
     pub fn has_ready(&self, class: InputClass) -> bool {
         self.heads[class.index()].ready_count() != 0
     }

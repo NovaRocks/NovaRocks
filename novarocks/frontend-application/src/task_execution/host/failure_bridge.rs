@@ -239,6 +239,17 @@ impl FailureBridge {
         {
             return Err(self.retain_failure("Native original root reply delivery failed", error));
         }
+        if let Some(error) = self
+            .residual
+            .as_ref()
+            .and_then(|residual| residual.original.observation_drain.as_ref().err())
+            .copied()
+        {
+            return Err(self.retain_failure(
+                "Native failed observation payload transfer refused",
+                Arc::new(error),
+            ));
+        }
         if !self.valid_residual() {
             return Err(self.retain_failure(
                 "Native failure residual did not prove local transport custody",

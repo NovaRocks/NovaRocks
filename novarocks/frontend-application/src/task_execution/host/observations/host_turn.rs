@@ -23,7 +23,7 @@ use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorRuntime, ActorTurnError, StandingInputId,
 };
 use novarocks_control_runtime_core::identity::InputId;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(crate) struct OrderedObservationHost {
     ingress: OrderedObservationInput<FrontendActor>,
@@ -32,6 +32,38 @@ pub(crate) struct OrderedObservationHost {
     indexed: Option<IndexedObservation>,
     progress_roles: BTreeMap<StandingInputId, ReadProgressInput>,
     indexed_progress: VecDeque<(StandingInputId, InputId)>,
+}
+
+/// Moves actual failed observation payloads into the existing credentialed
+/// supervisor without carrying any authority to publish or settle Core facts.
+pub(crate) struct OrderedObservationFailure {
+    ingress: OrderedObservationInput<FrontendActor>,
+    roles: BTreeSet<StandingInputId>,
+    ordered: [StandingInputId; 2],
+}
+
+impl OrderedObservationFailure {
+    pub(crate) fn dispose_queued(
+        self,
+        runtime: &ActorRuntime<FrontendActor>,
+    ) -> Result<(), ObservationError> {
+        let actor = self.ingress.root_binding().registration().actor();
+        while let Some(original) = self
+            .ingress
+            .take_failed_source_payload(&self.roles)
+            .map_err(ObservationError::Runtime)?
+        {
+            let role = original.standing_id();
+            let input = original.dispose().map_err(ObservationError::Runtime)?;
+            if self.ordered.contains(&role) {
+                runtime
+                    .retire_input(actor, input)
+                    .map_err(ObservationError::Runtime)?;
+                self.ingress.failed_input_retired(input)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct IndexedObservation {
@@ -193,6 +225,19 @@ impl OrderedObservationHost {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn fence_failed(&self) -> OrderedObservationFailure {
+        self.ingress.fence_failed_writer();
+        OrderedObservationFailure {
+            ingress: self.ingress.clone(),
+            ordered: self.roles,
+            roles: self
+                .roles
+                .into_iter()
+                .chain(self.progress_roles.keys().copied())
+                .collect(),
+        }
     }
 
     pub(crate) fn is_retired(&self) -> bool {

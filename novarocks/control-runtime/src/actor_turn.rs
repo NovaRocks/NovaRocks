@@ -388,6 +388,7 @@ pub enum InputPhase {
     Consuming,
     Committed,
     AbandonedByOwnerFailure,
+    DisposingByOwnerFailure,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputCustody {
@@ -1212,6 +1213,54 @@ pub struct StandingInputObligation<A: Actor> {
     standing_input_id: StandingInputId,
     active: bool,
 }
+/// The failed Source's original queued payload. Only explicit disposal
+/// makes its input eligible for retirement. An unconsumed carrier retains
+/// unresolved custody and must never drop rich input on the host poller.
+#[must_use = "Dispose the original payload off the host poller"]
+pub struct FailedSourcePayload<A: Actor> {
+    runtime: ActorRuntime<A>,
+    node: Arc<ActorCell<A>>,
+    input: InputId,
+    standing: StandingInputId,
+    value: ManuallyDrop<A::Input>,
+}
+
+impl<A: Actor> FailedSourcePayload<A> {
+    pub fn standing_id(&self) -> StandingInputId {
+        self.standing
+    }
+
+    /// A destructor panic preserves the original runtime input as unresolved.
+    pub fn dispose(self) -> Result<InputId, ActorTurnError> {
+        drop(ManuallyDrop::into_inner(self.value));
+        let mut inbox = self.node.inbox.lock().expect("failed payload inbox lock");
+        let record = inbox
+            .inputs
+            .get_mut(&self.input)
+            .ok_or(ActorTurnError::UnknownInput)?;
+        assert_eq!(record.phase, InputPhase::DisposingByOwnerFailure);
+        record.phase = InputPhase::AbandonedByOwnerFailure;
+        self.runtime.resolve_metadata_delivery(
+            &inbox,
+            self.input,
+            MetadataConsumption::AbandonedByOwnerFailure,
+        );
+        self.runtime.shared.record(|| HistoryFact::InputAbandoned {
+            target: self.node.history_target(),
+            input: self.input,
+        });
+        drop(inbox);
+        let registration = ActorRegistration {
+            actor: self.node.id,
+            attachment: self.node.attachment,
+            scope: self.node.scope.clone(),
+            origin: self.node.origin.clone(),
+        };
+        let _ = self.runtime.notify_host_actor(&registration);
+        Ok(self.input)
+    }
+}
+
 impl<A: Actor> std::fmt::Debug for StandingInputObligation<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StandingInputObligation")
@@ -1285,6 +1334,51 @@ impl<A: Actor> StandingInputObligation<A> {
             Err(error) => Err(error),
         }
     }
+    /// Move only a permitted standing role at this original Source's FIFO
+    /// head. The failure custodian may not take another Source's payload or
+    /// jump past an earlier occurrence of a different role.
+    pub fn take_failed_source_payload(
+        &self,
+        roles: &std::collections::BTreeSet<StandingInputId>,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        let node = self.original_node()?;
+        let mut inbox = node.inbox.lock().expect("failed Source inbox lock");
+        if !inbox.failed {
+            return Err(ActorTurnError::ActorNotRetired);
+        }
+        let source = inbox
+            .standing_inputs
+            .get(&self.standing_input_id)
+            .ok_or(ActorTurnError::UnknownStandingInput)?
+            .source;
+        let Some(head) = inbox.mailbox.head_from(source) else {
+            return Ok(None);
+        };
+        let original = inbox
+            .inputs
+            .get(&head.input)
+            .expect("original failed Source head");
+        let standing = original
+            .standing_input_id
+            .filter(|id| roles.contains(id))
+            .ok_or(ActorTurnError::InputAuthorMismatch)?;
+        assert_eq!(original.phase, InputPhase::Filled);
+        assert_eq!(inbox.mailbox.pop_from(head.class, source), Some(head));
+        inbox.inputs.get_mut(&head.input).unwrap().phase = InputPhase::DisposingByOwnerFailure;
+        let value = inbox
+            .payloads
+            .remove(&head.input)
+            .expect("original failed Source payload");
+        drop(inbox);
+        Ok(Some(FailedSourcePayload {
+            runtime: self.runtime.clone(),
+            node,
+            input: head.input,
+            standing,
+            value: ManuallyDrop::new(value),
+        }))
+    }
+
     /// Fills only an idle, already paid position, including during process drain.
     /// Every occurrence receives a fresh monotonic InputId; a prior effect ticket
     /// can never identify this new batch. Error returns the original neutral value.
@@ -5158,7 +5252,10 @@ impl<A: Actor> ActorRuntime<A> {
             .inputs
             .get_mut(&input)
             .ok_or(ActorTurnError::UnknownInput)?;
-        if record.phase == InputPhase::Filled {
+        if matches!(
+            record.phase,
+            InputPhase::Filled | InputPhase::DisposingByOwnerFailure
+        ) {
             return Err(ActorTurnError::InputStillQueued);
         }
         if record.phase == InputPhase::Committed {

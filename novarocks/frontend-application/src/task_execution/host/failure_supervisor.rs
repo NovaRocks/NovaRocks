@@ -17,7 +17,10 @@
 
 //! The original cleanup carrier, separate from normal attempt dispatch.
 
-use super::failure_publication::FailureContext;
+use super::{
+    failure_publication::FailureContext,
+    observations::{ObservationError, host_turn::OrderedObservationFailure},
+};
 use crate::control_runtime::actor::{FrontendActor, FrontendEffect};
 use novarocks_control_runtime::{
     actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket},
@@ -50,6 +53,7 @@ pub(crate) struct FailureCleanupRequest {
     pub(crate) core_panic: PanicPayload,
     pub(crate) publication: Result<(), ActorTurnError>,
     pub(crate) root_reply: Result<(), Arc<super::publication::PublicationError>>,
+    pub(crate) observation_drain: Result<(), ObservationError>,
     pub(crate) unknown_participations: Box<[ParticipationRef]>,
 }
 
@@ -136,6 +140,7 @@ impl FailureSupervisor {
         context: FailureContext,
         unresolved_actions: BTreeSet<AttemptActionId>,
         mut port: Box<dyn FailureCleanupPort>,
+        observations: Option<OrderedObservationFailure>,
     ) -> RunningFailureSupervisor {
         assert_eq!(ticket.actor, self.registration.actor());
         assert_eq!(ticket.descriptor.work, self.original.work().reference());
@@ -156,6 +161,8 @@ impl FailureSupervisor {
                 .deliver_committed_root_after_failure()
                 .await
                 .map_err(Arc::new);
+            let observation_drain =
+                observations.map_or(Ok(()), |original| original.dispose_queued(&runtime));
             let aborts = context.lifecycle.started_aborts().await;
             for &request in &aborts {
                 port.abort_once(request).await;
@@ -174,6 +181,7 @@ impl FailureSupervisor {
                 core_panic,
                 publication,
                 root_reply,
+                observation_drain,
                 unknown_participations,
             })
             .await;

@@ -746,6 +746,9 @@ impl EffectSource for AttemptTransportSource {
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
         context: Option<FailureContext>,
+        observations: Option<
+            crate::task_execution::host::observations::host_turn::OrderedObservationFailure,
+        >,
     ) {
         assert!(context.is_none());
         let original = self.failure.take().expect("one original failure lifecycle");
@@ -757,11 +760,12 @@ impl EffectSource for AttemptTransportSource {
                     original,
                     std::mem::take(&mut self.in_flight),
                     binding.port,
+                    observations,
                 )));
             }
-            None => std::panic::resume_unwind(Box::new((ticket, original))),
+            None => std::panic::resume_unwind(Box::new((ticket, original, observations))),
             Some(Supervisor::Running(running)) => {
-                std::panic::resume_unwind(Box::new((ticket, original, running)))
+                std::panic::resume_unwind(Box::new((ticket, original, running, observations)))
             }
         }
     }

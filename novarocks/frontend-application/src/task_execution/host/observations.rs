@@ -34,7 +34,10 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::{
     actor::Actor,
-    actor_turn::{ActorRegistration, ActorTurnError, InputAuthor, StandingInputObligation},
+    actor_turn::{
+        ActorRegistration, ActorTurnError, FailedSourcePayload, InputAuthor, StandingInputId,
+        StandingInputObligation,
+    },
     causal_input::{CausalFillFailure, CausalInputObligation},
     obligation::OwnedPositionObligation,
 };
@@ -46,7 +49,7 @@ use novarocks_coordination_contract::{
 use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
 use std::alloc::Layout;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroU64,
     sync::{Arc, Mutex, OnceLock, Weak},
     task::{Context, Poll, Waker},
@@ -227,6 +230,14 @@ pub(crate) enum ObservationError {
     Oversized { charged: usize, reserved: usize },
     Runtime(ActorTurnError),
 }
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "observation source refused: {self:?}")
+    }
+}
+
+impl std::error::Error for ObservationError {}
 
 /// A real bound Input pool slot is lent to a read/queued/applying object. Its
 /// Drop returns that SAME obligation to the original Source pool; it never
@@ -559,16 +570,30 @@ struct InFlight {
     control: bool,
     processed: bool,
     retired: bool,
+    abandoned: bool,
     // The payload has moved into the real runtime input. These same original
     // loans remain counted until its actual input retirement is acknowledged.
     _credits: Vec<ObservationCredit>,
     streams: Vec<StreamKey>,
 }
+impl InFlight {
+    fn finished(&self) -> bool {
+        self.retired && (!self.control || self.processed || self.abandoned)
+    }
+}
+
+enum RuntimeObservationReceipt {
+    RootProcessed,
+    Retired,
+    AbandonedAndRetired,
+}
+
 #[derive(Default)]
 struct EarlyConsumption {
     input: Option<InputId>,
     processed: bool,
     retired: bool,
+    abandoned: bool,
 }
 struct FailedFill<I> {
     _value: I,
@@ -1357,14 +1382,24 @@ impl<A: Actor> OrderedObservationInput<A> {
         }
     }
     pub(crate) fn root_control_processed(&self, input: InputId) -> Result<(), ObservationError> {
-        self.consumed(input, true)
+        self.consumed(input, RuntimeObservationReceipt::RootProcessed)
     }
     /// Only the actual runtime retire receipt may call this hook. A control
     /// still waits for its first COMPLETE core processing, not its final reply.
     pub(crate) fn input_retired(&self, input: InputId) -> Result<(), ObservationError> {
-        self.consumed(input, false)
+        self.consumed(input, RuntimeObservationReceipt::Retired)
     }
-    fn consumed(&self, input: InputId, processed: bool) -> Result<(), ObservationError> {
+    fn failed_input_retired(&self, input: InputId) -> Result<(), ObservationError> {
+        self.consumed(input, RuntimeObservationReceipt::AbandonedAndRetired)
+    }
+
+    fn consumed(
+        &self,
+        input: InputId,
+        receipt: RuntimeObservationReceipt,
+    ) -> Result<(), ObservationError> {
+        let processed = matches!(receipt, RuntimeObservationReceipt::RootProcessed);
+        let abandoned = matches!(receipt, RuntimeObservationReceipt::AbandonedAndRetired);
         {
             let mut state = self.0.state.lock().expect("ordered observation state");
             if let Some(flight) = state
@@ -1379,6 +1414,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                     flight.processed = true;
                 } else {
                     flight.retired = true;
+                    flight.abandoned |= abandoned;
                 }
             } else if state.writer_busy {
                 // A synchronous runtime notification may finish the real input
@@ -1391,6 +1427,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                     state.early.processed = true;
                 } else {
                     state.early.retired = true;
+                    state.early.abandoned |= abandoned;
                 }
             } else {
                 return Err(ObservationError::Busy);
@@ -1401,11 +1438,7 @@ impl<A: Actor> OrderedObservationInput<A> {
     fn release_if_finished(&self) -> Result<(), ObservationError> {
         let done = {
             let mut state = self.0.state.lock().expect("ordered observation state");
-            if state
-                .in_flight
-                .as_ref()
-                .is_some_and(|v| v.retired && (!v.control || v.processed))
-            {
+            if state.in_flight.as_ref().is_some_and(InFlight::finished) {
                 let done = state.in_flight.take().expect("finished original input");
                 Some(done)
             } else {
@@ -1581,6 +1614,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                             control,
                             processed: !control || early.processed,
                             retired: early.retired,
+                            abandoned: early.abandoned,
                             _credits: credits,
                             streams,
                         });
@@ -1604,11 +1638,7 @@ impl<A: Actor> OrderedObservationInput<A> {
             }
             let done = {
                 let mut state = self.0.state.lock().expect("ordered observation state");
-                if state
-                    .in_flight
-                    .as_ref()
-                    .is_some_and(|v| v.retired && (!v.control || v.processed))
-                {
+                if state.in_flight.as_ref().is_some_and(InFlight::finished) {
                     let done = state
                         .in_flight
                         .take()
@@ -1642,6 +1672,26 @@ impl<A: Actor> OrderedObservationInput<A> {
             .lock()
             .expect("ordered observation state")
             .metadata_retired
+    }
+
+    fn fence_failed_writer(&self) {
+        self.0
+            .state
+            .lock()
+            .expect("ordered observation state")
+            .closed = true;
+        self.0.changed.notify_waiters();
+    }
+
+    fn take_failed_source_payload(
+        &self,
+        roles: &BTreeSet<StandingInputId>,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.0
+            .observations
+            .lock()
+            .expect("ordered observation position")
+            .take_failed_source_payload(roles)
     }
 
     pub(crate) fn notify_source_progress(&self) {

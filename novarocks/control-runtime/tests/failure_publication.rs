@@ -135,6 +135,13 @@ struct Fixture {
     initial: Option<EffectTicket<u64>>,
 }
 fn fixture(start_cleanup: bool) -> Fixture {
+    fixture_with_before_failure(start_cleanup, |_, _| ()).0
+}
+
+fn fixture_with_before_failure<T>(
+    start_cleanup: bool,
+    before_failure: impl FnOnce(&ActorRuntime<FailingActor>, &WorkObligation) -> T,
+) -> (Fixture, T) {
     let history = HistoryCapture::new(256);
     let ledger = RuntimeLedger::with_history(vector(2), history.clone());
     let scope = ledger.open_scope_next(None, generation()).unwrap();
@@ -208,27 +215,31 @@ fn fixture(start_cleanup: bool) -> Fixture {
         .unwrap()
         .fill(77)
         .unwrap();
+    let original = before_failure(&runtime, &business);
     runtime.poll_one(Tick(2)).unwrap();
     let initial = runtime
         .take_effect(aid(), supervisor_input(&runtime), action(17))
         .unwrap();
-    Fixture {
-        ledger,
-        scope,
-        runtime,
-        history,
-        committed,
-        business,
-        business_capacity,
-        cleanup,
-        cleanup_capacity,
-        first,
-        failed,
-        reserved,
-        queued,
-        old: Some(old),
-        initial: Some(initial),
-    }
+    (
+        Fixture {
+            ledger,
+            scope,
+            runtime,
+            history,
+            committed,
+            business,
+            business_capacity,
+            cleanup,
+            cleanup_capacity,
+            first,
+            failed,
+            reserved,
+            queued,
+            old: Some(old),
+            initial: Some(initial),
+        },
+        original,
+    )
 }
 fn drain_neutral_inputs(f: &Fixture) {
     f.runtime.abandon_failed_input(aid(), f.reserved).unwrap();
@@ -730,4 +741,72 @@ fn failed_input_is_abandoned_once_and_waits_for_its_failure_batch_to_retire() {
         |entry| matches!(entry.fact, HistoryFact::InputConsumed { input, .. } if input == f.first)
     ));
     drain(f);
+}
+
+#[test]
+fn failed_source_moves_only_its_exact_fifo_head_and_pins_it_through_disposal() {
+    let (fixture, (mut first, first_id, mut second, second_id)) =
+        fixture_with_before_failure(true, |runtime, work| {
+            let source = ActorId::new(2).unwrap();
+            let standing = || {
+                runtime
+                    .reserve_admitted_input(aid(), source, InputClass::Ordinary, work)
+                    .unwrap()
+                    .into_standing_input()
+                    .unwrap()
+            };
+            let first = standing();
+            let second = standing();
+            let first_id = first.fill(201).unwrap();
+            let second_id = second.fill(202).unwrap();
+            (first, first_id, second, second_id)
+        });
+    let runtime = &fixture.runtime;
+    assert!(matches!(
+        second.take_failed_source_payload(&[second.id()].into()),
+        Err(ActorTurnError::InputAuthorMismatch)
+    ));
+    assert_eq!(
+        runtime
+            .input_custody(aid(), first_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        InputPhase::Filled
+    );
+    let roles = [first.id(), second.id()].into();
+    for (expected, role) in [(first_id, first.id()), (second_id, second.id())] {
+        let original = first.take_failed_source_payload(&roles).unwrap().unwrap();
+        assert_eq!(original.standing_id(), role);
+        assert_eq!(
+            runtime
+                .input_custody(aid(), expected)
+                .unwrap()
+                .unwrap()
+                .phase,
+            InputPhase::DisposingByOwnerFailure
+        );
+        assert_eq!(
+            runtime.retire_input(aid(), expected),
+            Err(ActorTurnError::InputStillQueued)
+        );
+        assert_eq!(
+            runtime.abandon_failed_input(aid(), expected),
+            Err(ActorTurnError::InputStillQueued)
+        );
+        assert_eq!(original.dispose().unwrap(), expected);
+        runtime.retire_input(aid(), expected).unwrap();
+    }
+    assert!(first.take_failed_source_payload(&roles).unwrap().is_none());
+    assert_eq!(
+        runtime
+            .input_custody(aid(), fixture.queued)
+            .unwrap()
+            .unwrap()
+            .phase,
+        InputPhase::Filled
+    );
+    first.close_after_exit().unwrap();
+    second.close_after_exit().unwrap();
+    drain(fixture);
 }
