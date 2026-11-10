@@ -221,19 +221,25 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                 adapter::descriptor,
                 failure_publication::FailurePublications,
                 observations::{
-                    ObservationBudget, OrderedObservationInput, RootControlBinding,
-                    tests::{Bank, ManualClock},
+                    MetadataRetirementRefusal, ObservationBudget, ObservationError,
+                    ObservationMetadataLayout, ObservationMetadataObligation,
+                    OrderedObservationInput, RootControlBinding, StreamKey,
+                    credits::ObservationCredits,
+                    read_progress::ReadProgressInput,
+                    source::{BoundObservationSource, ObservationMetadataAuthor},
+                    tests::ManualClock,
                 },
             },
         },
     };
     use novarocks_attempt_protocol::{
         effect::{AttemptEffect, EffectBody, EffectClass},
-        input::AttemptInput,
+        input::{AttemptInput, ExecutorFact},
     };
     use novarocks_control_runtime::{
         actor::{ActorConfig, ActorStep},
         actor_turn::ActorRuntime,
+        obligation::OwnedPositionObligation,
         transaction::RuntimeLedger,
     };
     use novarocks_control_runtime_core::{
@@ -247,8 +253,45 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
     };
+    use novarocks_execution_contract::ParticipationRef;
     use novarocks_query_application::coordination::accepted_root_status_projection_with_control_port;
-    use std::{num::NonZeroU64, task::Waker};
+    use novarocks_types::FrontendProcessId;
+    use std::{num::NonZeroU64, sync::Mutex, task::Waker};
+
+    // The test supplies a real Capture obligation as the fixture's original
+    // metadata backing. It deliberately refuses its first retirement.
+    struct FixtureMetadata(Mutex<Option<OwnedPositionObligation>>);
+    struct FixtureBacking {
+        capture: Option<OwnedPositionObligation>,
+        refused: bool,
+    }
+    impl ObservationMetadataAuthor for FixtureMetadata {
+        fn retain(
+            &self,
+            required: ObservationMetadataLayout,
+            participants: usize,
+        ) -> Result<Box<dyn ObservationMetadataObligation>, ObservationError> {
+            assert_eq!(required.total_positions, 3);
+            assert_eq!(participants, 1);
+            Ok(Box::new(FixtureBacking {
+                capture: self.0.lock().unwrap().take(),
+                refused: false,
+            }))
+        }
+    }
+    impl ObservationMetadataObligation for FixtureBacking {
+        fn retire_after_exit(mut self: Box<Self>) -> Result<(), MetadataRetirementRefusal> {
+            if !self.refused {
+                self.refused = true;
+                return Err(MetadataRetirementRefusal {
+                    error: ObservationError::Busy,
+                    original: self,
+                });
+            }
+            self.capture.take().unwrap().retire_after_exit().unwrap();
+            Ok(())
+        }
+    }
 
     struct ReplyActor;
     impl TestActor for ReplyActor {
@@ -262,6 +305,12 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             let FrontendInput::Attempt(input) = value else {
                 panic!("original root input")
             };
+            if matches!(
+                *input,
+                AttemptInput::Executor(ExecutorFact::ReadProgress(_))
+            ) {
+                return;
+            }
             let AttemptInput::Port(port) = *input else {
                 panic!("original root port")
             };
@@ -317,6 +366,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                 OwnedSlotNeed {
                     work_headers: 1,
                     inputs: budget.total_positions,
+                    captures: 1,
                     ..Default::default()
                 },
             ),
@@ -366,18 +416,15 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         &scope,
     ));
     let requests = RootControlRequests::new(binding.clone(), failure);
-    let pool = Bank::make(
-        budget,
-        (0..budget.total_positions)
-            .map(|_| {
-                let mut slot = positions.take_position(OwnedSlotKind::Input).unwrap();
-                slot.bind().unwrap();
-                slot
-            })
-            .collect(),
-        binding.clone(),
+    let participant = ParticipationRef::new(
+        root.query_execution_id(),
+        FrontendProcessId::new_v7(),
+        root.backend_process_id(),
     );
-    pool.bind_root_requests(requests.clone());
+    let credits =
+        ObservationCredits::bind(budget, [participant], &observations, &mut positions).unwrap();
+    let mut capture = positions.take_position(OwnedSlotKind::Capture).unwrap();
+    capture.bind().unwrap();
     let reserve = |class, work| {
         runtime
             .reserve_admitted_input_for(&registration, source, class, work)
@@ -385,6 +432,18 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             .into_standing_input()
             .unwrap()
     };
+    let progress = ReadProgressInput::new(
+        &registration,
+        participant,
+        reserve(InputClass::Ordinary, &observations),
+    );
+    let pool = BoundObservationSource::new(
+        binding.clone(),
+        requests.clone(),
+        credits,
+        [(participant, progress.clone())].into(),
+        Arc::new(FixtureMetadata(Mutex::new(Some(capture)))),
+    );
     let control_position = reserve(InputClass::Control, &control);
     binding.bind_reply_author(control_position.author().unwrap());
     let ingress = OrderedObservationInput::new(
@@ -398,6 +457,39 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     )
     .unwrap_or_else(|_| panic!("original ordered root Source"));
     requests.bind_ingress(&ingress);
+    let key = StreamKey {
+        participation: participant,
+        generation: NonZeroU64::MIN,
+    };
+    let foreign = StreamKey {
+        participation: ParticipationRef::new(
+            root.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            root.backend_process_id(),
+        ),
+        ..key
+    };
+    assert_eq!(
+        ingress.register_stream(foreign),
+        Err(ObservationError::UnknownStream)
+    );
+    ingress.register_stream(key).unwrap();
+    assert_eq!(
+        ingress.register_stream(key),
+        Err(ObservationError::GenerationAlreadyRegistered)
+    );
+    let original_read = ingress.reserve_read(key).await.unwrap();
+    ingress.job_closed(key).unwrap();
+    assert_eq!(ingress.retire_stream(key), Err(ObservationError::Busy));
+    drop(original_read);
+    assert_eq!(ingress.retire_stream(key), Err(ObservationError::Busy));
+    assert!(runtime.poll_one(Tick(1)).unwrap());
+    assert!(progress.retire_ready().unwrap());
+    ingress.retire_stream(key).unwrap();
+    assert_eq!(
+        ingress.retire_stream(key),
+        Err(ObservationError::UnknownStream)
+    );
     let (sender, status) =
         accepted_root_status_projection_with_control_port(root, requests.clone());
     sender
@@ -459,8 +551,12 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         publication.root.is_none(),
         "success moved the original publisher"
     );
+    let original_storage = scope.snapshot().unwrap().storage;
+    assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+    let before_metadata = scope.snapshot().unwrap().storage;
+    assert!(before_metadata < original_storage);
     ingress.close_after_exit().unwrap();
-    pool.retire_positions();
+    assert_eq!(scope.snapshot().unwrap().storage + 1, before_metadata);
     for (work, payer, owner) in [
         (&mut observations, &mut positions, &scope),
         (&mut control, &mut control_payer, &bridge),

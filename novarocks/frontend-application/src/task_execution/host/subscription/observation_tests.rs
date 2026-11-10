@@ -180,8 +180,6 @@ pub(in crate::task_execution::host) struct Bank {
     original: Weak<Bank>,
     on_return: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     binding: RootControlBinding,
-    root_requests:
-        std::sync::OnceLock<Arc<crate::task_execution::bridge::root_control::RootControlRequests>>,
     canonical: Mutex<BTreeMap<AttemptRequestToken, LogicalToAttempt<AttemptFailure>>>,
     projections: Mutex<usize>,
     metadata: Mutex<TestMetadataRecord>,
@@ -202,7 +200,6 @@ impl Bank {
             original: weak.clone(),
             on_return: Mutex::new(None),
             binding,
-            root_requests: std::sync::OnceLock::new(),
             canonical: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(0),
             metadata: Mutex::new(TestMetadataRecord::default()),
@@ -220,13 +217,6 @@ impl Bank {
                 claims: BTreeMap::new(),
             }),
         })
-    }
-
-    pub(in crate::task_execution::host) fn bind_root_requests(
-        &self,
-        owner: Arc<crate::task_execution::bridge::root_control::RootControlRequests>,
-    ) {
-        assert!(self.root_requests.set(owner).is_ok());
     }
 
     pub(in crate::task_execution::host) fn refuse_metadata_once(&self) {
@@ -433,13 +423,18 @@ impl ObservationSourcePool for Bank {
             retired: false,
         }))
     }
+    fn register_stream(&self, _: StreamKey) -> Result<(), ObservationError> {
+        Ok(())
+    }
+    fn retire_stream(&self, key: StreamKey) -> Result<(), ObservationError> {
+        self.stream_claims_exited(key)
+            .then_some(())
+            .ok_or(ObservationError::Busy)
+    }
     fn project_root_control(
         &self,
         reference: &RootControlRef,
     ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
-        if let Some(root) = self.root_requests.get() {
-            return root.project(reference);
-        }
         if !reference.belongs_to(&self.binding) {
             return Err(ObservationError::InvalidRootControl);
         }
@@ -503,10 +498,6 @@ impl ObservationSourcePool for Bank {
         &self,
         reference: &RootControlRef,
     ) -> Result<ObservationCredit, ObservationError> {
-        if let Some(root) = self.root_requests.get() {
-            root.project(reference)?;
-            return self.credit(true, None).ok_or(ObservationError::Busy);
-        }
         if !reference.belongs_to(&self.binding)
             || !self
                 .canonical

@@ -22,6 +22,7 @@
 pub(crate) mod credits;
 pub(crate) mod host_turn;
 pub(crate) mod read_progress;
+pub(crate) mod source;
 
 use novarocks_attempt_protocol::{
     failure::AttemptFailure,
@@ -326,6 +327,10 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
         &self,
         required: ObservationMetadataLayout,
     ) -> Result<Box<dyn ObservationMetadataObligation>, ObservationError>;
+    /// These two metadata-only operations run under the writer's stream
+    /// registration lock. They must never notify or drop publisher captures.
+    fn register_stream(&self, key: StreamKey) -> Result<(), ObservationError>;
+    fn retire_stream(&self, key: StreamKey) -> Result<(), ObservationError>;
     /// Validate the original live canonical row and source origin, then project
     /// using its fixed activation/root. Called only by the unique fill writer,
     /// with the original metadata obligation still held. The canonical owner
@@ -758,18 +763,13 @@ impl<A: Actor> OrderedObservationInput<A> {
             return Err(ObservationError::GenerationAlreadyRegistered);
         }
         let at = self.0.clock.now();
+        self.0.source.register_stream(key)?;
         state.streams.insert(key, ReadState::new(at));
         Ok(at)
     }
     /// Called only after the original generation job/confirmations and all
     /// held read objects have actually exited. It never substitutes for join.
     pub(crate) fn retire_stream(&self, key: StreamKey) -> Result<(), ObservationError> {
-        // The caller has independently proved the original generation job has
-        // exited, so no new read may start. Query the real pool outside this
-        // owner lock; a preread claim can outlive a positively exited async F.
-        if !self.0.source.stream_claims_exited(key) {
-            return Err(ObservationError::Busy);
-        }
         let mut state = self.0.state.lock().expect("ordered observation state");
         let stream = state
             .streams
@@ -779,6 +779,7 @@ impl<A: Actor> OrderedObservationInput<A> {
             EntryValue::Observation(v) if v.participation == key.participation && v.generation == key.generation)) {
             return Err(ObservationError::Busy);
         }
+        self.0.source.retire_stream(key)?;
         state.streams.remove(&key);
         Ok(())
     }

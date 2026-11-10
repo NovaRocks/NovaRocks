@@ -22,8 +22,12 @@ use super::failure_lifecycle::FailureLifecycle;
 use super::failure_publication::{FailureContext, FailurePublications};
 use super::failure_supervisor::FailureSupervisor;
 use super::observations::{
-    ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
-    host_turn::OrderedObservationHost, read_progress::ReadProgressInput,
+    ObservationBudget, ObservationError, ObservationSourcePool, OrderedObservationInput,
+    RootControlBinding,
+    credits::ObservationCredits,
+    host_turn::OrderedObservationHost,
+    read_progress::ReadProgressInput,
+    source::{BoundObservationSource, ObservationMetadataAuthor},
 };
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
@@ -36,7 +40,10 @@ use crate::{
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
     },
-    task_execution::{bridge::control::AttemptOwnerControls, host::custody::TransportRetirements},
+    task_execution::{
+        bridge::{control::AttemptOwnerControls, root_control::RootControlRequests},
+        host::custody::TransportRetirements,
+    },
 };
 use novarocks_attempt_protocol::{
     AttemptCore, Core, InputSelection,
@@ -112,6 +119,12 @@ pub(crate) struct AttemptActorRegistration {
     abort_bound: bool,
     config: ActorConfig,
     binding: Arc<OnceLock<AttemptBinding>>,
+}
+
+pub(crate) struct ObservationSourceBacking<'a> {
+    pub(crate) work: &'a WorkObligation,
+    pub(crate) positions: &'a mut ReservationObligation,
+    pub(crate) metadata: Arc<dyn ObservationMetadataAuthor>,
 }
 
 pub(crate) struct AttemptEffectAuthors {
@@ -719,6 +732,70 @@ impl AttemptActorRegistration {
         }
         self.read_progress_roles = Some(roles.values().cloned().collect());
         Ok(roles)
+    }
+
+    /// Assemble the attempt's real credits, stream publishers, and canonical
+    /// QA request owner before the shared writer is published.
+    pub(crate) fn bind_observation_source(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        backing: ObservationSourceBacking<'_>,
+        root_control_work: &WorkObligation,
+        requests: &Arc<RootControlRequests>,
+        clock: Arc<dyn MonotonicClock>,
+        progress: Waker,
+    ) -> Result<OrderedObservationInput<FrontendActor>, ObservationError> {
+        if self.ordered_bound || self.read_progress_roles.is_some() {
+            return Err(ObservationError::Busy);
+        }
+        if !requests.matches(&self.root_control) || self.scope.same_scope(root_control_work.scope())
+        {
+            return Err(ObservationError::InvalidRootControl);
+        }
+        let roles = self.bind_read_progress(runtime, backing.work)?;
+        let credits = match ObservationCredits::bind(
+            ObservationBudget::for_task_attempt(),
+            roles.keys().copied(),
+            backing.work,
+            backing.positions,
+        ) {
+            Ok(credits) => credits,
+            Err(error) => {
+                self.read_progress_roles = None;
+                for role in roles.values() {
+                    role.close_after_exit()
+                        .expect("unpublished read progress role");
+                }
+                return Err(error);
+            }
+        };
+        let source = BoundObservationSource::new(
+            self.root_control.clone(),
+            requests.clone(),
+            credits,
+            roles,
+            backing.metadata,
+        );
+        match self.bind_observations(
+            runtime,
+            backing.work,
+            root_control_work,
+            source.clone(),
+            clock,
+            progress,
+        ) {
+            Ok(ingress) => {
+                requests.bind_ingress(&ingress);
+                Ok(ingress)
+            }
+            Err(error) => {
+                self.read_progress_roles = None;
+                source
+                    .retire_unpublished()
+                    .expect("unpublished observation Source");
+                Err(error)
+            }
+        }
     }
 
     /// One original writer owns both mailbox classes for this registration.

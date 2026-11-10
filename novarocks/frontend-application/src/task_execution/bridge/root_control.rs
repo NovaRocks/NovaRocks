@@ -164,10 +164,18 @@ impl RootControlRequests {
         Ok(self.binding.reference(token))
     }
 
-    pub(crate) fn project(
+    pub(crate) fn validate_reference(
         &self,
         reference: &RootControlRef,
-    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
+    ) -> Result<(), ObservationError> {
+        self.with_request(reference, |_| ())
+    }
+
+    fn with_request<T>(
+        &self,
+        reference: &RootControlRef,
+        visit: impl FnOnce(&Request) -> T,
+    ) -> Result<T, ObservationError> {
         if !reference.belongs_to(&self.binding) {
             return Err(ObservationError::InvalidRootControl);
         }
@@ -177,7 +185,14 @@ impl RootControlRequests {
             .as_ref()
             .filter(|request| request.token == reference.token())
             .ok_or(ObservationError::InvalidRootControl)?;
-        Ok(LogicalToAttempt {
+        Ok(visit(original))
+    }
+
+    pub(crate) fn project(
+        &self,
+        reference: &RootControlRef,
+    ) -> Result<LogicalToAttempt<AttemptFailure>, ObservationError> {
+        self.with_request(reference, |original| LogicalToAttempt {
             activation: self.binding.activation(),
             body: match original.kind {
                 RootControlReplyKind::Seal => LogicalToAttemptBody::SealRequest {

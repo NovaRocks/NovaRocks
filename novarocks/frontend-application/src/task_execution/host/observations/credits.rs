@@ -57,6 +57,7 @@ impl ReadClaims {
 }
 
 struct Credits {
+    participants: BTreeSet<ParticipationRef>,
     data: Vec<OwnedPositionObligation>,
     control: Option<OwnedPositionObligation>,
     data_bytes: usize,
@@ -74,7 +75,6 @@ enum Claim {
 
 pub(crate) struct ObservationCredits {
     budget: ObservationBudget,
-    participants: BTreeSet<ParticipationRef>,
     state: Mutex<Credits>,
 }
 
@@ -107,8 +107,8 @@ impl ObservationCredits {
         let control = positions.pop();
         Ok(Arc::new(Self {
             budget,
-            participants,
             state: Mutex::new(Credits {
+                participants,
                 data: positions,
                 control,
                 data_bytes: 0,
@@ -120,12 +120,29 @@ impl ObservationCredits {
         }))
     }
 
+    pub(super) fn budget(&self) -> ObservationBudget {
+        self.budget
+    }
+
+    pub(super) fn matches_roster(
+        &self,
+        participants: impl Iterator<Item = ParticipationRef>,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("observation credit owner")
+            .participants
+            .iter()
+            .copied()
+            .eq(participants)
+    }
+
     pub(crate) fn register_stream(&self, stream: StreamKey) -> Result<(), ObservationError> {
         let mut state = self.state.lock().expect("observation credit owner");
         if state.closed {
             return Err(ObservationError::Closed);
         }
-        if !self.participants.contains(&stream.participation) {
+        if !state.participants.contains(&stream.participation) {
             return Err(ObservationError::UnknownStream);
         }
         if state.streams.contains_key(&stream) {
@@ -345,10 +362,12 @@ impl ObservationCredits {
         })();
         let mut state = self.state.lock().expect("observation credit owner");
         state.retiring = false;
-        state.data = positions;
-        state.control = control;
         if retired.is_ok() {
             state.streams.clear();
+            state.participants.clear();
+        } else {
+            state.data = positions;
+            state.control = control;
         }
         retired
     }
