@@ -188,3 +188,135 @@ async fn original_fe_completion_materializes_reads_joins_aggregates_and_analyze_
         fixture.finish(false).await;
     }
 }
+
+struct WrongCarrierSnapshot {
+    source: Arc<FrontendSystemTableFacts>,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl SystemTableSnapshotFactPort for WrongCarrierSnapshot {
+    async fn resolve_system_tables(
+        &self,
+        needs: &[SystemTableSnapshotNeed],
+    ) -> Result<Vec<SystemTableSnapshotFact>, SqlCompileError> {
+        use arrow::{
+            array::Array,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+        let [need] = needs else {
+            panic!("one original system occurrence")
+        };
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let provider = FrontendSystemTableProvider::new(
+            self.source.owners.system_relations.clone(),
+            self.source.clone(),
+        );
+        let request = SystemTableRequest::try_new(
+            need.declaration().clone(),
+            need.required_columns().to_vec(),
+            need.key_constraint().clone(),
+            &self.source.scope.connector_context,
+            self.source.planning().unwrap().batch_target_rows,
+        )
+        .unwrap();
+        let snapshot = provider.snapshot(&request).await.map_err(sql_error)?;
+        let batch = &snapshot.batches[0];
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.column(0).data_type(), &DataType::Utf8);
+        // Deliberately violate the provider contract by changing only the
+        // carrier header. The original buffers and storage stay unchanged.
+        let binary = arrow::array::make_array(
+            batch
+                .column(0)
+                .to_data()
+                .into_builder()
+                .data_type(DataType::Binary)
+                .build()
+                .unwrap(),
+        );
+        let field = batch.schema().field(0).clone();
+        let malformed = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                field.name(),
+                DataType::Binary,
+                field.is_nullable(),
+            )])),
+            vec![binary],
+        )
+        .unwrap();
+        SystemTableSnapshotFact::try_new(need, vec![malformed].into(), snapshot.storage)
+            .map(|fact| vec![fact])
+            .map_err(|error| SqlCompileError::Compilation(error.to_string()))
+    }
+}
+#[tokio::test]
+async fn original_fe_completion_rejects_a_provider_carrier_type_mismatch_as_internal() {
+    let provider = ListingFixture::new(FailurePoint::Views, ConnectorErrorKind::Unavailable);
+    let mut fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
+    let source = fixture.source();
+    let faulty = Arc::new(WrongCarrierSnapshot {
+        source: source.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let facts = Arc::new(statement_fact_source(
+        source.owners.clone(),
+        source.scope.clone(),
+        Arc::new(NoExternalScans),
+        faulty.clone(),
+    ));
+    let driver = FinalPlanCompletionDriver::new(facts.clone());
+    let cpu = source
+        .scope
+        .planning
+        .as_ref()
+        .unwrap()
+        .cpu
+        .as_ref()
+        .unwrap()
+        .clone();
+    let taken = ReadAccessSink::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        driven(
+            &fixture.control,
+            &mut fixture.driver,
+            driver.complete(
+                request(
+                    "SELECT table_name FROM system.information_schema.tables",
+                    SqlCompileIntent::Query,
+                    source.planning().unwrap().control.clone(),
+                ),
+                &source.scope.capacity.scope(),
+                &taken,
+                cpu.as_ref(),
+            ),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let Err(error) = result else {
+        panic!("malformed carrier cannot become a completed plan")
+    };
+    assert!(matches!(
+        &error,
+        novarocks_query_application::preparation::FinalPlanCompletionError::Compiler { .. }
+    ));
+    // Ordinary Read uses this exact completion projector. A malformed
+    // provider carrier stays an internal compiler contract failure.
+    let error = crate::query::compiler::FrontendQueryCompilerError::from_completion(&error);
+    assert!(matches!(
+        error,
+        crate::query::compiler::FrontendQueryCompilerError::Engine(_)
+    ));
+    assert_eq!(faulty.calls.load(Ordering::Relaxed), 1);
+    assert!(provider.calls().is_empty());
+    assert!(taken.into_taken().is_empty());
+    drop(driver);
+    drop(facts);
+    drop(faulty);
+    drop(cpu);
+    drop(source);
+    fixture.finish(false).await;
+}

@@ -97,6 +97,24 @@ impl Fixture {
         capacity_config: ResultCapacityConfig,
         compile_duration: Duration,
     ) -> Self {
+        Self::with_root_deadline(
+            pin,
+            class,
+            registry,
+            capacity_config,
+            compile_duration,
+            None,
+        )
+        .await
+    }
+    async fn with_root_deadline(
+        pin: novarocks_spi::connector::ConnectorControlPlanningPin,
+        class: ResultWindowClass,
+        registry: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
+        capacity_config: ResultCapacityConfig,
+        compile_duration: Duration,
+        root_deadline: Option<Instant>,
+    ) -> Self {
         let catalog = pin.binding().descriptor().instance_id.as_str().to_owned();
         let mut control = WorkloadControl::try_new_counted(WorkloadConfig {
             root_limit: 8,
@@ -136,7 +154,7 @@ impl Fixture {
             .try_begin_root_with_result(
                 WorkRequest {
                     class: WorkClass::Management,
-                    deadline: None,
+                    deadline: root_deadline.map(Into::into),
                 },
                 class,
             )
@@ -405,3 +423,124 @@ mod dml;
 mod current;
 
 mod inventory_store;
+
+#[tokio::test]
+async fn actual_root_deadline_does_not_release_a_held_snapshot_listing() {
+    for class in [ResultWindowClass::Client, ResultWindowClass::Local] {
+        let provider =
+            ListingFixture::new(FailurePoint::Views, ConnectorErrorKind::DeadlineExceeded);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        provider.hold_views(gate.clone());
+        let pin = crate::connector::metadata_binding_typed(provider.registry.as_ref(), "catalog")
+            .unwrap();
+        let fixture = Fixture::with_root_deadline(
+            pin,
+            class,
+            Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .unwrap(),
+            ),
+            ResultCapacityConfig::V1,
+            Duration::from_secs(5),
+            Some(Instant::now() + Duration::from_secs(1)),
+        )
+        .await;
+        let source = fixture.source();
+        let mut borrowed =
+            Box::pin(source.view_names("catalog", "db", &source.scope.connector_context));
+        assert!(futures::poll!(borrowed.as_mut()).is_pending());
+        drop(borrowed);
+        let deadline = fixture
+            .root
+            .owner
+            .scope()
+            .cancellation()
+            .unwrap()
+            .deadline()
+            .unwrap();
+        tokio::time::sleep_until(deadline).await;
+        assert!(fixture.root.owner.scope().check().is_err());
+        assert!(matches!(
+            fixture.root.owner.scope().cancellation().unwrap().reason(),
+            Some(CancellationReason::DeadlineExceeded)
+        ));
+        let mut close = Box::pin(source.close());
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        drop(close);
+        assert!(!source.io.lock().unwrap().joined);
+        assert!(source.local_health_failure().is_none());
+        gate.notify_one();
+        assert_original_error(
+            source.receive().await,
+            ConnectorErrorKind::DeadlineExceeded,
+            &provider,
+        );
+        drop(source);
+        fixture.finish(true).await;
+    }
+}
+#[tokio::test]
+async fn stabilized_listing_errors_keep_their_original_cause_after_a_late_root_stop() {
+    for kind in [
+        ConnectorErrorKind::CorruptData,
+        ConnectorErrorKind::ResourceExhausted,
+        ConnectorErrorKind::Cancelled,
+    ] {
+        for late_root in [false, true] {
+            let provider = ListingFixture::new(FailurePoint::Views, kind);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            provider.hold_views(gate.clone());
+            let fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
+            let source = fixture.source();
+            let mut borrowed =
+                Box::pin(source.view_names("catalog", "db", &source.scope.connector_context));
+            assert!(futures::poll!(borrowed.as_mut()).is_pending());
+            drop(borrowed);
+            gate.notify_one();
+            std::future::poll_fn(|cx| source.poll_progress(cx)).await;
+            assert!(source.io.lock().unwrap().response.is_some());
+            if late_root {
+                fixture
+                    .root
+                    .owner
+                    .cancel(CancellationReason::DeadlineExceeded);
+            }
+            assert_original_error(source.receive().await, kind, &provider);
+            assert!(source.local_health_failure().is_none());
+            assert_eq!(provider.calls(), ["views-start", "views"]);
+            drop(source);
+            fixture.finish(late_root).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn original_listing_port_keeps_each_connector_error_fact_and_detail() {
+    // Unsupported remains the raw port outcome; the information-schema
+    // provider separately interprets view-listing Unsupported as no view rows.
+    for kind in crate::catalog_application::statement::external_listing_tests::error_kinds() {
+        let provider = ListingFixture::new(FailurePoint::Views, kind);
+        let fixture = Fixture::new(&provider, ResultWindowClass::Client).await;
+        let source = fixture.source();
+        let error = source
+            .view_names("catalog", "db", &source.scope.connector_context)
+            .await
+            .unwrap_err();
+        let SystemTableError::Provider(error) = error else {
+            panic!("original connector error")
+        };
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), provider.expected_error());
+        let SqlCompileError::CompilationSource(cause) = sql_error(error.clone().into()) else {
+            panic!("original domain source")
+        };
+        assert_eq!(cause.downcast_ref::<ConnectorError>(), Some(&error));
+        assert_eq!(cause.failure_fact(), kind.failure_fact());
+        assert_eq!(cause.detail(), provider.expected_error());
+        assert_eq!(provider.calls(), ["views"]);
+        drop(cause);
+        drop(error);
+        drop(source);
+        fixture.finish(false).await;
+    }
+}

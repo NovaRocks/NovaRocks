@@ -159,8 +159,18 @@ async fn raw_provider_failure_and_cursor_remain_when_independent_health_is_unpro
         Arc::new(std::io::Error::other("held health cause")),
     );
     source.io.lock().unwrap().health = Some(health.clone());
+    assert!(std::ptr::addr_eq(
+        source.local_health_failure().unwrap().cause(),
+        health.cause()
+    ));
     let mut close = Box::pin(source.close());
     assert!(futures::poll!(close.as_mut()).is_pending());
+    assert!(source.io.lock().unwrap().future.is_some());
+    assert!(!source.io.lock().unwrap().joined);
+    assert!(std::ptr::addr_eq(
+        source.local_health_failure().unwrap().cause(),
+        health.cause()
+    ));
     gate.notify_one();
     let received = close.await.unwrap_err();
     assert!(std::ptr::addr_eq(received.cause(), health.cause()));
