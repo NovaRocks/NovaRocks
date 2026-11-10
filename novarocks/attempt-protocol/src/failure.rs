@@ -92,6 +92,8 @@ impl std::error::Error for HostProjectedFailure {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttemptFailure {
+    /// The frontend attempt owner failed internally and cannot be recovered.
+    OwnerFailed,
     Protocol(ProtocolFailure),
     TaskProtocol(Box<crate::error::TaskExecutionError>),
     Host(HostProjectedFailure),

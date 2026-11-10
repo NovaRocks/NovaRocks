@@ -924,9 +924,9 @@ impl EffectSource for SupervisorSource {
     fn owner_failed_cleanup(
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
-        lifecycle: Option<FailureLifecycle>,
+        context: Option<FailureContext>,
     ) {
-        assert!(lifecycle.is_none());
+        assert!(context.is_none());
         assert!(self.cleanup.lock().unwrap().replace(ticket).is_none());
     }
 
@@ -956,10 +956,54 @@ impl EffectSource for SupervisorSource {
 
 #[tokio::test]
 async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() {
-    use novarocks_control_runtime::{
-        exit_work::{PanicSink, run_future},
-        publication::PublishedReply,
+    run_failure_publication(false, false).await;
+    run_failure_publication(true, false).await;
+    run_failure_publication(true, true).await;
+}
+
+async fn run_failure_publication(bind_reply: bool, already_published: bool) {
+    use crate::task_execution::host::{
+        failure_lifecycle::FailureLifecycle,
+        failure_publication::{FailurePublications, ReplyAdmissionError, RootControlReplyKind},
     };
+    use novarocks_attempt_protocol::failure::AttemptFailure;
+    use novarocks_control_runtime::exit_work::{PanicSink, run_future};
+    use novarocks_coordination_contract::{
+        AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptToLogical,
+        AttemptToLogicalBody,
+    };
+    use novarocks_execution_contract::ParticipationRef;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
+    };
+    use std::num::NonZeroU64;
+
+    struct ReplyEmitter;
+    impl TestActor for ReplyEmitter {
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: InputEnvelope,
+            input: FrontendInput,
+            step: &mut ActorStep<'_, FrontendEffect>,
+        ) {
+            assert!(
+                !matches!(input, FrontendInput::Test(CLEANUP_FENCE)),
+                "fixture failure after original reply admission"
+            );
+            let work = step.input_author().unwrap().work();
+            step.effect(
+                EffectDescriptor {
+                    id: ActionId::new(1).unwrap(),
+                    work,
+                    kind: EffectKind::Publication,
+                    dependencies: vec![],
+                },
+                FrontendEffect::Test { value: 1 },
+            )
+            .unwrap();
+        }
+    }
 
     let ledger = RuntimeLedger::new(ResourceVector::default());
     let initial = Generation::new(1).unwrap();
@@ -997,11 +1041,100 @@ async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() 
         .register_supervised_bound(
             actor,
             scope.clone(),
-            FrontendActor::Test(Box::new(Emitter { batches: vec![] })),
+            FrontendActor::Test(Box::new(ReplyEmitter)),
             config,
             &work,
         )
         .unwrap_or_else(|(error, _)| panic!("supervised registration: {error:?}"));
+    let bridge_scope = ledger.open_scope_next(None, initial).unwrap();
+    let (mut bridge_work, mut bridge_capacity) = bridge_scope
+        .reserve_next(
+            initial,
+            ReservationResources::work_only(),
+            WorkKind::Business,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Business)
+        .unwrap();
+    bridge_work.start().unwrap();
+    let execution = QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap();
+    let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
+    let participation = ParticipationRef::new(
+        execution,
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let lifecycle = FailureLifecycle::freeze([participation].into_iter());
+    lifecycle.starts().record(participation);
+    let publications = Arc::new(FailurePublications::new(
+        registration.clone(),
+        activation,
+        &scope,
+    ));
+    let context = FailureContext {
+        lifecycle,
+        publications: publications.clone(),
+    };
+    let token = AttemptRequestToken::new(NonZeroU64::MIN);
+    let kind = if bind_reply {
+        RootControlReplyKind::Seal
+    } else {
+        RootControlReplyKind::TerminalControl
+    };
+    assert!(matches!(
+        publications.reserve_reply(&runtime, &work, token, kind),
+        Err(ReplyAdmissionError::Runtime(
+            ActorTurnError::PublicationTargetMismatch
+        ))
+    ));
+    let reply = publications
+        .reserve_reply(&runtime, &bridge_work, token, kind)
+        .unwrap();
+    assert!(matches!(
+        publications.reserve_reply(&runtime, &bridge_work, token, kind),
+        Err(ReplyAdmissionError::Full)
+    ));
+    assert!(!publications.release_reply(token));
+    let mut role = bind_reply.then(|| {
+        let role = CausalInputObligation::reserve_admitted(
+            &runtime,
+            &registration,
+            actor,
+            InputClass::Control,
+            &bridge_work,
+        )
+        .unwrap();
+        reply
+            .bind_input(&runtime, &role.event_author().unwrap())
+            .unwrap();
+        role
+    });
+    let original_reply = already_published.then(|| {
+        let (_, input) = role
+            .as_mut()
+            .unwrap()
+            .fill_with_receipt(None, FrontendInput::Test(1))
+            .unwrap_or_else(|_| panic!("same admitted control request"));
+        assert!(runtime.poll_one(Tick(0)).unwrap());
+        let ticket = runtime
+            .take_effect(actor, input, ActionId::new(1).unwrap())
+            .unwrap();
+        let value = Arc::new(AttemptToLogical {
+            activation,
+            action: AttemptActionId::new(NonZeroU64::new(4).unwrap()),
+            body: AttemptToLogicalBody::SealResult {
+                token,
+                result: Ok(Arc::from([])),
+            },
+        });
+        runtime
+            .commit_reply(&ticket, &reply, value.clone())
+            .unwrap();
+        runtime.effect_completed(ticket).unwrap();
+        runtime.retire_input(actor, input).unwrap();
+        value
+    });
     let consumer = ConsumerId::new(1).unwrap();
     let report = ReportSlot::reserve_next(
         &mut capacity,
@@ -1049,22 +1182,48 @@ async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() 
             && failed_input.input == failed)
     );
     let supervisor = ticket.input;
-    let reply = PublishedReply::new(&scope);
+    let unresolved = AttemptActionId::new(NonZeroU64::new(7).unwrap());
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
     let mut job = Box::pin(run_future(
         exit,
         async {
-            let mut session = runtime.claim_failure_publication(&ticket).unwrap();
-            assert!(session.registration().same_registration(&registration));
-            session
-                .commit_reply(&reply, Arc::new("OwnerFailed"))
+            context
+                .publish(&runtime, &ticket, Box::new([unresolved]))
                 .unwrap();
             wait.await.unwrap();
         },
         PanicSink::new(),
     ));
     assert!(futures::poll!(job.as_mut()).is_pending());
-    assert_eq!(reply.take_once().as_deref(), Some(&"OwnerFailed"));
+    let failed_reply = reply.take_once().unwrap();
+    assert_eq!(failed_reply.activation, activation);
+    if let Some(original) = original_reply {
+        assert!(Arc::ptr_eq(&original, &failed_reply));
+    } else {
+        match &failed_reply.body {
+            AttemptToLogicalBody::SealResult {
+                token: original,
+                result: Err(AttemptFailure::OwnerFailed),
+            } if bind_reply => assert_eq!(*original, token),
+            AttemptToLogicalBody::TerminalControlResult {
+                token: original,
+                result: Err(AttemptFailure::OwnerFailed),
+            } if !bind_reply => assert_eq!(*original, token),
+            body => panic!("wrong original root control reply: {body:?}"),
+        }
+    }
+    assert!(reply.take_once().is_none());
+    let lost = tokio::time::timeout(std::time::Duration::from_secs(1), publications.take_lost())
+        .await
+        .unwrap();
+    assert_eq!(lost.activation, activation);
+    assert!(
+        matches!(&lost.body, AttemptToLogicalBody::AttemptLost { failure: AttemptFailure::OwnerFailed, unknown_participations, unresolved_actions } if **unknown_participations == [participation] && **unresolved_actions == [unresolved])
+    );
+    assert!(matches!(
+        publications.reserve_reply(&runtime, &bridge_work, token, kind),
+        Err(ReplyAdmissionError::OwnerFailed)
+    ));
     assert!(matches!(
         runtime.retire_input(actor, supervisor),
         Err(ActorTurnError::EffectsRemain)
@@ -1084,6 +1243,15 @@ async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() 
     runtime.retire_input(actor, supervisor).unwrap();
     runtime.retire_input(actor, failed).unwrap();
     assert!(runtime.take_failure_payload(actor).unwrap().is_some());
+    bridge_work.body_exited().unwrap();
+    bridge_work.captures_exited().unwrap();
+    if let Some(role) = role.as_mut() {
+        role.close_after_exit().unwrap();
+    }
+    bridge_capacity.finish().unwrap();
+    bridge_scope.close_external().unwrap();
+    ledger.reap_scope_ready(bridge_scope.id(), 8).unwrap();
+    ledger.remove_scope(bridge_scope.id()).unwrap();
     report.consume(consumer).unwrap();
     assert!(custody.try_retire().unwrap());
     ledger.reap_scope_ready(scope.id(), 8).unwrap();

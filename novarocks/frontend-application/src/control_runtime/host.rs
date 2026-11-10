@@ -30,7 +30,7 @@ use super::{
 use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
-use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
+use crate::task_execution::host::failure_publication::FailureContext;
 use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{
@@ -146,9 +146,9 @@ pub(crate) trait EffectSource: Send + 'static {
     fn owner_failed_cleanup(
         &mut self,
         ticket: EffectTicket<FrontendEffect>,
-        lifecycle: Option<FailureLifecycle>,
+        context: Option<FailureContext>,
     ) {
-        std::panic::resume_unwind(Box::new((ticket, lifecycle)));
+        std::panic::resume_unwind(Box::new((ticket, context)));
     }
     /// Stop new external admission while draining already admitted effects.
     fn close_external(&mut self);

@@ -63,6 +63,18 @@ impl FailureLifecycle {
         LifecycleStarts(self.0.clone())
     }
 
+    pub(crate) fn started_participations(&self) -> Box<[ParticipationRef]> {
+        self.0
+            .iter()
+            .filter_map(|member| {
+                member
+                    .started
+                    .load(Ordering::Acquire)
+                    .then_some(member.abort.participation())
+            })
+            .collect()
+    }
+
     /// A delayed sender may reach its first poll after the Core failed. Wait
     /// for all original start authors to leave before finalizing the roster.
     /// Ownership moves once, so exact replays still yield a single abort.

@@ -18,6 +18,7 @@
 //! Bind the pure AttemptCore to the original FE actor turn and work authors.
 
 use super::failure_lifecycle::FailureLifecycle;
+use super::failure_publication::{FailureContext, FailurePublications};
 use super::observations::{
     ObservationError, ObservationSourcePool, OrderedObservationInput, RootControlBinding,
 };
@@ -93,6 +94,7 @@ pub(crate) struct AttemptActorRegistration {
     membership_source: ActorId,
     members: Option<Arc<[FrozenMember]>>,
     failure_lifecycle: Option<FailureLifecycle>,
+    failure_publications: Arc<FailurePublications>,
     root_control: RootControlBinding,
     ordered_bound: bool,
     startup_reserved: bool,
@@ -367,9 +369,13 @@ impl AttemptActorRegistration {
                     self.scope.clone(),
                     admission,
                     send,
-                    self.failure_lifecycle
-                        .take()
-                        .expect("original failure lifecycle"),
+                    FailureContext {
+                        lifecycle: self
+                            .failure_lifecycle
+                            .take()
+                            .expect("original failure lifecycle"),
+                        publications: self.failure_publications.clone(),
+                    },
                     source,
                 )),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
@@ -388,6 +394,10 @@ impl AttemptActorRegistration {
 
     pub(crate) fn root_control_binding(&self) -> &RootControlBinding {
         &self.root_control
+    }
+
+    pub(crate) fn failure_publications(&self) -> &Arc<FailurePublications> {
+        &self.failure_publications
     }
 
     pub(crate) fn bind_membership(
@@ -668,6 +678,11 @@ impl AttemptActor {
         let root_control =
             RootControlBinding::for_registered_source(original.clone(), activation, root)
                 .expect("the registered root belongs to the same activation");
+        let failure_publications = Arc::new(FailurePublications::new(
+            original.clone(),
+            activation,
+            &scope,
+        ));
         Ok(AttemptActorRegistration {
             original,
             scope,
@@ -679,6 +694,7 @@ impl AttemptActor {
             failure_lifecycle: Some(FailureLifecycle::freeze(
                 members.iter().map(|member| member.participation),
             )),
+            failure_publications,
             root_control,
             ordered_bound: false,
             startup_reserved: false,

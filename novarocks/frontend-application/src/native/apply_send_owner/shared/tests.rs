@@ -1685,6 +1685,7 @@ async fn run_actor_send(withdraw: bool) {
     };
     use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
+    use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
         effect::{
@@ -1991,7 +1992,16 @@ async fn run_actor_send(withdraw: bool) {
                 report_author,
                 idle: send_idle,
             },
-            lifecycle,
+            FailureContext {
+                lifecycle,
+                publications: Arc::new(FailurePublications::new(
+                    inbox.registration().clone(),
+                    novarocks_coordination_contract::AttemptActivationIdentity::from_parts(
+                        1, execution, 1,
+                    ),
+                    &roles.scope,
+                )),
+            },
             Box::new(ScopeOwner {
                 scope: roles.scope.clone(),
                 parent,

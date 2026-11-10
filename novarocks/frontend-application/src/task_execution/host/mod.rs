@@ -24,6 +24,7 @@ pub(crate) mod pumps;
 
 pub(crate) mod custody;
 pub(crate) mod failure_lifecycle;
+pub(crate) mod failure_publication;
 
 pub(crate) mod transport;
 
