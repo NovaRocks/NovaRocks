@@ -109,6 +109,14 @@ impl ReadProgressInput {
         self.role.retire_indexed_after_exit(input)
     }
 
+    pub(super) fn abandon_pending_after_failure(&self) {
+        self.role.abandon_pending_after_failure();
+    }
+
+    pub(super) fn retire_failed(&self) -> Result<(), ActorTurnError> {
+        self.role.retire_failed_after_exit()
+    }
+
     /// This role is stable across generations. Only the original Source
     /// owner closes it, after all publishers and their receipts have exited.
     pub(crate) fn close_after_exit(&self) -> Result<(), ActorTurnError> {

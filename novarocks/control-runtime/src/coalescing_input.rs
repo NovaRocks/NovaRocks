@@ -52,6 +52,7 @@ struct State<T> {
     in_flight: Option<u64>,
     issued: u64,
     retired: u64,
+    abandoned_through: u64,
     closed: bool,
 }
 struct Inner<A: Actor, T> {
@@ -105,6 +106,7 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
                 in_flight: None,
                 issued: 0,
                 retired: 0,
+                abandoned_through: 0,
                 closed: false,
             }),
             project,
@@ -171,6 +173,7 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
                 state.retired = state.retired.max(revision);
             }
             if state.closed {
+                state.retired = state.retired.max(state.abandoned_through);
                 return Ok(None);
             }
             Self::claim_fill(&mut state)
@@ -212,14 +215,21 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
         match result {
             Ok(input) => Ok(Some(input)),
             Err((error, input)) => {
+                drop(input);
                 if matches!(error, ActorTurnError::Closed | ActorTurnError::ActorFailed) {
                     let latest = {
                         let mut state = self.0.state.lock().expect("coalescing input state lock");
-                        state.in_flight = None;
                         state.closed = true;
                         state.latest.take()
                     };
-                    drop(latest);
+                    let abandoned = latest
+                        .as_ref()
+                        .map_or(update.revision, |latest| latest.revision);
+                    drop((update, latest));
+                    let mut state = self.0.state.lock().expect("coalescing input state lock");
+                    state.in_flight = None;
+                    state.abandoned_through = state.abandoned_through.max(abandoned);
+                    state.retired = state.retired.max(state.abandoned_through);
                 } else {
                     let mut state = self.0.state.lock().expect("coalescing input state lock");
                     // Preserve chronological merge order when a concurrent
@@ -235,7 +245,6 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
                     // its actual retirement may authorize another fill.
                     state.in_flight = (error == ActorTurnError::StandingInputBusy).then_some(0);
                 }
-                drop(input);
                 Err(error)
             }
         }
@@ -269,6 +278,54 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
         }
         self.after_retire()?;
         Ok(true)
+    }
+
+    /// The original failed Source disposes an accepted, unpublished update.
+    /// Advance the physical receipt frontier only after actual destruction,
+    /// and never across a still-live original occurrence.
+    pub fn abandon_pending_after_failure(&self) {
+        let latest = {
+            let mut state = self.0.state.lock().expect("coalescing input state lock");
+            state.closed = true;
+            state.latest.take()
+        };
+        if let Some(latest) = latest {
+            let revision = latest.revision;
+            drop(latest);
+            let mut state = self.0.state.lock().expect("coalescing input state lock");
+            state.abandoned_through = state.abandoned_through.max(revision);
+            if state.in_flight.is_none() {
+                state.retired = state.retired.max(state.abandoned_through);
+            }
+        }
+    }
+
+    /// The failed owner has closed admission, and the runtime verifies the
+    /// original occurrence has no remaining payload, effect, or reservation.
+    /// No discarded notification is refilled.
+    pub fn retire_failed_after_exit(&self) -> Result<(), ActorTurnError> {
+        if !self
+            .0
+            .state
+            .lock()
+            .expect("coalescing input state lock")
+            .closed
+        {
+            return Ok(());
+        }
+        let standing = self
+            .0
+            .standing
+            .lock()
+            .expect("coalescing standing input lock");
+        if standing.is_active()
+            && standing.in_flight()?.is_some()
+            && standing.retire_ready_after_exit()?
+        {
+            drop(standing);
+            self.after_retire()?;
+        }
+        Ok(())
     }
 
     /// Stops new notifications and discards pending updates. An occurrence

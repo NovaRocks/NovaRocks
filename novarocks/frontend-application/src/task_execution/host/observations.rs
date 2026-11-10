@@ -1674,6 +1674,11 @@ impl<A: Actor> OrderedObservationInput<A> {
             .metadata_retired
     }
 
+    fn failed_current_input(&self) -> Option<InputId> {
+        let state = self.0.state.lock().expect("ordered observation state");
+        state.in_flight.as_ref().map(|original| original.input)
+    }
+
     fn fence_failed_writer(&self) {
         self.0
             .state

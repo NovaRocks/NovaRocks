@@ -39,28 +39,21 @@ pub(crate) struct OrderedObservationHost {
 pub(crate) struct OrderedObservationFailure {
     ingress: OrderedObservationInput<FrontendActor>,
     roles: BTreeSet<StandingInputId>,
-    ordered: [StandingInputId; 2],
+    progress: Vec<ReadProgressInput>,
 }
 
 impl OrderedObservationFailure {
-    pub(crate) fn dispose_queued(
-        self,
-        runtime: &ActorRuntime<FrontendActor>,
-    ) -> Result<(), ObservationError> {
-        let actor = self.ingress.root_binding().registration().actor();
+    pub(crate) fn dispose_queued(self) -> Result<(), ObservationError> {
+        for role in &self.progress {
+            role.abandon_pending_after_failure();
+        }
+        self.ingress.notify_source_progress();
         while let Some(original) = self
             .ingress
             .take_failed_source_payload(&self.roles)
             .map_err(ObservationError::Runtime)?
         {
-            let role = original.standing_id();
-            let input = original.dispose().map_err(ObservationError::Runtime)?;
-            if self.ordered.contains(&role) {
-                runtime
-                    .retire_input(actor, input)
-                    .map_err(ObservationError::Runtime)?;
-                self.ingress.failed_input_retired(input)?;
-            }
+            original.dispose().map_err(ObservationError::Runtime)?;
         }
         Ok(())
     }
@@ -227,17 +220,53 @@ impl OrderedObservationHost {
         Ok(())
     }
 
-    pub(crate) fn fence_failed(&self) -> OrderedObservationFailure {
+    pub(crate) fn fence_failed(&mut self) -> OrderedObservationFailure {
         self.ingress.fence_failed_writer();
+        // The failed path re-reads actual standing occurrences; the normal
+        // committed index cannot account for payloads disposed off-poller.
+        self.indexed = None;
+        self.indexed_progress.clear();
         OrderedObservationFailure {
             ingress: self.ingress.clone(),
-            ordered: self.roles,
+            progress: self.progress_roles.values().cloned().collect(),
             roles: self
                 .roles
                 .into_iter()
                 .chain(self.progress_roles.keys().copied())
                 .collect(),
         }
+    }
+
+    /// The supervisor only disposes failed payloads. One original host
+    /// retires both previously committed and failed/disposed occurrences.
+    pub(crate) fn retire_failed(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        budget: &mut usize,
+    ) -> Result<(), ObservationError> {
+        let current = self.ingress.failed_current_input();
+        assert!(
+            self.progress_roles.len() + usize::from(current.is_some()) <= *budget,
+            "original host allowance covers failed observation roles"
+        );
+        if let Some(input) = current {
+            *budget -= 1;
+            match runtime.retire_input(self.registration.actor(), input) {
+                Ok(()) => self.ingress.failed_input_retired(input)?,
+                Err(
+                    ActorTurnError::InputStillQueued
+                    | ActorTurnError::EffectsRemain
+                    | ActorTurnError::ReservationsRemain
+                    | ActorTurnError::MetadataStillPending,
+                ) => {}
+                Err(error) => return Err(ObservationError::Runtime(error)),
+            }
+        }
+        for role in self.progress_roles.values() {
+            *budget -= 1;
+            role.retire_failed().map_err(ObservationError::Runtime)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn is_retired(&self) -> bool {

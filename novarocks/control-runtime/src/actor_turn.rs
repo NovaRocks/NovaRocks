@@ -1278,6 +1278,9 @@ impl<A: Actor> StandingInputObligation<A> {
         }
         Ok(node)
     }
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
     pub const fn id(&self) -> StandingInputId {
         self.standing_input_id
     }

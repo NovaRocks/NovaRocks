@@ -723,7 +723,7 @@ impl HostRegistry {
                             self.runtime.validate_failure_effect_ticket(&ticket)?;
                             let observations = machine
                                 .ordered_observations
-                                .as_ref()
+                                .as_mut()
                                 .map(OrderedObservationHost::fence_failed);
                             machine
                                 .source
@@ -764,6 +764,12 @@ impl HostRegistry {
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+        if failed
+            && machine.failure_handed_off
+            && let Some(observations) = &machine.ordered_observations
+        {
+            observations.retire_failed(&self.runtime, &mut budget)?;
         }
         let mut retired = machine
             .source

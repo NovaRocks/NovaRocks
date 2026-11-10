@@ -162,7 +162,7 @@ impl FailureSupervisor {
                 .await
                 .map_err(Arc::new);
             let observation_drain =
-                observations.map_or(Ok(()), |original| original.dispose_queued(&runtime));
+                observations.map_or(Ok(()), OrderedObservationFailure::dispose_queued);
             let aborts = context.lifecycle.started_aborts().await;
             for &request in &aborts {
                 port.abort_once(request).await;

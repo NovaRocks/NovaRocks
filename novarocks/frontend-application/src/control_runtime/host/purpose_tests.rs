@@ -1037,20 +1037,68 @@ async fn supervisor_cleanup_uses_its_own_ticket_and_keeps_the_host_until_exit() 
 }
 
 async fn run_failure_publication(bind_reply: bool, already_published: bool) {
+    use crate::task_execution::bridge::root_control::RootControlRequests;
     use crate::task_execution::host::{
         failure_lifecycle::FailureLifecycle,
         failure_publication::{FailurePublications, ReplyAdmissionError, RootControlReplyKind},
+        observations::{
+            MetadataRetirementRefusal, ObservationBudget, ObservationError,
+            ObservationMetadataLayout, ObservationMetadataObligation, OrderedObservationInput,
+            RootControlBinding, StreamKey,
+            credits::ObservationCredits,
+            read_progress::ReadProgressInput,
+            source::{BoundObservationSource, ObservationMetadataAuthor},
+        },
     };
     use novarocks_attempt_protocol::failure::AttemptFailure;
+    use novarocks_attempt_protocol::input::{
+        AttemptInput, ExecutorFact, ObservationEvent, ObservationFact, ObservationFailure,
+    };
+    use novarocks_control_runtime::obligation::OwnedPositionObligation;
+    use novarocks_control_runtime_core::owned_storage::OwnedSlotKind;
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptToLogical,
         AttemptToLogicalBody,
     };
     use novarocks_execution_contract::ParticipationRef;
+    use novarocks_execution_contract::TaskIdentity;
     use novarocks_types::{
-        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-    use std::num::NonZeroU64;
+    use std::{
+        future::ready,
+        num::NonZeroU64,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    #[derive(Debug)]
+    struct ObservationClock;
+    impl novarocks_coordination_contract::MonotonicClock for ObservationClock {
+        fn now(&self) -> novarocks_coordination_contract::MonotonicInstant {
+            novarocks_coordination_contract::MonotonicInstant::from_origin(
+                std::time::Duration::ZERO,
+            )
+        }
+    }
+
+    struct Metadata(Mutex<Option<OwnedPositionObligation>>);
+    struct Backing(Option<OwnedPositionObligation>);
+    impl ObservationMetadataAuthor for Metadata {
+        fn retain(
+            &self,
+            _: ObservationMetadataLayout,
+            _: usize,
+        ) -> Result<Box<dyn ObservationMetadataObligation>, ObservationError> {
+            Ok(Box::new(Backing(self.0.lock().unwrap().take())))
+        }
+    }
+    impl ObservationMetadataObligation for Backing {
+        fn retire_after_exit(mut self: Box<Self>) -> Result<(), MetadataRetirementRefusal> {
+            self.0.take().unwrap().retire_after_exit().unwrap();
+            Ok(())
+        }
+    }
 
     struct ReplyEmitter;
     impl TestActor for ReplyEmitter {
@@ -1065,6 +1113,15 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
                 !matches!(input, FrontendInput::Test(CLEANUP_FENCE)),
                 "fixture failure after original reply admission"
             );
+            if let FrontendInput::Attempt(original) = input {
+                assert!(matches!(
+                    *original,
+                    AttemptInput::Executor(
+                        ExecutorFact::Observations(_) | ExecutorFact::ReadProgress(_)
+                    )
+                ));
+                return;
+            }
             let work = step.input_author().unwrap().work();
             step.effect(
                 EffectDescriptor {
@@ -1214,6 +1271,133 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         runtime.retire_input(actor, input).unwrap();
         value
     });
+    let mut observation = None;
+    let mut ordered = None;
+    if already_published {
+        let budget = ObservationBudget {
+            queued_frames: 1,
+            total_positions: 3,
+            max_frame_bytes: 2048,
+            control_bytes: 512,
+            total_bytes: 4608,
+        };
+        let (mut owner, mut positions) = scope
+            .reserve_next(
+                initial,
+                ReservationResources::new(
+                    ResourceVector::default(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        inputs: budget.total_positions,
+                        captures: 1,
+                        ..Default::default()
+                    },
+                ),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        owner.start().unwrap();
+        let credits =
+            ObservationCredits::bind(budget, [participation], &owner, &mut positions).unwrap();
+        let mut backing = positions.take_position(OwnedSlotKind::Capture).unwrap();
+        backing.bind().unwrap();
+        let binding = RootControlBinding::for_registered_source(
+            registration.clone(),
+            activation,
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                participation.backend_process_id(),
+            ),
+        )
+        .unwrap();
+        let requests = RootControlRequests::new(binding.clone(), publications.clone());
+        let observation_source = ActorId::new(9).unwrap();
+        let standing = |class, author| {
+            runtime
+                .reserve_admitted_input_for(&registration, observation_source, class, author)
+                .unwrap()
+                .into_standing_input()
+                .unwrap()
+        };
+        let ordinary = standing(InputClass::Ordinary, &owner);
+        let ordinary_id = ordinary.id();
+        let progress = ReadProgressInput::new(&registration, participation, ordinary);
+        let control = standing(InputClass::Control, &bridge_work);
+        binding.bind_reply_author(control.author().unwrap());
+        let ingress = OrderedObservationInput::new(
+            standing(InputClass::Lifecycle, &owner),
+            control,
+            BoundObservationSource::new(
+                binding.clone(),
+                requests.clone(),
+                credits,
+                [(participation, progress.clone())].into(),
+                Arc::new(Metadata(Mutex::new(Some(backing)))),
+            ),
+            binding,
+            Arc::new(ObservationClock),
+            |input| FrontendInput::Attempt(Box::new(input)),
+            Waker::noop().clone(),
+        )
+        .unwrap();
+        requests.bind_ingress(&ingress);
+        let key = StreamKey {
+            participation,
+            generation: NonZeroU64::MIN,
+        };
+        ingress.register_stream(key).unwrap();
+        let mut credit = Some(ingress.reserve_read(key).await.unwrap());
+        assert!(runtime.poll_one(Tick(0)).unwrap());
+        assert!(progress.retire_ready().unwrap());
+        let mut opened = ready(Ok::<(), ObservationFailure>(()));
+        assert!(matches!(
+            ingress
+                .poll_open(
+                    key,
+                    &mut credit,
+                    Pin::new(&mut opened),
+                    &mut Context::from_waker(Waker::noop()),
+                )
+                .unwrap()
+                .result,
+            Poll::Ready(Ok(()))
+        ));
+        ingress
+            .accept(
+                key,
+                ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Bookmark {
+                        generation: 1,
+                        sequence: 1,
+                        covered_prefix: 1,
+                        source_cut: 1,
+                    },
+                },
+                32,
+                credit.take().unwrap(),
+            )
+            .unwrap();
+        assert!(runtime.poll_one(Tick(0)).unwrap());
+        let committed = runtime.committed_batches(actor, None, 4).unwrap()[0].1;
+        drop(ingress.reserve_read(key).await.unwrap());
+        drop(ingress.reserve_read(key).await.unwrap());
+        let queued = runtime
+            .standing_input_inventory(actor, None, 8)
+            .unwrap()
+            .into_iter()
+            .find(|original| original.standing_input_id == ordinary_id)
+            .unwrap()
+            .in_flight
+            .unwrap();
+        observation = Some((ingress.clone(), owner, positions, key, committed, queued));
+        ordered = Some(OrderedObservationHost::new(ingress).with_read_progress([progress]));
+    }
     let consumer = ConsumerId::new(1).unwrap();
     let report = ReportSlot::reserve_next(
         &mut capacity,
@@ -1262,7 +1446,7 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             }),
             executor: executor.clone(),
             transport: None,
-            ordered_observations: None,
+            ordered_observations: ordered,
         })
         .is_ok()
     );
@@ -1272,6 +1456,25 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         .fill(FrontendInput::Test(CLEANUP_FENCE))
         .unwrap();
     assert!(runtime.poll_one(Tick(1)).unwrap());
+    if let Some((_, _, _, _, committed, queued)) = &observation {
+        use novarocks_control_runtime::actor_turn::InputPhase;
+        assert_eq!(
+            runtime
+                .input_custody(actor, *committed)
+                .unwrap()
+                .unwrap()
+                .phase,
+            InputPhase::Committed
+        );
+        assert_eq!(
+            runtime
+                .input_custody(actor, *queued)
+                .unwrap()
+                .unwrap()
+                .phase,
+            InputPhase::Filled
+        );
+    }
     host.drive(Tick(1), runtime.claim_host_actor().unwrap());
     let (supervisor, triggering) = cleanup.lock().unwrap().unwrap();
     assert_eq!(triggering, failed);
@@ -1311,7 +1514,9 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
     runtime.notify_host_actor(&registration).unwrap();
     host.drive(Tick(2), runtime.claim_host_actor().unwrap());
     assert!(executor.jobs.lock().unwrap().is_empty());
-    assert!(runtime.claim_host_actor().is_none());
+    if observation.is_none() {
+        assert!(runtime.claim_host_actor().is_none());
+    }
     assert!(!host.is_empty());
     assert!(matches!(
         reached_cleanup.try_recv(),
@@ -1325,6 +1530,21 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             .unwrap()
             .unwrap();
     original.publication.unwrap();
+    original.observation_drain.unwrap();
+    if let Some((ingress, mut owner, mut positions, key, committed, queued)) = observation {
+        while let Some(turn) = runtime.claim_host_actor() {
+            host.drive(Tick(2), turn);
+        }
+        assert!(runtime.input_custody(actor, committed).unwrap().is_none());
+        assert!(runtime.input_custody(actor, queued).unwrap().is_none());
+        ingress.job_closed(key).unwrap();
+        ingress.retire_stream(key).unwrap();
+        ingress.close_after_exit().unwrap();
+        owner.body_exited().unwrap();
+        owner.captures_exited().unwrap();
+        positions.finish().unwrap();
+        scope.reap_ready(8).unwrap();
+    }
     assert_eq!(
         original.core_panic.downcast_ref::<&str>().copied(),
         Some("fixture failure after original reply admission")
