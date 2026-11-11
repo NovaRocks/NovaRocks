@@ -427,7 +427,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
         Table => match field {
             1 => singular(Message(Name)),
             2 | 4 | 6 | 9 => singular(Varint),
-            3 | 11 | 12 => singular(Scalar),
+            3 | 11 | 12 | 19 => singular(Scalar),
             5 | 16 | 18 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
@@ -3350,6 +3350,90 @@ mod tests {
                 assert_eq!(value.schema_table_name().table_name(), "events");
             }
             _ => panic!("expected system table relation"),
+        }
+    }
+
+    #[test]
+    fn frozen_write_target_partition_type_round_trips_through_closed_read_wire() {
+        use crate::delete_semantics::{PinnedEndpointFacts, ReadDomain, ReadObservationId};
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
+        };
+        use crate::typed_read::schema_binding::MutationMetadataSchema;
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields([Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        for partitioned in [false, true] {
+            let spec = PartitionSpec::builder(schema.clone()).with_spec_id(0);
+            let spec = if partitioned {
+                spec.add_partition_field("id", "part", Transform::Identity)
+                    .unwrap()
+            } else {
+                spec
+            }
+            .build()
+            .unwrap();
+            let endpoint = PinnedEndpointFacts::try_new(
+                uuid::Uuid::from_bytes([2; 16]),
+                "s3://warehouse/events/metadata/v1.json",
+                11,
+                &schema,
+                std::slice::from_ref(&spec),
+            )
+            .unwrap();
+            let mutation =
+                MutationMetadataSchema::from_endpoint(&endpoint, FormatVersion::V2, [spec])
+                    .unwrap();
+            let json = serde_json::to_string(mutation.partition_type()).unwrap();
+            let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+                schema_table_name: SchemaTableName::try_new("db", "events").unwrap(),
+                snapshot_id: Some(11),
+                table_schema_json: endpoint.schema_json().to_string(),
+                spec_id: Some(0),
+                partition_spec_jsons: endpoint
+                    .partition_spec_jsons()
+                    .iter()
+                    .map(|(id, json)| (*id, json.to_string()))
+                    .collect(),
+                format_version: 2,
+                unenforced_predicate: TupleDomain::all(),
+                enforced_predicate: TupleDomain::all(),
+                limit: None,
+                projected_columns: Default::default(),
+                name_mapping_json: None,
+                table_location: "s3://warehouse/events".into(),
+                storage_properties: Default::default(),
+                pinned_data_files: None,
+                read_domain: Some(Arc::new(ReadDomain::new(
+                    ReadObservationId::try_new([3; 16]).unwrap(),
+                    endpoint,
+                ))),
+            })
+            .unwrap()
+            .with_mutation_partition_type(Some(json.clone()))
+            .unwrap();
+            let payload = IcebergReadWireCodec
+                .encode_private(&IcebergRuntimeRelation::Table(table))
+                .unwrap();
+            let decoded = decode_with(ConnectorCodecCategory::ReadTable, &payload).unwrap();
+            let IcebergRuntimeRelation::Table(table) = decoded else {
+                panic!("expected a frozen Iceberg table");
+            };
+            assert_eq!(table.mutation_partition_type_json(), Some(json.as_str()));
+            let decoded_type = table.mutation_metadata().unwrap().unwrap();
+            assert_eq!(decoded_type.partition_type(), mutation.partition_type());
+            assert_eq!(
+                decoded_type.partition_type().fields().len(),
+                usize::from(partitioned)
+            );
         }
     }
 

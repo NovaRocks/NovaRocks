@@ -969,12 +969,12 @@ mod tests {
             write_bytes_field(&mut metadata, 2, &descriptor);
             metadata
         };
-        assert!(check_creation_metadata(&wrap(&inbound), 0).is_ok());
+        assert!(check_creation_metadata(&wrap(&inbound)).is_ok());
         // Prost would merge this second singular wrapper and append one
         // unpacked sender DOP. The bound must apply before Prost allocates.
         write_bytes_field(&mut inbound, 4, &[0x08, 0x01]);
         assert_eq!(
-            check_creation_metadata(&wrap(&inbound), 0)
+            check_creation_metadata(&wrap(&inbound))
                 .unwrap_err()
                 .to_string(),
             "position-shard roster exceeds 4096 sender DOPs",
