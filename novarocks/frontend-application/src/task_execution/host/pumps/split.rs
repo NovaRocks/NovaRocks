@@ -57,11 +57,14 @@ use novarocks_execution_contract::{
     TaskOperationId,
 };
 use novarocks_proto_codec::{FieldPath, lifecycle::QueryExecutionId};
+use novarocks_proto_models::connector_read as wire;
 use novarocks_query_application::execution_error::ExecutionFailureInput;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
-use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
+use novarocks_task_codec::domain::{WireContent, split_offer, wire_split_assignment};
+use novarocks_type_contract::owned_resources::layout::arc_layout;
 use novarocks_types::UniqueId;
 use std::{
+    alloc::Layout,
     collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
     sync::{Arc, Mutex},
@@ -237,7 +240,11 @@ impl SplitPump {
                 "unstarted split close requires the original started Cleanup work".into(),
             ));
         }
-        let result = self.executor.clone().close_unstarted().await;
+        let Some(result) = self.executor.clone().close_unstarted().await else {
+            return Err(TaskExecutionError::Schedule(
+                "split cleanup cannot replace an already started runner".into(),
+            ));
+        };
         self.deliveries.close_external();
         result
     }
@@ -391,6 +398,7 @@ impl OriginalSplitPublisher for BoundSplitRunner {
 struct Delivery {
     task: TaskIdentity,
     update: TaskDomainUpdate,
+    backing_bytes: usize,
     payload: Option<PayloadRef>,
     outcome: Option<SplitDeliverySettlement>,
 }
@@ -421,6 +429,7 @@ pub(crate) struct SplitPayloadRegistration {
     pub(crate) delivery: SplitDeliveryRef,
     pub(crate) task: TaskIdentity,
     pub(crate) payload: Arc<dyn CodecOwnedContent>,
+    pub(crate) backing_bytes: usize,
 }
 impl SplitDeliveryRecords {
     pub(crate) fn new(
@@ -513,6 +522,7 @@ impl SplitDeliveryRecords {
             delivery,
             task: record.task,
             payload: update.payload().clone(),
+            backing_bytes: record.backing_bytes,
         })
     }
     pub(crate) fn register_payload(
@@ -669,7 +679,8 @@ impl TaskUpdateTransport for SplitDeliveryRecords {
         let task = self.tasks.get(&target.task_key).copied().ok_or_else(|| {
             TaskUpdateTransportError::fatal("fragment instance is not a task of this attempt")
         })?;
-        let update = freeze_update(request).map_err(TaskUpdateTransportError::fatal)?;
+        let (update, backing_bytes) =
+            freeze_update(request).map_err(TaskUpdateTransportError::fatal)?;
         let mut records = self.records.lock().expect("split canonical records");
         if records.closing {
             return Err(TaskUpdateTransportError::closed(
@@ -696,6 +707,7 @@ impl TaskUpdateTransport for SplitDeliveryRecords {
             Delivery {
                 task,
                 update,
+                backing_bytes,
                 payload: None,
                 outcome: None,
             },
@@ -770,7 +782,7 @@ impl TaskUpdateTransport for SplitDeliveryRecords {
     }
 }
 /// This is the old bridge's exact codec projection, not a protocol verdict.
-fn freeze_update(request: &TaskUpdateRequest) -> Result<TaskDomainUpdate, String> {
+fn freeze_update(request: &TaskUpdateRequest) -> Result<(TaskDomainUpdate, usize), String> {
     let [assignment] = request.assignments() else {
         return Err(format!(
             "a task update must carry exactly one assignment, not {}",
@@ -786,9 +798,71 @@ fn freeze_update(request: &TaskUpdateRequest) -> Result<TaskDomainUpdate, String
         .ok_or_else(|| "a validated assignment produced no wire assignment".to_owned())?;
     let offer = split_offer(&proto, FieldPath::root("split_assignment"))
         .map_err(|error| error.to_string())?;
-    Ok(TaskDomainUpdate::SplitAssignment(
-        SplitAssignmentIntent::new(node, offer, wire_split_assignment(proto)),
+    let backing_bytes = split_backing_bytes(&proto)
+        .ok_or_else(|| "split payload backing exceeds addressable size".to_owned())?;
+    Ok((
+        TaskDomainUpdate::SplitAssignment(SplitAssignmentIntent::new(
+            node,
+            offer,
+            wire_split_assignment(proto),
+        )),
+        backing_bytes,
     ))
+}
+
+/// The frozen Arc owns these exact generated vectors and strings. Measure
+/// their capacities before moving them into the immutable wire carrier.
+fn split_backing_bytes(assignment: &wire::SplitAssignment) -> Option<usize> {
+    use wire::connector_split::Category;
+
+    let mut total = arc_layout(Layout::new::<WireContent<wire::SplitAssignment>>())
+        .ok()?
+        .size();
+    let mut add = |bytes| {
+        total = total.checked_add(bytes)?;
+        Some(())
+    };
+    add(
+        Layout::array::<wire::ScheduledSplit>(assignment.splits.capacity())
+            .ok()?
+            .size(),
+    )?;
+    for scheduled in &assignment.splits {
+        let Some(split) = &scheduled.split else {
+            continue;
+        };
+        add(
+            Layout::array::<wire::HostAddress>(split.addresses.capacity())
+                .ok()?
+                .size(),
+        )?;
+        for address in &split.addresses {
+            add(address.host.capacity())?;
+        }
+        if let Some(affinity) = &split.affinity_key {
+            add(affinity.capacity())?;
+        }
+        let payload = match &split.category {
+            Some(Category::Data(source)) => source.provider_payload.as_ref(),
+            Some(Category::TableChanges(source)) => source.provider_payload.as_ref(),
+            Some(Category::ChangeWindow(source)) => source.provider_payload.as_ref(),
+            Some(Category::SystemManifest(source)) => source.provider_payload.as_ref(),
+            Some(Category::RewritePositionDeleteFiles(source)) => source.provider_payload.as_ref(),
+            Some(Category::SystemRelation(source)) => source.provider_payload.as_ref(),
+            None => None,
+        };
+        if let Some(payload) = payload {
+            add(payload.payload.capacity())?;
+            if let Some(header) = &payload.header {
+                add(header.provider_id.capacity())?;
+                if let Some(catalog) = &header.catalog {
+                    add(catalog.catalog_name.capacity())?;
+                    add(catalog.version.capacity())?;
+                }
+            }
+        }
+    }
+    Some(total)
 }
 fn same_update(held: &TaskDomainUpdate, offered: &TaskDomainUpdate) -> bool {
     let (TaskDomainUpdate::SplitAssignment(held), TaskDomainUpdate::SplitAssignment(offered)) =
@@ -803,6 +877,37 @@ fn same_update(held: &TaskDomainUpdate, offered: &TaskDomainUpdate) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn split_payload_quote_includes_original_capacity_outside_wire_length() {
+    let empty = wire::SplitAssignment::default();
+    let mut assignment = wire::SplitAssignment {
+        splits: Vec::with_capacity(3),
+        ..empty.clone()
+    };
+    let mut split = wire::ConnectorSplit {
+        addresses: Vec::with_capacity(4),
+        affinity_key: Some(String::with_capacity(19)),
+        ..Default::default()
+    };
+    split.addresses.push(wire::HostAddress {
+        host: String::with_capacity(27),
+        port: 0,
+    });
+    let extra = assignment.splits.capacity() * size_of::<wire::ScheduledSplit>()
+        + split.addresses.capacity() * size_of::<wire::HostAddress>()
+        + split.addresses[0].host.capacity()
+        + split.affinity_key.as_ref().unwrap().capacity();
+    assignment.splits.push(wire::ScheduledSplit {
+        split: Some(split),
+        ..Default::default()
+    });
+    assert_eq!(
+        split_backing_bytes(&assignment).unwrap(),
+        split_backing_bytes(&empty).unwrap() + extra
+    );
+}
 
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -893,6 +998,9 @@ async fn dormant_split_cleanup_keeps_the_original_provider_close_and_work_exit()
     assert_eq!(enumerations.load(Ordering::SeqCst), 0);
     assert_eq!(custody.phase(), ExitCustodyPhase::Started);
     assert!(!job.is_finished());
+    let duplicate = original.clone().close_unstarted(custody.clone()).await;
+    assert!(matches!(duplicate, Err(TaskExecutionError::Schedule(_))));
+    assert!(!original.deliveries.records.lock().unwrap().closing);
 
     release.send(()).unwrap();
     let result = tokio::time::timeout(Duration::from_secs(2), job)

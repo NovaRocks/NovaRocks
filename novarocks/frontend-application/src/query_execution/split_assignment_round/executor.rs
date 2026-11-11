@@ -160,14 +160,12 @@ impl SplitAssignmentExecutor {
         self.started.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn close_unstarted(self: Arc<Self>) -> Result<(), TaskExecutionError> {
-        if self.has_started() {
-            return Err(TaskExecutionError::Schedule(
-                "split cleanup cannot replace an already started runner".into(),
-            ));
-        }
+    pub(crate) async fn close_unstarted(self: Arc<Self>) -> Option<Result<(), TaskExecutionError>> {
+        self.started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
         self.request_stop();
-        self.run_admitted(&UnstartedSplitClose).await.map(|_| ())
+        Some(self.run_started(&UnstartedSplitClose).await.map(|_| ()))
     }
 
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
@@ -216,6 +214,13 @@ impl SplitAssignmentExecutor {
             !self.started.swap(true, Ordering::AcqRel),
             "one original split runner"
         );
+        self.run_started(publisher).await
+    }
+
+    async fn run_started(
+        self: Arc<Self>,
+        publisher: &dyn OriginalSplitPublisher,
+    ) -> Result<SplitSourceProfile, TaskExecutionError> {
         let mut published_profile = None;
         let mut attempted_failure = false;
         loop {
