@@ -28,6 +28,7 @@ fn main() {
         .collect::<Vec<_>>();
     let mut config = prost_build::Config::new();
     config.btree_map(["."]);
+    config.boxed(".novarocks.connector.iceberg.IcebergFinalDeleteEffect.effect.replace_positions");
     config.file_descriptor_set_path(out_dir.join("iceberg_connector_descriptor.bin"));
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])

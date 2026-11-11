@@ -1788,7 +1788,7 @@ pub enum IcebergFinalDeleteKind {
         partition: IcebergArtifactPartition,
         old_exclusive_deletes: Box<[EntryIdentity]>,
     },
-    ReplacePositions(IcebergDeletionVectorArtifact),
+    ReplacePositions(Box<IcebergDeletionVectorArtifact>),
 }
 
 impl IcebergFinalDeleteEffect {

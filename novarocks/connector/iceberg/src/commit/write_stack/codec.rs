@@ -1012,7 +1012,7 @@ impl IcebergWriteValueCodec {
                                 "materialized DV requires new-object evidence",
                             ));
                         }
-                        Effect::ReplacePositions(self.encode_deletion_vector(file))
+                        Effect::ReplacePositions(Box::new(self.encode_deletion_vector(file)))
                     }
                 };
                 let target = effect.target();
@@ -1381,9 +1381,13 @@ impl IcebergWriteValueCodec {
                     )?
                     .into_boxed_slice(),
             },
-            Some(Effect::ReplacePositions(vector)) => IcebergFinalDeleteKind::ReplacePositions(
-                self.decode_deletion_vector(vector, path.field("replace_positions"), context)?,
-            ),
+            Some(Effect::ReplacePositions(vector)) => {
+                let vector =
+                    self.decode_deletion_vector(vector, path.field("replace_positions"), context)?;
+                observe_value_opaque(context, || {
+                    IcebergFinalDeleteKind::ReplacePositions(Box::new(vector))
+                })?
+            }
             None => {
                 return Err(spi_codec_error(
                     self.missing(path, "materialized delete requires an effect"),

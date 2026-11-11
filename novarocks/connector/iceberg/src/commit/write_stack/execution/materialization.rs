@@ -512,7 +512,8 @@ impl MaterializedDeleteWriter {
                 mutation: Some((locator, new_rows)),
                 exclusive,
             },
-            effect_bytes,
+            effect_bytes
+                .saturating_add(std::mem::size_of::<IcebergDeletionVectorArtifact>() as u64),
         )
         .await
     }
@@ -626,7 +627,7 @@ impl MaterializedDeleteWriter {
                     IcebergCommitFragment::final_delete(IcebergFinalDeleteEffect::try_new(
                         target,
                         new_rows,
-                        IcebergFinalDeleteKind::ReplacePositions(artifact),
+                        IcebergFinalDeleteKind::ReplacePositions(Box::new(artifact)),
                     )?)
                 }
                 None => IcebergCommitFragment::deletion_vector(artifact),

@@ -267,7 +267,7 @@ fn final_vector(vector: super::domain::IcebergDeletionVectorArtifact) -> Iceberg
         super::domain::IcebergFinalDeleteEffect::try_new(
             target,
             1,
-            super::domain::IcebergFinalDeleteKind::ReplacePositions(vector),
+            super::domain::IcebergFinalDeleteKind::ReplacePositions(Box::new(vector)),
         )
         .unwrap(),
     )
@@ -4619,8 +4619,8 @@ fn logical_final_delete(
             partition: sample_partition(),
             old_exclusive_deletes: Box::new([]),
         },
-        Some((path, rows)) => {
-            IcebergFinalDeleteKind::ReplacePositions(IcebergDeletionVectorArtifact::try_new(
+        Some((path, rows)) => IcebergFinalDeleteKind::ReplacePositions(Box::new(
+            IcebergDeletionVectorArtifact::try_new(
                 path.into(),
                 sample_partition(),
                 sample_metrics(rows, 4096),
@@ -4628,8 +4628,8 @@ fn logical_final_delete(
                 IcebergContentRange::try_new(4, 64)?,
                 rows,
                 vec![],
-            )?)
-        }
+            )?,
+        )),
     };
     Ok(IcebergCommitFragment::final_delete(
         IcebergFinalDeleteEffect::try_new(target, new_rows, kind)?,
