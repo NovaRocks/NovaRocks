@@ -31,8 +31,9 @@ use novarocks_coordination_contract::{
     AttemptComputationCut, SelectedTaskTermination, StatusObservation,
 };
 use novarocks_execution_contract::{
-    CreateTaskReceipt, LeaseReceipt, OperationKind, OperationOutcome, ParticipationReceipt,
-    ParticipationState, SafeDetail, TaskFailure, TaskFailurePhase, TaskResourceFacts,
+    CancelReason, CreateTaskReceipt, ExchangeDeliveryRequirement, LeaseReceipt, OperationKind,
+    OperationOutcome, ParticipationReceipt, ParticipationState, SafeDetail, TaskConvergenceReceipt,
+    TaskConvergenceVersion, TaskFailure, TaskFailurePhase, TaskResourceFacts,
     failure::{FailureClass, FailureFact, FailureReason},
     operation::OperationResult,
     root_result::RootResultEnd,
@@ -725,4 +726,231 @@ fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
         );
     }
     trace.expect_diagnostic_reads(&[peer, origin]);
+}
+
+#[test]
+fn pending_seal_recovers_only_after_exact_terminal_and_new_catch_up() {
+    let mut trace = TerminalTrace::new();
+    let root = trace.core.execution.graph().root_identity();
+    let leaf = trace
+        .core
+        .execution
+        .graph()
+        .edges()
+        .find(|edge| edge.delivery() == ExchangeDeliveryRequirement::MustDrain)
+        .unwrap()
+        .producers()[0];
+    let create = trace.start_create(leaf);
+    trace
+        .apply(
+            Some(create_reply(
+                create,
+                TaskStatus::created(leaf).with_installed(),
+            )),
+            None,
+        )
+        .unwrap();
+    let core = &mut trace.core;
+    let start = core.execution.monotonic_now();
+    let at = |seconds| start.saturating_add(Duration::from_secs(seconds));
+    let source = core.observation_source;
+    core.begin_native_prefix(
+        start,
+        AttemptSourceCut {
+            source: core.sources.native,
+            tail: None,
+        },
+    )
+    .unwrap();
+    let root_finished = frame(core, root, TaskState::Finished, None);
+    let participation = core
+        .execution
+        .graph()
+        .task(leaf.task_id())
+        .unwrap()
+        .participation();
+    core.subscriptions.activate(start, participation).unwrap();
+
+    let advance = |core: &mut Core, now, action: AttemptActionId| {
+        core.advance_subscription(
+            now,
+            action,
+            AttemptRequestToken::new(id(200)),
+            &mut Units(16),
+        )
+        .unwrap()
+    };
+    let open = |core: &mut Core, now, action| {
+        let SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::OpenSubscription(request),
+            ..
+        }) = advance(core, now, action)
+        else {
+            panic!("expected the original leaf subscription to open");
+        };
+        assert_eq!(request.participation, participation);
+        request
+    };
+    let observe = |core: &mut Core, now, items| {
+        core.apply_observations(now, source, ObservationBatch::new(items).unwrap())
+            .unwrap()
+    };
+    let stream = |opened, generation| {
+        move |received_at, event| ReceivedObservation {
+            participation,
+            generation,
+            received_at,
+            opening: ObservationOpening {
+                started_at: opened,
+                opened_at: Some(opened),
+            },
+            event,
+        }
+    };
+    let fact = |fact| ObservationEvent::Fact {
+        source_revision: None,
+        fact,
+    };
+    let complete = |generation: NonZeroU64, initial_cut| {
+        fact(ObservationFact::CatchUpComplete {
+            generation: generation.get(),
+            initial_cut,
+        })
+    };
+    let close = |core: &mut Core, now, action, opened, generation| {
+        assert!(matches!(
+            advance(core, now, action),
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::CloseSubscription { participation: closed, generation: closing },
+                ..
+            }) if closed == participation && closing == generation
+        ));
+        core.apply_subscription_input(
+            now,
+            &ExecutorFact::SubscriptionExited {
+                effect: opened,
+                participation,
+                generation,
+            },
+        )
+        .unwrap();
+    };
+
+    let action = |value| AttemptActionId::new(id(value));
+    let first = open(core, start, action(201));
+    let initial = stream(start, first.generation);
+    assert!(
+        observe(
+            core,
+            start,
+            vec![
+                root_finished,
+                initial(start, fact(ObservationFact::Gone(leaf))),
+                initial(start, complete(first.generation, 1)),
+            ],
+        )
+        .is_none()
+    );
+    let deadline = Some(at(30));
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(seal(core).unwrap().seal.is_none());
+    assert!(core.root.pending());
+
+    // The gap schedules reconciliation of the original subscription. Only
+    // its actual exit permits the next generation to open.
+    close(core, start, action(202), action(201), first.generation);
+    let second = open(core, start, action(203));
+    assert_eq!(second.generation.get(), first.generation.get() + 1);
+    let negative = stream(start, second.generation);
+    assert!(
+        observe(
+            core,
+            at(1),
+            vec![
+                negative(at(1), fact(ObservationFact::Unknown(leaf))),
+                negative(
+                    at(1),
+                    fact(ObservationFact::TaskConvergence(
+                        TaskConvergenceReceipt::actual_stopped(leaf, TaskConvergenceVersion::FIRST),
+                    )),
+                ),
+                negative(at(1), complete(second.generation, 2)),
+                negative(
+                    at(1),
+                    fact(ObservationFact::Bookmark {
+                        generation: second.generation.get(),
+                        sequence: 1,
+                        covered_prefix: 2,
+                        source_cut: 2,
+                    }),
+                ),
+                negative(at(1), ObservationEvent::Closed),
+            ],
+        )
+        .is_none()
+    );
+    assert!(core.execution.task_actual_stopped(leaf));
+    assert!(!core.execution.covered_observation_ready());
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(core.root.pending());
+
+    close(core, at(1), action(204), action(203), second.generation);
+    let third = open(core, at(2), action(205));
+    assert_eq!(third.generation.get(), second.generation.get() + 1);
+    assert!(third.task_convergence_cursors.iter().any(|cursor| {
+        cursor.identity() == leaf && cursor.current_version() == Some(TaskConvergenceVersion::FIRST)
+    }));
+    let recovered = stream(at(2), third.generation);
+    let canceled = |version, state| {
+        TaskStatus::try_new(
+            leaf,
+            TaskStatusVersion::new(version).unwrap(),
+            state,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::default(),
+        )
+        .unwrap()
+    };
+    let terminal = canceled(3, TaskState::Canceled);
+    assert!(
+        observe(
+            core,
+            at(29),
+            vec![
+                recovered(
+                    at(29),
+                    fact(ObservationFact::Status(canceled(2, TaskState::Canceling))),
+                ),
+                recovered(at(29), fact(ObservationFact::Status(terminal.clone()))),
+            ],
+        )
+        .is_none()
+    );
+    assert_eq!(
+        core.execution.task(leaf.task_id()).unwrap().status(),
+        Some(&terminal)
+    );
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(core.root.pending());
+
+    let cut = observe(
+        core,
+        at(29),
+        vec![recovered(at(29), complete(third.generation, 3))],
+    )
+    .expect("the newer complete catch-up settles the original seal");
+    assert_eq!(cut.settlement.token, AttemptRequestToken::new(id(90)));
+    assert!(cut.settlement.result.is_ok());
+    let projection = cut.root_before_seal.expect("the original root projection");
+    assert_eq!(projection.status.identity(), root);
+    assert_eq!(projection.status.state(), TaskState::Finished);
+    assert!(projection.status.output().responsibility_complete());
+    assert_eq!(projection.failure, AttemptRootFailure::None);
+    assert!(core.execution.covered_observation_ready());
+    assert_eq!(core.execution.covered_recovery_deadline(), None);
+    assert!(!core.root.pending());
+    assert!(core.root.sealed());
+    assert!(!core.execution.normal_drain_started());
 }
