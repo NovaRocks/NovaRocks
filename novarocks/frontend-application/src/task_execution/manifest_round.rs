@@ -27,7 +27,6 @@ use novarocks_query_application::api::{
 use novarocks_query_application::coordination::{
     AcceptedRootStatusSource, NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
 };
-use novarocks_task_codec::TransportBudget;
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
 use super::abort_effect::NativeAbortEffectIntake;
@@ -38,18 +37,16 @@ use super::attempt_convergence::{
 };
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
-use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
-use super::manifest_projection::ManifestProtocolFacts;
+use super::manifest_projection::ManifestAttemptInputs;
 use super::round::{AcknowledgementObserver, TaskRound};
-use super::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
+use super::sources::AttemptEstablishFacts;
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::task_transport::{
     AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
 };
-use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentFailureSource, SplitAssignmentRoundGuard,
@@ -64,9 +61,7 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 pub(crate) struct ManifestAttemptTransport {
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) dispatch_budget: DispatchBudget,
-    pub(crate) transport_budget: TransportBudget,
     pub(crate) status_subscription_error_budget: u32,
-    pub(crate) wire: AttemptWireFacts,
     pub(crate) data_runtime: FrontendDataRuntime,
     pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
     pub(crate) source_cohort:
@@ -126,22 +121,23 @@ pub(crate) enum ManifestAttemptCompletion {
 }
 
 pub(crate) fn assemble_manifest_round(
-    manifest: &TaskManifestBinding,
-    submissions: Vec<ValidatedNativeSubmission>,
+    inputs: ManifestAttemptInputs<'_>,
     establish: AttemptEstablishFacts,
     replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     transport: ManifestAttemptTransport,
 ) -> Result<ManifestAssembledRound, TaskExecutionError> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
-    let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
-    let ManifestProtocolFacts {
+    let ManifestAttemptInputs {
+        manifest,
+        graph,
+        compatibility,
+        transport: transport_budget,
         writers,
         summary_sources,
         admission_epochs,
         preparing_positions,
-    } = ManifestProtocolFacts::freeze(manifest, transport.wire.native_compatibility_id)?;
+    } = inputs;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
@@ -161,19 +157,18 @@ pub(crate) fn assemble_manifest_round(
     let native = Arc::new(
         NativeTaskOperationSink::new(
             &backends,
-            transport.transport_budget,
-            transport.wire.clone(),
+            transport_budget,
+            AttemptWireFacts {
+                native_compatibility_id: compatibility,
+            },
             acks.handle(),
             transport.data_runtime.clone(),
             transport.native_actions,
         )
         .map_err(TaskExecutionError::NativeTransport)?,
     ) as Arc<dyn TaskOperationSink>;
-    let (actor_sink, actor_gate, actor_observer) = ActorGatedTaskOperationSink::pair(
-        native,
-        Arc::clone(&wake),
-        transport.wire.native_compatibility_id,
-    );
+    let (actor_sink, actor_gate, actor_observer) =
+        ActorGatedTaskOperationSink::pair(native, Arc::clone(&wake), compatibility);
     let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
@@ -201,8 +196,8 @@ pub(crate) fn assemble_manifest_round(
     let mut execution = QueryTaskExecution::new(
         graph,
         transport.dispatch_budget,
-        transport.transport_budget,
-        transport.wire.native_compatibility_id,
+        transport_budget,
+        compatibility,
         &admission_epochs,
         &preparing_positions,
         clock,

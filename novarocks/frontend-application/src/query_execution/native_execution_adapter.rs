@@ -109,8 +109,9 @@ use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
     TaskOperationSubmit,
 };
+use crate::task_execution::manifest_projection::ManifestAttemptInputs;
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
-use crate::task_execution::sources::AttemptEstablishFacts;
+use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
 use crate::task_protocol_config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
@@ -2167,22 +2168,28 @@ impl ProductionManifestAttemptProjection {
             .iter()
             .map(|participation| participation.backend().target().descriptor().clone())
             .collect::<Vec<_>>();
+        let inputs = {
+            let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)
+                .map_err(|error| projection_message(error.to_string()))?;
+            ManifestAttemptInputs::freeze(
+                manifest,
+                &mut plans,
+                self.runtime.native_compatibility_id,
+                self.runtime.transport_budget,
+            )
+            .map_err(|error| projection_message(error.to_string()))?
+        };
         let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
-            manifest,
-            submissions,
+            inputs,
             establish,
             replacement_admissions,
             crate::task_execution::manifest_round::ManifestAttemptTransport {
                 clock: Arc::clone(&self.runtime.clock),
                 dispatch_budget: self.runtime.coordination_budgets.dispatch,
-                transport_budget: self.runtime.transport_budget,
                 status_subscription_error_budget: self
                     .runtime
                     .coordination_budgets
                     .status_subscription_error_budget,
-                wire: AttemptWireFacts {
-                    native_compatibility_id: self.runtime.native_compatibility_id,
-                },
                 data_runtime: self.runtime.data_runtime.clone(),
                 subscription_scope: self.work_scope.clone(),
                 source_cohort: self

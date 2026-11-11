@@ -20,7 +20,7 @@
 use super::{
     creation::PricedTaskCreation,
     error::TaskExecutionError,
-    graph::{TaskPlanSource, build_task_graph_from_manifest},
+    graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
     host::transport::AttemptEstablishMaterial,
     participation_owner::ParticipationEstablishSource,
 };
@@ -42,18 +42,25 @@ use std::{
     time::Duration,
 };
 
-pub(crate) struct ManifestProtocolFacts {
+pub(crate) struct ManifestAttemptInputs<'a> {
+    pub(crate) manifest: &'a TaskManifestBinding,
+    pub(crate) graph: TaskGraph,
+    pub(crate) compatibility: NativeCompatibilityId,
+    pub(crate) transport: TransportBudget,
     pub(crate) writers: BTreeSet<TaskIdentity>,
     pub(crate) summary_sources: PerKind<BTreeSet<TaskIdentity>>,
     pub(crate) admission_epochs: BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     pub(crate) preparing_positions: BTreeMap<BackendProcessId, usize>,
 }
 
-impl ManifestProtocolFacts {
+impl<'a> ManifestAttemptInputs<'a> {
     pub(crate) fn freeze(
-        manifest: &TaskManifestBinding,
+        manifest: &'a TaskManifestBinding,
+        plans: &mut dyn TaskPlanSource,
         compatibility: NativeCompatibilityId,
+        transport: TransportBudget,
     ) -> Result<Self, TaskExecutionError> {
+        let graph = build_task_graph_from_manifest(manifest, plans, transport)?;
         let writers = manifest
             .writer_cohorts()
             .map(|cohort| cohort.task())
@@ -93,6 +100,10 @@ impl ManifestProtocolFacts {
             }
         }
         Ok(Self {
+            manifest,
+            graph,
+            compatibility,
+            transport,
             writers,
             summary_sources,
             admission_epochs,
@@ -102,10 +113,8 @@ impl ManifestProtocolFacts {
 }
 
 pub(crate) struct AttemptPlanPolicy {
-    pub(crate) compatibility: NativeCompatibilityId,
     pub(crate) authorization_limits: AttemptAuthorizationLimits,
     pub(crate) coordination: CoordinationBudgets,
-    pub(crate) transport: TransportBudget,
     pub(crate) retry: TaskUpdateRetryPolicy,
     pub(crate) initial_lease: Duration,
     pub(crate) steady_lease: Duration,
@@ -118,34 +127,36 @@ pub(crate) struct AttemptManifestProjection {
 }
 
 impl AttemptManifestProjection {
-    /// Build the exact graph from the manifest's original plans. Move its
-    /// creation seeds and retain the Establish backing with one payload
-    /// identity sequence. Core receives only the frozen protocol projection.
-    pub(crate) fn freeze(
-        manifest: &TaskManifestBinding,
-        plans: &mut dyn TaskPlanSource,
+    /// Move the already bound graph's creation seeds and retain the Establish
+    /// backing with one payload identity sequence. Core receives only the
+    /// frozen protocol projection.
+    pub(crate) fn from_manifest_inputs(
+        inputs: ManifestAttemptInputs<'_>,
         establish: &dyn ParticipationEstablishSource,
         policy: AttemptPlanPolicy,
         pumps: Box<[(PayloadRef, PumpKind)]>,
         next_payload: &mut NonZeroU64,
     ) -> Result<Self, TaskExecutionError> {
-        let manifest_participations = manifest
-            .participations()
-            .iter()
-            .map(|row| row.participation())
-            .collect::<BTreeSet<_>>();
+        let ManifestAttemptInputs {
+            manifest,
+            graph,
+            compatibility,
+            transport,
+            writers,
+            summary_sources,
+            admission_epochs,
+            preparing_positions,
+        } = inputs;
         if policy.authorization_limits.activation.execution() != manifest.execution() {
             return Err(TaskExecutionError::Schedule(
                 "attempt projection differs from the original bound manifest".into(),
             ));
         }
-        let facts = ManifestProtocolFacts::freeze(manifest, policy.compatibility)?;
         let window = policy.coordination.dispatch.create_permits();
         let deployment_window = NonZeroUsize::new(window).ok_or_else(|| {
             TaskExecutionError::Schedule("the attempt deployment window is empty".into())
         })?;
-        let preparation_positions = facts
-            .preparing_positions
+        let preparation_positions = preparing_positions
             .into_iter()
             .map(|(backend, positions)| {
                 NonZeroUsize::new(positions)
@@ -159,20 +170,19 @@ impl AttemptManifestProjection {
             })
             .collect::<Result<_, _>>()?;
         let mut next = *next_payload;
-        let graph = build_task_graph_from_manifest(manifest, plans, policy.transport)?;
+        let participations = graph.participations().copied().collect::<Vec<_>>();
         let (graph, creations) = graph.into_attempt_graph(&mut next)?;
         let (establish_material, establish) =
-            AttemptEstablishMaterial::project(establish, manifest_participations, &mut next)?;
+            AttemptEstablishMaterial::project(establish, participations, &mut next)?;
         *next_payload = next;
-        let transport = policy.transport;
         Ok(Self {
             plan: FrozenAttemptPlan {
                 graph,
                 authorization_limits: policy.authorization_limits,
-                writers: facts.writers,
-                summary_sources: facts.summary_sources,
-                compatibility: policy.compatibility,
-                admission_epochs: facts.admission_epochs,
+                writers,
+                summary_sources,
+                compatibility,
+                admission_epochs,
                 preparation_positions,
                 deployment_window,
                 establish_material,

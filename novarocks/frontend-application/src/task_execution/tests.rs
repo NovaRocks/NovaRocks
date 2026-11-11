@@ -864,7 +864,9 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
 
 #[test]
 fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
-    use super::manifest_projection::{AttemptManifestProjection, AttemptPlanPolicy};
+    use super::manifest_projection::{
+        AttemptManifestProjection, AttemptPlanPolicy, ManifestAttemptInputs,
+    };
     use novarocks_attempt_protocol::{
         AttemptCore, Core,
         config::CoordinationBudgets,
@@ -897,19 +899,23 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
         .backend()
         .native_compatibility_id();
     let mut next = NonZeroU64::new(10).unwrap();
-    let projected = AttemptManifestProjection::freeze(
+    let inputs = ManifestAttemptInputs::freeze(
         &manifest,
         &mut plans,
+        compatibility,
+        TransportBudget::DEFAULT,
+    )
+    .unwrap();
+    let projected = AttemptManifestProjection::from_manifest_inputs(
+        inputs,
         &FakeEstablish,
         AttemptPlanPolicy {
-            compatibility,
             authorization_limits: AttemptAuthorizationLimits {
                 activation: AttemptActivationIdentity::from_parts(1, manifest.execution(), 1),
                 establish_per_participation: NonZeroUsize::MIN,
                 abort_per_participation: NonZeroUsize::MIN,
             },
             coordination: CoordinationBudgets::DEFAULT,
-            transport: TransportBudget::DEFAULT,
             retry: Default::default(),
             initial_lease: Duration::from_secs(30),
             steady_lease: Duration::from_secs(5),
