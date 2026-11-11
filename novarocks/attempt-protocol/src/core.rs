@@ -898,6 +898,8 @@ fn schedule(detail: &str) -> TaskExecutionError {
 
 #[cfg(test)]
 mod tests {
+    mod participation;
+
     use super::*;
     use crate::{
         capacity::QueueStage,
