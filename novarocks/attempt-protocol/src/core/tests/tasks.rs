@@ -20,15 +20,16 @@ use crate::{
     AttemptCore,
     capacity::ReservationToken,
     core::round_tail::RoundTailStep,
-    effect::{EffectClass, Publication, TaskDomainIntent},
+    effect::{EffectClass, Publication, PumpKind, QueuedInputPayload, TaskDomainIntent},
     execution::{
         CreateGrantProgress, EdgeAdmissionProgress,
         ack_phase::{admission_intent, dispatch_admission, queue_establish},
     },
     input::{
         AckPayload, AttemptInput, AttemptInputClaim, OperationReply, OperationReplyResult,
-        QueuedInputGrantRef, SendGeneration, UpdateAdmission,
+        QueuedInputGrantRef, SendGeneration, SplitDeliveryRef, UpdateAdmission,
     },
+    split_delivery::{AcceptedPlanNode, SplitDeliverySettlement},
 };
 use novarocks_coordination_contract::{
     AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
@@ -38,8 +39,8 @@ use novarocks_execution_contract::{
     AdmissionTicketId, CancelReason, CreateTaskReceipt, DomainProgression,
     ExchangeDeliveryRequirement, ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor,
     OperationEnvelope, OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
-    ParticipationState, PlanNodeId, SafeDetail, SplitOffer, SplitSequence, TaskDomainReceipt,
-    TaskFailure, UpdateTaskReceipt,
+    ParticipationState, PlanNodeId, PlanNodeSplitReceipt, SafeDetail, SplitOffer, SplitSequence,
+    SplitWatermark, TaskDomainReceipt, TaskFailure, UpdateTaskReceipt,
     failure::{FailureClass, FailureFact, FailureReason},
     operation::OperationResult,
 };
@@ -379,6 +380,7 @@ fn dispatch_continuation_preserves_original_effects_and_settlement_order() {
 }
 
 struct ExchangeTurn {
+    blocked_create: Option<BackendProcessId>,
     blocked_update: Option<BackendProcessId>,
     refused: usize,
 }
@@ -396,7 +398,9 @@ impl StepContext for ExchangeTurn {
         _: usize,
         _: usize,
     ) -> QueueStage {
-        if lane == DispatchLane::Update && self.blocked_update == Some(backend) {
+        if lane == DispatchLane::Create && self.blocked_create == Some(backend) {
+            QueueStage::TargetFull(backend)
+        } else if lane == DispatchLane::Update && self.blocked_update == Some(backend) {
             self.refused += 1;
             QueueStage::ProcessFull
         } else {
@@ -408,15 +412,19 @@ impl StepContext for ExchangeTurn {
 struct DrainTrace {
     core: Core,
     producer: TaskIdentity,
-    middle: [TaskIdentity; 2],
+    middle: Vec<TaskIdentity>,
     transport: ExchangeTurn,
     next: u64,
     replies: Vec<OperationObservation>,
     openings: BTreeMap<ParticipationRef, NonZeroU64>,
     creates: BTreeMap<TaskIdentity, (OperationIntent, SendGeneration)>,
     closes: BTreeMap<TaskIdentity, usize>,
+    close_sends: usize,
     producer_opens: usize,
     cancels: Vec<(TaskIdentity, CancelReason)>,
+    quiesces: Vec<ParticipationRef>,
+    split_notices: Vec<EffectBody>,
+    split_sends: Vec<(TaskIdentity, PlanNodeId, SplitOffer)>,
 }
 
 fn worker_accepted(
@@ -452,7 +460,14 @@ impl DrainTrace {
     }
 
     fn with_dispatched_creates() -> Self {
+        let trace = Self::with_chain(ExchangeDeliveryRequirement::DemandDriven);
+        assert_eq!(trace.creates.len(), 4);
+        trace
+    }
+
+    fn with_chain(delivery: ExchangeDeliveryRequirement) -> Self {
         let mut start = start();
+        let strict = delivery == ExchangeDeliveryRequirement::MustDrain;
         let graph = &mut start.plan.graph;
         let root = graph.root;
         let mut rows = graph.tasks.values();
@@ -462,52 +477,74 @@ impl DrainTrace {
         let producer = leaf.identity;
         let producer_part = leaf.participation;
         // Match the original three-stage chain. Root and leaf share a BE;
-        // the middle's two exact destinations live on distinct other BEs.
+        // each middle destination lives on a distinct other BE.
         let root = TaskIdentity::new(
             root.query_execution_id(),
             root.stage_id(),
             root.task_id(),
             producer.backend_process_id(),
         );
-        let sibling = TaskIdentity::new(
-            root.query_execution_id(),
-            middle.stage_id(),
-            TaskId::new(4).unwrap(),
-            root_part.backend_process_id(),
-        );
         graph.root = root;
         let root_task = graph.tasks.get_mut(&root.task_id()).unwrap();
         root_task.identity = root;
         root_task.participation = producer_part;
-        let mut sibling_task = graph.tasks[&middle.task_id()].clone();
-        sibling_task.identity = sibling;
-        sibling_task.participation = root_part;
-        sibling_task.task_key = UniqueId::new(4, 1);
-        sibling_task.creation.resource = PayloadRef(id(4));
-        graph.tasks.insert(sibling.task_id(), sibling_task);
+        let mut middle_tasks = vec![middle];
+        if strict {
+            start.plan.establish_material.remove(&root_part);
+            start
+                .plan
+                .admission_epochs
+                .remove(&root_part.backend_process_id());
+            start
+                .plan
+                .preparation_positions
+                .remove(&root_part.backend_process_id());
+            graph
+                .tasks
+                .get_mut(&producer.task_id())
+                .unwrap()
+                .split_plan_nodes = Box::from([PlanNodeId::new(5).unwrap()]);
+        } else {
+            let sibling = TaskIdentity::new(
+                root.query_execution_id(),
+                middle.stage_id(),
+                TaskId::new(4).unwrap(),
+                root_part.backend_process_id(),
+            );
+            let mut sibling_task = graph.tasks[&middle.task_id()].clone();
+            sibling_task.identity = sibling;
+            sibling_task.participation = root_part;
+            sibling_task.task_key = UniqueId::new(4, 1);
+            sibling_task.creation.resource = PayloadRef(id(4));
+            graph.tasks.insert(sibling.task_id(), sibling_task);
+            middle_tasks.push(sibling);
+        }
         graph.stages.insert(root.stage_id(), Box::from([root]));
         graph
             .stages
-            .insert(middle.stage_id(), Box::from([middle, sibling]));
+            .insert(middle.stage_id(), middle_tasks.clone().into_boxed_slice());
         let root_edge = graph
             .edges
             .get_mut(&ExchangeEdgeId::new(1).unwrap())
             .unwrap();
-        root_edge.producers = Box::from([middle, sibling]);
+        root_edge.delivery = delivery;
+        root_edge.producers = middle_tasks.clone().into_boxed_slice();
         root_edge.destinations = Box::from([root]);
         let leaf_edge = graph
             .edges
             .get_mut(&ExchangeEdgeId::new(2).unwrap())
             .unwrap();
-        leaf_edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
-        leaf_edge.destinations = Box::from([middle, sibling]);
+        leaf_edge.delivery = delivery;
+        leaf_edge.destinations = middle_tasks.clone().into_boxed_slice();
 
+        let tasks: Vec<_> = graph.tasks.values().map(|task| task.identity).collect();
         let core = Core::new(start).unwrap();
         let mut trace = Self {
             core,
             producer,
-            middle: [middle, sibling],
+            middle: middle_tasks,
             transport: ExchangeTurn {
+                blocked_create: strict.then_some(producer.backend_process_id()),
                 blocked_update: None,
                 refused: 0,
             },
@@ -516,10 +553,14 @@ impl DrainTrace {
             openings: BTreeMap::new(),
             creates: BTreeMap::new(),
             closes: BTreeMap::new(),
+            close_sends: 0,
             producer_opens: 0,
             cancels: Vec::new(),
+            quiesces: Vec::new(),
+            split_notices: Vec::new(),
+            split_sends: Vec::new(),
         };
-        trace.dispatch_creates([root, middle, producer, sibling]);
+        trace.dispatch_creates(tasks);
         trace
     }
 
@@ -528,7 +569,7 @@ impl DrainTrace {
         AttemptActionId::new(id(self.next))
     }
 
-    fn dispatch_creates(&mut self, tasks: [TaskIdentity; 4]) {
+    fn dispatch_creates(&mut self, tasks: Vec<TaskIdentity>) {
         let participants: Vec<ParticipationRef> = self
             .core
             .execution
@@ -625,7 +666,6 @@ impl DrainTrace {
             ));
         }
         self.run_round(None);
-        assert_eq!(self.creates.len(), tasks.len());
     }
 
     fn acknowledge_create(&mut self, status: TaskStatus) {
@@ -730,6 +770,10 @@ impl DrainTrace {
                                 self.cancels.push((cancel.identity(), cancel.reason()));
                                 None
                             }
+                            OperationIntent::QuiesceParticipation(request) => {
+                                self.quiesces.push(request.participation());
+                                continue;
+                            }
                             _ => panic!("unexpected operation {operation:?}"),
                         };
                         self.replies
@@ -758,6 +802,13 @@ impl DrainTrace {
                         | EffectBody::ReleaseQueuedInput { .. },
                     ..
                 }) => {}
+                RoundTailStep::Effect(AttemptEffect {
+                    body:
+                        body @ (EffectBody::PumpUpdateAdmitted { .. }
+                        | EffectBody::PumpOperationReleased { .. }
+                        | EffectBody::PumpOperationSettled { .. }),
+                    ..
+                }) => self.split_notices.push(body),
                 other => panic!("unexpected original round step {other:?}"),
             }
         }
@@ -788,12 +839,24 @@ impl DrainTrace {
                     destination,
                 },
             ] => {
+                self.close_sends += 1;
                 if identity == self.producer {
                     assert_eq!(*edge, ExchangeEdgeId::new(2).unwrap());
                     *self.closes.entry(*destination).or_default() += 1;
                 }
                 TaskDomainReceipt::CloseExchangeDestination {
                     accepted_version: *version,
+                    progression: DomainProgression::Apply,
+                }
+            }
+            [TaskDomainIntent::SplitAssignment { node, offer, .. }] => {
+                self.split_sends.push((identity, *node, *offer));
+                let (_, last) = offer
+                    .range()
+                    .expect("the strict-tail fixture sends a split batch");
+                let watermark = SplitWatermark::empty().apply_batch(last, offer.no_more_splits());
+                TaskDomainReceipt::SplitAssignment {
+                    nodes: vec![PlanNodeSplitReceipt::new(*node, watermark).with_queued_splits(1)],
                     progression: DomainProgression::Apply,
                 }
             }
@@ -930,7 +993,8 @@ fn original_authorized_close_and_create_reply_permutations() {
     let (mut closes, mut opens, mut late_ack) = (0, 0, 0);
     for events in &traces {
         let mut trace = DrainTrace::with_dispatched_creates();
-        let [closed, needed] = trace.middle;
+        let closed = trace.middle[0];
+        let needed = trace.middle[1];
         let participation = trace
             .core
             .execution
@@ -1170,4 +1234,202 @@ fn original_normal_drain_and_backpressure_permutations() {
             "close_first={close_first}"
         );
     }
+}
+
+#[test]
+fn strict_drain_preserves_original_create_split_and_late_exchange_open() {
+    let mut trace = DrainTrace::with_chain(ExchangeDeliveryRequirement::MustDrain);
+    let leaf = trace.producer;
+    let middle = trace.middle[0];
+    let root = trace.core.execution.graph().root_identity();
+    assert_eq!(trace.creates.keys().copied().collect::<Vec<_>>(), [middle]);
+    assert_eq!(trace.core.execution.dispatcher().queued_items(), 2);
+
+    trace.core.execution.begin_normal_drain();
+    assert!(!trace.core.execution.normal_drain_started());
+    let pump = PayloadRef(id(700));
+    let payload = PayloadRef(id(701));
+    let delivery = SplitDeliveryRef(id(702));
+    let node = PlanNodeId::new(5).unwrap();
+    let sequence = SplitSequence::new(1).unwrap();
+    let offer = SplitOffer::batch(sequence, sequence, true).unwrap();
+    trace.core.execution.bind_split_pump(Some(pump));
+    assert!(matches!(
+        trace.core.execution.split_pump_lifecycle(true),
+        Some(EffectBody::StartPump { pump: original, kind: PumpKind::SplitAssignment })
+            if original == pump
+    ));
+    trace
+        .core
+        .execution
+        .accept_split_delivery(
+            pump,
+            delivery,
+            leaf,
+            Box::from([TaskDomainIntent::SplitAssignment {
+                node,
+                offer,
+                payload,
+                queued_bytes: 128,
+            }]),
+        )
+        .unwrap();
+    let action = trace.action();
+    let effect = trace
+        .core
+        .execution
+        .prepare_split_delivery(leaf, action)
+        .unwrap()
+        .unwrap();
+    let EffectBody::AdmitQueuedInput {
+        operation: OperationIntent::UpdateTask {
+            envelope, identity, ..
+        },
+        payload: QueuedInputPayload::NewTaskUpdate(original),
+        ..
+    } = &effect.body
+    else {
+        panic!("expected the strict producer's original split admission");
+    };
+    let split_operation = envelope.operation_id();
+    assert_eq!((*identity, *original), (leaf, payload));
+    trace.grant_update_or_cancel(effect);
+    trace.pump();
+    assert!(trace.split_sends.is_empty());
+    assert!(trace.close_sends == 0 && trace.cancels.is_empty());
+
+    trace.transport.blocked_create = None;
+    trace.pump();
+    assert!(trace.creates.contains_key(&leaf));
+    assert!(trace.creates.contains_key(&root));
+    for task in [root, leaf] {
+        trace.acknowledge_create(TaskStatus::created(task).with_installed());
+    }
+    trace.pump();
+    assert_eq!(trace.split_sends, [(leaf, node, offer)]);
+    assert_eq!(
+        trace.producer_opens, 0,
+        "the strict destination still lacks Installed"
+    );
+    assert!(!trace.core.execution.normal_drain_started());
+    assert!(trace.close_sends == 0 && trace.cancels.is_empty());
+    assert!(
+        matches!(
+            trace.split_notices.as_slice(),
+            [
+                EffectBody::PumpUpdateAdmitted { pump: p1, delivery: d1, settlement: None },
+                EffectBody::PumpOperationReleased { pump: p2, delivery: d2, operation: o2 },
+                EffectBody::PumpOperationSettled {
+                    pump: p3, delivery: d3, operation: o3,
+                    settlement: SplitDeliverySettlement::Accepted(nodes),
+                },
+            ] if [*p1, *p2, *p3] == [pump; 3]
+                && [*d1, *d2, *d3] == [delivery; 3]
+                && [*o2, *o3] == [split_operation; 2]
+                && nodes.as_ref() == [AcceptedPlanNode {
+                    plan_node_id: 5, accepted_through_sequence: 1, no_more_splits: true, queued_splits: 1,
+                }]
+        ),
+        "{:?}",
+        trace.split_notices
+    );
+
+    trace.acknowledge_create(TaskStatus::created(middle).with_installed());
+    trace.pump();
+    assert_eq!(trace.producer_opens, 1);
+    assert!(!trace.core.execution.normal_drain_started());
+    assert!(trace.close_sends == 0 && trace.cancels.is_empty());
+
+    let participants: Vec<_> = trace
+        .core
+        .execution
+        .graph()
+        .participations()
+        .copied()
+        .collect();
+    for task in [root, middle, leaf] {
+        let participation = trace
+            .core
+            .execution
+            .graph()
+            .task(task.task_id())
+            .unwrap()
+            .participation();
+        let now = trace.core.execution.monotonic_now();
+        let observations = [
+            (2, TaskState::Running, false),
+            (3, TaskState::Flushing, false),
+            (4, TaskState::Finished, true),
+        ]
+        .map(|(version, state, complete)| ReceivedObservation {
+            participation,
+            generation: trace.openings[&participation],
+            received_at: now,
+            opening: ObservationOpening {
+                started_at: now,
+                opened_at: Some(now),
+            },
+            event: ObservationEvent::Fact {
+                source_revision: None,
+                fact: ObservationFact::Status(
+                    TaskStatus::try_new(
+                        task,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        None,
+                        TaskOutputFacts::new(complete),
+                    )
+                    .unwrap(),
+                ),
+            },
+        });
+        trace.run_round(Some(ObservationBatch::new(observations.into()).unwrap()));
+        assert_eq!(trace.core.execution.normal_drain_started(), task == leaf);
+        if task != leaf {
+            for &participation in &participants {
+                assert!(
+                    trace
+                        .core
+                        .execution
+                        .next_quiesce_intent(participation)
+                        .is_none()
+                );
+            }
+        }
+    }
+    for &participation in &participants {
+        let operation = trace
+            .core
+            .execution
+            .next_quiesce_intent(participation)
+            .unwrap();
+        let action = trace.action();
+        let effect = trace
+            .core
+            .execution
+            .begin_lifecycle_admission(operation, action)
+            .unwrap();
+        let EffectBody::AdmitQueuedInput {
+            operation,
+            generation,
+            ..
+        } = effect.body
+        else {
+            panic!("expected the exact normal Quiesce admission after all strict terminals");
+        };
+        let grant = QueuedInputGrantRef::new(id(trace.next), generation);
+        assert!(matches!(
+            trace
+                .core
+                .execution
+                .observe_lifecycle_grant(operation.operation_id(), grant)
+                .unwrap(),
+            CreateGrantProgress::Queued
+        ));
+    }
+    trace.run_round(None);
+    trace.quiesces.sort_unstable();
+    assert_eq!(trace.quiesces, participants);
+    assert!(trace.close_sends == 0 && trace.cancels.is_empty());
+    assert_eq!(trace.core.execution.failure_cause(), None);
 }
