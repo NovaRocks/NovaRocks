@@ -412,6 +412,9 @@ impl ObservationSourcePool for Bank {
     fn close_root_controls(&self) -> Result<(), ObservationError> {
         Ok(())
     }
+    fn fence_root_controls_for_close(&self) -> bool {
+        true
+    }
     fn retain_metadata(
         &self,
         required: ObservationMetadataLayout,

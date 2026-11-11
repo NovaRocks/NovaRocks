@@ -130,6 +130,12 @@ pub(crate) trait EffectSource: Send + 'static {
     fn retain_transport_release(&mut self, original: Box<dyn Any + Send>) {
         std::panic::resume_unwind(original);
     }
+    fn can_close_ordered_observations(&self, _failed: bool) -> bool {
+        false
+    }
+    fn close_ordered_observations(&mut self, original: OrderedObservationHost) {
+        std::panic::resume_unwind(Box::new(original));
+    }
     fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>);
     /// Core consumption is proved by these original committed runtime inputs;
     /// it is not a capture, result-consumer, or producer-exit acknowledgement.
@@ -756,6 +762,9 @@ impl HostRegistry {
         }
         let failed = self.runtime.snapshot(entry.registration.actor())?.failed;
         if entry.close_requested.load(Ordering::Acquire) && !machine.external_closed {
+            if let Some(observations) = &machine.ordered_observations {
+                observations.fence_root_controls();
+            }
             machine.source.close_external();
             machine.external_closed = true;
         }
@@ -905,6 +914,26 @@ impl HostRegistry {
             retired.progressed |= transport.progressed;
             retired.more |= transport.more;
             retired.retired &= machine.transport.as_ref().unwrap().is_empty();
+        }
+        if machine.ordered_observations.is_some()
+            && machine.source.can_close_ordered_observations(failed)
+        {
+            if budget == 0 {
+                retired.more = true;
+            } else {
+                budget -= 1;
+                if machine
+                    .ordered_observations
+                    .as_ref()
+                    .is_some_and(OrderedObservationHost::ready_for_close)
+                {
+                    let original = machine.ordered_observations.take().unwrap();
+                    machine.source.close_ordered_observations(original);
+                    retired.progressed = true;
+                    retired.more = true;
+                    retired.retired = false;
+                }
+            }
         }
         retired.retired &= machine
             .ordered_observations

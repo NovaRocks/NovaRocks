@@ -168,6 +168,10 @@ impl ObservationSourcePool for BoundObservationSource {
         self.requests.close_after_exit()
     }
 
+    fn fence_root_controls_for_close(&self) -> bool {
+        self.requests.fence_for_close()
+    }
+
     fn retain_metadata(
         &self,
         required: ObservationMetadataLayout,

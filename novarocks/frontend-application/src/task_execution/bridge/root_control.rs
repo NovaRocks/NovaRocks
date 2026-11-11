@@ -151,6 +151,15 @@ impl RootControlRequests {
         Ok(())
     }
 
+    /// Fence admission while the host still owns the original ordered input
+    /// and can retire a request that raced the fence. The weak writer alias
+    /// stays until the credentialed close actually consumes it.
+    pub(crate) fn fence_for_close(&self) -> bool {
+        let mut state = self.state.lock().expect("original root-control request");
+        state.closed = true;
+        !state.submitting && state.original.is_none() && !state.delivering
+    }
+
     fn ingress(&self) -> Option<OrderedObservationInput<FrontendActor>> {
         self.state
             .lock()

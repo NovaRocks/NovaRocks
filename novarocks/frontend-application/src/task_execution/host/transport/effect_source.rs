@@ -42,6 +42,7 @@ use crate::{
     task_execution::host::failure_supervisor::{
         FailureCleanupPort, FailureSupervisor, RunningFailureSupervisor,
     },
+    task_execution::host::observations::host_turn::OrderedObservationHost,
     task_execution::host::publication::OriginalHostFailure,
 };
 use novarocks_attempt_protocol::{
@@ -217,6 +218,26 @@ impl AttemptTransportSource {
         assert!(self.calls[3].is_some());
         self.releases = Some(TransportReleases::new(executor, wake));
         self
+    }
+
+    fn transport_drained(&self) -> bool {
+        self.subscriptions
+            .as_ref()
+            .is_none_or(AttemptSubscriptions::is_drained)
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_drained)
+            && self.report_author.is_none()
+            && self.send_live.is_empty()
+            && self.failed_sends.is_empty()
+            && self.requests.is_empty()
+            && self.admission.is_drained()
+            && self
+                .releases
+                .as_ref()
+                .is_none_or(TransportReleases::is_empty)
     }
 
     fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
@@ -850,6 +871,22 @@ impl EffectSource for AttemptTransportSource {
         self.other.result_admission_closed()
     }
 
+    fn can_close_ordered_observations(&self, failed: bool) -> bool {
+        self.result_admission_closed()
+            && self.releases.is_some()
+            && self.transport_drained()
+            // The failed supervisor consumes the original failed tail. In
+            // the normal path seal_drained first needs these roles returned.
+            && (!failed || self.supervisor.is_none())
+    }
+
+    fn close_ordered_observations(&mut self, original: OrderedObservationHost) {
+        self.releases
+            .as_mut()
+            .expect("original observation close executor")
+            .retain(ReleaseCapture::Observations(original));
+    }
+
     fn progress_retirement(
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -1069,23 +1106,8 @@ impl EffectSource for AttemptTransportSource {
                     .as_ref()
                     .is_some_and(TransportReleases::has_work)
             || progressed && self.result_admission_closed();
-        progress.retired &= subscription_progress.is_none_or(|progress| progress.retired)
-            && self.supervisor.is_none()
-            && self.abort_inputs.is_empty()
-            && self
-                .calls
-                .iter()
-                .flatten()
-                .all(AttemptCallSource::is_drained)
-            && self.report_author.is_none()
-            && self.send_live.is_empty()
-            && self.failed_sends.is_empty()
-            && self.requests.is_empty()
-            && self
-                .releases
-                .as_ref()
-                .is_none_or(TransportReleases::is_empty)
-            && self.admission.is_drained();
+        progress.retired &=
+            self.supervisor.is_none() && self.abort_inputs.is_empty() && self.transport_drained();
         progress
     }
 }

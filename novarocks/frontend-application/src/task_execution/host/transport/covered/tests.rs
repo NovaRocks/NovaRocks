@@ -32,8 +32,11 @@ use crate::{
             failure_publication::FailurePublications,
             observations::{
                 ObservationBudget, OrderedObservationInput,
-                backing::{ObservationBackingQuote, PaidObservationMetadata},
-                credits::ObservationCredits,
+                backing::{
+                    OBSERVATION_BACKING_BYTES, ObservationBackingQuote, PaidObservationMetadata,
+                },
+                credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
+                host_turn::OrderedObservationHost,
                 read_progress::ReadProgressInput,
                 source::BoundObservationSource,
                 tests::ManualClock,
@@ -66,7 +69,6 @@ use novarocks_workload_control::{WorkClass, WorkRequest};
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicBool, Ordering},
-    task::Waker,
     time::{Duration, Instant},
 };
 
@@ -75,6 +77,7 @@ struct HostSource {
     control: AttemptCallSource,
     releases: TransportReleases,
     sources_retired: Arc<AtomicBool>,
+    ordered_handed_off: bool,
     open_pending: bool,
     scope: ScopeHandle,
     closing: bool,
@@ -153,6 +156,19 @@ impl EffectSource for HostSource {
         self.closing
     }
 
+    fn can_close_ordered_observations(&self, failed: bool) -> bool {
+        assert!(!failed);
+        self.closing
+            && self.subscriptions.is_drained()
+            && self.control.is_drained()
+            && self.releases.is_empty()
+    }
+
+    fn close_ordered_observations(&mut self, original: OrderedObservationHost) {
+        assert!(!std::mem::replace(&mut self.ordered_handed_off, true));
+        self.releases.retain(ReleaseCapture::Observations(original));
+    }
+
     fn progress_retirement(
         &mut self,
         _: &ActorRuntime<FrontendActor>,
@@ -194,7 +210,7 @@ impl EffectSource for HostSource {
             }
             original.units += 1;
         }
-        original.retired &= self.closing && self.control.is_drained() && self.releases.is_empty();
+        original.retired &= self.ordered_handed_off && self.can_close_ordered_observations(false);
         if original.retired {
             self.sources_retired.store(true, Ordering::Release);
             original.retired = self.scope.join_ready().unwrap();
@@ -214,6 +230,7 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         control_bytes: 512,
     };
     let quote = ObservationBackingQuote::new(budget, 1).unwrap();
+    let backing_bytes = quote.quota().get(OBSERVATION_BACKING_BYTES);
     let resources = budget
         .byte_window()
         .unwrap()
@@ -278,6 +295,9 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     );
     let runtime = inbox.runtime();
     let registration = inbox.registration();
+    let handle = tokio::runtime::Handle::current();
+    let transport =
+        TransportRetirements::new(runtime.clone(), registration.clone(), handle.clone(), 3);
     let root = TaskIdentity::new(
         execution,
         StageId::new(1).unwrap(),
@@ -335,9 +355,10 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         root.clone(),
         Arc::new(ManualClock::default()),
         |input| FrontendInput::Attempt(Box::new(input)),
-        Waker::noop().clone(),
+        transport.host_waker(),
     )
     .unwrap();
+    let weak_ingress = ingress.weak();
     let (wc_owner, mut wc_driver, capacity) = wc::fixture();
     let wc_root = wc_owner
         .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -348,7 +369,6 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     let original =
         SubscriptionSource::from_cohort(participation, &wc_scope, &cohort, ingress.clone())
             .unwrap();
-    let handle = tokio::runtime::Handle::current();
     let mut data = FrontendDataRuntime::new(handle.clone());
     let mut peer = Loopback::start().await;
     let client = Client::for_backend(peer.descriptor(backend), data.clone());
@@ -386,8 +406,6 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
             ProcessClock::default(),
         ))),
     );
-    let transport =
-        TransportRetirements::new(runtime.clone(), registration.clone(), handle.clone(), 3);
     let sources_retired = Arc::new(AtomicBool::new(false));
     let mut exit = host
         .register(HostBinding {
@@ -408,6 +426,7 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
                 control,
                 releases: TransportReleases::new(handle.clone(), transport.host_waker()),
                 sources_retired: sources_retired.clone(),
+                ordered_handed_off: false,
                 open_pending: false,
                 scope: scope.clone(),
                 closing: false,
@@ -418,7 +437,9 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
             capacity: None,
             membership: None,
             owner_controls: None,
-            ordered_observations: None,
+            ordered_observations: Some(
+                OrderedObservationHost::new(ingress.clone()).with_read_progress([progress]),
+            ),
         })
         .unwrap_or_else(|_| panic!("original subscription host"));
 
@@ -440,7 +461,6 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
                     (read.participation, read.generation),
                     (participation, request.generation)
                 );
-                assert!(progress.retire_ready().unwrap());
                 continue;
             }
             assert_eq!(envelope.class, InputClass::Lifecycle);
@@ -544,8 +564,18 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     .unwrap();
     assert!(original.scope().is_err());
     assert!(original.applied_request(request.generation).is_err());
-    ingress.close_after_exit().unwrap();
-    drop((progress, ingress, original));
+    drop((ingress, original));
+    let observation_capacity = || {
+        ledger
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES, OBSERVATION_BACKING_BYTES])
+            .unwrap()
+            .unwrap()
+            .used
+    };
+    assert_eq!(observation_capacity(), [0, backing_bytes]);
+    assert!(!host.is_empty());
+    drop(weak_ingress);
+    assert_eq!(observation_capacity(), [0, 0]);
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
     payer.finish().unwrap();

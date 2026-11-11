@@ -291,4 +291,26 @@ impl OrderedObservationHost {
     pub(crate) fn is_retired(&self) -> bool {
         self.indexed.is_none() && self.indexed_progress.is_empty() && self.ingress.is_retired()
     }
+
+    pub(crate) fn ready_for_close(&self) -> bool {
+        self.indexed.is_none()
+            && self.indexed_progress.is_empty()
+            && self.ingress.ready_for_host_close()
+    }
+
+    pub(crate) fn backing_pin(&self) -> Option<backing::ObservationBackingPin> {
+        self.ingress.1.clone()
+    }
+
+    pub(crate) fn fence_root_controls(&self) {
+        self.ingress.fence_root_controls_for_close();
+    }
+
+    /// The caller transferred the original ordered host into its blocking
+    /// Work, so the same body destroys the retained roles and writer alias.
+    pub(crate) fn close_on_executor(self) {
+        if let Err(error) = self.ingress.close_after_exit() {
+            std::panic::resume_unwind(Box::new((error, self)));
+        }
+    }
 }

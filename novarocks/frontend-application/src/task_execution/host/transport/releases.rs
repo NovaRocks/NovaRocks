@@ -20,7 +20,7 @@
 use super::AttemptCallSource;
 use crate::task_execution::host::{
     custody::{CustodyError, HostDisposal},
-    observations::{ObservationError, backing},
+    observations::{ObservationError, backing, host_turn::OrderedObservationHost},
 };
 use novarocks_control_runtime::{obligation::WorkRetirementObserver, transaction::RuntimeError};
 use novarocks_control_runtime_core::{capacity::CapacityError, scope::ScopeError};
@@ -38,6 +38,7 @@ type Original = Box<dyn Any + Send>;
 pub(super) enum ReleaseCapture {
     Original(Original),
     Subscription(WorkOwner),
+    Observations(OrderedObservationHost),
 }
 
 impl ReleaseCapture {
@@ -45,6 +46,7 @@ impl ReleaseCapture {
         match self {
             Self::Original(original) => drop(original),
             Self::Subscription(owner) => owner.complete_after_terminal_cancel_settled(),
+            Self::Observations(owner) => owner.close_on_executor(),
         }
     }
 }
@@ -65,6 +67,7 @@ pub(super) struct ReleaseFailure {
 struct Active {
     header: WorkRetirementObserver,
     original: HostDisposal<ReleaseCapture>,
+    _observation_backing: Option<backing::ObservationBackingPin>,
 }
 
 /// One blocking job, one host batch (at most two objects), and the sole
@@ -185,16 +188,25 @@ impl TransportReleases {
                 })
             })
             .expect("original pending transport release");
+        let original = ManuallyDrop::into_inner(original);
+        let observation_backing = match &original {
+            ReleaseCapture::Observations(original) => original.backing_pin(),
+            _ => None,
+        };
         let header = work.work().retirement_observer();
         let original = HostDisposal::start(
             &self.executor,
             work,
             author.observer(),
-            ManuallyDrop::into_inner(original),
+            original,
             ReleaseCapture::dispose,
         )
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
-        self.active = Some(Active { header, original });
+        self.active = Some(Active {
+            header,
+            original,
+            _observation_backing: observation_backing,
+        });
         Ok(true)
     }
 

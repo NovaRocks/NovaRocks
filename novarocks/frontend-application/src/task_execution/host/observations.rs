@@ -424,6 +424,7 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
     /// Fence new root controls and retain the original writer until all
     /// already admitted requests have actually left canonical custody.
     fn close_root_controls(&self) -> Result<(), ObservationError>;
+    fn fence_root_controls_for_close(&self) -> bool;
     /// Retain the SAME already-admitted metadata author/backing for this real
     /// layout and its containers. No new quota/wallet or descriptor-only grant.
     /// P10a must supply this actual author; P10c provides no fallback.
@@ -2081,6 +2082,30 @@ impl<A: Actor> OrderedObservationInput<A> {
 
     pub(crate) fn notify_source_progress(&self) {
         self.0.progress.wake_by_ref();
+    }
+
+    /// Called after subscription and confirmation captures have retired.
+    /// Keep the writer available for already accepted observations and root
+    /// controls until their exact host occurrences have actually retired.
+    fn ready_for_host_close(&self) -> bool {
+        if !self.fence_root_controls_for_close() {
+            return false;
+        }
+        let state = self.0.state.lock().expect("ordered observation state");
+        !state.writer_busy
+            && !state.retiring_batch
+            && state.in_flight.is_none()
+            && state.queue.is_empty()
+            && state.deferred_control.is_none()
+            && state.streams.is_empty()
+            && matches!(
+                state.failure_tail,
+                FailureTail::Normal | FailureTail::Disposed
+            )
+    }
+
+    fn fence_root_controls_for_close(&self) -> bool {
+        self.0.source.fence_root_controls_for_close()
     }
 
     /// Call only after original stream/bridge holders actually exited and all

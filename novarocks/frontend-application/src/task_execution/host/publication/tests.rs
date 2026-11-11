@@ -225,6 +225,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                     ObservationMetadataLayout, ObservationMetadataObligation,
                     OrderedObservationInput, RootControlBinding, StreamKey,
                     credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
+                    host_turn::OrderedObservationHost,
                     read_progress::ReadProgressInput,
                     source::{BoundObservationSource, ObservationMetadataAuthor},
                     tests::ManualClock,
@@ -487,6 +488,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     )
     .unwrap_or_else(|_| panic!("original ordered root Source"));
     requests.bind_ingress(&ingress);
+    let ordered_host = OrderedObservationHost::new(ingress.clone());
     let key = StreamKey {
         participation: participant,
         generation: NonZeroU64::MIN,
@@ -588,6 +590,8 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             // This Seal has been accepted behind an actual observation. A
             // close request must fence new QA calls while leaving this FIFO
             // prefix and the already accepted Seal runnable.
+            ordered_host.fence_root_controls();
+            assert!(!ordered_host.ready_for_close());
             assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
             assert!(runtime.poll_one(Tick(1)).unwrap());
             let batches = runtime.committed_batches(actor, None, 4).unwrap();
@@ -636,6 +640,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         let wake_count = wakes.0.load(Ordering::SeqCst);
         if seal {
             let retained = scope.snapshot().unwrap().storage;
+            assert!(!ordered_host.ready_for_close());
             assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
             assert_eq!(scope.snapshot().unwrap().storage, retained);
             assert_eq!(used_bytes(), budget.total_bytes as u64);
@@ -645,6 +650,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         if seal {
             assert!(wakes.0.load(Ordering::SeqCst) > wake_count);
             assert!(status.begin_terminal_control_request().is_err());
+            assert!(ordered_host.ready_for_close());
         }
     }
     assert!(
