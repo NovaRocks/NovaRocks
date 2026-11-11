@@ -18,25 +18,47 @@
 //! Canonical driver deliveries. The core selects every protocol outcome; this
 //! host only preserves the same request, payload, operation and original ticket.
 
-use crate::query_execution::{
-    connector_domain::TaskUpdateRequest,
-    split_assignment::{
-        AcceptedPlanNode, AssignmentTarget, SplitAssignmentStop, TaskUpdateOutcome,
-        TaskUpdateTicket, TaskUpdateTransport, TaskUpdateTransportError,
+use super::{PumpRecordError, project_task_error};
+use crate::{
+    control_runtime::actor::{FrontendActor, FrontendInput},
+    native::data_runtime::FrontendDataRuntime,
+    query_execution::{
+        connector_domain::TaskUpdateRequest,
+        split_assignment::{
+            AcceptedPlanNode, AssignmentTarget, SplitAssignmentDriverError, SplitAssignmentStop,
+            TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport, TaskUpdateTransportError,
+        },
+        split_assignment_round::{
+            RoundSplitAssignmentPlan, SplitAssignmentProfileRead,
+            executor::{OriginalSplitPublisher, SplitAssignmentExecutor},
+        },
+    },
+    task_execution::{
+        error::TaskExecutionError, round::PumpCloseUnresolved, status_intake::StatusIntakeWake,
     },
 };
-use crate::task_execution::status_intake::StatusIntakeWake;
 use novarocks_attempt_protocol::{
-    effect::TaskDomainIntent,
-    input::{ExecutorFact, SplitDeliveryRef},
+    effect::{EffectBody, TaskDomainIntent},
+    failure::{AttemptFailure, HostFailureRef},
+    input::{AttemptInput, ExecutorFact, SplitDeliveryRef},
+    publication::SplitDiagnosticObservation,
     split_delivery::SplitDeliverySettlement,
     start::PayloadRef,
 };
+use novarocks_control_runtime::{
+    actor_turn::ActorTurnError,
+    causal_input::CausalInputObligation,
+    exit_custody::{ExitCustody, ExitCustodyPhase},
+};
+use novarocks_control_runtime_core::identity::InputId;
+use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::{
     CodecOwnedContent, PlanNodeId, SplitAssignmentIntent, TaskDomainUpdate, TaskIdentity,
     TaskOperationId,
 };
 use novarocks_proto_codec::{FieldPath, lifecycle::QueryExecutionId};
+use novarocks_query_application::execution_error::ExecutionFailureInput;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use std::{
@@ -51,6 +73,7 @@ pub(crate) enum SplitRecordError {
     MissingPayload,
     DuplicatePayload,
     WrongOperation,
+    WrongPump,
     DuplicateRunner,
 }
 impl std::fmt::Display for SplitRecordError {
@@ -59,6 +82,312 @@ impl std::fmt::Display for SplitRecordError {
     }
 }
 impl std::error::Error for SplitRecordError {}
+
+type Position = CausalInputObligation<FrontendActor>;
+
+/// The exact standing roles paid by the original Source. The runner fills
+/// each once; the Source keeps them until its original Join and input exits.
+pub(crate) struct SplitRunnerPublication {
+    positions: Mutex<[Option<Position>; 2]>,
+}
+
+impl SplitRunnerPublication {
+    pub(crate) fn new(failure: Position, profile: Position) -> Arc<Self> {
+        Arc::new(Self {
+            positions: Mutex::new([Some(failure), Some(profile)]),
+        })
+    }
+
+    fn fill(&self, fact: ExecutorFact) -> Result<(), TaskExecutionError> {
+        let index = match &fact {
+            ExecutorFact::PumpFailed { .. } => 0,
+            ExecutorFact::SplitProfile { .. } => 1,
+            _ => unreachable!("original split publication kind"),
+        };
+        let mut positions = self.positions.lock().expect("original split positions");
+        let position = positions[index].as_mut().expect("live split position");
+        position
+            .fill_with_receipt(
+                None,
+                FrontendInput::Attempt(Box::new(AttemptInput::Executor(fact))),
+            )
+            .map_err(|refused| {
+                TaskExecutionError::Schedule(format!(
+                    "original split publication refused: {:?}",
+                    refused.error
+                ))
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn owns_input(&self, input: InputId) -> bool {
+        self.positions
+            .lock()
+            .expect("original split positions")
+            .iter()
+            .flatten()
+            .any(|position| {
+                position
+                    .in_flight()
+                    .expect("original split input")
+                    .contains(&Some(input))
+            })
+    }
+
+    /// Only the caller of the exact runner Join may retire its producer roles.
+    pub(crate) fn retire_after_runner_exit(&self, failed: bool) -> Result<bool, ActorTurnError> {
+        let mut positions = self.positions.lock().expect("original split positions");
+        for position in positions.iter_mut() {
+            let Some(original) = position.as_mut() else {
+                continue;
+            };
+            if failed {
+                match original.take_failed_payload() {
+                    Ok(Some(neutral)) => {
+                        neutral.dispose()?;
+                    }
+                    Ok(None) | Err(ActorTurnError::InputAuthorMismatch) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if original.retire_ready_after_exit()? {
+                original.close_after_exit()?;
+                *position = None;
+            }
+        }
+        Ok(positions.iter().all(Option::is_none))
+    }
+}
+
+#[derive(Default)]
+struct SplitResults {
+    selected_failure: Option<(HostFailureRef, AttemptFailure)>,
+    original_failure: Option<TaskExecutionError>,
+    profile: Option<SplitSourceProfile>,
+}
+
+/// One original opened assignment plan, its delivery tickets, and immutable
+/// outcomes. The transport Source retains this while its runner or any
+/// diagnostic publication still needs the original records.
+pub(crate) struct SplitPump {
+    pump: PayloadRef,
+    executor: Arc<SplitAssignmentExecutor>,
+    deliveries: Arc<SplitDeliveryRecords>,
+    results: Mutex<SplitResults>,
+}
+
+impl SplitPump {
+    pub(crate) fn prepare(
+        pump: PayloadRef,
+        execution: QueryExecutionId,
+        plan: RoundSplitAssignmentPlan,
+        tasks: BTreeMap<UniqueId, TaskIdentity>,
+        wake: Arc<dyn StatusIntakeWake>,
+        data_runtime: FrontendDataRuntime,
+    ) -> Option<Arc<Self>> {
+        let deliveries = SplitDeliveryRecords::new(execution, tasks, wake);
+        let executor =
+            SplitAssignmentExecutor::prepare(execution, plan, deliveries.clone(), data_runtime)?;
+        deliveries
+            .install_runner_wake(executor.wake_handle())
+            .expect("new split records have no runner");
+        Some(Arc::new(Self {
+            pump,
+            executor,
+            deliveries,
+            results: Mutex::new(SplitResults::default()),
+        }))
+    }
+
+    pub(crate) const fn reference(&self) -> PayloadRef {
+        self.pump
+    }
+
+    pub(crate) fn bind_runner(
+        self: &Arc<Self>,
+        start: AttemptActionId,
+        custody: ExitCustody,
+        publication: Arc<SplitRunnerPublication>,
+    ) -> BoundSplitRunner {
+        BoundSplitRunner {
+            original: self.clone(),
+            failure: HostFailureRef(NonZeroU64::new(start.get()).expect("original split action")),
+            custody,
+            publication,
+        }
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.executor.request_stop();
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        self.executor.has_started()
+    }
+
+    /// Called inside a separate credentialed Cleanup job when the original
+    /// Start never ran. The caller retains the same actual Join and receives
+    /// the original close result without a Core split recipient.
+    pub(crate) async fn close_unstarted(
+        self: Arc<Self>,
+        custody: ExitCustody,
+    ) -> Result<(), TaskExecutionError> {
+        if custody.phase() != ExitCustodyPhase::Started {
+            return Err(TaskExecutionError::Schedule(
+                "unstarted split close requires the original started Cleanup work".into(),
+            ));
+        }
+        let result = self.executor.clone().close_unstarted().await;
+        self.deliveries.close_external();
+        result
+    }
+
+    pub(crate) fn unresolved(&self) -> Option<PumpCloseUnresolved> {
+        self.executor.unresolved()
+    }
+
+    pub(crate) fn deliveries(&self) -> &SplitDeliveryRecords {
+        &self.deliveries
+    }
+
+    pub(crate) fn apply_notice(&self, body: &EffectBody) -> Result<(), SplitRecordError> {
+        match body {
+            EffectBody::PumpUpdateAdmitted {
+                pump,
+                delivery,
+                settlement,
+            } if *pump == self.pump => self
+                .deliveries
+                .admission_chosen(*delivery, settlement.clone()),
+            EffectBody::PumpOperationReleased {
+                pump,
+                delivery,
+                operation,
+            } if *pump == self.pump => self.deliveries.operation_released(*delivery, *operation),
+            EffectBody::PumpOperationSettled {
+                pump,
+                delivery,
+                operation,
+                settlement,
+            } if *pump == self.pump => {
+                self.deliveries
+                    .operation_settled(*delivery, *operation, settlement.clone())
+            }
+            _ => Err(SplitRecordError::WrongPump),
+        }
+    }
+
+    fn record_failure(
+        &self,
+        reference: HostFailureRef,
+        original: TaskExecutionError,
+    ) -> AttemptFailure {
+        let mut results = self.results.lock().expect("original split results");
+        if let Some((selected, failure)) = &results.selected_failure {
+            assert_eq!(*selected, reference, "same original split runner");
+            return failure.clone();
+        }
+        let failure = project_task_error(reference, &original);
+        results.selected_failure = Some((reference, failure.clone()));
+        results.original_failure = Some(original);
+        failure
+    }
+
+    pub(crate) fn project_failure(
+        &self,
+        reference: HostFailureRef,
+    ) -> Option<ExecutionFailureInput> {
+        let results = self.results.lock().expect("original split results");
+        if results.selected_failure.as_ref()?.0 != reference {
+            return None;
+        }
+        Some(results.original_failure.as_ref()?.preparation_input())
+    }
+
+    pub(crate) fn take_failure(&self, reference: HostFailureRef) -> Option<TaskExecutionError> {
+        let mut results = self.results.lock().expect("original split results");
+        if results.selected_failure.as_ref()?.0 != reference {
+            return None;
+        }
+        results.original_failure.take()
+    }
+
+    pub(crate) fn profile(&self, reference: PayloadRef) -> Option<SplitSourceProfile> {
+        if reference != self.pump {
+            return None;
+        }
+        self.results.lock().expect("original split results").profile
+    }
+}
+
+/// Run under the common transport wrapper's original ExitObligation. The
+/// returned PumpFinished is a result; that wrapper still owes actual exit.
+pub(crate) struct BoundSplitRunner {
+    original: Arc<SplitPump>,
+    failure: HostFailureRef,
+    custody: ExitCustody,
+    publication: Arc<SplitRunnerPublication>,
+}
+
+impl BoundSplitRunner {
+    pub(crate) async fn run(self) -> Result<ExecutorFact, PumpRecordError> {
+        if self.custody.phase() != ExitCustodyPhase::Started {
+            return Err(PumpRecordError::WrongIdentity);
+        }
+        let result = self.original.executor.clone().run_admitted(&self).await;
+        self.original.deliveries.close_external();
+        Ok(ExecutorFact::PumpFinished {
+            pump: self.original.pump,
+            result: result
+                .map(|_| ())
+                .map_err(|original| self.original.record_failure(self.failure, original)),
+        })
+    }
+}
+
+impl OriginalSplitPublisher for BoundSplitRunner {
+    fn publish_original_failure(
+        &self,
+        failure: SplitAssignmentDriverError,
+    ) -> Result<(), TaskExecutionError> {
+        let failure = self
+            .original
+            .record_failure(self.failure, TaskExecutionError::SplitAssignment(failure));
+        self.publication.fill(ExecutorFact::PumpFailed {
+            pump: self.original.pump,
+            failure,
+        })
+    }
+
+    fn publish_original_profile(
+        &self,
+        observation: SplitAssignmentProfileRead,
+    ) -> Result<(), TaskExecutionError> {
+        let observation = match observation {
+            SplitAssignmentProfileRead::Available(profile) => {
+                let mut results = self
+                    .original
+                    .results
+                    .lock()
+                    .expect("original split results");
+                assert!(
+                    results.profile.replace(profile).is_none(),
+                    "one original split profile"
+                );
+                SplitDiagnosticObservation::Available(self.original.pump)
+            }
+            SplitAssignmentProfileRead::Failed => SplitDiagnosticObservation::Failed,
+            SplitAssignmentProfileRead::Pending | SplitAssignmentProfileRead::SourceGone => {
+                unreachable!("split runner publishes its original settled profile")
+            }
+        };
+        self.publication.fill(ExecutorFact::SplitProfile {
+            pump: self.original.pump,
+            observation,
+        })
+    }
+}
+
 struct Delivery {
     task: TaskIdentity,
     update: TaskDomainUpdate,
@@ -149,16 +478,27 @@ impl SplitDeliveryRecords {
     /// Only tickets consumed by the original driver reach this queue. Source
     /// removal of the corresponding payload record and rich disposal remain
     /// outside this lock, through its existing admitted disposal work.
-    pub(crate) fn take_retired(&self) -> Vec<SplitRetiredDelivery> {
+    pub(crate) fn take_retired_one(&self) -> Option<SplitRetiredDelivery> {
         let mut records = self.records.lock().expect("split canonical records");
-        records
-            .retired
-            .drain(..)
-            .map(|record| SplitRetiredDelivery {
-                payload: record.payload,
-                original: Box::new(record),
-            })
-            .collect()
+        records.retired.pop_front().map(SplitRetiredDelivery::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_retired(&self) -> Vec<SplitRetiredDelivery> {
+        std::iter::from_fn(|| self.take_retired_one()).collect()
+    }
+
+    /// The original Source calls this only after joining the runner and after
+    /// its Core can no longer issue a disposition for the exact delivery.
+    /// Preserve the canonical payload for the same credentialed disposal path.
+    pub(crate) fn take_remaining_after_close(&self) -> Option<SplitRetiredDelivery> {
+        let mut records = self.records.lock().expect("split canonical records");
+        assert!(records.closing, "split delivery producer has not closed");
+        let (delivery, original) = records.deliveries.pop_first()?;
+        records.pending.retain(|held| *held != delivery);
+        records.by_task.remove(&original.task);
+        records.by_operation.retain(|_, held| *held != delivery);
+        Some(original.into())
     }
     pub(crate) fn next_unregistered(&self) -> Option<SplitPayloadRegistration> {
         let records = self.records.lock().expect("split canonical records");
@@ -298,6 +638,16 @@ impl SplitDeliveryRecords {
         Ok(())
     }
 }
+
+impl From<Delivery> for SplitRetiredDelivery {
+    fn from(original: Delivery) -> Self {
+        Self {
+            payload: original.payload,
+            original: Box::new(original),
+        }
+    }
+}
+
 impl TaskUpdateTransport for SplitDeliveryRecords {
     fn begin(
         &self,
@@ -453,3 +803,120 @@ fn same_update(held: &TaskDomainUpdate, offered: &TaskDomainUpdate) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dormant_split_cleanup_keeps_the_original_provider_close_and_work_exit() {
+    use crate::{
+        query_execution::split_assignment_round::failure_observation_plan,
+        task_execution::{
+            blocking_io::tests::{OriginalExecutorsFixture, until},
+            status_intake::CountingWake,
+        },
+    };
+    use novarocks_control_runtime::{
+        completion::ReportSlot,
+        exit_work::{PanicSink, run_future},
+        reported_work::ReportedWork,
+        transaction::RuntimeLedger,
+    };
+    use novarocks_control_runtime_core::{
+        capacity::{ReservationResources, ResourceVector},
+        completion::ConsumerKind,
+        identity::{ConsumerId, Generation},
+        owned_storage::OwnedSlotNeed,
+        scope::{WorkAdmission, WorkKind},
+    };
+    use novarocks_types::{AttemptId, QueryId};
+    use std::{
+        sync::{atomic::Ordering, mpsc},
+        time::Duration,
+    };
+
+    let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let supervisor = data_runtime.connector_blocking_io().clone();
+    let mut workers = OriginalExecutorsFixture::install(&supervisor);
+    let execution =
+        QueryExecutionId::new(QueryId::new(19, 23), AttemptId::new(1).unwrap()).unwrap();
+    let (release, released) = mpsc::channel();
+    let (plan, enumerations, closes) =
+        failure_observation_plan(execution, supervisor, Some(released));
+    let original = SplitPump::prepare(
+        PayloadRef(NonZeroU64::new(1).unwrap()),
+        execution,
+        plan,
+        BTreeMap::new(),
+        Arc::new(CountingWake::default()),
+        data_runtime,
+    )
+    .unwrap();
+    assert!(!original.has_started());
+
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let generation = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let (work, mut payer) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    completions: 1,
+                    captures: 1,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    let observer = ConsumerId::new(1).unwrap();
+    let report = ReportSlot::reserve_next(
+        &mut payer,
+        generation,
+        1,
+        [(observer, ConsumerKind::Observer)],
+    )
+    .unwrap();
+    let (custody, exit) =
+        ExitCustody::from_admitted(ReportedWork::try_new(work, payer, report.clone()).unwrap());
+    let job = tokio::spawn(run_future(
+        exit,
+        original.clone().close_unstarted(custody.clone()),
+        PanicSink::new(),
+    ));
+    until(|| closes.load(Ordering::SeqCst) == 1);
+    assert!(original.has_started());
+    assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+    assert_eq!(custody.phase(), ExitCustodyPhase::Started);
+    assert!(!job.is_finished());
+
+    release.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), job)
+        .await
+        .expect("original provider close returns")
+        .expect("original Cleanup runner joins")
+        .expect("original work exits");
+    assert!(matches!(
+        result,
+        Err(TaskExecutionError::SplitAssignment(
+            SplitAssignmentDriverError::SourceClose { .. }
+        ))
+    ));
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+    assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
+    assert!(original.profile(original.reference()).is_none());
+    assert!(original.deliveries().take_remaining_after_close().is_none());
+    report.consume(observer).unwrap();
+    assert!(custody.try_retire().unwrap());
+    ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    scope.close_external().unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
+    drop(original);
+    workers.shutdown().await;
+}

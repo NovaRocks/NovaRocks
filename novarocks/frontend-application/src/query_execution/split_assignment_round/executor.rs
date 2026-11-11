@@ -52,10 +52,30 @@ pub(crate) trait OriginalSplitPublisher: Send + Sync {
     ) -> Result<(), TaskExecutionError>;
 }
 
+/// A dormant attempt has no Core split recipient. Its original close still
+/// returns the typed result to the Cleanup owner.
+struct UnstartedSplitClose;
+impl OriginalSplitPublisher for UnstartedSplitClose {
+    fn publish_original_profile(
+        &self,
+        _: SplitAssignmentProfileRead,
+    ) -> Result<(), TaskExecutionError> {
+        Ok(())
+    }
+
+    fn publish_original_failure(
+        &self,
+        _: SplitAssignmentDriverError,
+    ) -> Result<(), TaskExecutionError> {
+        Ok(())
+    }
+}
+
 pub(crate) struct SplitAssignmentExecutor {
     pump: Mutex<Option<SplitAssignmentPump>>,
     stop: RoundSplitAssignmentStop,
     changed: Arc<Notify>,
+    stop_requested: AtomicBool,
     started: AtomicBool,
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
     outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
@@ -118,6 +138,7 @@ impl SplitAssignmentExecutor {
             pump: Mutex::new(Some(pump)),
             stop,
             changed,
+            stop_requested: AtomicBool::new(false),
             started: AtomicBool::new(false),
             failure,
             outcome,
@@ -132,9 +153,23 @@ impl SplitAssignmentExecutor {
         Arc::new(ExecutorWake(self.changed.clone()))
     }
     pub(crate) fn request_stop(&self) {
-        self.stop.stop();
+        self.stop_requested.store(true, Ordering::Release);
         self.changed.notify_one();
     }
+    pub(crate) fn has_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn close_unstarted(self: Arc<Self>) -> Result<(), TaskExecutionError> {
+        if self.has_started() {
+            return Err(TaskExecutionError::Schedule(
+                "split cleanup cannot replace an already started runner".into(),
+            ));
+        }
+        self.request_stop();
+        self.run_admitted(&UnstartedSplitClose).await.map(|_| ())
+    }
+
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
         SplitAssignmentProfileSource {
             outcome: Arc::downgrade(&self.outcome),
@@ -192,6 +227,12 @@ impl SplitAssignmentExecutor {
                 let pump = original
                     .as_mut()
                     .expect("original split runner has not exited");
+                // Serialize stop with the driver's own delivery turn. A
+                // concurrent stop cannot turn a legitimate in-flight update
+                // into the driver's TaskUpdateTransportError::Closed path.
+                if self.stop_requested.load(Ordering::Acquire) {
+                    self.stop.stop();
+                }
                 let moved = match pump.advance() {
                     Ok(moved) => moved,
                     Err(error) => {
