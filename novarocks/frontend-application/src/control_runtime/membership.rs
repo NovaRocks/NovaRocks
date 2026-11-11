@@ -246,6 +246,29 @@ pub(crate) enum MembershipShutdownError {
     SourceClosed,
     Join(tokio::task::JoinError),
 }
+impl std::fmt::Display for MembershipShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("frontend membership observer exit is pending"),
+            Self::SourceClosed => {
+                formatter.write_str("frontend membership observation source closed")
+            }
+            Self::Join(error) => write!(
+                formatter,
+                "frontend membership observer join failed: {error}"
+            ),
+        }
+    }
+}
+impl std::error::Error for MembershipShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Join(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) struct MembershipObserver {
     stop: Option<oneshot::Sender<()>>,
     join: Option<tokio::task::JoinHandle<Result<(), MembershipShutdownError>>>,
@@ -258,13 +281,21 @@ impl MembershipObserver {
     ) -> Self {
         start_membership_service(data, port, registry)
     }
+    pub(crate) fn has_exited(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+    pub(crate) fn request_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
     pub(crate) async fn shutdown_until(
         &mut self,
         deadline: Instant,
     ) -> Result<(), MembershipShutdownError> {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
+        self.request_stop();
         let Some(join) = self.join.as_mut() else {
             return Ok(());
         };

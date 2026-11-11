@@ -187,6 +187,9 @@ impl NativeTransportCapacity {
     pub(crate) fn accepts_transport_budget(&self, source: TransportBudget) -> bool {
         self.source == source
     }
+    pub(crate) fn transport_budget(&self) -> TransportBudget {
+        self.source
+    }
     pub(crate) fn capacity_sources(&self) -> TransportCapacityFacts {
         self.facts
     }

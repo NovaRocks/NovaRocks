@@ -719,7 +719,7 @@ async fn acquire_replacement_admissions(
     let acks = TaskAckIntake::new(wake);
     let sink = NativeTaskOperationSink::new(
         &backends,
-        runtime.transport_budget,
+        runtime.transport_budget(),
         AttemptWireFacts {
             native_compatibility_id: runtime.native_compatibility_id,
         },
@@ -980,12 +980,12 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
+    attempt_runtime: Arc<crate::control_runtime::FrontendAttemptRuntime>,
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    transport_budget: TransportBudget,
     abort_capacity: NonZeroUsize,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
@@ -1001,13 +1001,17 @@ impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
                 &self.runtime_filter_worker_count,
             )
             .field("coordination_budgets", &self.coordination_budgets)
-            .field("transport_budget", &self.transport_budget)
+            .field("transport_budget", &self.transport_budget())
             .field("abort_capacity", &self.abort_capacity)
             .finish_non_exhaustive()
     }
 }
 
 impl FrontendNativeLogicalExecutionRuntime {
+    fn transport_budget(&self) -> TransportBudget {
+        self.attempt_runtime.transport_capacity().transport_budget()
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
@@ -1033,12 +1037,12 @@ impl FrontendNativeLogicalExecutionRuntime {
         topology: BackendTopologyService,
         process_observation: BackendProcessObservationService,
         data_runtime: FrontendDataRuntime,
+        attempt_runtime: Arc<crate::control_runtime::FrontendAttemptRuntime>,
         native_compatibility_id: NativeCompatibilityId,
         runtime_filter_worker_count: NonZeroUsize,
         task_update_retry_policy: TaskUpdateRetryPolicy,
         split_initial_wait_cap: Duration,
         coordination_budgets: CoordinationBudgets,
-        transport_budget: TransportBudget,
         abort_capacity: NonZeroUsize,
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
@@ -1056,12 +1060,12 @@ impl FrontendNativeLogicalExecutionRuntime {
             topology,
             process_observation,
             data_runtime,
+            attempt_runtime,
             native_compatibility_id,
             runtime_filter_worker_count,
             task_update_retry_policy,
             split_initial_wait_cap,
             coordination_budgets,
-            transport_budget,
             abort_capacity,
             lifecycle_diagnostics,
         }
@@ -2175,7 +2179,7 @@ impl ProductionManifestAttemptProjection {
                 manifest,
                 &mut plans,
                 self.runtime.native_compatibility_id,
-                self.runtime.transport_budget,
+                self.runtime.transport_budget(),
             )
             .map_err(|error| projection_message(error.to_string()))?
         };
@@ -2205,7 +2209,7 @@ impl ProductionManifestAttemptProjection {
             NativeTaskResultTransport::new(
                 &backends,
                 self.runtime.data_runtime.clone(),
-                TaskReadGrace::new(self.runtime.transport_budget.frontend_queue_residence()),
+                TaskReadGrace::new(self.runtime.transport_budget().frontend_queue_residence()),
             )
             .map_err(projection_message)?,
         );

@@ -70,6 +70,10 @@ use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessName
 use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
+use crate::control_runtime::{
+    FrontendControlRuntime, FrontendControlRuntimeConfig, FrontendShutdownError,
+    membership::MembershipShutdownError,
+};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceReader,
@@ -168,6 +172,7 @@ pub struct FrontendApplicationError {
     message: String,
     original: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
     original_cleanup: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
+    original_membership_exit: Option<Arc<MembershipShutdownError>>,
 
     #[cfg(novarocks_dev_controls)]
     root_observation_io: Option<Box<RootObservationIoSource>>,
@@ -180,6 +185,7 @@ impl FrontendApplicationError {
             message: error.to_string(),
             original: None,
             original_cleanup: None,
+            original_membership_exit: None,
 
             #[cfg(novarocks_dev_controls)]
             root_observation_io: None,
@@ -204,6 +210,9 @@ impl FrontendApplicationError {
     }
 
     fn preserve_original_cleanup(&mut self, cleanup: &Self) {
+        if self.original_membership_exit.is_none() {
+            self.original_membership_exit = cleanup.original_membership_exit.clone();
+        }
         if self.original.is_none() {
             self.original = cleanup.original.clone();
         } else if self.original_cleanup.is_none() {
@@ -268,6 +277,9 @@ impl std::error::Error for FrontendApplicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         if let Some(cause) = self.original.as_ref().or(self.original_cleanup.as_ref()) {
             return Some(cause);
+        }
+        if let Some(cause) = &self.original_membership_exit {
+            return Some(cause.as_ref());
         }
         #[cfg(novarocks_dev_controls)]
         if let Some(error) = &self.root_observation_io {
@@ -870,6 +882,8 @@ pub struct FrontendApplicationHost {
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
+    control_runtime: Option<FrontendControlRuntime>,
+    control_membership_failure: Option<Arc<MembershipShutdownError>>,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
@@ -1545,6 +1559,8 @@ impl FrontendApplicationHost {
             execution_runtime_owner,
             execution_role,
             data_runtime,
+            control_runtime: None,
+            control_membership_failure: None,
             topology: None,
             optimizer_query_mem_limit_bytes: execution.optimizer_query_mem_limit_bytes(),
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
@@ -1859,6 +1875,30 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
+        let process_observation = Arc::clone(host.topology())
+            as novarocks_query_application::api::BackendProcessObservationService;
+        let pollers = NonZeroUsize::new(host.data_runtime.handle().metrics().num_workers())
+            .expect("the role data runtime has at least one worker");
+        match FrontendControlRuntime::start(
+            FrontendControlRuntimeConfig {
+                pollers,
+                clock: Arc::clone(&host.execution_runtime_owner.clock),
+                transport: host.query_runtime.transport_budget.into_codec(),
+                history: None,
+            },
+            &host.data_runtime,
+            process_observation,
+        ) {
+            Ok(runtime) => host.control_runtime = Some(runtime),
+            Err(error) => {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        format!("start frontend control runtime: {error:?}"),
+                    ))
+                    .await);
+            }
+        }
         Ok(())
     }
 
@@ -1963,9 +2003,13 @@ impl FrontendApplicationHost {
 
     /// Pure level observation; original joins and causes stay with their owners.
     pub(crate) fn workload_progress_has_failed(&self) -> bool {
-        self.execution_runtime_owner
-            .deadline_supervisor
-            .has_exited()
+        self.control_runtime
+            .as_ref()
+            .is_some_and(FrontendControlRuntime::membership_has_exited)
+            || self
+                .execution_runtime_owner
+                .deadline_supervisor
+                .has_exited()
             || self.execution_runtime_owner.supervisor.service_has_exited()
             || self
                 .execution_runtime_owner
@@ -2021,6 +2065,16 @@ impl FrontendApplicationHost {
             self.execution_runtime_owner.close_admission();
             return Err(FrontendApplicationError::server(
                 "original statement control was not installed",
+            ));
+        }
+        if self
+            .control_runtime
+            .as_ref()
+            .is_some_and(FrontendControlRuntime::membership_has_exited)
+        {
+            self.execution_runtime_owner.close_admission();
+            return Err(FrontendApplicationError::server(
+                "frontend control membership observer exited before readiness",
             ));
         }
         self.execution_runtime_owner.mark_ready().map_err(|error| {
@@ -2237,12 +2291,15 @@ impl FrontendApplicationHost {
             Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             topology as novarocks_query_application::api::BackendProcessObservationService,
             self.data_runtime.clone(),
+            self.control_runtime
+                .as_ref()
+                .expect("frontend control runtime is installed before host open returns")
+                .attempts(),
             config.native_compatibility_id,
             config.runtime_filter_worker_count,
             config.task_update_retry_policy,
             config.split_initial_wait_cap,
             config.coordination_budgets,
-            config.transport_budget.into_codec(),
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
             Arc::clone(&self.execution_runtime_owner.clock),
@@ -2391,6 +2448,7 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .and_then(FrontendStateStoreOpening::original_failure)
                 .cloned();
+            result.original_membership_exit = self.control_membership_failure.clone();
             result
         })
     }
@@ -2403,6 +2461,9 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
+        if let Some(runtime) = self.control_runtime.take() {
+            runtime.retain_until_process_exit();
+        }
         if let Some(topology) = self.topology.as_ref()
             && let Err(error) = topology.request_heartbeat_stop_for_process_exit()
         {
@@ -2541,6 +2602,9 @@ impl FrontendApplicationHost {
     async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
+        if let Some(runtime) = &self.control_runtime {
+            runtime.close_registration();
+        }
         let mut primary_error: Option<String> = None;
         // Stop and physically settle the current Management round before WC
         // drain waits for that same Root. Keep both receivers on timeout.
@@ -2585,6 +2649,30 @@ impl FrontendApplicationHost {
             } else {
                 primary_error = Some(error);
             }
+        }
+        if let Some(runtime) = &mut self.control_runtime {
+            trace_shutdown_stage("frontend_control_join_started");
+            match runtime.shutdown_until(deadline).await {
+                Ok(()) => {}
+                Err(FrontendShutdownError::Pending(snapshot)) => {
+                    let error = format!("frontend control runtime shutdown pending: {snapshot:?}");
+                    return Err(match primary_error {
+                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                        None => error,
+                    });
+                }
+                Err(FrontendShutdownError::Membership(error)) => {
+                    let detail = error.to_string();
+                    self.control_membership_failure = Some(Arc::new(error));
+                    if let Some(primary) = primary_error.as_mut() {
+                        primary.push_str(&format!("; cleanup failed: {detail}"));
+                    } else {
+                        primary_error = Some(detail);
+                    }
+                }
+            }
+            self.control_runtime.take();
+            trace_shutdown_stage("frontend_control_join_returned");
         }
         trace_shutdown_stage("heartbeat_join_started");
         let heartbeat_error = match self.topology.as_ref() {

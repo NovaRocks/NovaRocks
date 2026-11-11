@@ -1848,10 +1848,13 @@ mod tests {
         assert!(ledger.is_empty());
         assert_eq!(custody.phase(), ExitCustodyPhase::Retired);
     }
-    struct MemberServicePort(tokio::sync::watch::Sender<u64>);
+    struct MemberServicePort(Option<tokio::sync::watch::Sender<u64>>);
     impl novarocks_query_application::api::BackendProcessObservationPort for MemberServicePort {
         fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-            self.0.subscribe()
+            self.0.as_ref().map_or_else(
+                || tokio::sync::watch::channel(0).1,
+                |source| source.subscribe(),
+            )
         }
         fn observe_process_at_endpoint(
             &self,
@@ -1864,6 +1867,53 @@ mod tests {
             Ok(novarocks_query_application::api::BackendProcessObservation::Current)
         }
     }
+
+    #[tokio::test]
+    async fn unexpected_membership_exit_remains_the_original_shutdown_failure() {
+        use crate::control_runtime::{
+            FrontendControlRuntime, FrontendControlRuntimeConfig, FrontendShutdownError,
+            membership::MembershipShutdownError,
+        };
+        let handle = tokio::runtime::Handle::current();
+        let mut data = crate::native::data_runtime::FrontendDataRuntime::new(handle.clone());
+        let mut owner = FrontendControlRuntime::start(
+            FrontendControlRuntimeConfig {
+                pollers: std::num::NonZeroUsize::new(handle.metrics().num_workers()).unwrap(),
+                clock: Arc::new(TestClock(Instant::now())),
+                transport: novarocks_task_codec::TransportBudget::DEFAULT,
+                history: None,
+            },
+            &data,
+            Arc::new(MemberServicePort(None)),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let detected = tokio::time::timeout_at(deadline.into(), async {
+            while !owner.membership_has_exited() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let shutdown = owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(detected.is_ok());
+        assert!(matches!(
+            shutdown,
+            Err(FrontendShutdownError::Membership(
+                MembershipShutdownError::SourceClosed
+            ))
+        ));
+        let snapshot = owner.shutdown_snapshot();
+        assert!(snapshot.pollers_joined && snapshot.membership_joined);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        data.drain_native_outgoing_until(deadline).await.unwrap();
+        data.drain_original_apply_until(deadline).await.unwrap();
+        data.drain_original_subscriptions_until(deadline)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_timeout_keeps_original_roles_captures_and_joins_until_actual_exit() {
         use crate::control_runtime::{
@@ -1880,15 +1930,16 @@ mod tests {
                 history: None,
             },
             &data,
-            Arc::new(MemberServicePort(tokio::sync::watch::channel(0).0)),
+            Arc::new(MemberServicePort(Some(tokio::sync::watch::channel(0).0))),
         )
         .unwrap_or_else(|e| panic!("actual FE runtime start: {e:?}"));
-        let runtime = owner.actor_runtime().clone();
-        let ledger = owner.ledger().clone();
+        let attempts = owner.attempts();
+        let runtime = attempts.actor_runtime().clone();
+        let ledger = attempts.ledger().clone();
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
-        let mut resources = owner
+        let mut resources = attempts
             .transport_capacity()
             .queue_resources(
                 novarocks_types::BackendProcessId::new_v7(),
@@ -1953,7 +2004,7 @@ mod tests {
         let captures = Arc::new(AtomicUsize::new(0));
         let held_captures = CaptureProbe(captures.clone());
         assert!(
-            owner
+            attempts
                 .register(HostBinding {
                     scope: scope.clone(),
                     registration: registration.clone(),
@@ -1988,7 +2039,7 @@ mod tests {
                 .is_ok()
         );
         let metric_registry = prometheus::Registry::new();
-        let metrics = owner.metrics(&metric_registry).unwrap();
+        let metrics = attempts.metrics(&metric_registry).unwrap();
         metrics.sample();
         let gathered = metric_registry.gather();
         let process = gathered

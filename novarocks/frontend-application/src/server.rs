@@ -947,7 +947,7 @@ pub async fn shutdown_frontend_application_to_convergence(
                 "frontend Host remained unconverged; committing the runner to process exit"
             );
             host.abandon_for_process_exit();
-            Err(first_error.with_cleanup_context(final_error))
+            Err(first_error.with_application_cleanup(final_error))
         }
     }
 }

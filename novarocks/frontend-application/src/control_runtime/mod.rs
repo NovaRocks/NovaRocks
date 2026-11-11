@@ -81,7 +81,7 @@ use std::{
 };
 
 pub(crate) struct FrontendControlRuntimeConfig {
-    /// Exactly actual_data_runtime_threads(), supplied by the real Server.
+    /// The actual worker count of the role's data runtime.
     pub(crate) pollers: NonZeroUsize,
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) transport: TransportBudget,
@@ -108,23 +108,29 @@ pub(crate) enum FrontendShutdownError {
     Membership(MembershipShutdownError),
 }
 /// The non-cloneable process owner retains every original physical Join.
-/// Reference projections below neither clone joins nor authorize new Work.
 pub(crate) struct FrontendControlRuntime {
+    attempts: Arc<FrontendAttemptRuntime>,
+    member_observer: MembershipObserver,
+    pollers: Option<PollerPool<FrontendActor>>,
+    membership_joined: bool,
+    shutdown_started: bool,
+}
+
+/// Attempt registration and its original runtime authorities. Logical
+/// launchers borrow this process registration without owning service joins.
+pub(crate) struct FrontendAttemptRuntime {
     registration_open: Mutex<bool>,
     runtime: ActorRuntime<FrontendActor>,
     ledger: RuntimeLedger,
     layout: NativeTransportCapacity,
     host: Arc<HostRegistry>,
     members: Arc<MembershipRegistry>,
-    member_observer: MembershipObserver,
     backend_processes: Arc<dyn BackendProcessObservationPort>,
     clock: Arc<dyn Clock>,
-    pollers: Option<PollerPool<FrontendActor>>,
-    membership_joined: bool,
     observation: RuntimeObservation,
     host_observation: Arc<FrontendHostObservations>,
 }
-impl FrontendControlRuntime {
+impl FrontendAttemptRuntime {
     /// Install the real host route before the application can post Bootstrap.
     /// Refusal returns the Source and its still-unpublished original position.
     pub(crate) fn register_attempt(
@@ -178,7 +184,9 @@ impl FrontendControlRuntime {
         }
         self.host.register(binding)
     }
+}
 
+impl FrontendControlRuntime {
     pub(crate) fn start(
         config: FrontendControlRuntimeConfig,
         data: &FrontendDataRuntime,
@@ -216,22 +224,43 @@ impl FrontendControlRuntime {
         // creating it adds no query Work that could block ledger drain.
         let member_observer =
             MembershipObserver::start(data, backend_processes.clone(), members.clone());
-        Ok(Self {
+        let attempts = Arc::new(FrontendAttemptRuntime {
             registration_open: Mutex::new(true),
             runtime,
             ledger,
             layout,
             host,
             members,
-            member_observer,
             backend_processes,
             clock,
-            pollers: Some(pollers),
-            membership_joined: false,
             observation,
             host_observation,
+        });
+        Ok(Self {
+            attempts,
+            member_observer,
+            pollers: Some(pollers),
+            membership_joined: false,
+            shutdown_started: false,
         })
     }
+
+    pub(crate) fn attempts(&self) -> Arc<FrontendAttemptRuntime> {
+        self.attempts.clone()
+    }
+
+    /// Fence new attempts while existing owners can still publish member
+    /// evidence and finish their original workload convergence.
+    pub(crate) fn close_registration(&self) {
+        *self
+            .attempts
+            .registration_open
+            .lock()
+            .expect("frontend registration gate") = false;
+    }
+}
+
+impl FrontendAttemptRuntime {
     pub(crate) fn prepare_attempt_process_source(
         &self,
         registration: &AttemptActorRegistration,
@@ -268,14 +297,7 @@ impl FrontendControlRuntime {
         startup: &AttemptStartup,
         target: Arc<MembershipTarget>,
     ) -> Result<(), (ActorTurnError, Arc<MembershipTarget>)> {
-        let open = self
-            .registration_open
-            .lock()
-            .expect("frontend registration gate");
         let admission = (|| {
-            if !*open {
-                return Err(ActorTurnError::Closed);
-            }
             self.runtime.validate_registration(&target.registration)?;
             if !startup.ready_for(&target.registration)? {
                 return Err(ActorTurnError::InputNotReserved);
@@ -306,34 +328,45 @@ impl FrontendControlRuntime {
             self.layout.clone(),
         )
     }
-    pub(crate) fn begin_shutdown(&self) {
-        let mut open = self
-            .registration_open
-            .lock()
-            .expect("frontend registration gate");
-        if !*open {
-            return;
-        }
-        *open = false;
-        // In-flight metadata registration has completed before this lock was
-        // acquired. Stop new member deliveries before asking Sources to drain.
-        self.members.close_delivery();
-        self.host.close_registration();
-        self.runtime.close_admission();
-        self.ledger.close_admission();
-    }
     fn drained(&self) -> bool {
         self.host.is_empty()
             && self.members.is_empty()
             && self.runtime.is_empty()
             && self.ledger.is_empty()
     }
+}
+
+impl FrontendControlRuntime {
+    fn begin_shutdown(&mut self) {
+        if self.shutdown_started {
+            return;
+        }
+        self.close_registration();
+        self.attempts.members.close_delivery();
+        self.attempts.host.close_registration();
+        self.attempts.runtime.close_admission();
+        self.attempts.ledger.close_admission();
+        self.shutdown_started = true;
+    }
+
+    pub(crate) fn membership_has_exited(&self) -> bool {
+        !self.shutdown_started && self.member_observer.has_exited()
+    }
+
+    /// The Server has exhausted graceful shutdown and committed to process
+    /// exit. Preserve the original owners if their actual exit is unresolved.
+    pub(crate) fn retain_until_process_exit(mut self) {
+        self.begin_shutdown();
+        self.member_observer.request_stop();
+        std::mem::forget(self);
+    }
+
     pub(crate) fn shutdown_snapshot(&self) -> FrontendShutdownSnapshot {
         FrontendShutdownSnapshot {
-            actors_drained: self.runtime.is_empty(),
-            ledger_drained: self.ledger.is_empty(),
-            host_routes_drained: self.host.is_empty(),
-            membership_routes_drained: self.members.is_empty(),
+            actors_drained: self.attempts.runtime.is_empty(),
+            ledger_drained: self.attempts.ledger.is_empty(),
+            host_routes_drained: self.attempts.host.is_empty(),
+            membership_routes_drained: self.attempts.members.is_empty(),
             pollers_joined: self.pollers.is_none(),
             membership_joined: self.membership_joined,
         }
@@ -346,10 +379,10 @@ impl FrontendControlRuntime {
     ) -> Result<(), FrontendShutdownError> {
         self.begin_shutdown();
         loop {
-            let changed = self.host.changed.notified();
+            let changed = self.attempts.host.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.drained() {
+            if self.attempts.drained() {
                 break;
             }
             tokio::select! {

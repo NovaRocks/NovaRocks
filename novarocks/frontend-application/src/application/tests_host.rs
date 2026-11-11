@@ -383,6 +383,14 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     let mut host = open_host(Some(state_store_input()))
         .await
         .expect("test StateStore host must open");
+    let control = host.control_runtime.as_ref().expect("role control runtime");
+    let running = control.shutdown_snapshot();
+    assert!(!running.pollers_joined && !running.membership_joined);
+    let attempts = control.attempts();
+    assert_eq!(
+        attempts.transport_capacity().transport_budget(),
+        host.query_runtime.transport_budget.into_codec()
+    );
 
     let store = host
         .state_store()
@@ -400,6 +408,8 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     host.shutdown()
         .await
         .expect("SQLite host shutdown must succeed");
+    assert!(host.control_runtime.is_none());
+    assert!(attempts.actor_runtime().is_empty() && attempts.ledger().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
