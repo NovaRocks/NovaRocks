@@ -44,6 +44,7 @@ mod queued_job;
 mod quote;
 mod receipt_input;
 mod release_wake;
+mod releases;
 mod send;
 mod send_binding;
 mod send_reports;
@@ -78,6 +79,7 @@ pub(crate) use quote::{
     SourceLayouts, original_run, original_run_for_factory, queued_input as queued_input_quote,
 };
 pub(crate) use receipt_input::NativeReceiptInput;
+pub(in crate::task_execution::host) use releases::TransportReleases;
 pub(crate) use send::{BoundSend, SendJob, run as run_send};
 pub(crate) use send_binding::{
     FrozenSendRequests, PreparedSendBatch, ResolvedBatch, SendBindingError, SendBindingRefusal,

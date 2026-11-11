@@ -549,15 +549,19 @@ impl<A: Actor> SubscriptionSource<A> {
     }
     /// Actual futures/captures exit before the SAME WC child is completed.
     /// Pending or Unknown preserves the original owner for later convergence.
+    pub(crate) fn take_owner_after_jobs(
+        &self,
+    ) -> Result<Option<WorkOwner>, SubscriptionSourceError> {
+        let mut state = self.state.lock().expect("covered original Source");
+        if state.open || !state.jobs.is_empty() {
+            return Err(SubscriptionSourceError::JobsStillLive);
+        }
+        Ok(state.owner.take())
+    }
+
+    #[cfg(test)]
     pub(crate) fn close_after_jobs(&self) -> Result<(), SubscriptionSourceError> {
-        let owner = {
-            let mut state = self.state.lock().expect("covered original Source");
-            if state.open || !state.jobs.is_empty() {
-                return Err(SubscriptionSourceError::JobsStillLive);
-            }
-            state.owner.take()
-        };
-        if let Some(owner) = owner {
+        if let Some(owner) = self.take_owner_after_jobs()? {
             owner.complete_after_terminal_cancel_settled();
         }
         Ok(())

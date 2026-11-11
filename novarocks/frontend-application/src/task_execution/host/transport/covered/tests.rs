@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::releases::TransportReleases;
 use super::*;
 use crate::{
     control_runtime::{
@@ -64,6 +65,7 @@ use novarocks_types::{
 use novarocks_workload_control::{WorkClass, WorkRequest};
 use std::{
     num::NonZeroU64,
+    sync::atomic::{AtomicBool, Ordering},
     task::Waker,
     time::{Duration, Instant},
 };
@@ -71,6 +73,8 @@ use std::{
 struct HostSource {
     subscriptions: AttemptSubscriptions,
     control: AttemptCallSource,
+    releases: TransportReleases,
+    sources_retired: Arc<AtomicBool>,
     open_pending: bool,
     scope: ScopeHandle,
     closing: bool,
@@ -156,19 +160,45 @@ impl EffectSource for HostSource {
         _: Tick,
         budget: usize,
     ) -> SourceProgress {
-        let mut original = self
-            .subscriptions
-            .progress(false, self.closing, true, budget, drop);
+        let release_visit = usize::from(budget != 0 && self.releases.has_work());
+        let released = release_visit != 0
+            && self
+                .releases
+                .progress(&self.control)
+                .unwrap_or_else(|failure| std::panic::resume_unwind(Box::new(failure)));
+        let accepts = self.releases.accepts_batch();
+        let allowance = if accepts {
+            (budget - release_visit).min(1)
+        } else {
+            0
+        };
+        let mut original =
+            self.subscriptions
+                .progress(false, self.closing, true, allowance, |capture| {
+                    self.releases.retain(capture)
+                });
+        original.units += release_visit;
+        original.more &= accepts;
+        original.more |= released || original.progressed && self.releases.has_work();
+        original.progressed |= released;
         if original.units < budget {
             original.progressed |= self.control.retire_result().unwrap();
-            if self.closing {
+            if self.closing && self.releases.accepts_batch() {
                 original.progressed |= self.control.close_idle().unwrap();
-                drop(self.control.take_drained_owner());
+                if let Some(owner) = self.control.take_drained_owner() {
+                    self.releases
+                        .retain(ReleaseCapture::Original(Box::new(owner)));
+                    original.progressed = true;
+                    original.more = true;
+                }
             }
             original.units += 1;
         }
-        original.retired &=
-            self.closing && self.control.is_drained() && self.scope.join_ready().unwrap();
+        original.retired &= self.closing && self.control.is_drained() && self.releases.is_empty();
+        if original.retired {
+            self.sources_retired.store(true, Ordering::Release);
+            original.retired = self.scope.join_ready().unwrap();
+        }
         original
     }
 }
@@ -356,6 +386,9 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
             ProcessClock::default(),
         ))),
     );
+    let transport =
+        TransportRetirements::new(runtime.clone(), registration.clone(), handle.clone(), 3);
+    let sources_retired = Arc::new(AtomicBool::new(false));
     let mut exit = host
         .register(HostBinding {
             scope: scope.clone(),
@@ -373,17 +406,14 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
             source: Box::new(HostSource {
                 subscriptions,
                 control,
+                releases: TransportReleases::new(handle.clone(), transport.host_waker()),
+                sources_retired: sources_retired.clone(),
                 open_pending: false,
                 scope: scope.clone(),
                 closing: false,
             }),
             executor: Arc::new(ActorTransportExecutor(handle.clone())),
-            transport: Some(TransportRetirements::new(
-                runtime.clone(),
-                registration.clone(),
-                handle,
-                3,
-            )),
+            transport: Some(transport),
             startup: None,
             capacity: None,
             membership: None,
@@ -505,13 +535,14 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
 
     exit.request_close().unwrap();
     tokio::time::timeout(wait, async {
-        while original.scope().is_ok() {
+        while !sources_retired.load(Ordering::Acquire) {
             drive();
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
+    assert!(original.scope().is_err());
     assert!(original.applied_request(request.generation).is_err());
     ingress.close_after_exit().unwrap();
     drop((progress, ingress, original));

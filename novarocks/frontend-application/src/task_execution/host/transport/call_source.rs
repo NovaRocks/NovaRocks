@@ -414,6 +414,43 @@ impl AttemptCallSource {
             }) => WorkKind::Business,
             _ => WorkKind::Settlement,
         };
+        let work = match self.reserve_work(self.generation, kind) {
+            Ok(work) => work,
+            Err(
+                RuntimeError::Scope(error) | RuntimeError::Capacity(CapacityError::Scope(error)),
+            ) if matches!(
+                error,
+                ScopeError::Failed | ScopeError::GenerationMismatch | ScopeError::Stopped
+            ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        self.pending = Some((effect.clone(), work));
+        Ok(self.idle.take())
+    }
+
+    pub(super) fn reserve_disposal(&self) -> Result<ReportedWork, RuntimeError> {
+        self.reserve_work(self.scope.snapshot()?.generation, WorkKind::Cleanup)
+    }
+
+    pub(super) fn observer(&self) -> ConsumerId {
+        self.observer
+    }
+
+    pub(super) fn reap_disposal(
+        &self,
+        header: &novarocks_control_runtime::obligation::WorkRetirementObserver,
+    ) -> Result<bool, RuntimeError> {
+        self.scope.reap_observed_header(header)
+    }
+
+    fn reserve_work(
+        &self,
+        generation: Generation,
+        kind: WorkKind,
+    ) -> Result<ReportedWork, RuntimeError> {
         let resources = ReservationResources::new(
             ResourceVector::default(),
             OwnedSlotNeed {
@@ -423,35 +460,18 @@ impl AttemptCallSource {
                 ..Default::default()
             },
         );
-        let guard =
-            match self
-                .scope
-                .reserve_child_next(self.generation, self.parent, resources, kind)
-            {
-                Ok(guard) => guard,
-                Err(
-                    RuntimeError::Scope(error)
-                    | RuntimeError::Capacity(CapacityError::Scope(error)),
-                ) if matches!(
-                    error,
-                    ScopeError::Failed | ScopeError::GenerationMismatch | ScopeError::Stopped
-                ) =>
-                {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
+        let guard = self
+            .scope
+            .reserve_child_next(generation, self.parent, resources, kind)?;
         let (work, mut payer) = guard.bind(kind).expect("original call child guard");
         let report = ReportSlot::reserve_next(
             &mut payer,
-            self.generation,
+            generation,
             1,
             [(self.observer, ConsumerKind::Observer)],
         )
         .expect("original call exit report");
-        let work = ReportedWork::try_new(work, payer, report).expect("same original call work");
-        self.pending = Some((effect.clone(), work));
-        Ok(self.idle.take())
+        Ok(ReportedWork::try_new(work, payer, report).expect("same original call work"))
     }
 
     pub(crate) fn bind(

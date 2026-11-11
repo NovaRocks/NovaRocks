@@ -337,6 +337,122 @@ fn disposal_work(
     let work = run_blocking(exit, move || body.dispose(), panic);
     move || work.run()
 }
+
+/// Owns an original host capture until its credentialed blocking disposal
+/// returns. A rejected handoff or a work that never starts keeps the capture
+/// here, including when Tokio drops its unstarted closure.
+#[must_use = "observe the original blocking disposal and retire its Work"]
+pub(crate) struct HostDisposal<T> {
+    role: Arc<OriginalRole<Result<(), ExitWorkError>>>,
+    _capture: Arc<Mutex<Option<ManuallyDrop<T>>>>,
+}
+
+type HostPanic = Box<dyn std::any::Any + Send>;
+
+fn host_disposal_work<T>(
+    exit: ExitObligation,
+    body: Arc<Mutex<Option<ManuallyDrop<T>>>>,
+    dispose: fn(T),
+    panic: PanicSink,
+) -> impl FnOnce() -> Result<(), ExitWorkError> {
+    let work = run_blocking(
+        exit,
+        move || {
+            let original = body.lock().expect("original host disposal").take();
+            dispose(ManuallyDrop::into_inner(
+                original.expect("one original host capture"),
+            ));
+        },
+        panic,
+    );
+    move || work.run()
+}
+
+impl<T: Send + 'static> HostDisposal<T> {
+    pub(crate) fn start(
+        runtime: &Handle,
+        original: ReportedWork,
+        observer: ConsumerId,
+        capture: T,
+        dispose: fn(T),
+    ) -> Result<Self, (CustodyRefusal, T)> {
+        let panic = PanicSink::new();
+        let (role, exit) = match OriginalRole::new(original, observer, panic.clone()) {
+            Ok(value) => value,
+            Err(refused) => return Err((refused, capture)),
+        };
+        let capture = Arc::new(Mutex::new(Some(ManuallyDrop::new(capture))));
+        let work = host_disposal_work(exit, Arc::clone(&capture), dispose, panic);
+        match catch_unwind(AssertUnwindSafe(|| runtime.spawn_blocking(work))) {
+            Ok(join) => role.install_join(join),
+            Err(cause) => role.record_handoff_failure(cause),
+        }
+        Ok(Self {
+            role,
+            _capture: capture,
+        })
+    }
+
+    pub(crate) fn poll_complete(&self, cx: &mut Context<'_>) -> Poll<Result<(), CustodyError>> {
+        self.role.poll_disposal(cx)
+    }
+
+    pub(crate) fn take_failure(&self) -> (Option<HostPanic>, Option<JoinError>, Option<HostPanic>) {
+        (
+            self.role.take_handoff_failure(),
+            self.role.take_join_failure(),
+            self.role.take_work_panic(),
+        )
+    }
+
+    pub(crate) fn backing_layouts() -> Result<
+        [std::alloc::Layout; 5],
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    > {
+        use novarocks_type_contract::owned_resources::layout::arc_layout;
+        use std::alloc::Layout;
+        fn carrier<T, F>(
+            _: fn(ExitObligation, Arc<Mutex<Option<ManuallyDrop<T>>>>, fn(T), PanicSink) -> F,
+        ) -> Layout {
+            Layout::new::<F>()
+        }
+        Ok([
+            arc_layout(Layout::new::<OriginalRole<Result<(), ExitWorkError>>>())?,
+            arc_layout(ExitCustody::backing_payload_layout())?,
+            arc_layout(PanicSink::backing_payload_layout())?,
+            arc_layout(Layout::new::<Mutex<Option<ManuallyDrop<T>>>>())?,
+            carrier(host_disposal_work::<T>),
+        ])
+    }
+}
+
+impl OriginalRole<Result<(), ExitWorkError>> {
+    fn poll_disposal(self: &Arc<Self>, cx: &mut Context<'_>) -> Poll<Result<(), CustodyError>> {
+        match self.poll_join(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        {
+            let state = self.joined.lock().unwrap_or_else(|e| e.into_inner());
+            if state.join_failed {
+                return Poll::Ready(Err(CustodyError::OriginalJoinFailed));
+            }
+            if !matches!(state.outcome, Some(Ok(()))) || self.panic.has_panic() {
+                return Poll::Ready(Err(CustodyError::OriginalWorkFailed));
+            }
+        }
+        if let Err(error) = self.resolve_local_report() {
+            return Poll::Ready(Err(error));
+        }
+        match self.retire() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
 impl OriginalDisposalObligation {
     pub(crate) fn start(
         runtime: &Handle,
@@ -387,29 +503,12 @@ impl OriginalDisposalObligation {
         if self.original.is_none() {
             return Poll::Ready(Err(CustodyError::CompletionAlreadyIssued));
         }
-        match self.role.poll_join(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        {
-            let state = self.role.joined.lock().unwrap_or_else(|e| e.into_inner());
-            if state.join_failed {
-                return Poll::Ready(Err(CustodyError::OriginalJoinFailed));
-            }
-            if !matches!(state.outcome, Some(Ok(()))) || self.role.panic.has_panic() {
-                return Poll::Ready(Err(CustodyError::OriginalWorkFailed));
-            }
-        }
-        if let Err(e) = self.role.resolve_local_report() {
-            return Poll::Ready(Err(e));
-        }
-        match self.role.retire() {
-            Ok(true) => Poll::Ready(Ok(NativeDisposalCompletion {
+        match self.role.poll_disposal(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(NativeDisposalCompletion {
                 original: self.original.take().unwrap(),
             })),
-            Ok(false) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

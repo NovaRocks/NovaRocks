@@ -22,6 +22,7 @@ use super::{
     AttemptSubscriptions, BodyOutcome, FrozenSendRequests, NativeProgressInput, NativeReceiptInput,
     PreparedActorSend, SendContext, SendKey, SendMemberReport, SendReportRows,
     call_source::{AttemptCallReply, TransportRelease},
+    releases::{ReleaseCapture, TransportReleases},
     send_reports::close_unlaunched,
 };
 use crate::{
@@ -71,7 +72,7 @@ use novarocks_types::BackendProcessId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Weak},
-    task::Poll,
+    task::{Poll, Waker},
 };
 
 type Position = CausalInputObligation<FrontendActor>;
@@ -153,6 +154,7 @@ pub(crate) struct AttemptTransportSource {
     abort_scan: usize,
     in_flight: BTreeSet<AttemptActionId>,
     external_closed: bool,
+    releases: Option<TransportReleases>,
     other: Box<dyn EffectSource>,
 }
 
@@ -206,8 +208,15 @@ impl AttemptTransportSource {
             supervisor: Some(Supervisor::Armed(failure.1)),
             in_flight: BTreeSet::new(),
             external_closed: false,
+            releases: None,
             other,
         }
+    }
+
+    pub(crate) fn with_releases(mut self, executor: tokio::runtime::Handle, wake: Waker) -> Self {
+        assert!(self.calls[3].is_some());
+        self.releases = Some(TransportReleases::new(executor, wake));
+        self
     }
 
     fn advance_supervisor(&mut self, turn: &ActorHostTurn<FrontendActor>) -> bool {
@@ -727,7 +736,11 @@ impl EffectSource for AttemptTransportSource {
                         self.other.retain_transport_failure(Box::new(refused));
                     }
                     if let Some(original) = source.take_refused_root_input() {
-                        self.other.retain_transport_release(Box::new(original));
+                        if let Some(releases) = &mut self.releases {
+                            releases.retain_refused_root(Box::new(original));
+                        } else {
+                            self.other.retain_transport_release(Box::new(original));
+                        }
                     }
                 }
                 TransportSourceEvent::Retired => {
@@ -846,6 +859,16 @@ impl EffectSource for AttemptTransportSource {
     ) -> SourceProgress {
         let mut units = 0;
         let mut progressed = false;
+        let mut release_advanced = false;
+        if budget != 0
+            && let Some(releases) = self.releases.as_mut().filter(|source| source.has_work())
+        {
+            units += 1;
+            match releases.progress(self.calls[3].as_ref().expect("original release author")) {
+                Ok(changed) => release_advanced = changed,
+                Err(error) => self.other.retain_transport_failure(Box::new(error)),
+            }
+        }
         let closing = self.result_admission_closed();
         // A terminal already in flight can still claim an exact raw error
         // from any call Source. Dispose unselected rows only after all paid
@@ -870,31 +893,53 @@ impl EffectSource for AttemptTransportSource {
             };
             units += 1;
             progressed |= source.retire_result().expect("original call result");
-            if closing {
+            if closing
+                && self
+                    .releases
+                    .as_ref()
+                    .is_none_or(TransportReleases::accepts_batch)
+            {
                 progressed |= source.close_idle().expect("original idle call role");
                 if retire_failures && let Some(original) = source.take_unselected_failure() {
-                    self.other.retain_transport_release(Box::new(original));
+                    retain_release(
+                        &mut self.releases,
+                        &mut self.other,
+                        ReleaseCapture::Original(Box::new(original)),
+                    );
                     progressed = true;
                 }
                 if let Some(original) = source.take_drained_owner() {
-                    self.other.retain_transport_release(Box::new(original));
+                    retain_release(
+                        &mut self.releases,
+                        &mut self.other,
+                        ReleaseCapture::Original(Box::new(original)),
+                    );
                     progressed = true;
                 }
             }
         }
+        let release_accepting = self
+            .releases
+            .as_ref()
+            .is_none_or(TransportReleases::accepts_batch);
         let subscription_progress = self.subscriptions.as_mut().map(|subscriptions| {
             let failed = self
                 .runtime
                 .snapshot(self.registration.actor())
                 .expect("original subscription host")
                 .failed;
+            let allowance = if release_accepting {
+                (budget - units).min(1)
+            } else {
+                0
+            };
             subscriptions.progress(
                 failed,
                 closing || self.external_closed,
                 retire_failures,
-                (budget - units).min(1),
+                allowance,
                 |original| {
-                    self.other.retain_transport_release(original);
+                    retain_release(&mut self.releases, &mut self.other, original);
                 },
             )
         });
@@ -991,9 +1036,16 @@ impl EffectSource for AttemptTransportSource {
                 && self.failed_sends.is_empty()
                 && self.admission.is_drained()
                 && !self.requests.is_empty()
+                && self
+                    .releases
+                    .as_ref()
+                    .is_none_or(TransportReleases::accepts_batch)
             {
-                self.other
-                    .retain_transport_release(Box::new(std::mem::take(&mut self.requests)));
+                retain_release(
+                    &mut self.releases,
+                    &mut self.other,
+                    ReleaseCapture::Original(Box::new(std::mem::take(&mut self.requests))),
+                );
                 units += 1;
                 progressed = true;
             }
@@ -1002,14 +1054,20 @@ impl EffectSource for AttemptTransportSource {
             .other
             .progress_retirement(runtime, turn, now, budget - units);
         progress.units += units;
-        progress.progressed |= progressed || supervisor_advanced;
+        progress.progressed |= progressed || supervisor_advanced || release_advanced;
         progress.more |= subscription_progress
             .as_ref()
-            .is_some_and(|progress| progress.more)
+            .is_some_and(|progress| release_accepting && progress.more)
             || supervisor_advanced
             || self.abort_scan != 0
             || self.admission_scan != 0
             || self.send_scan != 0
+            || release_advanced
+            || (budget == 0 || progressed)
+                && self
+                    .releases
+                    .as_ref()
+                    .is_some_and(TransportReleases::has_work)
             || progressed && self.result_admission_closed();
         progress.retired &= subscription_progress.is_none_or(|progress| progress.retired)
             && self.supervisor.is_none()
@@ -1023,8 +1081,26 @@ impl EffectSource for AttemptTransportSource {
             && self.send_live.is_empty()
             && self.failed_sends.is_empty()
             && self.requests.is_empty()
+            && self
+                .releases
+                .as_ref()
+                .is_none_or(TransportReleases::is_empty)
             && self.admission.is_drained();
         progress
+    }
+}
+
+fn retain_release(
+    releases: &mut Option<TransportReleases>,
+    other: &mut Box<dyn EffectSource>,
+    original: ReleaseCapture,
+) {
+    if let Some(releases) = releases {
+        releases.retain(original);
+    } else if let ReleaseCapture::Original(original) = original {
+        other.retain_transport_release(original);
+    } else {
+        unreachable!("subscription Source requires its original blocking release owner");
     }
 }
 

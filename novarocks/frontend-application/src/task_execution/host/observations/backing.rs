@@ -96,6 +96,7 @@ impl ObservationBackingQuote {
                 budget.total_positions,
                 participants,
             )?,
+            crate::task_execution::host::transport::TransportReleases::backing_bytes()?,
             arc::<PaidObservationMetadata>()?.size(),
             arc::<BackingCharge>()?.size(),
             Layout::new::<ObservationBackingPin>().size(),

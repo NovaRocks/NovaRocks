@@ -19,7 +19,7 @@
 
 use super::{
     ActorTransportWork, AttemptCallOwner, AttemptCallSource, BodyOutcome,
-    call_source::AttemptCallReply,
+    call_source::AttemptCallReply, releases::ReleaseCapture,
 };
 use crate::{
     control_runtime::{
@@ -548,7 +548,7 @@ impl AttemptSubscriptions {
         closing: bool,
         retire_failures: bool,
         budget: usize,
-        mut dispose: impl FnMut(Box<dyn Any + Send>),
+        mut dispose: impl FnMut(ReleaseCapture),
     ) -> SourceProgress {
         self.closing |= failed || closing;
         let mut units = 0;
@@ -585,10 +585,13 @@ impl AttemptSubscriptions {
             while units < budget
                 && let Some((participation, mut call)) = self.calls.pop_first()
             {
-                self.endpoints.as_ref().unwrap()[&participation]
+                if let Some(owner) = self.endpoints.as_ref().unwrap()[&participation]
                     .source
-                    .close_after_jobs()
-                    .expect("all original subscription generations reaped");
+                    .take_owner_after_jobs()
+                    .expect("all original subscription generations reaped")
+                {
+                    dispose(ReleaseCapture::Subscription(owner));
+                }
                 assert!(
                     call.close_idle()
                         .expect("original subscription result position")
@@ -601,7 +604,7 @@ impl AttemptSubscriptions {
                 while units < budget
                     && let Some((_, original)) = self.terminal_failures.pop_first()
                 {
-                    dispose(Box::new(original));
+                    dispose(ReleaseCapture::Original(Box::new(original)));
                     progressed = true;
                     units += 1;
                 }
@@ -611,7 +614,7 @@ impl AttemptSubscriptions {
                 && self.terminal_failures.is_empty()
                 && let Some(original) = self.endpoints.take()
             {
-                dispose(Box::new(original));
+                dispose(ReleaseCapture::Original(Box::new(original)));
                 progressed = true;
                 units += 1;
             }
@@ -630,7 +633,7 @@ impl AttemptSubscriptions {
         &mut self,
         effect: AttemptActionId,
         failed: bool,
-        dispose: &mut impl FnMut(Box<dyn Any + Send>),
+        dispose: &mut impl FnMut(ReleaseCapture),
     ) -> (bool, bool) {
         let row = self
             .active
@@ -688,7 +691,7 @@ impl AttemptSubscriptions {
         if row.registered {
             let endpoint = &self.endpoints.as_ref().unwrap()[&row.key.participation];
             match endpoint.source.reap_generation(row.key.generation) {
-                Ok(original) => dispose(Box::new(original)),
+                Ok(original) => dispose(ReleaseCapture::Original(Box::new(original))),
                 Err(
                     SubscriptionSourceError::JobsStillLive
                     | SubscriptionSourceError::Ingress(ObservationError::Busy),
@@ -709,7 +712,7 @@ impl AttemptSubscriptions {
                     .is_none()
             );
         } else {
-            dispose(Box::new(row.failure));
+            dispose(ReleaseCapture::Original(Box::new(row.failure)));
         }
         (true, true)
     }

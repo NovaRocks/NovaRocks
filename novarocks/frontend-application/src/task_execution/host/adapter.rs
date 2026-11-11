@@ -826,38 +826,41 @@ impl AttemptActorRegistration {
                 membership: None,
                 owner_controls: Some(owner_controls),
                 ordered_observations: Some(ordered_host),
-                source: Box::new(super::transport::AttemptTransportSource::new(
-                    runtime.clone(),
-                    self.original.clone(),
-                    self.native_source,
-                    self.scope.clone(),
-                    admission,
-                    [
-                        Some(qa),
-                        Some(process),
-                        Some(publication),
-                        Some(release),
-                        Some(read_confirmation),
-                        Some(subscription_control),
-                    ],
-                    Some(subscriptions),
-                    send,
-                    (
-                        FailureContext {
-                            lifecycle: self
-                                .failure_lifecycle
-                                .take()
-                                .expect("original failure lifecycle"),
-                            publications: self.failure_publications.clone(),
-                        },
-                        super::transport::AttemptFailureBinding {
-                            supervisor: failure,
-                            port: Box::new(cleanup),
-                            abort_drain: Some(abort_retirement),
-                        },
-                    ),
-                    source,
-                )),
+                source: Box::new(
+                    super::transport::AttemptTransportSource::new(
+                        runtime.clone(),
+                        self.original.clone(),
+                        self.native_source,
+                        self.scope.clone(),
+                        admission,
+                        [
+                            Some(qa),
+                            Some(process),
+                            Some(publication),
+                            Some(release),
+                            Some(read_confirmation),
+                            Some(subscription_control),
+                        ],
+                        Some(subscriptions),
+                        send,
+                        (
+                            FailureContext {
+                                lifecycle: self
+                                    .failure_lifecycle
+                                    .take()
+                                    .expect("original failure lifecycle"),
+                                publications: self.failure_publications.clone(),
+                            },
+                            super::transport::AttemptFailureBinding {
+                                supervisor: failure,
+                                port: Box::new(cleanup),
+                                abort_drain: Some(abort_retirement),
+                            },
+                        ),
+                        source,
+                    )
+                    .with_releases(native.0.clone(), retirement.host_waker()),
+                ),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
                     native,
                     other: executor.clone(),
