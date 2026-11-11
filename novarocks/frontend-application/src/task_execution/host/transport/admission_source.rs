@@ -200,6 +200,24 @@ impl AdmissionSource {
             .is_none_or(|row| row.claimed.is_none())
     }
 
+    pub(super) fn split_payload_claimed(&self, payload: PayloadRef) -> Option<bool> {
+        self.payloads
+            .get(&payload)
+            .filter(|row| row.creation.is_none())
+            .map(|row| row.claimed.is_some())
+    }
+
+    pub(super) fn take_split_payload_pin(
+        &mut self,
+        payload: PayloadRef,
+    ) -> Option<ExistingOwnerRetentionPin> {
+        assert_eq!(self.split_payload_claimed(payload), Some(false));
+        self.payloads
+            .remove(&payload)
+            .expect("original split admission payload")
+            .pin
+    }
+
     pub(crate) fn take_creation(
         &mut self,
         task: TaskIdentity,

@@ -16,12 +16,20 @@
 // under the License.
 
 use super::{
-    AttemptEstablishMaterial, GrantedInputs, QueueCustody, QueueWindow, SendInputLoan, SendKey,
+    AdmissionSource, AttemptEstablishMaterial, GrantedInputs, QueueCustody, QueueWindow,
+    SendInputLoan, SendKey,
 };
 use crate::{
     control_runtime::transport_withdrawal::AttemptEffectEnvelope,
     task_execution::{
-        creation::CreateTaskIntent, host::custody::TransportJoinRegistration,
+        creation::CreateTaskIntent,
+        host::{
+            custody::TransportJoinRegistration,
+            pumps::{
+                split::SplitPayloadRegistration,
+                split_source::{SplitPayloadError, SplitPayloadStore},
+            },
+        },
         intent::OperationIntent,
     },
 };
@@ -29,10 +37,16 @@ use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent as ProtocolIntent, TaskDomainIntent},
     start::PayloadRef,
 };
-use novarocks_execution_contract::{TaskDomainUpdate, TaskIdentity, TaskOperationId, UpdateTask};
+use novarocks_execution_contract::{
+    OperationEnvelope, SplitAssignmentIntent, TaskDomainUpdate, TaskIdentity, TaskOperationId,
+    UpdateTask,
+};
+use novarocks_resource_contract::ExistingOwnerRetentionPin;
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    num::NonZeroU64,
+    sync::{Arc, OnceLock},
 };
 
 /// Holds each frozen rich request once for its logical operation. Physical
@@ -41,8 +55,71 @@ use std::{
 pub(crate) struct FrozenSendRequests {
     originals: BTreeMap<TaskOperationId, OperationIntent>,
     creation_payloads: BTreeMap<PayloadRef, TaskOperationId>,
+    split_payloads: BTreeMap<PayloadRef, FrozenSplitPayload>,
     establish: Option<Arc<AttemptEstablishMaterial>>,
 }
+
+struct FrozenSplitPayload {
+    task: TaskIdentity,
+    assignment: SplitAssignmentIntent,
+    request: OnceLock<Arc<UpdateTask>>,
+}
+
+pub(super) struct NativeSplitPayloadStore<'a> {
+    pub(super) requests: &'a mut FrozenSendRequests,
+    pub(super) admission: &'a mut AdmissionSource,
+    pub(super) next: &'a mut NonZeroU64,
+}
+
+struct DetachedSplitPayload {
+    _request: FrozenSplitPayload,
+    _pin: Option<ExistingOwnerRetentionPin>,
+}
+
+impl SplitPayloadStore for NativeSplitPayloadStore<'_> {
+    fn install(
+        &mut self,
+        original: &SplitPayloadRegistration,
+    ) -> Result<Option<PayloadRef>, SplitPayloadError> {
+        let reference = PayloadRef(*self.next);
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or(SplitPayloadError::ReferenceExhausted)?;
+        if !self.requests.payload_ref_is_unused(reference)
+            || !self
+                .admission
+                .install_payload(reference, original.backing_bytes)
+        {
+            return Err(SplitPayloadError::DuplicateReference);
+        }
+        self.requests.install_split_payload(reference, original);
+        *self.next = next;
+        Ok(Some(reference))
+    }
+
+    fn detach(
+        &mut self,
+        reference: PayloadRef,
+    ) -> Result<Option<Box<dyn Any + Send>>, SplitPayloadError> {
+        let unaliased = self
+            .requests
+            .split_payload_unaliased(reference)
+            .ok_or(SplitPayloadError::MissingReference)?;
+        let claimed = self
+            .admission
+            .split_payload_claimed(reference)
+            .ok_or(SplitPayloadError::MissingReference)?;
+        if !unaliased || claimed {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(DetachedSplitPayload {
+            _request: self.requests.take_split_payload(reference),
+            _pin: self.admission.take_split_payload_pin(reference),
+        })))
+    }
+}
+
 impl FrozenSendRequests {
     pub(crate) fn with_establish(establish: Arc<AttemptEstablishMaterial>) -> Self {
         Self {
@@ -79,8 +156,7 @@ impl FrozenSendRequests {
         operation: TaskOperationId,
         creation: &mut Option<CreateTaskIntent>,
     ) -> bool {
-        if self.originals.contains_key(&operation) || self.creation_payloads.contains_key(&payload)
-        {
+        if self.originals.contains_key(&operation) || !self.payload_ref_is_unused(payload) {
             return false;
         }
         let original = creation.take().expect("original admitted creation");
@@ -105,8 +181,98 @@ impl FrozenSendRequests {
         self.originals.remove(&operation)
     }
 
+    fn payload_ref_is_unused(&self, reference: PayloadRef) -> bool {
+        !self.creation_payloads.contains_key(&reference)
+            && !self.split_payloads.contains_key(&reference)
+    }
+
+    fn install_split_payload(
+        &mut self,
+        reference: PayloadRef,
+        original: &SplitPayloadRegistration,
+    ) {
+        assert!(self.payload_ref_is_unused(reference));
+        self.split_payloads.insert(
+            reference,
+            FrozenSplitPayload {
+                task: original.task,
+                assignment: original.assignment.clone(),
+                request: OnceLock::new(),
+            },
+        );
+    }
+
+    fn split_payload_unaliased(&self, reference: PayloadRef) -> Option<bool> {
+        let payload = self.split_payloads.get(&reference)?;
+        // Only this host can clone the canonical request once the executor
+        // has returned its final alias. Existing send owners keep it live.
+        Some(
+            payload
+                .request
+                .get()
+                .is_none_or(|request| Arc::strong_count(request) == 1),
+        )
+    }
+
+    fn take_split_payload(&mut self, reference: PayloadRef) -> FrozenSplitPayload {
+        assert_eq!(self.split_payload_unaliased(reference), Some(true));
+        self.split_payloads
+            .remove(&reference)
+            .expect("original split payload")
+    }
+
+    fn resolve_split_payload(
+        &self,
+        envelope: OperationEnvelope,
+        identity: TaskIdentity,
+        domain: &TaskDomainIntent,
+    ) -> Result<OperationIntent, SendBindingError> {
+        let TaskDomainIntent::SplitAssignment {
+            node,
+            offer,
+            payload,
+            queued_bytes,
+        } = domain
+        else {
+            unreachable!("original split domain");
+        };
+        let original = self
+            .split_payloads
+            .get(payload)
+            .ok_or(SendBindingError::MissingRequest)?;
+        if original.task != identity
+            || original.assignment.node() != *node
+            || original.assignment.offer() != *offer
+            || original.assignment.payload().encoded_len() != *queued_bytes
+        {
+            return Err(SendBindingError::WrongRequest);
+        }
+        if original.request.get().is_none() {
+            let request = UpdateTask::try_new(
+                envelope.operation_id(),
+                identity,
+                vec![TaskDomainUpdate::SplitAssignment(
+                    original.assignment.clone(),
+                )],
+            )
+            .map_err(|_| SendBindingError::WrongRequest)?;
+            if request.envelope() != envelope {
+                return Err(SendBindingError::WrongRequest);
+            }
+            assert!(original.request.set(Arc::new(request)).is_ok());
+        }
+        let request = original
+            .request
+            .get()
+            .expect("original frozen split request");
+        if request.envelope() != envelope {
+            return Err(SendBindingError::WrongRequest);
+        }
+        Ok(OperationIntent::UpdateTask(request.clone()))
+    }
+
     pub(super) fn is_empty(&self) -> bool {
-        self.originals.is_empty() && self.establish.is_none()
+        self.originals.is_empty() && self.split_payloads.is_empty() && self.establish.is_none()
     }
 
     /// These lifecycle commands already carry the complete immutable
@@ -137,6 +303,13 @@ impl FrozenSendRequests {
                         .ok_or(SendBindingError::MissingRequest)?
                         .resolve(passive)?,
                 )
+            }
+            ProtocolIntent::UpdateTask {
+                envelope,
+                identity,
+                domains,
+            } if matches!(domains.as_ref(), [TaskDomainIntent::SplitAssignment { .. }]) => {
+                self.resolve_split_payload(*envelope, *identity, &domains[0])?
             }
             ProtocolIntent::UpdateTask {
                 envelope,
@@ -635,5 +808,116 @@ mod tests {
                 assert_eq!(encode_operation(&projected, &wire).unwrap(), original);
             }
         }
+    }
+
+    #[test]
+    fn split_native_request_keeps_its_original_binding_through_replay_and_alias_exit() {
+        use super::super::queue_input::tests::Governed;
+        use novarocks_attempt_protocol::input::SplitDeliveryRef;
+        use novarocks_control_runtime::transaction::RuntimeLedger;
+        use novarocks_control_runtime_core::{
+            capacity::{ReservationResources, ResourceVector},
+            identity::{ConsumerId, Generation},
+            scope::{WorkAdmission, WorkKind},
+        };
+        use novarocks_execution_contract::{PlanNodeId, SplitOffer};
+        use novarocks_proto_models::connector_read::SplitAssignment;
+        use novarocks_task_codec::domain::wire_split_assignment;
+        use novarocks_types::{StageId, TaskId};
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut parent, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        parent.start().unwrap();
+        let wc = Governed::new();
+        let mut admission = AdmissionSource::new(
+            &parent,
+            &payer,
+            generation,
+            ConsumerId::new(1).unwrap(),
+            wc.authority(),
+            Default::default(),
+        )
+        .unwrap_or_else(|_| panic!("original split payer"));
+        let mut requests = FrozenSendRequests::default();
+        let mut next = NonZeroU64::MIN;
+        let execution =
+            QueryExecutionId::new(QueryId::new(7, 8), AttemptId::new(1).unwrap()).unwrap();
+        let task = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let node = PlanNodeId::new(7).unwrap();
+        let original = wire_split_assignment(SplitAssignment {
+            plan_node_id: 7,
+            no_more_splits: true,
+            splits: Vec::new(),
+        });
+        let row = SplitPayloadRegistration {
+            delivery: SplitDeliveryRef(NonZeroU64::MIN),
+            task,
+            assignment: SplitAssignmentIntent::new(node, SplitOffer::Seal, original.clone()),
+            backing_bytes: 256,
+        };
+        let mut store = NativeSplitPayloadStore {
+            requests: &mut requests,
+            admission: &mut admission,
+            next: &mut next,
+        };
+        let payload = store.install(&row).unwrap().unwrap();
+        let envelope = OperationEnvelope::with_default_wait(
+            TaskOperationId::new_v7(),
+            OperationKind::UpdateTask,
+        );
+        let passive = ProtocolIntent::UpdateTask {
+            envelope,
+            identity: task,
+            domains: Arc::from([TaskDomainIntent::SplitAssignment {
+                node,
+                offer: SplitOffer::Seal,
+                payload,
+                queued_bytes: original.encoded_len(),
+            }]),
+        };
+        let OperationIntent::UpdateTask(first) = store.requests.resolve(&passive).unwrap() else {
+            panic!("split update")
+        };
+        let OperationIntent::UpdateTask(replay) = store.requests.resolve(&passive).unwrap() else {
+            panic!("split replay")
+        };
+        let [TaskDomainUpdate::SplitAssignment(assignment)] = first.domains() else {
+            panic!("original split assignment")
+        };
+        assert!(Arc::ptr_eq(assignment.payload(), &original));
+        assert!(Arc::ptr_eq(&first, &replay));
+        assert!(store.detach(payload).unwrap().is_none());
+        drop((first, replay));
+        drop(store.detach(payload).unwrap().unwrap());
+        assert!(requests.is_empty() && admission.is_drained());
+        drop(admission);
+        assert!(wc.finish());
+        parent.body_exited().unwrap();
+        parent.captures_exited().unwrap();
+        payer.finish().unwrap();
+        assert!(
+            scope
+                .reap_observed_header(&parent.retirement_observer())
+                .unwrap()
+        );
+        scope.close_external().unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
     }
 }
