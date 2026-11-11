@@ -104,6 +104,46 @@ impl FrozenBucket {
     }
 }
 
+#[derive(Debug)]
+struct PathPositionBucket {
+    bucket: Arc<FrozenBucket>,
+    /// The last member with a partition distinct from the newest member's.
+    last_conflict: Option<usize>,
+}
+
+impl PathPositionBucket {
+    fn new(bucket: Arc<FrozenBucket>) -> Self {
+        let members = bucket.members();
+        let last_conflict = members.last().and_then(|newest| {
+            members
+                .iter()
+                .rposition(|member| member.partition() != newest.partition())
+        });
+        Self {
+            bucket,
+            last_conflict,
+        }
+    }
+
+    fn suffix(
+        &self,
+        data: &DataFileFact,
+        cost: &mut CandidateLookupCost,
+    ) -> Result<Option<BucketView>> {
+        let Some(view) = self.bucket.suffix(data.sequence(), cost) else {
+            return Ok(None);
+        };
+        let members = self.bucket.members();
+        validate_exact_partition(data, &members[members.len() - 1])?;
+        if let Some(conflict) = self.last_conflict
+            && conflict >= view.start()
+        {
+            validate_exact_partition(data, &members[conflict])?;
+        }
+        Ok(Some(view))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CandidateLookupCost {
     pub bucket_lookups: usize,
@@ -130,7 +170,7 @@ pub struct DeleteCandidateIndex {
     global_equality: Vec<Arc<FrozenBucket>>,
     partition_equality: HashMap<TypedPartition, Vec<Arc<FrozenBucket>>>,
     partition_positions: HashMap<TypedPartition, Arc<FrozenBucket>>,
-    path_positions: HashMap<Arc<str>, Arc<FrozenBucket>>,
+    path_positions: HashMap<Arc<str>, PathPositionBucket>,
     deletion_vectors: HashMap<Arc<str>, Arc<DeleteFact>>,
     size: CandidateIndexSize,
 }
@@ -226,7 +266,9 @@ impl DeleteCandidateIndex {
                     result.partition_positions.insert(partition, bucket);
                 }
                 BucketKind::PathPositions(path) => {
-                    result.path_positions.insert(path, bucket);
+                    result
+                        .path_positions
+                        .insert(path, PathPositionBucket::new(bucket));
                 }
             }
         }
@@ -265,31 +307,20 @@ impl DeleteCandidateIndex {
         validate_partition_binding(&self.partition_bindings, data.partition())?;
         let mut cost = CandidateLookupCost::default();
         let position = if let Some(dv) = self.deletion_vectors.get(data.path()) {
-            if dv.sequence() < data.sequence() {
-                return Err(Error::new(
-                    Kind::DeletionVectorOlderThanData,
-                    format!(
-                        "DV sequence {} is older than exact target {} sequence {}",
-                        dv.sequence().get(),
-                        data.path(),
-                        data.sequence().get()
-                    ),
-                ));
-            }
+            validate_exact_dv(data, dv)?;
             cost.candidate_members += 1;
             PositionSource::OneDv(Arc::clone(dv))
         } else {
             let mut views = Vec::with_capacity(2);
-            for bucket in [
-                self.path_positions.get(data.path()),
-                self.partition_positions.get(data.partition()),
-            ]
-            .into_iter()
-            .flatten()
+            if let Some(bucket) = self.path_positions.get(data.path())
+                && let Some(view) = bucket.suffix(data, &mut cost)?
             {
-                if let Some(view) = bucket.suffix(data.sequence(), &mut cost) {
-                    views.push(view);
-                }
+                views.push(view);
+            }
+            if let Some(bucket) = self.partition_positions.get(data.partition())
+                && let Some(view) = bucket.suffix(data.sequence(), &mut cost)
+            {
+                views.push(view);
             }
             if views.is_empty() {
                 PositionSource::None
@@ -318,27 +349,61 @@ impl DeleteCandidateIndex {
     }
 }
 
+fn validate_exact_partition(data: &DataFileFact, delete: &DeleteFact) -> Result<()> {
+    let data_partition = data.partition();
+    let delete_partition = delete.partition();
+    if data_partition != delete_partition {
+        return Err(Error::new(
+            Kind::InvalidPartition,
+            format!(
+                "Iceberg exact-path delete {} partition differs from target {} (delete spec {}, data spec {})",
+                delete.address().path(),
+                data.path(),
+                delete_partition.spec_id(),
+                data_partition.spec_id(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_dv(data: &DataFileFact, dv: &DeleteFact) -> Result<()> {
+    if dv.sequence() < data.sequence() {
+        return Err(Error::new(
+            Kind::DeletionVectorOlderThanData,
+            format!(
+                "DV sequence {} is older than exact target {} sequence {}",
+                dv.sequence().get(),
+                data.path(),
+                data.sequence().get()
+            ),
+        ));
+    }
+    validate_exact_partition(data, dv)
+}
+
 /// Pure semantic membership. Raw observation validation happens first; this
 /// predicate must not be used to filter malformed raw metadata into validity.
 pub fn delete_applies(data: &DataFileFact, delete: &DeleteFact) -> Result<bool> {
     match delete.kind() {
         DeleteKind::Equality(_) => Ok(delete.sequence() > data.sequence()
             && (delete.partition().is_unpartitioned() || delete.partition() == data.partition())),
-        DeleteKind::Position { exact_target } => Ok(delete.sequence() >= data.sequence()
-            && match exact_target {
-                Some(target) => target.as_ref() == data.path(),
-                None => delete.partition() == data.partition(),
-            }),
+        DeleteKind::Position { .. } if delete.sequence() < data.sequence() => Ok(false),
+        DeleteKind::Position { exact_target: None } => Ok(delete.partition() == data.partition()),
+        DeleteKind::Position {
+            exact_target: Some(target),
+        } => {
+            if target.as_ref() != data.path() {
+                return Ok(false);
+            }
+            validate_exact_partition(data, delete)?;
+            Ok(true)
+        }
         DeleteKind::DeletionVector { exact_target } => {
             if exact_target.as_ref() != data.path() {
                 return Ok(false);
             }
-            if delete.sequence() < data.sequence() {
-                return Err(Error::new(
-                    Kind::DeletionVectorOlderThanData,
-                    "DV is older than its exact target",
-                ));
-            }
+            validate_exact_dv(data, delete)?;
             Ok(true)
         }
     }

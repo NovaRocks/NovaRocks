@@ -18,7 +18,8 @@
 //! Data age, physical file age and inherited row lineage are independent facts.
 
 use crate::iceberg::Result;
-use crate::iceberg::spec::{DataFile, ManifestEntry, Struct};
+use crate::iceberg::spec::{DataFile, Struct};
+use crate::manifest::binding::BoundEntry;
 
 use super::{EntryIdentity, invalid};
 
@@ -130,25 +131,23 @@ impl FrozenEntry {
         }
         Ok(Self { identity, facts })
     }
-    /// The caller supplies an inherited row ID when the containing manifest provided it.
-    pub fn from_manifest_entry(
-        entry: &ManifestEntry,
-        partition_spec_id: i32,
-        inherited_first_row_id: Option<i64>,
-    ) -> Result<Self> {
+    /// Freeze the resolved facts, including an authoritative absent row ID.
+    pub(crate) fn from_bound_entry(entry: &BoundEntry<'_>) -> Result<Self> {
+        let file = entry.raw.data_file();
         Self::new(
-            EntryIdentity::try_from(entry.data_file())?,
+            EntryIdentity::try_from(file)?,
             EntryFacts {
-                added_snapshot_id: entry.snapshot_id,
-                data_sequence: entry.sequence_number,
-                file_sequence: entry.file_sequence_number,
-                partition_spec_id,
-                partition: entry.data_file().partition().clone(),
-                record_count: entry.record_count(),
-                first_row_id: entry.data_file().first_row_id().or(inherited_first_row_id),
+                added_snapshot_id: entry.sequences.snapshot_id,
+                data_sequence: entry.sequences.data_sequence,
+                file_sequence: entry.sequences.file_sequence,
+                partition_spec_id: entry.source.descriptor.partition_spec_id,
+                partition: file.partition().clone(),
+                record_count: file.record_count(),
+                first_row_id: entry.first_row_id,
             },
         )
     }
+
     pub fn identity(&self) -> &EntryIdentity {
         &self.identity
     }
@@ -160,7 +159,7 @@ impl FrozenEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iceberg::spec::{DataContentType, DataFileFormat, ManifestStatus};
+    use crate::iceberg::spec::{DataContentType, DataFileFormat};
 
     fn file(first_row_id: Option<i64>) -> DataFile {
         crate::iceberg::spec::DataFileBuilder::default()
@@ -187,36 +186,5 @@ mod tests {
         assert!(AddedContent::new_logical_data(file(None), -1).is_err());
         let historical = AddedContent::new_logical_data(file(None), 3).unwrap();
         assert_eq!(historical.partition_spec_id(), 3);
-    }
-
-    #[test]
-    fn frozen_entries_preserve_source_age_and_actual_row_id_inheritance() {
-        let entry = ManifestEntry::builder()
-            .status(ManifestStatus::Existing)
-            .snapshot_id(12)
-            .sequence_number(9)
-            .file_sequence_number(10)
-            .data_file(file(None))
-            .build();
-        let frozen = FrozenEntry::from_manifest_entry(&entry, 7, Some(30)).unwrap();
-        assert_eq!(frozen.facts().added_snapshot_id, Some(12));
-        assert_eq!(frozen.facts().data_sequence, Some(9));
-        assert_eq!(frozen.facts().file_sequence, Some(10));
-        assert_eq!(frozen.facts().partition_spec_id, 7);
-        assert_eq!(frozen.facts().record_count, 3);
-        assert_eq!(frozen.facts().first_row_id, Some(30));
-        let unassigned = FrozenEntry::from_manifest_entry(&entry, 7, None).unwrap();
-        assert_eq!(unassigned.facts().first_row_id, None);
-        let explicit = ManifestEntry::builder()
-            .status(ManifestStatus::Existing)
-            .data_file(file(Some(60)))
-            .build();
-        assert_eq!(
-            FrozenEntry::from_manifest_entry(&explicit, 7, Some(30))
-                .unwrap()
-                .facts()
-                .first_row_id,
-            Some(60)
-        );
     }
 }

@@ -25,8 +25,6 @@ use std::collections::HashMap;
 use crate::iceberg::spec::{DataContentType, Operation};
 use async_trait::async_trait;
 
-use super::helpers::target_ref_snapshot_id;
-
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
 }
@@ -41,7 +39,7 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
         view: &crate::commit::staging::StagedView<'_>,
         intent: &crate::commit::model::OperationIntent,
     ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
-        use crate::commit::model::{EntryIdentity, SeqField};
+        use crate::commit::model::SeqField;
         use crate::commit::row_delta_dv_metadata::{logical_file_size, write_added_entry_groups};
         if intent.changes().added.is_empty() {
             return Ok(crate::commit::staging::PreparedChange {
@@ -54,13 +52,24 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
                 "Position-delete intent cannot remove entries".into(),
             ));
         }
-        let parent = target_ref_snapshot_id(view.metadata(), view.target_ref());
-        let mut inputs = crate::commit::dependency::ValidationInputs::new(
-            view.metadata(),
-            parent,
-            view.artifacts(),
-        );
-        let live = inputs.live_set().await?;
+        let sources = view.target_sources().await?;
+        let referenced = intent
+            .changes()
+            .added
+            .iter()
+            .filter_map(|added| added.file().referenced_data_file())
+            .collect::<std::collections::BTreeSet<_>>();
+        let live = match &sources {
+            Some(sources) => {
+                let paths = referenced.iter().map(String::as_str).collect();
+                sources
+                    .live_data_matches(&paths, view.artifacts().file_io(), || {
+                        view.artifacts().check_active()
+                    })
+                    .await?
+            }
+            None => Default::default(),
+        };
         let mut summary = HashMap::new();
         let mut records = [0u64; 2];
         let mut counts = [0usize; 2];
@@ -86,7 +95,7 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
                     )),
                 };
             if let Some(path) = file.referenced_data_file()
-                && !live.contains_key(&EntryIdentity::DataFile { path: path.clone() })
+                && !live.contains(&path)
             {
                 return Err(to_iceberg_unexpected(format!(
                     "Position delete references absent data file {path}"
@@ -115,24 +124,17 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
         );
         summary.insert("added-files-size".into(), size.to_string());
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
-        let mut manifests = if let Some(parent) = parent {
-            crate::manifest::load_manifest_list(
-                view.metadata().snapshot_by_id(parent).ok_or_else(|| {
-                    to_iceberg_unexpected("Target parent snapshot is absent".into())
-                })?,
-                view.artifacts().file_io(),
-                view.metadata(),
-            )
-            .await?
-            .entries()
-            .to_vec()
-        } else {
-            vec![]
-        };
-        manifests.extend(
-            write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?,
-        );
-        crate::commit::overwrite::prepare_snapshot_change(
+        let added =
+            write_added_entry_groups(view, snapshot_id, intent.changes().added.clone()).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
+            view,
+            snapshot_id,
+            sources.as_ref(),
+            &[],
+            added,
+        )
+        .await?;
+        crate::commit::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

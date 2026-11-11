@@ -37,6 +37,26 @@ Parquet schema、table/scan schema、partition 常量 Java 类及实际行 Java 
 独立预期不一致与 reader 异常分开；此模式只输出 `UEA4G_OBSERVATION_OK`，
 不能用作 fixture 或产品通过声明。
 
+`--mode lineage` 使用同一 Spark 1.11.0 入口并要求一个具名阶段：
+
+- `--lineage-phase mixed` 用公开 ManifestWriter 写入同源的 EXISTING X 与 ADDED
+  A、B，通过准确的 v3 list descriptor 发布子快照。X 保留原有起点 800；A/B
+  分别继承 1000/1050。Spark 检查实际行身份，NovaRocks 另检查普通扫描和
+  `$entries` 中保留的原始 first_row_id。
+- `--lineage-phase historical` 准备旧 bucket 源列删除与同 identity spec 的
+  INT→LONG、FLOAT→DOUBLE 两张表。各有两个真实旧 manifest，准备完成后打开
+  标准提交合并。原 manifest、typed tuple 和 Spark 行袋保留在收据中。
+- `--lineage-phase historical-check` 在 NovaRocks 普通 INSERT 后读取同一对表。
+  它验证前置来源确实被合并、历史条目的 snapshot/sequence/row-ID 未丢失、输出
+  header 与实际 tuple 和摘要匹配、原 metrics 的 bounds 宽度保留，并用 Spark
+  核对所有数据及行身份。传入历史准备阶段的 `--lineage-seed-receipt FILE`，
+  校验原 list、manifest、数据对象的实际 SHA-256 未变。三个阶段各写新的
+  `--output` 目录。
+
+两个 compatibility SQL case 使用本次 runner 原 scratch namespace 与清理 owner。
+lineage 收据包含实际对象地址、原始 list/header/entries、SHA-256 导出、Spark
+观测和独立预期。Java 生成与检查阶段的完成只证明各自的执行结果。
+
 `--mode anomalies` 先运行正向控制，再运行低层异常矩阵。异常用真实 writer 的
 不可变内容和 Avro schema 构造独立 metadata；保留同 manifest 重复、跨 manifest
 重复、manifest-list 重复引用，以及同地址异 sequence/count/scope 的原始重数。

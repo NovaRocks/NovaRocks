@@ -27,9 +27,8 @@ mod view;
 pub(crate) use engine::freeze_existing_change;
 pub use engine::{PreparedChange, Preparer, StagingBase, StagingEngine};
 pub use initialization::staged_create_updates;
-pub use manifests::{
-    FirstRowIdInheritance, ManifestEntryWrite, write_manifest, write_manifest_list,
-};
+pub use manifests::{ManifestEntryWrite, write_manifest, write_manifest_list};
+pub(crate) use manifests::{write_sourced_manifest, write_sourced_manifest_with_class};
 pub use snapshot_id::new_snapshot_id;
 pub use view::StagedView;
 
@@ -39,6 +38,8 @@ fn invalid(message: impl Into<String>) -> crate::iceberg::Error {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::TestWriter;
 
 #[cfg(test)]
 mod interop_tests;

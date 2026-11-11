@@ -42,11 +42,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const FILE_PATH_ID: i32 = i32::MAX - 101;
+const LEGACY_ANOMALY_RUNTIME: &str =
+    "Apache Iceberg 1.11.0 (commit 6976e020b894f6a6777704df2b8c4458cb291ae9)";
+const EXACT_PARTITION_REFERENCE: &str = "212aa894e919ff9fdf89160da4aadcbe6858ac01";
 
 #[derive(Debug, Serialize)]
 pub struct ClosureOracleSummary {
     pub cases_verified: usize,
     pub planning_errors_matched: usize,
+    pub versioned_partition_rejections: usize,
     pub data_files_verified: usize,
     pub logical_members_verified: usize,
     pub load_members_verified: usize,
@@ -89,174 +93,18 @@ pub async fn verify_receipt(
     let receipt_bytes = std::fs::read(receipt_path).context("read Java oracle receipt")?;
     let receipt: Value =
         serde_json::from_slice(&receipt_bytes).context("parse Java oracle receipt")?;
+    let legacy_anomalies = receipt["mode"].as_str() == Some("anomalies")
+        && receipt.pointer("/runtime/iceberg").and_then(Value::as_str)
+            == Some(LEGACY_ANOMALY_RUNTIME);
     verify_inputs(
         array(&receipt, "artifacts")?,
         array(&receipt, "cases")?,
         file_io,
         output_dir,
         json!({"receipt_sha256":format!("{:x}",Sha256::digest(receipt_bytes))}),
+        legacy_anomalies,
     )
     .await
-}
-
-/// Normalize the frozen scale JSONL dictionaries without rewriting the receipt.
-/// All observations, including both streaming-window endpoints, are checked.
-pub async fn verify_scale_receipt(
-    receipt_path: &Path,
-    file_io: FileIO,
-    output_dir: &Path,
-) -> Result<ClosureOracleSummary> {
-    let receipt_bytes = std::fs::read(receipt_path).context("read scale oracle receipt")?;
-    let receipt: Value = serde_json::from_slice(&receipt_bytes)?;
-    let parent = receipt_path
-        .parent()
-        .context("scale receipt has no directory")?;
-    let mut sources = BTreeMap::from([(
-        "receipt".to_string(),
-        format!("{:x}", Sha256::digest(&receipt_bytes)),
-    )]);
-    let artifacts = read_sidecar(parent, &receipt, "artifacts", &mut sources)?;
-    let plans = read_sidecar(parent, &receipt, "java_plans", &mut sources)?;
-    let members = read_sidecar(parent, &receipt, "java_delete_members", &mut sources)?;
-    let cases = normalize_scale_cases(&receipt, plans, members)?;
-    ensure!(
-        artifacts.len() as u64 == uint(&receipt, "artifact_count")?,
-        "scale artifact count differs from receipt"
-    );
-    verify_inputs(
-        &artifacts,
-        &cases,
-        file_io,
-        output_dir,
-        json!({"source_sha256":sources,"normalization":"in-memory scale dictionary projection; original bytes unchanged"}),
-    )
-    .await
-}
-
-fn read_sidecar(
-    parent: &Path,
-    receipt: &Value,
-    field: &str,
-    sources: &mut BTreeMap<String, String>,
-) -> Result<Vec<Value>> {
-    let name = string(receipt, field)?;
-    ensure!(
-        Path::new(name).components().count() == 1,
-        "scale sidecar must be a sibling filename"
-    );
-    let bytes =
-        std::fs::read(parent.join(name)).with_context(|| format!("read scale sidecar {name}"))?;
-    sources.insert(name.to_string(), format!("{:x}", Sha256::digest(&bytes)));
-    std::str::from_utf8(&bytes)?
-        .lines()
-        .enumerate()
-        .map(|(line, text)| {
-            serde_json::from_str(text)
-                .with_context(|| format!("parse scale sidecar {name} line {}", line + 1))
-        })
-        .collect()
-}
-
-fn normalize_scale_cases(
-    receipt: &Value,
-    plans: Vec<Value>,
-    members: Vec<Value>,
-) -> Result<Vec<Value>> {
-    let mut dictionaries = BTreeMap::<String, serde_json::Map<String, Value>>::new();
-    for member in members {
-        ensure!(
-            string(&member, "record")? == "scale-delete-member",
-            "unexpected scale member record"
-        );
-        let name = string(&member, "case")?.to_string();
-        let id = uint(&member, "member_id")?.to_string();
-        ensure!(
-            member["content"].is_object(),
-            "scale member has no content descriptor"
-        );
-        ensure!(
-            dictionaries
-                .entry(name)
-                .or_default()
-                .insert(id, member["content"].clone())
-                .is_none(),
-            "duplicate scale delete member id"
-        );
-    }
-    let mut tasks = BTreeMap::<String, BTreeMap<u64, Value>>::new();
-    for plan in plans {
-        ensure!(
-            string(&plan, "record")? == "scale-plan-file",
-            "unexpected scale plan record"
-        );
-        let name = string(&plan, "case")?.to_string();
-        let ordinal = uint(&plan, "data_ordinal")?;
-        let ids = array(&plan, "delete_member_ids")?;
-        ensure!(
-            ids.len() as u64 == uint(&plan, "delete_list_size")?,
-            "scale member list size differs"
-        );
-        let mut unique = BTreeSet::new();
-        for id in ids {
-            let id = id.as_u64().context("scale member id is not unsigned")?;
-            ensure!(unique.insert(id), "scale task repeats a member id");
-            ensure!(
-                dictionaries
-                    .get(&name)
-                    .is_some_and(|dictionary| dictionary.contains_key(&id.to_string())),
-                "scale task references a missing dictionary member"
-            );
-        }
-        ensure!(
-            tasks
-                .entry(name)
-                .or_default()
-                .insert(ordinal, plan)
-                .is_none(),
-            "duplicate scale data ordinal"
-        );
-    }
-    let raw_cases = array(receipt, "cases")?;
-    ensure!(
-        raw_cases.len() as u64 == uint(receipt, "case_count")?,
-        "scale case count differs from receipt"
-    );
-    let mut names = BTreeSet::new();
-    let mut normalized = Vec::new();
-    for case in raw_cases {
-        let name = string(case, "case")?;
-        ensure!(names.insert(name), "duplicate scale case");
-        ensure!(
-            string(case, "java_planFiles")? == "success",
-            "scale case did not plan successfully"
-        );
-        let plans = tasks.remove(name).unwrap_or_default();
-        ensure!(
-            plans.len() as u64 == uint(case, "plan_file_count")?,
-            "scale task count differs"
-        );
-        ensure!(
-            plans.keys().copied().eq(0..plans.len() as u64),
-            "scale data ordinals are not contiguous"
-        );
-        let dictionary = dictionaries.remove(name).unwrap_or_default();
-        ensure!(
-            dictionary.len() as u64 == uint(case, "delete_dictionary_size")?,
-            "scale dictionary count differs"
-        );
-        let mut normalized_case = case.clone();
-        normalized_case["java_planFiles"] = json!({
-            "status":"success",
-            "tasks":plans.into_values().collect::<Vec<_>>(),
-            "delete_dictionary":dictionary,
-        });
-        normalized.push(normalized_case);
-    }
-    ensure!(
-        tasks.is_empty() && dictionaries.is_empty(),
-        "scale sidecars contain observations absent from receipt"
-    );
-    Ok(normalized)
 }
 
 async fn verify_inputs(
@@ -265,6 +113,7 @@ async fn verify_inputs(
     file_io: FileIO,
     output_dir: &Path,
     sources: Value,
+    legacy_anomalies: bool,
 ) -> Result<ClosureOracleSummary> {
     ensure!(!cases.is_empty(), "oracle receipt has no cases");
     std::fs::create_dir_all(output_dir)?;
@@ -272,6 +121,7 @@ async fn verify_inputs(
     let mut summary = ClosureOracleSummary {
         cases_verified: 0,
         planning_errors_matched: 0,
+        versioned_partition_rejections: 0,
         data_files_verified: 0,
         logical_members_verified: 0,
         load_members_verified: 0,
@@ -316,7 +166,7 @@ async fn verify_inputs(
     let mut failures = Vec::new();
     for case in cases {
         let name = string(case, "case")?;
-        match verify_case(case, &frozen_io, &inventory, &mut summary).await {
+        match verify_case(case, &frozen_io, &inventory, &mut summary, legacy_anomalies).await {
             Ok(report) => {
                 summary.cases_verified += 1;
                 case_reports.push(report);
@@ -350,6 +200,7 @@ async fn verify_case(
     io: &FileIO,
     inventory: &BTreeMap<String, (u64, String)>,
     summary: &mut ClosureOracleSummary,
+    legacy_anomalies: bool,
 ) -> Result<Value> {
     let name = string(case, "case")?;
     let metadata_path = string(case, "metadata")?;
@@ -395,8 +246,75 @@ async fn verify_case(
         string(java, "status")? == "success",
         "unknown Java plan outcome"
     );
+    let versioned_case = legacy_anomalies
+        && case["independent_expected_rows"].is_null()
+        && case.pointer("/generation/method").and_then(Value::as_str)
+            == Some("controlled Avro rewrite of official writer output")
+        && ["/generation/raw_manifests", "/generation/raw_manifest_list"]
+            .iter()
+            .all(|field| {
+                case.pointer(field)
+                    .and_then(Value::as_array)
+                    .is_some_and(|entries| !entries.is_empty())
+            });
+    if let Err(error) = &rust
+        && !versioned_case
+    {
+        bail!("{error}");
+    }
+    let observed = observe_manifests(&table, snapshot_id, &schema)
+        .await
+        .map_err(|failure| match &rust {
+            Err(error) => failure.context(format!("Nova planner rejected the input: {error}")),
+            Ok(_) => failure,
+        })?;
+    if versioned_case {
+        let conflicts =
+            exact_partition_conflicts(java, &observed, &metadata, &schema).map_err(|failure| {
+                match &rust {
+                    Err(error) => {
+                        failure.context(format!("Nova planner rejected the input: {error}"))
+                    }
+                    Ok(_) => failure,
+                }
+            })?;
+        if !conflicts.is_empty() {
+            let Err(error) = rust else {
+                bail!(
+                    "Nova accepted an exact-path partition contradiction proven by raw manifests"
+                );
+            };
+            ensure!(
+                conflicts.iter().any(|(data, delete)| error.contains(&format!(
+                    "Iceberg exact-path delete {} partition differs from target {} (delete spec {}, data spec {})",
+                    delete.path, data.path, delete.spec, data.spec,
+                ))),
+                "Nova rejected the input for a different reason: {error}",
+            );
+            summary.versioned_partition_rejections += 1;
+            let witnesses = conflicts
+                .iter()
+                .map(|(data, delete)| {
+                    json!({
+                        "data": data,
+                        "delete": delete,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(json!({
+                "case": name,
+                "status": "verified_versioned_partition_rejection",
+                "snapshot": snapshot_id,
+                "java_runtime": LEGACY_ANOMALY_RUNTIME,
+                "java_planFiles": java,
+                "java_row_read": case["java_row_read"],
+                "reference_source_commit": EXACT_PARTITION_REFERENCE,
+                "rust_error": error,
+                "verified_raw_manifest_witnesses": witnesses,
+            }));
+        }
+    }
     let rust = rust.map_err(anyhow::Error::msg)?;
-    let observed = observe_manifests(&table, snapshot_id, &schema).await?;
     let mut expected_files = BTreeMap::new();
     for task in array(java, "tasks")? {
         let path = string(&task["data"], "path")?;
@@ -444,7 +362,7 @@ async fn verify_case(
             "Rust data typed partition differs from Java"
         );
         let mut expected = BTreeMap::new();
-        for member in java_delete_members(task, java)? {
+        for member in array(task, "deletes")? {
             let fact = find_java_observation(member, &observed, &metadata, &schema)?;
             *expected.entry(fact.descriptor.clone()).or_insert(0usize) += 1;
         }
@@ -508,26 +426,30 @@ async fn verify_case(
     )
 }
 
-fn java_delete_members<'a>(task: &'a Value, java: &'a Value) -> Result<Vec<&'a Value>> {
-    if let Some(members) = task.get("deletes") {
-        return Ok(members
-            .as_array()
-            .context("Java deletes is not an array")?
-            .iter()
-            .collect());
+/// Iceberg 1.11 attached these members without the exact partition check
+/// introduced in the pinned 1.12 source. Match every Java attachment to
+/// verified raw objects before recognizing a version-dependent result.
+fn exact_partition_conflicts<'a>(
+    java: &Value,
+    observed: &'a [Observed],
+    metadata: &TableMetadata,
+    schema: &Schema,
+) -> Result<Vec<(&'a Descriptor, &'a Descriptor)>> {
+    let mut conflicts = Vec::new();
+    for task in array(java, "tasks")? {
+        let data = &find_java_observation(&task["data"], observed, metadata, schema)?.descriptor;
+        for member in array(task, "deletes")? {
+            let delete = &find_java_observation(member, observed, metadata, schema)?.descriptor;
+            if matches!(delete.kind.as_str(), "POSITION" | "DV")
+                && delete.target.as_deref() == Some(data.path.as_str())
+                && delete.sequence >= data.sequence
+                && (delete.spec != data.spec || delete.typed_partition != data.typed_partition)
+            {
+                conflicts.push((data, delete));
+            }
+        }
     }
-    let dictionary = java["delete_dictionary"]
-        .as_object()
-        .context("scale dictionary is missing")?;
-    array(task, "delete_member_ids")?
-        .iter()
-        .map(|id| {
-            let id = id.as_u64().context("scale member id is not unsigned")?;
-            dictionary
-                .get(&id.to_string())
-                .context("scale member id is absent")
-        })
-        .collect()
+    Ok(conflicts)
 }
 
 fn intern_bag(
@@ -1207,109 +1129,6 @@ mod tests {
         let data = builder.build().unwrap();
         assert!(validate_java_metrics(&json!({"value_counts":{"1":4}}), &data, &schema).is_err());
         validate_java_metrics(&json!({"value_counts":{"1":4,"2":4}}), &data, &schema).unwrap();
-    }
-
-    /// Explicit local replay uses only the receipt's SHA-verified captured
-    /// artifacts. It starts no server and writes no fixture or golden input.
-    #[tokio::test]
-    #[ignore = "requires the explicit frozen Java receipt and output directory"]
-    async fn frozen_receipt_replay_without_native() {
-        let receipt_path = std::path::PathBuf::from(
-            std::env::var("NOVAROCKS_UEA4G_ORACLE_RECEIPT").expect("explicit receipt"),
-        );
-        let output = std::path::PathBuf::from(
-            std::env::var("NOVAROCKS_UEA4G_ORACLE_OUTPUT").expect("explicit output"),
-        );
-        let receipt: Value =
-            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-        let io = FileIO::new_with_memory();
-        let mut sdk_metrics = Vec::new();
-        for artifact in array(&receipt, "artifacts").unwrap() {
-            let bytes = std::fs::read(
-                receipt_path
-                    .parent()
-                    .unwrap()
-                    .join(string(artifact, "local_path").unwrap()),
-            )
-            .unwrap();
-            assert_eq!(bytes.len() as u64, uint(artifact, "size").unwrap());
-            assert_eq!(
-                format!("{:x}", Sha256::digest(&bytes)),
-                string(artifact, "sha256").unwrap()
-            );
-            if artifact["kind"] == "manifest" {
-                let manifest =
-                    novarocks_connector_iceberg::iceberg::spec::Manifest::parse_avro(&bytes)
-                        .unwrap();
-                for entry in manifest.entries() {
-                    let file = entry.data_file();
-                    if file.content_type() == DataContentType::PositionDeletes {
-                        sdk_metrics.push(json!({"manifest_sha256":artifact["sha256"],"path":file.file_path(),
-                            "value_counts":file.value_counts(),"null_value_counts":file.null_value_counts(),
-                            "lower_bounds":file.lower_bounds().iter().map(|(id,value)|(id.to_string(),value.to_string())).collect::<BTreeMap<_,_>>(),
-                            "upper_bounds":file.upper_bounds().iter().map(|(id,value)|(id.to_string(),value.to_string())).collect::<BTreeMap<_,_>>()}));
-                    }
-                }
-            }
-            io.new_output(string(artifact, "path").unwrap())
-                .unwrap()
-                .write(bytes::Bytes::from(bytes))
-                .await
-                .unwrap();
-        }
-        std::fs::create_dir_all(&output).unwrap();
-        std::fs::write(
-            output.join("sdk-raw-position-metrics.json"),
-            serde_json::to_vec_pretty(&sdk_metrics).unwrap(),
-        )
-        .unwrap();
-        let summary = verify_receipt(&receipt_path, io, &output).await.unwrap();
-        assert_eq!(
-            summary.cases_verified,
-            array(&receipt, "cases").unwrap().len()
-        );
-    }
-
-    #[test]
-    fn scale_projection_retains_dictionary_members_and_both_endpoints() {
-        let receipt = json!({"case_count":2,"cases":[
-            {"case":"from","java_planFiles":"success","plan_file_count":1,"delete_dictionary_size":1},
-            {"case":"to","java_planFiles":"success","plan_file_count":1,"delete_dictionary_size":1}
-        ]});
-        let members = ["from", "to"].into_iter().map(|name| json!({
-            "record":"scale-delete-member","case":name,"member_id":0,
-            "content":{"path":"same-physical-delete","data_sequence":if name=="from" {2} else {3}}
-        })).collect();
-        let plans = ["from", "to"]
-            .into_iter()
-            .map(|name| {
-                json!({
-                    "record":"scale-plan-file","case":name,"data_ordinal":0,
-                    "data":{"path":"data"},"delete_member_ids":[0],"delete_list_size":1
-                })
-            })
-            .collect();
-        let cases = normalize_scale_cases(&receipt, plans, members).unwrap();
-        assert_eq!(cases.len(), 2);
-        for (case, sequence) in cases.iter().zip([2, 3]) {
-            let java = &case["java_planFiles"];
-            let members = java_delete_members(&java["tasks"][0], java).unwrap();
-            assert_eq!(members.len(), 1);
-            assert_eq!(members[0]["data_sequence"], sequence);
-            assert!(java["tasks"][0].get("deletes").is_none());
-        }
-    }
-
-    #[test]
-    fn scale_projection_rejects_a_missing_member_instead_of_dropping_it() {
-        let receipt = json!({"case_count":1,"cases":[
-            {"case":"case","java_planFiles":"success","plan_file_count":1,"delete_dictionary_size":0}
-        ]});
-        let plans = vec![
-            json!({"record":"scale-plan-file","case":"case","data_ordinal":0,
-            "data":{"path":"data"},"delete_member_ids":[0],"delete_list_size":1}),
-        ];
-        assert!(normalize_scale_cases(&receipt, plans, Vec::new()).is_err());
     }
 
     fn bounded(lower: Datum, upper: Datum, nulls: Option<u64>, nans: Option<u64>) -> DataFile {

@@ -30,13 +30,79 @@ import hashlib
 import json
 import pathlib
 import re
+from typing import Optional
 
 
 def row_bag(rows: list) -> collections.Counter:
     return collections.Counter(json.dumps(row, separators=(",", ":"), sort_keys=True) for row in rows)
 
 
-def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
+LINEAGE_PHASES = {
+    "mixed": {"manifest_mixed"},
+    "historical": {"manifest_old_bucket", "manifest_promoted_identity"},
+    "historical-check": {"manifest_old_bucket", "manifest_promoted_identity"},
+}
+
+
+def validate_lineage(records: list, artifact_paths: set, phase: str) -> list:
+    lineage = [record for record in records if record["record"] == "lineage"]
+    expected = LINEAGE_PHASES[phase]
+    if len(lineage) != len(expected) or {case["case"] for case in lineage} != expected:
+        raise ValueError(f"Incomplete manifest-lineage phase: {phase}")
+    for case in lineage:
+        rows = case["spark_rows"]
+        if phase == "historical-check":
+            new = rows[-1]
+            if not isinstance(new[-2], int) or new[-2] < 2:
+                raise ValueError(f"{case['case']}: missing distinct new row identity")
+            rows = rows[:-1] + [new[:-2] + [None, new[-1]]]
+        if row_bag(rows) != row_bag(case["independent_expected_rows"]):
+            raise ValueError(f"{case['case']}: independent lineage row-bag mismatch")
+        snapshots = case["snapshots"]
+        if len(snapshots) != (2 if phase == "historical-check" else 1):
+            raise ValueError(f"{case['case']}: missing expected snapshot observation")
+        required_paths = {case["metadata"]}
+        manifest_paths = set()
+        for snapshot in snapshots:
+            required_paths.add(snapshot["manifest_list"])
+            for manifest in snapshot["raw_manifests"]:
+                manifest_paths.add(manifest["path"])
+                for entry in manifest["entries"]:
+                    required_paths.add(entry["data_file"]["file_path"])
+        if (required_paths | manifest_paths) - artifact_paths:
+            raise ValueError(f"{case['case']}: incomplete lineage artifact export")
+        if phase == "mixed":
+            if case["mixed_manifest"] not in manifest_paths:
+                raise ValueError("Missing mixed manifest from the snapshot list")
+        elif not set(case["source_manifests"]) <= manifest_paths:
+            raise ValueError(f"{case['case']}: missing original manifests")
+    return lineage
+
+
+def check_lineage_seed(receipt: dict, seed_path: pathlib.Path) -> None:
+    seed_bytes = seed_path.read_bytes()
+    seed = json.loads(seed_bytes)
+    if seed["mode"] != "lineage" or seed["lineage_phase"] != "historical":
+        raise ValueError("Expected a historical lineage seed receipt")
+    for key in ("iceberg", "requested_warehouse", "namespace", "prefix"):
+        if receipt["runtime"][key] != seed["runtime"][key]:
+            raise ValueError(f"Lineage verification changed the seed {key}")
+    by_case = {case["case"]: case for case in seed["lineage"]}
+    for case in receipt["lineage"]:
+        before = by_case[case["case"]]
+        if case["table_uuid"] != before["table_uuid"] or case["snapshots"][0] != before["snapshots"][0]:
+            raise ValueError(f"{case['case']}: observed a different seed table or snapshot")
+    digests = {artifact["path"]: artifact["sha256"] for artifact in receipt["artifacts"]}
+    for artifact in seed["artifacts"]:
+        if artifact["kind"] != "metadata" and digests.get(artifact["path"]) != artifact["sha256"]:
+            raise ValueError(f"Append changed a historical object: {artifact['path']}")
+    receipt["lineage_seed_receipt"] = {
+        "path": str(seed_path.resolve()), "sha256": hashlib.sha256(seed_bytes).hexdigest(),
+    }
+
+
+def validate(log: pathlib.Path, output: pathlib.Path, mode: str,
+             lineage_phase: Optional[str] = None, lineage_seed: Optional[pathlib.Path] = None) -> dict:
     text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
     if "UEA4G_COMPLETE" not in text.splitlines():
         raise ValueError("Missing completion marker; Scala compilation or execution failed")
@@ -50,7 +116,9 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
     if len(names) != len(set(names)):
         raise ValueError("Duplicate case names")
     expected = {f"same_commit_{kind}" for kind in ("position", "equality", "dv")}
-    if mode == "promotion":
+    if mode == "lineage":
+        expected = set()
+    elif mode == "promotion":
         expected = {f"promotion_{partition}_{scan}" for partition in ("partitioned", "unpartitioned")
                     for scan in ("before", "snapshot", "current_projection")}
     elif mode == "projection":
@@ -152,6 +220,11 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
             raise ValueError(f"{endpoint['case']}: endpoint added row-bag mismatch")
     receipt = {"runtime": runtime[0], "mode": mode, "cases": cases,
                "artifacts": artifacts, "registrations": registrations, "endpoint_oracles": endpoints}
+    if mode == "lineage":
+        receipt["lineage_phase"] = lineage_phase
+        receipt["lineage"] = validate_lineage(records, artifact_paths, lineage_phase)
+        if lineage_seed is not None:
+            check_lineage_seed(receipt, lineage_seed)
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     for case in cases:
         planned = case["java_planFiles"]
@@ -164,6 +237,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection"), required=True)
+    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection", "lineage"), required=True)
+    parser.add_argument("--lineage-phase", choices=LINEAGE_PHASES)
+    parser.add_argument("--lineage-seed-receipt", type=pathlib.Path)
     args = parser.parse_args()
-    validate(args.log, args.output, args.mode)
+    if (args.mode == "lineage") != (args.lineage_phase is not None):
+        parser.error("--lineage-phase is required with --mode lineage and unavailable otherwise")
+    if (args.lineage_phase == "historical-check") != (args.lineage_seed_receipt is not None):
+        parser.error("--lineage-seed-receipt is required with historical-check and unavailable otherwise")
+    validate(args.log, args.output, args.mode, args.lineage_phase, args.lineage_seed_receipt)

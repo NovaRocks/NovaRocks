@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native UEA-4A-2 range-read scenarios. The G0 pilot records calibration
-//! only; the functional stage checks multi-file rows and held-read cleanup.
+//! Native multi-file and short-range reads through scenario-owned Iceberg and S3.
 
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
 use super::provider_mysql_actors::{
@@ -28,276 +27,202 @@ use crate::actors::sql::{SqlSession, StatementFailure};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::delayed_s3::{DelayedS3Config, DelayedS3Proxy};
-use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, LaunchProfile,
-};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::env;
-use std::fs::{self, File};
-use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use novarocks_cluster_harness::fixture_run::{RunBudget, canonical_s3};
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
+use novarocks_cluster_harness::{CrossProcessChildEnvironment, CrossProcessConfigOverlay};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
 // Actual range/cancellation probes require object reads rather than cached pages.
 const FUNCTIONAL_CACHE_OVERLAY: &str = "[runtime.cache]\npage_cache_enable = false\nparquet_page_cache_enable = false\ndatacache_enable = false\n";
-const FIXTURE_ENV: &str = "NOVAROCKS_UEA4A2_FIXTURE_MANIFEST";
-const SHORT_FIXTURE_ENV: &str = "NOVAROCKS_ICEBERG_SHORT_FIXTURE_MANIFEST";
 const ACCESS_KEY_ENV: &str = "NOVAROCKS_UEA4A2_S3_ACCESS_KEY_ID";
 const SECRET_KEY_ENV: &str = "NOVAROCKS_UEA4A2_S3_SECRET_ACCESS_KEY";
+const CREDENTIAL_NAME: &str = "range-fixture";
+const CREDENTIAL_GENERATION: &str = "v1";
+const CATALOG: &str = "range_fixture";
+const NAMESPACE: &str = "range_source";
+const TABLE: &str = "sample_data";
+const MULTI_ROWS: u64 = 768;
+const MULTI_FILES: usize = 24;
+const SHORT_ROWS: u64 = 4096;
 
-#[derive(Deserialize)]
-struct PublishedIcebergFixture {
-    schema_version: u32,
-    fixture_kind: String,
-    table_location: String,
-    warehouse_uri: String,
-    rest_uri: String,
-    s3_endpoint: String,
-    region: String,
-    credential_name: String,
-    credential_generation: String,
-    database: String,
-    table: String,
-    data_file_count: u64,
-    row_count: u64,
-    objects_sha256: String,
-    artifacts: BTreeMap<String, String>,
+struct LiveFixture {
+    rest: IsolatedIcebergRestFixture,
+    proxy: Option<DelayedS3Proxy>,
 }
 
-#[derive(Deserialize)]
-struct FixtureOracle {
-    row_count: u64,
-    min_id: u64,
-    max_id: u64,
-    id_sum: u64,
-    value_sum: u64,
-}
-
-#[derive(Deserialize)]
-struct FixtureObject {
-    key: String,
-    etag: String,
-    sha256: Option<String>,
+#[derive(Deserialize, Serialize)]
+struct SeedFile {
+    path: String,
+    rows: u64,
     size: u64,
 }
 
-struct CheckedFixture {
-    facts: PublishedIcebergFixture,
-    objects: Vec<FixtureObject>,
-    manifest_sha256: String,
-}
-
-impl CheckedFixture {
-    fn load_source(path: &Path, allow_a4: bool) -> Result<Self> {
-        let bytes =
-            fs::read(path).with_context(|| format!("read UEA-4A-2 fixture {}", path.display()))?;
-        let digest = sha256(&bytes);
-        let root = path
-            .parent()
-            .context("fixture manifest has no parent directory")?;
-        let ready = fs::read_to_string(root.join("READY")).context("read exact fixture READY")?;
-        ensure!(
-            ready.trim() == format!("sha256:{digest}"),
-            "fixture READY does not bind the exact manifest"
-        );
-        let facts: PublishedIcebergFixture =
-            serde_json::from_slice(&bytes).context("decode published Iceberg fixture")?;
-        ensure!(
-            facts.schema_version == 1,
-            "published Iceberg fixture must be versioned"
-        );
-        let a4_fixture = allow_a4 && facts.fixture_kind == "uea4a4-iceberg-performance-v1";
-        let short_fixture = facts.fixture_kind == "uea4a2-iceberg-short-v1";
-        ensure!(
-            a4_fixture || short_fixture,
-            "expected a published short or explicitly selected A4 Iceberg fixture"
-        );
-        ensure!(
-            if a4_fixture {
-                facts.data_file_count >= 16 && facts.row_count == 768
-            } else {
-                facts.data_file_count >= 1 && facts.row_count == 4096
-            },
-            "published Iceberg fixture has the wrong source data shape"
-        );
-        ensure!(
-            facts.rest_uri.starts_with("http://127.0.0.1:")
-                || facts.rest_uri.starts_with("http://localhost:"),
-            "fixture REST endpoint must be loopback"
-        );
-        ensure!(
-            facts.s3_endpoint.starts_with("http://127.0.0.1:")
-                || facts.s3_endpoint.starts_with("http://localhost:"),
-            "fixture S3 endpoint must be loopback"
-        );
-        ensure!(
-            facts.table_location.starts_with("s3://") && !facts.table_location.contains('?'),
-            "fixture table location must be an exact S3 path"
-        );
-        for id in [
-            &facts.database,
-            &facts.table,
-            &facts.credential_name,
-            &facts.credential_generation,
-        ] {
-            ensure!(
-                !id.is_empty()
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-                "invalid fixture identifier"
-            );
-        }
-        for (name, hash) in &facts.artifacts {
-            ensure!(
-                !name.contains('/') && !name.contains("..") && is_sha256(hash),
-                "invalid fixture artifact name or hash"
-            );
-            ensure!(
-                sha256_file(&root.join(name))? == *hash,
-                "fixture artifact hash mismatch: {name}"
-            );
-        }
-        ensure!(
-            facts.artifacts.get("objects.json") == Some(&facts.objects_sha256),
-            "fixture object inventory hash is not published"
-        );
-        let objects_bytes =
-            fs::read(root.join("objects.json")).context("read G0 pilot object inventory")?;
-        ensure!(
-            sha256(&objects_bytes) == facts.objects_sha256,
-            "fixture object inventory changed after artifact verification"
-        );
-        let objects: Vec<FixtureObject> =
-            serde_json::from_slice(&objects_bytes).context("decode G0 pilot object inventory")?;
-        let mut distinct_keys = BTreeSet::new();
-        let data_files = objects
-            .iter()
-            .filter(|object| object.key.starts_with("data/") && object.key.ends_with(".parquet"))
-            .count();
-        ensure!(
-            u64::try_from(data_files).ok() == Some(facts.data_file_count)
-                && objects.iter().all(|object| {
-                    (object.key.starts_with("metadata/")
-                        || (object.key.starts_with("data/") && object.key.ends_with(".parquet")))
-                        && !object.key.contains("..")
-                        && !object.etag.is_empty()
-                        && object.size > 0
-                        && (!short_fixture
-                            || !object.key.starts_with("data/")
-                            || object.sha256.as_deref().is_some_and(is_sha256))
-                        && distinct_keys.insert(&object.key)
-                }),
-            "fixture source object inventory does not match declared data files"
-        );
-        if short_fixture && data_files == 1 {
-            let data_object = objects
-                .iter()
-                .find(|object| object.key.starts_with("data/"))
-                .context("short fixture has no source data object")?;
-            ensure!(
-                data_object.sha256.as_ref() == facts.artifacts.get("data.parquet"),
-                "short fixture data artifact does not match its source object"
-            );
-        }
-        let oracle_bytes =
-            fs::read(root.join("oracle.json")).context("read G0 pilot row oracle")?;
-        ensure!(
-            facts.artifacts.get("oracle.json") == Some(&sha256(&oracle_bytes)),
-            "fixture oracle hash mismatch"
-        );
-        let oracle: FixtureOracle =
-            serde_json::from_slice(&oracle_bytes).context("decode G0 pilot oracle")?;
-        let expected_rows = if a4_fixture { 768 } else { 4096 };
-        let expected_id_sum = (expected_rows - 1) * expected_rows / 2;
-        ensure!(
-            oracle.row_count == expected_rows
-                && oracle.row_count == facts.row_count
-                && oracle.min_id == 0
-                && oracle.max_id == expected_rows - 1
-                && oracle.id_sum == expected_id_sum
-                && if a4_fixture {
-                    oracle.value_sum > 0
-                } else {
-                    oracle.value_sum == 3 * expected_id_sum
-                },
-            "published Iceberg row oracle is inconsistent"
-        );
-        Ok(Self {
-            facts,
-            objects,
-            manifest_sha256: digest,
-        })
-    }
-
-    fn table_name(&self) -> String {
-        format!("uea4a2_pilot.{}.{}", self.facts.database, self.facts.table)
-    }
-
-    fn catalog_sql(&self, endpoint: &str) -> String {
-        let f = &self.facts;
-        format!(
-            "CREATE EXTERNAL CATALOG uea4a2_pilot PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"{}\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{}\",\"credential.object-store-metadata.generation\"=\"{}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"{}\",\"credential.object-store-data.generation\"=\"{}\")",
-            sql_string(&f.rest_uri),
-            sql_string(&f.warehouse_uri),
-            sql_string(endpoint),
-            sql_string(&f.region),
-            f.credential_name,
-            f.credential_generation,
-            f.credential_name,
-            f.credential_generation
-        )
-    }
-}
-
-struct LiveFixture {
-    checked: CheckedFixture,
-    proxy: DelayedS3Proxy,
-}
-
-fn credential_overlay(purpose: &str, fixture: &PublishedIcebergFixture) -> String {
+fn credential_overlay(purpose: &str) -> String {
     format!(
-        "[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"{}\"\ngeneration = \"{}\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{ACCESS_KEY_ENV}}}\"\naccess_key_secret = \"${{ENV:{SECRET_KEY_ENV}}}\"\n",
-        fixture.credential_name, fixture.credential_generation
+        "[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"{CREDENTIAL_NAME}\"\ngeneration = \"{CREDENTIAL_GENERATION}\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{ACCESS_KEY_ENV}}}\"\naccess_key_secret = \"${{ENV:{SECRET_KEY_ENV}}}\"\n{FUNCTIONAL_CACHE_OVERLAY}"
     )
-}
-
-fn env_path(name: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(env::var(name).with_context(|| {
-        format!("{name} must name a published manifest")
-    })?))
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut reader =
-        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .with_context(|| format!("read {}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn sql_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn catalog_sql(rest: &IsolatedIcebergRestFixture, endpoint: &str) -> String {
+    let rest = rest.endpoints();
+    format!(
+        "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"{CREDENTIAL_NAME}\",\"credential.object-store-data.generation\"=\"{CREDENTIAL_GENERATION}\")",
+        sql_string(&rest.rest_uri),
+        sql_string(&rest.rest_warehouse),
+        sql_string(endpoint),
+    )
+}
+
+fn source_sql(rows: u64, files: usize, value: &str) -> String {
+    let table = format!("ice_rest.{NAMESPACE}.{TABLE}");
+    format!(
+        "CREATE NAMESPACE ice_rest.{NAMESPACE};
+CREATE TABLE {table} (id BIGINT, value BIGINT) USING iceberg
+TBLPROPERTIES ('format-version'='2', 'write.format.default'='parquet', 'write.distribution-mode'='none');
+INSERT INTO {table} SELECT id, {value} FROM range(0, {rows}, 1, {files});
+SELECT concat('RANGE_FILE|', to_json(named_struct('path', file_path, 'rows', record_count, 'size', file_size_in_bytes)))
+FROM {table}.files WHERE content = 0 ORDER BY file_path;
+SELECT concat('RANGE_SOURCE_OK|', CAST(count(DISTINCT id) AS STRING)) FROM {table}
+WHERE id BETWEEN 0 AND {rows} - 1 AND value = {value};
+"
+    )
+}
+
+#[cfg(unix)]
+fn seed_source(
+    rest: &IsolatedIcebergRestFixture,
+    root: &Path,
+    budget: &RunBudget,
+    short: bool,
+) -> Result<Vec<SeedFile>> {
+    use novarocks_test_support::{ManagedCommand, capture_command_until};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let (rows, file_count, value) = if short {
+        (SHORT_ROWS, 1, "id * 3")
+    } else {
+        (MULTI_ROWS, MULTI_FILES, "id DIV 32")
+    };
+    let source = root.join("range-source.sql");
+    fs::write(&source, source_sql(rows, file_count, value))?;
+    let spark_defaults = root.join("range-source.spark.conf");
+    // The Spark task partition count fixes the fixture files. One worker
+    // processes those small tasks without competing with the native cluster.
+    fs::write(&spark_defaults, "spark.master local[1]\n")?;
+    let program =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/iceberg-rest/spark-sql.sh");
+    let env_file = rest.runtime_env_file()?;
+    let mut command = ManagedCommand::new(&program);
+    command
+        .arg(&source)
+        .env("NOVA_ENV_REST_ENV_FILE", &env_file)
+        .env("NOVAROCKS_WORKSPACE_ROOT", rest.workspace_root())
+        .env("NOVAROCKS_SPARK_EXTRA_DEFAULTS", &spark_defaults)
+        .terminate_at(budget.work_deadline(), budget.deadline());
+    let open_log = |name: &str| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(name))
+    };
+    fs::write(
+        root.join("range-source-command.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "program":program, "sql":source, "private_env_file":env_file,
+            "spark_defaults":spark_defaults,
+        }))?,
+    )?;
+    let outcome = capture_command_until(
+        command,
+        open_log("range-source.stdout")?,
+        open_log("range-source.stderr")?,
+        budget.work_deadline(),
+    )?;
+    fs::write(
+        root.join("range-source-exit.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "exit_code":outcome.output.status.code(), "timed_out":outcome.timed_out,
+            "local_group_exited":outcome.group_exit_observed(), "failures":outcome.failures,
+        }))?,
+    )?;
+    ensure!(
+        outcome.output.status.success()
+            && !outcome.timed_out
+            && outcome.failures.is_empty()
+            && outcome.group_exit_observed(),
+        "private Spark fixture did not finish under its original deadline; diagnostics={}",
+        outcome.diagnostic_root().display(),
+    );
+    let stdout = std::str::from_utf8(&outcome.output.stdout)?;
+    let files = parse_source(stdout, rows, file_count, &rest.endpoints().rest_warehouse)?;
+    fs::write(
+        root.join("range-source-files.json"),
+        serde_json::to_vec_pretty(&files)?,
+    )?;
+    outcome.release_diagnostics()?;
+    Ok(files)
+}
+
+#[cfg(not(unix))]
+fn seed_source(
+    _: &IsolatedIcebergRestFixture,
+    _: &Path,
+    _: &RunBudget,
+    _: bool,
+) -> Result<Vec<SeedFile>> {
+    anyhow::bail!("private Spark fixture process ownership requires Unix")
+}
+
+fn parse_source(
+    stdout: &str,
+    rows: u64,
+    file_count: usize,
+    warehouse: &str,
+) -> Result<Vec<SeedFile>> {
+    let counts = stdout
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("RANGE_SOURCE_OK|"))
+        .map(str::parse::<u64>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        counts == [rows],
+        "Spark source row oracle failed: {counts:?}"
+    );
+    let files = stdout
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("RANGE_FILE|"))
+        .map(serde_json::from_str::<SeedFile>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let scope = format!(
+        "{}/{NAMESPACE}/{TABLE}/data/",
+        warehouse.trim_end_matches('/')
+    );
+    let mut paths = BTreeSet::new();
+    ensure!(
+        files.len() == file_count
+            && files.iter().map(|file| file.rows).sum::<u64>() == rows
+            && files.iter().all(|file| file.rows > 0
+                && file.size > 0
+                && file.path.starts_with(&scope)
+                && file.path.ends_with(".parquet")
+                && canonical_s3(&file.path).is_ok_and(|path| path == file.path)
+                && paths.insert(&file.path)),
+        "Spark source did not publish the required physical Iceberg files",
+    );
+    Ok(files)
 }
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -310,33 +235,11 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     ]
 }
 
-/// Functional native read and cancellation checks over the published A4
-/// multi-file table. This stage has no timing, throughput, or RSS assertion.
+/// Native range reads and cancellation against scenario-owned Iceberg data.
 #[derive(Default)]
 struct RangeFunctional {
     fixture: Mutex<Option<LiveFixture>>,
     short: bool,
-}
-
-impl RangeFunctional {
-    fn checked_fixture(&self) -> Result<CheckedFixture> {
-        let variable = if self.short {
-            SHORT_FIXTURE_ENV
-        } else {
-            FIXTURE_ENV
-        };
-        let fixture = CheckedFixture::load_source(&env_path(variable)?, !self.short)?;
-        let expected_kind = if self.short {
-            "uea4a2-iceberg-short-v1"
-        } else {
-            "uea4a4-iceberg-performance-v1"
-        };
-        ensure!(
-            fixture.facts.fixture_kind == expected_kind,
-            "functional range input does not match the explicitly selected fixture"
-        );
-        Ok(fixture)
-    }
 }
 
 impl Scenario for RangeFunctional {
@@ -361,59 +264,48 @@ impl Scenario for RangeFunctional {
         true
     }
 
-    fn validate_runner_inputs(&self, _profile: LaunchProfile) -> Result<()> {
-        self.checked_fixture()?;
-        for name in ["AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY"] {
-            ensure!(!env::var(name)?.is_empty(), "{name} must be nonempty");
-        }
-        Ok(())
-    }
-
-    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let fixture = self.checked_fixture()?;
-        let proxy = DelayedS3Proxy::start(DelayedS3Config {
-            downstream: fixture.facts.s3_endpoint.clone(),
-            delay: Duration::ZERO,
-        })?;
-        for (index, object) in fixture.objects.iter().enumerate() {
-            let uri = format!(
-                "{}/{}",
-                fixture.facts.table_location.trim_end_matches('/'),
-                object.key
-            );
-            let path = uri
-                .strip_prefix("s3://")
-                .context("fixture object is not S3")?;
-            proxy.label_object(&format!("/{path}"), &format!("object_{index}"))?;
-        }
-        let mut child = CrossProcessChildEnvironment::default();
-        let access = env::var("AWS_S3_ACCESS_KEY_ID")?;
-        let secret = env::var("AWS_S3_SECRET_ACCESS_KEY")?;
-        for values in [&mut child.fe, &mut child.be] {
-            values.insert(ACCESS_KEY_ENV.to_owned(), access.clone());
-            values.insert(SECRET_KEY_ENV.to_owned(), secret.clone());
-        }
-        let metadata = format!(
-            "{}\n{FUNCTIONAL_CACHE_OVERLAY}",
-            credential_overlay("object-store-metadata", &fixture.facts)
-        );
-        let data = format!(
-            "{}\n{FUNCTIONAL_CACHE_OVERLAY}",
-            credential_overlay("object-store-data", &fixture.facts)
-        );
-        *self
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &Path,
+        budget: &RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut slot = self
             .fixture
             .lock()
-            .map_err(|_| anyhow::anyhow!("functional fixture lock poisoned"))? =
-            Some(LiveFixture {
-                checked: fixture,
-                proxy,
-            });
+            .map_err(|_| anyhow::anyhow!("range fixture lock poisoned"))?;
+        ensure!(slot.is_none(), "range fixture initialized twice");
+        let (rest, _) =
+            IsolatedIcebergRestFixture::start_private_with_budget(scenario_root, budget, false)
+                .context("start private range fixture")?;
+        // The runner can settle the private owner even if Spark or proxy setup fails.
+        let fixture = slot.insert(LiveFixture { rest, proxy: None });
+        let files = seed_source(&fixture.rest, scenario_root, budget, self.short)?;
+        let proxy = DelayedS3Proxy::start(DelayedS3Config {
+            downstream: fixture.rest.endpoints().minio_endpoint.clone(),
+            delay: Duration::ZERO,
+        })?;
+        for (index, file) in files.iter().enumerate() {
+            let path = file
+                .path
+                .strip_prefix("s3://")
+                .context("source file is not S3")?;
+            proxy.label_object(&format!("/{path}"), &format!("range_data_{index}"))?;
+        }
+        fixture.proxy = Some(proxy);
+        let identity = fixture.rest.static_s3_identity();
+        let mut child = CrossProcessChildEnvironment::default();
+        for role in [&mut child.fe, &mut child.be] {
+            role.insert(ACCESS_KEY_ENV.to_owned(), identity.access_key_id.clone());
+            role.insert(
+                SECRET_KEY_ENV.to_owned(),
+                identity.secret_access_key.clone(),
+            );
+        }
         Ok(ScenarioLaunchConfig {
             child_environment: child,
             config_overlay: CrossProcessConfigOverlay {
-                fe: Some(metadata),
-                be: Some(data),
+                fe: Some(credential_overlay("object-store-metadata")),
+                be: Some(credential_overlay("object-store-data")),
                 ..Default::default()
             },
             ..Default::default()
@@ -429,15 +321,16 @@ impl Scenario for RangeFunctional {
         let fixture = fixture
             .as_ref()
             .context("functional fixture was not prepared")?;
-        context.action(format!(
-            "functional Iceberg input manifest_sha256={}",
-            fixture.checked.manifest_sha256
-        ));
-        let table = fixture.checked.table_name();
+        let proxy = fixture
+            .proxy
+            .as_ref()
+            .context("functional range proxy was not prepared")?;
+        context.action("read from the private Spark-authored Iceberg snapshot");
+        let table = format!("{CATALOG}.{NAMESPACE}.{TABLE}");
         let mut connection =
             SqlSession::new(context.sql_user(), context.trino_port(), context.deadline())?;
         connection
-            .execute(fixture.checked.catalog_sql(fixture.proxy.endpoint()))
+            .execute(catalog_sql(&fixture.rest, proxy.endpoint()))
             .map(|_| ())
             .context("create functional Iceberg catalog")?;
         if self.short {
@@ -446,16 +339,19 @@ impl Scenario for RangeFunctional {
             context.action("four short-range clients independently verified (id, 3 * id) for id=1..10 and exited");
             return Ok(());
         }
-        let scan = format!("SELECT id FROM {table} WHERE id BETWEEN 0 AND 767 ORDER BY id");
+        let scan = format!(
+            "SELECT id FROM {table} WHERE id BETWEEN 0 AND {} ORDER BY id",
+            MULTI_ROWS - 1
+        );
         let initial_baseline = resource_baseline(context)?;
-        let before = fixture.proxy.snapshot();
+        let before = proxy.snapshot();
         verify_functional_rows(&mut connection, &scan)?;
-        let after = fixture.proxy.snapshot();
+        let after = proxy.snapshot();
         ensure!(
             after.gets > before.gets && after.upstream_errors == before.upstream_errors,
             "multi-file Iceberg read did not complete real S3 GETs without upstream errors"
         );
-        context.action("verified every ordered ID across the published multi-file Iceberg table");
+        context.action("verified every ordered ID across the private multi-file Iceberg table");
         let first_five: Vec<u64> = connection
             .execute(format!("{scan} LIMIT 5"))
             .and_then(unsigned_rows)
@@ -472,7 +368,7 @@ impl Scenario for RangeFunctional {
         );
 
         let baseline = resource_baseline(context)?;
-        let hold = fixture.proxy.hold_next_read_with_suffix(".parquet")?;
+        let hold = proxy.hold_next_read_with_suffix(".parquet")?;
         let held_scan = scan.clone();
         let mut actor =
             ProviderActor::spawn(context, "a4-held-read", move |connection, statements| {
@@ -557,9 +453,7 @@ impl Scenario for RangeFunctional {
         {
             cleanup.push(error.context("resource exit"));
         }
-        if let Err(error) =
-            record_cancelled_proxy_read(context, "a4-held-read", &fixture.proxy, &hold)
-        {
+        if let Err(error) = record_cancelled_proxy_read(context, "a4-held-read", proxy, &hold) {
             cleanup.push(error.context("proxy terminal evidence"));
         }
         let evidence = (|| -> Result<()> {
@@ -588,10 +482,15 @@ impl Scenario for RangeFunctional {
     }
 
     fn teardown(&self) -> Result<()> {
-        self.fixture
+        let fixture = self
+            .fixture
             .lock()
-            .map_err(|_| anyhow::anyhow!("functional fixture lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("range fixture lock poisoned"))?
             .take();
+        if let Some(LiveFixture { mut rest, proxy }) = fixture {
+            drop(proxy);
+            rest.shutdown().context("shutdown private range fixture")?;
+        }
         Ok(())
     }
 }
@@ -605,8 +504,8 @@ fn verify_functional_rows(connection: &mut SqlSession, sql: &str) -> Result<()> 
 }
 fn verify_functional_result(rows: Vec<u64>) -> Result<()> {
     ensure!(
-        rows.len() == 768 && rows.iter().copied().eq(0..768),
-        "multi-file Iceberg rows differ from the published ordered ID oracle"
+        rows.iter().copied().eq(0..MULTI_ROWS),
+        "multi-file Iceberg rows differ from the independent ordered ID oracle"
     );
     Ok(())
 }
@@ -618,7 +517,10 @@ fn run_range_clients(context: &mut ScenarioContext, table: &str, short: bool) ->
     let sql = if short {
         format!("SELECT id, value FROM {table} WHERE id BETWEEN 1 AND 10 ORDER BY id")
     } else {
-        format!("SELECT id FROM {table} WHERE id BETWEEN 0 AND 767 ORDER BY id")
+        format!(
+            "SELECT id FROM {table} WHERE id BETWEEN 0 AND {} ORDER BY id",
+            MULTI_ROWS - 1
+        )
     };
     let checks = (0..4)
         .map(|index| {

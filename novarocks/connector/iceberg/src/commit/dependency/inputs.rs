@@ -17,26 +17,36 @@
 
 //! Manifest input retains logical identities, including multiple DV blobs in one Puffin.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::model::{ArtifactWriter, EntryIdentity, FrozenEntry};
+#[cfg(test)]
+use super::super::manifest_sources::duplicate_identity;
+use super::super::manifest_sources::{LocatedEntry, SnapshotSources};
+#[cfg(test)]
+use super::super::model::FrozenEntry;
+use super::super::model::{ArtifactWriter, EntryIdentity};
 #[cfg(test)]
 use super::{HistoryGap, HistoryWindow, history_window};
-use crate::iceberg::spec::{DataContentType, DataFile, ManifestFile, SnapshotRef, TableMetadata};
+#[cfg(test)]
+use crate::iceberg::spec::DataFile;
+use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Error, ErrorKind, Result};
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct LiveEntry {
     pub frozen: FrozenEntry,
     pub file: DataFile,
 }
 
+#[cfg(test)]
 pub type LiveSet = BTreeMap<EntryIdentity, LiveEntry>;
 
 pub struct ValidationInputs<'a> {
     pub metadata: &'a TableMetadata,
     pub parent: Option<i64>,
     io: &'a dyn ArtifactWriter,
+    #[cfg(test)]
     live: Option<LiveSet>,
 }
 
@@ -50,10 +60,58 @@ impl<'a> ValidationInputs<'a> {
             metadata,
             parent,
             io,
+            #[cfg(test)]
             live: None,
         }
     }
 
+    pub(crate) async fn live_data_matches(
+        &self,
+        paths: &BTreeSet<&str>,
+    ) -> Result<BTreeSet<String>> {
+        self.io.check_active()?;
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let Some(parent) = self.parent else {
+            return Ok(BTreeSet::new());
+        };
+        let snapshot = self.metadata.snapshot_by_id(parent).ok_or_else(|| {
+            invalid(format!(
+                "Target ref snapshot {parent} is absent from metadata"
+            ))
+        })?;
+        let sources = SnapshotSources::load(self.metadata, snapshot, self.io.file_io(), || {
+            self.io.check_active()
+        })
+        .await?;
+        sources
+            .live_data_matches(paths, self.io.file_io(), || self.io.check_active())
+            .await
+    }
+
+    pub(crate) async fn compact_live_entries(
+        &self,
+    ) -> Result<BTreeMap<EntryIdentity, LocatedEntry>> {
+        self.io.check_active()?;
+        let Some(parent) = self.parent else {
+            return Ok(BTreeMap::new());
+        };
+        let snapshot = self.metadata.snapshot_by_id(parent).ok_or_else(|| {
+            invalid(format!(
+                "Target ref snapshot {parent} is absent from metadata"
+            ))
+        })?;
+        let sources = SnapshotSources::load(self.metadata, snapshot, self.io.file_io(), || {
+            self.io.check_active()
+        })
+        .await?;
+        sources
+            .live_entries(self.io.file_io(), || self.io.check_active())
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn live_set(&mut self) -> Result<&LiveSet> {
         if self.live.is_none() {
             let mut live = LiveSet::new();
@@ -63,13 +121,37 @@ impl<'a> ValidationInputs<'a> {
                         "Target ref snapshot {parent} is absent from metadata"
                     ))
                 })?;
-                for (identity, entry) in self.snapshot_entries(snapshot, false).await? {
-                    if live.insert(identity.clone(), entry).is_some() {
-                        return Err(invalid(format!(
-                            "Duplicate live Iceberg entry identity: {identity:?}"
-                        )));
-                    }
-                }
+                let sources =
+                    SnapshotSources::load(self.metadata, snapshot, self.io.file_io(), || {
+                        self.io.check_active()
+                    })
+                    .await?;
+                sources
+                    .fold(
+                        self.io.file_io(),
+                        || self.io.check_active(),
+                        |_| true,
+                        |entry| {
+                            if entry.raw.is_alive() {
+                                let frozen = FrozenEntry::from_bound_entry(&entry)?;
+                                let identity = frozen.identity().clone();
+                                if live
+                                    .insert(
+                                        identity.clone(),
+                                        LiveEntry {
+                                            frozen,
+                                            file: entry.raw.data_file().clone(),
+                                        },
+                                    )
+                                    .is_some()
+                                {
+                                    return Err(duplicate_identity(&identity));
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await?;
             }
             self.live = Some(live);
         }
@@ -79,80 +161,6 @@ impl<'a> ValidationInputs<'a> {
     #[cfg(test)]
     pub fn history(&self, start: Option<i64>) -> std::result::Result<HistoryWindow, HistoryGap> {
         history_window(self.metadata, start, self.parent)
-    }
-
-    /// Reads only manifests written by this snapshot. Inherited manifests are not new history.
-    #[cfg(test)]
-    pub async fn own_snapshot_entries(
-        &self,
-        snapshot: &SnapshotRef,
-    ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
-        self.snapshot_entries(snapshot, true).await
-    }
-
-    async fn snapshot_entries(
-        &self,
-        snapshot: &SnapshotRef,
-        own_only: bool,
-    ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
-        self.io.check_active()?;
-        let list =
-            crate::manifest::load_manifest_list(snapshot, self.io.file_io(), self.metadata).await?;
-        self.io.check_active()?;
-        let mut entries = Vec::new();
-        for manifest in list.entries() {
-            if own_only && manifest.added_snapshot_id != snapshot.snapshot_id() {
-                continue;
-            }
-            entries.extend(self.manifest_entries(manifest, own_only).await?);
-        }
-        Ok(entries)
-    }
-
-    async fn manifest_entries(
-        &self,
-        manifest: &ManifestFile,
-        include_deleted: bool,
-    ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
-        self.io.check_active()?;
-        let loaded = crate::manifest::load_manifest(manifest, self.io.file_io()).await?;
-        self.io.check_active()?;
-        let mut next_row = manifest
-            .first_row_id
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| invalid("Manifest first row ID exceeds i64"))?;
-        let mut out = Vec::new();
-        for entry in loaded.entries() {
-            let file = entry.data_file();
-            let inherited = if entry.is_alive() && file.content_type() == DataContentType::Data {
-                let inherited = file.first_row_id().or(next_row);
-                if let Some(next) = next_row.as_mut().filter(|_| file.first_row_id().is_none()) {
-                    *next = next
-                        .checked_add(
-                            i64::try_from(file.record_count())
-                                .map_err(|_| invalid("Manifest row count exceeds i64"))?,
-                        )
-                        .ok_or_else(|| invalid("Manifest row ID inheritance overflows"))?;
-                }
-                inherited
-            } else {
-                None
-            };
-            if !include_deleted && !entry.is_alive() {
-                continue;
-            }
-            let frozen =
-                FrozenEntry::from_manifest_entry(entry, manifest.partition_spec_id, inherited)?;
-            out.push((
-                frozen.identity().clone(),
-                LiveEntry {
-                    frozen,
-                    file: file.clone(),
-                },
-            ));
-        }
-        Ok(out)
     }
 }
 

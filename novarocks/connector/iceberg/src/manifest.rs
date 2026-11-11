@@ -18,7 +18,6 @@
 //! Provider-owned manifest facts used by statistics and mutation planning.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
@@ -33,6 +32,12 @@ use crate::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
 };
+
+pub(crate) mod binding;
+pub(crate) mod partition_pruning;
+pub(crate) mod partition_types;
+pub(crate) mod source;
+pub(crate) mod target_query;
 
 pub(crate) fn schema_contains_variant(schema: &crate::iceberg::spec::Schema) -> bool {
     fn contains(data_type: &crate::iceberg::spec::Type) -> bool {
@@ -121,24 +126,15 @@ pub(crate) fn decode_manifest(
     bytes: &[u8],
     descriptor: &ManifestFile,
 ) -> crate::iceberg::Result<Manifest> {
-    // Iceberg's initial sequence is zero; the SDK keeps this constant private.
-    const INITIAL_SEQUENCE_NUMBER: i64 = 0;
     let (entries, metadata) = parse_manifest_checked(bytes)?.into_parts();
     let entries = entries
         .into_iter()
         .map(|entry| {
-            let mut entry = Arc::unwrap_or_clone(entry);
-            if entry.snapshot_id.is_none() {
-                entry.snapshot_id = Some(descriptor.added_snapshot_id);
-            }
-            let inherits_sequence = entry.status == ManifestStatus::Added
-                || descriptor.sequence_number == INITIAL_SEQUENCE_NUMBER;
-            if entry.sequence_number.is_none() && inherits_sequence {
-                entry.sequence_number = Some(descriptor.sequence_number);
-            }
-            if entry.file_sequence_number.is_none() && inherits_sequence {
-                entry.file_sequence_number = Some(descriptor.sequence_number);
-            }
+            let mut entry = std::sync::Arc::unwrap_or_clone(entry);
+            let inherited = binding::EntrySequences::resolve(&entry, descriptor, false);
+            entry.snapshot_id = inherited.snapshot_id;
+            entry.sequence_number = inherited.data_sequence;
+            entry.file_sequence_number = inherited.file_sequence;
             entry
         })
         .collect();
