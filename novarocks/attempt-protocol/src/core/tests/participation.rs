@@ -956,3 +956,222 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
         first.admission_epoch_capability()
     );
 }
+
+fn call_source_step(
+    core: &mut Core,
+    source: AttemptSourceId,
+    number: u64,
+    input: AttemptInput,
+) -> AttemptStep {
+    core.handle(
+        core.execution.monotonic_now(),
+        AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(number)),
+            native_cut: Some(AttemptSourceCut {
+                source: core.sources.native,
+                tail: None,
+            }),
+            selected_cut: Some(AttemptSourceCut {
+                source: core.sources.observation,
+                tail: None,
+            }),
+        },
+        input,
+        &mut Units(64),
+    )
+    .unwrap()
+}
+
+#[test]
+fn next_convergence_read_is_authored_by_a_separate_timer_input() {
+    use crate::input::MembershipObservation;
+    use novarocks_coordination_contract::AttemptConvergenceMode;
+
+    let original = start();
+    let sources = original.sources;
+    let activation = original.activation.identity;
+    let now = original.initial_now;
+    let mut core = Core::new(original).unwrap();
+    let participants: Vec<_> = core.execution.graph().participations().copied().collect();
+    for (sequence, &participation) in (1..=2).zip(&participants) {
+        let request = admission_intent(&mut core.execution, participation);
+        let accepted = dispatch_admission(
+            &mut core.execution,
+            request,
+            sequence,
+            OperationOutcome::Accepted,
+        );
+        core.execution.apply_dispatched_reply(&accepted).1.unwrap();
+    }
+    call_source_step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
+    call_source_step(
+        &mut core,
+        sources.actor,
+        2,
+        AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Normal,
+                remote_deadline: now.saturating_add(Duration::from_secs(3)),
+                computation_ready: None,
+                retain_diagnostics: false,
+            },
+        }),
+    );
+
+    let mut next = call_source_step(&mut core, sources.actor, 3, AttemptInput::Timer);
+    let mut previous = None;
+    for (number, &original) in (0..2).zip(&participants) {
+        let Some(AttemptEffect {
+            body:
+                EffectBody::ObserveProcess {
+                    request,
+                    participation,
+                },
+            ..
+        }) = next.effect
+        else {
+            panic!("expected the next original convergence row");
+        };
+        assert_eq!(participation, original);
+        assert_ne!(Some(request), previous);
+        assert_eq!(next.selection, InputSelection::Only(sources.process));
+        assert_eq!(core.next_deadline(), None);
+
+        let reply = call_source_step(
+            &mut core,
+            sources.process,
+            4 + 2 * number,
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request,
+                participation,
+                sampled_at: now,
+                observation: MembershipObservation::ExactReplacement(crate::test_support::backend(
+                    99,
+                )),
+            }),
+        );
+        assert!(reply.effect.is_none());
+        assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+        assert_eq!(core.next_deadline(), Some(now));
+        previous = Some(request);
+        next = call_source_step(
+            &mut core,
+            sources.actor,
+            5 + 2 * number,
+            AttemptInput::Timer,
+        );
+    }
+    assert!(matches!(next.effect, Some(AttemptEffect {
+        body: EffectBody::Port(port), ..
+    }) if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress {
+        local_exited: false, closure: Some(_), ..
+    })));
+}
+
+#[test]
+fn replacement_permission_reply_defers_only_same_lane_terminal_publication() {
+    for may_observe in [false, true] {
+        let mut fixture = Fixture::new(BeforeStop::Ticket, 64);
+        let sources = fixture.sources;
+        let participation = fixture.participation;
+        let intent = fixture
+            .core
+            .execution
+            .next_authorization_intent(
+                participation,
+                fixture.core.establish_material[&participation],
+            )
+            .unwrap()
+            .unwrap();
+        let generation = fixture.emit_fixture_send(&intent, 710);
+        let execution = &mut fixture.core.execution;
+        execution
+            .establish_send_started(participation, intent.operation_id())
+            .unwrap();
+        let error = execution
+            .apply_dispatched_reply(&reply(
+                &intent,
+                generation,
+                OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::IdentityMismatch,
+                    detail: None,
+                    acknowledgement: None,
+                }),
+            ))
+            .1
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TaskExecutionError::PreReadyEstablishRejected { .. }
+        ));
+        assert!(
+            fixture
+                .core
+                .terminal
+                .record_execution_failure(error.clone(), execution)
+                .unwrap()
+        );
+
+        let publication = (0..8)
+            .find_map(|_| fixture.step(sources.actor, AttemptInput::Timer).effect)
+            .expect("original protocol publication");
+        assert!(matches!(
+            publication.body,
+            EffectBody::Publish(Publication::ProtocolBatch(_))
+        ));
+        let asked = fixture.step(
+            sources.publication,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: publication.id,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+        );
+        let Some(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = asked.effect
+        else {
+            panic!("expected the original replacement permission query");
+        };
+        let AttemptToLogicalBody::PreReadyReplacementQuery { token, refusal } = port.body else {
+            panic!("expected replacement permission, got {:?}", port.body);
+        };
+        assert_eq!(refusal, AttemptFailure::TaskProtocol(Box::new(error)));
+        assert_eq!(asked.selection, InputSelection::Only(sources.qa));
+        if !may_observe {
+            fixture.stop(AttemptStopReason::Client);
+            assert_eq!(
+                fixture.core.authorizations.preparation(),
+                crate::terminal::GatePreparation::Applied { ready: true },
+            );
+        }
+        let reply = fixture.step(
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: fixture.activation,
+                body: LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe },
+            }),
+        );
+        if may_observe {
+            assert!(matches!(reply.effect, Some(AttemptEffect {
+                body: EffectBody::ObserveProcess { participation: exact, .. }, ..
+            }) if exact == participation));
+            assert_eq!(reply.selection, InputSelection::Only(sources.process));
+        } else {
+            assert!(reply.effect.is_none());
+            assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+            assert_eq!(fixture.core.next_deadline(), Some(fixture.now));
+            assert_eq!(
+                fixture.core.terminal.terminal(),
+                Some(&AttemptTerminal::Failed(refusal.clone()))
+            );
+            let publication = fixture.step(sources.actor, AttemptInput::Timer);
+            assert!(matches!(publication.effect, Some(AttemptEffect {
+                body: EffectBody::Port(port), ..
+            }) if matches!(&port.body, AttemptToLogicalBody::AttemptTerminal(
+                AttemptTerminal::Failed(original)) if original == &refusal)));
+        }
+    }
+}

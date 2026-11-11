@@ -87,6 +87,7 @@ enum Phase {
         success: bool,
     },
     Terminal(TerminalWake),
+    PublishTerminal,
     Tail,
     Converge,
     ClosingGate,
@@ -259,9 +260,10 @@ impl AttemptCore for Core {
             {
                 None
             }
-            Phase::Terminal(_) | Phase::NativeQuiesce | Phase::Observations => {
-                Some(self.execution.monotonic_now())
-            }
+            Phase::Terminal(_)
+            | Phase::PublishTerminal
+            | Phase::NativeQuiesce
+            | Phase::Observations => Some(self.execution.monotonic_now()),
             Phase::Idle if self.stop.pending() && !self.authorizations.waiting_for_reply() => {
                 Some(self.execution.monotonic_now())
             }
@@ -359,7 +361,7 @@ impl Core {
             Phase::AwaitRoot(..) | Phase::AwaitSeal { .. } => Only(self.sources.publication),
             Phase::Terminal(_) if self.terminal.waiting_for_permission() => Only(self.sources.qa),
             Phase::Terminal(_) if self.terminal.waiting_for_process() => Only(self.sources.process),
-            Phase::Terminal(_) => Only(self.sources.actor),
+            Phase::Terminal(_) | Phase::PublishTerminal => Only(self.sources.actor),
             Phase::Tail
                 if self.round_tail.waiting_for_publication()
                     && self.publication.has_pending_apply() =>
@@ -444,7 +446,7 @@ impl Core {
                         || self.local_close_due())
                 {
                     self.turn.phase = Phase::Converge;
-                    return self.drive_convergence(now, context, result);
+                    return self.drive_convergence(now, true, context, result);
                 }
                 let cut = claim
                     .native_cut
@@ -472,12 +474,24 @@ impl Core {
                         .is_some_and(|deadline| now.has_reached(deadline))
                 {
                     self.turn.phase = Phase::Terminal(TerminalWake::Continuation);
-                    return self.drive_terminal(now, TerminalWake::Continuation, context, result);
+                    return self.drive_terminal(
+                        now,
+                        TerminalWake::Continuation,
+                        false,
+                        context,
+                        result,
+                    );
                 }
                 if timer && self.turn.cancellation_due && self.terminal_needs_drive() {
                     self.turn.cancellation_due = false;
                     self.turn.phase = Phase::Terminal(TerminalWake::Cancellation);
-                    return self.drive_terminal(now, TerminalWake::Cancellation, context, result);
+                    return self.drive_terminal(
+                        now,
+                        TerminalWake::Cancellation,
+                        false,
+                        context,
+                        result,
+                    );
                 }
                 self.begin_native_prefix(now, cut)?;
                 self.enter_common_or_skip()?;
@@ -570,6 +584,16 @@ impl Core {
             Phase::Terminal(wake) => {
                 self.apply_terminal(now, claim, input, wake, context, result)?
             }
+            Phase::PublishTerminal if timer => {
+                if context.charge(1) {
+                    let terminal = self
+                        .terminal
+                        .terminal()
+                        .expect("selected terminal publication")
+                        .clone();
+                    self.publish_terminal(terminal, result)?;
+                }
+            }
             Phase::Tail => self.apply_tail(now, claim, input, context, result)?,
             Phase::Candidates if timer => self.drive_candidates(context, result)?,
             Phase::Candidates => {
@@ -603,7 +627,7 @@ impl Core {
                         result.effect = Some(effect);
                     }
                 } else {
-                    self.drive_convergence(now, context, result)?;
+                    self.drive_convergence(now, true, context, result)?;
                 }
             }
             Phase::Converge => {
@@ -626,7 +650,9 @@ impl Core {
                     sampled_at,
                     observation,
                 )?;
-                self.drive_convergence(now, context, result)?;
+                // The reply still owns the Process result position. Park an
+                // exact next read for the Timer while allowing independent progress.
+                self.drive_convergence(now, false, context, result)?;
             }
             _ => return Err(schedule("input crossed an unfinished Root phase")),
         }
@@ -776,7 +802,7 @@ impl Core {
                     self.turn.phase = Phase::Converge;
                 }
                 if self.turn.phase == Phase::Converge {
-                    self.drive_convergence(now, context, result)?;
+                    self.drive_convergence(now, true, context, result)?;
                 }
             }
             AttemptInput::Membership(view) => {
@@ -901,6 +927,7 @@ impl Core {
     fn drive_convergence(
         &mut self,
         now: MonotonicInstant,
+        may_observe_process: bool,
         context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
@@ -968,15 +995,18 @@ impl Core {
         if self.convergence.waiting_for_process() || !context.charge(1) {
             return Ok(());
         }
-        let (id, token) = self.turn.issue()?;
-        match self
-            .convergence
-            .advance(now, &self.execution, context, Some(token))?
-        {
+        let process_read = may_observe_process.then(|| self.turn.issue()).transpose()?;
+        match self.convergence.advance(
+            now,
+            &self.execution,
+            context,
+            process_read.map(|(_, token)| token),
+        )? {
             RemoteConvergenceDirective::ObserveProcess {
                 request,
                 participation,
             } => {
+                let (id, _) = process_read.expect("original process read credit");
                 result.effect = Some(AttemptEffect {
                     id,
                     class: EffectClass::Settlement,
@@ -1546,7 +1576,7 @@ impl Core {
                 if self.terminal_needs_drive() {
                     self.turn.cancellation_due = false;
                     self.turn.phase = Phase::Terminal(TerminalWake::Round);
-                    self.drive_terminal(now, TerminalWake::Round, context, result)?;
+                    self.drive_terminal(now, TerminalWake::Round, false, context, result)?;
                 } else {
                     self.begin_candidates_or_resume();
                 }
@@ -1817,6 +1847,7 @@ impl Core {
         context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
+        let defer_publication = matches!(&input, AttemptInput::Port(_));
         let wake = match input {
             AttemptInput::Timer => {
                 self.verify_source(claim.source, self.sources.actor)?;
@@ -1866,13 +1897,14 @@ impl Core {
             }
             _ => return Err(schedule("input crossed the original terminal decision")),
         };
-        self.drive_terminal(now, wake, context, result)
+        self.drive_terminal(now, wake, defer_publication, context, result)
     }
 
     fn drive_terminal(
         &mut self,
         now: MonotonicInstant,
         wake: TerminalWake,
+        defer_publication: bool,
         context: &mut dyn StepContext,
         result: &mut AttemptStep,
     ) -> Result<(), TaskExecutionError> {
@@ -1937,22 +1969,36 @@ impl Core {
                 ) {
                     self.request_stop(result);
                 }
-                let normal = matches!(
-                    terminal,
-                    novarocks_coordination_contract::AttemptTerminal::Completed
-                );
-                result.effect =
-                    Some(self.port_effect(AttemptToLogicalBody::AttemptTerminal(terminal))?);
-                if normal {
-                    self.begin_candidates_or_resume();
+                if defer_publication {
+                    // Keep the decision at its permission-reply cut, but let
+                    // that input retire before publishing through the same QA lane.
+                    self.turn.phase = Phase::PublishTerminal;
                 } else {
-                    self.resume_after_terminal();
+                    self.publish_terminal(terminal, result)?;
                 }
             }
             TerminalDirective::Wait => self.resume_after_terminal(),
             TerminalDirective::NeedRequestCredit => {
                 return Err(schedule("charged terminal request lost its identity"));
             }
+        }
+        Ok(())
+    }
+
+    fn publish_terminal(
+        &mut self,
+        terminal: novarocks_coordination_contract::AttemptTerminal<AttemptFailure>,
+        result: &mut AttemptStep,
+    ) -> Result<(), TaskExecutionError> {
+        let normal = matches!(
+            terminal,
+            novarocks_coordination_contract::AttemptTerminal::Completed
+        );
+        result.effect = Some(self.port_effect(AttemptToLogicalBody::AttemptTerminal(terminal))?);
+        if normal {
+            self.begin_candidates_or_resume();
+        } else {
+            self.resume_after_terminal();
         }
         Ok(())
     }
