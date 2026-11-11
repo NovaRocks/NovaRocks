@@ -238,6 +238,28 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_metrics_sample_the_installed_control_ledger_and_omit_it_after_exit() {
+    use crate::metrics::{FrontendMetricsRegistry, render_metrics};
+
+    let mut host = open_host(Some(state_store_input())).await.unwrap();
+    let registry =
+        FrontendMetricsRegistry::with_role_observations(None, Some(&host.attempt_runtime()))
+            .unwrap();
+    let running = render_metrics(&registry).unwrap();
+    host.shutdown().await.unwrap();
+    drop(host);
+    let exited = render_metrics(&registry).unwrap();
+    let availability =
+        r#"novarocks_frontend_control_runtime_observation_available{source="transport_process"}"#;
+    assert!(running.contains(&format!("{availability} 1")));
+    assert!(running.contains(
+        r#"novarocks_frontend_control_runtime_transport_process{dimension="1",resource="used"} 0"#
+    ));
+    assert!(exited.contains(&format!("{availability} 0")));
+    assert!(!exited.contains("novarocks_frontend_control_runtime_transport_process{"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn original_process_health_blocks_ready_and_triggers_running_host_observation() {
     #[derive(Debug)]
     struct OriginalCause;

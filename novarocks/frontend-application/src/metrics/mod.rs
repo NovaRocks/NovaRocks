@@ -24,6 +24,7 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
+use crate::control_runtime::{FrontendAttemptRuntime, metrics::FrontendRuntimeMetrics};
 use crate::workload_lifecycle::{FrontendCatalogSourceMode, FrontendServingSnapshot};
 use novarocks_query_application::serving_admission::FrontendServingState;
 
@@ -297,19 +298,22 @@ static FRONTEND_SERVING_METRICS_PUBLISH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mut
 /// both Frontend and Backend application hosts.
 pub(crate) struct FrontendMetricsRegistry {
     registry: Registry,
-    process_memory: Option<(Mutex<()>, process_memory::ProcessMemoryGauges)>,
+    scrape: Mutex<()>,
+    process_memory: Option<process_memory::ProcessMemoryGauges>,
+    control_runtime: Option<FrontendRuntimeMetrics>,
 }
 
 impl FrontendMetricsRegistry {
     #[cfg(test)]
     pub(crate) fn new() -> Result<Arc<Self>, String> {
-        Self::with_process_memory(None)
+        Self::with_role_observations(None, None)
     }
 
-    /// The registry, plus this process's memory readings when the Server
-    /// supplies a sampler. Readings are refreshed on every scrape.
-    pub(crate) fn with_process_memory(
+    /// Bind the original role runtime and optional Server memory sampler.
+    /// Each scrape refreshes these observations before gathering.
+    pub(crate) fn with_role_observations(
         observation: Option<FrontendProcessMemoryObservation>,
+        attempt_runtime: Option<&FrontendAttemptRuntime>,
     ) -> Result<Arc<Self>, String> {
         refresh_frontend_gauges();
         let registry = Registry::new();
@@ -354,11 +358,15 @@ impl FrontendMetricsRegistry {
             .map(|observation| {
                 process_memory::ProcessMemoryGauges::register(&registry, observation)
             })
-            .transpose()?
-            .map(|gauges| (Mutex::new(()), gauges));
+            .transpose()?;
+        let control_runtime = attempt_runtime
+            .map(|runtime| runtime.metrics(&registry))
+            .transpose()?;
         Ok(Arc::new(Self {
             registry,
+            scrape: Mutex::new(()),
             process_memory,
+            control_runtime,
         }))
     }
 
@@ -373,11 +381,13 @@ impl FrontendMetricsRegistry {
 
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         // Sampling and collection happen in one scrape order.
-        let _scrape = self.process_memory.as_ref().map(|(lock, gauges)| {
-            let guard = lock.lock().expect("frontend process memory scrape lock");
-            gauges.publish();
-            guard
-        });
+        let _scrape = self.scrape.lock().expect("frontend metrics scrape lock");
+        if let Some(memory) = &self.process_memory {
+            memory.publish();
+        }
+        if let Some(runtime) = &self.control_runtime {
+            runtime.sample();
+        }
         self.registry.gather()
     }
 }
@@ -682,8 +692,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         let resident = Arc::new(AtomicU64::new(4096));
         let sampled = Arc::clone(&resident);
-        let registry =
-            FrontendMetricsRegistry::with_process_memory(Some(FrontendProcessMemoryObservation {
+        let registry = FrontendMetricsRegistry::with_role_observations(
+            Some(FrontendProcessMemoryObservation {
                 allocator: "jemalloc",
                 sample: Arc::new(move || PhysicalMemoryReading {
                     cgroup_anonymous_bytes: None,
@@ -694,8 +704,10 @@ mod tests {
                         resident_bytes: 300,
                     }),
                 }),
-            }))
-            .expect("create frontend metrics registry");
+            }),
+            None,
+        )
+        .expect("create frontend metrics registry");
         let body = render_metrics(registry.as_ref()).expect("render metrics");
         assert!(
             body.contains(r#"novarocks_frontend_process_allocator_info{allocator="jemalloc"} 1"#)

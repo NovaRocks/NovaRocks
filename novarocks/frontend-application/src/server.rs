@@ -966,9 +966,11 @@ pub fn start_frontend_management_server(
     config: &FrontendManagementConfig,
     host: &FrontendApplicationHost,
 ) -> Result<FrontendManagementServer, FrontendApplicationError> {
-    let metrics_registry =
-        crate::metrics::FrontendMetricsRegistry::with_process_memory(config.process_memory.clone())
-            .map_err(FrontendApplicationError::server)?;
+    let metrics_registry = crate::metrics::FrontendMetricsRegistry::with_role_observations(
+        config.process_memory.clone(),
+        Some(&host.attempt_runtime()),
+    )
+    .map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
     let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
         config.native_compatibility_id,
@@ -987,8 +989,6 @@ pub fn start_frontend_management_server(
         .test_session
         .as_ref()
         .and_then(|session| session.statement.clone());
-    #[cfg(not(novarocks_dev_controls))]
-    let _ = host;
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
         &config.bind_host,
         config.http_port,

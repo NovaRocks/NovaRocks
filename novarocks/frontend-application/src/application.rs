@@ -71,8 +71,8 @@ use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::control_runtime::{
-    FrontendControlRuntime, FrontendControlRuntimeConfig, FrontendShutdownError,
-    membership::MembershipShutdownError,
+    FrontendAttemptRuntime, FrontendControlRuntime, FrontendControlRuntimeConfig,
+    FrontendShutdownError, membership::MembershipShutdownError,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::{
@@ -2280,6 +2280,13 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.logical_execution_client()
     }
 
+    pub(crate) fn attempt_runtime(&self) -> Arc<FrontendAttemptRuntime> {
+        self.control_runtime
+            .as_ref()
+            .expect("frontend control runtime is installed before host open returns")
+            .attempts()
+    }
+
     /// Materializes the native-read launcher while Server constructs its
     /// immutable role products. The returned launcher owns no process
     /// lifecycle state; it only joins the Host-owned execution runtime with
@@ -2291,10 +2298,7 @@ impl FrontendApplicationHost {
             Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             topology as novarocks_query_application::api::BackendProcessObservationService,
             self.data_runtime.clone(),
-            self.control_runtime
-                .as_ref()
-                .expect("frontend control runtime is installed before host open returns")
-                .attempts(),
+            self.attempt_runtime(),
             config.native_compatibility_id,
             config.runtime_filter_worker_count,
             config.task_update_retry_policy,
