@@ -24,6 +24,7 @@ use super::{
     graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
     host::transport::{AttemptEstablishMaterial, FrozenSendRequests},
     participation_owner::ParticipationEstablishSource,
+    protocol_facts::{AttemptProtocolFactsPublisher, AttemptProtocolFactsReceiver},
 };
 use crate::{
     control_runtime::membership::FrozenMember, query_execution::artifact::TaskManifestBinding,
@@ -38,7 +39,10 @@ use novarocks_coordination_contract::{
     AttemptActivation, AttemptCompletionPolicy, AttemptInheritedAdmission, AttemptLifecyclePolicy,
     MonotonicInstant,
 };
-use novarocks_execution_contract::{AdmissionEpochCapability, ParticipationRef, TaskIdentity};
+use novarocks_execution_contract::{
+    AdmissionEpochCapability, BackendProcessDescriptor, ParticipationRef, TaskIdentity,
+};
+use novarocks_query_application::api::PlanSeal;
 use novarocks_query_application::coordination::{
     NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
 };
@@ -52,8 +56,9 @@ use std::{
     time::Duration,
 };
 
-pub(crate) struct ManifestAttemptInputs<'a> {
-    pub(crate) manifest: &'a TaskManifestBinding,
+/// Facts owned by the projected attempt across the handoff to the original QA drive.
+pub(crate) struct ManifestAttemptInputs {
+    pub(crate) plan: PlanSeal,
     pub(crate) graph: TaskGraph,
     pub(crate) compatibility: NativeCompatibilityId,
     pub(crate) transport: TransportBudget,
@@ -62,11 +67,12 @@ pub(crate) struct ManifestAttemptInputs<'a> {
     pub(crate) admission_epochs: BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     pub(crate) preparing_positions: BTreeMap<BackendProcessId, usize>,
     pub(crate) members: Arc<[FrozenMember]>,
+    pub(crate) backends: Arc<[BackendProcessDescriptor]>,
 }
 
-impl<'a> ManifestAttemptInputs<'a> {
+impl ManifestAttemptInputs {
     pub(crate) fn freeze(
-        manifest: &'a TaskManifestBinding,
+        manifest: &TaskManifestBinding,
         plans: &mut dyn TaskPlanSource,
         compatibility: NativeCompatibilityId,
         transport: TransportBudget,
@@ -89,6 +95,7 @@ impl<'a> ManifestAttemptInputs<'a> {
         let mut admission_epochs = BTreeMap::new();
         let mut preparing_positions = BTreeMap::new();
         let mut members = Vec::with_capacity(manifest.participations().len());
+        let mut backends = Vec::with_capacity(manifest.participations().len());
         for participation in manifest.participations() {
             let backend = participation.backend();
             if backend.native_compatibility_id() != compatibility {
@@ -97,10 +104,8 @@ impl<'a> ManifestAttemptInputs<'a> {
                     backend.process_id()
                 )));
             }
-            preparing_positions.insert(
-                backend.process_id(),
-                backend.target().descriptor().preparing_positions(),
-            );
+            let descriptor = backend.target().descriptor();
+            preparing_positions.insert(backend.process_id(), descriptor.preparing_positions());
             if admission_epochs
                 .insert(backend.process_id(), backend.admission_epoch_capability())
                 .is_some()
@@ -112,12 +117,13 @@ impl<'a> ManifestAttemptInputs<'a> {
             }
             members.push(FrozenMember {
                 participation: participation.participation(),
-                endpoint: backend.endpoint().clone(),
+                endpoint: descriptor.endpoint().clone(),
             });
+            backends.push(descriptor.clone());
         }
         members.sort_unstable_by_key(|member| member.participation);
         Ok(Self {
-            manifest,
+            plan: manifest.plan(),
             graph,
             compatibility,
             transport,
@@ -126,6 +132,7 @@ impl<'a> ManifestAttemptInputs<'a> {
             admission_epochs,
             preparing_positions,
             members: members.into(),
+            backends: backends.into(),
         })
     }
 }
@@ -150,6 +157,9 @@ pub(crate) struct AttemptActivationInputs<'a> {
 pub(crate) struct AttemptManifestProjection {
     pub(crate) start: AttemptStart,
     pub(crate) members: Arc<[FrozenMember]>,
+    pub(crate) backends: Arc<[BackendProcessDescriptor]>,
+    pub(super) protocol: AttemptProtocolFactsPublisher,
+    pub(crate) protocol_facts: AttemptProtocolFactsReceiver,
     pub(crate) creations: BTreeMap<PayloadRef, PricedTaskCreation>,
     pub(crate) requests: FrozenSendRequests,
     pub(crate) qa: AttemptQaBridge,
@@ -160,7 +170,7 @@ impl AttemptManifestProjection {
     /// backing with one payload identity sequence. Core receives only the
     /// frozen protocol projection.
     pub(crate) fn from_manifest_inputs(
-        inputs: ManifestAttemptInputs<'_>,
+        inputs: ManifestAttemptInputs,
         establish: &dyn ParticipationEstablishSource,
         activation: AttemptActivationInputs<'_>,
         policy: AttemptPlanPolicy,
@@ -168,7 +178,7 @@ impl AttemptManifestProjection {
         next_payload: &mut NonZeroU64,
     ) -> Result<Self, TaskExecutionError> {
         let ManifestAttemptInputs {
-            manifest,
+            plan,
             graph,
             compatibility,
             transport,
@@ -177,9 +187,10 @@ impl AttemptManifestProjection {
             admission_epochs,
             preparing_positions,
             members,
+            backends,
         } = inputs;
         let identity = activation.drive.identity();
-        if identity.execution() != manifest.execution() {
+        if identity.execution() != graph.execution_id() {
             return Err(TaskExecutionError::Schedule(
                 "attempt projection differs from the original bound manifest".into(),
             ));
@@ -214,6 +225,8 @@ impl AttemptManifestProjection {
                     })
             })
             .collect::<Result<_, _>>()?;
+        let (protocol, protocol_facts) =
+            AttemptProtocolFactsPublisher::for_graph(plan, &graph, &writers, &summary_sources)?;
         let mut next = *next_payload;
         let (graph, creations) = graph.into_attempt_graph(&mut next)?;
         let (establish_material, establish) = AttemptEstablishMaterial::project(
@@ -269,6 +282,9 @@ impl AttemptManifestProjection {
         Ok(Self {
             start,
             members,
+            backends,
+            protocol,
+            protocol_facts,
             creations,
             requests: FrozenSendRequests::with_establish(establish.clone()),
             qa: AttemptQaBridge::new(Arc::new(activation.drive.clone()), compatibility, establish),

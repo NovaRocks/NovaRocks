@@ -869,7 +869,11 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         ManifestAttemptInputs,
     };
     use novarocks_attempt_protocol::{
-        AttemptCore, Core, config::CoordinationBudgets, ids::IdSeed, input::AttemptSourceId,
+        AttemptCore, Core,
+        config::CoordinationBudgets,
+        ids::IdSeed,
+        input::AttemptSourceId,
+        publication::{ProtocolMembership, ProtocolPublication},
         start::AttemptSources,
     };
     use novarocks_coordination_contract::{
@@ -961,6 +965,21 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
     );
     assert_eq!(authorization_limits.abort_per_participation, abort_limit);
 
+    let root = manifest.root();
+    let plan_seal = manifest.plan();
+    let task_count = manifest.tasks().len();
+    let roster = manifest
+        .participations()
+        .iter()
+        .map(|member| {
+            let backend = member.backend();
+            (
+                member.participation(),
+                backend.target().descriptor().clone(),
+                backend.admission_epoch_capability(),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut next = NonZeroU64::new(10).unwrap();
     let inputs = ManifestAttemptInputs::freeze(
         &manifest,
@@ -969,6 +988,7 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         TransportBudget::DEFAULT,
     )
     .unwrap();
+    drop(manifest);
     let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
     let lease = super::lease::RequestedLeaseDurations::DEFAULT;
     let mut projected = AttemptManifestProjection::from_manifest_inputs(
@@ -1007,12 +1027,15 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
     let plan = &projected.start.plan;
     assert_eq!(projected.start.activation.identity, activation);
     assert_eq!(plan.authorization_limits, authorization_limits);
-    assert_eq!(plan.graph.root, manifest.root());
-    assert_eq!(plan.graph.tasks.len(), manifest.tasks().len());
+    assert_eq!(plan.graph.root, root);
+    assert_eq!(plan.graph.tasks.len(), task_count);
     assert_eq!(plan.graph.edges.len(), edges.len());
-    assert_eq!(
-        plan.establish_material.len(),
-        manifest.participations().len()
+    assert_eq!(plan.establish_material.len(), roster.len());
+    assert!(
+        projected
+            .backends
+            .iter()
+            .eq(roster.iter().map(|entry| &entry.1))
     );
     assert_eq!(
         next.get() as usize,
@@ -1025,9 +1048,7 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
             .map(|member| &member.participation)
             .eq(plan.establish_material.keys())
     );
-    for participant in manifest.participations() {
-        let backend = participant.backend();
-        let participation = participant.participation();
+    for (participation, backend, admission_epoch) in roster {
         let member = projected
             .members
             .iter()
@@ -1036,11 +1057,11 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         assert_eq!(&member.endpoint, backend.endpoint());
         assert_eq!(
             plan.admission_epochs[&backend.process_id()],
-            backend.admission_epoch_capability()
+            admission_epoch
         );
         assert_eq!(
             plan.preparation_positions[&backend.process_id()].get(),
-            backend.target().descriptor().preparing_positions()
+            backend.preparing_positions()
         );
         assert!(
             !projected
@@ -1054,6 +1075,31 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
             task.identity
         );
     }
+    let initial = ProtocolPublication {
+        owner_revision: 0,
+        initial_membership: Some(Arc::new(ProtocolMembership {
+            writers: plan.writers.clone(),
+            summary_sources: plan.summary_sources.clone(),
+        })),
+        changes: Vec::new(),
+        selected_failure: None,
+        root_success_sealed: false,
+    };
+    assert!(
+        projected
+            .protocol
+            .publish_core_batch(activation, &initial)
+            .unwrap()
+    );
+    assert!(
+        projected
+            .protocol_facts
+            .take_changes(activation, root, plan_seal)
+            .unwrap()
+            .unwrap()
+            .is_initial()
+    );
+
     let participant = projected.members[0].participation;
     let admission = AcquireParticipationAdmissionTicket::new(
         TaskOperationId::new_v7(),

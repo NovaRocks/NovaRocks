@@ -2167,11 +2167,6 @@ impl ProductionManifestAttemptProjection {
         }
         // Even an empty table carries the original collector's transfer fact.
         let credential_storage = Some(storage);
-        let backends = manifest
-            .participations()
-            .iter()
-            .map(|participation| participation.backend().target().descriptor().clone())
-            .collect::<Vec<_>>();
         let inputs = {
             let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)
                 .map_err(|error| projection_message(error.to_string()))?;
@@ -2183,6 +2178,7 @@ impl ProductionManifestAttemptProjection {
             )
             .map_err(|error| projection_message(error.to_string()))?
         };
+        let backends = Arc::clone(&inputs.backends);
         let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
             inputs,
             establish,

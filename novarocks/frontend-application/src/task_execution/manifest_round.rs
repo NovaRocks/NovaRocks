@@ -121,7 +121,7 @@ pub(crate) enum ManifestAttemptCompletion {
 }
 
 pub(crate) fn assemble_manifest_round(
-    inputs: ManifestAttemptInputs<'_>,
+    inputs: ManifestAttemptInputs,
     establish: AttemptEstablishFacts,
     replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
     transport: ManifestAttemptTransport,
@@ -129,7 +129,7 @@ pub(crate) fn assemble_manifest_round(
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
     let ManifestAttemptInputs {
-        manifest,
+        plan,
         graph,
         compatibility,
         transport: transport_budget,
@@ -138,16 +138,12 @@ pub(crate) fn assemble_manifest_round(
         admission_epochs,
         preparing_positions,
         members,
+        backends,
     } = inputs;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
 
-    let backends = manifest
-        .participations()
-        .iter()
-        .map(|participation| participation.backend().target().descriptor().clone())
-        .collect::<Vec<_>>();
     let convergence_targets = members
         .iter()
         .map(|member| {
@@ -219,8 +215,7 @@ pub(crate) fn assemble_manifest_round(
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .observing(actor_observer)
     .with_connector_blocking_io(connector_blocking_io);
-    let protocol_facts =
-        round.install_protocol_facts(manifest.plan(), &writers, &summary_sources)?;
+    let protocol_facts = round.install_protocol_facts(plan, &writers, &summary_sources)?;
     let convergence =
         NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
     Ok(ManifestAssembledRound {
