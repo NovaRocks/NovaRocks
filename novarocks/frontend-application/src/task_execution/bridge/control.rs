@@ -22,7 +22,9 @@ use novarocks_attempt_protocol::{
     failure::{AttemptFailure, AttemptFailureSite, ProtocolFailure},
     input::AttemptInput,
 };
-use novarocks_control_runtime::actor_turn::{ActorTurnError, StandingInputObligation};
+use novarocks_control_runtime::actor_turn::{
+    ActorRegistration, ActorTurnError, StandingInputObligation,
+};
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptComputationCut, AttemptConvergenceMode, AttemptStopReason,
@@ -32,16 +34,59 @@ use novarocks_query_application::{
     api::NativeActiveConvergenceRequest, session_outcome::governed_cancellation_failure_input,
 };
 use novarocks_workload_control::CancellationReason;
-use std::time::Instant;
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
+use tokio::sync::Notify;
 
 type Position = StandingInputObligation<FrontendActor>;
+
+const STOP: usize = 0;
+const CONVERGENCE: usize = 1;
+
+struct ControlInputs {
+    positions: [Mutex<Position>; 2],
+    fenced: AtomicBool,
+    changed: Notify,
+}
+impl ControlInputs {
+    fn position(&self, role: usize) -> std::sync::MutexGuard<'_, Position> {
+        self.positions[role]
+            .lock()
+            .expect("original attempt owner control")
+    }
+
+    fn fill(&self, role: usize, value: FrontendInput) -> Result<InputId, ActorTurnError> {
+        let position = self.position(role);
+        if self.fenced.load(Ordering::Acquire) {
+            return Err(ActorTurnError::Closed);
+        }
+        position.fill(value).map_err(|(error, _)| error)
+    }
+
+    fn fence(&self) {
+        if !self.fenced.swap(true, Ordering::AcqRel) {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn close_positions(&self) -> Result<(), ActorTurnError> {
+        self.position(STOP).close_after_exit()?;
+        self.position(CONVERGENCE).close_after_exit()
+    }
+}
 
 #[must_use]
 pub(crate) struct AttemptOwnerControls {
     activation: AttemptActivationIdentity,
-    stop: Position,
-    convergence: Position,
+    inputs: Arc<ControlInputs>,
     stopped: bool,
+    host_bound: bool,
+    #[cfg(test)]
     closed: bool,
     submitted: Option<ConvergenceSubmission>,
 }
@@ -63,9 +108,14 @@ impl AttemptOwnerControls {
     ) -> Self {
         Self {
             activation,
-            stop,
-            convergence,
+            inputs: Arc::new(ControlInputs {
+                positions: [Mutex::new(stop), Mutex::new(convergence)],
+                fenced: AtomicBool::new(false),
+                changed: Notify::new(),
+            }),
             stopped: false,
+            host_bound: false,
+            #[cfg(test)]
             closed: false,
             submitted: None,
         }
@@ -78,10 +128,10 @@ impl AttemptOwnerControls {
         if self.stopped {
             return Ok(None);
         }
-        let input = self
-            .stop
-            .fill(owner_input(self.activation, cancellation_stop(reason)))
-            .map_err(|(error, _)| error)?;
+        let input = self.inputs.fill(
+            STOP,
+            owner_input(self.activation, cancellation_stop(reason)),
+        )?;
         self.stopped = true;
         Ok(Some(input))
     }
@@ -128,33 +178,141 @@ impl AttemptOwnerControls {
             retain_diagnostics: next.retain_diagnostics,
         };
         let input = self
-            .convergence
-            .fill(owner_input(self.activation, body))
-            .map_err(|(error, _)| error)?;
+            .inputs
+            .fill(CONVERGENCE, owner_input(self.activation, body))?;
         self.submitted = Some(next);
         Ok(Some(input))
     }
 
-    pub(crate) fn retire_ready(&self) -> Result<bool, ActorTurnError> {
-        if self.closed {
-            return Ok(true);
+    pub(crate) fn bind_host(&mut self, original: ActorRegistration) -> AttemptOwnerControlSource {
+        assert!(!self.host_bound, "original controls already have a host");
+        self.host_bound = true;
+        let stop = self.inputs.position(STOP);
+        let convergence = self.inputs.position(CONVERGENCE);
+        assert!(
+            stop.matches_registration(&original) && convergence.matches_registration(&original)
+        );
+        assert_ne!(stop.id(), convergence.id());
+        AttemptOwnerControlSource {
+            original,
+            inputs: self.inputs.clone(),
+            indexed: [None; 2],
+            closed: false,
         }
-        let stop = self.stop.retire_ready_after_exit()?;
-        let convergence = self.convergence.retire_ready_after_exit()?;
-        Ok(stop && convergence)
     }
 
+    /// Wait for the original convergence occurrence and all its effects.
+    pub(crate) async fn wait_convergence_idle(&self) -> Result<(), ActorTurnError> {
+        loop {
+            let changed = self.inputs.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let position = self.inputs.position(CONVERGENCE);
+                if self.inputs.fenced.load(Ordering::Acquire) {
+                    return Err(ActorTurnError::Closed);
+                }
+                if position.in_flight()?.is_none() {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
         if self.closed {
             return Ok(());
         }
-        if !self.retire_ready()? {
+        if !self.inputs.position(STOP).retire_ready_after_exit()?
+            || !self
+                .inputs
+                .position(CONVERGENCE)
+                .retire_ready_after_exit()?
+        {
             return Err(ActorTurnError::StandingInputBusy);
         }
-        self.stop.close_after_exit()?;
-        self.convergence.close_after_exit()?;
+        self.inputs.fence();
+        self.inputs.close_positions()?;
         self.closed = true;
         Ok(())
+    }
+}
+
+pub(crate) struct AttemptOwnerControlSource {
+    original: ActorRegistration,
+    inputs: Arc<ControlInputs>,
+    indexed: [Option<InputId>; 2],
+    closed: bool,
+}
+impl AttemptOwnerControlSource {
+    pub(crate) fn matches(&self, original: &ActorRegistration) -> bool {
+        self.original.same_registration(original)
+    }
+
+    pub(crate) fn index_committed(&mut self, inputs: &[InputId]) -> Result<bool, ActorTurnError> {
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        let mut found = false;
+        for (role, indexed) in self.indexed.iter_mut().enumerate() {
+            if let Some(input) = self.inputs.position(role).in_flight()?
+                && inputs.contains(&input)
+            {
+                assert!(indexed.replace(input).is_none());
+                found = true;
+            }
+        }
+        Ok(found)
+    }
+
+    pub(crate) const VISIT_UNITS: usize = 2;
+
+    pub(crate) fn needs_progress(&self, failed: bool, closing: bool) -> bool {
+        failed || closing || self.indexed.iter().any(Option::is_some)
+    }
+
+    pub(crate) fn progress(&mut self, failed: bool, closing: bool) -> Result<bool, ActorTurnError> {
+        if failed || closing {
+            self.inputs.fence();
+        }
+        let mut idle = true;
+        for (role, indexed) in self.indexed.iter_mut().enumerate() {
+            let position = self.inputs.position(role);
+            if failed {
+                match position.take_failed_role_payload() {
+                    Ok(Some(original)) => {
+                        // Dispose only this role's bounded protocol input.
+                        // Startup shares the Source and owns its own payload.
+                        drop(position);
+                        original.dispose()?;
+                        return Ok(true);
+                    }
+                    Ok(None) | Err(ActorTurnError::InputAuthorMismatch) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let retired = if failed || indexed.is_some() {
+                position.retire_ready_after_exit()?
+            } else {
+                position.in_flight()?.is_none()
+            };
+            if retired && indexed.take().is_some() && role == CONVERGENCE {
+                drop(position);
+                self.inputs.changed.notify_waiters();
+            }
+            idle &= retired;
+        }
+        if idle && self.inputs.fenced.load(Ordering::Acquire) {
+            self.inputs.close_positions()?;
+            self.closed = true;
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
     }
 }
 

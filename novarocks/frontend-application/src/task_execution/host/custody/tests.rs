@@ -977,6 +977,7 @@ async fn publication_host_returns_original_result_and_typed_failure() {
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original publication host"));
@@ -1415,6 +1416,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original QA host registration"));
@@ -1895,6 +1897,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         startup: None,
         capacity: None,
         membership: None,
+        owner_controls: None,
         ordered_observations: None,
     })
     .unwrap_or_else(|_| panic!("same original host route"));

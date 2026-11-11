@@ -28,6 +28,7 @@ use super::{
     membership::AttemptMembershipSource,
     metrics::FrontendHostObservations,
 };
+use crate::task_execution::bridge::control::AttemptOwnerControlSource;
 use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
@@ -263,6 +264,7 @@ struct HostMachine {
     startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     capacity: Option<AttemptCapacitySource>,
     membership: Option<AttemptMembershipSource>,
+    owner_controls: Option<AttemptOwnerControlSource>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -340,6 +342,7 @@ pub(crate) struct HostBinding {
     pub(crate) startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     pub(crate) capacity: Option<AttemptCapacitySource>,
     pub(crate) membership: Option<AttemptMembershipSource>,
+    pub(crate) owner_controls: Option<AttemptOwnerControlSource>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -393,6 +396,10 @@ impl HostRegistry {
             || binding.membership.as_ref().is_some_and(|membership| {
                 !membership.matches(&binding.registration) || binding.startup.is_none()
             })
+            || binding
+                .owner_controls
+                .as_ref()
+                .is_some_and(|controls| !controls.matches(&binding.registration))
         {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
@@ -521,6 +528,7 @@ impl HostRegistry {
                 startup: binding.startup,
                 capacity: binding.capacity,
                 membership: binding.membership,
+                owner_controls: binding.owner_controls,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -835,15 +843,15 @@ impl HostRegistry {
             observations.retire_failed(&self.runtime, &mut budget)?;
         }
         let mut capacity_more = false;
-        let closing_capacity = machine.source.result_admission_closed();
+        let source_closing = machine.source.result_admission_closed();
         if let Some(capacity) = &mut machine.capacity
-            && capacity.needs_progress(failed, closing_capacity)
+            && capacity.needs_progress(failed, source_closing)
         {
             if budget == 0 {
                 capacity_more = true;
             } else {
                 budget -= 1;
-                capacity_more = capacity.progress(failed, closing_capacity)?;
+                capacity_more = capacity.progress(failed, source_closing)?;
                 if capacity.is_closed() {
                     machine.capacity = None;
                 }
@@ -851,16 +859,30 @@ impl HostRegistry {
         }
         let mut membership_more = false;
         if let Some(membership) = &mut machine.membership
-            && membership.needs_progress(failed, closing_capacity)
+            && membership.needs_progress(failed, source_closing)
         {
             let units = membership.visit_units();
             if budget < units {
                 membership_more = true;
             } else {
                 budget -= units;
-                membership_more = membership.progress(failed, closing_capacity)?;
+                membership_more = membership.progress(failed, source_closing)?;
                 if membership.is_closed() {
                     machine.membership = None;
+                }
+            }
+        }
+        let mut controls_more = false;
+        if let Some(controls) = &mut machine.owner_controls
+            && controls.needs_progress(failed, source_closing)
+        {
+            if budget < AttemptOwnerControlSource::VISIT_UNITS {
+                controls_more = true;
+            } else {
+                budget -= AttemptOwnerControlSource::VISIT_UNITS;
+                controls_more = controls.progress(failed, source_closing)?;
+                if controls.is_closed() {
+                    machine.owner_controls = None;
                 }
             }
         }
@@ -873,10 +895,11 @@ impl HostRegistry {
         );
         budget -= retired.units;
         // The original Source can finish admission in this progress call.
-        // Schedule the retained capacity role for its separate final visit.
-        if !closing_capacity && machine.source.result_admission_closed() {
+        // Schedule the remaining roles for their separate final visit.
+        if !source_closing && machine.source.result_admission_closed() {
             capacity_more |= machine.capacity.is_some();
             membership_more |= machine.membership.is_some();
+            controls_more |= machine.owner_controls.is_some();
         }
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
@@ -887,9 +910,11 @@ impl HostRegistry {
             .ordered_observations
             .as_ref()
             .is_none_or(OrderedObservationHost::is_retired);
-        retired.retired &=
-            machine.startup.is_none() && machine.capacity.is_none() && machine.membership.is_none();
-        retired.more |= startup_more || capacity_more || membership_more;
+        retired.retired &= machine.startup.is_none()
+            && machine.capacity.is_none()
+            && machine.membership.is_none()
+            && machine.owner_controls.is_none();
+        retired.more |= startup_more || capacity_more || membership_more || controls_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -962,6 +987,9 @@ impl HostRegistry {
             }
             if let Some(membership) = &mut machine.membership {
                 membership_more |= membership.index_committed(&indexed.inputs)?;
+            }
+            if let Some(controls) = &mut machine.owner_controls {
+                controls_more |= controls.index_committed(&indexed.inputs)?;
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -1181,6 +1209,7 @@ impl HostRegistry {
             || startup_more
             || capacity_more
             || membership_more
+            || controls_more
             || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
@@ -1520,6 +1549,7 @@ mod tests {
                 startup: Some(source),
                 capacity: None,
                 membership: None,
+                owner_controls: None,
             })
             .unwrap_or_else(|_| panic!("install original host startup"));
         let drive_host = || {
@@ -1583,6 +1613,211 @@ mod tests {
         exit.request_close().unwrap();
         drive_host();
         exit.wait().await.unwrap();
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installed_host_retires_owner_control_occurrences_before_reuse_or_close() {
+        use crate::task_execution::bridge::control::AttemptOwnerControls;
+        use novarocks_attempt_protocol::input::AttemptInput;
+        use novarocks_coordination_contract::{
+            AttemptActivationIdentity, AttemptConvergenceMode, AttemptStopReason,
+            LogicalToAttemptBody,
+        };
+        use novarocks_query_application::api::NativeActiveConvergenceRequest;
+        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+        use novarocks_workload_control::{
+            CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig,
+            WorkloadControl,
+        };
+
+        struct Probe(Arc<Mutex<Vec<InputId>>>);
+        impl TestActor for Probe {
+            fn handle(
+                &mut self,
+                _: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                let FrontendInput::Attempt(input) = input else {
+                    panic!("unexpected input to the owner-control host");
+                };
+                let AttemptInput::Port(input) = *input else {
+                    panic!("unexpected attempt input to the owner-control host");
+                };
+                assert_eq!(envelope.class, InputClass::Control);
+                assert!(matches!(
+                    input.body,
+                    LogicalToAttemptBody::BeginConvergence { .. }
+                        | LogicalToAttemptBody::Stop {
+                            reason: AttemptStopReason::Client,
+                            ..
+                        }
+                ));
+                self.0.lock().unwrap().push(envelope.input);
+            }
+        }
+
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+        )
+        .unwrap();
+        workload.mark_ready().unwrap();
+        let root = workload
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let now = Instant::now();
+        let cancellation = root.owner.scope().cancellation().unwrap();
+        let request = NativeActiveConvergenceRequest::new(
+            cancellation.clone(),
+            now + Duration::from_secs(20),
+        );
+        let tightened =
+            NativeActiveConvergenceRequest::new(cancellation, now + Duration::from_secs(10));
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let clock = Arc::new(TestClock(now));
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(Arc::new(FrontendClock(
+                clock.clone(),
+            )))),
+        );
+        let actor = ActorId::new(1).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = ActorConfig {
+            mailbox: [2; 4],
+            max_batches: 2,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(Probe(seen.clone()))),
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original actor registration: {error:?}"));
+        let standing = || {
+            runtime
+                .reserve_input(actor, actor, InputClass::Control)
+                .unwrap()
+                .into_standing_input()
+                .unwrap()
+        };
+        let activation = AttemptActivationIdentity::from_parts(
+            1,
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap(),
+            1,
+        );
+        let mut controls = AttemptOwnerControls::new(activation, standing(), standing());
+        let source = controls.bind_host(registration.clone());
+        let mut exit = host
+            .register(HostBinding {
+                scope: scope.clone(),
+                registration,
+                kind: FrontendActorKind::Test,
+                config,
+                policy: FrontendLanePolicy {
+                    lane: |_| None,
+                    per_step_inventory: 1,
+                },
+                source: Box::new(MetadataSource {
+                    scope,
+                    closing: false,
+                    retire_batches: false,
+                }),
+                executor: Arc::new(NoExecutor),
+                transport: None,
+                ordered_observations: None,
+                startup: None,
+                capacity: None,
+                membership: None,
+                owner_controls: Some(source),
+            })
+            .unwrap_or_else(|_| panic!("install original owner-control host"));
+        let drive = || {
+            host.drive(
+                Tick(1),
+                runtime.claim_host_actor().expect("original host wake"),
+            );
+        };
+        let begin = |controls: &mut AttemptOwnerControls, request| {
+            controls.begin_convergence(request, AttemptConvergenceMode::Cleanup, false, &*clock)
+        };
+        let first = begin(&mut controls, &request).unwrap().unwrap();
+        assert_eq!(begin(&mut controls, &request), Ok(None));
+        assert_eq!(
+            begin(&mut controls, &tightened),
+            Err(ActorTurnError::StandingInputBusy)
+        );
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        drive(); // Index only. A Core commit has not returned the position.
+        assert_eq!(
+            begin(&mut controls, &tightened),
+            Err(ActorTurnError::StandingInputBusy)
+        );
+        {
+            let idle = controls.wait_convergence_idle();
+            tokio::pin!(idle);
+            assert!(futures::poll!(idle.as_mut()).is_pending());
+            drive(); // Retire the original occurrence and wake the idle waiter.
+            tokio::time::timeout(Duration::from_secs(1), idle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let second = begin(&mut controls, &tightened).unwrap().unwrap();
+        let stop = controls
+            .stop_for_cancellation(CancellationReason::Requested)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            controls.stop_for_cancellation(CancellationReason::Requested),
+            Ok(None)
+        );
+        assert_ne!(first, second);
+        exit.request_close().unwrap();
+        drive();
+        assert_eq!(
+            controls.wait_convergence_idle().await,
+            Err(ActorTurnError::Closed)
+        );
+        assert_eq!(
+            runtime
+                .standing_input_inventory(actor, None, 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!host.is_empty());
+
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        assert_eq!(*seen.lock().unwrap(), [first, second, stop]);
+        for _ in 0..6 {
+            let Some(turn) = runtime.claim_host_actor() else {
+                break;
+            };
+            host.drive(Tick(1), turn);
+        }
+        tokio::time::timeout(Duration::from_secs(1), exit.wait())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
     }
 
@@ -1718,6 +1953,7 @@ mod tests {
                     registry.clone(),
                     membership.target.clone(),
                 )),
+                owner_controls: None,
             })
             .unwrap_or_else(|_| panic!("install original membership host"));
         let drive = || {
@@ -1872,6 +2108,7 @@ mod tests {
                 startup: None,
                 capacity: Some(capacity),
                 membership: None,
+                owner_controls: None,
             })
             .unwrap_or_else(|_| panic!("install original capacity Source"));
         let occupy = || {
@@ -2005,6 +2242,7 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
+                owner_controls: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2386,6 +2624,7 @@ mod tests {
                 startup: None,
                 capacity: None,
                 membership: None,
+                owner_controls: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2688,6 +2927,7 @@ mod tests {
                     startup: None,
                     capacity: None,
                     membership: None,
+                    owner_controls: None,
                     ordered_observations: None,
                 })
                 .is_ok()

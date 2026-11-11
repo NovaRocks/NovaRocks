@@ -70,7 +70,7 @@ use membership::{
 };
 use metrics::{FrontendHostObservations, FrontendRuntimeMetrics};
 use novarocks_control_runtime::{
-    actor_turn::{ActorRuntime, ActorTurnError, Clock, PollerPool},
+    actor_turn::{ActorRuntime, Clock, PollerPool},
     history::HistoryCapture,
     observation::RuntimeObservation,
     transaction::{RuntimeError, RuntimeLedger},

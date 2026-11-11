@@ -2210,6 +2210,7 @@ async fn run_actor_send(
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("same host registration"));

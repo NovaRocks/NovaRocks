@@ -611,7 +611,7 @@ impl AttemptActorRegistration {
                 ));
             }
         };
-        let controls = match self.prepare_owner_controls(runtime, startup_work) {
+        let mut controls = match self.prepare_owner_controls(runtime, startup_work) {
             Ok(controls) => controls,
             Err(error) => {
                 input
@@ -626,6 +626,7 @@ impl AttemptActorRegistration {
                 ));
             }
         };
+        let owner_controls = controls.bind_host(self.original.clone());
         self.startup_reserved = true;
         let AttemptTransportBinding {
             retirement,
@@ -677,6 +678,7 @@ impl AttemptActorRegistration {
                 startup: Some(startup_source),
                 capacity: Some(capacity),
                 membership: None,
+                owner_controls: Some(owner_controls),
                 ordered_observations: Some(ordered_host),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),

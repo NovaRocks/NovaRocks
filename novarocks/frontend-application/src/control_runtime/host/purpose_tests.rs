@@ -459,6 +459,7 @@ impl Fixture {
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("actual purpose Source registration"));
@@ -1468,6 +1469,7 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: ordered,
         })
         .is_ok()

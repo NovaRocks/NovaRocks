@@ -2544,6 +2544,7 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
             startup: None,
             capacity: None,
             membership: None,
+            owner_controls: None,
             ordered_observations: Some(
                 OrderedObservationHost::new(ingress.clone())
                     .with_read_progress([read_progress.clone()]),
