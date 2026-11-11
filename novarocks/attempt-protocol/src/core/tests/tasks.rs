@@ -327,7 +327,7 @@ fn drive_dispatch_cut(budget: usize) -> (DispatchTrace, bool) {
 
     // Correlate each response with the effect emitted in its own run. Resuming
     // the tail can allocate unused action IDs; operation and grant IDs are exact.
-    let finished = step(
+    let reply = step(
         &mut core,
         claim(sources.qa, 4),
         AttemptInput::Port(qa(
@@ -335,7 +335,11 @@ fn drive_dispatch_cut(budget: usize) -> (DispatchTrace, bool) {
             AttemptAuthorizationDecision::AdmissionGranted,
         )),
     );
-    assert_eq!(finished.retired_authorization, Some(operation));
+    assert_eq!(reply.retired_authorization, Some(operation));
+    assert!(reply.round_result.is_none() && reply.effect.is_none());
+    assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+    assert_eq!(core.next_deadline(), Some(now));
+    let finished = step(&mut core, claim(sources.actor, 106), AttemptInput::Timer);
     assert_eq!(finished.round_result, Some(Ok(())));
     assert_eq!(finished.selection, InputSelection::Prefer(sources.native));
     assert!(finished.effect.is_none());
@@ -359,7 +363,7 @@ fn drive_dispatch_cut(budget: usize) -> (DispatchTrace, bool) {
             publication_revision: batch.owner_revision,
             send,
             settled_admission: (issue, operation_id, ticket),
-            retired_authorization: finished.retired_authorization,
+            retired_authorization: reply.retired_authorization,
             round_result: finished.round_result,
             remaining_credits,
             deadline: core.next_deadline(),

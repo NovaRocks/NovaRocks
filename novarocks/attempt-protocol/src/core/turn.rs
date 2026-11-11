@@ -1518,6 +1518,10 @@ impl Core {
             AttemptInput::Port(port) => {
                 self.verify_source(claim.source, self.sources.qa)?;
                 self.accept_qa(port, result)?;
+                // The QA result position cannot retire while this input has
+                // effects. Drive the next settlement from the original timer
+                // so it can borrow the same position after actual retirement.
+                return Ok(());
             }
             _ => return Err(schedule("primary input crossed the original round tail")),
         }

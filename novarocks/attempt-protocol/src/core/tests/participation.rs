@@ -38,6 +38,130 @@ use novarocks_execution_contract::{
 };
 use std::sync::Arc;
 
+#[test]
+fn next_qa_settlement_is_authored_by_a_separate_timer_input() {
+    use novarocks_coordination_contract::{
+        AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
+    };
+
+    let frozen = start();
+    let sources = frozen.sources;
+    let activation = frozen.activation.identity;
+    let now = frozen.initial_now;
+    let mut core = Core::new(frozen).unwrap();
+    let participants: Vec<_> = core.execution.graph().participations().copied().collect();
+    let mut receipts = Vec::new();
+    for (sequence, participation) in (1..=2).zip(participants) {
+        let request = admission_intent(&mut core.execution, participation);
+        let token = AttemptRequestToken::new(id(sequence));
+        assert!(matches!(
+            core.authorize_candidate(
+                &OperationIntent::AcquireParticipationAdmissionTicket(request),
+                token,
+                AttemptActionId::new(id(sequence)),
+            )
+            .unwrap(),
+            AuthorizationStep::Request(_)
+        ));
+        core.apply_qa_reply(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(
+                    AttemptAuthorizationRef::new(id(sequence)),
+                )),
+            },
+        })
+        .unwrap();
+        receipts.push(dispatch_admission(
+            &mut core.execution,
+            request,
+            sequence,
+            OperationOutcome::Accepted,
+        ));
+    }
+    assert_eq!(receipts.len(), 2);
+    let operations: Vec<_> = receipts
+        .iter()
+        .map(|receipt| receipt.reply.operation_id())
+        .collect();
+    let mut next_input = 1;
+    let mut step = |source, input, native_tail| {
+        let claim = AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(next_input)),
+            native_cut: Some(AttemptSourceCut {
+                source: sources.native,
+                tail: native_tail,
+            }),
+            selected_cut: Some(AttemptSourceCut {
+                source: sources.observation,
+                tail: None,
+            }),
+        };
+        next_input += 1;
+        core.handle(now, claim, input, &mut Units(128)).unwrap()
+    };
+    step(sources.actor, AttemptInput::Bootstrap, None);
+    for receipt in receipts {
+        step(
+            sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(receipt)),
+            Some(AttemptInputId(id(3))),
+        );
+    }
+    let publication = (0..8)
+        .find_map(|_| step(sources.actor, AttemptInput::Timer, None).effect)
+        .expect("original protocol publication");
+    assert!(matches!(
+        publication.body,
+        EffectBody::Publish(Publication::ProtocolBatch(_))
+    ));
+    let mut request = step(
+        sources.publication,
+        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+            effect: publication.id,
+            result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+        }),
+        None,
+    );
+
+    for operation in operations {
+        let Some(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = request.effect
+        else {
+            panic!("expected the next original settlement");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request: AttemptAuthorization::SettleAdmission { operation_id, .. },
+        } = port.body
+        else {
+            panic!("expected original admission settlement");
+        };
+        assert_eq!(operation_id, operation);
+        let reply = step(
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token,
+                    decision: Ok(AttemptAuthorizationDecision::AdmissionGranted),
+                },
+            }),
+            None,
+        );
+        assert_eq!(reply.retired_authorization, Some(operation));
+        assert!(reply.effect.is_none() && reply.round_result.is_none());
+        assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+        request = step(sources.actor, AttemptInput::Timer, None);
+    }
+    assert_eq!(request.round_result, Some(Ok(())));
+    assert_eq!(request.selection, InputSelection::Prefer(sources.native));
+}
+
 #[derive(Clone, Copy, Debug)]
 enum BeforeStop {
     Pristine,
