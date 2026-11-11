@@ -515,6 +515,7 @@ impl RegisteredActiveAttempt {
             let normal = !failed
                 && !self.controls.cancellation_submitted()
                 && (request.computation_ready().is_some()
+                    || request.streamed_success() == Some(self.terminal.normal.activation)
                     || matches!(self.run_outcome, Some(NativeAttemptTerminal::Completed)));
             let mode = if normal {
                 AttemptConvergenceMode::Normal

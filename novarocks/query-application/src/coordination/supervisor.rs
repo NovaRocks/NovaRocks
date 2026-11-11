@@ -2944,6 +2944,10 @@ async fn supervise_rows_inner(
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
+        // The result pump can finish while the borrowed Native run is still pending.
+        if matches!(&pump_result, Ok(super::LogicalConclusion::Succeeded)) {
+            attempt.active.retain_streamed_success(drive.identity())?;
+        }
         if let Some(token) = internal.as_ref().and_then(|internal| internal.accepted) {
             attempt.active.retain_computation_ready(token)?;
             // Consume the budget established at the actor cut. Time spent

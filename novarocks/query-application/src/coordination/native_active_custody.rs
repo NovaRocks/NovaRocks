@@ -1129,6 +1129,7 @@ impl NativeActiveCustodyReservation {
             terminal_cut: None,
             remote_deadline: None,
             computation_ready: None,
+            streamed_success: None,
             closed: false,
         };
         Ok((original, rows))
@@ -1148,6 +1149,7 @@ impl NativeActiveCustodyReservation {
             terminal_cut: None,
             remote_deadline: None,
             computation_ready: None,
+            streamed_success: None,
             closed: false,
         }
     }
@@ -1178,6 +1180,7 @@ pub(crate) struct SupervisedActiveNativeOwner {
     terminal_cut: Option<Instant>,
     remote_deadline: Option<Instant>,
     computation_ready: Option<crate::api::ComputationReadyToken>,
+    streamed_success: Option<AttemptActivationIdentity>,
     closed: bool,
 }
 impl fmt::Debug for SupervisedActiveNativeOwner {
@@ -1237,6 +1240,24 @@ impl SupervisedActiveNativeOwner {
         let deadline = *self.remote_deadline.get_or_insert_with(|| cut + budget);
         NativeActiveConvergenceRequest::new(cancellation, deadline)
             .with_computation_ready(self.computation_ready)
+            .with_streamed_success(self.streamed_success)
+    }
+    pub(crate) fn retain_streamed_success(
+        &mut self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<(), QueryExecutionError> {
+        if activation.execution() != self.custody.key.execution
+            || self
+                .streamed_success
+                .is_some_and(|original| original != activation)
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "streamed success does not belong to the original Native owner",
+            ));
+        }
+        self.streamed_success = Some(activation);
+        Ok(())
     }
     pub(crate) fn retain_computation_ready(
         &mut self,
