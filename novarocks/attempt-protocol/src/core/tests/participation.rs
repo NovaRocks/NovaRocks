@@ -608,6 +608,15 @@ fn stop_dispatches_the_original_actor_abort_after_terminal_cleanup() {
 
 #[test]
 fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
+    admission_ticket_waits_for_worker_expiry(Duration::from_secs(11), Duration::from_secs(11));
+}
+
+#[test]
+fn timely_unused_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
+    admission_ticket_waits_for_worker_expiry(Duration::from_secs(1), Duration::from_secs(10));
+}
+
+fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_delay: Duration) {
     use novarocks_coordination_contract::{
         AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
     };
@@ -715,9 +724,8 @@ fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
     );
     fixture.drain(|effect| panic!("send start does not produce a ticket: {effect:?}"));
 
-    // The conservative send-time window is already over. The Worker may
-    // still hold this ticket for its full validity after the receipt arrived.
-    let received_at = sent_at.saturating_add(Duration::from_secs(11));
+    let conservative_expiry = sent_at.saturating_add(ticket_valid_for);
+    let received_at = sent_at.saturating_add(receipt_delay);
     fixture.now = received_at;
     let ticket = ParticipationAdmissionTicketReceipt::new(
         AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
@@ -759,6 +767,20 @@ fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
     assert_eq!(settled_operation, operation_id);
     assert_eq!(participation, fixture.participation);
     assert_eq!(settled_ticket, ticket);
+    let owner = fixture.core.execution.owner(participation).unwrap();
+    assert_eq!(owner.state(), ParticipationState::Absent);
+    assert!(!owner.is_released());
+    assert_eq!(
+        owner.needs_admission_ticket(),
+        received_at.has_reached(conservative_expiry),
+        "the timely receipt must still be held while the original QA settlement is pending"
+    );
+    fixture.drain(|effect| panic!("the original QA settlement is still pending: {effect:?}"));
+
+    // The timely receipt is still unused at its conservative deadline.
+    // Answer the original settlement, then let the original candidate scan run.
+    fixture.now = sent_at.saturating_add(settlement_delay);
+    assert!(fixture.now.has_reached(conservative_expiry));
     assert!(
         qa_reply(
             &mut fixture,
@@ -772,6 +794,7 @@ fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
     let owner = fixture.core.execution.owner(participation).unwrap();
     assert_eq!(owner.state(), ParticipationState::Absent);
     assert!(!owner.is_released());
+    assert!(owner.needs_admission_ticket());
 
     let reissue_at = received_at.saturating_add(ticket_valid_for);
     assert_eq!(fixture.core.next_deadline(), Some(reissue_at));

@@ -729,6 +729,192 @@ fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
 }
 
 #[test]
+fn root_read_projection_waits_for_exact_installation_not_create_reply() {
+    use crate::{
+        AttemptCore,
+        effect::Publication,
+        input::{AttemptInput, AttemptInputClaim, LocalDispatchResult},
+    };
+    use std::cell::Cell;
+
+    for (accepted_first, finished_before_reply) in [(true, false), (false, false), (false, true)] {
+        let mut trace = TerminalTrace::new();
+        let root = trace.core.execution.graph().root_identity();
+        let create = trace.start_create(root);
+        let uninstalled = TaskStatus::created(root);
+        let stream = status_frame(&mut trace, uninstalled.clone());
+        let core = &mut trace.core;
+        let now = core.execution.monotonic_now();
+        let sources = core.sources;
+        let next = Cell::new(1);
+        let step = |core: &mut Core, source, input| {
+            let current = AttemptInputId(id(next.get()));
+            next.set(next.get() + 1);
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: current,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: (source == sources.native).then_some(current),
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: (source == sources.observation).then_some(current),
+                    }),
+                },
+                input,
+                &mut Units(128),
+            )
+            .unwrap()
+        };
+        let finish = |core: &mut Core, mut pending: AttemptStep| {
+            let mut roots = Vec::new();
+            for _ in 0..24 {
+                let publication = pending.effect.take().and_then(|effect| {
+                    let applied = match effect.body {
+                        EffectBody::Publish(Publication::RootStatus(projection)) => {
+                            assert_eq!(projection.failure, AttemptRootFailure::None);
+                            roots.push(projection.status);
+                            PublicationApplied::RootStatus
+                        }
+                        EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                            PublicationApplied::ProtocolBatch { published: true }
+                        }
+                        EffectBody::ReleaseQueuedInput { .. }
+                        | EffectBody::ReleaseCreationPayload { .. } => return None,
+                        EffectBody::AdjustReadWindow(request) => {
+                            assert_eq!(request.generation, stream.generation);
+                            return None;
+                        }
+                        other => {
+                            panic!("unexpected effect in root-read readiness round: {other:?}")
+                        }
+                    };
+                    Some((effect.id, applied))
+                });
+                let (source, input) = match (pending.selection, publication) {
+                    (InputSelection::Only(source), Some((effect, applied)))
+                        if source == sources.publication =>
+                    {
+                        (
+                            source,
+                            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                effect,
+                                result: Ok(applied),
+                            }),
+                        )
+                    }
+                    (InputSelection::Only(source), None)
+                        if source == sources.actor || source == sources.observation =>
+                    {
+                        (sources.actor, AttemptInput::Timer)
+                    }
+                    (InputSelection::Prefer(source), None) if source == sources.native => {
+                        assert_eq!(pending.round_result, Some(Ok(())));
+                        return roots;
+                    }
+                    selection => panic!("unexpected root-read readiness selection: {selection:?}"),
+                };
+                pending = step(core, source, input);
+            }
+            panic!("root-read readiness round did not complete");
+        };
+        let observe = |core: &mut Core, status: TaskStatus| {
+            let frame = ReceivedObservation {
+                event: ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Status(status),
+                },
+                ..stream.clone()
+            };
+            let pending = step(
+                core,
+                sources.observation,
+                AttemptInput::Executor(ExecutorFact::Observations(
+                    ObservationBatch::new(vec![frame]).unwrap(),
+                )),
+            );
+            finish(core, pending)
+        };
+        let reply = |core: &mut Core, reply| {
+            let pending = step(
+                core,
+                sources.native,
+                AttemptInput::Executor(ExecutorFact::Operation(reply)),
+            );
+            finish(core, pending)
+        };
+        step(core, sources.actor, AttemptInput::Bootstrap);
+
+        // Neither a Create Accepted receipt nor an uninstalled stream
+        // snapshot can release the production root projection to the reader.
+        let before = if accepted_first {
+            reply(core, create_reply(create, uninstalled.clone()))
+        } else {
+            observe(core, uninstalled.clone())
+        };
+        assert!(before.is_empty());
+        let task = core.execution.task(root.task_id()).unwrap();
+        assert_eq!(task.status(), Some(&uninstalled));
+        assert_eq!(task.create_ownership_proven(), accepted_first);
+        assert!(!task.installed());
+
+        // A covered snapshot can carry Finished across skipped versions.
+        // Both that and an Installed Planned root make the original result
+        // capability visible, including while the original Create is in flight.
+        let installed = TaskStatus::try_new_with_installed(
+            root,
+            TaskStatusVersion::new(if finished_before_reply { 3 } else { 2 }).unwrap(),
+            if finished_before_reply {
+                TaskState::Finished
+            } else {
+                TaskState::Planned
+            },
+            None,
+            TaskOutputFacts::new(finished_before_reply),
+            true,
+        )
+        .unwrap();
+        let projected = observe(core, installed.clone());
+        assert_eq!(projected.as_slice(), std::slice::from_ref(&installed));
+        let task = core.execution.task(root.task_id()).unwrap();
+        assert!(task.create_ownership_proven());
+        assert!(task.installed());
+        assert_eq!(task.has_released_operation(), !accepted_first);
+
+        if !accepted_first {
+            let late = if finished_before_reply {
+                create_reply(create, uninstalled)
+            } else {
+                OperationObservation {
+                    generation: create.1,
+                    reply: OperationReply {
+                        operation_id: create.0,
+                        kind: OperationKind::CreateTask,
+                        result: OperationReplyResult::Local {
+                            result: LocalDispatchResult::TransportUnknown,
+                            failure: None,
+                            protocol_failure: None,
+                            detail: None,
+                        },
+                    },
+                }
+            };
+            let after = reply(core, late);
+            assert!(after.iter().all(|status| status == &installed));
+            let task = core.execution.task(root.task_id()).unwrap();
+            assert_eq!(task.status(), Some(&installed));
+            assert!(!task.has_released_operation());
+            assert!(task.create_ownership_proven());
+            assert!(!task.create_result_is_unresolved());
+            assert_eq!(core.root_projection().unwrap().status, installed);
+        }
+    }
+}
+
+#[test]
 fn pending_seal_recovers_only_after_exact_terminal_and_new_catch_up() {
     let mut trace = TerminalTrace::new();
     let root = trace.core.execution.graph().root_identity();
