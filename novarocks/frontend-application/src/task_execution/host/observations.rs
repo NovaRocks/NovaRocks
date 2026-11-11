@@ -1046,6 +1046,15 @@ impl<A: Actor> OrderedObservationInput<A> {
         self.0.changed.notify_waiters();
     }
 
+    pub(crate) fn stream_limit(&self) -> usize {
+        self.0.budget.total_positions
+    }
+
+    pub(crate) fn can_register_stream(&self) -> bool {
+        let state = self.0.state.lock().expect("ordered observation state");
+        !state.closed && state.streams.len() < self.0.budget.total_positions
+    }
+
     pub(crate) fn register_stream(
         &self,
         key: StreamKey,
@@ -1070,12 +1079,21 @@ impl<A: Actor> OrderedObservationInput<A> {
             .streams
             .get(&key)
             .ok_or(ObservationError::UnknownStream)?;
-        if !stream.closed || stream.pending || stream.confirming || stream.accepted_unretired != 0 || state.queue.iter().any(|entry| matches!(&entry.value,
-            EntryValue::Observation(v) if v.participation == key.participation && v.generation == key.generation)) {
+        // Every FIFO entry and live read receipt retains an accepted claim
+        // until its original payload and position actually return.
+        if !stream.closed
+            || stream.pending
+            || stream.confirming
+            || stream.polling
+            || stream.poisoned
+            || stream.accepted_unretired != 0
+        {
             return Err(ObservationError::Busy);
         }
         self.0.source.retire_stream(key)?;
         state.streams.remove(&key);
+        drop(state);
+        self.notify_source_progress();
         Ok(())
     }
     pub(crate) async fn reserve_read(

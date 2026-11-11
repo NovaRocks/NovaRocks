@@ -1008,6 +1008,8 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
                 observation: source(6),
                 capacity: source(7),
                 membership: source(8),
+                subscription: source(9),
+                transport: source(10),
                 mailbox: [4; 4],
             },
             retain_diagnostics: true,

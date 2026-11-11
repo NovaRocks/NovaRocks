@@ -183,10 +183,10 @@ pub enum EffectBody {
     Withdraw {
         effect: AttemptEffectId,
     },
-    OpenSubscription(crate::observation::SubscriptionRequest),
+    OpenSubscription(std::sync::Arc<crate::observation::SubscriptionRequest>),
     /// Update the same generation's applied request record. This does not
     /// alter or restart the immutable RPC. Reopen uses explicit Close/Open.
-    AdjustReadWindow(crate::observation::SubscriptionRequest),
+    AdjustReadWindow(std::sync::Arc<crate::observation::SubscriptionRequest>),
     CloseSubscription {
         participation: ParticipationRef,
         generation: NonZeroU64,

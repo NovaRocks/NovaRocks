@@ -243,6 +243,10 @@ impl AdmissionSource {
             && self.idle.iter().all(VecDeque::is_empty)
     }
 
+    pub(crate) fn idle_positions(&self) -> usize {
+        self.idle.iter().map(VecDeque::len).sum()
+    }
+
     pub(super) fn matches_scope(&self, scope: &ScopeHandle) -> bool {
         self.scope.same_scope(scope)
     }

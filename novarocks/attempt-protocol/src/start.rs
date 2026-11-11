@@ -140,6 +140,8 @@ pub struct AttemptSources {
     pub qa: AttemptSourceId,
     pub process: AttemptSourceId,
     pub native: AttemptSourceId,
+    pub transport: AttemptSourceId,
+    pub subscription: AttemptSourceId,
     pub observation: AttemptSourceId,
     pub capacity: AttemptSourceId,
     pub membership: AttemptSourceId,

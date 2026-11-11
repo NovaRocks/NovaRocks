@@ -1088,9 +1088,11 @@ impl Core {
                 | ExecutorFact::ReadState(_)
                 | ExecutorFact::ReadProgress(_)
                 | ExecutorFact::SubscriptionExited { .. } => {
+                    self.verify_source(claim.source, self.sources.subscription)?;
                     self.apply_subscription_input(now, &fact)?
                 }
                 ExecutorFact::Withdrawn { .. } | ExecutorFact::QueuedInputWithdrawn { .. } => {
+                    self.verify_source(claim.source, self.sources.transport)?;
                     let mut abort = None;
                     self.apply_transport_withdrawal(now, &fact, |operation| {
                         // An emitted batch targets one frozen backend, which
@@ -1111,6 +1113,7 @@ impl Core {
                 ExecutorFact::QueuedInputGranted {
                     operation, grant, ..
                 } => {
+                    self.verify_source(claim.source, self.sources.transport)?;
                     let cleanup = if self.execution.tracks_pending_update_grant(grant) {
                         None
                     } else if self.aborts.owns(operation) {
@@ -1142,6 +1145,7 @@ impl Core {
                     generation,
                     failure,
                 } => {
+                    self.verify_source(claim.source, self.sources.transport)?;
                     if let Some(settlement) = self.aborts.admission_failed(operation, generation) {
                         if let Some(body) = settlement {
                             result.abort_settlement = Some(self.abort_effect(body)?);

@@ -1211,7 +1211,7 @@ fn one_wc_source_child_survives_generation_exit_until_original_jobs_and_frames_r
     };
     for generation in [2, 3] {
         let job = source
-            .prepare(request(generation), &f.phase(generation))
+            .prepare(Arc::new(request(generation)), &f.phase(generation))
             .unwrap();
         let (work, mut parcel) = f
             .scope
@@ -1396,7 +1396,7 @@ fn generation_keeps_phase_rpc_exit_and_actual_claim_return_as_independent_facts(
             required_identities: Box::new([]),
         };
         let phase = f.phase(2);
-        let job = source.prepare(request, &phase).unwrap();
+        let job = source.prepare(Arc::new(request), &phase).unwrap();
         let wire = if malformed {
             TaskStatusStreamEvent::default()
         } else {

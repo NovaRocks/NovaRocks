@@ -30,6 +30,7 @@ mod actor_adapter;
 mod admission_source;
 mod call_source;
 mod capacity;
+mod covered;
 mod effect_source;
 mod establish_material;
 mod execute;
@@ -60,6 +61,7 @@ pub(crate) use call_source::{AttemptCallOwner, AttemptCallSource};
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
+pub(crate) use covered::{AttemptSubscriptions, SubscriptionEndpoint, SubscriptionEndpoints};
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
     FailedSendResult, NativeReportReferences,

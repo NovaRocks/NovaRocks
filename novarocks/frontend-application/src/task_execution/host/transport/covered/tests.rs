@@ -1,0 +1,535 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::{
+    control_runtime::{
+        actor::FrontendActorKind,
+        host::{EffectSource, FrontendLanePolicy, HostBinding, HostRegistry, PendingHandoff},
+        metrics::FrontendHostObservations,
+    },
+    native::{data_runtime::FrontendDataRuntime, task_transport::tests::Loopback},
+    query_execution::native_execution_adapter::source_cohort::tests as wc,
+    task_execution::{
+        bridge::root_control::RootControlRequests,
+        host::{
+            custody::{TransportRetirements, tests::WithdrawalInbox},
+            failure_publication::FailurePublications,
+            observations::{
+                ObservationBudget, OrderedObservationInput,
+                backing::{ObservationBackingQuote, PaidObservationMetadata},
+                credits::ObservationCredits,
+                read_progress::ReadProgressInput,
+                source::BoundObservationSource,
+                tests::ManualClock,
+            },
+            transport::ActorTransportExecutor,
+        },
+    },
+};
+use novarocks_attempt_protocol::{
+    effect::{AttemptEffect, EffectClass},
+    observation::SubscriptionRequest,
+};
+use novarocks_control_runtime::{
+    actor::ActorConfig,
+    actor_turn::{ActorHostTurn, ProcessClock},
+    transaction::{RuntimeLedger, ScopeHandle},
+};
+use novarocks_control_runtime_core::{
+    capacity::ReservationResources,
+    identity::Tick,
+    owned_storage::OwnedSlotNeed,
+    scope::{WorkAdmission, WorkKind},
+};
+use novarocks_coordination_contract::AttemptActivationIdentity;
+use novarocks_execution_contract::TaskIdentity;
+use novarocks_types::{
+    AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+};
+use novarocks_workload_control::{WorkClass, WorkRequest};
+use std::{
+    num::NonZeroU64,
+    task::Waker,
+    time::{Duration, Instant},
+};
+
+struct HostSource {
+    subscriptions: AttemptSubscriptions,
+    control: AttemptCallSource,
+    open_pending: bool,
+    scope: ScopeHandle,
+    closing: bool,
+}
+impl EffectSource for HostSource {
+    fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
+        let FrontendEffect::Attempt(effect) = effect else {
+            unreachable!()
+        };
+        self.open_pending = effect.is_subscription_open();
+        if self.open_pending {
+            self.subscriptions.prepay(effect)
+        } else {
+            self.control.prepay(effect).unwrap()
+        }
+    }
+
+    fn bind_job(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+    ) -> PreparedEffectJob {
+        if self.open_pending {
+            self.subscriptions.bind_job(ticket, result)
+        } else {
+            self.control.bind(ticket, result)
+        }
+    }
+
+    fn return_unclaimed_result(&mut self, result: Position) {
+        if self.open_pending {
+            self.subscriptions.return_unclaimed(result);
+        } else {
+            self.control.return_unclaimed(result);
+        }
+    }
+
+    fn core_consumed(&mut self, inputs: &[InputId]) {
+        self.subscriptions.core_consumed(inputs);
+    }
+
+    fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        if self.subscriptions.owns(effect) {
+            match event {
+                TransportSourceEvent::Result(original) => self
+                    .subscriptions
+                    .accept(effect, original)
+                    .unwrap_or_else(|original| std::panic::resume_unwind(original)),
+                TransportSourceEvent::Retired => self.subscriptions.transport_retired(effect),
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
+        } else {
+            match event {
+                TransportSourceEvent::Result(original) => self
+                    .control
+                    .accept(original)
+                    .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original))),
+                TransportSourceEvent::Retired => self.control.transport_retired(effect),
+                original => std::panic::resume_unwind(Box::new(original)),
+            }
+        }
+    }
+
+    fn owner_failed_pending(&mut self, original: PendingHandoff) {
+        std::panic::resume_unwind(Box::new(original))
+    }
+
+    fn close_external(&mut self) {
+        self.closing = true;
+        self.scope.close_external().unwrap();
+    }
+
+    fn result_admission_closed(&self) -> bool {
+        self.closing
+    }
+
+    fn progress_retirement(
+        &mut self,
+        _: &ActorRuntime<FrontendActor>,
+        _: &ActorHostTurn<FrontendActor>,
+        _: Tick,
+        budget: usize,
+    ) -> SourceProgress {
+        let mut original = self
+            .subscriptions
+            .progress(false, self.closing, true, budget, drop);
+        if original.units < budget {
+            original.progressed |= self.control.retire_result().unwrap();
+            if self.closing {
+                original.progressed |= self.control.close_idle().unwrap();
+                drop(self.control.take_drained_owner());
+            }
+            original.units += 1;
+        }
+        original.retired &=
+            self.closing && self.control.is_drained() && self.scope.join_ready().unwrap();
+        original
+    }
+}
+
+#[tokio::test]
+async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_exit() {
+    let generation = Generation::new(1).unwrap();
+    let budget = ObservationBudget {
+        queued_frames: 2,
+        total_positions: 4,
+        max_frame_bytes: 1024,
+        total_bytes: 2560,
+        control_bytes: 512,
+    };
+    let quote = ObservationBackingQuote::new(budget, 1).unwrap();
+    let resources = budget
+        .byte_window()
+        .unwrap()
+        .checked_add(quote.quota())
+        .unwrap();
+    let ledger = RuntimeLedger::new(resources.clone());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let (mut parent, mut payer) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                resources,
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    parent.start().unwrap();
+    let backend = BackendProcessId::new_v7();
+    let execution = QueryExecutionId::new(QueryId::new(17, 1), AttemptId::new(1).unwrap()).unwrap();
+    let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let request = Arc::new(SubscriptionRequest {
+        participation,
+        generation: NonZeroU64::MIN,
+        status_cursors: Box::new([]),
+        task_convergence_cursors: Box::new([]),
+        participation_cursor: None,
+        quiesce_cursor: None,
+        required_identities: Box::new([]),
+    });
+    let adjusted = Arc::new((*request).clone());
+    let id = |n| AttemptActionId::new(NonZeroU64::new(n).unwrap());
+    let effects = [
+        EffectBody::OpenSubscription(request.clone()),
+        EffectBody::AdjustReadWindow(adjusted.clone()),
+        EffectBody::CloseSubscription {
+            participation,
+            generation: request.generation,
+        },
+    ];
+    let mailbox = [8; 4];
+    let inbox = WithdrawalInbox::with_commands(
+        &scope,
+        effects.into_iter().enumerate().map(|(n, body)| {
+            (
+                AttemptEffectEnvelope::new(AttemptEffect {
+                    id: id(n as u64 + 1),
+                    class: EffectClass::Settlement,
+                    body,
+                }),
+                None,
+            )
+        }),
+        mailbox,
+    );
+    let runtime = inbox.runtime();
+    let registration = inbox.registration();
+    let root = TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        backend,
+    );
+    let root = RootControlBinding::for_registered_source(
+        registration.clone(),
+        AttemptActivationIdentity::from_parts(1, execution, 1),
+        root,
+    )
+    .unwrap();
+    let metadata = PaidObservationMetadata::take_from(quote, &parent, &mut payer).unwrap();
+    let credits = ObservationCredits::bind(
+        budget,
+        [participation],
+        &parent,
+        &mut payer,
+        Some(metadata.pin()),
+    )
+    .unwrap();
+    let standing = |source, class| {
+        runtime
+            .reserve_admitted_input_for(registration, source, class, &parent)
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    };
+    let progress = ReadProgressInput::new(
+        registration,
+        participation,
+        standing(inbox.source(), InputClass::Ordinary),
+    )
+    .with_backing(Some(metadata.pin()));
+    let requests = RootControlRequests::new(
+        root.clone(),
+        Arc::new(FailurePublications::new(
+            registration.clone(),
+            root.activation(),
+            &scope,
+        )),
+    );
+    let source = BoundObservationSource::new(
+        root.clone(),
+        requests,
+        credits,
+        BTreeMap::from([(participation, progress.clone())]),
+        metadata,
+    );
+    let observation_source = ActorId::new(4).unwrap();
+    let ingress = OrderedObservationInput::new(
+        standing(observation_source, InputClass::Lifecycle),
+        standing(observation_source, InputClass::Control),
+        source,
+        root.clone(),
+        Arc::new(ManualClock::default()),
+        |input| FrontendInput::Attempt(Box::new(input)),
+        Waker::noop().clone(),
+    )
+    .unwrap();
+    let (wc_owner, mut wc_driver, capacity) = wc::fixture();
+    let wc_root = wc_owner
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let wc_scope = wc_root.owner.scope();
+    wc::bind(&wc_scope, &mut wc_driver);
+    let cohort = wc::cohort(&wc_scope, 1, &mut wc_driver);
+    let original =
+        SubscriptionSource::from_cohort(participation, &wc_scope, &cohort, ingress.clone())
+            .unwrap();
+    let handle = tokio::runtime::Handle::current();
+    let mut data = FrontendDataRuntime::new(handle.clone());
+    let mut peer = Loopback::start().await;
+    let client = Client::for_backend(peer.descriptor(backend), data.clone());
+    let endpoints = Arc::new(BTreeMap::from([(
+        participation,
+        SubscriptionEndpoint {
+            source: original.clone(),
+            client,
+        },
+    )]));
+    let observer = ConsumerId::new(1).unwrap();
+    let subscriptions = AttemptSubscriptions::bind(
+        runtime.clone(),
+        registration.clone(),
+        inbox.source(),
+        &root,
+        &parent,
+        &payer,
+        observer,
+        endpoints.clone(),
+    )
+    .unwrap();
+    let control = AttemptCallSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer,
+        AttemptCallOwner::SubscriptionControl(endpoints),
+        inbox.reserve_result(&parent),
+    );
+    let host = HostRegistry::new(
+        runtime.clone(),
+        ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            ProcessClock::default(),
+        ))),
+    );
+    let mut exit = host
+        .register(HostBinding {
+            scope: scope.clone(),
+            registration: registration.clone(),
+            kind: FrontendActorKind::Test,
+            config: ActorConfig {
+                mailbox,
+                max_batches: 4,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+            policy: FrontendLanePolicy::attempt(1),
+            source: Box::new(HostSource {
+                subscriptions,
+                control,
+                open_pending: false,
+                scope: scope.clone(),
+                closing: false,
+            }),
+            executor: Arc::new(ActorTransportExecutor(handle.clone())),
+            transport: Some(TransportRetirements::new(
+                runtime.clone(),
+                registration.clone(),
+                handle,
+                3,
+            )),
+            startup: None,
+            capacity: None,
+            membership: None,
+            owner_controls: None,
+            ordered_observations: None,
+        })
+        .unwrap_or_else(|_| panic!("original subscription host"));
+
+    let drive = || {
+        while let Some(turn) = runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+    };
+    let post = || inbox.submit_command(&parent);
+    let next_fact = || {
+        while let Some((envelope, input)) = inbox.try_commit_envelope() {
+            assert_eq!(envelope.source, inbox.source());
+            let AttemptInput::Executor(fact) = input else {
+                panic!("expected an original subscription fact");
+            };
+            if let ExecutorFact::ReadProgress(read) = fact {
+                assert_eq!(envelope.class, InputClass::Ordinary);
+                assert_eq!(
+                    (read.participation, read.generation),
+                    (participation, request.generation)
+                );
+                assert!(progress.retire_ready().unwrap());
+                continue;
+            }
+            assert_eq!(envelope.class, InputClass::Lifecycle);
+            return Some(fact);
+        }
+        None
+    };
+    let wait_handoff = |input| async move {
+        loop {
+            let _ = runtime.poll_one(Tick(1)).unwrap();
+            drive();
+            match runtime.retire_input(registration.actor(), input) {
+                Ok(()) => return,
+                Err(ActorTurnError::EffectsRemain | ActorTurnError::InputStillQueued) => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("original subscription effect retirement: {error:?}"),
+            }
+        }
+    };
+    let wait = Duration::from_secs(3);
+    tokio::time::timeout(wait, wait_handoff(post()))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &original.applied_request(request.generation).unwrap(),
+        &request
+    ));
+
+    tokio::time::timeout(wait, async {
+        loop {
+            drive();
+            if let Some(fact) = next_fact() {
+                let ExecutorFact::SubscriptionProgress(phase) = fact else {
+                    panic!("original phase: {fact:?}")
+                };
+                assert_eq!(
+                    (phase.participation, phase.generation),
+                    (participation, request.generation)
+                );
+                if phase.opened_at.is_some() {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(peer.subscription_requests().len(), 1);
+
+    tokio::time::timeout(wait, wait_handoff(post()))
+        .await
+        .unwrap();
+    tokio::time::timeout(wait, async {
+        while !Arc::ptr_eq(
+            &original.applied_request(request.generation).unwrap(),
+            &adjusted,
+        ) {
+            drive();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(peer.subscription_requests().len(), 1);
+    assert!(next_fact().is_none());
+
+    tokio::time::timeout(wait, wait_handoff(post()))
+        .await
+        .unwrap();
+    tokio::time::timeout(wait, async {
+        loop {
+            drive();
+            if let Some(ExecutorFact::SubscriptionExited {
+                effect,
+                participation: actual,
+                generation,
+            }) = next_fact()
+            {
+                assert_eq!(
+                    (effect, actual, generation),
+                    (id(1), participation, request.generation)
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    exit.request_close().unwrap();
+    tokio::time::timeout(wait, async {
+        while original.scope().is_ok() {
+            drive();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(original.applied_request(request.generation).is_err());
+    ingress.close_after_exit().unwrap();
+    drop((progress, ingress, original));
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    scope.reap_ready(128).unwrap();
+    runtime.notify_host_actor(registration).unwrap();
+    drive();
+    tokio::time::timeout(wait, exit.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    drop((cohort, capacity, wc_scope));
+    wc::finish(wc_owner, wc_root, wc_driver);
+    data.drain_native_outgoing_until(Instant::now() + wait)
+        .await
+        .unwrap();
+    assert!(peer.settle().await);
+}

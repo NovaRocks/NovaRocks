@@ -256,6 +256,7 @@ impl std::error::Error for PublicationError {
 /// The original host error stays owned until the terminal or disposal
 /// custodian receives it. The Core only sees the compact typed projection.
 pub(crate) enum OriginalHostFailure {
+    Subscription(super::subscriptions::OriginalSubscriptionFailure),
     Task(TaskExecutionError),
     Publication(PublicationError),
 }
@@ -263,6 +264,7 @@ pub(crate) enum OriginalHostFailure {
 impl OriginalHostFailure {
     pub(crate) fn preparation_input(&self) -> ExecutionFailureInput {
         match self {
+            Self::Subscription(original) => original.preparation_input(),
             Self::Task(original) | Self::Publication(PublicationError::Protocol(original)) => {
                 original.preparation_input()
             }

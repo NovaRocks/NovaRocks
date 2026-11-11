@@ -581,6 +581,18 @@ impl WithdrawalInbox {
         source: ActorId,
         class: InputClass,
     ) -> Option<(InputId, AttemptInput)> {
+        let (envelope, fact) = self.try_commit_envelope()?;
+        assert_eq!(envelope.source, source);
+        assert_eq!(envelope.class, class);
+        Some((envelope.input, fact))
+    }
+
+    pub(in crate::task_execution::host) fn try_commit_envelope(
+        &self,
+    ) -> Option<(
+        novarocks_control_runtime_core::mailbox::InputEnvelope,
+        AttemptInput,
+    )> {
         if self.observed.lock().unwrap().is_empty() {
             self.runtime.poll_one(Tick(1)).unwrap();
         }
@@ -588,10 +600,7 @@ impl WithdrawalInbox {
         if observed.is_empty() {
             return None;
         }
-        let (envelope, fact) = observed.remove(0);
-        assert_eq!(envelope.source, source);
-        assert_eq!(envelope.class, class);
-        Some((envelope.input, fact))
+        Some(observed.remove(0))
     }
     pub(crate) fn finish(self) {
         while let Some(turn) = self.runtime.claim_host_actor() {

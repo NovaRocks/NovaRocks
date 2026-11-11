@@ -42,24 +42,28 @@ use std::{
 
 pub(crate) const OBSERVATION_BACKING_BYTES: DimensionId = DimensionId::new(13).unwrap();
 
-pub(super) fn arc<T>() -> Result<Layout, ObservationError> {
+pub(in crate::task_execution::host) fn arc<T>() -> Result<Layout, ObservationError> {
     arc_layout(Layout::new::<T>()).map_err(|_| ObservationError::Budget)
 }
 
-pub(super) fn array<T>(len: usize) -> Result<usize, ObservationError> {
+pub(in crate::task_execution::host) fn array<T>(len: usize) -> Result<usize, ObservationError> {
     Layout::array::<T>(len)
         .map(|layout| layout.size())
         .map_err(|_| ObservationError::Budget)
 }
 
-pub(super) fn sum<const N: usize>(parts: [usize; N]) -> Result<usize, ObservationError> {
+pub(in crate::task_execution::host) fn sum<const N: usize>(
+    parts: [usize; N],
+) -> Result<usize, ObservationError> {
     parts
         .into_iter()
         .try_fold(0usize, |total, bytes| total.checked_add(bytes))
         .ok_or(ObservationError::Budget)
 }
 
-pub(super) fn tree<K, V>(entries: usize) -> Result<usize, ObservationError> {
+pub(in crate::task_execution::host) fn tree<K, V>(
+    entries: usize,
+) -> Result<usize, ObservationError> {
     let node = node_layout::<K, V>().map_err(|_| ObservationError::Budget)?;
     // Every retained node can be charged as an internal allocation. Add a
     // full possible split cascade and root above the retained inventory.
@@ -88,6 +92,10 @@ impl ObservationBackingQuote {
             ObservationCredits::backing_bytes(budget.total_positions, participants)?,
             BoundObservationSource::backing_bytes(participants)?,
             OrderedObservationHost::backing_bytes(participants)?,
+            crate::task_execution::host::transport::AttemptSubscriptions::backing_bytes(
+                budget.total_positions,
+                participants,
+            )?,
             arc::<PaidObservationMetadata>()?.size(),
             arc::<BackingCharge>()?.size(),
             Layout::new::<ObservationBackingPin>().size(),

@@ -140,6 +140,8 @@ fn start() -> AttemptStart {
             observation: source(6),
             capacity: source(7),
             membership: source(8),
+            subscription: source(9),
+            transport: source(10),
             mailbox: [8; 4],
         },
         observe_dev_root: false,
@@ -354,11 +356,9 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
         .filter(|row| !before_progress.contains(row))
         .collect();
     assert_eq!(progress_positions.len(), members.len());
-    assert!(
-        progress_positions
-            .iter()
-            .all(|row| { row.source == lifecycle.source && row.class == InputClass::Ordinary })
-    );
+    assert!(progress_positions.iter().all(|row| {
+        row.source == runtime_source(sources.subscription) && row.class == InputClass::Ordinary
+    }));
     assert!(matches!(
         registered.bind_read_progress(&runtime, &observation_work, None),
         Err(ObservationError::Busy)

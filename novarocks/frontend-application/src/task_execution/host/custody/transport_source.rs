@@ -126,6 +126,10 @@ impl TransportRetirements {
         }
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub(crate) fn has_room(&self) -> bool {
         self.rows.len() < self.capacity
     }

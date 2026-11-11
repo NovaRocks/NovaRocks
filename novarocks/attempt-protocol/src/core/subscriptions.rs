@@ -345,9 +345,9 @@ impl Subscriptions {
                 .get_mut(&request.participation)
                 .expect("original subscription")
                 .opened = Some((action, request.generation));
-            EffectBody::OpenSubscription(request)
+            EffectBody::OpenSubscription(std::sync::Arc::new(request))
         } else {
-            EffectBody::AdjustReadWindow(request)
+            EffectBody::AdjustReadWindow(std::sync::Arc::new(request))
         };
         self.request = None;
         Ok(SubscriptionStep::Effect(AttemptEffect {

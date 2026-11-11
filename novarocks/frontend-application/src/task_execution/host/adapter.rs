@@ -104,6 +104,8 @@ pub(crate) struct AttemptActorRegistration {
     pub(crate) original: ActorRegistration,
     scope: ScopeHandle,
     native_source: ActorId,
+    transport_source: ActorId,
+    subscription_source: ActorId,
     qa_source: ActorId,
     process_source: ActorId,
     publication_source: ActorId,
@@ -164,6 +166,8 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) publication: super::transport::AttemptCallSource,
     pub(crate) release: super::transport::AttemptCallSource,
     pub(crate) read_confirmation: super::transport::AttemptCallSource,
+    pub(crate) subscription_control: super::transport::AttemptCallSource,
+    pub(crate) subscriptions: super::transport::AttemptSubscriptions,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -391,7 +395,7 @@ impl AttemptActorRegistration {
             parent,
             payer,
             observer,
-            self.native_source,
+            self.transport_source,
             super::transport::AttemptCallOwner::Release,
         )
     }
@@ -414,8 +418,78 @@ impl AttemptActorRegistration {
             parent,
             payer,
             observer,
-            self.native_source,
+            self.subscription_source,
             super::transport::AttemptCallOwner::ReadConfirmation(ingress),
+        )
+    }
+
+    pub(crate) fn prepare_subscriptions(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        endpoints: Arc<super::transport::SubscriptionEndpoints>,
+    ) -> Result<
+        (
+            super::transport::AttemptSubscriptions,
+            super::transport::AttemptCallSource,
+        ),
+        AttemptRegistrationError,
+    > {
+        if !endpoints
+            .keys()
+            .copied()
+            .eq(self.failure_members.iter().map(|row| row.participation))
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "subscription endpoints differ from the original roster",
+            ));
+        }
+        let mut control = self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.subscription_source,
+            super::transport::AttemptCallOwner::SubscriptionControl(endpoints.clone()),
+        )?;
+        match super::transport::AttemptSubscriptions::bind(
+            runtime.clone(),
+            self.original.clone(),
+            self.subscription_source,
+            &self.root_control,
+            parent,
+            payer,
+            observer,
+            endpoints,
+        ) {
+            Ok(subscriptions) => Ok((subscriptions, control)),
+            Err(error) => {
+                assert!(
+                    control
+                        .close_idle()
+                        .expect("original unpublished subscription control")
+                );
+                Err(AttemptRegistrationError::Runtime(error))
+            }
+        }
+    }
+
+    pub(crate) fn reserve_transport_result(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+    ) -> Result<CausalInputObligation<FrontendActor>, ActorTurnError> {
+        if !self.scope.same_scope(parent.scope()) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        CausalInputObligation::reserve_admitted(
+            runtime,
+            &self.original,
+            self.transport_source,
+            InputClass::Lifecycle,
+            parent,
         )
     }
 
@@ -491,7 +565,7 @@ impl AttemptActorRegistration {
                 match CausalInputObligation::reserve_admitted(
                     runtime,
                     &self.original,
-                    self.native_source,
+                    self.transport_source,
                     InputClass::Lifecycle,
                     parent,
                 ) {
@@ -604,6 +678,28 @@ impl AttemptActorRegistration {
             AttemptTransportBinding,
         ),
     > {
+        let transient_calls = [
+            &transport.qa,
+            &transport.process,
+            &transport.publication,
+            &transport.release,
+            &transport.read_confirmation,
+            &transport.subscription_control,
+        ]
+        .len();
+        let required_joins = transport
+            .admission
+            .idle_positions()
+            .checked_add(
+                transport
+                    .send
+                    .idle
+                    .iter()
+                    .map(std::collections::VecDeque::len)
+                    .sum(),
+            )
+            .and_then(|count| count.checked_add(transient_calls))
+            .and_then(|count| count.checked_add(transport.subscriptions.participants()));
         if self.startup_reserved
             || !self.ordered_bound
             || self.read_progress_roles.is_none()
@@ -619,6 +715,10 @@ impl AttemptActorRegistration {
             || !transport
                 .abort
                 .matches(&self.original, self.root_control.activation())
+            || !transport
+                .subscriptions
+                .matches(&self.original, self.subscription_source)
+            || required_joins.is_none_or(|count| count > transport.retirement.capacity())
             || !transport
                 .retirement
                 .matches_registration(runtime, &self.original)
@@ -679,6 +779,8 @@ impl AttemptActorRegistration {
             publication,
             release,
             read_confirmation,
+            subscription_control,
+            subscriptions,
             send,
             executor: native,
             failure,
@@ -736,7 +838,9 @@ impl AttemptActorRegistration {
                         Some(publication),
                         Some(release),
                         Some(read_confirmation),
+                        Some(subscription_control),
                     ],
+                    Some(subscriptions),
                     send,
                     (
                         FailureContext {
@@ -818,7 +922,7 @@ impl AttemptActorRegistration {
         for member in self.failure_members.iter() {
             let standing = match self.reserve_standing(
                 runtime,
-                self.observation_source,
+                self.subscription_source,
                 InputClass::Ordinary,
                 observation_work,
             ) {
@@ -1156,6 +1260,8 @@ impl AttemptActor {
         }
         let actor = runtime_source(start.sources.actor);
         let native = runtime_source(start.sources.native);
+        let transport_source = runtime_source(start.sources.transport);
+        let subscription_source = runtime_source(start.sources.subscription);
         let qa_source = runtime_source(start.sources.qa);
         let process_source = runtime_source(start.sources.process);
         let publication_source = runtime_source(start.sources.publication);
@@ -1208,6 +1314,8 @@ impl AttemptActor {
             original,
             scope,
             native_source: native,
+            transport_source,
+            subscription_source,
             qa_source,
             process_source,
             publication_source,

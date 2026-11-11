@@ -19,7 +19,8 @@
 //! Replacement qualification supplies its QA leg directly to the same kernel.
 use super::{
     ActorSendReports,
-    call_source::BoundAttemptCall,
+    call_source::{AttemptCallReply, BoundAttemptCall},
+    covered::BoundSubscription,
     queued_job::{BoundQueue, QueueJob, run as run_queue},
     send::{BoundSend, SendJob, run as run_send},
     source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg},
@@ -79,6 +80,7 @@ pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
     Admit(Box<BoundQueue>),
     Call(BoundAttemptCall),
+    Subscription(Box<BoundSubscription>),
 }
 impl ActorTransportWork {
     fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
@@ -115,6 +117,7 @@ impl ActorTransportWork {
                     && bound.control == operation.requires_control_progress()
             }
             (Self::Call(call), _) => call.matches(effect),
+            (Self::Subscription(bound), _) => bound.matches(effect),
             _ => false,
         }
     }
@@ -122,7 +125,7 @@ impl ActorTransportWork {
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
             Self::Send(send) => send.reports.actor().cloned(),
-            Self::Admit(_) | Self::Call(_) => None,
+            Self::Admit(_) | Self::Call(_) | Self::Subscription(_) => None,
         }
     }
 }
@@ -287,12 +290,34 @@ pub(crate) fn handoff_actor_transport(
                 bound,
             })
         }),
+        ActorTransportWork::Subscription(bound) => {
+            let fact = bound.exit_fact();
+            launch.spawn(runtime, exit, |exit, registration| async move {
+                let outcome = match run_future(exit, bound.run(), panic).await {
+                    Ok(Ok(()))
+                    | Ok(Err(
+                        crate::task_execution::host::subscriptions::SubscriptionRunError::Ingress(
+                            crate::task_execution::host::observations::ObservationError::Closed,
+                        ),
+                    ))
+                    | Err(ExitWorkError::NotStarted(_)) => {
+                        BodyOutcome::Call(AttemptCallReply::Input {
+                            input: novarocks_attempt_protocol::input::AttemptInput::Executor(fact),
+                            failure: None,
+                        })
+                    }
+                    Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
+                    Err(error) => BodyOutcome::RawFailure(Box::new(error)),
+                };
+                stage_actor_outcome(&registration, outcome);
+            })
+        }
         ActorTransportWork::Call(bound) if effect.is_transport_release() => {
             launch.spawn_blocking(runtime, exit, |exit, registration| {
                 let work = run_blocking(exit, move || bound.dispose(), panic);
                 move || {
                     let outcome = match work.run() {
-                        Ok(()) => BodyOutcome::Call(super::call_source::AttemptCallReply::NoInput),
+                        Ok(()) => BodyOutcome::Call(AttemptCallReply::NoInput),
                         Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                     };
                     stage_actor_outcome(&registration, outcome);
@@ -308,7 +333,7 @@ pub(crate) fn handoff_actor_transport(
                     Err(ExitWorkError::NotStarted(_)) if confirms_read => {
                         // The start fence rejected the exact read and its
                         // captures already exited. There is no read fact.
-                        BodyOutcome::Call(super::call_source::AttemptCallReply::NoInput)
+                        BodyOutcome::Call(AttemptCallReply::NoInput)
                     }
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };

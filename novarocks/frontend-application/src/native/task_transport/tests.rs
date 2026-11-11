@@ -911,7 +911,7 @@ impl NovaRocksGrpc for TaskWirePeer {
 }
 
 /// Two independent sockets for one shared process fixture.
-pub(in crate::native) struct Loopback {
+pub(crate) struct Loopback {
     peer: TaskWirePeer,
     endpoint: RuntimeEndpoint,
     pub(in crate::native) control_endpoint: RuntimeEndpoint,
@@ -953,7 +953,7 @@ impl Loopback {
         )
     }
 
-    pub(in crate::native) async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let peer = TaskWirePeer::default();
         let (endpoint, data_shutdown, data_served) = Self::serve(peer.clone()).await;
         let mut control_peer = peer.clone();
@@ -969,12 +969,16 @@ impl Loopback {
         }
     }
 
-    fn descriptor(&self, process: BackendProcessId) -> BackendProcessDescriptor {
+    pub(crate) fn descriptor(&self, process: BackendProcessId) -> BackendProcessDescriptor {
         test_descriptor(
             process,
             self.endpoint.clone(),
             self.control_endpoint.clone(),
         )
+    }
+
+    pub(crate) fn subscription_requests(&self) -> Vec<proto::SubscribeTaskStatusRequest> {
+        self.peer.subscribed()
     }
 
     pub(in crate::native) fn control_requests(&self) -> usize {
@@ -999,7 +1003,7 @@ impl Loopback {
             .expect_apply(ApplyAnswer::Outcomes(vec![OperationOutcome::OwnerFailed]));
     }
 
-    pub(in crate::native) async fn settle(&mut self) -> bool {
+    pub(crate) async fn settle(&mut self) -> bool {
         for shutdown in &mut self.shutdown {
             if let Some(shutdown) = shutdown.take() {
                 let _ = shutdown.send(());

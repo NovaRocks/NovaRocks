@@ -52,7 +52,7 @@ pub(crate) enum NativeSubscriptionFailure {
 }
 
 impl NativeSubscriptionFailure {
-    fn kind(&self) -> ObservationFailureKind {
+    pub(super) fn kind(&self) -> ObservationFailureKind {
         match self {
             Self::WrongClient { .. } | Self::Encode(_) => ObservationFailureKind::ProtocolViolation,
             Self::Channel(error) => ObservationFailureKind::RecoverableTransport {

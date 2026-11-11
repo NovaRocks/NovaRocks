@@ -18,8 +18,8 @@
 //! A paid reply lane for one original attempt port.
 
 use super::{
-    ActorTransportWork, BodyOutcome, OriginalQueuedInput, prepare_actor_transport,
-    process_observation::AttemptProcessObserver, queued_job::CreationSeed,
+    ActorTransportWork, BodyOutcome, OriginalQueuedInput, covered::SubscriptionEndpoints,
+    prepare_actor_transport, process_observation::AttemptProcessObserver, queued_job::CreationSeed,
 };
 use crate::{
     control_runtime::{
@@ -82,6 +82,8 @@ pub(crate) enum AttemptCallOwner {
     Publication(Arc<AttemptPublicationOwner>),
     Release,
     ReadConfirmation(OrderedObservationInput<FrontendActor>),
+    SubscriptionOpen,
+    SubscriptionControl(Arc<SubscriptionEndpoints>),
 }
 
 impl AttemptCallOwner {
@@ -92,6 +94,8 @@ impl AttemptCallOwner {
             Self::Publication(_) => effect.is_publication_call(),
             Self::Release => effect.is_transport_release(),
             Self::ReadConfirmation(_) => effect.is_read_confirmation(),
+            Self::SubscriptionOpen => effect.is_subscription_open(),
+            Self::SubscriptionControl(_) => effect.is_subscription_control(),
         }
     }
 }
@@ -259,6 +263,14 @@ impl BoundAttemptCall {
                     ),
                     failure: None,
                 })
+            }
+            AttemptCallOwner::SubscriptionControl(original) => {
+                super::covered::control(&original, &effect.protocol.body)
+                    .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>)?;
+                Ok(AttemptCallReply::NoInput)
+            }
+            AttemptCallOwner::SubscriptionOpen => {
+                unreachable!("original subscription generation carrier")
             }
             AttemptCallOwner::Release => unreachable!("transport release uses blocking Work"),
         }
@@ -480,22 +492,7 @@ impl AttemptCallSource {
         receipt: Option<Arc<AbortReceiptSlot>>,
         take_original: impl FnOnce() -> Option<TransportRelease>,
     ) -> PreparedEffectJob {
-        let (effect, work) = self.pending.take().expect("same original call prepayment");
-        assert!(
-            matches!(&ticket.effect, FrontendEffect::Attempt(original) if Arc::ptr_eq(original, &effect))
-        );
-        let header = work.work().retirement_observer();
-        assert!(
-            self.live
-                .replace(Live {
-                    effect: effect.clone(),
-                    header,
-                    result: None,
-                    abort_input: None,
-                    retired: false,
-                })
-                .is_none()
-        );
+        let (effect, work) = self.begin_binding(ticket);
         let owner = self.owner.as_ref().expect("original call owner").clone();
         let abort = effect.is_abort_settlement().then(|| {
             (
@@ -532,6 +529,54 @@ impl AttemptCallSource {
             })
         })
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
+    }
+
+    pub(super) fn pending_work(&self) -> &WorkObligation {
+        self.pending
+            .as_ref()
+            .expect("original prepaid call")
+            .1
+            .work()
+    }
+
+    pub(super) fn bind_subscription(
+        &mut self,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+        bind: impl FnOnce() -> ActorTransportWork,
+    ) -> PreparedEffectJob {
+        assert!(matches!(
+            self.owner,
+            Some(AttemptCallOwner::SubscriptionOpen)
+        ));
+        let (effect, work) = self.begin_binding(ticket);
+        prepare_actor_transport(effect, result, work, VecDeque::new(), self.observer, |_| {
+            bind()
+        })
+        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
+    }
+
+    fn begin_binding(
+        &mut self,
+        ticket: &EffectTicket<FrontendEffect>,
+    ) -> (Arc<AttemptEffectEnvelope>, ReportedWork) {
+        let (effect, work) = self.pending.take().expect("same original call prepayment");
+        assert!(
+            matches!(&ticket.effect, FrontendEffect::Attempt(original) if Arc::ptr_eq(original, &effect))
+        );
+        let header = work.work().retirement_observer();
+        assert!(
+            self.live
+                .replace(Live {
+                    effect: effect.clone(),
+                    header,
+                    result: None,
+                    abort_input: None,
+                    retired: false,
+                })
+                .is_none()
+        );
+        (effect, work)
     }
 
     pub(crate) fn return_unclaimed(&mut self, result: Position) {
@@ -608,11 +653,14 @@ impl AttemptCallSource {
                         publication.error,
                         ActorTurnError::ActorFailed | ActorTurnError::Closed
                     );
-                    if fenced && original.effect.is_read_confirmation() {
+                    if fenced
+                        && (original.effect.is_read_confirmation()
+                            || original.effect.is_subscription_open())
+                    {
                         // The same actor's fence refused the bounded passive
                         // snapshot. The original result role remains ours.
                         assert!(matches!(&publication.event, FrontendInput::Attempt(input)
-                            if matches!(**input, AttemptInput::Executor(novarocks_attempt_protocol::input::ExecutorFact::ReadState(_)))));
+                            if matches!(**input, AttemptInput::Executor(novarocks_attempt_protocol::input::ExecutorFact::ReadState(_) | novarocks_attempt_protocol::input::ExecutorFact::SubscriptionExited { .. }))));
                         drop(publication);
                     } else if fenced && original.effect.is_root_control_reply() {
                         // The actual QA delivery is already done. Keep the
@@ -735,7 +783,10 @@ impl AttemptCallSource {
             && self.failures.is_empty()
         {
             let original = self.owner.take()?;
-            if matches!(original, AttemptCallOwner::Release) {
+            if matches!(
+                original,
+                AttemptCallOwner::Release | AttemptCallOwner::SubscriptionOpen
+            ) {
                 return None;
             }
             Some((original, self.abort.take(), self.terminal.take()))

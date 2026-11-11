@@ -84,6 +84,19 @@ impl AttemptEffectEnvelope {
             || self.is_publication_call()
             || self.is_transport_release()
             || self.is_read_confirmation()
+            || self.is_subscription_open()
+            || self.is_subscription_control()
+    }
+
+    pub(crate) fn is_subscription_open(&self) -> bool {
+        matches!(self.protocol.body, EffectBody::OpenSubscription(_))
+    }
+
+    pub(crate) fn is_subscription_control(&self) -> bool {
+        matches!(
+            self.protocol.body,
+            EffectBody::AdjustReadWindow(_) | EffectBody::CloseSubscription { .. }
+        )
     }
 
     pub(crate) fn is_read_confirmation(&self) -> bool {

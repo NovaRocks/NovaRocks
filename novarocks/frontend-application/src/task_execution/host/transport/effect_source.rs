@@ -18,9 +18,9 @@
 //! Composition of the original admission and SendBatch Sources.
 
 use super::{
-    ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource, BodyOutcome,
-    FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
-    SendKey, SendMemberReport, SendReportRows,
+    ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource,
+    AttemptSubscriptions, BodyOutcome, FrozenSendRequests, NativeProgressInput, NativeReceiptInput,
+    PreparedActorSend, SendContext, SendKey, SendMemberReport, SendReportRows,
     call_source::{AttemptCallReply, TransportRelease},
     send_reports::close_unlaunched,
 };
@@ -94,6 +94,7 @@ pub(crate) struct AttemptSendSource {
 enum Prepaid {
     Admission,
     Call(usize),
+    OpenSubscription,
     Send(usize, Box<PreparedActorSend>),
     Other,
 }
@@ -130,7 +131,8 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    calls: [Option<AttemptCallSource>; 5],
+    calls: [Option<AttemptCallSource>; 6],
+    subscriptions: Option<AttemptSubscriptions>,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -161,7 +163,8 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        calls: [Option<AttemptCallSource>; 5],
+        calls: [Option<AttemptCallSource>; 6],
+        subscriptions: Option<AttemptSubscriptions>,
         send: AttemptSendSource,
         mut failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
@@ -182,6 +185,7 @@ impl AttemptTransportSource {
             scope,
             admission,
             calls,
+            subscriptions,
             requests: send.requests,
             contexts: send.contexts,
             report_references: send.report_references,
@@ -456,6 +460,7 @@ impl EffectSource for AttemptTransportSource {
                 original if original.is_publication_call() => Some(2),
                 original if original.is_transport_release() => Some(3),
                 original if original.is_read_confirmation() => Some(4),
+                original if original.is_subscription_control() => Some(5),
                 _ => None,
             };
             if let Some(lane) = call_lane {
@@ -477,6 +482,15 @@ impl EffectSource for AttemptTransportSource {
                     return Some(result);
                 }
                 EffectBody::SendBatch { .. } => return self.prepare_send(original),
+                EffectBody::OpenSubscription(_) => {
+                    let result = self
+                        .subscriptions
+                        .as_mut()
+                        .expect("original subscription Source")
+                        .prepay(original)?;
+                    self.pending = Some(Prepaid::OpenSubscription);
+                    return Some(result);
+                }
                 _ => {}
             }
         }
@@ -526,12 +540,16 @@ impl EffectSource for AttemptTransportSource {
                         _ => None,
                     };
                     let projection = failure.and_then(|reference| {
-                        let input = self.admission.project_failure(reference).or_else(|| {
-                            self.calls
-                                .iter()
-                                .flatten()
-                                .find_map(|source| source.project_failure(reference))
-                        })?;
+                        let input = self
+                            .admission
+                            .project_failure(reference)
+                            .or_else(|| self.subscriptions.as_ref()?.project_failure(reference))
+                            .or_else(|| {
+                                self.calls
+                                    .iter()
+                                    .flatten()
+                                    .find_map(|source| source.project_failure(reference))
+                            })?;
                         Some((reference, input))
                     });
                     let source = self.calls[lane].as_mut().unwrap();
@@ -579,6 +597,17 @@ impl EffectSource for AttemptTransportSource {
                     .as_mut()
                     .unwrap()
                     .bind_with_abort_receipt(ticket, result, receipt))
+            }
+            Prepaid::OpenSubscription => {
+                let FrontendEffect::Attempt(effect) = &ticket.effect else {
+                    unreachable!()
+                };
+                assert!(self.in_flight.insert(effect.protocol.id));
+                Ok(self
+                    .subscriptions
+                    .as_mut()
+                    .unwrap()
+                    .bind_job(ticket, result))
             }
             Prepaid::Admission => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
@@ -631,6 +660,11 @@ impl EffectSource for AttemptTransportSource {
         match self.pending.take().expect("same original prepayment") {
             Prepaid::Call(lane) => self.calls[lane].as_mut().unwrap().return_unclaimed(result),
             Prepaid::Admission => self.admission.return_unclaimed(result),
+            Prepaid::OpenSubscription => self
+                .subscriptions
+                .as_mut()
+                .unwrap()
+                .return_unclaimed(result),
             Prepaid::Other => self.other.return_unclaimed_result(result),
             Prepaid::Send(lane, prepared) => {
                 prepared.revoke_unused_reports();
@@ -640,10 +674,30 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn core_consumed(&mut self, inputs: &[InputId]) {
+        if let Some(subscriptions) = self.subscriptions.as_mut() {
+            subscriptions.core_consumed(inputs);
+        }
         self.other.core_consumed(inputs);
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        if let Some(subscriptions) = self.subscriptions.as_mut()
+            && subscriptions.owns(effect)
+        {
+            match event {
+                TransportSourceEvent::Result(original) => {
+                    if let Err(original) = subscriptions.accept(effect, original) {
+                        self.other.retain_transport_failure(original);
+                    }
+                }
+                TransportSourceEvent::Retired => {
+                    self.in_flight.remove(&effect);
+                    subscriptions.transport_retired(effect);
+                }
+                original => self.other.transport_event(effect, original),
+            }
+            return;
+        }
         if let Some(lane) = self
             .calls
             .iter()
@@ -658,6 +712,7 @@ impl EffectSource for AttemptTransportSource {
                             .admission
                             .take_failure(reference)
                             .map(OriginalHostFailure::Task)
+                            .or_else(|| self.subscriptions.as_ref()?.take_failure(reference))
                             .or_else(|| {
                                 self.calls
                                     .iter_mut()
@@ -827,6 +882,26 @@ impl EffectSource for AttemptTransportSource {
                 }
             }
         }
+        let subscription_progress = self.subscriptions.as_mut().map(|subscriptions| {
+            let failed = self
+                .runtime
+                .snapshot(self.registration.actor())
+                .expect("original subscription host")
+                .failed;
+            subscriptions.progress(
+                failed,
+                closing || self.external_closed,
+                retire_failures,
+                (budget - units).min(1),
+                |original| {
+                    self.other.retain_transport_release(original);
+                },
+            )
+        });
+        if let Some(progress) = &subscription_progress {
+            units += progress.units;
+            progressed |= progress.progressed;
+        }
         let supervisor_advanced = if units < budget && self.supervisor.is_some() {
             units += 1;
             self.advance_supervisor(turn)
@@ -928,12 +1003,16 @@ impl EffectSource for AttemptTransportSource {
             .progress_retirement(runtime, turn, now, budget - units);
         progress.units += units;
         progress.progressed |= progressed || supervisor_advanced;
-        progress.more |= supervisor_advanced
+        progress.more |= subscription_progress
+            .as_ref()
+            .is_some_and(|progress| progress.more)
+            || supervisor_advanced
             || self.abort_scan != 0
             || self.admission_scan != 0
             || self.send_scan != 0
             || progressed && self.result_admission_closed();
-        progress.retired &= self.supervisor.is_none()
+        progress.retired &= subscription_progress.is_none_or(|progress| progress.retired)
+            && self.supervisor.is_none()
             && self.abort_inputs.is_empty()
             && self
                 .calls

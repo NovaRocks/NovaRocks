@@ -530,7 +530,7 @@ fn stop_dispatches_the_original_actor_abort_after_terminal_cleanup() {
         let operation = OperationIntent::AbortParticipation(request);
         let grant = QueuedInputGrantRef::new(id(802), generation);
         let granted = fixture.step(
-            fixture.sources.actor,
+            fixture.sources.transport,
             AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
                 operation: operation_id,
                 grant,
@@ -679,7 +679,7 @@ fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
     assert!(
         fixture
             .step(
-                sources.actor,
+                sources.transport,
                 AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
                     operation: operation_id,
                     grant,

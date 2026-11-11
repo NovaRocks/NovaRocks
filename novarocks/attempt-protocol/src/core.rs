@@ -159,6 +159,8 @@ impl Core {
             qa,
             process,
             native,
+            transport: transport_source,
+            subscription,
             observation,
             capacity,
             membership,
@@ -170,6 +172,8 @@ impl Core {
             qa,
             process,
             native,
+            transport_source,
+            subscription,
             observation,
             capacity,
             membership,
@@ -1009,6 +1013,8 @@ mod tests {
                 observation: AttemptSourceId(id(8)),
                 capacity: AttemptSourceId(id(9)),
                 membership: AttemptSourceId(id(10)),
+                subscription: AttemptSourceId(id(11)),
+                transport: AttemptSourceId(id(12)),
                 mailbox: [4; 4],
             },
         }
@@ -2139,6 +2145,81 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn subscription_phase_enters_only_its_independent_core_source() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim, SubscriptionPhaseSnapshot},
+        };
+        for route in [
+            |sources: AttemptSources| sources.subscription,
+            |sources: AttemptSources| sources.observation,
+            |sources: AttemptSources| sources.native,
+        ] {
+            let start = start();
+            let now = start.initial_now;
+            let sources = start.sources;
+            let mut core = Core::new(start).unwrap();
+            let claim = |source, n| {
+                let input = AttemptInputId(id(n));
+                AttemptInputClaim {
+                    source,
+                    input,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: (source == sources.native).then_some(input),
+                    }),
+                    selected_cut: None,
+                }
+            };
+            core.handle(
+                now,
+                claim(sources.actor, 1),
+                AttemptInput::Bootstrap,
+                &mut Units(32),
+            )
+            .unwrap();
+            let participation = *core.execution.graph().participations().next().unwrap();
+            core.subscriptions.activate(now, participation).unwrap();
+            let SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::OpenSubscription(request),
+                ..
+            }) = core
+                .subscriptions
+                .advance(
+                    &core.execution,
+                    now,
+                    AttemptActionId::new(id(80)),
+                    AttemptRequestToken::new(id(80)),
+                    &mut Units(32),
+                )
+                .unwrap()
+            else {
+                panic!("original subscription is selected");
+            };
+            let fact = ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                participation,
+                generation: request.generation,
+                opening_started_at: now,
+                opened_at: Some(now),
+            });
+            let source = route(sources);
+            let applied = core.handle(
+                now,
+                claim(source, 2),
+                AttemptInput::Executor(fact),
+                &mut Units(32),
+            );
+            assert_eq!(applied.is_ok(), source == sources.subscription);
+            if applied.is_ok() {
+                assert_eq!(
+                    core.next_subscription_deadline(),
+                    Some(now.saturating_add(Duration::from_secs(5)))
+                );
+            }
+        }
     }
 
     #[test]
@@ -3763,7 +3844,7 @@ mod tests {
 
         step(
             &mut core,
-            sources.actor,
+            sources.transport,
             13,
             AttemptInput::Executor(ExecutorFact::Withdrawn {
                 effect: unstarted,
@@ -4031,7 +4112,7 @@ mod tests {
         let accept_grant = |core: &mut Core, intent: &OperationIntent, grant| {
             step(
                 core,
-                sources.actor,
+                sources.transport,
                 AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
                     operation: intent.operation_id(),
                     grant,
@@ -4357,7 +4438,7 @@ mod tests {
         let grant = QueuedInputGrantRef::new(id(70), generation);
         step(
             &mut core,
-            sources.actor,
+            sources.transport,
             9,
             AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
                 operation,

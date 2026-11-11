@@ -33,7 +33,7 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::{
     actor::Actor,
-    actor_turn::StandingInputObligation,
+    actor_turn::{ActorTurnError, StandingInputObligation},
     coalescing_input::{CoalescingInput, Merge},
 };
 use novarocks_control_runtime_core::identity::InputId;
@@ -58,6 +58,10 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::watch;
+
+#[path = "subscription/failure.rs"]
+mod failure;
+pub(crate) use failure::{OriginalSubscriptionFailure, SubscriptionFailureRecord};
 
 #[path = "subscription/native_io.rs"]
 mod native_io;
@@ -212,7 +216,29 @@ impl<A: Actor> SubscriptionPhasePublisher<A> {
             .map(|_| ())
             .map_err(ObservationError::Runtime)
     }
-    fn close_after_exit(&self) -> Result<(), ObservationError> {
+    pub(crate) fn retire_indexed_after_exit(&self, input: InputId) -> Result<bool, ActorTurnError> {
+        self.input.retire_indexed_after_exit(input)
+    }
+
+    pub(crate) fn retire_after_failure(&self) -> Result<bool, ActorTurnError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        self.input.abandon_pending_after_failure();
+        match self.input.take_failed_role_payload() {
+            Ok(Some(original)) => {
+                original.dispose()?;
+                Ok(true)
+            }
+            Ok(None) | Err(ActorTurnError::InputAuthorMismatch) => {
+                self.input.retire_failed_after_exit()?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -252,7 +278,7 @@ enum GenerationPhase {
 struct GenerationRecord {
     phase: GenerationPhase,
     stop: watch::Sender<bool>,
-    applied: SubscriptionRequest,
+    applied: Arc<SubscriptionRequest>,
     // The erased holder contains no Core policy, only the actual original
     // Lifecycle role and its complete timestamped phase snapshots.
     phase_exit: Arc<dyn PhaseExit>,
@@ -325,20 +351,48 @@ impl<A: Actor> SubscriptionSource<A> {
             .map(WorkOwner::scope)
             .ok_or(SubscriptionSourceError::Closed)
     }
+    pub(crate) fn matches(
+        &self,
+        participation: ParticipationRef,
+        root: &super::observations::RootControlBinding,
+    ) -> bool {
+        self.participation == participation && self.ingress.root_binding().same_original(root)
+    }
+
+    pub(crate) fn stream_limit(&self) -> usize {
+        self.ingress.stream_limit()
+    }
+
+    pub(crate) fn generation_backing_bytes() -> Result<usize, ObservationError> {
+        use super::observations::backing;
+        backing::sum([
+            backing::tree::<NonZeroU64, GenerationRecord>(1)?,
+            backing::arc::<SubscriptionPhasePublisher<A>>()?.size(),
+            novarocks_type_contract::owned_resources::layout::arc_layout(CoalescingInput::<
+                A,
+                PhaseUpdate<A>,
+            >::backing_payload_layout(
+            ))
+            .map_err(|_| ObservationError::Budget)?
+            .size(),
+        ])
+    }
+
+    pub(crate) fn can_register_generation(&self) -> bool {
+        self.ingress.can_register_stream()
+    }
+
     /// The caller has already admitted this generation's original common-
     /// runtime Work/ExitCustody. This method adds only its exact Source record;
     /// the original exit authority stays with the execution carrier.
     pub(crate) fn prepare(
         self: &Arc<Self>,
-        request: SubscriptionRequest,
+        request: Arc<SubscriptionRequest>,
         phase: &Arc<SubscriptionPhasePublisher<A>>,
     ) -> Result<SubscriptionGeneration<A>, SubscriptionSourceError> {
         if request.participation != self.participation {
             return Err(SubscriptionSourceError::WrongParticipation);
         }
-        let decoded = decode_request(&request);
-        novarocks_task_codec::operation::encode_covered_subscribe_task_status(&decoded)
-            .map_err(SubscriptionSourceError::Request)?;
         let key = StreamKey {
             participation: request.participation,
             generation: request.generation,
@@ -366,13 +420,13 @@ impl<A: Actor> SubscriptionSource<A> {
             GenerationRecord {
                 phase: GenerationPhase::Admitted,
                 stop,
-                applied: request,
+                applied: request.clone(),
                 phase_exit: phase.clone(),
             },
         );
         drop(state);
         Ok(SubscriptionGeneration {
-            request: Some(decoded),
+            request: Some(request),
             receiver: Some(receiver),
             phase: Some(phase.clone()),
             guard: Some(GenerationExitObligation {
@@ -386,7 +440,7 @@ impl<A: Actor> SubscriptionSource<A> {
     /// stays immutable; AP must explicitly Close/Open to reconcile another cut.
     pub(crate) fn adjust_read_window(
         &self,
-        request: SubscriptionRequest,
+        request: Arc<SubscriptionRequest>,
     ) -> Result<(), SubscriptionSourceError> {
         if request.participation != self.participation {
             return Err(SubscriptionSourceError::WrongParticipation);
@@ -397,10 +451,16 @@ impl<A: Actor> SubscriptionSource<A> {
         .map_err(SubscriptionSourceError::Request)?;
         let old = {
             let mut state = self.state.lock().expect("covered original Source");
-            let record = state
-                .jobs
-                .get_mut(&request.generation)
-                .ok_or(SubscriptionSourceError::UnknownGeneration)?;
+            let old = state
+                .max_generation
+                .is_some_and(|original| request.generation <= original);
+            let Some(record) = state.jobs.get_mut(&request.generation) else {
+                return if old {
+                    Ok(())
+                } else {
+                    Err(SubscriptionSourceError::UnknownGeneration)
+                };
+            };
             std::mem::replace(&mut record.applied, request)
         };
         drop(old);
@@ -410,7 +470,7 @@ impl<A: Actor> SubscriptionSource<A> {
     pub(crate) fn applied_request(
         &self,
         generation: NonZeroU64,
-    ) -> Result<SubscriptionRequest, SubscriptionSourceError> {
+    ) -> Result<Arc<SubscriptionRequest>, SubscriptionSourceError> {
         self.state
             .lock()
             .expect("covered original Source")
@@ -423,14 +483,14 @@ impl<A: Actor> SubscriptionSource<A> {
         &self,
         generation: NonZeroU64,
     ) -> Result<(), SubscriptionSourceError> {
-        let stop = self
-            .state
-            .lock()
-            .expect("covered original Source")
-            .jobs
-            .get(&generation)
-            .map(|record| record.stop.clone())
-            .ok_or(SubscriptionSourceError::UnknownGeneration)?;
+        let stop = {
+            let state = self.state.lock().expect("covered original Source");
+            match state.jobs.get(&generation) {
+                Some(record) => record.stop.clone(),
+                None if state.max_generation.is_some_and(|old| generation <= old) => return Ok(()),
+                None => return Err(SubscriptionSourceError::UnknownGeneration),
+            }
+        };
         // A cancellation wake is not actual exit. Keep the same record and its
         // WorkOwner until the original future/captures really leave.
         stop.send_replace(true);
@@ -441,7 +501,7 @@ impl<A: Actor> SubscriptionSource<A> {
     pub(crate) fn reap_generation(
         &self,
         generation: NonZeroU64,
-    ) -> Result<(), SubscriptionSourceError> {
+    ) -> Result<Arc<SubscriptionRequest>, SubscriptionSourceError> {
         let phase = {
             let state = self.state.lock().expect("covered original Source");
             let record = state
@@ -465,10 +525,14 @@ impl<A: Actor> SubscriptionSource<A> {
             .lock()
             .expect("covered original Source")
             .jobs
-            .remove(&generation);
-        drop(record);
-        Ok(())
+            .remove(&generation)
+            .expect("same original retired generation");
+        Ok(record.applied)
     }
+    pub(crate) fn close_admission(&self) {
+        self.state.lock().expect("covered original Source").open = false;
+    }
+
     pub(crate) fn close_new_jobs(&self) {
         let stops = {
             let mut state = self.state.lock().expect("covered original Source");
@@ -548,7 +612,7 @@ impl<A: Actor> Drop for GenerationExitObligation<A> {
 /// A metadata-admitted generation has not started its RPC or Work. Its caller
 /// wraps run() in the original GatedWork/run_future credentialed execution.
 pub(crate) struct SubscriptionGeneration<A: Actor> {
-    request: Option<DecodedCoveredSubscription>,
+    request: Option<Arc<SubscriptionRequest>>,
     receiver: Option<watch::Receiver<bool>>,
     guard: Option<GenerationExitObligation<A>>,
     phase: Option<Arc<SubscriptionPhasePublisher<A>>>,
@@ -588,9 +652,11 @@ impl<A: Actor> SubscriptionGeneration<A> {
         let ingress = guard.source.ingress.clone();
         let body = async move {
             let mut credit = Some(tokio::select! {
+                biased;
                 _ = stopped(&mut receiver) => { ingress.job_closed(key).map_err(SubscriptionRunError::Ingress)?; return Ok(SubscriptionEnd::CoreClosed); }
                 credit = ingress.reserve_read(key) => credit.map_err(SubscriptionRunError::Ingress)?,
             });
+            let request = decode_request(&request);
             let mut opening = io.open(request.clone());
             let mut published_phase = None;
             let stream = tokio::select! {
