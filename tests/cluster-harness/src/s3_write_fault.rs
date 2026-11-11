@@ -22,7 +22,7 @@
 use anyhow::{Context, Result, ensure};
 use axum::body::Body;
 use bytes::Bytes;
-use http::{HeaderMap, Method, Request, Response, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -68,6 +68,7 @@ struct AckLoss {
     operation: S3Operation,
     target: AckTarget,
     dropped: bool,
+    readback_etag: Option<HeaderValue>,
     pause: Option<(PauseAfter, Arc<PausedResponse>)>,
 }
 
@@ -75,7 +76,7 @@ struct AckLoss {
 #[serde(rename_all = "snake_case")]
 pub enum PauseAfter {
     SuccessfulCreate,
-    RetryPreconditionFailure,
+    ReadbackHead,
 }
 
 #[derive(Default)]
@@ -116,6 +117,7 @@ pub struct S3WriteEvent {
     pub condition_if_none_match_star: bool,
     pub create_marker: Option<CreateMarker>,
     pub readback_sha256: Option<String>,
+    pub readback_matches_head_etag: bool,
     pub attempt: u64,
     pub status: Option<u16>,
     pub xml_code: Option<String>,
@@ -322,6 +324,7 @@ impl S3WriteFault {
             operation,
             target,
             dropped: false,
+            readback_etag: None,
             pause,
         });
         Ok(())
@@ -508,7 +511,7 @@ async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<
         .headers
         .get(header::IF_NONE_MATCH)
         .is_some_and(|value| value == "*");
-    let attempt = {
+    let (attempt, readback_matches_head_etag) = {
         let mut observed = shared
             .observations
             .lock()
@@ -520,12 +523,20 @@ async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<
         {
             fault.target = AckTarget::Object(path.clone());
         }
+        let readback_matches_head_etag = operation == S3Operation::Get
+            && observed.ack_loss.as_ref().is_some_and(|fault| {
+                matches!(&fault.target, AckTarget::Object(target) if *target == path)
+                    && fault
+                        .readback_etag
+                        .as_ref()
+                        .is_some_and(|etag| parts.headers.get(header::IF_MATCH) == Some(etag))
+            });
         let attempt = observed
             .attempts
             .entry((operation, path.clone(), upload.clone(), part))
             .or_default();
         *attempt += 1;
-        *attempt
+        (*attempt, readback_matches_head_etag)
     };
     let recorded = RecordedRequest {
         shared: Arc::clone(&shared),
@@ -537,6 +548,7 @@ async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<
             condition_if_none_match_star: conditional,
             create_marker: conditional.then(|| create_marker(&parts.headers)).flatten(),
             readback_sha256: None,
+            readback_matches_head_etag,
             attempt,
             status: None,
             xml_code: None,
@@ -617,27 +629,29 @@ async fn finish_upstream(
             let mut drop_response = false;
             let mut pause = None;
             if let Some(fault) = &mut observed.ack_loss
-                && fault.operation == event.operation
-                && event.condition_if_none_match_star
                 && matches!(&fault.target, AckTarget::Object(path) if *path == event.object_path)
             {
-                let phase = if successful_create && !fault.dropped {
-                    drop_response = true;
-                    fault.dropped = true;
-                    Some(PauseAfter::SuccessfulCreate)
-                } else if fault.dropped
-                    && status == StatusCode::PRECONDITION_FAILED
-                    && event.xml_code.as_deref() == Some("PreconditionFailed")
-                {
-                    Some(PauseAfter::RetryPreconditionFailure)
-                } else {
-                    None
-                };
+                let phase =
+                    if event.operation == fault.operation && successful_create && !fault.dropped {
+                        drop_response = true;
+                        fault.dropped = true;
+                        Some(PauseAfter::SuccessfulCreate)
+                    } else if event.operation == S3Operation::Head
+                        && fault.dropped
+                        && status.is_success()
+                    {
+                        Some(PauseAfter::ReadbackHead)
+                    } else {
+                        None
+                    };
                 if fault
                     .pause
                     .as_ref()
                     .is_some_and(|(configured, _)| Some(*configured) == phase)
                 {
+                    if phase == Some(PauseAfter::ReadbackHead) {
+                        fault.readback_etag = headers.get(header::ETAG).cloned();
+                    }
                     pause = fault.pause.take();
                 }
             }

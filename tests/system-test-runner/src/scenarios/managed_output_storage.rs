@@ -69,14 +69,14 @@ const FOREIGN: &str = "d56eff61-8e8c-41bc-9abe-1a1ce7000002";
 const READBACK_FAULTS: [ReadbackFault; 3] = [
     ReadbackFault::ForeignSameBytes,
     ReadbackFault::OwnedWrongDigest,
-    ReadbackFault::MissingAfterRetry,
+    ReadbackFault::OwnedReadRejected,
 ];
 
 #[derive(Clone, Copy, Debug)]
 enum ReadbackFault {
     ForeignSameBytes,
     OwnedWrongDigest,
-    MissingAfterRetry,
+    OwnedReadRejected,
 }
 
 impl ReadbackFault {
@@ -84,22 +84,15 @@ impl ReadbackFault {
         let id = match self {
             Self::ForeignSameBytes => 101,
             Self::OwnedWrongDigest => 102,
-            Self::MissingAfterRetry => 103,
+            Self::OwnedReadRejected => 103,
         };
         format!("INSERT INTO {CATALOG}.{SOURCE} VALUES ({id})")
     }
 
     fn pause(self) -> PauseAfter {
         match self {
-            Self::MissingAfterRetry => PauseAfter::RetryPreconditionFailure,
+            Self::OwnedReadRejected => PauseAfter::ReadbackHead,
             _ => PauseAfter::SuccessfulCreate,
-        }
-    }
-
-    fn head_status(self) -> u16 {
-        match self {
-            Self::MissingAfterRetry => 404,
-            _ => 200,
         }
     }
 }
@@ -750,14 +743,19 @@ async fn alter_fixture_object(
             );
             return Ok(Some(sha256(&data)));
         }
-        ReadbackFault::OwnedWrongDigest => {
+        ReadbackFault::OwnedWrongDigest | ReadbackFault::OwnedReadRejected => {
+            if matches!(fault, ReadbackFault::OwnedReadRejected) {
+                ensure!(
+                    metadata.version().is_none() && metadata.etag().is_some(),
+                    "readback refusal requires an unversioned MinIO object with an ETag"
+                );
+            }
             let mut data = op.read(relative).await?.to_vec();
             *data.first_mut().context("native staged parquet is empty")? ^= 1;
             op.write_with(relative, data)
                 .user_metadata(original_marker.clone())
                 .await?;
         }
-        ReadbackFault::MissingAfterRetry => op.delete(relative).await?,
     }
     Ok(None)
 }
@@ -831,7 +829,7 @@ fn check_readback_exit(
         events
             .iter()
             .any(|event| event.operation == S3Operation::Head
-                && event.status == Some(fault.head_status())
+                && event.status == Some(200)
                 && event.upstream_response_complete),
         "native write did not observe the actual readback status for {fault:?}: {events:?}"
     );
@@ -879,10 +877,35 @@ fn check_readback_exit(
                 && !fixture.rest.object_exists(&uri)?,
             "native owner failed to read back and retire its known-owned mismatching output",
         ),
-        ReadbackFault::MissingAfterRetry => ensure!(
-            cleanup.is_empty() && !fixture.rest.object_exists(&uri)?,
-            "native cleanup tried to remove an unproven target after actual HEAD 404"
-        ),
+        ReadbackFault::OwnedReadRejected => {
+            let head = events
+                .iter()
+                .position(|event| {
+                    event.operation == S3Operation::Head
+                        && event.response_pause == Some(PauseAfter::ReadbackHead)
+                        && event.upstream_response_complete
+                        && event.status == Some(200)
+                })
+                .context("native readback refusal did not pause the original successful HEAD")?;
+            let rejected = events[head + 1..]
+                .iter()
+                .position(|event| {
+                    event.operation == S3Operation::Get
+                        && event.readback_matches_head_etag
+                        && event.status == Some(412)
+                        && event.xml_code.as_deref() == Some("PreconditionFailed")
+                        && event.upstream_response_complete
+                })
+                .context("MinIO did not refuse the GET pinned to the original HEAD ETag")?;
+            ensure!(
+                events[head + rejected + 2..].iter().any(|event| {
+                    event.operation == S3Operation::Delete
+                        && event.status == Some(204)
+                        && event.upstream_response_complete
+                }) && !fixture.rest.object_exists(&uri)?,
+                "native owner did not retire its known-owned output after GET refusal"
+            );
+        }
     }
     Ok(json!({"fault":format!("{fault:?}"),"http":events}))
 }
