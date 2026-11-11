@@ -98,7 +98,7 @@ pub(super) fn resolve_target(
 fn delete_where_expr<'a>(
     stmt: &'a Delete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
-) -> Result<&'a Expr, String> {
+) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
         "DELETE requires a WHERE clause; for full table replacement use \
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
@@ -412,7 +412,10 @@ fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
-fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
+fn validate_where(
+    expr: &Expr,
+    columns: &[ColumnDef],
+) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
         Expr::Binary(binary) => match binary.operator {
             BinaryOperator::And | BinaryOperator::Or => {
@@ -437,11 +440,12 @@ fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
                 }
                 let (col_name, value_expr, _flipped) =
                     extract_comparison(&binary.left, &binary.right)?;
-                validate_literal_for_column(value_expr, columns, &col_name)
+                validate_literal_for_column(value_expr, columns, &col_name).map_err(Into::into)
             }
             other => Err(format!(
                 "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
-            )),
+            )
+            .into()),
         },
         Expr::InList(in_list) => {
             let col_name = expr_to_column_name(&in_list.expr)?;
@@ -456,13 +460,29 @@ fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
                 IsPredicate::Null | IsPredicate::NotNull
             ) =>
         {
-            expr_to_column_name(&predicate.expr).map(|_| ())
+            expr_to_column_name(&predicate.expr)
+                .map(|_| ())
+                .map_err(Into::into)
         }
         Expr::Nested(nested) => validate_where(&nested.expression, columns),
+        // This restricted DELETE path rejects subqueries before SQL completion
+        // can resolve their relations. Preserve that capability refusal as a
+        // typed source rather than flattening it into an internal error.
+        Expr::InSubquery(_) | Expr::Exists(_) | Expr::Subquery(_) => {
+            Err(crate::dml::error::DmlExecutionError::Compilation(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "subqueries are unsupported in DELETE predicates",
+                    ),
+                ),
+            ))
+        }
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
-        )),
+        )
+        .into()),
     }
 }
 
@@ -810,6 +830,9 @@ mod tests {
             for literal in [below, above] {
                 let error = super::validate_where(&where_expr(&format!("n = {literal}")), &columns)
                     .expect_err("the restricted DELETE surface retains exact-domain parsing");
+                let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                    panic!("expected the original literal validation error");
+                };
                 assert!(error.contains(&format!("literal `{literal}`")), "{error}");
                 assert!(error.contains("fit in target type"), "{error}");
             }
@@ -840,7 +863,32 @@ mod tests {
         let where_clause = where_expr("v = 'x'");
         let error = super::validate_where(&where_clause, &columns_with_variant())
             .expect_err("a bare variant comparison is not supported");
+        let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+            panic!("expected the original variant validation error");
+        };
         assert!(error.contains("LargeBinary"), "{error}");
+    }
+
+    #[test]
+    fn delete_subquery_refusal_preserves_unsupported_source_before_completion() {
+        for predicate in [
+            "id IN (SELECT 1 FROM system.information_schema.tables)",
+            "id = 1 AND (id IN (SELECT 1 FROM system.information_schema.tables))",
+            "EXISTS (SELECT 1 FROM system.information_schema.tables)",
+        ] {
+            let error = super::validate_where(&where_expr(predicate), &columns_with_variant())
+                .expect_err("the restricted DELETE path does not support subqueries");
+            let crate::dml::error::DmlExecutionError::Compilation(source) = error else {
+                panic!("capability refusal must retain its typed source");
+            };
+            let connector = source
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .expect("original capability author");
+            assert_eq!(
+                connector.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            );
+        }
     }
 
     /// DELETE takes its sink and distribution from the Provider's signed

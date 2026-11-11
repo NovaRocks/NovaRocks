@@ -5,7 +5,7 @@ catalog_name	schema_name	name	storage_catalog	storage_schema	storage_table	fresh
 -- query 3
 -- types	varchar	varchar	timestamp(9) with time zone	varchar	varchar
 name	freshness	last_fresh_time	comment	storage_table
-system_mv	STALE	NULL		system_mv
+system_mv	STALE	NULL	""	system_mv
 
 -- query 5
 -- types	varchar	varchar	timestamp(9) with time zone
