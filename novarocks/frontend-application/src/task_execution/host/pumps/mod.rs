@@ -23,6 +23,7 @@ mod dynamic_filters;
 mod job;
 mod source;
 pub(crate) mod split;
+pub(crate) mod split_source;
 
 pub(crate) use diagnostics::{DiagnosticRecords, DiagnosticRegistration};
 pub(crate) use dynamic_filters::{DynamicFilterRecords, DynamicReadRegistration};

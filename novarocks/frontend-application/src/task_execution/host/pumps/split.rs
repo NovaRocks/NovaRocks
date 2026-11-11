@@ -53,8 +53,7 @@ use novarocks_control_runtime::{
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::{
-    CodecOwnedContent, PlanNodeId, SplitAssignmentIntent, TaskDomainUpdate, TaskIdentity,
-    TaskOperationId,
+    PlanNodeId, SplitAssignmentIntent, TaskDomainUpdate, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_codec::{FieldPath, lifecycle::QueryExecutionId};
 use novarocks_proto_models::connector_read as wire;
@@ -424,11 +423,11 @@ pub(crate) struct SplitRetiredDelivery {
     pub(crate) original: Box<dyn std::any::Any + Send>,
 }
 /// The original Source assigns a canonical payload reference before publishing
-/// this delivery. The returned Arc aliases its original encoder-produced bytes.
+/// this delivery. The assignment aliases its original encoder-produced bytes.
 pub(crate) struct SplitPayloadRegistration {
     pub(crate) delivery: SplitDeliveryRef,
     pub(crate) task: TaskIdentity,
-    pub(crate) payload: Arc<dyn CodecOwnedContent>,
+    pub(crate) assignment: SplitAssignmentIntent,
     pub(crate) backing_bytes: usize,
 }
 impl SplitDeliveryRecords {
@@ -475,9 +474,9 @@ impl SplitDeliveryRecords {
         }
         self.wake.wake();
     }
-    /// Closing stops fresh driver input but does not erase a pending canonical
-    /// request or operation. Their original outcomes and actual jobs still exit.
-    pub(crate) fn close_external(&self) {
+    /// The original driver returned from its provider close. Seal fresh input
+    /// while retaining any canonical request and its original operation.
+    fn close_external(&self) {
         self.records
             .lock()
             .expect("split canonical records")
@@ -509,19 +508,27 @@ impl SplitDeliveryRecords {
         records.by_operation.retain(|_, held| *held != delivery);
         Some(original.into())
     }
+    pub(crate) fn producer_closed(&self) -> bool {
+        self.records
+            .lock()
+            .expect("split canonical records")
+            .closing
+    }
+
     pub(crate) fn next_unregistered(&self) -> Option<SplitPayloadRegistration> {
         let records = self.records.lock().expect("split canonical records");
-        let (&delivery, record) = records
-            .deliveries
-            .iter()
-            .find(|(_, r)| r.payload.is_none())?;
+        let &delivery = records.pending.front()?;
+        let record = &records.deliveries[&delivery];
+        if record.payload.is_some() {
+            return None;
+        }
         let TaskDomainUpdate::SplitAssignment(update) = &record.update else {
             unreachable!("the original bridge freezes only split assignments")
         };
         Some(SplitPayloadRegistration {
             delivery,
             task: record.task,
-            payload: update.payload().clone(),
+            assignment: update.clone(),
             backing_bytes: record.backing_bytes,
         })
     }
