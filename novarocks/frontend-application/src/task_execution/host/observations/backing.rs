@@ -25,7 +25,9 @@ use super::{
     source::{BoundObservationSource, ObservationMetadataAuthor},
 };
 use crate::control_runtime::actor::FrontendActor;
-use novarocks_control_runtime::obligation::{ReservationObligation, WorkObligation};
+use novarocks_control_runtime::obligation::{
+    ReservationObligation, ReservationRetirementObserver, WorkObligation,
+};
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
     identity::DimensionId,
@@ -38,6 +40,7 @@ use std::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
+    task::Waker,
 };
 
 pub(crate) const OBSERVATION_BACKING_BYTES: DimensionId = DimensionId::new(13).unwrap();
@@ -143,6 +146,7 @@ struct BackingCharge {
     reservation: ReservationObligation,
     quota: ResourceVector,
     phase: AtomicU8,
+    wake: Waker,
 }
 
 impl BackingCharge {
@@ -166,6 +170,8 @@ impl Drop for BackingCharge {
         {
             // The active reservation records the unresolved row on Drop.
             tracing::error!(?error, "retire original observation backing");
+        } else {
+            self.wake.wake_by_ref();
         }
     }
 }
@@ -174,6 +180,12 @@ impl Drop for BackingCharge {
 /// releases the one prepaid partition after the explicit Source exit.
 #[derive(Clone)]
 pub(crate) struct ObservationBackingPin(Arc<BackingCharge>);
+
+impl ObservationBackingPin {
+    pub(crate) fn exit(&self) -> ReservationRetirementObserver {
+        self.0.reservation.retirement_observer()
+    }
+}
 
 impl ObservationMetadataObligation for ObservationBackingPin {
     fn backing_pin(&self) -> Option<Self> {
@@ -197,6 +209,7 @@ impl PaidObservationMetadata {
         quote: ObservationBackingQuote,
         work: &WorkObligation,
         positions: &mut ReservationObligation,
+        progress: Waker,
     ) -> Result<Arc<Self>, ObservationError> {
         if !positions.belongs_to_bound_work(work.scope(), work.id()) {
             return Err(ObservationError::Budget);
@@ -214,6 +227,7 @@ impl PaidObservationMetadata {
                 reservation,
                 quota: quote.quota,
                 phase: AtomicU8::new(UNPUBLISHED),
+                wake: progress,
             })),
         }))
     }
@@ -273,7 +287,13 @@ mod tests {
             .bind(WorkKind::Settlement)
             .unwrap();
         work.start().unwrap();
-        let metadata = PaidObservationMetadata::take_from(quote, &work, &mut reservation).unwrap();
+        let metadata = PaidObservationMetadata::take_from(
+            quote,
+            &work,
+            &mut reservation,
+            Waker::noop().clone(),
+        )
+        .unwrap();
         let proof = metadata.retain(layout, 1).unwrap();
         let alias = proof.backing_pin().unwrap();
         drop((metadata, proof, alias));

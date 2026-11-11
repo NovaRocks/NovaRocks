@@ -1001,7 +1001,12 @@ impl AttemptActorRegistration {
         }
         let budget = ObservationBudget::for_task_attempt();
         let quote = ObservationBackingQuote::new(budget, self.failure_members.len())?;
-        let metadata = PaidObservationMetadata::take_from(quote, backing.work, backing.positions)?;
+        let metadata = PaidObservationMetadata::take_from(
+            quote,
+            backing.work,
+            backing.positions,
+            progress.clone(),
+        )?;
         let roles = match self.bind_read_progress(runtime, backing.work, Some(&metadata.pin())) {
             Ok(roles) => roles,
             Err(error) => {

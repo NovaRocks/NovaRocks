@@ -805,7 +805,51 @@ pub struct ReservationObligation {
     pub(crate) id: ReservationId,
     pub(crate) active: bool,
 }
+
+/// A passive witness for the actual release of one original reservation.
+/// Keeping this witness grants no quota and pins neither its Work nor storage.
+#[derive(Clone)]
+pub struct ReservationRetirementObserver {
+    scope: ScopeHandle,
+    id: ReservationId,
+}
+
+impl ReservationRetirementObserver {
+    pub fn belongs_to_bound_work(&self, work: &WorkObligation) -> bool {
+        self.scope.same_scope(work.scope())
+            && self
+                .scope
+                .runtime
+                .shared
+                .state
+                .lock()
+                .expect("runtime ledger lock")
+                .ledger
+                .reservation(self.id)
+                .is_some_and(|original| original.bound && original.work == work.id())
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock")
+            .ledger
+            .reservation(self.id)
+            .is_none()
+    }
+}
+
 impl ReservationObligation {
+    pub fn retirement_observer(&self) -> ReservationRetirementObserver {
+        ReservationRetirementObserver {
+            scope: self.scope.clone(),
+            id: self.id,
+        }
+    }
+
     /// A passive check against the original bound reservation's ledger and scope.
     pub fn belongs_to(&self, scope: &ScopeHandle) -> bool {
         self.scope.same_scope(scope)

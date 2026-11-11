@@ -28,6 +28,7 @@ pub(crate) mod failure_bridge;
 pub(crate) mod failure_lifecycle;
 pub(crate) mod failure_publication;
 pub(crate) mod failure_supervisor;
+pub(crate) mod funding;
 
 pub(crate) mod transport;
 

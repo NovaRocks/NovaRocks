@@ -302,6 +302,15 @@ impl OrderedObservationHost {
         self.ingress.1.clone()
     }
 
+    pub(crate) fn backing_exit(
+        &self,
+    ) -> Option<novarocks_control_runtime::obligation::ReservationRetirementObserver> {
+        self.ingress
+            .1
+            .as_ref()
+            .map(backing::ObservationBackingPin::exit)
+    }
+
     pub(crate) fn fence_root_controls(&self) {
         self.ingress.fence_root_controls_for_close();
     }

@@ -57,6 +57,7 @@ use crate::task_execution::host::adapter::{
     AttemptActorRegistration, AttemptRegistrationError, PreparedAttemptHost,
 };
 use crate::task_execution::host::failure_bridge::PendingFailureBridge;
+use crate::task_execution::host::funding::AttemptHostFunding;
 use crate::task_execution::host::observations::{
     ObservationBudget, ObservationError, backing::ObservationBackingQuote,
 };
@@ -143,6 +144,7 @@ impl FrontendAttemptRuntime {
     pub(crate) fn register_attempt(
         &self,
         prepared: PreparedAttemptHost,
+        funding: AttemptHostFunding,
     ) -> Result<
         (
             AttemptStartup,
@@ -156,6 +158,7 @@ impl FrontendAttemptRuntime {
             PendingFailureBridge,
             Arc<TerminalOutbox>,
             MembershipErrors,
+            AttemptHostFunding,
         ),
     > {
         let PreparedAttemptHost {
@@ -171,7 +174,8 @@ impl FrontendAttemptRuntime {
             self.members.clone(),
             membership.target,
         ));
-        match self.register(binding) {
+        let mut funding = Some(funding);
+        match self.register(binding, &mut funding) {
             Ok(exit) => Ok((
                 startup,
                 controls,
@@ -188,11 +192,16 @@ impl FrontendAttemptRuntime {
                 failure,
                 terminal,
                 membership.errors,
+                funding.expect("registration refusal returns the original funding"),
             )),
         }
     }
 
-    fn register(&self, binding: HostBinding) -> Result<HostExit, HostRegistrationRefusal> {
+    fn register(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
         let open = self
             .registration_open
             .lock()
@@ -204,7 +213,7 @@ impl FrontendAttemptRuntime {
                 binding,
             });
         }
-        self.host.register(binding)
+        self.host.register_with_funding(binding, funding)
     }
 }
 

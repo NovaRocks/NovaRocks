@@ -35,6 +35,7 @@ use crate::task_execution::host::custody::{
 use crate::task_execution::host::{
     adapter::AttemptCapacitySource,
     failure_publication::FailureContext,
+    funding::{AttemptHostFunding, FundingProgress},
     observations::{
         ObservationError,
         host_turn::{OrderedObservationFailure, OrderedObservationHost},
@@ -271,6 +272,7 @@ struct HostMachine {
     capacity: Option<AttemptCapacitySource>,
     membership: Option<AttemptMembershipSource>,
     owner_controls: Option<AttemptOwnerControlSource>,
+    funding: Option<AttemptHostFunding>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -387,6 +389,14 @@ impl HostRegistry {
         &self,
         binding: HostBinding,
     ) -> Result<HostExit, HostRegistrationRefusal> {
+        self.register_with_funding(binding, &mut None)
+    }
+
+    pub(crate) fn register_with_funding(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
         if !binding.registration.matches_scope(&binding.scope)
             || binding.transport.as_ref().is_some_and(|transport| {
                 !transport.matches_registration(&self.runtime, &binding.registration)
@@ -500,6 +510,22 @@ impl HostRegistry {
                 binding,
             });
         }
+        let backing = binding
+            .ordered_observations
+            .as_ref()
+            .and_then(OrderedObservationHost::backing_exit);
+        if funding.as_ref().is_some_and(|funding| {
+            !binding.scope.same_scope(funding.scope())
+                || !backing
+                    .as_ref()
+                    .is_some_and(|backing| funding.owns_observation(backing))
+        }) {
+            return Err(HostRegistrationRefusal {
+                reason: "attempt funding differs from the original Source work",
+                runtime_error: None,
+                binding,
+            });
+        }
         let mut state = self.state.lock().expect("frontend host registry lock");
         if !state.open || state.entries.contains_key(&binding.scope.id()) {
             return Err(HostRegistrationRefusal {
@@ -516,6 +542,10 @@ impl HostRegistry {
         );
         let (exit, exited) = watch::channel(false);
         let start_after_registration = binding.startup.is_some();
+        let funding = funding.take().map(|mut original| {
+            original.bind_observation_exit(backing.expect("qualified paid observation backing"));
+            original
+        });
         let original = Arc::new(HostEntry {
             scope: binding.scope,
             registration: binding.registration,
@@ -535,6 +565,7 @@ impl HostRegistry {
                 capacity: binding.capacity,
                 membership: binding.membership,
                 owner_controls: binding.owner_controls,
+                funding,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -969,6 +1000,22 @@ impl HostRegistry {
                         units: entry.budget,
                         handoffs,
                         more: true,
+                        retired: false,
+                    });
+                }
+            }
+            if let Some(funding) = &mut machine.funding {
+                let progress = if budget == 0 {
+                    FundingProgress::More
+                } else {
+                    budget -= 1;
+                    funding.progress(&self.ledger, &self.runtime, &entry.registration)?
+                };
+                if !matches!(progress, FundingProgress::Retired) {
+                    return Ok(HostProgress {
+                        units: entry.budget - budget,
+                        handoffs,
+                        more: matches!(progress, FundingProgress::More),
                         retired: false,
                     });
                 }
@@ -2967,41 +3014,44 @@ mod tests {
         let held_captures = CaptureProbe(captures.clone());
         assert!(
             attempts
-                .register(HostBinding {
-                    scope: scope.clone(),
-                    registration: registration.clone(),
-                    kind: FrontendActorKind::Test,
-                    config,
-                    policy: FrontendLanePolicy {
-                        lane: |_| None,
-                        per_step_inventory: 1
-                    },
-                    source: Box::new(RealSource {
+                .register(
+                    HostBinding {
                         scope: scope.clone(),
-                        ledger: ledger.clone(),
-                        runtime: runtime.clone(),
                         registration: registration.clone(),
-                        result: Some(role),
-                        exit: None,
-                        captures: None,
-                        custody: custody.clone(),
-                        report: report.clone(),
-                        returned: Arc::new(ReturnedResult {
-                            role: Mutex::new(None),
-                            indexed: Mutex::new(vec![])
+                        kind: FrontendActorKind::Test,
+                        config,
+                        policy: FrontendLanePolicy {
+                            lane: |_| None,
+                            per_step_inventory: 1
+                        },
+                        source: Box::new(RealSource {
+                            scope: scope.clone(),
+                            ledger: ledger.clone(),
+                            runtime: runtime.clone(),
+                            registration: registration.clone(),
+                            result: Some(role),
+                            exit: None,
+                            captures: None,
+                            custody: custody.clone(),
+                            report: report.clone(),
+                            returned: Arc::new(ReturnedResult {
+                                role: Mutex::new(None),
+                                indexed: Mutex::new(vec![])
+                            }),
+                            binds: Arc::new(AtomicUsize::new(0)),
+                            closing: false,
+                            report_consumed: false
                         }),
-                        binds: Arc::new(AtomicUsize::new(0)),
-                        closing: false,
-                        report_consumed: false
-                    }),
-                    executor: Arc::new(NoExecutor),
-                    transport: None,
-                    startup: None,
-                    capacity: None,
-                    membership: None,
-                    owner_controls: None,
-                    ordered_observations: None,
-                })
+                        executor: Arc::new(NoExecutor),
+                        transport: None,
+                        startup: None,
+                        capacity: None,
+                        membership: None,
+                        owner_controls: None,
+                        ordered_observations: None,
+                    },
+                    &mut None
+                )
                 .is_ok()
         );
         let metric_registry = prometheus::Registry::new();

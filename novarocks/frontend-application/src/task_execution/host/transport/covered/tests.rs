@@ -30,6 +30,7 @@ use crate::{
         host::{
             custody::{TransportRetirements, tests::WithdrawalInbox},
             failure_publication::FailurePublications,
+            funding::AttemptHostFunding,
             observations::{
                 ObservationBudget, OrderedObservationInput,
                 backing::{
@@ -52,7 +53,7 @@ use novarocks_attempt_protocol::{
 use novarocks_control_runtime::{
     actor::ActorConfig,
     actor_turn::{ActorHostTurn, ProcessClock},
-    transaction::{RuntimeLedger, ScopeHandle},
+    transaction::RuntimeLedger,
 };
 use novarocks_control_runtime_core::{
     capacity::ReservationResources,
@@ -79,7 +80,6 @@ struct HostSource {
     sources_retired: Arc<AtomicBool>,
     ordered_handed_off: bool,
     open_pending: bool,
-    scope: ScopeHandle,
     closing: bool,
 }
 impl EffectSource for HostSource {
@@ -149,7 +149,6 @@ impl EffectSource for HostSource {
 
     fn close_external(&mut self) {
         self.closing = true;
-        self.scope.close_external().unwrap();
     }
 
     fn result_admission_closed(&self) -> bool {
@@ -213,7 +212,6 @@ impl EffectSource for HostSource {
         original.retired &= self.ordered_handed_off && self.can_close_ordered_observations(false);
         if original.retired {
             self.sources_retired.store(true, Ordering::Release);
-            original.retired = self.scope.join_ready().unwrap();
         }
         original
     }
@@ -237,25 +235,44 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         .checked_add(quote.quota())
         .unwrap();
     let ledger = RuntimeLedger::new(resources.clone());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let (mut parent, mut payer) = scope
+    let outer = ledger.open_scope_next(None, generation).unwrap();
+    let (mut launcher, mut launcher_payer) = outer
         .reserve_next(
             generation,
-            ReservationResources::new(
-                resources,
-                OwnedSlotNeed {
-                    work_headers: 1,
-                    inputs: budget.total_positions,
-                    ..Default::default()
-                },
-            ),
-            WorkKind::Cleanup,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
             WorkAdmission::External,
         )
         .unwrap()
-        .bind(WorkKind::Cleanup)
+        .bind(WorkKind::Settlement)
         .unwrap();
-    parent.start().unwrap();
+    launcher.start().unwrap();
+    let mut funding = AttemptHostFunding::reserve(
+        &ledger,
+        Some(&launcher),
+        generation,
+        ReservationResources::new(
+            resources,
+            OwnedSlotNeed {
+                work_headers: 1,
+                inputs: budget.total_positions,
+                ..Default::default()
+            },
+        ),
+    )
+    .unwrap();
+    let scope = funding.scope().clone();
+    let (mut command, mut command_payer) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    command.start().unwrap();
     let backend = BackendProcessId::new_v7();
     let execution = QueryExecutionId::new(QueryId::new(17, 1), AttemptId::new(1).unwrap()).unwrap();
     let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
@@ -310,18 +327,26 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         root,
     )
     .unwrap();
-    let metadata = PaidObservationMetadata::take_from(quote, &parent, &mut payer).unwrap();
+    let (observation, observation_payer, root_control) = funding.observation_and_root_control();
+    let control_scope = root_control.scope().clone();
+    let metadata = PaidObservationMetadata::take_from(
+        quote,
+        observation,
+        observation_payer,
+        transport.host_waker(),
+    )
+    .unwrap();
     let credits = ObservationCredits::bind(
         budget,
         [participation],
-        &parent,
-        &mut payer,
+        observation,
+        observation_payer,
         Some(metadata.pin()),
     )
     .unwrap();
-    let standing = |source, class| {
+    let standing = |source, class, work| {
         runtime
-            .reserve_admitted_input_for(registration, source, class, &parent)
+            .reserve_admitted_input_for(registration, source, class, work)
             .unwrap()
             .into_standing_input()
             .unwrap()
@@ -329,7 +354,7 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     let progress = ReadProgressInput::new(
         registration,
         participation,
-        standing(inbox.source(), InputClass::Ordinary),
+        standing(inbox.source(), InputClass::Ordinary, observation),
     )
     .with_backing(Some(metadata.pin()));
     let requests = RootControlRequests::new(
@@ -342,15 +367,17 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     );
     let source = BoundObservationSource::new(
         root.clone(),
-        requests,
+        requests.clone(),
         credits,
         BTreeMap::from([(participation, progress.clone())]),
         metadata,
     );
     let observation_source = ActorId::new(4).unwrap();
+    let control_position = standing(observation_source, InputClass::Control, root_control);
+    let reply_author = control_position.author().unwrap();
     let ingress = OrderedObservationInput::new(
-        standing(observation_source, InputClass::Lifecycle),
-        standing(observation_source, InputClass::Control),
+        standing(observation_source, InputClass::Lifecycle, observation),
+        control_position,
         source,
         root.clone(),
         Arc::new(ManualClock::default()),
@@ -358,6 +385,8 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         transport.host_waker(),
     )
     .unwrap();
+    root.bind_reply_author(reply_author);
+    requests.bind_ingress(&ingress);
     let weak_ingress = ingress.weak();
     let (wc_owner, mut wc_driver, capacity) = wc::fixture();
     let wc_root = wc_owner
@@ -366,7 +395,7 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     let wc_scope = wc_root.owner.scope();
     wc::bind(&wc_scope, &mut wc_driver);
     let cohort = wc::cohort(&wc_scope, 1, &mut wc_driver);
-    let mut data = FrontendDataRuntime::new(handle.clone());
+    let data = FrontendDataRuntime::new(handle.clone());
     let mut peer = Loopback::start().await;
     let backends: Arc<[BackendProcessDescriptor]> = Arc::from([peer.descriptor(backend)]);
     let descriptor = &backends[0];
@@ -400,24 +429,25 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     assert_eq!(cohort.remaining(), 0);
     let original = endpoints[&participation].source.clone();
     let observer = ConsumerId::new(1).unwrap();
+    let (parent, payer) = funding.parent();
     let subscriptions = AttemptSubscriptions::bind(
         runtime.clone(),
         registration.clone(),
         inbox.source(),
         &root,
-        &parent,
-        &payer,
+        parent,
+        payer,
         observer,
         endpoints.clone(),
     )
     .unwrap();
     let control = AttemptCallSource::new(
-        &parent,
-        &payer,
+        parent,
+        payer,
         generation,
         observer,
         AttemptCallOwner::SubscriptionControl(endpoints),
-        inbox.reserve_result(&parent),
+        inbox.reserve_result(parent),
     );
     let host = HostRegistry::new(
         runtime.clone(),
@@ -427,48 +457,52 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         ))),
     );
     let sources_retired = Arc::new(AtomicBool::new(false));
+    let mut funding = Some(funding);
     let mut exit = host
-        .register(HostBinding {
-            scope: scope.clone(),
-            registration: registration.clone(),
-            kind: FrontendActorKind::Test,
-            config: ActorConfig {
-                mailbox,
-                max_batches: 4,
-                max_effects_per_step: 1,
-                max_dependencies_per_effect: 0,
-                turn_budget: 8,
-                max_step_work: 1,
-            },
-            policy: FrontendLanePolicy::attempt(1),
-            source: Box::new(HostSource {
-                subscriptions,
-                control,
-                releases: TransportReleases::new(handle.clone(), transport.host_waker()),
-                sources_retired: sources_retired.clone(),
-                ordered_handed_off: false,
-                open_pending: false,
+        .register_with_funding(
+            HostBinding {
                 scope: scope.clone(),
-                closing: false,
-            }),
-            executor: Arc::new(ActorTransportExecutor(handle.clone())),
-            transport: Some(transport),
-            startup: None,
-            capacity: None,
-            membership: None,
-            owner_controls: None,
-            ordered_observations: Some(
-                OrderedObservationHost::new(ingress.clone()).with_read_progress([progress]),
-            ),
-        })
+                registration: registration.clone(),
+                kind: FrontendActorKind::Test,
+                config: ActorConfig {
+                    mailbox,
+                    max_batches: 4,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+                policy: FrontendLanePolicy::attempt(1),
+                source: Box::new(HostSource {
+                    subscriptions,
+                    control,
+                    releases: TransportReleases::new(handle.clone(), transport.host_waker()),
+                    sources_retired: sources_retired.clone(),
+                    ordered_handed_off: false,
+                    open_pending: false,
+                    closing: false,
+                }),
+                executor: Arc::new(ActorTransportExecutor(handle.clone())),
+                transport: Some(transport),
+                startup: None,
+                capacity: None,
+                membership: None,
+                owner_controls: None,
+                ordered_observations: Some(
+                    OrderedObservationHost::new(ingress.clone()).with_read_progress([progress]),
+                ),
+            },
+            &mut funding,
+        )
         .unwrap_or_else(|_| panic!("original subscription host"));
+    assert!(funding.is_none());
 
     let drive = || {
         while let Some(turn) = runtime.claim_host_actor() {
             host.drive(Tick(1), turn);
         }
     };
-    let post = || inbox.submit_command(&parent);
+    let post = || inbox.submit_command(&command);
     let next_fact = || {
         while let Some((envelope, input)) = inbox.try_commit_envelope() {
             assert_eq!(envelope.source, inbox.source());
@@ -573,6 +607,14 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     .await
     .unwrap();
 
+    command.body_exited().unwrap();
+    command.captures_exited().unwrap();
+    command_payer.finish().unwrap();
+    assert!(
+        scope
+            .reap_observed_header(&command.retirement_observer())
+            .unwrap()
+    );
     exit.request_close().unwrap();
     tokio::time::timeout(wait, async {
         while !sources_retired.load(Ordering::Acquire) {
@@ -596,17 +638,24 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     assert!(!host.is_empty());
     drop(weak_ingress);
     assert_eq!(observation_capacity(), [0, 0]);
-    parent.body_exited().unwrap();
-    parent.captures_exited().unwrap();
-    payer.finish().unwrap();
-    scope.reap_ready(128).unwrap();
-    runtime.notify_host_actor(registration).unwrap();
     drive();
     tokio::time::timeout(wait, exit.wait())
         .await
         .unwrap()
         .unwrap();
-    assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    assert!(host.is_empty() && runtime.is_empty());
+    assert!(scope.snapshot().is_err() && control_scope.snapshot().is_err());
+    launcher.body_exited().unwrap();
+    launcher.captures_exited().unwrap();
+    launcher_payer.finish().unwrap();
+    assert!(
+        outer
+            .reap_observed_header(&launcher.retirement_observer())
+            .unwrap()
+    );
+    outer.close_external().unwrap();
+    ledger.remove_scope(outer.id()).unwrap();
+    assert!(ledger.is_empty());
     drop((cohort, capacity, wc_scope));
     wc::finish(wc_owner, wc_root, wc_driver);
     data.drain_native_outgoing_until(Instant::now() + wait)
