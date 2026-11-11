@@ -22,7 +22,7 @@
 use crate::actor_turn::StandingInputId;
 use crate::{
     actor::Actor,
-    actor_turn::{ActorTurnError, StandingInputObligation},
+    actor_turn::{ActorTurnError, FailedSourcePayload, StandingInputObligation},
     sync::{Arc, Mutex},
 };
 use novarocks_control_runtime_core::identity::InputId;
@@ -304,6 +304,17 @@ impl<A: Actor, T: Merge> CoalescingInput<A, T> {
                 state.retired = state.retired.max(state.abandoned_through);
             }
         }
+    }
+
+    /// Claim the original failed FIFO payload from this standing role.
+    pub fn take_failed_role_payload(
+        &self,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.0
+            .standing
+            .lock()
+            .expect("coalescing standing input lock")
+            .take_failed_role_payload()
     }
 
     /// The failed owner has closed admission, and the runtime verifies the

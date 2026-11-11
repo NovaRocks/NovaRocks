@@ -2542,6 +2542,7 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
             executor: Arc::new(NoJobs),
             transport: None,
             startup: None,
+            capacity: None,
             ordered_observations: Some(
                 OrderedObservationHost::new(ingress.clone())
                     .with_read_progress([read_progress.clone()]),

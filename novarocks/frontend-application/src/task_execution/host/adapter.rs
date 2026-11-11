@@ -178,42 +178,109 @@ impl Merge for CapacityReleased {
 /// wait before retiring it after the original holder exits.
 pub(crate) struct AttemptCapacitySource {
     registration: ActorRegistration,
-    runtime: ActorRuntime<FrontendActor>,
     input: CoalescingInput<FrontendActor, CapacityReleased>,
     registrant: Arc<CapacityRegistrant>,
+    indexed: Option<InputId>,
+    closing: bool,
+    closed: bool,
 }
 
 impl AttemptCapacitySource {
-    /// Call after the host has indexed the original committed input. An
-    /// occurrence with outstanding work stays in the actual mailbox role.
-    pub(crate) fn retire_ready(&mut self) -> Result<bool, ActorTurnError> {
-        let Some(input) = self.input.in_flight()? else {
+    pub(crate) fn new(
+        registration: ActorRegistration,
+        standing: StandingInputObligation<FrontendActor>,
+        registrant: Arc<CapacityRegistrant>,
+    ) -> Self {
+        assert!(standing.matches_registration(&registration));
+        let input = CoalescingInput::new(standing, |_| FrontendInput::CapacityReleased);
+        registrant.update_waker(&input.waker());
+        Self {
+            registration,
+            input,
+            registrant,
+            indexed: None,
+            closing: false,
+            closed: false,
+        }
+    }
+
+    pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
+        self.registration.same_registration(registration)
+    }
+
+    pub(crate) fn index_committed(&mut self, inputs: &[InputId]) -> Result<bool, ActorTurnError> {
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        let Some(input) = self
+            .input
+            .in_flight()?
+            .filter(|input| inputs.contains(input))
+        else {
             return Ok(false);
         };
-        let actor = self.registration.actor();
-        match self.runtime.input_retirement_status(actor, input) {
-            Ok(()) => {}
-            Err(
-                ActorTurnError::InputStillQueued
-                | ActorTurnError::EffectsRemain
-                | ActorTurnError::ReservationsRemain
-                | ActorTurnError::MetadataStillPending,
-            ) => return Ok(false),
-            Err(error) => return Err(error),
+        assert!(self.indexed.replace(input).is_none());
+        Ok(true)
+    }
+
+    pub(crate) fn needs_progress(&self, failed: bool, closing: bool) -> bool {
+        self.indexed.is_some() || failed || closing
+    }
+
+    pub(crate) fn progress(&mut self, failed: bool, closing: bool) -> Result<bool, ActorTurnError> {
+        if (closing || failed) && !self.closing {
+            self.close();
+            self.closing = true;
         }
-        self.runtime.retire_input(actor, input)?;
-        match self.input.after_retire() {
-            Ok(_) | Err(ActorTurnError::Closed | ActorTurnError::ActorFailed) => Ok(true),
+        if failed {
+            if let Some(payload) = self.input.take_failed_role_payload()? {
+                // This Source only ever fills a neutral CapacityReleased
+                // marker. The actual FIFO payload must still be disposed.
+                payload.dispose()?;
+                return Ok(true);
+            }
+            self.input.retire_failed_after_exit()?;
+            self.indexed = None;
+        } else if let Some(input) = self.indexed
+            && self.retire_indexed(input)?
+        {
+            self.indexed = None;
+            return Ok(self.closing);
+        }
+        if self.closing && self.input.in_flight()?.is_none() {
+            self.input.close_after_exit()?;
+            self.closed = true;
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn retire_indexed(&self, input: InputId) -> Result<bool, ActorTurnError> {
+        match self.input.retire_indexed_after_exit(input) {
+            Ok(retired) => Ok(retired),
+            Err(ActorTurnError::Closed | ActorTurnError::ActorFailed) => Ok(true),
             Err(error) => Err(error),
         }
     }
 
-    pub(crate) fn close(&self) {
+    #[cfg(test)]
+    fn retire_ready(&self) -> Result<bool, ActorTurnError> {
+        match self.input.in_flight()? {
+            Some(input) => self.retire_indexed(input),
+            None => Ok(false),
+        }
+    }
+
+    fn close(&self) {
         self.input.close();
         self.registrant.cancel();
     }
 
-    pub(crate) fn close_after_exit(&self) -> Result<(), ActorTurnError> {
+    #[cfg(test)]
+    fn close_after_exit(&self) -> Result<(), ActorTurnError> {
         self.close();
         self.input.close_after_exit()
     }
@@ -479,6 +546,7 @@ impl AttemptActorRegistration {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         startup_work: &WorkObligation,
+        capacity: AttemptCapacitySource,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
         transport: AttemptTransportBinding,
@@ -486,6 +554,7 @@ impl AttemptActorRegistration {
         PreparedAttemptHost,
         (
             AttemptRegistrationError,
+            AttemptCapacitySource,
             Box<dyn EffectSource>,
             AttemptTransportBinding,
         ),
@@ -493,7 +562,10 @@ impl AttemptActorRegistration {
         if self.startup_reserved
             || !self.ordered_bound
             || self.read_progress_roles.is_none()
-            || self.binding.get().is_none()
+            || !capacity.matches(&self.original)
+            || !self.binding.get().is_some_and(|binding| {
+                Arc::ptr_eq(&binding.capacity_registrant, &capacity.registrant)
+            })
             || !self.scope.same_scope(startup_work.scope())
             || !transport
                 .abort
@@ -509,6 +581,7 @@ impl AttemptActorRegistration {
                 AttemptRegistrationError::InvalidConfig(
                     "attempt startup requires its original bound Sources and Work",
                 ),
+                capacity,
                 source,
                 transport,
             ));
@@ -521,7 +594,12 @@ impl AttemptActorRegistration {
         ) {
             Ok(input) => input,
             Err(error) => {
-                return Err((AttemptRegistrationError::Runtime(error), source, transport));
+                return Err((
+                    AttemptRegistrationError::Runtime(error),
+                    capacity,
+                    source,
+                    transport,
+                ));
             }
         };
         let controls = match self.prepare_owner_controls(runtime, startup_work) {
@@ -530,7 +608,12 @@ impl AttemptActorRegistration {
                 input
                     .close_after_exit()
                     .expect("unpublished startup position");
-                return Err((AttemptRegistrationError::Runtime(error), source, transport));
+                return Err((
+                    AttemptRegistrationError::Runtime(error),
+                    capacity,
+                    source,
+                    transport,
+                ));
             }
         };
         self.startup_reserved = true;
@@ -582,6 +665,7 @@ impl AttemptActorRegistration {
                 config: self.config,
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
                 startup: Some(startup_source),
+                capacity: Some(capacity),
                 ordered_observations: Some(ordered_host),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),
@@ -959,8 +1043,6 @@ impl AttemptActorRegistration {
                 capacity_work,
             )
             .map_err(Runtime)?;
-        let input = CoalescingInput::new(standing, |_| FrontendInput::CapacityReleased);
-        registrant.update_waker(&input.waker());
         assert!(
             self.binding
                 .set(AttemptBinding {
@@ -973,12 +1055,11 @@ impl AttemptActorRegistration {
                 .is_ok(),
             "the registration binds its Sources once"
         );
-        Ok(AttemptCapacitySource {
-            registration: self.original.clone(),
-            runtime: runtime.clone(),
-            input,
+        Ok(AttemptCapacitySource::new(
+            self.original.clone(),
+            standing,
             registrant,
-        })
+        ))
     }
 }
 

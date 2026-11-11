@@ -31,6 +31,7 @@ use crate::task_execution::host::custody::{
     TransportRetirement, TransportRetirements, TransportSourceEvent,
 };
 use crate::task_execution::host::{
+    adapter::AttemptCapacitySource,
     failure_publication::FailureContext,
     observations::{
         ObservationError,
@@ -259,6 +260,7 @@ struct HostMachine {
     transport: Option<TransportRetirements>,
     ordered_observations: Option<OrderedObservationHost>,
     startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
+    capacity: Option<AttemptCapacitySource>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -334,6 +336,7 @@ pub(crate) struct HostBinding {
     pub(crate) transport: Option<TransportRetirements>,
     pub(crate) ordered_observations: Option<OrderedObservationHost>,
     pub(crate) startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
+    pub(crate) capacity: Option<AttemptCapacitySource>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -380,6 +383,10 @@ impl HostRegistry {
                 .ordered_observations
                 .as_ref()
                 .is_some_and(|observations| !observations.matches(&binding.registration))
+            || binding
+                .capacity
+                .as_ref()
+                .is_some_and(|capacity| !capacity.matches(&binding.registration))
         {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
@@ -495,6 +502,7 @@ impl HostRegistry {
                 transport: binding.transport,
                 ordered_observations: binding.ordered_observations,
                 startup: binding.startup,
+                capacity: binding.capacity,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -803,6 +811,21 @@ impl HostRegistry {
         {
             observations.retire_failed(&self.runtime, &mut budget)?;
         }
+        let mut capacity_more = false;
+        let closing_capacity = machine.source.result_admission_closed();
+        if let Some(capacity) = &mut machine.capacity
+            && capacity.needs_progress(failed, closing_capacity)
+        {
+            if budget == 0 {
+                capacity_more = true;
+            } else {
+                budget -= 1;
+                capacity_more = capacity.progress(failed, closing_capacity)?;
+                if capacity.is_closed() {
+                    machine.capacity = None;
+                }
+            }
+        }
         let mut retired = machine
             .source
             .progress_retirement(&self.runtime, turn, now, budget);
@@ -811,6 +834,11 @@ impl HostRegistry {
             "Source work uses the original finite host allowance"
         );
         budget -= retired.units;
+        // The original Source can finish admission in this progress call.
+        // Schedule the retained capacity role for its separate final visit.
+        capacity_more |= machine.capacity.is_some()
+            && !closing_capacity
+            && machine.source.result_admission_closed();
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
             retired.more |= transport.more;
@@ -820,8 +848,8 @@ impl HostRegistry {
             .ordered_observations
             .as_ref()
             .is_none_or(OrderedObservationHost::is_retired);
-        retired.retired &= machine.startup.is_none();
-        retired.more |= startup_more;
+        retired.retired &= machine.startup.is_none() && machine.capacity.is_none();
+        retired.more |= startup_more || capacity_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -888,6 +916,9 @@ impl HostRegistry {
             }
             if let Some(startup) = &mut machine.startup {
                 startup_more |= startup.indexed(&indexed.inputs);
+            }
+            if let Some(capacity) = &mut machine.capacity {
+                capacity_more |= capacity.index_committed(&indexed.inputs)?;
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -1105,6 +1136,7 @@ impl HostRegistry {
         }
         let more = retired.more
             || startup_more
+            || capacity_more
             || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
@@ -1442,6 +1474,7 @@ mod tests {
                 transport: None,
                 ordered_observations: None,
                 startup: Some(source),
+                capacity: None,
             })
             .unwrap_or_else(|_| panic!("install original host startup"));
         let drive_host = || {
@@ -1508,6 +1541,163 @@ mod tests {
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
     }
 
+    #[tokio::test]
+    async fn installed_host_indexes_each_capacity_input_and_cancels_the_original_wait() {
+        use novarocks_control_runtime::transaction::RuntimeError;
+        use novarocks_control_runtime_core::{
+            capacity::ReservationResources,
+            identity::DimensionId,
+            scope::{WorkAdmission, WorkKind},
+        };
+        use std::task::Waker;
+
+        struct CapacityProbe(Arc<Mutex<Vec<InputId>>>);
+        impl TestActor for CapacityProbe {
+            fn handle(
+                &mut self,
+                _: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                assert!(matches!(input, FrontendInput::CapacityReleased));
+                assert_eq!(envelope.class, InputClass::Ordinary);
+                self.0.lock().unwrap().push(envelope.input);
+            }
+        }
+
+        let quota = ResourceVector::new([(DimensionId::new(1).unwrap(), 1)]).unwrap();
+        let ledger = RuntimeLedger::new(quota.clone());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let runtime = ActorRuntime::new();
+        let clock = Arc::new(FrontendClock(Arc::new(TestClock(Instant::now()))));
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(clock)),
+        );
+        let actor = ActorId::new(1).unwrap();
+        let source = ActorId::new(2).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let config = ActorConfig {
+            mailbox: [1; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(CapacityProbe(observed.clone()))),
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original actor registration: {error:?}"));
+        let position = runtime
+            .reserve_input(actor, source, InputClass::Ordinary)
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        let registrant = Arc::new(scope.capacity_registrant(Waker::noop().clone()).unwrap());
+        let capacity =
+            AttemptCapacitySource::new(registration.clone(), position, registrant.clone());
+        let mut exit = host
+            .register(HostBinding {
+                scope: scope.clone(),
+                registration,
+                kind: FrontendActorKind::Test,
+                config,
+                policy: FrontendLanePolicy {
+                    lane: |_| None,
+                    per_step_inventory: 1,
+                },
+                source: Box::new(MetadataSource {
+                    scope: scope.clone(),
+                    closing: false,
+                    retire_batches: false,
+                }),
+                executor: Arc::new(NoExecutor),
+                transport: None,
+                ordered_observations: None,
+                startup: None,
+                capacity: Some(capacity),
+            })
+            .unwrap_or_else(|_| panic!("install original capacity Source"));
+        let occupy = || {
+            let blocker = scope
+                .reserve_next(
+                    generation,
+                    ReservationResources::for_work(quota.clone()),
+                    WorkKind::Business,
+                    WorkAdmission::External,
+                )
+                .unwrap();
+            assert!(matches!(
+                scope.reserve_next_or_wait(
+                    generation,
+                    ReservationResources::for_work(quota.clone()),
+                    WorkKind::Business,
+                    WorkAdmission::External,
+                    &registrant,
+                ),
+                Err(RuntimeError::CapacityDenied(_))
+            ));
+            blocker
+        };
+        let pending = || runtime.standing_input_inventory(actor, None, 1).unwrap()[0].in_flight;
+        let drive = || {
+            host.drive(
+                Tick(1),
+                runtime.claim_host_actor().expect("original host wake"),
+            );
+        };
+        drop(occupy());
+        let first = pending().unwrap();
+        drop(occupy());
+        assert_eq!(pending(), Some(first));
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+
+        drive();
+        assert_eq!(
+            pending(),
+            Some(first),
+            "indexing retains the original occurrence"
+        );
+        drive();
+        let second = pending().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(*observed.lock().unwrap(), [first]);
+
+        let blocker = occupy();
+        let waits = || {
+            ledger
+                .try_capacity_waiter_snapshot()
+                .unwrap()
+                .unwrap()
+                .logical_waiters
+        };
+        assert_eq!(waits(), 1);
+        exit.request_close().unwrap();
+        drive();
+        assert_eq!(waits(), 0);
+        assert_eq!(pending(), Some(second));
+        drop(blocker);
+
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        assert_eq!(*observed.lock().unwrap(), [first, second]);
+        for _ in 0..8 {
+            let Some(turn) = runtime.claim_host_actor() else {
+                break;
+            };
+            host.drive(Tick(1), turn);
+        }
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+        exit.wait().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn three_actual_pollers_exclude_each_other_on_one_actor_and_drain_real_metadata() {
         const INPUTS: usize = 64;
@@ -1565,6 +1755,7 @@ mod tests {
                 executor: Arc::new(NoExecutor),
                 transport: None,
                 startup: None,
+                capacity: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -1944,6 +2135,7 @@ mod tests {
                 executor: executor.clone(),
                 transport: None,
                 startup: None,
+                capacity: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2244,6 +2436,7 @@ mod tests {
                     executor: Arc::new(NoExecutor),
                     transport: None,
                     startup: None,
+                    capacity: None,
                     ordered_observations: None,
                 })
                 .is_ok()
