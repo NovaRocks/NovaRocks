@@ -497,16 +497,31 @@ fn enumerate_input(
 impl SplitAssignmentPump {
     const PUMP_NAME: &'static str = "split_assignment";
     fn arm_wake(&mut self, deadline: Instant) {
+        use std::{future::Future, task::Context};
+
         if self.timer_at.is_some_and(|armed| armed <= deadline) {
             return;
         }
         self.timer_at = Some(deadline);
         let deadline = tokio::time::Instant::from_std(deadline);
-        if let Some(timer) = &mut self.timer {
+        let timer = if let Some(timer) = &mut self.timer {
             timer.as_mut().reset(deadline);
+            timer
         } else {
             let _entered = self.data_runtime.handle().enter();
-            self.timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+            self.timer
+                .insert(Box::pin(tokio::time::sleep_until(deadline)))
+        };
+        // The executor can park as soon as this visit returns. Poll the
+        // original timer here so it can wake that executor on its own.
+        if timer
+            .as_mut()
+            .poll(&mut Context::from_waker(&self.source_waker))
+            .is_ready()
+        {
+            self.timer = None;
+            self.timer_at = None;
+            self.wake.wake();
         }
     }
     fn start_close(&mut self, error: Option<SplitAssignmentDriverError>) {

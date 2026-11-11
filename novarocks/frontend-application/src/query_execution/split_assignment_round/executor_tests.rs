@@ -54,7 +54,7 @@ use novarocks_types::{AttemptId, QueryId, UniqueId};
 use std::{
     num::NonZeroU64,
     sync::{atomic::AtomicUsize, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct NeverSend;
@@ -303,7 +303,7 @@ impl OriginalSplitPublisher for PaidPublisher {
     }
 }
 
-async fn run_case(refuse_failure: bool) {
+async fn run_case(refuse_failure: bool, check_idle_timer: bool) {
     let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
     let supervisor = data_runtime.connector_blocking_io().clone();
     let mut workers = OriginalExecutorsFixture::install(&supervisor);
@@ -365,6 +365,18 @@ async fn run_case(refuse_failure: bool) {
         data_runtime.clone(),
     )
     .unwrap();
+    if check_idle_timer {
+        let now = Instant::now();
+        {
+            let mut original = executor.pump.lock().unwrap();
+            let pump = original.as_mut().unwrap();
+            pump.arm_wake(now + Duration::from_secs(2));
+            pump.arm_wake(now + Duration::from_millis(20));
+        }
+        tokio::time::timeout(Duration::from_secs(1), executor.changed.notified())
+            .await
+            .expect("the original timer wakes the executor without another pump turn");
+    }
     let ledger = RuntimeLedger::new(ResourceVector::default());
     let scope: ScopeHandle = ledger
         .open_scope_next(None, Generation::new(1).unwrap())
@@ -579,11 +591,16 @@ async fn run_case(refuse_failure: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn original_failure_reaches_paid_source_while_close_profile_finish_and_exit_are_pending() {
-    run_case(false).await;
+    run_case(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_failure_publication_is_primary_and_never_retried_while_original_close_is_pending()
 {
-    run_case(true).await;
+    run_case(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_timer_wakes_the_original_executor_without_an_external_event() {
+    run_case(false, true).await;
 }
