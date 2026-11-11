@@ -1,0 +1,49 @@
+-- query 1
+-- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar	timestamp(9) with time zone	varchar	varchar
+catalog_name	schema_name	name	storage_catalog	storage_schema	storage_table	freshness	last_fresh_time	comment	definition
+
+-- query 3
+-- types	varchar	varchar	timestamp(9) with time zone	varchar	varchar
+name	freshness	last_fresh_time	comment	storage_table
+system_mv	STALE	NULL	""	system_mv
+
+-- query 5
+-- types	varchar	varchar	timestamp(9) with time zone
+name	freshness	last_fresh_time
+system_mv	FRESH	NULL
+
+-- query 7
+-- types	varchar	varchar	timestamp(9) with time zone
+name	freshness	last_fresh_time
+system_mv	STALE	NULL
+
+-- query 8
+-- types	boolean
+saved_definition
+true
+
+-- query 9
+-- types	varchar	varchar
+table_name	table_type
+system_base	BASE TABLE
+system_mv	BASE TABLE
+
+-- query 10
+-- types	varchar	varchar
+table_name	table_type
+materialized_views	BASE TABLE
+
+-- query 12
+-- types	bigint
+mv_count
+1
+
+-- query 13
+-- types	varchar	varchar
+name	freshness
+
+-- query 17
+-- types	integer	bigint
+k1	v2
+1	10
+2	20

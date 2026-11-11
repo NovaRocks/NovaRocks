@@ -677,6 +677,7 @@ pub(crate) enum Operator {
     LogicalIntersect(IntersectOp),
     LogicalExcept(ExceptOp),
     LogicalValues(ValuesOp),
+    LogicalSystemTable(crate::planner::system_relation::PlanSystemTableNode),
     LogicalGenerateSeries(GenerateSeriesOp),
     LogicalTableFunction(TableFunctionOp),
     LogicalRepeat(RepeatOp),
@@ -717,6 +718,7 @@ pub(crate) enum Operator {
     PhysicalIntersect(IntersectOp),
     PhysicalExcept(ExceptOp),
     PhysicalValues(ValuesOp),
+    PhysicalSystemTable(crate::planner::system_relation::PlanSystemTableNode),
     PhysicalGenerateSeries(GenerateSeriesOp),
     PhysicalTableFunction(TableFunctionOp),
     PhysicalAssertOneRow(AssertOneRowOp),
@@ -739,6 +741,7 @@ impl Operator {
                 | Operator::LogicalIntersect(_)
                 | Operator::LogicalExcept(_)
                 | Operator::LogicalValues(_)
+                | Operator::LogicalSystemTable(_)
                 | Operator::LogicalGenerateSeries(_)
                 | Operator::LogicalTableFunction(_)
                 | Operator::LogicalRepeat(_)

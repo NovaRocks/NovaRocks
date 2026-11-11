@@ -64,7 +64,12 @@ impl FrontendWorkloadCapacityProfile {
                 || source.transport.process_retained_bytes != budget.max_backend_queued_bytes()
                 || source.transport.target_items != budget.max_query_backend_queued_operations()
                 || source.transport.control_reserved_items != budget.max_batch_items()
-                || source.transport.maximum_batch_encoded_bytes != budget.max_batch_encoded_bytes()
+                || source.transport.batch_target_encoded_bytes
+                    != budget.batch_target_encoded_bytes()
+                || source.transport.ordinary_request_max_bytes
+                    != budget.message_limits().ordinary_request_max_bytes
+                || source.transport.control_request_max_bytes
+                    != budget.message_limits().control_request_max_bytes
             {
                 return Err(WorkError::InvalidConfig(
                     "frontend actual Native source configuration",

@@ -30,6 +30,16 @@ const UNKNOWN_TABLE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const UNKNOWN_CATALOG: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_catalog"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const UNKNOWN_SCHEMA: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_schema"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const UNKNOWN_COLUMN: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.unknown_column"),
     phase: ErrorPhase::Analyze,
@@ -120,6 +130,8 @@ const INTERNAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
 /// only permitted aggregate owner.
 pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_TABLE,
+    UNKNOWN_CATALOG,
+    UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
     TYPE_MISMATCH,
@@ -143,6 +155,8 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnalyzeErrorKind {
     UnknownTable,
+    UnknownCatalog,
+    UnknownSchema,
     UnknownColumn,
     UnknownFunction,
     TypeMismatch,
@@ -168,6 +182,8 @@ impl AnalyzeErrorKind {
     pub const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
             Self::UnknownTable => UNKNOWN_TABLE,
+            Self::UnknownCatalog => UNKNOWN_CATALOG,
+            Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
             Self::TypeMismatch => TYPE_MISMATCH,
@@ -446,6 +462,30 @@ impl AnalyzeError {
             message,
             span.into().filter(|span| !span.is_empty()),
         )
+    }
+
+    pub(crate) fn system_table_lookup(
+        failure: crate::system_table::SystemTableLookupError,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Self {
+        use crate::system_table::SystemTableLookupError;
+        let (kind, message) = match failure {
+            SystemTableLookupError::CatalogNotFound => (
+                AnalyzeErrorKind::UnknownCatalog,
+                format!("catalog '{catalog}' does not exist"),
+            ),
+            SystemTableLookupError::SchemaNotFound => (
+                AnalyzeErrorKind::UnknownSchema,
+                format!("schema '{catalog}.{schema}' does not exist"),
+            ),
+            SystemTableLookupError::TableNotFound => (
+                AnalyzeErrorKind::UnknownTable,
+                format!("table '{catalog}.{schema}.{table}' does not exist"),
+            ),
+        };
+        Self::at_optional(kind, message, None)
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
@@ -803,6 +843,8 @@ mod tests {
             codes,
             vec![
                 "sql.analyze.unknown_table",
+                "sql.analyze.unknown_catalog",
+                "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
                 "sql.analyze.type_mismatch",

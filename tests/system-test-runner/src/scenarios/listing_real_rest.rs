@@ -794,7 +794,7 @@ impl Scenario for RealRestListing {
                             scope.spawn(move || -> Result<()> {
                                 barrier.wait();
                                 let mut connection = SqlSession::new_with_request_timeout_cap(user, port, deadline, timeout)?;
-                                let count = listing_sql(&mut connection, "SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%'", deadline).and_then(|result| listing_count(&result).map(Some))?;
+                                let count = listing_sql(&mut connection, "SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%' AND TABLE_TYPE='BASE TABLE'", deadline).and_then(|result| listing_count(&result).map(Some))?;
                                 ensure!(count == Some(16384), "real REST information_schema omitted or duplicated tables");
                                 Ok(())
                             })
@@ -829,7 +829,7 @@ impl Scenario for RealRestListing {
                                 format!("USE cl_normal.cl_ns_{namespace:04}"),
                                 deadline,
                             )?;
-                            let mut views = listing_sql(&mut control, "SHOW VIEWS", deadline)
+                            let mut views = listing_sql(&mut control, format!("SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_{namespace:04}' AND table_type='VIEW' ORDER BY table_name"), deadline)
                                 .and_then(listing_views)?;
                             views.sort();
                             let expected = (0..512)
@@ -837,18 +837,18 @@ impl Scenario for RealRestListing {
                                 .collect::<Vec<_>>();
                             ensure!(
                                 views == expected,
-                                "real REST SHOW VIEWS omitted or duplicated names"
+                                "real REST view-row query omitted or duplicated names"
                             );
                             Ok(json!({"namespace":namespace,"rows":views.len()}))
                         },
                     )?;
                     ensure!(
                         result["provider"]["routes"]["list_views"].as_u64() == Some(2),
-                        "SHOW VIEWS did not read both actual REST pages"
+                        "view-row query did not read both actual REST pages"
                     );
                     ensure!(
                         actual_count(&result["provider"], "mutations")? == 0,
-                        "SHOW VIEWS mutated provider state"
+                        "view-row query mutated provider state"
                     );
                     Ok(result)
                 },

@@ -206,7 +206,6 @@ impl PreparedMutationFacts {
         // Same receiving owns the accepted session before query shaping can fail.
         let (query, kind, assertion) = match self.as_ref() {
             Self::Update(p) => build_update_mor_producer(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -214,7 +213,6 @@ impl PreparedMutationFacts {
                 &p.target_ref,
             )?,
             Self::Merge(p) => build_merge_mor_producer(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -269,7 +267,6 @@ impl PreparedMutationFacts {
         let query = match self.as_ref() {
             Self::Update(p) => {
                 let source_sql = mutation_source_to_sql(
-                    state,
                     &p.stmt.cow_text()?.source,
                     p.current_catalog.as_deref(),
                     &p.target,
@@ -282,7 +279,6 @@ impl PreparedMutationFacts {
                 )?
             }
             Self::Merge(p) => build_exact_cow_merge_selection_query(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -462,6 +458,7 @@ impl PreparedMorMutationWrite {
             &self.session,
             options,
             &control,
+            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
         )
     }
 }
@@ -486,13 +483,17 @@ fn install_fact_source(
         capacity.scope(),
         capacity.clone(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_system_table_source_policy(
+        crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
+    );
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider,
         state.completion_fact_owners()?,
-        scope.with_definition_owned(
-            state.constant_policy(),
+        scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(facts.execution()),
+            facts.execution().cancellation().clone(),
+            None,
         ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
@@ -578,6 +579,7 @@ impl PreparedCowSelection {
             &self.declarations,
             options.as_ref(),
             &control,
+            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
         )?;
         let signed = self.facts.signed()?;
         Ok(PreparedCowMatchAssembly {

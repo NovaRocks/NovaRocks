@@ -45,11 +45,8 @@ pub enum ListingMode {
     Normal,
     ExactEntries,
     PagedOverflow,
-    TerminalOverflow,
     NameOverflow,
-    TokenOverflow,
     TokenCycle,
-    PageOverflow,
     Delayed,
 }
 
@@ -461,9 +458,6 @@ fn listing_page(
     };
     if kind != "namespaces" {
         match mode {
-            ListingMode::TokenOverflow => {
-                return Ok((vec![format!("{prefix}000000")], Some("x".repeat(4097))));
-            }
             ListingMode::TokenCycle => {
                 return Ok((
                     vec![format!(
@@ -477,12 +471,6 @@ fn listing_page(
                         }
                     )],
                     Some(if token == "a" { "b" } else { "a" }.into()),
-                ));
-            }
-            ListingMode::PageOverflow => {
-                return Ok((
-                    Vec::new(),
-                    Some((token.parse::<usize>().unwrap_or(0) + 1).to_string()),
                 ));
             }
             ListingMode::NameOverflow => {
@@ -505,7 +493,7 @@ fn listing_page(
     } else {
         match mode {
             ListingMode::ExactEntries => 65536,
-            ListingMode::PagedOverflow | ListingMode::TerminalOverflow => 65537,
+            ListingMode::PagedOverflow => 65537,
             _ => MEMBERS,
         }
     };
@@ -515,11 +503,7 @@ fn listing_page(
         token.parse::<usize>()?
     };
     ensure!(start <= total, "page token outside fixture");
-    let end = if mode == ListingMode::TerminalOverflow && kind != "namespaces" {
-        total
-    } else {
-        (start + page_size).min(total)
-    };
+    let end = (start + page_size).min(total);
     let names = (start..end)
         .map(|n| {
             if kind == "namespaces" {
@@ -644,10 +628,23 @@ mod tests {
             listing_page(ListingMode::Normal, "tables", &token.unwrap(), PAGE_SIZE).unwrap();
         assert_eq!(last.len(), PAGE_SIZE);
         assert!(end.is_none());
-        let (terminal, end) =
-            listing_page(ListingMode::TerminalOverflow, "tables", "", PAGE_SIZE).unwrap();
-        assert_eq!(terminal.len(), 65537);
-        assert!(end.is_none());
+        let mut token = String::new();
+        let mut entries = 0;
+        let mut pages = 0;
+        loop {
+            let (names, next) =
+                listing_page(ListingMode::PagedOverflow, "views", &token, PAGE_SIZE).unwrap();
+            assert_eq!(names.first().unwrap(), &format!("cl_view_{entries:06}"));
+            entries += names.len();
+            pages += 1;
+            let Some(next) = next else {
+                break;
+            };
+            assert_ne!(token, next);
+            token = next;
+        }
+        assert_eq!(entries, 65537);
+        assert_eq!(pages, 257);
         let (names, token) =
             listing_page(ListingMode::NameOverflow, "tables", "", PAGE_SIZE).unwrap();
         assert!(names.iter().all(|name| name.len() == 65536));

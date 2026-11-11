@@ -25,6 +25,24 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::view_service::{DEFAULT_CATALOG, build_query_result};
 
+pub(crate) fn require_mutable_view_target(
+    parts: &[String],
+    context: ViewRequestContext<'_>,
+) -> Result<(), crate::api::CommandError> {
+    let target = novarocks_types::naming::resolve_catalog_table_name(
+        parts,
+        Some(context.current_catalog.unwrap_or(DEFAULT_CATALOG)),
+        context.current_database,
+    )?;
+    if novarocks_sql::system_table::is_system_table_name(&target.catalog, &target.namespace) {
+        return Err(crate::api::CommandError::new(
+            crate::api::CommandErrorKind::Unsupported,
+            "system catalogs and information_schema are read-only",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_external_target_parts(
     _engine: &dyn ViewEngine,
     parts: &[String],

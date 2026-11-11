@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const VARIABLE: &str = "__fe_catalog_symbols";
+const CATALOG_COLUMNS: &[&str] = &["catalog_name", "table_catalog", "storage_catalog"];
 const CAPACITY: usize = 36 * 36 * 36 * 36;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct CatalogSymbols(BTreeMap<String, String>);
@@ -676,18 +677,21 @@ fn catalog_column(expr: &Expr) -> Option<&Ident> {
         Expr::CompoundIdentifier(n) => n.parts.last()?,
         _ => return None,
     };
-    matches!(
-        ident.value.to_ascii_lowercase().as_str(),
-        "catalog_name" | "table_catalog"
-    )
-    .then_some(ident)
+    CATALOG_COLUMNS
+        .contains(&ident.value.to_ascii_lowercase().as_str())
+        .then_some(ident)
 }
 fn metadata_query(q: &Query) -> bool {
-    let SetExpr::Select(s) = q.body.as_ref() else {
+    let SetExpr::Select(select) = q.body.as_ref() else {
         return false;
     };
-    !s.from.is_empty() && s.from.iter().all(|t| t.joins.is_empty() && matches!(&t.relation,TableFactor::Table{name,..} if name.parts.iter().rev().nth(1).is_some_and(|n| n.value.eq_ignore_ascii_case("information_schema"))))
+    !select.from.is_empty() && select.from.iter().all(|table| {
+        table.joins.is_empty() && matches!(&table.relation, TableFactor::Table {name,..}
+            if name.parts.iter().rev().nth(1).is_some_and(|part|part.value.eq_ignore_ascii_case("information_schema"))
+                || (name.parts.len()==3 && name.parts[0].value.eq_ignore_ascii_case("system")))
+    })
 }
+
 #[derive(Clone, Debug)]
 enum OutputColumn {
     Named { header: String, catalog: bool },
@@ -752,9 +756,7 @@ fn control_catalog_column(sql: &str, plan: &[OutputColumn], column: &str) -> boo
     for entry in plan {
         match entry {
             OutputColumn::Named { header, catalog } if header == column => return *catalog,
-            OutputColumn::MetadataWildcard
-                if matches!(column, "catalog_name" | "table_catalog") =>
-            {
+            OutputColumn::MetadataWildcard if CATALOG_COLUMNS.contains(&column) => {
                 return true;
             }
             _ => {}
@@ -783,9 +785,10 @@ fn output_catalog_positions(plan: &[OutputColumn], header: &[String]) -> BTreeSe
             OutputColumn::MetadataWildcard => {
                 let width = header.len().saturating_sub(plan.len() - 1);
                 for position in index..index + width {
-                    if header.get(position).is_some_and(|name| {
-                        matches!(name.as_str(), "catalog_name" | "table_catalog")
-                    }) {
+                    if header
+                        .get(position)
+                        .is_some_and(|name| CATALOG_COLUMNS.contains(&name.as_str()))
+                    {
                         positions.insert(position);
                     }
                 }
@@ -1035,6 +1038,73 @@ mod tests {
         assert_eq!(
             meta.result_contains,
             vec![format!("{name}.ns.t"), "literal owned".into()]
+        );
+    }
+    #[test]
+    fn standard_mv_metadata_maps_catalog_literals_and_projected_cells_only() {
+        let symbols = symbols();
+        let mapped = symbols.lookup("owned").unwrap();
+        let sql = "SELECT catalog_name AS c, storage_catalog AS s, 'owned' AS business FROM system.metadata.materialized_views WHERE catalog_name='owned' AND storage_catalog='owned';";
+        let rewritten = symbols.rewrite_source(sql).unwrap();
+        assert!(rewritten.contains("FROM system.metadata.materialized_views"));
+        assert!(rewritten.contains(&format!("catalog_name='{mapped}'")));
+        assert!(rewritten.contains(&format!("storage_catalog='{mapped}'")));
+        assert!(rewritten.contains("'owned' AS business"));
+        let mut projected = crate::types::ResultSet {
+            golden: None,
+            header: vec!["c".into(), "s".into(), "business".into()],
+            rows: vec![vec!["owned".into(); 3]],
+        };
+        symbols.render_expected(&rewritten, &mut projected).unwrap();
+        assert_eq!(
+            projected.rows[0],
+            vec![mapped.to_owned(), mapped.to_owned(), "owned".into()]
+        );
+        let mut wildcard = crate::types::ResultSet {
+            golden: None,
+            header: vec![
+                "catalog_name".into(),
+                "storage_catalog".into(),
+                "comment".into(),
+            ],
+            rows: vec![vec!["owned".into(); 3]],
+        };
+        symbols
+            .render_expected(
+                "SELECT * FROM system.metadata.materialized_views",
+                &mut wildcard,
+            )
+            .unwrap();
+        assert_eq!(
+            wildcard.rows[0],
+            vec![mapped.to_owned(), mapped.to_owned(), "owned".into()]
+        );
+        let mut duplicate = crate::types::ResultSet {
+            golden: None,
+            header: vec!["x".into(), "x".into()],
+            rows: vec![vec!["owned".into(); 2]],
+        };
+        symbols
+            .render_expected(
+                "SELECT storage_catalog AS x, 'owned' AS x FROM system.metadata.materialized_views",
+                &mut duplicate,
+            )
+            .unwrap();
+        assert_eq!(duplicate.rows[0], vec![mapped.to_owned(), "owned".into()]);
+        let mut metadata = crate::types::QueryMeta {
+            result_rows_where: vec![
+                ("s".into(), "owned".into()),
+                ("business".into(), "owned".into()),
+            ],
+            ..Default::default()
+        };
+        symbols.rewrite_meta(&mut metadata, sql).unwrap();
+        assert_eq!(
+            metadata.result_rows_where,
+            vec![
+                ("s".into(), mapped.to_owned()),
+                ("business".into(), "owned".into())
+            ]
         );
     }
     #[test]
@@ -1342,7 +1412,33 @@ mod tests {
                 .contains(&format!("FROM {sealed_catalog}.information_schema.tables"))
         );
         assert_eq!(bound.steps[58].query_number, 59);
-        assert_eq!(bound.steps[58].sql, "SHOW VIEWS;");
+        assert!(
+            bound.steps[56]
+                .sql
+                .contains("FROM system.metadata.materialized_views")
+        );
+        assert!(
+            bound.steps[56]
+                .sql
+                .contains(&format!("catalog_name = '{sealed_catalog}'"))
+        );
+        assert!(
+            bound.steps[56]
+                .sql
+                .contains(&format!("schema_name = '{}'", namespaces[&base]))
+        );
+        assert!(
+            bound.steps[58]
+                .sql
+                .contains(&format!("FROM {sealed_catalog}.information_schema.tables"))
+        );
+        assert!(bound.steps[58].sql.contains("table_type = 'VIEW'"));
+        assert!(
+            bound.steps[58]
+                .sql
+                .contains(&format!("table_schema = '{}'", namespaces[&base]))
+        );
+        assert!(bound.steps[58].meta.expect_error.is_none());
         assert_eq!(bound.steps[59].query_number, 60);
         assert!(bound.steps[59].meta.cleanup);
         assert_eq!(bound.steps[60].query_number, 61);

@@ -1417,21 +1417,21 @@ pub struct ConnectorTableObjectRebindRequest {
     pub context: ConnectorRequestContext,
 }
 
-/// Enumerate one namespace's tables. The provider refuses a listing that
-/// would exceed `bound`; it never truncates one.
+/// Enumerate one namespace's tables. The provider returns the complete listing
+/// and uses `page_size` only as a pagination request.
 #[derive(Clone)]
 pub struct ConnectorListTablesRequest {
     pub namespace: ConnectorNamespaceIdentity,
-    pub bound: super::ConnectorListingBound,
+    pub page_size: super::ConnectorListingPageSize,
     pub context: ConnectorRequestContext,
 }
 
-/// Enumerate one catalog's namespaces. The provider refuses a listing that
-/// would exceed `bound`; it never truncates one.
+/// Enumerate one catalog's namespaces. The provider returns the complete listing
+/// and uses `page_size` only as a pagination request.
 #[derive(Clone)]
 pub struct ConnectorListNamespacesRequest {
     pub instance_id: ConnectorInstanceId,
-    pub bound: super::ConnectorListingBound,
+    pub page_size: super::ConnectorListingPageSize,
     pub context: ConnectorRequestContext,
 }
 

@@ -67,7 +67,8 @@ pub struct FragmentPackageInput {
 /// Explicit host-authored admission for this exact coexisting source.
 /// PlanLimits are structural counts; the independent property ceilings admit
 /// its occurrence projection. This is not a complete validator scratch model
-/// or a MEM grant. Source bytes must cover all original retained backing.
+/// or a MEM grant. Source bytes cover structural backing. System-relation batch data is
+/// separately reported by SystemRelationResourceFacts to its original owner.
 #[derive(Clone, Copy, Debug)]
 pub struct FragmentPackageAdmission {
     pub plan_limits: crate::PlanLimits,

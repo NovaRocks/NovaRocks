@@ -306,6 +306,7 @@ pub(crate) struct FrontendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: FrontendNativeTransport,
+    task_message_limits: novarocks_task_codec::TransportMessageLimits,
     transport_admission: NativeTransportAdmission,
     channels: Arc<Mutex<ChannelPools>>,
     dial_gates: [Arc<tokio::sync::Mutex<()>>; 4],
@@ -324,6 +325,7 @@ impl Clone for FrontendDataRuntime {
             handle: self.handle.clone(),
             native_trust: Arc::clone(&self.native_trust),
             native_transport: self.native_transport.clone(),
+            task_message_limits: self.task_message_limits,
             transport_admission: self.transport_admission.clone(),
             channels: Arc::clone(&self.channels),
             dial_gates: self.dial_gates.clone(),
@@ -353,6 +355,10 @@ impl FrontendDataRuntime {
             #[cfg(test)]
             physical: self.transport_admission.dimensions(),
         })
+    }
+
+    pub(crate) const fn task_message_limits(&self) -> novarocks_task_codec::TransportMessageLimits {
+        self.task_message_limits
     }
 
     pub(crate) fn handle(&self) -> &Handle {
@@ -407,6 +413,7 @@ impl FrontendDataRuntime {
             handle,
             native_trust,
             native_transport,
+            task_message_limits: task_transport_budget.message_limits(),
             transport_admission,
             channels,
             dial_gates,
@@ -421,6 +428,11 @@ impl FrontendDataRuntime {
 
     #[cfg(test)]
     pub(crate) fn new(handle: Handle) -> Self {
+        Self::new_with_task_budget(handle, TransportBudget::DEFAULT)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_task_budget(handle: Handle, budget: TransportBudget) -> Self {
         use novarocks_native_trust::{
             DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
         };
@@ -437,7 +449,7 @@ impl FrontendDataRuntime {
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
-            TransportBudget::DEFAULT,
+            budget,
             novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
         )
         .expect("the default task transport budget is valid");

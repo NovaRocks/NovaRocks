@@ -163,7 +163,7 @@ impl MaintenanceCommandExecutor {
         );
         let target = engine
             .resolve_target(&name_parts, context)
-            .map_err(novarocks_table_maintenance::runtime::TerminalError::pre_dispatch_failed)?;
+            .map_err(novarocks_table_maintenance::runtime::TerminalError::from)?;
         super::cleanup_action::prepare(
             &self.kernel,
             target,

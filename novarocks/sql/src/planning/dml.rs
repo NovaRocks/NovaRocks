@@ -675,6 +675,7 @@ pub struct DmlWriteCompletion {
     functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
+    system_needs: Box<[crate::compiler::SystemTableSnapshotNeed]>,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
@@ -723,10 +724,11 @@ pub fn begin_final_connector_write_plan(
         &mut physical,
         settings,
     );
-    let (physical, needs) = crate::compiler::collect_provider_needs(
+    let (physical, needs, system_needs) = crate::compiler::collect_provider_inputs(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        true,
         &control,
     )?;
     Ok((
@@ -736,6 +738,7 @@ pub fn begin_final_connector_write_plan(
             functions: compiled.function_catalog,
             query_statistics: compiled.statistics.snapshot,
             physical,
+            system_needs,
             sink,
             write_target_ordinal,
             auxiliary,
@@ -745,6 +748,24 @@ pub fn begin_final_connector_write_plan(
 }
 
 impl DmlWriteCompletion {
+    pub fn system_table_needs(&self) -> &[crate::compiler::SystemTableSnapshotNeed] {
+        &self.system_needs
+    }
+    /// Install this optimized producer's own system snapshots without repeating
+    /// optimization, runtime-filter placement or provider occurrence allocation.
+    pub fn install_system_tables(
+        &mut self,
+        facts: Box<[crate::compiler::SystemTableSnapshotFact]>,
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<(), crate::compiler::SqlCompileError> {
+        crate::compiler::install_system_table_snapshots(
+            &mut self.physical,
+            &self.system_needs,
+            facts,
+            control,
+        )
+    }
+
     /// Lower this write against the reads its scans were frozen with.
     pub fn finish(
         self,
@@ -1093,10 +1114,11 @@ pub fn begin_final_ctas_connector_write_plan(
         &mut physical,
         settings,
     );
-    let (physical, needs) = crate::compiler::collect_provider_needs(
+    let (physical, needs, system_needs) = crate::compiler::collect_provider_inputs(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
+        true,
         control,
     )?;
     Ok((
@@ -1106,6 +1128,7 @@ pub fn begin_final_ctas_connector_write_plan(
             functions: source.function_catalog.clone(),
             query_statistics: source.query_statistics.clone(),
             physical,
+            system_needs,
             sink,
             write_target_ordinal,
             auxiliary,

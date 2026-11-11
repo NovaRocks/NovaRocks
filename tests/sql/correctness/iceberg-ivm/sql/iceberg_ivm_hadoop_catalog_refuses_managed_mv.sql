@@ -76,9 +76,10 @@ INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10);
 SELECT region, amount FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders ORDER BY region;
 
 -- query 5
-SELECT table_name
-FROM information_schema.materialized_views
-WHERE table_schema = 'ns_${uuid0}' AND table_name = 'agg_mv_${uuid0}';
+SELECT name
+FROM system.metadata.materialized_views
+WHERE catalog_name = 'ice_ivm_hadoop_${uuid0}'
+  AND schema_name = 'ns_${uuid0}' AND name = 'agg_mv_${uuid0}';
 
 -- query 6
 -- @cleanup=true

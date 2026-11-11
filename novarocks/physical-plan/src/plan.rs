@@ -891,6 +891,10 @@ pub enum NodeKind {
     Values {
         rows: Box<[Box<[ExprId]>]>,
     },
+    SystemRelation {
+        output_fields: std::sync::Arc<[arrow_schema::FieldRef]>,
+        data: crate::SystemRelationData,
+    },
     Repeat {
         /// Every key any grouping set may group by, in the order their
         /// presence is written into a grouping id. A key that no set keeps and
@@ -1077,7 +1081,8 @@ impl NodeKind {
                     }
                 }
             }
-            Self::Limit { .. }
+            Self::SystemRelation { .. }
+            | Self::Limit { .. }
             | Self::SetOp { .. }
             | Self::Repeat { .. }
             | Self::AssertOneRow(_)

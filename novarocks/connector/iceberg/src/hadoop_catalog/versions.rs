@@ -22,7 +22,7 @@ use super::HadoopFileSystemCatalog;
 use crate::access_binding::IcebergReadBinding;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::{Error, ErrorKind, Result, TableIdent};
-use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
+use novarocks_spi::connector::{ConnectorError, ConnectorListingPageSize};
 use std::future::IntoFuture;
 use std::sync::Arc;
 
@@ -152,32 +152,18 @@ pub(crate) async fn inventory(
 ) -> Result<VersionInventory> {
     let metadata = format!("{}/metadata", location.trim_end_matches('/'));
     let mut files = Vec::new();
-    let mut names_bytes = 0usize;
-    crate::fs_io::visit_direct_files(&metadata, binding, ConnectorListingBound::V1, |name| {
-        if let Some(version) = version_number(name) {
-            let path_len = metadata
-                .len()
-                .checked_add(name.len())
-                .and_then(|size| size.checked_add(1))
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            crate::fs_io::check_listing_path_size(path_len)?;
-            names_bytes = names_bytes
-                .checked_add(path_len)
-                .ok_or_else(crate::fs_io::listing_refusal)?;
-            crate::fs_io::grow_listing_vec(
-                &mut files,
-                names_bytes,
-                crate::fs_io::HADOOP_LISTING_WORKSPACE_BYTES,
-                ConnectorListingBound::V1.entries,
-            )?;
-            let mut path = String::with_capacity(path_len);
-            path.push_str(&metadata);
-            path.push('/');
-            path.push_str(name);
-            files.push(VersionFile { version, path });
-        }
-        Ok(true)
-    })
+    crate::fs_io::visit_direct_files(
+        &metadata,
+        binding,
+        ConnectorListingPageSize::DEFAULT,
+        |name| {
+            if let Some(version) = version_number(name) {
+                let path = format!("{metadata}/{name}");
+                files.push(VersionFile { version, path });
+            }
+            Ok(true)
+        },
+    )
     .await?;
     files.sort_unstable_by(|left, right| {
         left.version
@@ -190,11 +176,13 @@ pub(crate) async fn inventory(
 
 pub(crate) async fn physical_exists(location: &str, binding: IcebergReadBinding) -> Result<bool> {
     let metadata = format!("{}/metadata", location.trim_end_matches('/'));
-    let complete =
-        crate::fs_io::visit_direct_files(&metadata, binding, ConnectorListingBound::V1, |name| {
-            Ok(version_number(name).is_none())
-        })
-        .await?;
+    let complete = crate::fs_io::visit_direct_files(
+        &metadata,
+        binding,
+        ConnectorListingPageSize::DEFAULT,
+        |name| Ok(version_number(name).is_none()),
+    )
+    .await?;
     Ok(!complete)
 }
 
@@ -633,55 +621,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_inventory_counts_every_raw_entry_at_frozen_bound() {
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = test_catalog(warehouse.path().to_str().expect("path"));
-        let ident = TableIdent::from_strs(["ns", "table"]).expect("ident");
+
+    async fn complete_inventory_exceeds_former_entry_and_workspace_quotas() {
+        let warehouse = tempfile::tempdir().unwrap();
+        let mut deep = warehouse.path().to_path_buf();
+        for _ in 0..8 {
+            deep.push("w".repeat(64));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let catalog = test_catalog(deep.to_str().unwrap());
+        let ident = TableIdent::from_strs(["ns", "table"]).unwrap();
         let root = catalog.table_location(&ident);
         let directory = std::path::PathBuf::from(&root).join("metadata");
-        std::fs::create_dir_all(&directory).expect("directory");
-        // Hard links keep this exact raw-entry boundary test cheap; unrelated
-        // names still count even though the retained version inventory is tiny.
+        std::fs::create_dir_all(&directory).unwrap();
         for number in 0..4 {
             std::fs::write(
                 warehouse.path().join(format!("payload-{number}")),
-                b"unrelated",
+                b"metadata bytes unused by inventory",
             )
-            .expect("payload");
+            .unwrap();
         }
-        for number in 0..65_535 {
+        for number in 1..=65_537 {
             std::fs::hard_link(
-                warehouse
-                    .path()
-                    .join(format!("payload-{}", number / 16_384)),
-                directory.join(format!("ignored-{number}")),
+                warehouse.path().join(format!("payload-{}", number % 4)),
+                directory.join(format!("v{number}.metadata.json")),
             )
-            .expect("raw entry");
+            .unwrap();
         }
-        std::fs::hard_link(
-            warehouse.path().join("payload-0"),
-            directory.join("v1.metadata.json"),
-        )
-        .expect("version");
-        let binding = catalog.listing_binding().expect("binding");
-        assert_eq!(
-            inventory(&root, binding.clone())
-                .await
-                .expect("65,536 raw entries")
-                .files
-                .len(),
-            1
-        );
-        std::fs::create_dir(directory.join("unrelated-directory")).expect("65,537th entry");
-        let error = inventory(&root, binding)
+        std::fs::write(directory.join("ignored"), b"unrelated").unwrap();
+        let result = inventory(&root, catalog.listing_binding().unwrap())
             .await
-            .expect_err("whole inventory refused");
-        let source = std::error::Error::source(&error)
-            .and_then(|error| error.downcast_ref::<ConnectorError>())
-            .expect("typed resource failure");
-        assert_eq!(
-            source.kind(),
-            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+            .unwrap();
+        assert_eq!(result.files.len(), 65_537);
+        assert!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.len())
+                .sum::<usize>()
+                > 32 * 1024 * 1024
         );
+        assert_eq!(result.files.first().unwrap().version, 1);
+        assert_eq!(result.files.last().unwrap().version, 65_537);
     }
 }

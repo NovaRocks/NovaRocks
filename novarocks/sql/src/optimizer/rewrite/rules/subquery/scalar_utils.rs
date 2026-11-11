@@ -35,6 +35,7 @@ pub(super) fn opt_output_columns(
     arena: &ScalarArena,
 ) -> Result<Vec<OutputColumn>, String> {
     match &expr.op {
+        Operator::LogicalSystemTable(table) => Ok(table.columns.clone()),
         Operator::LogicalScan(scan) => Ok(scan.columns.clone()),
         Operator::LogicalProject(project) => Ok(project
             .items

@@ -24,7 +24,7 @@
 -- 2. Validate a recreated base table starts the MV fresh — no stale rows from
 --    the prior table version survive.
 -- 3. Validate EXPLAIN references the MV when enable_materialized_view_rewrite=true.
--- 4. Validate information_schema.materialized_views is visible for Iceberg MVs.
+-- 4. Validate system.metadata.materialized_views is visible for Iceberg MVs.
 -- 5. Validate SHOW MATERIALIZED VIEWS lists the MV.
 -- Source: adapted from mv-on-iceberg/sql/test_mv_with_iceberg_recreate.sql.
 -- Note:
@@ -101,10 +101,11 @@ SELECT dt, sum(col_int) FROM mv_ice_tbl_${uuid0} GROUP BY dt ORDER BY dt;
 SHOW MATERIALIZED VIEWS;
 
 -- query 7
-SELECT table_name, is_active, inactive_reason
-FROM information_schema.materialized_views
-WHERE table_schema = 'mv_ice_db_${uuid0}' AND table_name = 'test_mv1'
-ORDER BY table_name;
+SELECT name
+FROM system.metadata.materialized_views
+WHERE catalog_name = 'mv_iceberg_${uuid0}'
+  AND schema_name = 'mv_ice_db_${uuid0}' AND name = 'test_mv1'
+ORDER BY name;
 
 -- query 8
 -- Drop MV before base table (NovaRocks enforces: base with downstream MV cannot be dropped).

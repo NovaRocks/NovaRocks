@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
+use novarocks_spi::connector::{ConnectorError, ConnectorListingPageSize};
 
 use super::admission::{
     CatalogAdmission, CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogInitiation,
@@ -426,7 +426,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
 
     async fn list_namespaces(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_namespaces(bound).await
     }
@@ -437,7 +437,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let context = binding.request_context().cloned().ok_or_else(|| {
             ConnectorError::new(
@@ -486,7 +486,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_tables(&namespace, bound).await
     }
@@ -497,7 +497,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         &self,
         namespace: CatalogNamespaceName,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let context = binding.request_context().cloned().ok_or_else(|| {
             ConnectorError::new(
@@ -615,7 +615,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn list_views(
         &self,
         _namespace: CatalogNamespaceName,
-        _bound: ConnectorListingBound,
+        _bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         Err(super::views_unsupported("list_views"))
     }

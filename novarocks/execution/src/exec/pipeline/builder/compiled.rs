@@ -689,6 +689,21 @@ fn build_node(
     }
     let node_id = display_id(id)?;
     let mut build = match node.kind() {
+        ProgramNodeKind::SystemRelation { .. } => {
+            let source: Box<dyn OperatorFactory> = Box::new(
+                system_relation_source::CompiledSystemRelationSourceFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?,
+            );
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(1),
+            })
+        }
         ProgramNodeKind::Values { .. } => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(values_source::CompiledValuesSourceFactory::try_new(
@@ -1247,6 +1262,7 @@ fn build_node(
                 }
                 let label = match node.kind() {
                     ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
+                    ProgramNodeKind::SystemRelation { .. } => "SystemRelationSource".to_string(),
                     _ => factory.name().to_string(),
                 };
                 Box::new(ProfiledCompiledFactory {
@@ -1422,6 +1438,8 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
     }
 }
 
+#[path = "compiled_system_relation.rs"]
+mod system_relation_source;
 #[path = "compiled_values.rs"]
 mod values_source;
 
@@ -1522,3 +1540,7 @@ mod compiled_window_metadata_tests;
 #[cfg(test)]
 #[path = "compiled_migration_shape_tests.rs"]
 mod migration_shape_tests;
+
+#[cfg(test)]
+#[path = "compiled_system_relation_tests.rs"]
+mod system_relation_tests;

@@ -49,6 +49,87 @@ use novarocks_types::identity::BackendProcessId;
 /// rather than only in items.
 pub const OPERATION_FIXED_BYTES: usize = 256;
 
+/// Proven queued-carrier bounds from the original intent author. Each
+/// request has at most the codec's existing operation/domain/edge counts;
+/// payload bytes occur inside its protobuf bytes, while native arrays and
+/// per-operation queue metadata may be larger than their wire representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeRequestWindows {
+    pub ordinary_queued_max_bytes: usize,
+    pub control_queued_max_bytes: usize,
+    pub ordinary_request_max_bytes: usize,
+    pub control_request_max_bytes: usize,
+    pub control_reserved_bytes: usize,
+    pub process_retained_bytes: usize,
+    pub target_retained_bytes: usize,
+}
+
+impl NativeRequestWindows {
+    pub fn for_transport(transport: novarocks_task_codec::TransportBudget) -> Result<Self, String> {
+        use novarocks_task_codec::domain::{MAX_DOMAIN_UPDATES, MAX_OPEN_EDGES};
+        let limits = transport.message_limits();
+        let overflow = || "Native request window arithmetic overflow".to_owned();
+        let close = size_of::<novarocks_execution::task_execution::TaskIdentity>()
+            .checked_add(size_of::<u32>())
+            .ok_or_else(overflow)?;
+        let open = MAX_OPEN_EDGES
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(overflow)?;
+        let quote = |message: usize, domain: usize| -> Result<usize, String> {
+            let per_operation = MAX_DOMAIN_UPDATES
+                .checked_mul(domain)
+                .and_then(|v| v.checked_add(OPERATION_FIXED_BYTES))
+                .ok_or_else(overflow)?;
+            message
+                .checked_add(
+                    transport
+                        .max_batch_items()
+                        .checked_mul(per_operation)
+                        .ok_or_else(overflow)?,
+                )
+                .ok_or_else(overflow)
+        };
+        let ordinary_queued_max_bytes = quote(limits.ordinary_request_max_bytes, open.max(close))?;
+        // The closed control grammar carries destination closes, never edge opens.
+        let control_queued_max_bytes = quote(limits.control_request_max_bytes, close)?;
+        let control_reserved_bytes = control_queued_max_bytes
+            .checked_add(limits.control_request_max_bytes)
+            .ok_or_else(overflow)?;
+        let ordinary = ordinary_queued_max_bytes
+            .checked_add(limits.ordinary_request_max_bytes)
+            .ok_or_else(overflow)?;
+        let process = ordinary
+            .checked_add(control_reserved_bytes)
+            .ok_or_else(overflow)?;
+        if transport.max_backend_queued_bytes() < process
+            || transport.max_query_backend_queued_bytes() < ordinary
+        {
+            return Err("Native request windows must fit queued and encoded forms of one maximum ordinary request and one reserved control request".to_owned());
+        }
+        Ok(Self {
+            ordinary_queued_max_bytes,
+            control_queued_max_bytes,
+            ordinary_request_max_bytes: limits.ordinary_request_max_bytes,
+            control_request_max_bytes: limits.control_request_max_bytes,
+            control_reserved_bytes,
+            process_retained_bytes: transport.max_backend_queued_bytes(),
+            target_retained_bytes: transport.max_query_backend_queued_bytes(),
+        })
+    }
+
+    /// A permanently impossible operation fails; an occupied window waits.
+    pub fn empty_queue_capacity(self, control: bool) -> usize {
+        if control {
+            self.control_reserved_bytes - self.control_request_max_bytes
+        } else {
+            (self.process_retained_bytes
+                - self.control_reserved_bytes
+                - self.ordinary_request_max_bytes)
+                .min(self.target_retained_bytes - self.ordinary_request_max_bytes)
+        }
+    }
+}
+
 /// One immutable request an owner has decided to make.
 #[derive(Clone, Debug)]
 pub enum OperationIntent {
@@ -190,6 +271,39 @@ impl OperationIntent {
         }
     }
 
+    /// Exact protobuf length of this operation as a one-item method request.
+    /// The codec's allocation-free author is also used for the final batch.
+    pub(crate) fn encoded_protobuf_bytes(
+        &self,
+    ) -> novarocks_task_codec::operation::wire_size::SizeResult {
+        use novarocks_task_codec::operation::wire_size as size;
+        let control = self.requires_control_progress();
+        let item = match self {
+            OperationIntent::AcquireParticipationAdmissionTicket(value) => size::acquire(*value),
+            OperationIntent::EstablishParticipation(value) => size::establish(value),
+            OperationIntent::CreateTask(value) => size::create(
+                value.envelope(),
+                value.parts().fragment().content().len(),
+                value.parts().metadata().len(),
+            ),
+            OperationIntent::UpdateTask(value) => size::update(value, control),
+            OperationIntent::UpdateParticipation(value) => match value.as_ref() {
+                UpdateParticipation::Establish(value) => size::establish(value),
+                UpdateParticipation::AdvanceDomain(value) => size::advance(value),
+                UpdateParticipation::RenewLease(value) => size::renew(value, control),
+            },
+            OperationIntent::CancelTask(value) => size::cancel(*value, control),
+            OperationIntent::QuiesceParticipation(value) => size::quiesce(*value, control),
+            OperationIntent::AbortParticipation(value) => size::abort(*value, control),
+            OperationIntent::ReleaseParticipation(value) => size::release(*value, control),
+            #[cfg(test)]
+            OperationIntent::FetchTaskDynamicFilters(_) => {
+                return Err(size::WireSizeError::NotCodecProduced);
+            }
+        }?;
+        size::batch_item(item)
+    }
+
     /// What this request occupies in a bounded frontend queue.
     pub fn queued_bytes(&self) -> usize {
         let payload = match self {
@@ -235,6 +349,7 @@ impl OperationIntent {
             lane: self.lane(),
             control_progress: self.requires_control_progress(),
             queued_bytes: self.queued_bytes(),
+            encoded_bytes: self.encoded_protobuf_bytes(),
             native_input: crate::native::task_transport::queued_intent_quote(self).ok(),
         }
     }
@@ -275,6 +390,7 @@ pub struct TaskOperationQueueRequest {
     lane: DispatchLane,
     control_progress: bool,
     queued_bytes: usize,
+    encoded_bytes: novarocks_task_codec::operation::wire_size::SizeResult,
     pub(crate) native_input:
         Option<novarocks_workload_control::joint_admission::NativeQueuedInputQuote>,
 }
@@ -282,24 +398,35 @@ pub struct TaskOperationQueueRequest {
 impl TaskOperationQueueRequest {
     /// The reservation for one task create, priced before the create is
     /// frozen. `queued_bytes` is the create's exact queued size.
-    pub(crate) const fn create_task(backend: BackendProcessId, queued_bytes: usize) -> Self {
+    pub(crate) const fn create_task(
+        backend: BackendProcessId,
+        queued_bytes: usize,
+        encoded_bytes: novarocks_task_codec::operation::wire_size::SizeResult,
+    ) -> Self {
         Self {
             backend,
             lane: DispatchLane::Create,
             control_progress: false,
             queued_bytes,
+            encoded_bytes,
             native_input: None,
         }
     }
 
     /// The reservation for one task-domain update before it enters a
     /// `RemoteTask`'s pending queue.
-    pub(crate) fn task_update(backend: BackendProcessId, update: &TaskDomainUpdate) -> Self {
+    pub(crate) fn task_update(
+        identity: novarocks_execution::task_execution::TaskIdentity,
+        update: &TaskDomainUpdate,
+    ) -> Self {
         Self {
-            backend,
+            backend: identity.backend_process_id(),
             lane: DispatchLane::Update,
             control_progress: task_domain_requires_control(update),
             queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
+            encoded_bytes: novarocks_task_codec::operation::wire_size::pending_update(
+                identity, update,
+            ),
             native_input: crate::native::task_transport::queued_update_quote(update).ok(),
         }
     }
@@ -323,6 +450,12 @@ impl TaskOperationQueueRequest {
 
     pub const fn requires_control_progress(self) -> bool {
         self.control_progress
+    }
+
+    pub(crate) const fn encoded_bytes(
+        self,
+    ) -> novarocks_task_codec::operation::wire_size::SizeResult {
+        self.encoded_bytes
     }
 
     pub const fn queued_bytes(self) -> usize {

@@ -34,7 +34,6 @@ use novarocks_sql::planning::catalog::{
     resolve_time_travel_snapshot_binding,
 };
 use novarocks_sql::semantic::ObjectName;
-use novarocks_types::schema::ColumnDef;
 
 /// Keeps SQL analysis facts distinct from catalog and connector failures until
 /// the frontend still has the original statement source for user rendering.
@@ -42,8 +41,21 @@ use novarocks_types::schema::ColumnDef;
 pub(crate) enum TimeTravelRewriteError {
     Engine(String),
     Analyze(AnalyzeError),
+    Source(novarocks_failure_contract::SharedFailureCause),
 }
 
+impl From<crate::catalog_application::resolver::TargetResolutionError> for TimeTravelRewriteError {
+    fn from(error: crate::catalog_application::resolver::TargetResolutionError) -> Self {
+        match error {
+            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
+                Self::Engine(message)
+            }
+            crate::catalog_application::resolver::TargetResolutionError::Unsupported(error) => {
+                Self::Source(novarocks_failure_contract::SharedFailureCause::new(error))
+            }
+        }
+    }
+}
 impl From<String> for TimeTravelRewriteError {
     fn from(error: String) -> Self {
         Self::Engine(error)
@@ -570,71 +582,6 @@ fn rewrite_time_travel_in_table_with_joins_async<'a>(
     })
 }
 
-/// Resolve statement-level connector schema facts without registering a
-/// concrete scan in the shared local catalog.  `ANALYZE` only needs columns;
-/// it must not leave a provider table or file carrier visible to a later SQL
-/// request.
-#[allow(
-    dead_code,
-    reason = "Retained for statement-level connector schema resolution without catalog registration."
-)]
-pub(crate) fn external_schema_columns_for_statement(
-    resolver: &impl TimeTravelResolver,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    name: &ObjectName,
-) -> Result<Option<Vec<ColumnDef>>, String> {
-    let target = resolve_table_target(resolver, name, current_catalog, current_database)?;
-    if target.provider_id.as_str() != "iceberg" {
-        // Non-Iceberg sources are already represented in the local catalog.
-        return Ok(None);
-    }
-    // Time-travel identities live only in a query binding store and are never
-    // valid statement-level catalog objects.
-    if is_synthetic_time_travel_table(&target.table) {
-        return Err("time-travel identities are not valid ANALYZE targets".to_string());
-    }
-
-    let materialization =
-        crate::catalog_application::query_catalog::load_connector_table_materialization_with_lease(
-            resolver.connector_control(),
-            crate::connector::connector_request_context(
-                None,
-                novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            )?,
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )
-        .map_err(|err| {
-            format!(
-                "load iceberg table {}.{}.{} failed: {err}",
-                target.catalog, target.namespace, target.table
-            )
-        })?;
-    Ok(Some(materialization.columns))
-}
-
-/// Returns true if `table_name` was produced by a time-travel rewriter.
-/// SQLX-1 query-local overlays use `__sqlx1_tt_<table>_<snapshot_id>`;
-/// recognize the legacy form as well so old statement materialization cannot
-/// mistake either identity for a durable catalog object.
-fn is_synthetic_time_travel_table(table_name: &str) -> bool {
-    if let Some(encoded) = table_name.strip_prefix("__sqlx1_tt_")
-        && let Some((base, snapshot)) = encoded.rsplit_once('_')
-    {
-        return !base.is_empty() && snapshot.parse::<i64>().is_ok();
-    }
-    if let Some(at_pos) = table_name.rfind("__at_") {
-        let suffix = &table_name[at_pos + "__at_".len()..];
-        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '-')
-    } else {
-        false
-    }
-}
-
-// Remove a durable local catalog relation after DDL replaces or drops it.
-
 #[cfg(test)]
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {
     data_files
@@ -695,7 +642,7 @@ fn stamp_delta_table_def_change_ops(
     }
 
     let field = novarocks_execution::exec::change_op::change_op_field();
-    table_facts.push_iceberg_row_lineage_metadata_column(ColumnDef {
+    table_facts.push_iceberg_row_lineage_metadata_column(novarocks_types::schema::ColumnDef {
         name: field.name().clone(),
         data_type: field.data_type().clone(),
         nullable: field.is_nullable(),

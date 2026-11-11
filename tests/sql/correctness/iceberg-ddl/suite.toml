@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/connector/iceberg/**", "novarocks/sql/src/planning/**", "tests/sql/fixtures/iceberg-read-policy/**"]
+paths = ["novarocks/connector/iceberg/**", "novarocks/sql/src/planning/**", "tests/sql/fixtures/iceberg-read-policy/**", "novarocks/sql/src/system_table.rs", "novarocks/query-application/src/system_tables/**", "novarocks/frontend-application/src/system_tables/**"]
 
 [reuse]
 scope = "suite"

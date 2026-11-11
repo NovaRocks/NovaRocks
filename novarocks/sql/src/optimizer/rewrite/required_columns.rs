@@ -64,7 +64,9 @@ pub(crate) fn tag_required_columns(
 ) -> OptExpr {
     match &expr.op {
         Operator::LogicalScan(_) => tag_scan(expr, parent_needed),
-        Operator::LogicalValues(_) => tag_values(expr, parent_needed),
+        Operator::LogicalValues(_) | Operator::LogicalSystemTable(_) => {
+            tag_values(expr, parent_needed)
+        }
         Operator::LogicalGenerateSeries(_) => tag_generate_series(expr, parent_needed),
         Operator::LogicalProject(_) => tag_project(expr, arena, parent_needed),
         Operator::LogicalFilter(_) => tag_filter(expr, arena, parent_needed),
@@ -151,11 +153,15 @@ fn tag_scan(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptE
 }
 
 fn tag_values(mut expr: OptExpr, parent_needed: Option<HashSet<ColumnId>>) -> OptExpr {
-    let Operator::LogicalValues(node) = &expr.op else {
+    let (Operator::LogicalValues(crate::optimizer::operator::ValuesOp { columns, .. })
+    | Operator::LogicalSystemTable(crate::planner::system_relation::PlanSystemTableNode {
+        columns,
+        ..
+    })) = &expr.op
+    else {
         unreachable!()
     };
-    let needed =
-        parent_needed.unwrap_or_else(|| node.columns.iter().map(|c| c.column_id).collect());
+    let needed = parent_needed.unwrap_or_else(|| columns.iter().map(|c| c.column_id).collect());
     expr.required_output_columns = Some(needed);
     expr
 }
@@ -936,6 +942,7 @@ fn subtree_untagged(expr: &OptExpr) -> bool {
         // Leaves: always get `Some(_)` after tagging.
         Operator::LogicalScan(_)
         | Operator::LogicalValues(_)
+        | Operator::LogicalSystemTable(_)
         | Operator::LogicalGenerateSeries(_)
         | Operator::LogicalCTEConsume(_) => expr.required_output_columns.is_none(),
         // Non-leaves: check the first child (which will itself be a leaf or

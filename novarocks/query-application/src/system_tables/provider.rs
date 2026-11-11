@@ -15,27 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! View SHOW pure turns on the same closed creator queue and actual-exit packet.
-use super::*;
+use super::{SystemTableError, SystemTableRequest, SystemTableSnapshot};
+use async_trait::async_trait;
 
-impl InternalResultCpu {
-    pub(crate) fn submit_view_show(
+/// A statement-scoped reader. Captured capabilities belong to the same
+/// statement; the startup registry never retains this object.
+#[async_trait]
+pub trait SystemTableProvider: Send + Sync {
+    async fn snapshot(
         &self,
-        original: Arc<crate::query::view_read_action::ViewShowOriginal>,
-        window: ResultWindowAlias,
-        source: InternalCpuActionSource,
-        cancellation: QueryCancellationView,
-        runtime: &tokio::runtime::Handle,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> CreatorCpuJob {
-        CreatorCpuJob::from_original(self.submit_creator_input(
-            ClosedCreatorInput::ViewShow(original),
-            window,
-            None,
-            Some(source),
-            cancellation,
-            runtime,
-            wake,
-        ))
-    }
+        request: &SystemTableRequest<'_>,
+    ) -> Result<SystemTableSnapshot, SystemTableError>;
 }

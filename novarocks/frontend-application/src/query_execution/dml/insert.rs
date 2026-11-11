@@ -59,7 +59,7 @@ pub trait InsertEngine: Send + Sync {
         input: InsertStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     >;
 }
 
@@ -69,7 +69,7 @@ impl InsertEngine for DmlExecutionKernel {
         input: InsertStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::insert_action::prepare(self.clone(), input)
     }

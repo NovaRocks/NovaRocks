@@ -55,6 +55,7 @@ use std::{collections::BTreeMap, fmt, num::NonZeroUsize, sync::Arc};
 use super::package_freeze::CompiledPackageCarrier;
 mod resources;
 use resources::RootResources;
+pub(crate) use resources::with_root_value_creation;
 
 /// Constructed by Server from the SAME frozen interpreter product as the BE.
 /// No default catalogue, provider, codec, constant policy or resource is made.

@@ -848,6 +848,7 @@ fn compose_frontend_result_profile(
     runtime: &crate::app_config::RuntimeConfig,
 ) -> anyhow::Result<FrontendResultCapacityProfile> {
     let mut capacity = novarocks_workload_control::ResultCapacityConfig::V1;
+    capacity.all_objects_bytes[0] = runtime.frontend_workload.client_result_all_objects_bytes;
     capacity.positions[2] = runtime.frontend_workload.internal_result_positions;
     capacity.all_objects_bytes[2] = runtime.frontend_workload.internal_result_all_objects_bytes;
     FrontendResultCapacityProfile::try_new(capacity).context("construct frontend result capacity")
@@ -982,8 +983,8 @@ fn compose_task_execution_budgets(
     })?;
     let transport = FrontendTaskTransportBudget::try_new(
         runtime.task_operation_max_batch_items,
-        runtime.task_operation_max_batch_encoded_bytes,
-        runtime.task_descriptor_max_encoded_bytes,
+        runtime.task_operation_batch_target_encoded_bytes,
+        runtime.native_ingress.message_limits(),
         runtime.task_query_backend_max_queued_operations,
         runtime.task_query_backend_max_queued_bytes,
         runtime.task_backend_max_queued_operations,
@@ -994,10 +995,11 @@ fn compose_task_execution_budgets(
     )
     .ok_or_else(|| {
         anyhow::anyhow!(
-            "construct task transport budget: a descriptor must fit in a batch, a batch in one \
-             query's queue, and the process must retain one maximum ordinary and control batch"
+            "construct task transport budget: queue counts, message lengths and nonzero policy must be valid"
         )
     })?;
+    novarocks_frontend_application::NativeRequestWindows::for_transport(transport.into_codec())
+        .map_err(|error| anyhow::anyhow!("construct task transport request windows: {error}"))?;
     Ok(ComposedTaskExecutionBudgets {
         coordination: CoordinationBudgets {
             dispatch,
@@ -1247,27 +1249,23 @@ mod tests {
 
     #[test]
     fn a_configured_budget_may_tighten_the_bounds_but_not_invert_them() {
-        // The bounds are a hierarchy, not ten unrelated numbers. Composition
-        // is where a deployment's numbers become the type that enforces them,
-        // so a configuration that could never send anything must fail here
-        // rather than at the first oversized descriptor.
         let mut config = crate::app_config::NovaRocksConfig::default();
         config.runtime.task_operation_max_batch_items = 4;
-        config.runtime.task_operation_max_batch_encoded_bytes = 1 << 20;
-        config.runtime.task_descriptor_max_encoded_bytes = 1 << 19;
-        let budgets = compose_task_execution_budgets(&config).expect("a tightened budget composes");
+        // A grouping target may exceed both the queue and message window.
+        config.runtime.task_operation_batch_target_encoded_bytes = 1024 * 1024 * 1024;
+        let budgets =
+            compose_task_execution_budgets(&config).expect("a grouping target is not a refusal");
         assert_eq!(budgets.transport.max_batch_items(), 4);
-        assert_eq!(budgets.transport.max_descriptor_encoded_bytes(), 1 << 19);
-
-        // A descriptor larger than a batch could never be sent at all.
-        config.runtime.task_descriptor_max_encoded_bytes = (1 << 20) + 1;
-        let error = compose_task_execution_budgets(&config)
-            .expect_err("an inverted hierarchy is refused")
-            .to_string();
-        assert!(
-            error.contains("task transport budget"),
-            "the refusal must name the budget it rejected, got: {error}"
+        assert_eq!(
+            budgets.transport.batch_target_encoded_bytes(),
+            1024 * 1024 * 1024
         );
+        config.runtime.task_query_backend_max_queued_bytes =
+            config.runtime.native_ingress.ordinary_request_max_bytes;
+        let error = compose_task_execution_budgets(&config)
+            .expect_err("one maximum request must fit an empty target window")
+            .to_string();
+        assert!(error.contains("task transport request windows"), "{error}");
 
         let mut zeroed = crate::app_config::NovaRocksConfig::default();
         zeroed.runtime.task_operation_max_batch_items = 0;
@@ -1277,9 +1275,14 @@ mod tests {
         );
 
         let mut byte_starved = crate::app_config::NovaRocksConfig::default();
-        let batch_bytes = byte_starved.runtime.task_operation_max_batch_encoded_bytes;
-        byte_starved.runtime.task_query_backend_max_queued_bytes = batch_bytes;
-        byte_starved.runtime.task_backend_max_queued_bytes = batch_bytes * 4 - 1;
+        let windows = novarocks_frontend_application::NativeRequestWindows::for_transport(
+            FrontendTaskTransportBudget::DEFAULT.into_codec(),
+        )
+        .unwrap();
+        let ordinary = windows.ordinary_queued_max_bytes + windows.ordinary_request_max_bytes;
+        byte_starved.runtime.task_query_backend_max_queued_bytes = ordinary;
+        byte_starved.runtime.task_backend_max_queued_bytes =
+            ordinary + windows.control_reserved_bytes - 1;
         assert!(
             compose_task_execution_budgets(&byte_starved).is_err(),
             "the process byte bound must retain queued and encoded forms of ordinary and control batches"
@@ -1310,12 +1313,12 @@ mod tests {
             frozen.max_batch_items()
         );
         assert_eq!(
-            budgets.transport.max_batch_encoded_bytes(),
-            frozen.max_batch_encoded_bytes()
+            budgets.transport.batch_target_encoded_bytes(),
+            frozen.batch_target_encoded_bytes()
         );
         assert_eq!(
-            budgets.transport.max_descriptor_encoded_bytes(),
-            frozen.max_descriptor_encoded_bytes()
+            budgets.transport.message_limits(),
+            config.runtime.native_ingress.message_limits()
         );
         assert_eq!(
             budgets.transport.max_query_backend_queued_operations(),
@@ -1549,6 +1552,32 @@ fn remote_effect_guarantee(
 #[cfg(test)]
 mod frontend_runtime_policy_tests {
     use super::*;
+    #[test]
+    fn configured_client_bytes_reach_only_the_original_client_budget() {
+        let defaults = novarocks_workload_control::ResultCapacityConfig::V1;
+        let mut runtime: crate::app_config::RuntimeConfig =
+            toml::from_str("[frontend_workload]\nclient_result_all_objects_bytes = 201326592\n")
+                .unwrap();
+        let (_, _, _, installed, _) = compose_frontend_workload_runtime(&runtime).unwrap();
+        let installed = installed.declared();
+        assert_eq!(installed.all_objects_bytes[0], 192 * 1024 * 1024);
+        assert_eq!(
+            installed.all_objects_bytes[1..],
+            defaults.all_objects_bytes[1..]
+        );
+        assert_eq!(installed.positions, defaults.positions);
+        let default_runtime: crate::app_config::RuntimeConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            compose_frontend_result_profile(&default_runtime)
+                .unwrap()
+                .declared()
+                .all_objects_bytes[0],
+            8 * 1024 * 1024
+        );
+        runtime.frontend_workload.client_result_all_objects_bytes = 0;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
     #[test]
     fn configured_internal_capacity_reaches_the_actual_runtime_projection() {
         let mut runtime = crate::app_config::RuntimeConfig::default();

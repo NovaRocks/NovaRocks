@@ -97,6 +97,18 @@ pub(crate) fn derive_statistics(
         Ok(match &expr.op {
             // -- Leaf operators (no children) --
             Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input, work)?,
+            // Optimization sees the declaration only; snapshot rows are not statistics.
+            Operator::LogicalSystemTable(table) | Operator::PhysicalSystemTable(table) => {
+                Statistics {
+                    output_row_count: MISSING_BASE_ROW_COUNT_FALLBACK,
+                    row_count_confidence: Confidence::Fallback,
+                    column_statistics: table
+                        .columns
+                        .iter()
+                        .map(|column| (column.column_id, ColumnStatistic::unknown()))
+                        .collect(),
+                }
+            }
             Operator::LogicalValues(vals) => Statistics {
                 output_row_count: vals.rows.len() as f64,
                 row_count_confidence: Confidence::Exact,
@@ -2648,6 +2660,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::LogicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
+        Operator::LogicalSystemTable(v) => v.columns.clone(),
         Operator::LogicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
@@ -2727,6 +2740,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
         Operator::PhysicalChangeEventExpand(e) => e.output_columns.clone(),
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
+        Operator::PhysicalSystemTable(v) => v.columns.clone(),
         Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),

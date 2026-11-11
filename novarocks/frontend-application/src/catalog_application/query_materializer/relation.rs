@@ -62,6 +62,9 @@ impl CatalogServiceMaterializer<'_> {
         use novarocks_spi::connector::{ConnectorErrorKind, ConnectorTableResolution};
         use novarocks_sql::compiler::CatalogTimeTravelResolution;
 
+        if let Some(fact) = self.system_relation_fact(need) {
+            return fact.map_err(crate::mv::domain::application::MvApplicationError::from_compile);
+        }
         if !matches!(need.target(), CatalogLookupTarget::Table { .. }) {
             return Err(
                 crate::query_execution::mv_assembly::refresh_preparation::io_gate::contract_error(
@@ -71,11 +74,6 @@ impl CatalogServiceMaterializer<'_> {
         }
         if let Some(fact) = self.local_view_fact(need) {
             return fact.map_err(crate::mv::domain::application::MvApplicationError::from_compile);
-        }
-        if let Some(result) = self.original_system_relation_fact(need, io).await
-            && let Some(fact) = result?
-        {
-            return Ok(fact);
         }
         if let Some(fact) = self.local_relation_fact(need) {
             return fact.map_err(crate::mv::domain::application::MvApplicationError::from_compile);
@@ -545,10 +543,8 @@ impl CatalogServiceMaterializer<'_> {
         if let Some(fact) = self.local_view_fact(need) {
             return fact;
         }
-        if let Some(result) = self.system_relation_fact(need)
-            && let Some(fact) = result?
-        {
-            return Ok(fact);
+        if let Some(fact) = self.system_relation_fact(need) {
+            return fact;
         }
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;
@@ -602,21 +598,8 @@ impl CatalogServiceMaterializer<'_> {
         if let Some(fact) = self.local_view_fact(need) {
             return fact;
         }
-        if self.system_source(need).is_some() {
-            // The caller must drive this source with its original CPU path.
-            // A completed None is the original reader's explicit decline.
-            let memo = self
-                .bindings
-                .system_relations
-                .lock()
-                .expect("statement system relation memo")
-                .get(need.relation())
-                .cloned();
-            if !matches!(memo, Some(Ok(None))) {
-                return Err(SqlCompileError::Compilation(
-                    "definition system relation requires its original CPU fact path".into(),
-                ));
-            }
+        if let Some(fact) = self.system_relation_fact(need) {
+            return fact;
         }
         if let Some(fact) = self.local_relation_fact(need) {
             return fact;

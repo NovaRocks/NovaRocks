@@ -68,21 +68,12 @@ impl StateStoreMvRepository {
     }
     pub async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         self.read_repository()
-            .list_keyed_projection_inventory(bound)
+            .list_keyed_projection_inventory()
             .await
     }
-    pub async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.read_repository()
-            .find_keyed_by_target_bounded(target, bound)
-            .await
-    }
+
     pub async fn delete_keyed_projection(
         &self,
         operation_id: Uuid,
@@ -102,13 +93,12 @@ impl StateStoreMvRepository {
             .await
     }
 }
-pub(super) async fn bounded_keyed_inventory<T: ReadAccess + ?Sized>(
+pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
     tx: &mut T,
-    bound: MvProjectionInventoryBound,
 ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-    let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+    let mut inventory = MvProjectionInventoryBuilder::new()?;
     let mut range = BoundedRecordRange::new(projection_prefix().map_err(corruption)?)?;
-    while let Some(row) = range.next(tx, bound).await? {
+    while let Some(row) = range.next(tx).await? {
         let projection = decode_keyed_projection(&row.key, &row.value)
             .map_err(corruption)?
             .value;

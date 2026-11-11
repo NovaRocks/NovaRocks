@@ -307,25 +307,6 @@ impl OperationDispatcher {
         intent: &OperationIntent,
     ) -> Result<(), TaskExecutionError> {
         self.validate_queue_request(intent.queue_request())?;
-        if let OperationIntent::CreateTask(request) = &intent {
-            self.validate_plan_carrier_bytes(request.plan_carrier_bytes())?;
-        }
-        Ok(())
-    }
-
-    /// Refuses a create whose static plan and task assignment together exceed
-    /// the bound the backend enforces on them.
-    ///
-    /// This is a property of the request itself, not of any queue: waiting
-    /// cannot make it smaller, so it fails closed rather than backpressuring.
-    pub(super) fn validate_plan_carrier_bytes(
-        &self,
-        actual: usize,
-    ) -> Result<(), TaskExecutionError> {
-        let limit = self.transport.max_descriptor_encoded_bytes();
-        if actual > limit {
-            return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
-        }
         Ok(())
     }
 
@@ -359,8 +340,35 @@ impl OperationDispatcher {
         &self,
         request: TaskOperationQueueRequest,
     ) -> Result<(), TaskExecutionError> {
+        let encoded_bytes = request.encoded_bytes().map_err(|error| {
+            TaskExecutionError::Workload(match error {
+                novarocks_task_codec::operation::wire_size::WireSizeError::Overflow => {
+                    novarocks_workload_control::WorkError::ArithmeticOverflow
+                }
+                novarocks_task_codec::operation::wire_size::WireSizeError::NotCodecProduced => {
+                    novarocks_workload_control::WorkError::Conflict
+                }
+            })
+        })?;
+        let request_limit = self
+            .transport
+            .message_limits()
+            .request_max_bytes(request.requires_control_progress());
+        if encoded_bytes > request_limit {
+            return Err(CapacityBound::OperationBytes {
+                limit: request_limit,
+                actual: encoded_bytes,
+            }
+            .into());
+        }
+        let windows =
+            super::intent::NativeRequestWindows::for_transport(self.transport).map_err(|_| {
+                TaskExecutionError::Workload(novarocks_workload_control::WorkError::InvalidConfig(
+                    "Native request windows",
+                ))
+            })?;
         let queued_bytes = request.queued_bytes();
-        let operation_limit = self.transport.max_operation_queued_bytes();
+        let operation_limit = windows.empty_queue_capacity(request.requires_control_progress());
         if queued_bytes > operation_limit {
             return Err(CapacityBound::OperationBytes {
                 limit: operation_limit,
@@ -403,7 +411,7 @@ impl OperationDispatcher {
         if queues.in_flight[lane] >= self.budget.permits_for(intent.lane()) {
             return Ok(false);
         }
-        Ok(queued_bytes <= self.transport.max_batch_encoded_bytes())
+        Ok(true)
     }
 
     /// Reports whether an exact operation is still locally queued or has
@@ -640,7 +648,8 @@ impl OperationDispatcher {
         lane: usize,
         max_items: usize,
     ) -> Option<DispatchBatch> {
-        let max_bytes = self.transport.max_batch_encoded_bytes();
+        let batch_target = self.transport.batch_target_encoded_bytes();
+        let message_limits = self.transport.message_limits();
         let (operations, queue_permits, queued_bytes, queued_at, native_pending) = {
             let queues = self.backends.get_mut(&backend)?;
             if queues.lanes[lane].is_empty() {
@@ -666,6 +675,7 @@ impl OperationDispatcher {
             let mut operations = Vec::new();
             let mut queue_permits = Vec::new();
             let mut queued_bytes = 0_usize;
+            let mut encoded_bytes = 0_usize;
             let mut queued_at = None;
             let original_run = queues.lanes[lane]
                 .front()
@@ -688,12 +698,23 @@ impl OperationDispatcher {
                 if !operations.is_empty() && entry.native_pending.is_some() {
                     break;
                 }
-                // Enqueueing already proved one operation fits. The aggregate
-                // check keeps the queue-side carrier of the whole batch under
-                // the same hard bound as its encoded request.
-                if queued_bytes.saturating_add(entry.queued_bytes) > max_bytes {
+                let item_encoded = entry
+                    .intent
+                    .encoded_protobuf_bytes()
+                    .expect("prequeue validation retained the original encoding facts");
+                let request_max =
+                    message_limits.request_max_bytes(entry.intent.requires_control_progress());
+                // Always release a legal head, including an operation above
+                // the grouping target. Further items must fit both the target
+                // queued shape and this exact method's wire limit.
+                if !operations.is_empty()
+                    && (queued_bytes.saturating_add(entry.queued_bytes)
+                        > batch_target.min(request_max)
+                        || encoded_bytes.saturating_add(item_encoded) > request_max)
+                {
                     break;
                 }
+                encoded_bytes += item_encoded;
                 let mut entry = queues.lanes[lane]
                     .pop_front()
                     .expect("the front entry was just observed");

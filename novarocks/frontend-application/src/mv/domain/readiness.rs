@@ -42,17 +42,6 @@ pub struct MvReadinessPort {
     controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
-fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
-    use novarocks_mv_application::repository::MvProjectionInventoryBound;
-
-    MvProjectionInventoryBound {
-        entries: novarocks_query_application::api::LocalResultBound::V1.rows,
-        snapshot_bytes: 16 * 1024 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-    }
-}
-
 /// Read-only inventory for query-local MV candidate discovery.
 ///
 /// A query freezes and validates every returned lake publication before it can
@@ -346,13 +335,9 @@ impl MvReadinessExecution<'_> {
     /// its next_ready/next_listable methods are async product methods.
     pub(crate) async fn local_projection_inventory(
         &self,
-    ) -> Result<
-        novarocks_mv_application::readiness::MvBoundedKeyedProjectionInventory,
-        MvRepositoryError,
-    > {
-        self.service
-            .bounded_projection_inventory(local_inventory_bound())
-            .await
+    ) -> Result<novarocks_mv_application::readiness::MvKeyedProjectionInventory, MvRepositoryError>
+    {
+        self.service.projection_inventory().await
     }
     pub(crate) async fn list_ready_projections(
         &self,
@@ -375,7 +360,6 @@ impl MvReadinessExecution<'_> {
             .list_ready_dependencies_by_downstream_bounded(
                 projection,
                 novarocks_mv_application::repository::MvDependencyReadBound {
-                    inventory: local_inventory_bound(),
                     entries: 4096,
                     collection_bytes: 4 * 1024 * 1024,
                 },

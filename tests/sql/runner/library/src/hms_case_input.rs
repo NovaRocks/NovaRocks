@@ -260,8 +260,8 @@ impl Definition {
                 .iter()
                 .filter(|s| s.meta.expect_error.is_some())
                 .count()
-                == 39,
-            "HMS recipe requires its original negative guards and view-listing refusal"
+                == 38,
+            "HMS recipe requires its original negative guards and supported empty view listing"
         );
         ensure!(
             case.steps
@@ -1168,7 +1168,7 @@ print(json.dumps({'empty': {'remaining_objects':empty},
                 .iter()
                 .filter(|step| step.meta.expect_error.is_some())
                 .count(),
-            39
+            38
         );
         assert_eq!(
             case.steps
@@ -1227,19 +1227,35 @@ print(json.dumps({'empty': {'remaining_objects':empty},
                 .contains(&format!("FROM {catalog}.information_schema.tables"))
         );
         assert!(!case.steps[57].meta.cleanup);
-        assert_eq!(case.steps[58].sql, "SHOW VIEWS;");
-        assert_eq!(
-            case.steps[58].meta.expect_sql_code.as_deref(),
-            Some("query.execution.unsupported")
+        assert!(
+            case.steps[56]
+                .sql
+                .contains("FROM system.metadata.materialized_views")
         );
-        assert_eq!(
-            case.steps[58].meta.expect_sql_phase,
-            Some(crate::sql_error_codes::SqlErrorPhase::Execution)
+        assert!(
+            case.steps[56]
+                .sql
+                .contains(&format!("catalog_name = '{catalog}'"))
         );
-        assert_eq!(
-            case.steps[58].meta.expect_error.as_deref(),
-            Some("TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }")
+        assert!(
+            case.steps[56]
+                .sql
+                .contains(&format!("schema_name = '{namespace}'"))
         );
+        assert!(
+            case.steps[58]
+                .sql
+                .contains(&format!("FROM {catalog}.information_schema.tables"))
+        );
+        assert!(case.steps[58].sql.contains("table_type = 'VIEW'"));
+        assert!(
+            case.steps[58]
+                .sql
+                .contains(&format!("table_schema = '{namespace}'"))
+        );
+        assert!(case.steps[58].meta.expect_sql_code.is_none());
+        assert!(case.steps[58].meta.expect_sql_phase.is_none());
+        assert!(case.steps[58].meta.expect_error.is_none());
         assert!(!case.steps[58].meta.cleanup);
         assert!(case.steps[59].meta.cleanup);
         assert!(

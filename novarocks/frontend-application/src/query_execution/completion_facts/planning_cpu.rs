@@ -92,16 +92,13 @@ fn root_output_for_read(
                 .map_err(client_render_schema_error)?,
             )
         }
-        ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows) => {
-            return Err(FrontendQueryCompilerError::Engine(
-                "distributed read received a different application output purpose".into(),
-            ));
-        }
         ReadEncodingPurpose::Profile(_) => novarocks_result_contract::FrozenRootOutput::CountOnly,
     })
 }
 
 pub(crate) struct ReadEncodingInput {
+    pub(crate) capacity:
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
     pub(crate) purpose: ReadEncodingPurpose,
     pub(crate) version: novarocks_physical_plan::PlanVersionId,
     pub(crate) options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
@@ -159,16 +156,10 @@ struct LogicalCatalogInput {
     session: SqlSessionContext,
     control: SqlCompileControl,
 }
-struct SystemRelationInput {
-    source: novarocks_query_application::system_catalog::SystemCatalogRelations,
-    need: novarocks_sql::compiler::CatalogRelationNeed,
-    facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
-    policy: novarocks_functions::ConstantPolicy,
-    control: SqlCompileControl,
-}
 enum PlanningCpuInput {
     SessionProperties(Box<crate::query::session_property_computation::SessionPropertyCpuInput>),
-    SystemRelation(Box<SystemRelationInput>),
+    SystemTableBatch,
+    SystemTableFinish,
     Start(Box<SqlFinalPlanCompileRequest>),
     Finish {
         compilation: SqlCompilation,
@@ -196,8 +187,12 @@ enum PlanningCpuOutput {
             >,
         >,
     ),
-    SystemRelation(
-        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+    SystemTableBatch(Result<(), novarocks_query_application::system_tables::SystemTableError>),
+    SystemTableSnapshot(
+        Result<
+            novarocks_query_application::system_tables::SystemTableSnapshot,
+            novarocks_query_application::system_tables::SystemTableError,
+        >,
     ),
     Progress(Result<SqlCompileProgress, FinalPlanCompletionError>),
     Candidate(Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError>),
@@ -207,6 +202,7 @@ enum PlanningCpuOutput {
     LogicalLines(Result<Vec<String>, SqlCompileError>),
 }
 struct PlanningCpuBody {
+    system_snapshot: Option<crate::system_tables::SystemTableCpuStaging>,
     input: Option<PlanningCpuInput>,
     output: Option<PlanningCpuOutput>,
     candidate: Option<CompletedPhysicalPlanCandidate>,
@@ -265,10 +261,17 @@ impl PlanningCpuOriginal {
             PlanningCpuInput::SessionProperties(input) => {
                 PlanningCpuOutput::SessionProperties(Box::new(input.run()))
             }
-            PlanningCpuInput::SystemRelation(input) => PlanningCpuOutput::SystemRelation(
-                input
-                    .source
-                    .materialize(&input.need, input.facts, input.policy, &input.control),
+            PlanningCpuInput::SystemTableBatch => PlanningCpuOutput::SystemTableBatch(
+                body.system_snapshot
+                    .as_mut()
+                    .expect("original system table snapshot state")
+                    .flush(),
+            ),
+            PlanningCpuInput::SystemTableFinish => PlanningCpuOutput::SystemTableSnapshot(
+                body.system_snapshot
+                    .take()
+                    .expect("original system table snapshot state")
+                    .finish(),
             ),
             PlanningCpuInput::Start(request) => {
                 PlanningCpuOutput::Progress(SqlCompletionPureSteps::start(*request))
@@ -379,6 +382,7 @@ impl PlanningCpuOriginal {
             &input.carrier,
             input.policy,
             &input.control,
+            &input.capacity,
         )
         .map_err(FrontendQueryCompilerError::from_encode)?;
         let prepared = encoded
@@ -473,6 +477,7 @@ impl FrontendPlanningCpuSource {
             executor,
             original: Arc::new(PlanningCpuOriginal {
                 body: Mutex::new(Some(PlanningCpuBody {
+                    system_snapshot: None,
                     input: None,
                     output: None,
                     candidate: None,
@@ -804,28 +809,138 @@ impl FrontendPlanningCpuSource {
         // The original candidate/access remain in this Source through its close.
         Ok(result)
     }
-    pub(crate) async fn system_relation(
+    #[cfg(test)]
+    pub(crate) fn system_snapshot_field_for_test(
         &self,
-        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
-        need: novarocks_sql::compiler::CatalogRelationNeed,
-        facts: novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
-        policy: novarocks_functions::ConstantPolicy,
+    ) -> Option<std::sync::Weak<arrow::datatypes::Field>> {
+        self.original
+            .loan()
+            .body
+            .as_ref()?
+            .system_snapshot
+            .as_ref()?
+            .first_field_for_test()
+    }
+    pub(crate) fn begin_system_snapshot(
+        &self,
+        declaration: Arc<novarocks_sql::system_table::SystemTableDeclaration>,
+        required_columns: &[usize],
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         control: SqlCompileControl,
     ) -> Result<
-        Result<Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>, SqlCompileError>,
+        Result<(), novarocks_query_application::system_tables::SystemTableError>,
         StatementNativeHealthFailure,
     > {
-        self.install(PlanningCpuInput::SystemRelation(Box::new(
-            SystemRelationInput {
-                source,
-                need,
-                facts,
-                policy,
-                control,
-            },
-        )));
-        let PlanningCpuOutput::SystemRelation(result) = self.receive().await? else {
-            panic!("system relation returned another CPU phase")
+        let mut driver_loan = self.driver_loan();
+        let driver = driver_loan.body.as_mut().expect("original planning driver");
+        if let Some(health) = &driver.health {
+            return Err(health.clone());
+        }
+        if driver.closing || driver.job.is_some() {
+            return Ok(Err(crate::system_tables::control_error(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(
+                        novarocks_workload_control::WorkError::Conflict,
+                    ),
+                ),
+            )));
+        }
+        let mut loan = self.original.loan();
+        let body = loan.body.as_mut().expect("original planning body");
+        if body.input.is_some()
+            || body.output.is_some()
+            || body.system_snapshot.is_some()
+            || body.candidate.is_some()
+        {
+            return Ok(Err(
+                novarocks_query_application::system_tables::SystemTableError::Internal(
+                    "original planning snapshot destination is occupied".into(),
+                ),
+            ));
+        }
+        let window = match capacity.try_window_alias() {
+            Ok(window) => window,
+            Err(error) => {
+                return Ok(Err(crate::system_tables::control_error(
+                    novarocks_type_contract::CompileControlError::Source(
+                        novarocks_failure_contract::SharedFailureCause::new(error),
+                    ),
+                )));
+            }
+        };
+        match crate::system_tables::SystemTableCpuStaging::new(
+            declaration,
+            required_columns,
+            capacity.scope().clone(),
+            window,
+            control,
+        ) {
+            Ok(staging) => {
+                body.system_snapshot = Some(staging);
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+    pub(crate) fn stage_system_row(
+        &self,
+        values: &[Option<&str>],
+    ) -> Result<
+        Result<
+            crate::system_tables::RowStage,
+            novarocks_query_application::system_tables::SystemTableError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        let mut driver_loan = self.driver_loan();
+        let driver = driver_loan.body.as_mut().expect("original planning driver");
+        if let Some(health) = &driver.health {
+            return Err(health.clone());
+        }
+        if driver.closing || driver.job.is_some() {
+            return Ok(Err(crate::system_tables::control_error(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(
+                        novarocks_workload_control::WorkError::Conflict,
+                    ),
+                ),
+            )));
+        }
+        let mut loan = self.original.loan();
+        let body = loan.body.as_mut().expect("original planning body");
+        let Some(staging) = body.system_snapshot.as_mut() else {
+            return Ok(Err(
+                novarocks_query_application::system_tables::SystemTableError::Internal(
+                    "original system table snapshot was not begun".into(),
+                ),
+            ));
+        };
+        Ok(staging.stage_row(values))
+    }
+    pub(crate) async fn materialize_system_batch(
+        &self,
+    ) -> Result<
+        Result<(), novarocks_query_application::system_tables::SystemTableError>,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SystemTableBatch);
+        let PlanningCpuOutput::SystemTableBatch(result) = self.receive().await? else {
+            panic!("system table batch returned another CPU phase");
+        };
+        Ok(result)
+    }
+    pub(crate) async fn finish_system_snapshot(
+        &self,
+    ) -> Result<
+        Result<
+            novarocks_query_application::system_tables::SystemTableSnapshot,
+            novarocks_query_application::system_tables::SystemTableError,
+        >,
+        StatementNativeHealthFailure,
+    > {
+        self.install(PlanningCpuInput::SystemTableFinish);
+        let PlanningCpuOutput::SystemTableSnapshot(result) = self.receive().await? else {
+            panic!("system table snapshot returned another CPU phase");
         };
         Ok(result)
     }
@@ -1016,10 +1131,6 @@ mod client_render_error_tests {
     #[test]
     fn internal_count_only_does_not_require_a_client_presentation() {
         use novarocks_result_contract::FrozenRootOutput;
-        let port = result_port(novarocks_physical_plan::ValueType::new(
-            arrow::datatypes::DataType::Int64,
-            true,
-        ));
         assert_eq!(
             root_output_for_read(
                 ReadEncodingPurpose::Profile(std::time::Instant::now()),
@@ -1028,10 +1139,6 @@ mod client_render_error_tests {
             )
             .unwrap(),
             FrozenRootOutput::CountOnly
-        );
-        assert!(
-            matches!(root_output_for_read(ReadEncodingPurpose::Read(FrontendQueryPurpose::LocalRows), None, Some(&port)),
-            Err(FrontendQueryCompilerError::Engine(message)) if message == "distributed read received a different application output purpose")
         );
     }
 

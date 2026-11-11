@@ -189,11 +189,20 @@ impl QueryServiceError {
         use crate::execution_error::ExecutionFailureSite;
         use novarocks_failure_contract::{FailureEvidence, FailureProjection};
 
-        let eligible = match (&self.body, &self.failure_cause) {
-            (QueryServiceErrorBody::Execution { input, .. }, Some(cause)) => {
+        let original_fact = match &self.failure_cause {
+            Some(cause) => Some(cause.failure_fact()),
+            // A pure compiler's actual typed stop is retained in its sidecar.
+            // Provenance alone cannot establish an original observation, and
+            // a sidecar must never override a contradictory retained cause.
+            None => self
+                .compile_control_error()
+                .map(|error| error.failure_fact()),
+        };
+        let eligible = match &self.body {
+            QueryServiceErrorBody::Execution { input, .. } => {
                 matches!(input.site(), ExecutionFailureSite::Coordinator)
                     && input.fact().evidence() == FailureEvidence::StopObservation
-                    && cause.failure_fact() == input.fact()
+                    && original_fact == Some(input.fact())
             }
             _ => false,
         };
@@ -1230,6 +1239,119 @@ mod publication_message_tests {
             selected,
             "the accepted query verdict is not another stop observation",
         );
+        root.owner.complete_after_terminal_cancel_settled();
+        root.business.release();
+    }
+
+    #[test]
+    fn typed_compiler_stop_requires_the_same_roots_actual_cancellation() {
+        use novarocks_type_contract::CompileControlError;
+        use novarocks_workload_control::CancellationReason;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+        ] {
+            for reason in [
+                CancellationReason::DeadlineExceeded,
+                CancellationReason::ExplicitKill {
+                    requester_session: 29,
+                },
+            ] {
+                let (_control, root, cancellation) = original_stop_root();
+                let original = QueryServiceError::from_compile_control(control.clone());
+                assert!(original.failure_cause().is_none());
+                assert_eq!(
+                    original
+                        .clone()
+                        .reconcile_local_stop_observation(&cancellation),
+                    original,
+                    "a pure caller stop is not accepted query cancellation",
+                );
+                root.owner.cancel(reason);
+                let expected = crate::session_outcome::cancellation_failure_input(
+                    cancellation.reason().unwrap(),
+                );
+                let selected = original.reconcile_local_stop_observation(&cancellation);
+                assert_eq!(selected.execution_failure(), Some(&expected));
+                assert_eq!(selected.compile_control_error(), Some(control.clone()));
+                assert_eq!(
+                    selected.compile_control_provenance(),
+                    Some(control.provenance())
+                );
+                assert!(selected.failure_cause().is_none());
+                assert_eq!(
+                    selected
+                        .clone()
+                        .reconcile_local_stop_observation(&cancellation),
+                    selected,
+                );
+                root.owner.complete_after_terminal_cancel_settled();
+                root.business.release();
+            }
+        }
+    }
+
+    #[test]
+    fn compiler_stop_keeps_typed_sources_and_rejects_provenance_or_conflicting_causes() {
+        use novarocks_type_contract::{CompileControlError, CompileControlProvenance};
+        use novarocks_workload_control::{CancellationReason, WorkError};
+        let (_control, root, cancellation) = original_stop_root();
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        let source = original_stop_cause();
+        let typed = CompileControlError::Source(source.clone());
+        let original = QueryServiceError::from_compile_control(typed.clone());
+        let selected = original
+            .clone()
+            .reconcile_local_stop_observation(&cancellation);
+        assert_eq!(selected.compile_control_error(), Some(typed));
+        assert_eq!(selected.failure_cause(), None);
+        assert_eq!(
+            selected.execution_failure(),
+            Some(&crate::session_outcome::cancellation_failure_input(
+                cancellation.reason().unwrap()
+            )),
+        );
+        assert_ne!(selected.execution_failure(), original.execution_failure());
+        let provenance_only = QueryServiceError::from_execution_failure(
+            original.execution_failure().unwrap().clone(),
+        )
+        .with_compile_control_provenance(Some(CompileControlProvenance::DeadlineExceeded));
+        let foreign_site = QueryServiceError::from_execution_failure(ExecutionFailureInput::new(
+            original.execution_failure().unwrap().fact(),
+            SafeDetail::truncating("a backend stop observation"),
+            ExecutionFailureSite::Backend {
+                process: novarocks_types::BackendProcessId::new_v7(),
+            },
+        ))
+        .with_compile_control(original.compile_control_error());
+        let mut conflicting =
+            QueryServiceError::from_compile_control(CompileControlError::DeadlineExceeded);
+        conflicting.failure_cause = Some(novarocks_failure_contract::SharedFailureCause::new(
+            WorkError::ForeignAuthority,
+        ));
+        let resource =
+            QueryServiceError::from_compile_control(CompileControlError::ResourceExhausted);
+        let originating = QueryServiceError::from_compile_control(CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "original provider failure",
+            )),
+        ));
+        for original in [
+            provenance_only,
+            foreign_site,
+            conflicting,
+            resource,
+            originating,
+        ] {
+            assert_eq!(
+                original
+                    .clone()
+                    .reconcile_local_stop_observation(&cancellation),
+                original,
+                "late Root stop cannot replace a different original fact",
+            );
+        }
         root.owner.complete_after_terminal_cancel_settled();
         root.business.release();
     }

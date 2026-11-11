@@ -62,6 +62,7 @@ pub(crate) fn freeze_completed_packages(
     root_fragment_id: FragmentId,
     carrier: &CompiledPackageCarrier,
     control: &dyn PureCompileControl,
+    author: crate::query_execution::physical_encoding::EncodingAuthor<'_>,
 ) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, PhysicalEncodeError> {
     let mut frozen = BTreeMap::new();
     for (packaged_id, package) in &packages {
@@ -80,8 +81,36 @@ pub(crate) fn freeze_completed_packages(
         let has_stream_edge = plan.has_stream_edge_from(fragment_id);
         validate_fragment_output_kind(fragment_id, is_root, has_stream_edge, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(fragment_id, is_root, has_stream_edge)?;
-        let artifact =
-            FragmentArtifact::freeze_package(package, physical.edges(), carrier, control)?;
+        let artifact = match author {
+            crate::query_execution::physical_encoding::EncodingAuthor::Statement(capacity) => {
+                let window = capacity.try_window_alias().map_err(|error| {
+                    PhysicalEncodeError::Control(
+                        novarocks_type_contract::CompileControlError::Source(
+                            novarocks_failure_contract::SharedFailureCause::new(error),
+                        ),
+                    )
+                })?;
+                crate::query_execution::required_constant_eval::with_root_value_creation(
+                    capacity.scope(),
+                    &window,
+                    control,
+                    |creation| {
+                        FragmentArtifact::freeze_package_with_creator(
+                            package,
+                            physical.edges(),
+                            carrier,
+                            control,
+                            creation,
+                        )
+                    },
+                )
+                .map_err(PhysicalEncodeError::Control)??
+            }
+            #[cfg(test)]
+            crate::query_execution::physical_encoding::EncodingAuthor::SemanticFixture => {
+                FragmentArtifact::freeze_package(package, physical.edges(), carrier, control)?
+            }
+        };
         if frozen.insert(fragment_id, artifact).is_some() {
             return Err(
                 format!("completed plan packaged duplicate fragment id={fragment_id}").into(),

@@ -118,12 +118,14 @@ pub enum NeedKind {
     Statistics,
     MaterializedView,
     ProviderRead,
+    ProviderInputs,
 }
 
 /// Exact analyzer lookup surface. Metadata-table lookup is a distinct owner
 /// call and never hides in a table-name suffix convention.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogLookupTarget {
+    SystemTable,
     Table { mode: TableLookupMode },
     IcebergMetadata { kind: MetadataTableKind },
 }
@@ -939,12 +941,154 @@ fn validate_provider_constraint(
     Ok(())
 }
 
+/// One optimized physical occurrence; columns are original declaration ordinals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemTableSnapshotNeed {
+    id: CompileNeedId,
+    occurrence: crate::system_table::SystemTableOccurrenceId,
+    declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+    required_columns: Box<[usize]>,
+    key_constraint: crate::system_table::SystemTableKeyConstraint,
+}
+impl SystemTableSnapshotNeed {
+    pub(super) fn new(
+        id: CompileNeedId,
+        occurrence: crate::system_table::SystemTableOccurrenceId,
+        declaration: std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+        required_columns: Box<[usize]>,
+        key_constraint: crate::system_table::SystemTableKeyConstraint,
+    ) -> Self {
+        Self {
+            id,
+            occurrence,
+            declaration,
+            required_columns,
+            key_constraint,
+        }
+    }
+    pub const fn id(&self) -> CompileNeedId {
+        self.id
+    }
+    pub const fn occurrence(&self) -> crate::system_table::SystemTableOccurrenceId {
+        self.occurrence
+    }
+    pub fn declaration(&self) -> &std::sync::Arc<crate::system_table::SystemTableDeclaration> {
+        &self.declaration
+    }
+    pub fn required_columns(&self) -> &[usize] {
+        &self.required_columns
+    }
+    pub const fn key_constraint(&self) -> &crate::system_table::SystemTableKeyConstraint {
+        &self.key_constraint
+    }
+}
+
+#[derive(Debug)]
+pub struct SystemTableSnapshotFact {
+    request: SystemTableSnapshotNeed,
+    batches: std::sync::Arc<[arrow::record_batch::RecordBatch]>,
+    storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl SystemTableSnapshotFact {
+    /// The original storage follows every alias through lowering and execution.
+    pub fn try_new(
+        need: &SystemTableSnapshotNeed,
+        batches: std::sync::Arc<[arrow::record_batch::RecordBatch]>,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    ) -> Result<Self, CompletionProtocolError> {
+        if !batches.is_empty() && storage.is_pure() {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "system table snapshot has no original storage lifetime",
+            });
+        }
+        let fields = need
+            .required_columns
+            .iter()
+            .map(|ordinal| {
+                let column = need.declaration.columns.get(*ordinal).ok_or(
+                    CompletionProtocolError::InvalidFact {
+                        id: need.id,
+                        reason: "system table output ordinal is outside declaration",
+                    },
+                )?;
+                column
+                    .value_type
+                    .try_to_field(&column.name)
+                    .map(std::sync::Arc::new)
+                    .map_err(|_| CompletionProtocolError::InvalidFact {
+                        id: need.id,
+                        reason: "system table declaration field is invalid",
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for batch in batches.iter() {
+            if batch.num_rows() == 0
+                || batch.schema().fields().as_ref() != fields.as_slice()
+                || !batch.schema().metadata().is_empty()
+            {
+                return Err(CompletionProtocolError::InvalidFact {
+                    id: need.id,
+                    reason: "system table snapshot differs from its exact declaration and projection",
+                });
+            }
+            if batch
+                .columns()
+                .iter()
+                .zip(fields.iter())
+                .any(|(array, field)| !field.is_nullable() && array.null_count() != 0)
+            {
+                return Err(CompletionProtocolError::InvalidFact {
+                    id: need.id,
+                    reason: "system table snapshot violates declared nullability",
+                });
+            }
+        }
+        Ok(Self {
+            request: need.clone(),
+            batches,
+            storage,
+        })
+    }
+    pub const fn id(&self) -> CompileNeedId {
+        self.request.id
+    }
+    pub const fn occurrence(&self) -> crate::system_table::SystemTableOccurrenceId {
+        self.request.occurrence
+    }
+    pub fn resource_facts(
+        &self,
+    ) -> Result<
+        novarocks_physical_plan::SystemRelationResourceFacts,
+        novarocks_type_contract::CompileControlError,
+    > {
+        novarocks_physical_plan::SystemRelationData::Batches {
+            batches: self.batches.clone(),
+            storage: self.storage.clone(),
+        }
+        .resource_facts()
+    }
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        SystemTableSnapshotNeed,
+        std::sync::Arc<[arrow::record_batch::RecordBatch]>,
+        novarocks_type_contract::ValueTypeStorageLifetime,
+    ) {
+        (self.request, self.batches, self.storage)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SqlNeedBatch {
     CatalogRelations(Box<[CatalogRelationNeed]>),
     Statistics(Box<[StatisticsNeed]>),
     MaterializedViews(Box<[MaterializedViewNeed]>),
     ProviderReads(Box<[ProviderReadNeed]>),
+    ProviderInputs {
+        reads: Box<[ProviderReadNeed]>,
+        system_tables: Box<[SystemTableSnapshotNeed]>,
+    },
 }
 
 impl SqlNeedBatch {
@@ -954,6 +1098,7 @@ impl SqlNeedBatch {
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedViews(_) => NeedKind::MaterializedView,
             Self::ProviderReads(_) => NeedKind::ProviderRead,
+            Self::ProviderInputs { .. } => NeedKind::ProviderInputs,
         }
     }
 
@@ -963,6 +1108,10 @@ impl SqlNeedBatch {
             Self::Statistics(needs) => needs.len(),
             Self::MaterializedViews(needs) => needs.len(),
             Self::ProviderReads(needs) => needs.len(),
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => reads.len() + system_tables.len(),
         }
     }
 
@@ -976,6 +1125,15 @@ impl SqlNeedBatch {
             Self::Statistics(needs) => Box::new(needs.iter().map(StatisticsNeed::id)),
             Self::MaterializedViews(needs) => Box::new(needs.iter().map(MaterializedViewNeed::id)),
             Self::ProviderReads(needs) => Box::new(needs.iter().map(ProviderReadNeed::id)),
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => Box::new(
+                reads
+                    .iter()
+                    .map(ProviderReadNeed::id)
+                    .chain(system_tables.iter().map(SystemTableSnapshotNeed::id)),
+            ),
         }
     }
 
@@ -1011,6 +1169,14 @@ impl SqlNeedBatch {
                     ])
                 })),
             ]),
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => checked_sum([
+                checked_mul(reads.len(), std::mem::size_of::<ProviderReadNeed>()),
+                checked_sum(reads.iter().map(provider_need_bytes)),
+                checked_sum(system_tables.iter().map(system_table_need_bytes)),
+            ]),
             Self::ProviderReads(needs) => checked_sum([
                 checked_mul(needs.len(), std::mem::size_of::<ProviderReadNeed>()),
                 checked_sum(needs.iter().map(provider_need_bytes)),
@@ -1021,10 +1187,17 @@ impl SqlNeedBatch {
 
 #[derive(Debug)]
 pub enum CatalogRelationOutcome {
-    Inline(std::sync::Arc<crate::catalog::SqlInlineRelation>),
+    SystemTable(
+        Result<
+            std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+            crate::system_table::SystemTableLookupError,
+        >,
+    ),
     Resolved(Box<ResolvedAnalyzerTable>),
     View(std::sync::Arc<SqlViewDefinition>),
-    Missing { reason: Box<str> },
+    Missing {
+        reason: Box<str>,
+    },
     SelectionRefused(Box<crate::analyze_error::AnalyzeError>),
 }
 
@@ -1050,45 +1223,24 @@ impl CatalogRelationFact {
         self.definition_context
     }
 
-    /// Current-only inline sources cannot answer a historical definition.
-    /// Keep the original selection in a pure capability refusal.
-    pub fn inline_time_travel_unsupported(
+    pub fn system_table(
         need: &CatalogRelationNeed,
+        declaration: Result<
+            std::sync::Arc<crate::system_table::SystemTableDeclaration>,
+            crate::system_table::SystemTableLookupError,
+        >,
     ) -> Result<Self, CompletionProtocolError> {
-        if !need.definition_context || !matches!(need.target, CatalogLookupTarget::Table { .. }) {
+        if need.target != CatalogLookupTarget::SystemTable || need.version().is_some() {
             return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
         }
-        let Some(version) = need.version() else {
-            return Err(CompletionProtocolError::CatalogLookupTargetMismatch { id: need.id });
-        };
-        Ok(Self {
-            id: need.id,
-            relation: need.relation.clone(),
-            target: need.target,
-            local_view_shadow: need.local_view_shadow,
-            definition_context: need.definition_context,
-            selection: need.selection.clone(),
-            selected_snapshot: None,
-            outcome: CatalogRelationOutcome::SelectionRefused(Box::new(
-                crate::analyze_error::AnalyzeError::unsupported_query_shape(
-                    "historical selection is not supplied by an inline system relation",
-                    version.span,
-                ),
-            )),
-        })
-    }
-
-    pub fn inline(
-        need: &CatalogRelationNeed,
-        relation: std::sync::Arc<crate::catalog::SqlInlineRelation>,
-    ) -> Result<Self, CompletionProtocolError> {
-        if !need.definition_context
-            || need.version().is_some()
-            || !matches!(need.target, CatalogLookupTarget::Table { .. })
+        if let Ok(declaration) = &declaration
+            && (declaration.binding.catalog_name() != need.relation.catalog
+                || declaration.schema != need.relation.namespace
+                || declaration.table != need.relation.table)
         {
             return Err(CompletionProtocolError::InvalidFact {
                 id: need.id,
-                reason: "inline values require an exact Current definition relation need",
+                reason: "system table declaration differs from exact relation need",
             });
         }
         Ok(Self {
@@ -1099,7 +1251,7 @@ impl CatalogRelationFact {
             definition_context: need.definition_context,
             selection: None,
             selected_snapshot: None,
-            outcome: CatalogRelationOutcome::Inline(relation),
+            outcome: CatalogRelationOutcome::SystemTable(declaration),
         })
     }
 
@@ -1265,6 +1417,12 @@ impl CatalogRelationFact {
         need: &CatalogRelationNeed,
         reason: impl Into<Box<str>>,
     ) -> Result<Self, CompletionProtocolError> {
+        if need.target == CatalogLookupTarget::SystemTable {
+            return Err(CompletionProtocolError::InvalidFact {
+                id: need.id,
+                reason: "system table lookup requires its typed failure category",
+            });
+        }
         let reason = reason.into();
         if reason.trim().is_empty() {
             return Err(CompletionProtocolError::EmptyFailureReason { id: need.id });
@@ -1334,6 +1492,7 @@ fn catalog_lookup_target_matches_table(
         )
         | (CatalogLookupTarget::IcebergMetadata { .. }, _) => false,
         (CatalogLookupTarget::Table { .. }, _) => true,
+        (CatalogLookupTarget::SystemTable, _) => false,
     }
 }
 
@@ -1771,6 +1930,10 @@ pub enum SqlFactBatch {
     Statistics(Box<[StatisticsFact]>),
     MaterializedViews(Box<[MaterializedViewFact]>),
     ProviderReads(Box<[ProviderReadFact]>),
+    ProviderInputs {
+        reads: Box<[ProviderReadFact]>,
+        system_tables: Box<[SystemTableSnapshotFact]>,
+    },
 }
 
 impl SqlFactBatch {
@@ -1780,6 +1943,7 @@ impl SqlFactBatch {
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedViews(_) => NeedKind::MaterializedView,
             Self::ProviderReads(_) => NeedKind::ProviderRead,
+            Self::ProviderInputs { .. } => NeedKind::ProviderInputs,
         }
     }
 
@@ -1789,6 +1953,10 @@ impl SqlFactBatch {
             Self::Statistics(facts) => facts.len(),
             Self::MaterializedViews(facts) => facts.len(),
             Self::ProviderReads(facts) => facts.len(),
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => reads.len() + system_tables.len(),
         }
     }
 
@@ -1798,6 +1966,15 @@ impl SqlFactBatch {
             Self::Statistics(facts) => Box::new(facts.iter().map(StatisticsFact::id)),
             Self::MaterializedViews(facts) => Box::new(facts.iter().map(MaterializedViewFact::id)),
             Self::ProviderReads(facts) => Box::new(facts.iter().map(ProviderReadFact::id)),
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => Box::new(
+                reads
+                    .iter()
+                    .map(ProviderReadFact::id)
+                    .chain(system_tables.iter().map(SystemTableSnapshotFact::id)),
+            ),
         }
     }
 
@@ -1807,6 +1984,19 @@ impl SqlFactBatch {
             Self::Statistics(facts) => Ok(checked_sum(facts.iter().map(statistics_fact_bytes))?),
             Self::MaterializedViews(facts) => materialized_view_facts_bytes(facts),
             Self::ProviderReads(facts) => Ok(checked_sum(facts.iter().map(provider_fact_bytes))?),
+            // Snapshot payloads and per-batch headers belong to their original creator,
+            // not to the fixed completion protocol exchange budget.
+            Self::ProviderInputs {
+                reads,
+                system_tables,
+            } => Ok(checked_sum([
+                checked_sum(reads.iter().map(provider_fact_bytes)),
+                checked_sum(
+                    system_tables
+                        .iter()
+                        .map(|fact| system_table_need_bytes(&fact.request)),
+                ),
+            ])?),
         }
     }
 }
@@ -2201,6 +2391,18 @@ impl SqlCompiler {
                 CompilerContinuation::MaterializedView(state),
                 SqlFactBatch::MaterializedViews(facts),
             ) => super::resume_materialized_view(*state, facts, control)?,
+            (
+                CompilerContinuation::ProviderRead(state),
+                SqlFactBatch::ProviderInputs {
+                    reads,
+                    system_tables,
+                },
+            ) => super::completion_driver::resume_provider_inputs(
+                *state,
+                reads,
+                system_tables,
+                control,
+            )?,
             (CompilerContinuation::ProviderRead(state), SqlFactBatch::ProviderReads(facts)) => {
                 super::resume_provider_read(*state, facts, control)?
             }
@@ -2226,7 +2428,7 @@ impl CompilerContinuation {
             Self::Catalog(_) => NeedKind::CatalogRelation,
             Self::Statistics(_) => NeedKind::Statistics,
             Self::MaterializedView(_) => NeedKind::MaterializedView,
-            Self::ProviderRead(_) => NeedKind::ProviderRead,
+            Self::ProviderRead(state) => state.kind(),
             #[cfg(test)]
             Self::Test(kind) => *kind,
         }
@@ -3022,6 +3224,48 @@ fn validate_fact_semantics(
                 validate_provider_contract(need, &fact.contract)?;
             }
         }
+        (
+            SqlNeedBatch::ProviderInputs {
+                reads: needs,
+                system_tables: system_needs,
+            },
+            SqlFactBatch::ProviderInputs {
+                reads: facts,
+                system_tables: system_facts,
+            },
+        ) => {
+            let expected = needs
+                .iter()
+                .map(|need| (need.id, need))
+                .collect::<BTreeMap<_, _>>();
+            for fact in facts {
+                let need = expected
+                    .get(&fact.id)
+                    .ok_or(CompletionProtocolError::InvalidFact {
+                        id: fact.id,
+                        reason: "read fact belongs to another provider input domain",
+                    })?;
+                if fact.binding != need.binding || fact.occurrence != need.occurrence {
+                    return Err(CompletionProtocolError::InvalidFact {
+                        id: fact.id,
+                        reason: "read fact differs from its exact binding or occurrence",
+                    });
+                }
+                validate_provider_contract(need, &fact.contract)?;
+            }
+            let expected = system_needs
+                .iter()
+                .map(|need| (need.id, need))
+                .collect::<BTreeMap<_, _>>();
+            for fact in system_facts {
+                if expected.get(&fact.id()).copied() != Some(&fact.request) {
+                    return Err(CompletionProtocolError::InvalidFact {
+                        id: fact.id(),
+                        reason: "system table snapshot differs from its exact request",
+                    });
+                }
+            }
+        }
         _ => unreachable!("fact batch kind was validated"),
     }
     Ok(())
@@ -3413,13 +3657,56 @@ fn provider_expression_dynamic_bytes(
     }
 }
 
+fn system_table_need_bytes(need: &SystemTableSnapshotNeed) -> Result<u64, CompletionProtocolError> {
+    checked_sum([
+        checked_size(std::mem::size_of::<SystemTableSnapshotNeed>()),
+        checked_size(need.declaration.binding.catalog_name().len()),
+        checked_size(need.declaration.schema.len()),
+        checked_size(need.declaration.table.len()),
+        checked_size(std::mem::size_of_val(need.required_columns.as_ref())),
+        checked_size(std::mem::size_of_val(need.declaration.columns.as_ref())),
+        checked_size(std::mem::size_of_val(need.declaration.key_columns.as_ref())),
+        checked_sum(need.declaration.columns.iter().map(|column| {
+            checked_add(
+                checked_size(column.name.len())?,
+                function_value_type_bytes(&column.value_type)?,
+            )
+        })),
+        checked_sum(need.key_constraint.columns().values().map(|values| {
+            use crate::system_table::SystemTableKeyValues;
+            match values {
+                SystemTableKeyValues::Values(values) => checked_sum(values.iter().map(|value| {
+                    checked_add(
+                        checked_size(std::mem::size_of::<String>())?,
+                        checked_size(value.len())?,
+                    )
+                })),
+                _ => Ok(0),
+            }
+        })),
+    ])
+}
+
 fn catalog_fact_bytes(fact: &CatalogRelationFact) -> Result<u64, CompletionProtocolError> {
     let relation = table_identity_bytes(&fact.relation)?;
     let outcome = match &fact.outcome {
-        CatalogRelationOutcome::Inline(relation) => checked_add(
-            relation.retained_bytes(),
-            (2 * std::mem::size_of::<usize>()) as u64,
-        )?,
+        CatalogRelationOutcome::SystemTable(Ok(declaration)) => checked_sum([
+            checked_size(std::mem::size_of_val(declaration.as_ref())),
+            checked_size(declaration.binding.catalog_name().len()),
+            checked_size(declaration.schema.len()),
+            checked_size(declaration.table.len()),
+            checked_size(std::mem::size_of_val(declaration.columns.as_ref())),
+            checked_size(std::mem::size_of_val(declaration.key_columns.as_ref())),
+            checked_sum(declaration.columns.iter().map(|column| {
+                checked_add(
+                    checked_size(column.name.len())?,
+                    function_value_type_bytes(&column.value_type)?,
+                )
+            })),
+        ])?,
+        CatalogRelationOutcome::SystemTable(Err(_)) => checked_size(std::mem::size_of::<
+            crate::system_table::SystemTableLookupError,
+        >())?,
         CatalogRelationOutcome::Missing { reason } => checked_size(reason.len())?,
         CatalogRelationOutcome::SelectionRefused(error) => checked_sum([
             checked_size(std::mem::size_of::<crate::analyze_error::AnalyzeError>()),

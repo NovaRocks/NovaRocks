@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
-use std::future::IntoFuture;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
@@ -44,9 +43,6 @@ use crate::http_transport::Reqwest012Transport;
 mod s3_signing;
 use s3_signing::{S3PresignLayer, S3RequestSigner, S3SigningTransport};
 
-use crate::list_body_limit::{
-    ListBodyLimitFetch, OBJECT_STORE_LIST_BODY_LIMIT_BYTES, is_list_body_limit_exceeded,
-};
 use crate::storage_authority::{StorageAuthority, StorageAuthorityId};
 use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, SecretValue};
 
@@ -102,179 +98,6 @@ impl FsListEntry {
     pub fn into_parts(self) -> (String, u64, bool) {
         (self.location, self.size, self.is_dir)
     }
-}
-
-/// Explicit bounds for a local catalog listing, never applied to generic reads.
-/// Page size is an OpenDAL request parameter, not a response/XML allocation bound.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FsListingBound {
-    page_entries: usize,
-    path_bytes: usize,
-    workspace_bytes: usize,
-}
-
-impl FsListingBound {
-    pub fn try_new(
-        page_entries: usize,
-        path_bytes: usize,
-        workspace_bytes: usize,
-    ) -> FileResult<Self> {
-        if page_entries == 0
-            || page_entries > 256
-            || path_bytes == 0
-            || path_bytes > 65_536
-            || workspace_bytes == 0
-            || workspace_bytes > 32 * 1024 * 1024
-        {
-            return Err(FileError::invalid(
-                "bounded local listing exceeds its frozen page/path/workspace profile",
-            ));
-        }
-        Ok(Self {
-            page_entries,
-            path_bytes,
-            workspace_bytes,
-        })
-    }
-
-    /// Borrowed preflight for a host's validation copies, before parsing a URI.
-    pub fn check_path(&self, path: &str) -> FileResult<()> {
-        if path.len() > self.path_bytes {
-            return Err(listing_path_exhausted());
-        }
-        // FsLocation keeps original + split pieces (<=2*input bytes), with
-        // fixed String/error headers. A provider can use this before its own
-        // location validation, even when it supplies a smaller workspace.
-        self.check_workspace(
-            path.len()
-                .checked_mul(2)
-                .and_then(|bytes| bytes.checked_add(256))
-                .ok_or_else(listing_workspace_exhausted)?,
-        )
-    }
-
-    fn check_workspace(&self, bytes: usize) -> FileResult<()> {
-        if bytes > self.workspace_bytes {
-            return Err(listing_workspace_exhausted());
-        }
-        Ok(())
-    }
-}
-
-impl FsListingBound {
-    fn check_path_length(&self, bytes: usize) -> FileResult<()> {
-        if bytes > self.path_bytes {
-            return Err(listing_path_exhausted());
-        }
-        Ok(())
-    }
-}
-
-struct ListingUriContext {
-    scheme: FsScheme,
-    uri_scheme: Option<String>,
-    authority: Option<String>,
-    local_root: Option<String>,
-    bounds: FsListingBound,
-}
-
-impl ListingUriContext {
-    fn render(&self, path: &str) -> FileResult<String> {
-        self.bounds.check_path(path)?;
-        match self.scheme {
-            FsScheme::ObjectStore | FsScheme::Hdfs => {
-                let scheme =
-                    self.uri_scheme
-                        .as_deref()
-                        .unwrap_or(if self.scheme == FsScheme::ObjectStore {
-                            "s3"
-                        } else {
-                            "hdfs"
-                        });
-                let authority = self.authority.as_deref().unwrap_or_default();
-                let path = path.trim_start_matches('/');
-                let length = scheme
-                    .len()
-                    .checked_add(3)
-                    .and_then(|bytes| bytes.checked_add(authority.len()))
-                    .and_then(|bytes| bytes.checked_add(1))
-                    .and_then(|bytes| bytes.checked_add(path.len()))
-                    .ok_or_else(listing_path_exhausted)?;
-                let mut uri = bounded_listing_string(length, self.bounds)?;
-                uri.push_str(scheme);
-                uri.push_str("://");
-                uri.push_str(authority);
-                uri.push('/');
-                uri.push_str(path);
-                Ok(uri)
-            }
-            FsScheme::Local => {
-                // Preauthorize the worst-case join before PathBuf copies. Keep
-                // std Path::join semantics, including absolute child paths.
-                let root = self.local_root.as_deref().filter(|root| *root != ".");
-                let length = match root {
-                    Some(root) if !Path::new(path).is_absolute() => {
-                        let separator = usize::from(
-                            !root.is_empty() && !root.ends_with(std::path::MAIN_SEPARATOR),
-                        );
-                        root.len()
-                            .checked_add(separator)
-                            .and_then(|bytes| bytes.checked_add(path.len()))
-                            .ok_or_else(listing_path_exhausted)?
-                    }
-                    _ => path.len(),
-                };
-                self.bounds.check_path_length(length)?;
-                self.bounds.check_workspace(
-                    length
-                        .checked_mul(3)
-                        .ok_or_else(listing_workspace_exhausted)?,
-                )?;
-                let mut joined = PathBuf::with_capacity(length);
-                if !Path::new(path).is_absolute()
-                    && let Some(root) = root
-                {
-                    joined.push(root);
-                }
-                joined.push(path);
-                self.bounds.check_path_length(joined.capacity())?;
-                let text = joined.to_str().ok_or_else(|| {
-                    FileError::new(FileErrorKind::Invalid, "listing joined path is not UTF-8")
-                })?;
-                let mut uri = bounded_listing_string(text.len(), self.bounds)?;
-                uri.push_str(text);
-                Ok(uri)
-            }
-        }
-    }
-}
-
-fn bounded_listing_string(bytes: usize, bounds: FsListingBound) -> FileResult<String> {
-    bounds.check_path_length(bytes)?;
-    bounds.check_workspace(
-        bytes
-            .checked_mul(3)
-            .ok_or_else(listing_workspace_exhausted)?,
-    )?;
-    let mut result = String::new();
-    result
-        .try_reserve_exact(bytes)
-        .map_err(|_| listing_workspace_exhausted())?;
-    bounds.check_path_length(result.capacity())?;
-    Ok(result)
-}
-
-fn listing_path_exhausted() -> FileError {
-    FileError::new(
-        FileErrorKind::ResourceExhausted,
-        "bounded listing path bytes exceeded",
-    )
-}
-fn listing_workspace_exhausted() -> FileError {
-    FileError::new(
-        FileErrorKind::ResourceExhausted,
-        "bounded listing URI workspace exceeded",
-    )
 }
 
 pub type FsListStream = Pin<Box<dyn Stream<Item = FileResult<FsListEntry>> + Send + 'static>>;
@@ -667,176 +490,6 @@ impl FsAccessHandle {
                 is_dir: entry.metadata().is_dir(),
             })
         })))
-    }
-
-    fn preflight_bounded_location(&self, prefix: &str, bounds: FsListingBound) -> FileResult<()> {
-        bounds.check_path(prefix)?;
-        let root_capacity = self.root.as_ref().map_or(0, String::capacity);
-        let authority_capacity = self.authority.as_ref().map_or(0, String::capacity);
-        if root_capacity > bounds.path_bytes || authority_capacity > bounds.path_bytes {
-            return Err(listing_path_exhausted());
-        }
-        // Object/capacity proof (P=prefix bytes, R/A=actual root/authority
-        // capacities, L=path limit): FsLocation original + split components
-        // <=2P; local relative PathBuf <=P; normalization old+new <=3P,
-        // or normalized String + PathBuf <=3P. Their maximum is <=6P.
-        // Subsequent list-path/context copies and bounded permission/error
-        // formatting fit the 12P allowance. Root/authority context copies,
-        // retained originals and error formatting fit 4(R+A). Active local
-        // join + exact URI and host handoff fit 4L (handoff moves the String).
-        // Fixed headers/async state use 64KiB. P,R,A,L<=64KiB makes the whole
-        // transient proof <=25*64KiB<2MiB, reserved inside the catalog's
-        // 32MiB workspace; it is not an independent capacity wallet.
-        let prepared_bytes = prefix
-            .len()
-            .checked_mul(12)
-            .and_then(|bytes| {
-                root_capacity
-                    .checked_add(authority_capacity)
-                    .and_then(|roots| roots.checked_mul(4))
-                    .and_then(|roots| bytes.checked_add(roots))
-            })
-            .and_then(|bytes| {
-                bounds
-                    .path_bytes
-                    .checked_mul(4)
-                    .and_then(|item| bytes.checked_add(item))
-            })
-            .and_then(|bytes| bytes.checked_add(64 * 1024))
-            .ok_or_else(listing_workspace_exhausted)?;
-        bounds.check_workspace(prepared_bytes)?;
-        Ok(())
-    }
-
-    /// One explicitly bounded catalog metadata probe over the authorized
-    /// client. It creates no BoundFile, paths-inventory clone or size cache.
-    /// The same <2MiB source auxiliary covers both listing and sequential
-    /// schema probes; this does not allocate a second workspace allowance.
-    pub async fn stat_location_bounded(
-        &self,
-        prefix: impl AsRef<str>,
-        cancellation: &FileCancellation,
-        bounds: FsListingBound,
-    ) -> FileResult<u64> {
-        cancellation.check()?;
-        let prefix = prefix.as_ref();
-        self.preflight_bounded_location(prefix, bounds)?;
-        let location = FsLocation::parse(prefix)?;
-        let relative = self.resolve_bound_relative_path(&location)?;
-        bounds.check_path_length(relative.capacity())?;
-        // FsLocation <=2P + normalized relative <=P; normalization's old/new
-        // <=3P and headers/error formatting are already in the shared 12P
-        // preflight. The operator is borrowed; no identity/path-inventory copy.
-        let metadata = match futures::future::select(
-            Box::pin(self.operator.stat(&relative)),
-            Box::pin(cancellation.ended()),
-        )
-        .await
-        {
-            futures::future::Either::Left((result, _)) => result.map_err(|error| {
-                map_bounded_listing_opendal_error("stat catalog metadata", error)
-            })?,
-            futures::future::Either::Right((error, _)) => return Err(error),
-        };
-        cancellation.check()?;
-        Ok(metadata.content_length())
-    }
-
-    /// Bounded local-catalog listing over this same authorized client.
-    ///
-    /// Checks borrowed inputs before URI/identity/relative-path growth, avoids
-    /// cloning the handle's entire paths inventory, and requests finite pages.
-    /// OpenDAL's received page and XML decoder remain third-party internals;
-    /// this entrypoint does not claim to bound that response body.
-    pub async fn list_location_bounded(
-        &self,
-        prefix: impl AsRef<str>,
-        recursive: bool,
-        cancellation: &FileCancellation,
-        bounds: FsListingBound,
-    ) -> FileResult<FsListStream> {
-        cancellation.check()?;
-        let prefix = prefix.as_ref();
-        self.preflight_bounded_location(prefix, bounds)?;
-        let location = FsLocation::parse(prefix)?;
-        let relative = self.resolve_bound_relative_path(&location)?;
-        let relative = relative.trim_end_matches('/');
-        let list_len = relative
-            .len()
-            .checked_add(1)
-            .ok_or_else(listing_path_exhausted)?;
-        bounds.check_path_length(list_len)?;
-        let mut list_path = bounded_listing_string(list_len, bounds)?;
-        list_path.push_str(relative);
-        list_path.push('/');
-        let lister = match futures::future::select(
-            Box::pin(
-                self.operator
-                    .lister_with(&list_path)
-                    .recursive(recursive)
-                    .limit(bounds.page_entries)
-                    .into_future(),
-            ),
-            Box::pin(cancellation.ended()),
-        )
-        .await
-        {
-            futures::future::Either::Left((result, _)) => {
-                result.map_err(|error| map_bounded_listing_opendal_error("list files", error))?
-            }
-            futures::future::Either::Right((error, _)) => return Err(error),
-        };
-        cancellation.check()?;
-        let context = ListingUriContext {
-            scheme: self.scheme,
-            uri_scheme: location.uri_scheme().map(ToOwned::to_owned),
-            authority: location.authority().map(ToOwned::to_owned),
-            local_root: self.root.clone(),
-            bounds,
-        };
-        let initial = Some((lister, context, cancellation.clone()));
-        Ok(Box::pin(futures::stream::unfold(
-            initial,
-            |state| async move {
-                let (mut lister, context, cancellation) = state?;
-                if let Err(error) = cancellation.check() {
-                    return Some((Err(error), None));
-                }
-                // A pending SDK next must register a stop/deadline wake; a
-                // checkpoint alone cannot observe cancellation until it returns.
-                // The losing future is dropped before releasing this state.
-                let next = match futures::future::select(
-                    Box::pin(lister.next()),
-                    Box::pin(cancellation.ended()),
-                )
-                .await
-                {
-                    futures::future::Either::Left((result, _)) => result,
-                    futures::future::Either::Right((error, _)) => return Some((Err(error), None)),
-                };
-                let entry = match next? {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        return Some((
-                            Err(map_bounded_listing_opendal_error("list files", error)),
-                            None,
-                        ));
-                    }
-                };
-                let result = cancellation
-                    .check()
-                    .and_then(|()| context.render(entry.path()))
-                    .map(|location| FsListEntry {
-                        location,
-                        size: entry.metadata().content_length(),
-                        is_dir: entry.metadata().is_dir(),
-                    });
-                match result {
-                    Ok(entry) => Some((Ok(entry), Some((lister, context, cancellation)))),
-                    Err(error) => Some((Err(error), None)),
-                }
-            },
-        )))
     }
 
     /// Atomically create one authorized path without replacing an existing file.
@@ -2563,13 +2216,9 @@ fn build_object_store_operator(
         Reqwest012Transport::new(client),
         signer,
     ));
-    // Preserve the independent list body limit outside signing/HTTP dispatch.
     let context = operator
         .base_context()
-        .with_http_transport(HttpTransporter::new(ListBodyLimitFetch::new(
-            signed_transport,
-            OBJECT_STORE_LIST_BODY_LIMIT_BYTES,
-        )));
+        .with_http_transport(signed_transport);
     operator = operator.with_context(context);
     let mut timeout = TimeoutLayer::new();
     timeout = timeout.with_timeout(Duration::from_millis(endpoint.timeout_ms));
@@ -3303,11 +2952,7 @@ fn map_stream_error(operation: &str, error: std::io::Error) -> FileError {
 }
 
 fn classify_opendal_error(error: &opendal::Error) -> FileErrorKind {
-    if is_list_body_limit_exceeded(error) {
-        FileErrorKind::ResourceExhausted
-    } else {
-        file_error_kind_for_opendal(error.kind())
-    }
+    file_error_kind_for_opendal(error.kind())
 }
 
 fn file_error_kind_for_opendal(kind: opendal::ErrorKind) -> FileErrorKind {
@@ -3729,26 +3374,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_body_limit_error_remains_resource_exhausted_in_all_fs_mappings() {
-        fn overflow() -> opendal::Error {
-            opendal::Error::new(opendal::ErrorKind::Unexpected, "bounded list body")
-                .set_source(crate::list_body_limit::ListBodyLimitExceeded)
-        }
-        assert_eq!(
-            map_opendal_error("list", overflow()).kind(),
-            FileErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            map_bounded_listing_opendal_error("list", overflow()).kind(),
-            FileErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            map_stream_error("list", std::io::Error::other(overflow())).kind(),
-            FileErrorKind::ResourceExhausted
-        );
-    }
-
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3993,485 +3618,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug, Default)]
-    struct ListingRecord {
-        pending_first_poll: Arc<AtomicUsize>,
-        pending_next: Arc<AtomicUsize>,
-        first_poll_future_drops: Arc<AtomicUsize>,
-        next_future_drops: Arc<AtomicUsize>,
-        stats: Arc<AtomicUsize>,
-        stat_failure: Arc<AtomicUsize>,
-        requests: Arc<Mutex<Vec<Option<usize>>>>,
-        polls: Arc<AtomicUsize>,
-        first_polls: Arc<AtomicUsize>,
-        drops: Arc<AtomicUsize>,
-    }
-    impl Layer for ListingRecord {
-        fn apply_service(&self, inner: Servicer) -> Servicer {
-            Arc::new(RecordingListAccess {
-                inner,
-                record: self.clone(),
-            })
-        }
-    }
-    #[derive(Debug)]
-    struct RecordingListAccess {
-        inner: Servicer,
-        record: ListingRecord,
-    }
-    struct RecordedLister<L> {
-        inner: L,
-        record: ListingRecord,
-        first_poll: bool,
-    }
-    struct PendingListingFutureDrop(Arc<AtomicUsize>);
-    impl Drop for PendingListingFutureDrop {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    impl<L> Drop for RecordedLister<L> {
-        fn drop(&mut self) {
-            self.record.drops.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    impl<L: oio::List> oio::List for RecordedLister<L> {
-        async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
-            self.record.polls.fetch_add(1, Ordering::SeqCst);
-            if std::mem::replace(&mut self.first_poll, false) {
-                self.record.first_polls.fetch_add(1, Ordering::SeqCst);
-                if self.record.pending_first_poll.load(Ordering::SeqCst) != 0 {
-                    let _hold =
-                        PendingListingFutureDrop(Arc::clone(&self.record.first_poll_future_drops));
-                    return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
-                }
-            } else if self.record.pending_next.load(Ordering::SeqCst) != 0 {
-                let _hold = PendingListingFutureDrop(Arc::clone(&self.record.next_future_drops));
-                return std::future::pending::<opendal::Result<Option<oio::Entry>>>().await;
-            }
-            self.inner.next().await
-        }
-    }
-    impl Service for RecordingListAccess {
-        type Reader = oio::Reader;
-        type Writer = oio::Writer;
-        type Lister = RecordedLister<oio::Lister>;
-        type Deleter = oio::Deleter;
-        type Copier = oio::Copier;
-
-        fn info(&self) -> ServiceInfo {
-            self.inner.info()
-        }
-
-        fn capability(&self) -> opendal::Capability {
-            self.inner.capability()
-        }
-
-        async fn create_dir(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpCreateDir,
-        ) -> opendal::Result<RpCreateDir> {
-            self.inner.create_dir(ctx, path, args).await
-        }
-
-        fn read(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpRead,
-        ) -> opendal::Result<Self::Reader> {
-            self.inner.read(ctx, path, args)
-        }
-
-        fn write(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpWrite,
-        ) -> opendal::Result<Self::Writer> {
-            self.inner.write(ctx, path, args)
-        }
-
-        fn delete(&self, ctx: &OperationContext) -> opendal::Result<Self::Deleter> {
-            self.inner.delete(ctx)
-        }
-
-        async fn stat(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpStat,
-        ) -> opendal::Result<RpStat> {
-            self.record.stats.fetch_add(1, Ordering::SeqCst);
-            if self.record.stat_failure.load(Ordering::SeqCst) != 0 {
-                return Err(opendal::Error::new(
-                    opendal::ErrorKind::PermissionDenied,
-                    "x".repeat(8192),
-                )
-                .with_context("path", "y".repeat(8192))
-                .set_source(ListingPanicDisplay));
-            }
-            self.inner.stat(ctx, path, args).await
-        }
-
-        fn list(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpList,
-        ) -> opendal::Result<Self::Lister> {
-            self.record.requests.lock().unwrap().push(args.limit());
-            self.inner
-                .list(ctx, path, args)
-                .map(|inner| RecordedLister {
-                    inner,
-                    record: self.record.clone(),
-                    first_poll: true,
-                })
-        }
-
-        fn copy(
-            &self,
-            ctx: &OperationContext,
-            from: &str,
-            to: &str,
-            args: OpCopy,
-            opts: OpCopier,
-        ) -> opendal::Result<Self::Copier> {
-            self.inner.copy(ctx, from, to, args, opts)
-        }
-
-        async fn rename(
-            &self,
-            ctx: &OperationContext,
-            from: &str,
-            to: &str,
-            args: OpRename,
-        ) -> opendal::Result<RpRename> {
-            self.inner.rename(ctx, from, to, args).await
-        }
-
-        async fn presign(
-            &self,
-            ctx: &OperationContext,
-            path: &str,
-            args: OpPresign,
-        ) -> opendal::Result<RpPresign> {
-            self.inner.presign(ctx, path, args).await
-        }
-    }
-
-    fn listing_access(operator: Operator) -> FsAccessHandle {
-        FsAccessHandle::new(
-            domain(84),
-            FsScheme::ObjectStore,
-            operator,
-            Some("bucket".to_owned()),
-            None,
-            Vec::new(),
-        )
-    }
-    fn listing_bound(path_bytes: usize) -> FsListingBound {
-        FsListingBound::try_new(1, path_bytes, 32 * 1024 * 1024).unwrap()
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_pending_first_poll_stop_and_deadline_drop_state_then_eof() {
-        for deadline in [false, true] {
-            let record = ListingRecord::default();
-            record.pending_first_poll.store(1, Ordering::SeqCst);
-            let access = listing_access(memory_operator().unwrap().layer(record.clone()));
-            let cancellation = if deadline {
-                FileCancellation::new()
-                    .with_deadline(Some(Instant::now() + Duration::from_millis(100)))
-            } else {
-                FileCancellation::new()
-            };
-            let mut opening = Box::pin(access.list_location_bounded(
-                "s3://bucket/warehouse",
-                false,
-                &cancellation,
-                listing_bound(64),
-            ));
-            // OpenDAL 0.58 creates the lister synchronously. The first async
-            // listing boundary is the returned lister's actual next poll.
-            let mut stream = match futures::poll!(opening.as_mut()) {
-                std::task::Poll::Ready(Ok(stream)) => stream,
-                std::task::Poll::Ready(Err(error)) => panic!("lister creation failed: {error}"),
-                std::task::Poll::Pending => panic!("synchronous SDK lister creation suspended"),
-            };
-            drop(opening);
-            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
-            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
-            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
-            let mut next = Box::pin(stream.next());
-            assert!(matches!(
-                futures::poll!(next.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
-            if !deadline {
-                cancellation.cancel();
-            }
-            let error = tokio::time::timeout(Duration::from_secs(2), next.as_mut())
-                .await
-                .expect("pending first SDK poll must wake on stop/deadline")
-                .expect("typed terminal error")
-                .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                if deadline {
-                    FileErrorKind::DeadlineExceeded
-                } else {
-                    FileErrorKind::Cancelled
-                }
-            );
-            drop(next);
-            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 1);
-            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                record.drops.load(Ordering::SeqCst),
-                1,
-                "the constructed lister exits with the terminal error"
-            );
-            assert!(stream.next().await.is_none());
-            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_pending_next_stop_and_deadline_drop_state_then_eof() {
-        for deadline in [false, true] {
-            let record = ListingRecord::default();
-            record.pending_next.store(1, Ordering::SeqCst);
-            let operator = memory_operator().unwrap().layer(record.clone());
-            operator.write("warehouse/a", "a").await.unwrap();
-            operator.write("warehouse/b", "b").await.unwrap();
-            let access = listing_access(operator);
-            let cancellation = if deadline {
-                FileCancellation::new()
-                    .with_deadline(Some(Instant::now() + Duration::from_millis(100)))
-            } else {
-                FileCancellation::new()
-            };
-            let mut stream = access
-                .list_location_bounded(
-                    "s3://bucket/warehouse",
-                    false,
-                    &cancellation,
-                    listing_bound(64),
-                )
-                .await
-                .unwrap();
-            assert_eq!(*record.requests.lock().unwrap(), [Some(1)]);
-            assert_eq!(record.polls.load(Ordering::SeqCst), 0);
-            let first = stream.next().await.unwrap().unwrap();
-            assert_eq!(first.location, "s3://bucket/warehouse/a");
-            assert!(!first.is_dir);
-            assert_eq!(record.polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(record.drops.load(Ordering::SeqCst), 0);
-            let mut next = Box::pin(stream.next());
-            assert!(matches!(
-                futures::poll!(next.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(
-                record.polls.load(Ordering::SeqCst),
-                2,
-                "the SDK continuation actually started after a real entry"
-            );
-            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
-            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 0);
-            if !deadline {
-                cancellation.cancel();
-            }
-            let error = tokio::time::timeout(Duration::from_secs(2), next.as_mut())
-                .await
-                .expect("pending SDK next must wake on stop/deadline")
-                .expect("typed terminal error")
-                .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                if deadline {
-                    FileErrorKind::DeadlineExceeded
-                } else {
-                    FileErrorKind::Cancelled
-                }
-            );
-            drop(next);
-            assert_eq!(record.first_poll_future_drops.load(Ordering::SeqCst), 0);
-            assert_eq!(record.next_future_drops.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                record.drops.load(Ordering::SeqCst),
-                1,
-                "lister/context state exits with the terminal error"
-            );
-            assert!(stream.next().await.is_none());
-            assert_eq!(
-                record.polls.load(Ordering::SeqCst),
-                2,
-                "EOF must not poll the dropped lister"
-            );
-            assert_eq!(record.first_polls.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn bounded_stat_ignores_unrelated_inventory_and_keeps_no_bound_file() {
-        let record = ListingRecord::default();
-        let operator = memory_operator().unwrap().layer(record.clone());
-        operator
-            .write("warehouse/schema-0", "schema")
-            .await
-            .unwrap();
-        let mut access = listing_access(operator);
-        // These owner-held paths are outside the one bounded probe. Copying
-        // this inventory would exceed its explicit 1MiB temporary allowance.
-        for _ in 0..4 {
-            access.paths.push(ResolvedFsPath {
-                location: FsLocation::parse("s3://bucket/warehouse").unwrap(),
-                operator_relative_path: "x".repeat(512 * 1024),
-            });
-        }
-        let paths_ptr = access.paths.as_ptr();
-        let size = access
-            .stat_location_bounded(
-                "s3://bucket/warehouse/schema-0",
-                &FileCancellation::new(),
-                FsListingBound::try_new(1, 64, 1024 * 1024).unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(size, 6);
-        assert_eq!(access.paths.as_ptr(), paths_ptr);
-        assert_eq!(record.stats.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn bounded_stat_long_schema_and_liveness_refuse_before_io() {
-        let record = ListingRecord::default();
-        let access = listing_access(memory_operator().unwrap().layer(record.clone()));
-        let long = format!("s3://bucket/warehouse/{}/schema-0", "x".repeat(128));
-        let expired =
-            FileCancellation::new().with_deadline(Some(Instant::now() - Duration::from_secs(1)));
-        let cancelled = FileCancellation::new();
-        cancelled.cancel();
-        for (path, cancellation, kind) in [
-            (
-                long.as_str(),
-                FileCancellation::new(),
-                FileErrorKind::ResourceExhausted,
-            ),
-            (
-                "s3://bucket/warehouse/schema-0",
-                expired,
-                FileErrorKind::DeadlineExceeded,
-            ),
-            (
-                "s3://bucket/warehouse/schema-0",
-                cancelled,
-                FileErrorKind::Cancelled,
-            ),
-        ] {
-            let error = access
-                .stat_location_bounded(path, &cancellation, listing_bound(64))
-                .await
-                .unwrap_err();
-            assert_eq!(error.kind(), kind);
-        }
-        assert_eq!(record.stats.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn bounded_stat_not_found_and_opaque_source_keep_typed_bounded_diagnostics() {
-        let record = ListingRecord::default();
-        let access = listing_access(memory_operator().unwrap().layer(record.clone()));
-        let path = "s3://bucket/warehouse/schema-0";
-        let error = access
-            .stat_location_bounded(path, &FileCancellation::new(), listing_bound(64))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), FileErrorKind::NotFound);
-        assert!(std::error::Error::source(&error).is_none());
-        record.stat_failure.store(1, Ordering::SeqCst);
-        let error = access
-            .stat_location_bounded(path, &FileCancellation::new(), listing_bound(64))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), FileErrorKind::Permission);
-        assert!(
-            novarocks_spi::connector::ConnectorError::from(&error)
-                .message()
-                .len()
-                < 128
-        );
-    }
-
-    #[test]
-    fn bounded_listing_uri_matches_old_bytes_and_exact_capacity() {
-        for (scheme, uri_scheme, authority, root, path) in [
-            (
-                FsScheme::ObjectStore,
-                Some("s3a"),
-                Some("bucket"),
-                None,
-                "/warehouse/表/",
-            ),
-            (
-                FsScheme::Hdfs,
-                Some("hdfs"),
-                Some("host:9000"),
-                None,
-                "warehouse/t",
-            ),
-            (FsScheme::Local, None, None, Some("/tmp/root/"), "table/"),
-            (FsScheme::Local, None, None, Some("."), "table/"),
-            (
-                FsScheme::Local,
-                None,
-                None,
-                Some("/tmp/root"),
-                "/absolute/table",
-            ),
-        ] {
-            let old = if scheme == FsScheme::Local {
-                match root {
-                    Some(root) if root != "." => Path::new(root).join(path),
-                    _ => PathBuf::from(path),
-                }
-                .to_string_lossy()
-                .into_owned()
-            } else {
-                format!(
-                    "{}://{}/{}",
-                    uri_scheme.unwrap(),
-                    authority.unwrap(),
-                    path.trim_start_matches('/')
-                )
-            };
-            let context = ListingUriContext {
-                scheme,
-                uri_scheme: uri_scheme.map(str::to_owned),
-                authority: authority.map(str::to_owned),
-                local_root: root.map(str::to_owned),
-                bounds: listing_bound(old.len()),
-            };
-            let actual = context.render(path).unwrap();
-            assert_eq!(actual, old);
-            assert_eq!(actual.capacity(), actual.len());
-        }
-    }
-
     #[test]
     fn listing_entry_transfers_the_same_backing_without_copy() {
         let mut location = String::with_capacity(128);
@@ -4489,174 +3635,112 @@ mod tests {
         assert_eq!((size, is_dir), (7, false));
     }
 
-    #[test]
-    fn bounded_listing_uri_refuses_composed_size_before_copy() {
-        let context = ListingUriContext {
-            scheme: FsScheme::ObjectStore,
-            uri_scheme: Some("s3".to_owned()),
-            authority: Some("bucket".to_owned()),
-            local_root: None,
-            bounds: listing_bound(16),
-        };
-        assert_eq!(
-            context.render("warehouse/name").unwrap_err().kind(),
-            FileErrorKind::ResourceExhausted
-        );
-        assert_eq!(
-            bounded_listing_string(usize::MAX, listing_bound(64))
-                .unwrap_err()
-                .kind(),
-            FileErrorKind::ResourceExhausted
-        );
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_requests_pages_and_keeps_complete_generic_semantics() {
-        let record = ListingRecord::default();
-        let operator = memory_operator().unwrap().layer(record.clone());
-        operator.write("warehouse/a", "a").await.unwrap();
-        operator.write("warehouse/b", "b").await.unwrap();
-        let access = listing_access(operator);
-        let cancellation = FileCancellation::new();
-        let bounded = access
-            .list_location_bounded(
-                "s3://bucket/warehouse",
-                false,
-                &cancellation,
-                listing_bound(64),
-            )
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<FileResult<Vec<_>>>()
-            .unwrap();
-        let generic = access
-            .list_location("s3://bucket/warehouse", false, &cancellation)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<FileResult<Vec<_>>>()
-            .unwrap();
-        assert_eq!(bounded, generic);
-        assert_eq!(bounded.len(), 2);
-        assert_eq!(*record.requests.lock().unwrap(), [Some(1), None]);
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_rejects_borrowed_prefix_and_capacity_before_open() {
-        let record = ListingRecord::default();
-        let mut access = listing_access(memory_operator().unwrap().layer(record.clone()));
-        let cancellation = FileCancellation::new();
-        for (prefix, bounds) in [
-            ("s3://bucket/warehouse-too-long", listing_bound(16)),
-            (
-                "s3://bucket/warehouse",
-                FsListingBound::try_new(1, 64, 64).unwrap(),
-            ),
-        ] {
-            let error = match access
-                .list_location_bounded(prefix, false, &cancellation, bounds)
-                .await
-            {
-                Ok(_) => panic!("oversized source accepted"),
-                Err(error) => error,
-            };
-            assert_eq!(error.kind(), FileErrorKind::ResourceExhausted);
-        }
-        let mut root = String::with_capacity(1024);
-        root.push_str("root");
-        access.root = Some(root);
-        let error = match access
-            .list_location_bounded(
-                "s3://bucket/warehouse",
-                false,
-                &cancellation,
-                listing_bound(64),
-            )
-            .await
-        {
-            Ok(_) => panic!("spare capacity accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), FileErrorKind::ResourceExhausted);
-        assert!(record.requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_stops_and_drops_after_streamed_uri_refusal() {
-        let record = ListingRecord::default();
-        let operator = memory_operator().unwrap().layer(record.clone());
-        operator
-            .write("warehouse/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "a")
-            .await
-            .unwrap();
-        operator
-            .write("warehouse/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "b")
-            .await
-            .unwrap();
-        let access = listing_access(operator);
-        let mut stream = access
-            .list_location_bounded(
-                "s3://bucket/warehouse",
-                false,
-                &FileCancellation::new(),
-                listing_bound(32),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            stream.next().await.unwrap().unwrap_err().kind(),
-            FileErrorKind::ResourceExhausted
-        );
-        let polls = record.polls.load(Ordering::SeqCst);
-        assert!(stream.next().await.is_none());
-        assert_eq!(record.polls.load(Ordering::SeqCst), polls);
-        assert_eq!(record.drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn bounded_listing_preserves_authority_and_cancel_refusals() {
-        let record = ListingRecord::default();
-        let access = listing_access(memory_operator().unwrap().layer(record.clone()));
-        let cancellation = FileCancellation::new();
-        let error = match access
-            .list_location_bounded(
-                "s3://other/warehouse",
-                false,
-                &cancellation,
-                listing_bound(64),
-            )
-            .await
-        {
-            Ok(_) => panic!("other authority accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), FileErrorKind::Permission);
-        let mut stream = access
-            .list_location_bounded(
-                "s3://bucket/warehouse",
-                false,
-                &cancellation,
-                listing_bound(64),
-            )
-            .await
-            .unwrap();
-        cancellation.cancel();
-        assert_eq!(
-            stream.next().await.unwrap().unwrap_err().kind(),
-            FileErrorKind::Cancelled
-        );
-        assert!(stream.next().await.is_none());
-        assert_eq!(record.polls.load(Ordering::SeqCst), 0);
-    }
-
     fn memory_operator() -> FileResult<Operator> {
         Operator::new(opendal::services::Memory::default())
             .map_err(|error| map_opendal_error("initialize test memory operator", error))
+    }
+
+    // The production S3 XML parser consumes a legal large final response through
+    // the signed transport. The server owns and joins its thread on every exit.
+    #[test]
+    fn s3_listing_parses_a_response_above_the_former_body_limit() {
+        use futures::TryStreamExt;
+        use std::io::{Read, Write};
+        struct Server(Option<std::thread::JoinHandle<()>>);
+        impl Server {
+            fn join(mut self) -> std::thread::Result<()> {
+                self.0.take().expect("original S3 fixture thread").join()
+            }
+        }
+        impl Drop for Server {
+            fn drop(&mut self) {
+                if let Some(thread) = self.0.take() {
+                    // Always join during unwinding without replacing the
+                    // primary failure with a second destructor panic. Normal
+                    // completion checks the explicit join result below.
+                    let _ = thread.join();
+                }
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = Server(Some(std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(value) => break value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "S3 listing request did not arrive"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("S3 fixture accept: {error}"),
+                }
+            };
+            // Accepted sockets can inherit the listener's nonblocking mode.
+            // This thread uses blocking I/O with the original socket deadlines.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: aws4-hmac-sha256")
+            );
+            // Whitespace is valid XML and does not require an invalid S3 key.
+            let body = format!(
+                "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}<Name>warehouse</Name><Prefix>root/</Prefix><KeyCount>1</KeyCount><MaxKeys>256</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>root/one</Key><LastModified>2024-01-01T00:00:00.000Z</LastModified><ETag>\"fixture\"</ETag><Size>7</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+                " ".repeat(16 * 1024 * 1024 + 1)
+            );
+            assert!(body.len() > 16 * 1024 * 1024);
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+        })));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut config = endpoint_config(&format!("http://{address}"));
+        config.retry_max_times = Some(0);
+        config.timeout_ms = Some(10_000);
+        config.io_timeout_ms = Some(10_000);
+        let endpoint = ObjectStoreEndpointIdentity::try_new("warehouse", &config).unwrap();
+        let operator = build_object_store_operator(
+            &endpoint,
+            &static_source("listing"),
+            test_s3_http_client(),
+        )
+        .unwrap();
+        let listing = runtime.block_on(async {
+            operator
+                .lister_with("root/")
+                .limit(256)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        });
+        let server_exit = server.join();
+        assert!(
+            server_exit.is_ok(),
+            "S3 HTTP fixture failed; client result: {:?}",
+            listing.as_ref().map(Vec::len)
+        );
+        let entries = listing.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), "root/one");
     }
 
     #[test]

@@ -1561,6 +1561,53 @@ impl Drop for RawUnaryConnection {
 }
 
 impl RawUnaryClient {
+    /// Header-only rejection on this same physical connection and its original
+    /// deadline. The caller closes/joins the original owner on either outcome.
+    pub(super) fn header_rejection_until(
+        &self,
+        path: &str,
+        authorization: &str,
+        extra_name: &str,
+        extra_value: &str,
+        original_deadline: std::time::Instant,
+    ) -> Result<tonic::Status> {
+        let deadline = self
+            .original_deadline
+            .map_or(original_deadline, |original| {
+                original.min(original_deadline)
+            });
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "raw Native original header deadline expired"
+        );
+        let mut sender = self.sender.clone();
+        let outcome = self.runtime.block_on(async move {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/grpc")
+                    .header("te", "trailers")
+                    .header(header::AUTHORIZATION, authorization)
+                    .header(extra_name, extra_value)
+                    .body(())?;
+                sender = sender.ready().await?;
+                let (response, unwritten_body) = sender.send_request(request, false)?;
+                let response = response.await?;
+                let status = tonic::Status::from_header_map(response.headers())
+                    .context("early Native ingress rejection omitted grpc-status")?;
+                drop(unwritten_body);
+                Ok::<_, anyhow::Error>(status)
+            })
+            .await
+            .context("raw Native original ready/header deadline expired")?
+        })?;
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "raw Native header response completed after its original deadline"
+        );
+        Ok(outcome)
+    }
     pub(super) fn response_with_hold_until<M: Message, R: Message + Default>(
         &self,
         path: &str,

@@ -65,6 +65,17 @@ pub struct QueryOptionsParts {
     pub cache: QueryCacheOptions,
 }
 
+/// The effective processing target shared by runtime chunks and metadata batches.
+/// This is not an input rejection limit.
+pub fn chunk_size(options: Option<&QueryOptions>) -> usize {
+    options
+        .and_then(|options| options.batch_size)
+        .filter(|size| *size > 0)
+        .map(|size| size as usize)
+        .unwrap_or(4096)
+        .max(1)
+}
+
 impl QueryOptions {
     /// Records an SQL-owner decision already parsed at the ingress boundary.
     pub fn set_allow_throw_exception(&mut self, enabled: bool) {

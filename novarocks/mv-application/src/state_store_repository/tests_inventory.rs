@@ -18,7 +18,7 @@
 use super::StateStoreMvRepository;
 use super::keyed::LoadedKeyedMvProjection;
 use super::tests_definition::{projection_facts, repository, target};
-use crate::repository::{MvProjectionInventoryBound, MvRepositoryErrorKind};
+use crate::repository::MvRepositoryErrorKind;
 use novarocks_state_store_api::{
     AttemptSupervisor, Key, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
     StateStoreError, StateStoreLimits, StoreIdentity, WriteAttempt, WriteTransaction,
@@ -191,15 +191,6 @@ impl StateStore for RecordingStore {
     }
 }
 
-fn bound() -> MvProjectionInventoryBound {
-    MvProjectionInventoryBound {
-        entries: 4,
-        snapshot_bytes: 16 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-    }
-}
-
 async fn recorded_repository() -> (Arc<RecordingStore>, Arc<StateStoreMvRepository>) {
     let (store, _) = repository().await;
     let store = RecordingStore::new(store);
@@ -226,12 +217,7 @@ async fn inventory_reads_one_snapshot_in_single_record_pages_and_returns_thin_id
     let first = seed(&repository, "first").await;
     let second = seed(&repository, "second").await;
     store.reset();
-    let mut exact = bound();
-    exact.entries = 2;
-    let inventory = repository
-        .list_keyed_projection_inventory(exact)
-        .await
-        .unwrap();
+    let inventory = repository.list_keyed_projection_inventory().await.unwrap();
     store.assert_scan_closed(2);
     assert_eq!(inventory.len(), 2);
     for (entry, loaded) in inventory.iter().zip([&first, &second]) {
@@ -245,7 +231,7 @@ async fn inventory_reads_one_snapshot_in_single_record_pages_and_returns_thin_id
     // Snapshot locators do not serve as a cached projection/version read.
     assert_eq!(
         repository
-            .find_keyed_by_target_bounded(&target("first"), exact)
+            .find_keyed_by_target(&target("first"))
             .await
             .unwrap(),
         Some(first),
@@ -292,10 +278,7 @@ async fn inventory_and_exact_lookup_accept_a_stored_projection_above_one_mib() {
         .expect("close actual encoded-value read");
 
     store.reset();
-    let inventory = repository
-        .list_keyed_projection_inventory(bound())
-        .await
-        .unwrap();
+    let inventory = repository.list_keyed_projection_inventory().await.unwrap();
     store.assert_scan_closed(1);
     assert_eq!(inventory.len(), 1);
     assert_eq!(inventory[0].mv_id, loaded.projection.mv_id);
@@ -307,7 +290,7 @@ async fn inventory_and_exact_lookup_accept_a_stored_projection_above_one_mib() {
 
     store.reset();
     let exact = repository
-        .find_keyed_by_target_bounded(&inventory[0].target, bound())
+        .find_keyed_by_target(&inventory[0].target)
         .await
         .unwrap()
         .expect("exact large projection");
@@ -332,41 +315,6 @@ async fn inventory_and_exact_lookup_accept_a_stored_projection_above_one_mib() {
 }
 
 #[tokio::test]
-async fn inventory_entry_refusal_closes_the_snapshot_without_reading_the_third_page() {
-    let (store, repository) = recorded_repository().await;
-    for name in ["first", "second", "third"] {
-        seed(&repository, name).await;
-    }
-    store.reset();
-    let mut tiny = bound();
-    tiny.entries = 1;
-    let error = repository
-        .list_keyed_projection_inventory(tiny)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
-    assert!(error.message().contains("entry bound"), "{error}");
-    store.assert_scan_closed(2);
-}
-
-#[tokio::test]
-async fn inventory_snapshot_byte_refusal_closes_before_reading_the_next_page() {
-    let (store, repository) = recorded_repository().await;
-    seed(&repository, "first").await;
-    seed(&repository, "second").await;
-    store.reset();
-    let mut tiny = bound();
-    tiny.snapshot_bytes = 1;
-    let error = repository
-        .list_keyed_projection_inventory(tiny)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
-    assert!(error.message().contains("snapshot byte bound"), "{error}");
-    store.assert_scan_closed(1);
-}
-
-#[tokio::test]
 async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_insert_and_delete() {
     let (store, repository) = recorded_repository().await;
     let first = seed(&repository, "first").await;
@@ -374,7 +322,7 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
     store.reset();
     let (reached, resume) = store.pause_next_page();
     let scanner = Arc::clone(&repository);
-    let task = tokio::spawn(async move { scanner.list_keyed_projection_inventory(bound()).await });
+    let task = tokio::spawn(async move { scanner.list_keyed_projection_inventory().await });
     tokio::time::timeout(Duration::from_secs(5), reached)
         .await
         .expect("first snapshot page must be reached")
@@ -413,14 +361,14 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
     assert_eq!(inventory[1].target, target("removed"));
     assert!(
         repository
-            .find_keyed_by_target_bounded(&target("removed"), bound())
+            .find_keyed_by_target(&target("removed"))
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         repository
-            .find_keyed_by_target_bounded(&target("inserted"), bound())
+            .find_keyed_by_target(&target("inserted"))
             .await
             .unwrap()
             .is_some()
@@ -431,10 +379,7 @@ async fn inventory_continuation_keeps_its_first_snapshot_across_concurrent_inser
 async fn bounded_target_lookup_returns_the_current_exact_version_after_replacement() {
     let (_, repository) = recorded_repository().await;
     let created = seed(&repository, "first").await;
-    let inventory = repository
-        .list_keyed_projection_inventory(bound())
-        .await
-        .unwrap();
+    let inventory = repository.list_keyed_projection_inventory().await.unwrap();
     let replacement = repository
         .install_keyed_projection(
             Uuid::now_v7(),
@@ -449,7 +394,7 @@ async fn bounded_target_lookup_returns_the_current_exact_version_after_replaceme
         .expect("replace the scanned target");
     assert_ne!(created.version, replacement.version);
     let fresh = repository
-        .find_keyed_by_target_bounded(&inventory[0].target, bound())
+        .find_keyed_by_target(&inventory[0].target)
         .await
         .unwrap()
         .expect("fresh target");
@@ -465,7 +410,6 @@ async fn bounded_target_lookup_returns_the_current_exact_version_after_replaceme
 
 fn dependency_bound() -> crate::repository::MvDependencyReadBound {
     crate::repository::MvDependencyReadBound {
-        inventory: bound(),
         entries: 4,
         collection_bytes: 16 * 1024,
     }
@@ -518,76 +462,6 @@ async fn bounded_dependencies_preserve_the_exact_classification_and_sort_oracle(
     assert!(trace.ranges[1].continuation.is_some());
     assert!(trace.ranges[2].continuation.is_none());
     assert!(trace.ranges[3].continuation.is_some());
-}
-
-#[tokio::test]
-async fn bounded_dependencies_refuse_before_retaining_or_following_an_over_budget_stream() {
-    let (store, repository) = recorded_repository().await;
-    let downstream = seed(&repository, "downstream").await;
-    for (tiny, ranges, message) in [
-        (
-            crate::repository::MvDependencyReadBound {
-                entries: 1,
-                ..dependency_bound()
-            },
-            2,
-            "entry bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                collection_bytes: 1,
-                ..dependency_bound()
-            },
-            1,
-            "collection byte bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                inventory: MvProjectionInventoryBound {
-                    single_name_bytes: 1,
-                    ..bound()
-                },
-                ..dependency_bound()
-            },
-            1,
-            "single name byte bound",
-        ),
-        (
-            crate::repository::MvDependencyReadBound {
-                inventory: MvProjectionInventoryBound {
-                    continuation_token_bytes: 1,
-                    ..bound()
-                },
-                ..dependency_bound()
-            },
-            1,
-            "continuation token byte bound",
-        ),
-    ] {
-        store.reset();
-        let error = repository
-            .list_keyed_dependencies_by_downstream_bounded(&downstream, tiny)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(message), "{error}");
-        assert_dependency_scan_closed(&store, ranges);
-    }
-}
-
-#[tokio::test]
-async fn bounded_dependencies_refuse_an_incomplete_classification_inventory() {
-    let (store, repository) = recorded_repository().await;
-    let downstream = seed(&repository, "downstream").await;
-    seed(&repository, "other").await;
-    let mut tiny = dependency_bound();
-    tiny.inventory.entries = 1;
-    store.reset();
-    let error = repository
-        .list_keyed_dependencies_by_downstream_bounded(&downstream, tiny)
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
-    assert_dependency_scan_closed(&store, 4);
 }
 
 #[tokio::test]
@@ -739,5 +613,38 @@ async fn bounded_dependency_range_or_close_failures_never_publish_partial_facts(
             .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
         assert_dependency_scan_closed(&store, ranges);
+    }
+}
+
+#[tokio::test]
+async fn dependency_display_keeps_its_own_entry_and_collection_limits() {
+    let (store, repository) = recorded_repository().await;
+    let downstream = seed(&repository, "downstream").await;
+    for (bound, message) in [
+        (
+            crate::repository::MvDependencyReadBound {
+                entries: 1,
+                ..dependency_bound()
+            },
+            "entry bound",
+        ),
+        (
+            crate::repository::MvDependencyReadBound {
+                collection_bytes: 1,
+                ..dependency_bound()
+            },
+            "collection byte bound",
+        ),
+    ] {
+        store.reset();
+        let error = repository
+            .list_keyed_dependencies_by_downstream_bounded(&downstream, bound)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        let trace = store.trace.lock().unwrap();
+        assert_eq!(trace.begins, 1);
+        assert_eq!(trace.aborts, 1);
+        assert!(trace.ranges.iter().all(|request| request.page_size == 1));
     }
 }

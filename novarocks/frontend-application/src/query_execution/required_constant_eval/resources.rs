@@ -199,6 +199,31 @@ impl ValueSchemaCreationScope<CompileControlError> for RootScope<'_> {
         self.backing.reserve(bytes)
     }
 }
+/// Reuse the original statement-window author for pure planning construction.
+/// This creates no interpreter, allocator policy, window, or Work owner.
+pub(crate) fn with_root_value_creation<T>(
+    root: &WorkScope,
+    window: &ResultWindowAlias,
+    control: &dyn PureCompileControl,
+    body: impl FnOnce(&mut novarocks_type_contract::ValueSchemaCreation<'_, CompileControlError>) -> T,
+) -> Result<T, CompileControlError> {
+    let factory = root_factory(root, window, control)?;
+    let scope = factory.begin_scope()?;
+    Ok(scope.with_creation(body))
+}
+fn root_factory<'a>(
+    root: &WorkScope,
+    window: &'a ResultWindowAlias,
+    control: &'a dyn PureCompileControl,
+) -> Result<RootFactory<'a>, CompileControlError> {
+    if !window.is_for_scope(root) {
+        return Err(source(WorkError::ForeignAuthority));
+    }
+    root.check().map_err(source)?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(RootFactory { window, control })
+}
+
 impl ValueSchemaCreationFactory<CompileControlError> for RootFactory<'_> {
     type Scope<'a>
         = RootScope<'a>
@@ -249,18 +274,14 @@ impl<'a> RootResources<'a> {
         window: &'a ResultWindowAlias,
         control: &'a dyn PureCompileControl,
     ) -> Result<Self, CompileControlError> {
-        if !window.is_for_scope(root) {
-            return Err(source(WorkError::ForeignAuthority));
-        }
-        root.check().map_err(source)?;
-        control.checkpoint(CompilePhase::Validate, 0)?;
+        let factory = root_factory(root, window, control)?;
         let operations = Backing::new(window, Layout::new::<BackingGuard>().size())?;
         let failure_guard = Some(Box::new(BackingGuard {
             _backing: operations.clone(),
         }));
         Ok(Self {
             allocator: RootAllocator::new(window)?,
-            factory: RootFactory { window, control },
+            factory,
             operations,
             failure_guard,
         })

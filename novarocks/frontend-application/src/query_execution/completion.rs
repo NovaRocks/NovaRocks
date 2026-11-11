@@ -25,7 +25,6 @@ use crate::query_execution::lifecycle_plan::{
     AttemptCredentialLeaseCollector, AttemptTerminalCredentialResolver, QueryCredentialLeases,
 };
 use novarocks_query_application::api::build_string_query_result;
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_types::QueryExecutionId;
 #[cfg(test)]
@@ -179,24 +178,11 @@ impl Drop for QueryAttemptReservation {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Prepared query operations preserve their direct immediate and distributed boundary payloads."
-)]
 pub enum PreparedQueryOperation {
-    Immediate(PreparedImmediateQuery),
     /// Plain read query owned by Query Application. The carrier retains the
     /// frozen logical description and the reusable Native attempt template;
     /// it cannot be downgraded to one legacy coordinator round.
     LogicalRead(PreparedLogicalRead),
-}
-
-impl PreparedQueryOperation {
-    /// Build a completed statement result without exposing the immediate
-    /// operation constructor to application callers.
-    pub fn immediate(result: StatementResult) -> Self {
-        Self::Immediate(PreparedImmediateQuery::new(result))
-    }
 }
 
 /// Move-only plain SELECT handoff into the Query Application runtime.
@@ -251,20 +237,6 @@ impl PreparedLogicalRead {
         Arc<crate::query_execution::contract::ResolvedQueryOptions>,
     ) {
         (self.description, self.attempt_template, self.options)
-    }
-}
-
-pub struct PreparedImmediateQuery {
-    result: StatementResult,
-}
-
-impl PreparedImmediateQuery {
-    pub(crate) fn new(result: StatementResult) -> Self {
-        Self { result }
-    }
-
-    pub fn into_result(self) -> StatementResult {
-        self.result
     }
 }
 

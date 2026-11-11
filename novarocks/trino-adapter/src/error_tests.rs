@@ -88,6 +88,28 @@ fn assert_wire(error: &TrinoQueryError, name: &str) {
 }
 
 #[test]
+fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
+    for sql in [
+        "SHOW VIEWS",
+        "SHOW VIEWS FROM x",
+        "SHOW VIEWS IN x",
+        "SHOW BASIC STATS META",
+        "SHOW HISTOGRAM STATS META",
+    ] {
+        let parse = novarocks_parser::parse(sql)
+            .expect_err("retired metadata command must fail in parsing");
+        let user = parse.to_user_error(sql);
+        assert_eq!(user.code().as_str(), "sql.parse.unexpected_token", "{sql}");
+        let service = QueryServiceError::from_user_error(user);
+        let wire = query_error(TrinoErrorSource::Service {
+            error: &service,
+            sql,
+        });
+        assert_wire(&wire, "SYNTAX_ERROR");
+    }
+}
+
+#[test]
 fn query_text_too_large_has_the_frozen_trino_483_identity_without_text_classification() {
     let error = query_error(TrinoErrorSource::QueryTextTooLarge {
         message: "opaque admission fact",
@@ -114,6 +136,8 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.validate.duplicate_cte_name" => "DUPLICATE_NAMED_QUERY",
         "sql.validate.duplicate_window_name" => "DUPLICATE_WINDOW_NAME",
         "sql.validate.invalid_window_frame_bounds" => "INVALID_WINDOW_FRAME",
+        "sql.analyze.unknown_catalog" => "CATALOG_NOT_FOUND",
+        "sql.analyze.unknown_schema" => "SCHEMA_NOT_FOUND",
         "sql.analyze.unknown_table" => "TABLE_NOT_FOUND",
         "sql.analyze.unknown_column" => "COLUMN_NOT_FOUND",
         "sql.analyze.unknown_function" => "FUNCTION_NOT_FOUND",

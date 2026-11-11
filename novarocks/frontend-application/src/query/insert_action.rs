@@ -136,7 +136,10 @@ struct PreparationInput {
 pub(crate) fn prepare(
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
     input: InsertStatementInput,
-) -> Result<Box<dyn GovernedStatementAction>, String> {
+) -> Result<
+    Box<dyn GovernedStatementAction>,
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let root_capacity = input
         .context
         .execution()
@@ -166,7 +169,9 @@ pub(crate) fn prepare(
         .typed_connector_control()
         .acquire_exact_write_stack(planning_pin.control_runtime_id())
         .map_err(|e| e.to_string())?;
-    let profile = stack.session().io_profile().map_err(|e| e.to_string())?;
+    let profile = kernel
+        .snapshot_io_profile(stack.session().io_profile().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
     drop(stack);
     // Use the existing Provider profile for this source metadata backing.
     // Retained payload and Root admission keep their original owners.

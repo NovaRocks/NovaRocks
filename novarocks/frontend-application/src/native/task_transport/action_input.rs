@@ -92,17 +92,6 @@ impl NativeApplyInputPlan {
         if items.get() > budget.max_batch_items() {
             return Err("operation count exceeds batch bound");
         }
-        let mut queued_bytes = 0usize;
-        for operation in operations {
-            queued_bytes = queued_bytes
-                .checked_add(operation.queued_bytes())
-                .ok_or("operation carrier byte sum overflow")?;
-        }
-        // The original dispatcher uses the same carrier bound when forming a
-        // batch. Recheck it here before any encoded DTO or task is created.
-        if queued_bytes > budget.max_batch_encoded_bytes() {
-            return Err("operation carriers exceed batch byte bound");
-        }
         let _: super::NativeApplyKnownInputLayouts =
             super::known_input_layouts_for_composition(items, budget)
                 .map_err(|_| "operation input layout exceeds addressable backing")?;

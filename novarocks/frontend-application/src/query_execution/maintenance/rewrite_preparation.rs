@@ -61,6 +61,7 @@ enum OriginalInput {
         context: ConnectorRequestContext,
     },
     Freeze {
+        capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         recipe: Arc<RewriteCohortRecipe>,
         fact: novarocks_sql::compiler::ProviderReadFact,
         access: Option<Access>,
@@ -285,6 +286,7 @@ impl RewritePlanCpuSource for RewriteCohortCpuOriginal {
             } => prepare_rewrite_cohort_recipe(session, *cohort_id, execution, context)
                 .map(OriginalOutput::Recipe),
             OriginalInput::Freeze {
+                capacity,
                 recipe,
                 fact,
                 access,
@@ -303,6 +305,7 @@ impl RewritePlanCpuSource for RewriteCohortCpuOriginal {
                     carrier,
                     *constant_policy,
                     &control,
+                    capacity,
                 )
                 .map(OriginalOutput::Frozen)
             }
@@ -477,6 +480,7 @@ pub(crate) async fn prepare_original_cohort_in(
         incarnation: rewrite.incarnation(),
         body: Mutex::new(Some(CpuBody {
             input: OriginalInput::Freeze {
+                capacity: capacity.clone(),
                 recipe: recipe.clone(),
                 fact: facts.pop().unwrap(),
                 access: Some(access),

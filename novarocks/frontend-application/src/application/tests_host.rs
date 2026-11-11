@@ -185,20 +185,6 @@ fn execute_view_statement(
     let [novarocks_parser::ast::Statement::View(statement)] = statements.as_slice() else {
         return Err("expected typed View statement".to_string());
     };
-    if let novarocks_parser::ast::ViewStatement::Show(show) = statement {
-        let prepared = service.prepare_show_views(show, context)?;
-        let novarocks_query_application::view::ShowViewsSource::Local(_) = &prepared.source else {
-            return Err("test host has no external SHOW provider".to_string());
-        };
-        let mut prepared = prepared;
-        let novarocks_query_application::view::ShowViewsSource::Local(names) = std::mem::replace(
-            &mut prepared.source,
-            novarocks_query_application::view::ShowViewsSource::Local(Vec::new()),
-        ) else {
-            unreachable!()
-        };
-        return prepared.finish(names).map(ViewStatementResult::Query);
-    }
     service
         .execute_statement(engine, statement, context)
         .map_err(|error| error.to_string())

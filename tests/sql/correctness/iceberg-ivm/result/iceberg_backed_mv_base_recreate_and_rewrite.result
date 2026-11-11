@@ -13,9 +13,9 @@ dt	_col1
 2023-12-04	4002
 
 -- query 7
--- types	varchar	boolean	varchar
-table_name	is_active	inactive_reason
-test_mv1	true	NULL
+-- types	varchar
+name
+test_mv1
 
 -- query 11
 -- types	date	bigint

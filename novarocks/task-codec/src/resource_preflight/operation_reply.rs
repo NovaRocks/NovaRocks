@@ -28,8 +28,12 @@ use novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_SECTION_M
 /// Reuses the production batch, domain, context-membership and terminal-profile
 /// limits. Malformed protobuf is still interpreted only by prost. Repeated
 /// singular messages share counters because prost merges their repeated fields.
-pub fn check_operation_reply(raw: &[u8]) -> Result<(), ResourcePreflightError> {
-    if raw.len() > crate::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES {
+pub fn check_operation_reply(
+    raw: &[u8],
+    expected_receipts: usize,
+    response_max_encoded_bytes: usize,
+) -> Result<(), ResourcePreflightError> {
+    if raw.len() > response_max_encoded_bytes {
         return Err(ResourcePreflightError(
             "operation reply exceeds Native decoded-message limit",
         ));
@@ -39,7 +43,7 @@ pub fn check_operation_reply(raw: &[u8]) -> Result<(), ResourcePreflightError> {
         if let (1, Value::Bytes(receipt)) = (field, value) {
             checked_increment(
                 &mut receipts,
-                TransportBudget::DEFAULT.max_batch_items(),
+                expected_receipts,
                 "operation reply exceeds batch item bound",
             )?;
             let mut ack = AckCounts::default();
@@ -214,6 +218,15 @@ mod tests {
             panic!("update");
         };
         assert_eq!(ack.accepted_domains.len(), MAX_DOMAIN_UPDATES + 2);
-        assert!(check_operation_reply(&raw).is_err());
+        assert!(
+            check_operation_reply(
+                &raw,
+                TransportBudget::DEFAULT.max_batch_items(),
+                TransportBudget::DEFAULT
+                    .message_limits()
+                    .ordinary_response_max_bytes
+            )
+            .is_err()
+        );
     }
 }

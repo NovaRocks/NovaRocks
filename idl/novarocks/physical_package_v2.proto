@@ -65,6 +65,7 @@ message FragmentPackage {
   // Provider-authored source facts have a separate sparse namespace.
   repeated PublicSourceSchemaFactsDefinition public_source_schemas = 23;
   novarocks.physical_type_v2.SourceFieldTable source_fields = 24;
+  repeated SystemRelationUnits system_relation_units = 25;
 }
 message RequiredContracts { uint32 plan_contract_revision = 1; }
 message Fragment {
@@ -626,6 +627,7 @@ message PhysicalNode {
     ExchangeSourceNode exchange_source = 24;
     WriterTarget table_writer = 25;
     WriterFinish table_finish = 26;
+    SystemRelationNode system_relation = 27;
   }
 }
 message OutputPort {
@@ -798,6 +800,12 @@ enum SetOperationKind {
   SET_OPERATION_KIND_EXCEPT = 3;
 }
 message ValuesNode { repeated ExpressionIds rows = 1; }
+message SystemRelationNode { uint64 batches = 1; uint64 rows = 2; }
+message SystemRelationUnits {
+  optional uint32 node_id = 1;
+  repeated bytes units = 2;
+  repeated uint32 output_field_ids = 3;
+}
 message RepeatNode {
   repeated uint32 rollup_key_value_ids = 1;
   repeated ValueIds grouping_sets = 2;

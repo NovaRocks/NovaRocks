@@ -40,15 +40,14 @@ use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
-    ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialDomainId,
-    CredentialEpoch, CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion,
-    ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
-    ParticipationAdmissionTicketReceipt, ParticipationReceipt, ParticipationRef,
-    ParticipationState, PlanNodeId, PlanNodeSplitReceipt, QuiesceParticipationReceipt,
-    ReleaseOutcome, SplitAssignmentIntent, SplitOffer, SplitSequence, SplitWatermark,
-    TaskConvergenceReceipt, TaskConvergenceVersion, TaskDomainReceipt, TaskDomainUpdate,
-    TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
-    TerminationDetail, UpdateTaskReceipt,
+    CreateTaskReceipt, CredentialDomainId, CredentialEpoch, CredentialUpdate, DomainVersion,
+    DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId, LeaseReceipt, LeaseSequence,
+    LeaseValidFor, OperationKind, OperationOutcome, ParticipationAdmissionTicketReceipt,
+    ParticipationReceipt, ParticipationRef, ParticipationState, PlanNodeId, PlanNodeSplitReceipt,
+    QuiesceParticipationReceipt, ReleaseOutcome, SplitAssignmentIntent, SplitOffer, SplitSequence,
+    SplitWatermark, TaskConvergenceReceipt, TaskConvergenceVersion, TaskDomainReceipt,
+    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus,
+    TaskStatusVersion, TerminationDetail, UpdateTaskReceipt,
 };
 use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_models::novarocks as wire;
@@ -118,45 +117,6 @@ fn test_connector_blocking_io() -> ConnectorBlockingIoSupervisor {
 // ---------------------------------------------------------------------------
 // Fakes
 // ---------------------------------------------------------------------------
-
-/// Codec-owned content whose only observable facts are its fingerprint and
-/// its size, which is exactly what the neutral contract exposes.
-#[derive(Debug)]
-struct FakeContent {
-    fingerprint: ContentFingerprint,
-    encoded_len: usize,
-}
-
-impl FakeContent {
-    fn new(tag: u8, encoded_len: usize) -> Arc<Self> {
-        Arc::new(Self {
-            fingerprint: ContentFingerprint::from_bytes([tag; 16]),
-            encoded_len,
-        })
-    }
-}
-
-impl CodecOwnedContent for FakeContent {
-    fn fingerprint(&self) -> ContentFingerprint {
-        self.fingerprint
-    }
-
-    fn encoded_len(&self) -> usize {
-        self.encoded_len
-    }
-}
-
-struct FakeSecret;
-
-impl ConfidentialContent for FakeSecret {
-    fn encoded_len(&self) -> usize {
-        32
-    }
-
-    fn matches(&self, _other: &dyn ConfidentialContent) -> bool {
-        true
-    }
-}
 
 /// A checked Result or single-Stream package. Multi-edge control tests keep
 /// their neutral topology separate and use a real Result package here; they
@@ -311,13 +271,33 @@ impl ParticipationEstablishSource for FakeEstablish {
         _participation: ParticipationRef,
     ) -> Result<ParticipationEstablishFacts, TaskExecutionError> {
         Ok(ParticipationEstablishFacts {
-            catalog_binding: FakeContent::new(0xa1, 64),
-            initial_runtime_filter: FakeContent::new(0xa2, 32),
-            query_options: FakeContent::new(0xa3, 48),
+            catalog_binding: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.catalog",
+                novarocks_proto_models::catalog::CatalogSet::default(),
+            )),
+            initial_runtime_filter: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.filter",
+                wire::RuntimeFilterContribution::default(),
+            )),
+            query_options: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.options",
+                wire::QueryOptions {
+                    batch_size: 4096,
+                    query_timeout: 30,
+                    pipeline_dop: 1,
+                    ..Default::default()
+                },
+            )),
             initial_credential: CredentialUpdate::new(
                 CredentialDomainId::new(7),
                 CredentialEpoch::FIRST,
-                Arc::new(FakeSecret),
+                Arc::new(
+                    novarocks_task_codec::domain::WireCredential::decode(
+                        &[],
+                        novarocks_proto_codec::FieldPath::root("test.credential"),
+                    )
+                    .unwrap(),
+                ),
             ),
         })
     }
@@ -1079,24 +1059,12 @@ fn static_sink_unknown_target_fragment_fails_closed() {
 }
 
 #[test]
-fn a_static_plan_over_the_descriptor_bound_is_refused_before_any_task_exists() {
+fn a_static_plan_beyond_the_old_descriptor_bound_is_built() {
     let processes = backends(1);
     let schedule = chain_schedule(&[0], &[0]);
-    let error = build_graph(
-        &schedule,
-        &chain_edges(),
-        &processes,
-        TransportBudget::DEFAULT.max_descriptor_encoded_bytes(),
-    )
-    .expect_err("a static plan larger than one descriptor can never be created");
-    assert!(
-        matches!(
-            error,
-            TaskExecutionError::Capacity(CapacityBound::DescriptorBytes { limit, .. })
-                if limit == TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
-        ),
-        "an inherent size limit is a deterministic error, not backpressure: {error:?}"
-    );
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 16 * 1024 * 1024 + 1)
+        .expect("message and preparation owners govern large immutable plans");
+    assert!(graph.stages().len() > 0);
 }
 
 fn protocol_frozen_fragments(
@@ -1591,7 +1559,18 @@ fn split_update(node: i32, sequence: u64, no_more: bool) -> TaskDomainUpdate {
     TaskDomainUpdate::SplitAssignment(SplitAssignmentIntent::new(
         PlanNodeId::new(node).expect("a nonnegative plan node"),
         SplitOffer::batch(sequence, sequence, no_more).expect("a contiguous split batch"),
-        FakeContent::new(0xb1, 128),
+        Arc::new(novarocks_task_codec::domain::WireContent::new(
+            b"test.split_assignment",
+            novarocks_proto_models::connector_read::SplitAssignment {
+                plan_node_id: node,
+                splits: vec![novarocks_proto_models::connector_read::ScheduledSplit {
+                    sequence_id: sequence.get(),
+                    plan_node_id: node,
+                    split: None,
+                }],
+                no_more_splits: no_more,
+            },
+        )),
     ))
 }
 
@@ -5848,6 +5827,11 @@ fn an_establish_accounts_for_its_query_options_payload() {
     let facts = FakeEstablish
         .facts_for(participation)
         .expect("the fake source has facts");
+    let expected = OPERATION_FIXED_BYTES
+        + facts.catalog_binding.encoded_len()
+        + facts.initial_runtime_filter.encoded_len()
+        + facts.query_options.encoded_len()
+        + facts.initial_credential.material().encoded_len();
     grant_admission(&mut owner, MonotonicInstant::ORIGIN);
     let intent = owner
         .establish_intent(facts, MonotonicInstant::ORIGIN)
@@ -5856,13 +5840,13 @@ fn an_establish_accounts_for_its_query_options_payload() {
 
     assert_eq!(
         intent.queued_bytes(),
-        OPERATION_FIXED_BYTES + 64 + 32 + 48 + 32,
+        expected,
         "the bounded queue must account for every establish payload"
     );
 }
 
 #[test]
-fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
+fn one_operation_above_the_grouping_target_still_leaves_the_queue() {
     let participation = ParticipationRef::new(
         execution_id(),
         FrontendProcessId::new_v7(),
@@ -5884,22 +5868,30 @@ fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
         )
         .expect("an establish is produced")
         .expect("the establish intent exists");
-    let transport = TransportBudget::new(1, 255, 1, 1, 255, 2, 1020, 1, 2, Duration::from_secs(1))
-        .expect("the process has one ordinary and one control retained window");
+    let transport = TransportBudget::new(
+        1,
+        255,
+        novarocks_task_codec::TransportMessageLimits::DEFAULT,
+        1,
+        256 * 1024 * 1024,
+        2,
+        512 * 1024 * 1024,
+        1,
+        2,
+        Duration::from_secs(1),
+    )
+    .expect("the process has one ordinary and one control retained window");
     let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
-    let actual = intent.queued_bytes();
-    let error = dispatcher
+    assert!(intent.queued_bytes() > transport.batch_target_encoded_bytes());
+    dispatcher
         .enqueue(intent, MonotonicInstant::ORIGIN)
-        .expect_err("an oversized queue-side carrier must fail before it can become head-of-line");
-    assert_eq!(
-        error,
-        TaskExecutionError::Capacity(CapacityBound::OperationBytes { limit: 255, actual })
-    );
+        .unwrap();
+    assert_eq!(dispatcher.take_batch().unwrap().operations().len(), 1);
 }
 
 #[test]
 fn a_full_target_queue_holds_later_creates_back_instead_of_being_exceeded() {
-    // Every create carries a static plan near the descriptor bound, so a
+    // Every create carries a substantial static plan, so a
     // moderate fan-out to one backend fills that backend's queue. A full
     // queue is backpressure, not a failure: the creates that do not fit wait,
     // unmeasured again and unfrozen, and follow as capacity is released.
@@ -12507,8 +12499,8 @@ fn actual_batch_limit_keeps_unselected_sources_and_restores_the_same_head() {
     let original = TransportBudget::DEFAULT;
     let transport = TransportBudget::new(
         2,
-        original.max_batch_encoded_bytes(),
-        original.max_descriptor_encoded_bytes(),
+        original.batch_target_encoded_bytes(),
+        original.message_limits(),
         original.max_query_backend_queued_operations(),
         original.max_query_backend_queued_bytes(),
         original.max_backend_queued_operations(),

@@ -76,15 +76,26 @@ fn lower_atom(
     columns: &BTreeMap<ColumnId, ProviderPredicateColumn>,
     predicate: &TypedExpr,
 ) -> Option<(u32, Domain)> {
+    lower_atom_with_column(predicate, |expression| {
+        lower_column(scan, columns, expression)
+    })
+}
+
+/// Shared exact atom author. Each caller supplies its original column identity
+/// and complete type checks; this function never resolves names or scans.
+pub(super) fn lower_atom_with_column(
+    predicate: &TypedExpr,
+    resolve_column: impl Fn(&TypedExpr) -> Option<ProviderPredicateColumn>,
+) -> Option<(u32, Domain)> {
     match &unnest(predicate).kind {
         ExprKind::BinaryOp {
             left, op, right, ..
         } => {
-            let (column, op, literal) = if let Some(column) = lower_column(scan, columns, left) {
+            let (column, op, literal) = if let Some(column) = resolve_column(left) {
                 (column, *op, right.as_ref())
             } else {
                 (
-                    lower_column(scan, columns, right)?,
+                    resolve_column(right)?,
                     reverse_comparison(*op),
                     left.as_ref(),
                 )
@@ -96,7 +107,7 @@ fn lower_atom(
             ))
         }
         ExprKind::IsNull { expr, negated } => {
-            let column = lower_column(scan, columns, expr)?;
+            let column = resolve_column(expr)?;
             Some((
                 column.ordinal,
                 if *negated {
@@ -111,7 +122,7 @@ fn lower_atom(
             list,
             negated,
         } if !negated && !list.is_empty() => {
-            let column = lower_column(scan, columns, expr)?;
+            let column = resolve_column(expr)?;
             let values = list
                 .iter()
                 .map(|literal| lower_literal(literal, column.value_type))

@@ -19,7 +19,7 @@
 
 use crate::{
     ParseError, Span,
-    ast::{CreateView, DropView, ShowCreateView, ShowViews, Statement, ViewStatement},
+    ast::{CreateView, DropView, ShowCreateView, Statement, ViewStatement},
 };
 
 use super::{StatementParser, query};
@@ -41,11 +41,6 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
         && parser.peek_word(2, "VIEW")
     {
         return parse_show_create(parser).map(Some);
-    }
-    if parser.current_is_word("SHOW")
-        && (parser.peek_word(1, "VIEWS") || parser.peek_word(1, "VIEW"))
-    {
-        return parse_show(parser).map(Some);
     }
     Ok(None)
 }
@@ -102,24 +97,6 @@ fn parse_drop(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
     Ok(Statement::View(ViewStatement::Drop(DropView {
         if_exists,
         name,
-        span,
-    })))
-}
-
-fn parse_show(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
-    let start = parser.consume_word("SHOW")?.start();
-    parser.consume_word("VIEWS")?;
-    let database = if parser.consume_if_word("FROM") || parser.consume_if_word("IN") {
-        Some(parser.parse_object_name()?)
-    } else {
-        None
-    };
-    if parser.current_is_word("LIKE") || parser.current_is_word("WHERE") {
-        return Err(parser.unexpected("unfiltered SHOW VIEWS"));
-    }
-    let span = Span::new(start, parser.current_offset());
-    Ok(Statement::View(ViewStatement::Show(ShowViews {
-        database,
         span,
     })))
 }

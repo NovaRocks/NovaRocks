@@ -61,7 +61,10 @@ pub(crate) fn resolve_target(
     statement: &OwnedMutationStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     match statement {
         OwnedMutationStatement::Update(statement) => super::mutation_flow::resolve_update_target(
             state,
@@ -98,7 +101,7 @@ pub trait MutationEngine: Send + Sync {
         input: MutationStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     >;
 }
 
@@ -464,7 +467,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         input: MutationStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::mutation_action::prepare(self.clone(), input)
     }

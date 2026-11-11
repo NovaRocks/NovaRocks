@@ -305,7 +305,8 @@ shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fi
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 ORDER BY id;
 
 -- query 57
-SELECT table_name FROM information_schema.materialized_views WHERE table_schema = 'iru7_${uuid0}' AND table_name = 'agg_mv';
+SELECT name FROM system.metadata.materialized_views
+WHERE catalog_name = 'ice_hms_${uuid0}' AND schema_name = 'iru7_${uuid0}' AND name = 'agg_mv';
 
 -- query 58
 -- Spark's prepare action creates exactly v1, v2 and v3, with no views.
@@ -316,11 +317,12 @@ WHERE table_catalog = 'ice_hms_${uuid0}' AND table_schema = 'iru7_${uuid0}'
 ORDER BY table_name;
 
 -- query 59
--- Preserve the catalog's explicit refusal instead of accepting an empty list.
--- @expect_sql_code=query.execution.unsupported
--- @expect_sql_phase=Execution
--- @expect_error=TrinoError { name=NOT_SUPPORTED type=USER_ERROR code=13 }
-SHOW VIEWS;
+-- HMS has no view enumeration capability, so it supplies no VIEW rows.
+-- Static expectation only: the private HMS fixture is not run in this task.
+SELECT table_name
+FROM ice_hms_${uuid0}.information_schema.tables
+WHERE table_schema = 'iru7_${uuid0}' AND table_type = 'VIEW'
+ORDER BY table_name;
 
 -- query 60
 -- @cleanup=true
