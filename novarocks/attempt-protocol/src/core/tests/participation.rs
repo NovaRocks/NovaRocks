@@ -98,6 +98,7 @@ struct Fixture {
     participation: ParticipationRef,
     inputs: u64,
     units: usize,
+    queue_control: bool,
 }
 
 impl Fixture {
@@ -138,6 +139,7 @@ impl Fixture {
             core: Core::new(start).unwrap(),
             inputs: 0,
             units,
+            queue_control: true,
         };
         fixture.prepare(state);
         let owner = fixture.core.execution.owner(participation).unwrap();
@@ -314,7 +316,7 @@ impl Fixture {
                 input,
                 &mut Turn {
                     units: Units(self.units),
-                    control: true,
+                    control: self.queue_control,
                 },
             )
             .unwrap()
@@ -333,6 +335,17 @@ impl Fixture {
         );
         assert!(stop.stop_producing);
         assert!(stop.effect.is_none());
+    }
+
+    fn expect_effect(&mut self) -> AttemptEffect {
+        let mut found = None;
+        self.drain(|effect| {
+            assert!(
+                found.replace(effect).is_none(),
+                "unexpected additional effect"
+            );
+        });
+        found.expect("expected one protocol effect")
     }
 
     fn drain(&mut self, mut observe: impl FnMut(AttemptEffect)) {
@@ -591,4 +604,208 @@ fn stop_dispatches_the_original_actor_abort_after_terminal_cleanup() {
                 .is_none()
         );
     }
+}
+
+#[test]
+fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
+    use novarocks_coordination_contract::{
+        AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
+    };
+    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+
+    let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+    fixture.queue_control = false;
+    let sources = fixture.sources;
+    let activation = fixture.activation;
+    let qa_reply = |fixture: &mut Fixture, token, decision| {
+        fixture.step(
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token,
+                    decision: Ok(decision),
+                },
+            }),
+        )
+    };
+
+    let sent_at = fixture.now;
+    assert!(
+        fixture
+            .step(sources.actor, AttemptInput::StartProtocol)
+            .effect
+            .is_none()
+    );
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("expected the first QA admission request");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: begin,
+        request: AttemptAuthorization::BeginAdmission(first),
+    } = port.body
+    else {
+        panic!("expected QA BeginAdmission for the original participation");
+    };
+    let operation_id = first.envelope().operation_id();
+    let ticket_valid_for = Duration::from_secs(10);
+    assert_eq!(first.participation(), fixture.participation);
+    assert_eq!(first.valid_for().get(), ticket_valid_for);
+    let issue = AttemptAuthorizationRef::new(id(830));
+    let Some(AttemptEffect {
+        id: admit,
+        body:
+            EffectBody::AdmitQueuedInput {
+                operation,
+                generation,
+                lane: DispatchLane::Lifecycle,
+                ..
+            },
+        ..
+    }) = qa_reply(
+        &mut fixture,
+        begin,
+        AttemptAuthorizationDecision::AdmissionStarted(issue),
+    )
+    .effect
+    else {
+        panic!("expected Lifecycle admission for the original request");
+    };
+    assert_eq!(operation.operation_id(), operation_id);
+    assert_eq!(generation.admission_effect(), admit);
+    fixture.drain(|effect| panic!("admission has no WC grant yet: {effect:?}"));
+
+    let grant = QueuedInputGrantRef::new(id(831), generation);
+    assert!(
+        fixture
+            .step(
+                sources.actor,
+                AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                    operation: operation_id,
+                    grant,
+                    queued_bytes: operation.queued_bytes(),
+                }),
+            )
+            .effect
+            .is_none()
+    );
+    let AttemptEffect {
+        id: send,
+        body: EffectBody::SendBatch { batch, .. },
+        ..
+    } = fixture.expect_effect()
+    else {
+        panic!("expected the original Admission dispatch");
+    };
+    assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+    assert_eq!(batch.operations.len(), 1);
+    assert_eq!(batch.operations[0].operation_id(), operation_id);
+    fixture.drain(|effect| panic!("admission still awaits Worker: {effect:?}"));
+    assert!(
+        fixture
+            .step(
+                sources.native,
+                AttemptInput::Executor(ExecutorFact::SendStarted {
+                    effect: send,
+                    started_at: sent_at,
+                }),
+            )
+            .effect
+            .is_none()
+    );
+    fixture.drain(|effect| panic!("send start does not produce a ticket: {effect:?}"));
+
+    // The conservative send-time window is already over. The Worker may
+    // still hold this ticket for its full validity after the receipt arrived.
+    let received_at = sent_at.saturating_add(Duration::from_secs(11));
+    fixture.now = received_at;
+    let ticket = ParticipationAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+        fixture.participation,
+        first.valid_for(),
+    );
+    assert!(
+        fixture
+            .step(
+                sources.native,
+                AttemptInput::Executor(ExecutorFact::Operation(reply(
+                    &operation,
+                    generation,
+                    worker(AckPayload::AdmissionTicket(ticket)),
+                ))),
+            )
+            .effect
+            .is_none()
+    );
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("the original QA issue must settle even with an expired ticket");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: settle,
+        request:
+            AttemptAuthorization::SettleAdmission {
+                issue: settled_issue,
+                participation,
+                operation_id: settled_operation,
+                outcome: Some(OperationOutcome::Accepted),
+                receipt: Some(settled_ticket),
+                prior_transport_unknown: false,
+            },
+    } = port.body
+    else {
+        panic!("expected the original positive Worker receipt at QA settlement");
+    };
+    assert_eq!(settled_issue, issue);
+    assert_eq!(settled_operation, operation_id);
+    assert_eq!(participation, fixture.participation);
+    assert_eq!(settled_ticket, ticket);
+    assert!(
+        qa_reply(
+            &mut fixture,
+            settle,
+            AttemptAuthorizationDecision::AdmissionGranted,
+        )
+        .effect
+        .is_none()
+    );
+    fixture.drain(|effect| panic!("an expired ticket cannot authorize Establish: {effect:?}"));
+    let owner = fixture.core.execution.owner(participation).unwrap();
+    assert_eq!(owner.state(), ParticipationState::Absent);
+    assert!(!owner.is_released());
+
+    let reissue_at = received_at.saturating_add(ticket_valid_for);
+    assert_eq!(fixture.core.next_deadline(), Some(reissue_at));
+    fixture.now = received_at.saturating_add(Duration::from_millis(9_999));
+    assert!(
+        fixture
+            .step(sources.capacity, AttemptInput::CapacityReleased)
+            .effect
+            .is_none()
+    );
+    fixture.drain(|effect| panic!("the Worker may still hold the original ticket: {effect:?}"));
+    assert_eq!(fixture.core.next_deadline(), Some(reissue_at));
+
+    fixture.now = reissue_at;
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("the original Worker expiry must wake fresh QA admission");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: fresh_token,
+        request: AttemptAuthorization::BeginAdmission(fresh),
+    } = port.body
+    else {
+        panic!("expected a fresh admission once the original ticket must be gone");
+    };
+    assert_ne!(fresh_token, begin);
+    assert_ne!(fresh.envelope().operation_id(), operation_id);
+    assert_eq!(fresh.participation(), participation);
+    assert_eq!(fresh.valid_for(), first.valid_for());
+    assert_eq!(
+        fresh.native_compatibility_id(),
+        first.native_compatibility_id()
+    );
+    assert_eq!(
+        fresh.admission_epoch_capability(),
+        first.admission_epoch_capability()
+    );
 }
