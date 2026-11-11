@@ -26,10 +26,10 @@ use crate::{
     },
 };
 use novarocks_attempt_protocol::{
-    effect::{EffectBody, OperationIntent as ProtocolIntent},
+    effect::{EffectBody, OperationIntent as ProtocolIntent, TaskDomainIntent},
     start::PayloadRef,
 };
-use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
+use novarocks_execution_contract::{TaskDomainUpdate, TaskIdentity, TaskOperationId, UpdateTask};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -137,6 +137,48 @@ impl FrozenSendRequests {
                         .ok_or(SendBindingError::MissingRequest)?
                         .resolve(passive)?,
                 )
+            }
+            ProtocolIntent::UpdateTask {
+                envelope,
+                identity,
+                domains,
+            } if domains.iter().all(|domain| {
+                matches!(
+                    domain,
+                    TaskDomainIntent::OpenExchangeEdges { .. }
+                        | TaskDomainIntent::CloseExchangeDestination { .. }
+                )
+            }) =>
+            {
+                // Exchange updates have no external payload to recover. The
+                // frozen Core values are the complete immutable request.
+                let domains = domains
+                    .iter()
+                    .map(|domain| match domain {
+                        TaskDomainIntent::OpenExchangeEdges { version, edges } => {
+                            TaskDomainUpdate::OpenExchangeEdges {
+                                version: *version,
+                                edges: edges.clone(),
+                            }
+                        }
+                        TaskDomainIntent::CloseExchangeDestination {
+                            version,
+                            edge,
+                            destination,
+                        } => TaskDomainUpdate::CloseExchangeDestination {
+                            version: *version,
+                            edge: *edge,
+                            destination: *destination,
+                        },
+                        _ => unreachable!("original inline exchange domains"),
+                    })
+                    .collect();
+                let request = UpdateTask::try_new(envelope.operation_id(), *identity, domains)
+                    .map_err(|_| SendBindingError::WrongRequest)?;
+                if request.envelope() != *envelope {
+                    return Err(SendBindingError::WrongRequest);
+                }
+                OperationIntent::UpdateTask(Arc::new(request))
             }
             _ => {
                 let operation = passive.operation_id();
@@ -530,5 +572,68 @@ mod tests {
             encode_operation(&projected, &facts).unwrap(),
             encode_operation(&existing, &facts).unwrap()
         );
+    }
+
+    #[test]
+    fn core_exchange_updates_preserve_original_wire_request_on_replay() {
+        use novarocks_execution_contract::{DomainVersion, EdgeOpenVersion, ExchangeEdgeId};
+        use novarocks_types::{StageId, TaskId};
+
+        let execution =
+            QueryExecutionId::new(QueryId::new(0x7a5c, 7), AttemptId::new(1).unwrap()).unwrap();
+        let task = |ordinal| {
+            TaskIdentity::new(
+                execution,
+                StageId::new(ordinal).unwrap(),
+                TaskId::new(ordinal).unwrap(),
+                BackendProcessId::new_v7(),
+            )
+        };
+        let (producer, destination) = (task(1), task(2));
+        let edge = ExchangeEdgeId::new(3).unwrap();
+        let wire = AttemptWireFacts {
+            native_compatibility_id: NativeCompatibilityId::new([1; 32]),
+        };
+        let requests = FrozenSendRequests::default();
+        for (passive, original) in [
+            (
+                TaskDomainIntent::OpenExchangeEdges {
+                    version: EdgeOpenVersion::FIRST,
+                    edges: vec![edge],
+                },
+                TaskDomainUpdate::OpenExchangeEdges {
+                    version: EdgeOpenVersion::FIRST,
+                    edges: vec![edge],
+                },
+            ),
+            (
+                TaskDomainIntent::CloseExchangeDestination {
+                    version: DomainVersion::FIRST,
+                    edge,
+                    destination,
+                },
+                TaskDomainUpdate::CloseExchangeDestination {
+                    version: DomainVersion::FIRST,
+                    edge,
+                    destination,
+                },
+            ),
+        ] {
+            let operation = TaskOperationId::new_v7();
+            let original = UpdateTask::try_new(operation, producer, vec![original]).unwrap();
+            let passive = ProtocolIntent::UpdateTask {
+                envelope: original.envelope(),
+                identity: producer,
+                domains: Arc::from([passive]),
+            };
+            let original =
+                encode_operation(&OperationIntent::UpdateTask(Arc::new(original)), &wire).unwrap();
+            for _ in 0..2 {
+                let projected = requests.resolve(&passive).unwrap();
+                assert_eq!(projected.operation_id(), operation);
+                assert_eq!(projected.queued_bytes(), passive.queued_bytes());
+                assert_eq!(encode_operation(&projected, &wire).unwrap(), original);
+            }
+        }
     }
 }
