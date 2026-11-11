@@ -673,7 +673,7 @@ impl LocalExchanger {
             })
             .transpose()?;
         let position_file = matches!(
-            self.partition,
+            &self.partition_spec,
             LocalExchangePartitionSpec::HierarchicalFileInput(_)
         );
         for row in 0..chunk.len() {
