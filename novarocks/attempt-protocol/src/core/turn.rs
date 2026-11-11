@@ -590,10 +590,9 @@ impl Core {
                         "authorization close awaited its original QA reply",
                     ));
                 };
+                // The original QA result input must retire before the next
+                // gate settlement can borrow that same result position.
                 self.accept_qa(port, result)?;
-                if self.turn.phase == Phase::ClosingGate {
-                    self.drive_gate_close(context, result)?;
-                }
             }
             Phase::Converge if timer => {
                 if self.diagnostic_work_due() {

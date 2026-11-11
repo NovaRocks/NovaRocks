@@ -4775,7 +4775,12 @@ mod tests {
         );
         assert_eq!(stale.selection, InputSelection::Only(sources.qa));
         assert_eq!(core.authorizations.preparation(), GatePreparation::Applying);
-        step(&mut core, sources.qa, 5, actual(guard), None);
+        let replied = step(&mut core, sources.qa, 5, actual(guard), None);
+        assert!(replied.effect.is_none());
+        assert_eq!(replied.selection, InputSelection::Only(sources.actor));
+        assert_eq!(core.authorizations.preparation(), GatePreparation::Applying);
+        let closed = step(&mut core, sources.actor, 6, AttemptInput::Timer, None);
+        assert!(closed.effect.is_none());
         assert_eq!(
             core.authorizations.preparation(),
             GatePreparation::Applied { ready: true }
@@ -4783,35 +4788,35 @@ mod tests {
 
         // The unused authorization result is not return of the original WC grant.
         assert_eq!(core.execution.dispatcher().queued_items(), 1);
-        let stopped = step(&mut core, sources.actor, 6, AttemptInput::Timer, None);
+        let stopped = step(&mut core, sources.actor, 7, AttemptInput::Timer, None);
         assert!(
             matches!(stopped.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
             if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(novarocks_coordination_contract::AttemptTerminal::Failed(_))))
         );
-        step(&mut core, sources.actor, 7, AttemptInput::Timer, None);
+        step(&mut core, sources.actor, 8, AttemptInput::Timer, None);
         step(
             &mut core,
             sources.actor,
-            8,
+            9,
             AttemptInput::Timer,
             Some(AttemptSourceCut {
                 source: sources.observation,
                 tail: None,
             }),
         );
-        step(&mut core, sources.actor, 9, AttemptInput::Timer, None);
-        let published = step(&mut core, sources.actor, 10, AttemptInput::Timer, None);
+        step(&mut core, sources.actor, 10, AttemptInput::Timer, None);
+        let published = step(&mut core, sources.actor, 11, AttemptInput::Timer, None);
         let mut release = step(
             &mut core,
             sources.publication,
-            11,
+            12,
             AttemptInput::Executor(ExecutorFact::PublicationApplied {
                 effect: published.effect.unwrap().id,
                 result: Ok(PublicationApplied::ProtocolBatch { published: true }),
             }),
             None,
         );
-        for n in 12..17 {
+        for n in 13..18 {
             if !matches!(
                 release.effect,
                 Some(AttemptEffect {
