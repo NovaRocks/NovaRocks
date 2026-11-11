@@ -605,14 +605,17 @@ fn ctas_sql(table: &str) -> String {
 }
 
 fn require_absent_table(control: &mut SqlSession, name: &str) -> Result<()> {
-    let tables = control.execute(format!("SHOW TABLES FROM {CATALOG}.managed_objects"))?;
+    let tables = control.execute(format!(
+        "SELECT table_name FROM {CATALOG}.information_schema.tables \
+         WHERE table_schema = 'managed_objects'"
+    ))?;
     ensure!(
         tables.is_result_set() && tables.columns.len() == 1,
-        "SHOW TABLES did not return its original result shape"
+        "catalog table listing returned an unexpected result shape"
     );
     for row in tables.rows {
         let [sql::TrinoValue::Text(table)] = row.as_slice() else {
-            anyhow::bail!("unexpected SHOW TABLES result carrier");
+            anyhow::bail!("catalog table listing returned a non-text table name");
         };
         ensure!(table != name, "CTAS unexpectedly published {name}");
     }

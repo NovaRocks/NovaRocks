@@ -45,8 +45,7 @@ fn mixed_merge_sql(catalog: &str, database: &str, dop: i32) -> String {
     format!(
         "MERGE INTO {catalog}.{database}.logical_mix_{dop} t \
          USING {catalog}.{database}.logical_mix_source_{dop} s ON t.id=s.id \
-         WHEN MATCHED AND s.id=3 THEN DELETE \
-         WHEN MATCHED THEN UPDATE SET v=s.v \
+         WHEN MATCHED AND s.id<>3 THEN UPDATE SET v=s.v \
          WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,s.v)"
     )
 }
@@ -262,8 +261,8 @@ fn mixed_actions(
         seeded.len() == 1 && seeded[0].1 == 4,
         "mixed DELETE/Replace must select positions from one original file: {seeded:?}"
     );
-    // Separate physical source files contribute Delete and Replace to the
-    // same target. The independent logical counts are U=2/D=1/I=3.
+    // Separate physical source files match rows in the same original target
+    // file. The first statement has U=2/I=3 and one matched no-action row.
     for rows in [
         "(1, 101), (10, 1000)",
         "(2, 202), (11, 1100)",
@@ -280,17 +279,42 @@ fn mixed_actions(
         &mixed_merge_sql(catalog, database, dop),
         &before,
         dop,
-        6,
+        5,
         None,
         dop_observation::Geometry::MixedSameFile,
-        "mixed MERGE U=2/D=1/I=3 across one old file",
+        "mixed MERGE U=2/I=3 across one old file",
+    )?;
+    assert_rows(
+        control,
+        &table,
+        &[
+            (1, 101),
+            (2, 202),
+            (3, 30),
+            (4, 40),
+            (10, 1000),
+            (11, 1100),
+            (12, 1200),
+        ],
+        "matched no-action row survives the mixed MERGE",
+    )?;
+    mutate(
+        control,
+        &table,
+        &format!(
+            "MERGE INTO {table} t USING {source} s ON t.id=s.id \
+             WHEN MATCHED AND s.id=3 THEN DELETE"
+        ),
+        1,
+        1,
+        "delete one more position from the same original file",
     )?;
     let deletes = writer_live_files(&control.execute(format!(
         "SELECT content, file_path, file_format, record_count FROM {table}$files WHERE content=1"
     ))?)?;
     anyhow::ensure!(
         deletes.len() == 1 && deletes[0].2 == "PUFFIN" && deletes[0].3 == 3,
-        "same-file Delete and Replace require one cumulative DV with all three positions: {deletes:?}"
+        "same-file Replace followed by Delete requires one cumulative DV with three positions: {deletes:?}"
     );
     assert_rows(
         control,
