@@ -454,7 +454,10 @@ async fn keyed_data_finish<'a>(
         .to_owned();
     let received = ConnectorPreparedWriteSet::try_new(
         1,
-        vec![(target.ordinal(), fragment.clone())],
+        fragments
+            .into_iter()
+            .map(|fragment| (target.ordinal(), fragment))
+            .collect(),
         &plan.expected_targets(),
     )
     .unwrap()
