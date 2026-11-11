@@ -18,7 +18,7 @@
 //! Frozen protocol facts and original payload ownership from one bound manifest.
 
 use super::{
-    bridge::qa::AttemptQaBridge,
+    bridge::{qa::AttemptQaBridge, root_control::PendingRootControls},
     creation::PricedTaskCreation,
     error::TaskExecutionError,
     graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
@@ -44,7 +44,8 @@ use novarocks_execution_contract::{
 };
 use novarocks_query_application::api::PlanSeal;
 use novarocks_query_application::coordination::{
-    NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
+    AcceptedRootStatusSender, AcceptedRootStatusSource, NativeAttemptDrive,
+    ReplacementWorkerAdmissionEvidence,
 };
 use novarocks_result_contract::PerKind;
 use novarocks_task_codec::TransportBudget;
@@ -135,6 +136,45 @@ impl ManifestAttemptInputs {
             backends: backends.into(),
         })
     }
+
+    /// Reserve the one public status and protocol-fact projections while the
+    /// dormant owner still holds the same frozen Native manifest. The active
+    /// owner will bind their publishers to the original QA drive.
+    pub(crate) fn prepare_publications(
+        self,
+    ) -> Result<PreparedManifestAttempt, TaskExecutionError> {
+        let (protocol, protocol_facts) = AttemptProtocolFactsPublisher::for_graph(
+            self.plan,
+            &self.graph,
+            &self.writers,
+            &self.summary_sources,
+        )?;
+        let (root_sender, root_status, root_controls) =
+            PendingRootControls::project(self.graph.root_identity());
+        Ok(PreparedManifestAttempt {
+            inputs: self,
+            publications: ManifestPublications {
+                root_sender,
+                root_status: Some(root_status),
+                root_controls,
+                protocol,
+                protocol_facts: Some(protocol_facts),
+            },
+        })
+    }
+}
+
+pub(crate) struct ManifestPublications {
+    pub(crate) root_sender: AcceptedRootStatusSender,
+    pub(crate) root_status: Option<AcceptedRootStatusSource>,
+    pub(crate) root_controls: Arc<PendingRootControls>,
+    pub(crate) protocol: AttemptProtocolFactsPublisher,
+    pub(crate) protocol_facts: Option<AttemptProtocolFactsReceiver>,
+}
+
+pub(crate) struct PreparedManifestAttempt {
+    inputs: ManifestAttemptInputs,
+    pub(crate) publications: ManifestPublications,
 }
 
 pub(crate) struct AttemptPlanPolicy {
@@ -158,8 +198,7 @@ pub(crate) struct AttemptManifestProjection {
     pub(crate) start: AttemptStart,
     pub(crate) members: Arc<[FrozenMember]>,
     pub(crate) backends: Arc<[BackendProcessDescriptor]>,
-    pub(super) protocol: AttemptProtocolFactsPublisher,
-    pub(crate) protocol_facts: AttemptProtocolFactsReceiver,
+    pub(crate) publications: ManifestPublications,
     pub(crate) creations: BTreeMap<PayloadRef, PricedTaskCreation>,
     pub(crate) requests: FrozenSendRequests,
     pub(crate) qa: AttemptQaBridge,
@@ -169,8 +208,8 @@ impl AttemptManifestProjection {
     /// Move the already bound graph's creation seeds and retain the Establish
     /// backing with one payload identity sequence. Core receives only the
     /// frozen protocol projection.
-    pub(crate) fn from_manifest_inputs(
-        inputs: ManifestAttemptInputs,
+    pub(crate) fn from_prepared_manifest(
+        prepared: PreparedManifestAttempt,
         establish: &dyn ParticipationEstablishSource,
         activation: AttemptActivationInputs<'_>,
         policy: AttemptPlanPolicy,
@@ -178,7 +217,6 @@ impl AttemptManifestProjection {
         next_payload: &mut NonZeroU64,
     ) -> Result<Self, TaskExecutionError> {
         let ManifestAttemptInputs {
-            plan,
             graph,
             compatibility,
             transport,
@@ -188,7 +226,8 @@ impl AttemptManifestProjection {
             preparing_positions,
             members,
             backends,
-        } = inputs;
+            ..
+        } = prepared.inputs;
         let identity = activation.drive.identity();
         if identity.execution() != graph.execution_id() {
             return Err(TaskExecutionError::Schedule(
@@ -225,8 +264,6 @@ impl AttemptManifestProjection {
                     })
             })
             .collect::<Result<_, _>>()?;
-        let (protocol, protocol_facts) =
-            AttemptProtocolFactsPublisher::for_graph(plan, &graph, &writers, &summary_sources)?;
         let mut next = *next_payload;
         let (graph, creations) = graph.into_attempt_graph(&mut next)?;
         let (establish_material, establish) = AttemptEstablishMaterial::project(
@@ -283,8 +320,7 @@ impl AttemptManifestProjection {
             start,
             members,
             backends,
-            protocol,
-            protocol_facts,
+            publications: prepared.publications,
             creations,
             requests: FrozenSendRequests::with_establish(establish.clone()),
             qa: AttemptQaBridge::new(Arc::new(activation.drive.clone()), compatibility, establish),

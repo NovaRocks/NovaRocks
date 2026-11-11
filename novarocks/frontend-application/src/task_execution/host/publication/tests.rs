@@ -216,7 +216,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             transport_withdrawal::AttemptEffectEnvelope,
         },
         task_execution::{
-            bridge::root_control::{RootControlRequests, reply_kind},
+            bridge::root_control::{PendingRootControls, RootControlRequests, reply_kind},
             host::{
                 adapter::descriptor,
                 failure_publication::FailurePublications,
@@ -257,7 +257,6 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         AttemptActionId, AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody,
     };
     use novarocks_execution_contract::ParticipationRef;
-    use novarocks_query_application::coordination::accepted_root_status_projection_with_control_port;
     use novarocks_types::FrontendProcessId;
     use std::{
         future::ready,
@@ -436,6 +435,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         )
         .unwrap_or_else(|_| panic!("original root actor"));
     let (mut publication, _, root, _) = fixture();
+    let (sender, status, pending_controls) = PendingRootControls::project(root);
     let activation = publication.activation;
     let binding =
         RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
@@ -487,6 +487,10 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         Waker::from(wakes.clone()),
     )
     .unwrap_or_else(|_| panic!("original ordered root Source"));
+    assert_eq!(
+        pending_controls.bind(ingress.root_binding(), &requests),
+        Err(ObservationError::Closed)
+    );
     requests.bind_ingress(&ingress);
     let ordered_host = OrderedObservationHost::new(ingress.clone());
     let key = StreamKey {
@@ -522,8 +526,20 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         ingress.retire_stream(key),
         Err(ObservationError::UnknownStream)
     );
-    let (sender, status) =
-        accepted_root_status_projection_with_control_port(root, requests.clone());
+    assert!(status.begin_terminal_control_request().is_err());
+    let different_binding =
+        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
+    assert_eq!(
+        pending_controls.bind(&different_binding, &requests),
+        Err(ObservationError::InvalidRootControl)
+    );
+    pending_controls
+        .bind(ingress.root_binding(), &requests)
+        .unwrap();
+    assert_eq!(
+        pending_controls.bind(ingress.root_binding(), &requests),
+        Err(ObservationError::Busy)
+    );
     sender
         .publish_attempt_observation(
             TaskStatus::try_new(

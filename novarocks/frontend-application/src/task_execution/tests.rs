@@ -864,6 +864,7 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
 
 #[tokio::test]
 async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
+    use super::host::publication::PublicationRecord;
     use super::manifest_projection::{
         AttemptActivationInputs, AttemptManifestProjection, AttemptPlanPolicy,
         ManifestAttemptInputs,
@@ -871,8 +872,9 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
     use novarocks_attempt_protocol::{
         AttemptCore, Core,
         config::CoordinationBudgets,
+        effect::Publication,
         ids::IdSeed,
-        input::AttemptSourceId,
+        input::{AttemptSourceId, PublicationApplied},
         publication::{ProtocolMembership, ProtocolPublication},
         start::AttemptSources,
     };
@@ -956,15 +958,6 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         participants,
     )
     .unwrap();
-    let activation = logical.activate_initial().await.unwrap();
-    let drive = logical.native_attempt_drive();
-    let authorization_limits = drive.authorization_limits();
-    assert_eq!(
-        authorization_limits.establish_per_participation,
-        establish_limit
-    );
-    assert_eq!(authorization_limits.abort_per_participation, abort_limit);
-
     let root = manifest.root();
     let plan_seal = manifest.plan();
     let task_count = manifest.tasks().len();
@@ -981,18 +974,32 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         })
         .collect::<Vec<_>>();
     let mut next = NonZeroU64::new(10).unwrap();
-    let inputs = ManifestAttemptInputs::freeze(
+    let mut prepared = ManifestAttemptInputs::freeze(
         &manifest,
         &mut plans,
         compatibility,
         TransportBudget::DEFAULT,
     )
+    .unwrap()
+    .prepare_publications()
     .unwrap();
+    let root_status = prepared.publications.root_status.take().unwrap();
+    let mut protocol_facts = prepared.publications.protocol_facts.take().unwrap();
+    assert!(root_status.begin_terminal_control_request().is_err());
     drop(manifest);
+
+    let activation = logical.activate_initial().await.unwrap();
+    let drive = logical.native_attempt_drive();
+    let authorization_limits = drive.authorization_limits();
+    assert_eq!(
+        authorization_limits.establish_per_participation,
+        establish_limit
+    );
+    assert_eq!(authorization_limits.abort_per_participation, abort_limit);
     let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
     let lease = super::lease::RequestedLeaseDurations::DEFAULT;
-    let mut projected = AttemptManifestProjection::from_manifest_inputs(
-        inputs,
+    let mut projected = AttemptManifestProjection::from_prepared_manifest(
+        prepared,
         &FakeEstablish,
         AttemptActivationInputs {
             drive: &drive,
@@ -1087,15 +1094,21 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         selected_failure: None,
         root_success_sealed: false,
     };
-    assert!(
-        projected
-            .protocol
-            .publish_core_batch(activation, &initial)
-            .unwrap()
+    let mut publication = PublicationRecord::new(
+        activation,
+        projected.publications.root_sender,
+        projected.publications.protocol,
+        None,
+        None,
+    );
+    assert_eq!(
+        publication
+            .publish(&Publication::ProtocolBatch(initial), None)
+            .unwrap(),
+        PublicationApplied::ProtocolBatch { published: true },
     );
     assert!(
-        projected
-            .protocol_facts
+        protocol_facts
             .take_changes(activation, root, plan_seal)
             .unwrap()
             .unwrap()

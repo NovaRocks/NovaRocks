@@ -35,10 +35,13 @@ use novarocks_coordination_contract::{
     AttemptRequestToken, AttemptToLogical, AttemptToLogicalBody, LogicalToAttempt,
     LogicalToAttemptBody,
 };
-use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+use novarocks_execution_contract::{SafeDetail, TaskIdentity, failure::FailureProjection};
 use novarocks_query_application::{
     api::QueryExecutionError,
-    coordination::{AcceptedRootControlPort, AcceptedRootControlRequest},
+    coordination::{
+        AcceptedRootControlPort, AcceptedRootControlRequest, AcceptedRootStatusSender,
+        AcceptedRootStatusSource, accepted_root_status_projection_with_control_port,
+    },
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use std::{
@@ -46,6 +49,65 @@ use std::{
     num::NonZeroU64,
     sync::{Arc, Mutex, OnceLock, Weak},
 };
+
+/// The dormant projection can return the original QA status source before
+/// `run` receives its activation drive and installs the exact attempt host.
+/// This endpoint owns no request slot, writer credit, or activation.
+#[derive(Debug)]
+pub(crate) struct PendingRootControls {
+    root: TaskIdentity,
+    original: OnceLock<Weak<RootControlRequests>>,
+}
+
+impl PendingRootControls {
+    pub(crate) fn project(
+        root: TaskIdentity,
+    ) -> (
+        AcceptedRootStatusSender,
+        AcceptedRootStatusSource,
+        Arc<Self>,
+    ) {
+        let endpoint = Arc::new(Self {
+            root,
+            original: OnceLock::new(),
+        });
+        let (sender, source) =
+            accepted_root_status_projection_with_control_port(root, endpoint.clone());
+        (sender, source, endpoint)
+    }
+
+    pub(crate) fn bind(
+        &self,
+        binding: &RootControlBinding,
+        original: &Arc<RootControlRequests>,
+    ) -> Result<(), ObservationError> {
+        if binding.root() != self.root || !original.matches(binding) {
+            return Err(ObservationError::InvalidRootControl);
+        }
+        let state = original
+            .state
+            .lock()
+            .expect("original root-control request");
+        if state.closed || state.ingress.is_none() {
+            return Err(ObservationError::Closed);
+        }
+        self.original
+            .set(Arc::downgrade(original))
+            .map_err(|_| ObservationError::Busy)
+    }
+}
+
+impl AcceptedRootControlPort for PendingRootControls {
+    fn enqueue_root_control(
+        &self,
+        request: AcceptedRootControlRequest,
+    ) -> Result<(), AcceptedRootControlRequest> {
+        let Some(original) = self.original.get().and_then(Weak::upgrade) else {
+            return Err(request);
+        };
+        original.enqueue_root_control(request)
+    }
+}
 
 struct Request {
     token: AttemptRequestToken,
