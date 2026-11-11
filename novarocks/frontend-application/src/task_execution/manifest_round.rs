@@ -17,7 +17,6 @@
 
 //! TaskRound assembly from one exact application-bound Task manifest.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::task_protocol_config::DispatchBudget;
@@ -41,6 +40,7 @@ use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
+use super::manifest_projection::ManifestProtocolFacts;
 use super::round::{AcknowledgementObserver, TaskRound};
 use super::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
 use super::split_transport::SplitDeliveryBridge;
@@ -134,58 +134,27 @@ pub(crate) fn assemble_manifest_round(
 ) -> Result<ManifestAssembledRound, TaskExecutionError> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    // Freeze declaration before submissions are consumed; never infer writers
-    // from the subset of Task statuses that happens to report writer facts.
-    let writers = manifest
-        .writer_cohorts()
-        .map(|cohort| cohort.task())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut summary_sources = novarocks_result_contract::PerKind::empty();
-    for (kind, task, _) in manifest.summary_sources() {
-        if summary_sources.get(kind).is_none() {
-            summary_sources.insert(kind, std::collections::BTreeSet::new());
-        }
-        summary_sources
-            .get_mut(kind)
-            .expect("declared kind")
-            .insert(task);
-    }
     let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
+    let ManifestProtocolFacts {
+        writers,
+        summary_sources,
+        admission_epochs,
+        preparing_positions,
+    } = ManifestProtocolFacts::freeze(manifest, transport.wire.native_compatibility_id)?;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
 
     let mut backends = Vec::with_capacity(manifest.participations().len());
-    let mut admission_epochs = BTreeMap::new();
-    let mut preparing_positions = BTreeMap::new();
     let mut convergence_targets = Vec::with_capacity(manifest.participations().len());
     for participation in manifest.participations() {
         let backend = participation.backend();
-        if backend.native_compatibility_id() != transport.wire.native_compatibility_id {
-            return Err(TaskExecutionError::Schedule(format!(
-                "manifest backend {} compatibility differs from the attempt wire identity",
-                backend.process_id()
-            )));
-        }
         backends.push(backend.target().descriptor().clone());
-        preparing_positions.insert(
-            backend.process_id(),
-            backend.target().descriptor().preparing_positions(),
-        );
         convergence_targets.push(NativeAttemptConvergenceTarget::new(
             participation.participation(),
             backend.endpoint().clone(),
         ));
-        if admission_epochs
-            .insert(backend.process_id(), backend.admission_epoch_capability())
-            .is_some()
-        {
-            return Err(TaskExecutionError::Schedule(format!(
-                "manifest repeats admission authority for backend {}",
-                backend.process_id()
-            )));
-        }
     }
 
     let acks = TaskAckIntake::new(Arc::clone(&wake));

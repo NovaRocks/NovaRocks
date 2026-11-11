@@ -863,6 +863,148 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
 }
 
 #[test]
+fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
+    use super::manifest_projection::{AttemptManifestProjection, AttemptPlanPolicy};
+    use novarocks_attempt_protocol::{
+        AttemptCore, Core,
+        config::CoordinationBudgets,
+        effect::OperationIntent as ProtocolIntent,
+        ids::IdSeed,
+        input::AttemptSourceId,
+        start::{AttemptSources, AttemptStart},
+    };
+    use novarocks_coordination_contract::{
+        AttemptActivation, AttemptActivationIdentity, AttemptAuthorization,
+        AttemptAuthorizationLimits, AttemptCompletionPolicy, AttemptLifecyclePolicy,
+    };
+    use novarocks_execution_contract::operation::OperationEnvelope;
+
+    let schedule = chain_schedule(&[0, 1], &[1]);
+    let edges = chain_edges();
+    let processes = backends(2);
+    let mut plans = FakePlans::new(&schedule, &edges, 64);
+    let fragments = protocol_frozen_fragments(&schedule, &mut plans).unwrap();
+    let manifest = TaskManifestBinding::protocol_fixture_for_test(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
+        fragments,
+    )
+    .unwrap();
+    let compatibility = manifest.participations()[0]
+        .backend()
+        .native_compatibility_id();
+    let mut next = NonZeroU64::new(10).unwrap();
+    let projected = AttemptManifestProjection::freeze(
+        &manifest,
+        &mut plans,
+        &FakeEstablish,
+        AttemptPlanPolicy {
+            compatibility,
+            authorization_limits: AttemptAuthorizationLimits {
+                activation: AttemptActivationIdentity::from_parts(1, manifest.execution(), 1),
+                establish_per_participation: NonZeroUsize::MIN,
+                abort_per_participation: NonZeroUsize::MIN,
+            },
+            coordination: CoordinationBudgets::DEFAULT,
+            transport: TransportBudget::DEFAULT,
+            retry: Default::default(),
+            initial_lease: Duration::from_secs(30),
+            steady_lease: Duration::from_secs(5),
+        },
+        Box::new([]),
+        &mut next,
+    )
+    .unwrap();
+    let plan = projected.plan;
+    assert_eq!(plan.graph.root, manifest.root());
+    assert_eq!(plan.graph.tasks.len(), manifest.tasks().len());
+    assert_eq!(plan.graph.edges.len(), edges.len());
+    assert_eq!(
+        plan.establish_material.len(),
+        manifest.participations().len()
+    );
+    assert_eq!(
+        next.get() as usize,
+        10 + projected.creations.len() + plan.establish_material.len()
+    );
+    for participant in manifest.participations() {
+        let backend = participant.backend();
+        assert_eq!(
+            plan.admission_epochs[&backend.process_id()],
+            backend.admission_epoch_capability()
+        );
+        assert_eq!(
+            plan.preparation_positions[&backend.process_id()].get(),
+            backend.target().descriptor().preparing_positions()
+        );
+        assert!(
+            !projected
+                .creations
+                .contains_key(&plan.establish_material[&participant.participation()].material)
+        );
+    }
+    for task in plan.graph.tasks.values() {
+        assert_eq!(
+            projected.creations[&task.creation.resource].seed.identity(),
+            task.identity
+        );
+    }
+    let (&participation, quote) = plan.establish_material.first_key_value().unwrap();
+    let operation_id = TaskOperationId::new_v7();
+    let envelope =
+        OperationEnvelope::with_default_wait(operation_id, OperationKind::UpdateParticipation);
+    let original = projected
+        .establish
+        .for_authorization(
+            &ProtocolIntent::EstablishParticipation {
+                envelope,
+                participation,
+                ticket: AdmissionTicketId::try_from_bytes([41; 16]).unwrap(),
+                initial_lease_sequence: LeaseSequence::INITIAL,
+                initial_lease_valid_for: LeaseValidFor::new(plan.initial_lease).unwrap(),
+                material: quote.material,
+                queued_bytes: quote.queued_bytes,
+            },
+            AttemptAuthorization::Establish {
+                participation,
+                operation_id,
+            },
+        )
+        .unwrap();
+    assert_eq!(original.envelope(), envelope);
+    let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
+    <Core as AttemptCore>::new(AttemptStart {
+        activation: AttemptActivation {
+            identity: plan.authorization_limits.activation,
+            policy: AttemptLifecyclePolicy {
+                completion: AttemptCompletionPolicy::AcceptedRootSuccessSeal,
+                retain_diagnostics: true,
+            },
+            inherited_admissions: Box::new([]),
+        },
+        plan,
+        ids: IdSeed::new(1, 100),
+        initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
+        sources: AttemptSources {
+            actor: source(1),
+            publication: source(2),
+            qa: source(3),
+            process: source(4),
+            native: source(5),
+            observation: source(6),
+            capacity: source(7),
+            membership: source(8),
+            mailbox: [4; 4],
+        },
+        observe_dev_root: false,
+    })
+    .expect("Core accepts the exact bound manifest projection");
+}
+
+#[test]
 fn manifest_projection_keeps_creation_seeds_with_their_exact_quotes() {
     use novarocks_execution_contract::operation::OperationEnvelope;
 

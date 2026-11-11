@@ -49,6 +49,7 @@ pub(crate) mod feedback_pump;
 pub(crate) mod graph;
 pub(crate) mod intent;
 pub(crate) mod lease;
+pub(crate) mod manifest_projection;
 pub(crate) mod manifest_round;
 pub(crate) mod operation;
 pub(crate) mod participation_convergence;
