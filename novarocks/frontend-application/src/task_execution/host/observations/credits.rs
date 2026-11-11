@@ -23,17 +23,65 @@ use super::{
     read_progress::{ReadProgressInput, ReadProgressReceipt},
 };
 use novarocks_attempt_protocol::input::ReadProgressSnapshot;
-use novarocks_control_runtime::obligation::{
-    OwnedPositionObligation, ReservationObligation, WorkObligation,
+use novarocks_control_runtime::{
+    obligation::{OwnedPositionObligation, ReservationObligation, WorkObligation},
+    transaction::RuntimeError,
 };
-use novarocks_control_runtime_core::owned_storage::OwnedSlotKind;
+use novarocks_control_runtime_core::{
+    capacity::{CapacityError, ReservationResources, ResourceVector},
+    identity::DimensionId,
+    owned_storage::{OwnedSlotKind, OwnedSlotNeed},
+};
 use novarocks_execution_contract::ParticipationRef;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
     ops::Bound::{Excluded, Unbounded},
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
+
+/// The observation byte window is prepaid on the same ledger as its real
+/// input positions. It is independent of the send queue/encoding dimensions.
+pub(crate) const OBSERVATION_WINDOW_BYTES: DimensionId = DimensionId::new(12).unwrap();
+
+impl ObservationBudget {
+    pub(crate) fn byte_window(self) -> Result<ResourceVector, RuntimeError> {
+        self.byte_windows(NonZeroUsize::MIN)
+    }
+
+    /// The process maximum follows the original FE scope inventory. Opening
+    /// a scope and admitting one actual Source still require their own owners.
+    pub(crate) fn byte_windows(self, scopes: NonZeroUsize) -> Result<ResourceVector, RuntimeError> {
+        let bytes = u64::try_from(self.total_bytes)
+            .ok()
+            .zip(u64::try_from(scopes.get()).ok())
+            .and_then(|(bytes, scopes)| bytes.checked_mul(scopes))
+            .ok_or(CapacityError::Overflow)?;
+        Ok(ResourceVector::new([(OBSERVATION_WINDOW_BYTES, bytes)])?)
+    }
+}
+
+/// Retains the byte share once the split's Input positions move to their
+/// actual owners. Abandoned Drop leaves the original ledger row unresolved.
+struct ObservationWindow {
+    original: ReservationObligation,
+    bytes: ResourceVector,
+}
+
+impl ObservationWindow {
+    fn retire_after_exit(&mut self) -> Result<(), ObservationError> {
+        if !self.bytes.is_empty() {
+            self.original
+                .release_quota(&self.bytes)
+                .map_err(|error| ObservationError::Runtime(error.into()))?;
+            self.bytes = ResourceVector::default();
+        }
+        self.original
+            .finish()
+            .map_err(|error| ObservationError::Runtime(error.into()))
+    }
+}
 
 #[derive(Default)]
 struct ReadClaims {
@@ -61,6 +109,7 @@ struct Credits {
     participants: BTreeSet<ParticipationRef>,
     data: Vec<OwnedPositionObligation>,
     control: Option<OwnedPositionObligation>,
+    window: Option<ObservationWindow>,
     data_bytes: usize,
     control_live: bool,
     streams: BTreeMap<StreamKey, ReadClaims>,
@@ -80,8 +129,8 @@ pub(crate) struct ObservationCredits {
 }
 
 impl ObservationCredits {
-    /// Bind the real Input positions against the original Source Work before
-    /// publishing the pool. The fixed roster bounds the waiter/claim inventory.
+    /// Split the paid positions and bytes from the same original Source Work
+    /// before publishing the pool. The roster bounds the waiter inventory.
     pub(crate) fn bind(
         budget: ObservationBudget,
         participants: impl IntoIterator<Item = ParticipationRef>,
@@ -92,16 +141,31 @@ impl ObservationCredits {
         if !reservation.belongs_to_bound_work(work.scope(), work.id()) {
             return Err(ObservationError::Budget);
         }
-        let participants = participants.into_iter().collect();
+        let bytes = budget
+            .byte_window()
+            .map_err(|error| ObservationError::Runtime(error.into()))?;
+        let original = reservation
+            .split_next(&ReservationResources::new(
+                bytes.clone(),
+                OwnedSlotNeed {
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ))
+            .map_err(|error| ObservationError::Runtime(error.into()))?;
+        let mut window = ObservationWindow { original, bytes };
         let mut positions = Vec::with_capacity(budget.total_positions);
         for _ in 0..budget.total_positions {
-            // Refusal drops only positions that were still unbound.
-            positions.push(
-                reservation
-                    .take_position(OwnedSlotKind::Input)
-                    .map_err(|error| ObservationError::Runtime(error.into()))?,
-            );
+            match window.original.take_position(OwnedSlotKind::Input) {
+                Ok(position) => positions.push(position),
+                Err(error) => {
+                    drop(positions);
+                    window.retire_after_exit()?;
+                    return Err(ObservationError::Runtime(error.into()));
+                }
+            }
         }
+        let participants = participants.into_iter().collect();
         for position in &mut positions {
             position.bind().expect("new original observation position");
         }
@@ -112,6 +176,7 @@ impl ObservationCredits {
                 participants,
                 data: positions,
                 control,
+                window: Some(window),
                 data_bytes: 0,
                 control_live: false,
                 streams: BTreeMap::new(),
@@ -349,7 +414,7 @@ impl ObservationCredits {
     /// Only the original Source calls this after all publishers, queued
     /// values, and runtime consumers have actually exited.
     pub(crate) fn retire_after_exit(&self) -> Result<(), ObservationError> {
-        let (mut positions, mut control) = {
+        let (mut positions, mut control, mut window) = {
             let mut state = self.state.lock().expect("observation credit owner");
             state.closed = true;
             if state.retiring
@@ -360,7 +425,11 @@ impl ObservationCredits {
                 return Err(ObservationError::Busy);
             }
             state.retiring = true;
-            (std::mem::take(&mut state.data), state.control.take())
+            (
+                std::mem::take(&mut state.data),
+                state.control.take(),
+                state.window.take(),
+            )
         };
         let retired = (|| {
             while let Some(position) = positions.pop() {
@@ -375,6 +444,9 @@ impl ObservationCredits {
                 control = Some(original);
                 return Err(ObservationError::Runtime(error.into()));
             }
+            if let Some(window) = window.as_mut() {
+                window.retire_after_exit()?;
+            }
             Ok(())
         })();
         let mut state = self.state.lock().expect("observation credit owner");
@@ -385,6 +457,7 @@ impl ObservationCredits {
         } else {
             state.data = positions;
             state.control = control;
+            state.window = window;
         }
         retired
     }

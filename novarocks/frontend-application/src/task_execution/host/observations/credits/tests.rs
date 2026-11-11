@@ -41,22 +41,30 @@ fn stream() -> StreamKey {
     }
 }
 
-fn pool(streams: &[StreamKey], data_bytes: usize) -> (Arc<ObservationCredits>, ScopeHandle) {
-    let generation = Generation::new(1).unwrap();
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let budget = ObservationBudget {
+fn budget(data_bytes: usize) -> ObservationBudget {
+    ObservationBudget {
         queued_frames: 1,
         total_positions: 3,
         max_frame_bytes: 100,
         total_bytes: data_bytes + 10,
         control_bytes: 10,
-    };
+    }
+}
+
+fn pool(
+    streams: &[StreamKey],
+    data_bytes: usize,
+) -> (Arc<ObservationCredits>, ScopeHandle, RuntimeLedger) {
+    let budget = budget(data_bytes);
+    let generation = Generation::new(1).unwrap();
+    let quota = budget.byte_window().unwrap();
+    let ledger = RuntimeLedger::new(quota.clone());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
     let (mut work, mut reservation) = scope
         .reserve_next(
             generation,
             ReservationResources::new(
-                ResourceVector::default(),
+                quota,
                 OwnedSlotNeed {
                     work_headers: 1,
                     inputs: budget.total_positions,
@@ -83,7 +91,7 @@ fn pool(streams: &[StreamKey], data_bytes: usize) -> (Arc<ObservationCredits>, S
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
     reservation.finish().unwrap();
-    (credits, scope)
+    (credits, scope, ledger)
 }
 
 #[derive(Default)]
@@ -104,11 +112,58 @@ fn ready_credit(polled: Poll<Result<ObservationCredit, ObservationError>>) -> Ob
 }
 
 #[test]
+fn insufficient_observation_bytes_leave_the_original_positions_untouched() {
+    let budget = budget(100);
+    let generation = Generation::new(1).unwrap();
+    let ledger = RuntimeLedger::new(budget.byte_window().unwrap());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let (mut work, mut reservation) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    work.start().unwrap();
+    let original = reservation.resources().unwrap();
+    assert!(matches!(
+        ObservationCredits::bind(budget, [stream().participation], &work, &mut reservation),
+        Err(ObservationError::Runtime(_))
+    ));
+    assert_eq!(reservation.resources().unwrap(), original);
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    reservation.finish().unwrap();
+    scope.close_external().unwrap();
+    ledger.reap_scope_ready(scope.id(), 16).unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
+}
+
+#[test]
 fn data_bytes_and_positions_wake_reads_without_spending_the_control_share() {
     let first = stream();
     let second = stream();
     let third = stream();
-    let (credits, scope) = pool(&[first, second, third], 160);
+    let (credits, scope, ledger) = pool(&[first, second, third], 160);
+    let used = || {
+        ledger
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES])
+            .unwrap()
+            .unwrap()
+            .used[0]
+    };
+    assert_eq!(used(), 170);
     let original_storage = scope.snapshot().unwrap().storage;
     let wakes = Arc::new(Wakes::default());
     let waker = Waker::from(wakes.clone());
@@ -134,11 +189,13 @@ fn data_bytes_and_positions_wake_reads_without_spending_the_control_share() {
     assert!(credits.stream_claims_exited(first));
     let third_credit = ready_credit(credits.poll_read(third, &mut cx));
     assert_eq!(credits.retire_after_exit(), Err(ObservationError::Busy));
+    assert_eq!(used(), 170);
     drop((second_credit, third_credit));
     assert!(credits.stream_claims_exited(second));
     assert!(credits.stream_claims_exited(third));
     assert_eq!(scope.snapshot().unwrap().storage, original_storage);
     credits.retire_after_exit().unwrap();
+    assert_eq!(used(), 0);
     assert_eq!(scope.snapshot().unwrap().storage + 3, original_storage);
 }
 
@@ -169,7 +226,7 @@ fn slot_return_wakes_other_readers_when_a_wake_synchronously_reregisters() {
         generation: NonZeroU64::new(3).unwrap(),
         ..original
     };
-    let (credits, _) = pool(&[original, reentrant, later], 100);
+    let (credits, _, _) = pool(&[original, reentrant, later], 100);
     let credit = ready_credit(credits.poll_read(original, &mut Context::from_waker(Waker::noop())));
     let retry = Arc::new(Wakes::default());
     let reentry = Arc::new(ReentrantReader {
@@ -205,7 +262,7 @@ fn slot_return_wakes_other_readers_when_a_wake_synchronously_reregisters() {
 fn retirement_requires_exact_generation_and_wait_cancellation() {
     let first = stream();
     let second = stream();
-    let (credits, scope) = pool(&[first, second], 100);
+    let (credits, scope, _) = pool(&[first, second], 100);
     let mut cx = Context::from_waker(Waker::noop());
     let first_credit = ready_credit(credits.poll_read(first, &mut cx));
     assert!(credits.poll_read(second, &mut cx).is_pending());
@@ -255,7 +312,7 @@ fn wake_panic_keeps_the_original_return_unacknowledged() {
 
     let first = stream();
     let second = stream();
-    let (credits, scope) = pool(&[first, second], 100);
+    let (credits, scope, _) = pool(&[first, second], 100);
     let credit = ready_credit(credits.poll_read(first, &mut Context::from_waker(Waker::noop())));
     let original_storage = scope.snapshot().unwrap().storage;
     let waker = Waker::from(Arc::new(PanicWake));
@@ -312,7 +369,7 @@ fn read_progress_retires_only_the_generations_covered_by_each_actual_occurrence(
         generation: NonZeroU64::new(2).unwrap(),
         ..old
     };
-    let (credits, scope) = pool(&[old, replacement], 300);
+    let (credits, scope, _) = pool(&[old, replacement], 300);
     let runtime = ActorRuntime::new();
     let actor = ActorId::new(1).unwrap();
     let source = ActorId::new(2).unwrap();

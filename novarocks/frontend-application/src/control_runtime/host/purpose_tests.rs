@@ -1137,7 +1137,14 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         }
     }
 
-    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let budget = ObservationBudget {
+        queued_frames: 1,
+        total_positions: 3,
+        max_frame_bytes: 2048,
+        control_bytes: 512,
+        total_bytes: 4608,
+    };
+    let ledger = RuntimeLedger::new(budget.byte_window().unwrap());
     let initial = Generation::new(1).unwrap();
     let scope = ledger.open_scope_next(None, initial).unwrap();
     let (work, mut capacity) = scope
@@ -1275,18 +1282,11 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
     let mut observation = None;
     let mut ordered = None;
     if already_published {
-        let budget = ObservationBudget {
-            queued_frames: 1,
-            total_positions: 3,
-            max_frame_bytes: 2048,
-            control_bytes: 512,
-            total_bytes: 4608,
-        };
         let (mut owner, mut positions) = scope
             .reserve_next(
                 initial,
                 ReservationResources::new(
-                    ResourceVector::default(),
+                    budget.byte_window().unwrap(),
                     OwnedSlotNeed {
                         work_headers: 1,
                         inputs: budget.total_positions,

@@ -274,8 +274,8 @@ impl Drop for InputSlotLoan {
     }
 }
 /// An uncloneable claim in the SAME existing observation Source byte window.
-/// Actual holder Drop refunds that original window. It does not fund WC bytes
-/// or transport-ledger dimensions. Refusal preserves the same live claim.
+/// Actual holder Drop returns its bytes to the prepaid observation window.
+/// Refusal preserves the same live claim.
 pub(crate) trait ObservationByteLoan: Send {
     fn reserved_bytes(&self) -> usize;
     fn shrink_to(&mut self, charged_bytes: usize) -> Result<(), ObservationError>;

@@ -224,7 +224,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
                     MetadataRetirementRefusal, ObservationBudget, ObservationError,
                     ObservationMetadataLayout, ObservationMetadataObligation,
                     OrderedObservationInput, RootControlBinding, StreamKey,
-                    credits::ObservationCredits,
+                    credits::{OBSERVATION_WINDOW_BYTES, ObservationCredits},
                     read_progress::ReadProgressInput,
                     source::{BoundObservationSource, ObservationMetadataAuthor},
                     tests::ManualClock,
@@ -245,7 +245,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         transaction::RuntimeLedger,
     };
     use novarocks_control_runtime_core::{
-        capacity::{ReservationResources, ResourceVector},
+        capacity::ReservationResources,
         effect::EffectKind,
         identity::{ActorId, Generation, Tick},
         mailbox::{InputClass, InputEnvelope},
@@ -368,10 +368,6 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         }
     }
 
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let generation = Generation::new(1).unwrap();
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let bridge = ledger.open_scope_next(None, generation).unwrap();
     let budget = ObservationBudget {
         queued_frames: 1,
         total_positions: 3,
@@ -379,11 +375,22 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         control_bytes: 512,
         total_bytes: 2560,
     };
+    let ledger = RuntimeLedger::new(budget.byte_window().unwrap());
+    let used_bytes = || {
+        ledger
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES])
+            .unwrap()
+            .unwrap()
+            .used[0]
+    };
+    let generation = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let bridge = ledger.open_scope_next(None, generation).unwrap();
     let (mut observations, mut positions) = scope
         .reserve_next(
             generation,
             ReservationResources::new(
-                ResourceVector::default(),
+                budget.byte_window().unwrap(),
                 OwnedSlotNeed {
                     work_headers: 1,
                     inputs: budget.total_positions,
@@ -630,6 +637,7 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
             let retained = scope.snapshot().unwrap().storage;
             assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
             assert_eq!(scope.snapshot().unwrap().storage, retained);
+            assert_eq!(used_bytes(), budget.total_bytes as u64);
         }
         requests.deliver(token, &mut publication).unwrap();
         reply.await.unwrap().unwrap();
@@ -644,6 +652,11 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
     );
     let original_storage = scope.snapshot().unwrap().storage;
     assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+    assert_eq!(
+        used_bytes(),
+        0,
+        "the frame and canonical request backing exited"
+    );
     let before_metadata = scope.snapshot().unwrap().storage;
     assert!(before_metadata < original_storage);
     ingress.close_after_exit().unwrap();

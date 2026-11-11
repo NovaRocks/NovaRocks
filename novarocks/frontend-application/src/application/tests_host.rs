@@ -239,12 +239,31 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn role_metrics_sample_the_installed_control_ledger_and_omit_it_after_exit() {
-    use crate::metrics::{FrontendMetricsRegistry, render_metrics};
+    use crate::{
+        metrics::{FrontendMetricsRegistry, render_metrics},
+        task_execution::host::observations::{
+            ObservationBudget, credits::OBSERVATION_WINDOW_BYTES,
+        },
+    };
 
     let mut host = open_host(Some(state_store_input())).await.unwrap();
-    let registry =
-        FrontendMetricsRegistry::with_role_observations(None, Some(&host.attempt_runtime()))
+    let registry = {
+        let runtime = host.attempt_runtime();
+        let capacity = runtime
+            .ledger()
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES])
+            .unwrap()
             .unwrap();
+        let scope_limit = host
+            .execution_runtime_owner
+            .native_capacity_profile
+            .policy()
+            .scope_limit();
+        let per_source = ObservationBudget::for_task_attempt().total_bytes;
+        assert_eq!(capacity.limits[0], scope_limit as u64 * per_source as u64);
+        assert_eq!(capacity.used[0], 0);
+        FrontendMetricsRegistry::with_role_observations(None, Some(&runtime)).unwrap()
+    };
     let running = render_metrics(&registry).unwrap();
     host.shutdown().await.unwrap();
     drop(host);

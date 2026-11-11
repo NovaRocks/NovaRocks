@@ -86,6 +86,7 @@ pub(crate) struct FrontendControlRuntimeConfig {
     pub(crate) pollers: NonZeroUsize,
     pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) transport: TransportBudget,
+    pub(crate) workload_scope_limit: NonZeroUsize,
     pub(crate) history: Option<HistoryCapture>,
 }
 #[derive(Debug)]
@@ -197,8 +198,16 @@ impl FrontendControlRuntime {
             .map_err(FrontendControlStartError::Transport)?;
         let clock: Arc<dyn Clock> = Arc::new(FrontendClock(config.clock));
         let observation = RuntimeObservation::new(Some(clock.clone()));
+        let observation_windows =
+            crate::task_execution::host::observations::ObservationBudget::for_task_attempt()
+                .byte_windows(config.workload_scope_limit)
+                .map_err(FrontendControlStartError::Ledger)?;
+        let limits = layout
+            .process_limits()
+            .checked_add(&observation_windows)
+            .map_err(|error| FrontendControlStartError::Ledger(error.into()))?;
         let ledger = RuntimeLedger::with_keyed_families_and_observation(
-            layout.process_limits(),
+            limits,
             layout.keyed_families(),
             [],
             config.history.clone(),

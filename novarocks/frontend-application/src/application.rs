@@ -1884,6 +1884,13 @@ impl FrontendApplicationHost {
                 pollers,
                 clock: Arc::clone(&host.execution_runtime_owner.clock),
                 transport: host.query_runtime.transport_budget.into_codec(),
+                workload_scope_limit: NonZeroUsize::new(
+                    host.execution_runtime_owner
+                        .native_capacity_profile
+                        .policy()
+                        .scope_limit(),
+                )
+                .expect("the installed workload scope inventory is nonempty"),
                 history: None,
             },
             &host.data_runtime,
