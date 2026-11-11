@@ -908,6 +908,7 @@ fn schedule(detail: &str) -> TaskExecutionError {
 
 #[cfg(test)]
 mod tests {
+    mod observation;
     mod participation;
     mod tasks;
 
