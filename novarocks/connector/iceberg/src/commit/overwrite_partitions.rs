@@ -78,23 +78,17 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
                 "Overwrite partitions output must use the staged default partition spec",
             ));
         }
-        let parent = metadata
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(metadata, parent, view.artifacts());
+        let (sources, live) = view.observe_live_sources().await?;
         let touched: Vec<_> = intent
             .changes()
             .added
             .iter()
             .map(|a| a.file().partition().clone())
             .collect();
-        let live = inputs.live_set().await?;
         let mut removed = Vec::new();
-        let mut entries = Vec::new();
         for entry in live.values() {
             let deleted = match partition_match_in_touched(
-                entry.file.partition(),
+                &entry.frozen.facts().partition,
                 entry.frozen.facts().partition_spec_id,
                 metadata.default_partition_spec_id(),
                 &touched,
@@ -109,9 +103,8 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
                 }
             };
             if deleted {
-                removed.push(entry.clone());
+                removed.push(entry);
             }
-            entries.push((entry.clone(), deleted));
         }
         let removed_data: HashSet<_> = removed
             .iter()
@@ -120,27 +113,37 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
                 _ => None,
             })
             .collect();
-        for (entry, deleted) in &mut entries {
-            if !*deleted
-                && matches!(entry.frozen.identity(),
-                    super::model::EntryIdentity::DeletionVector { referenced_data_file, .. }
-                        if removed_data.contains(referenced_data_file)
-                )
-            {
-                *deleted = true;
-                removed.push(entry.clone());
-            }
-        }
+        let selected = removed
+            .iter()
+            .map(|entry| entry.frozen.identity())
+            .collect::<HashSet<_>>();
+        let dependent = live
+            .values()
+            .filter(|entry| {
+                !selected.contains(entry.frozen.identity())
+                    && matches!(
+                        entry.frozen.identity(),
+                        super::model::EntryIdentity::DeletionVector { referenced_data_file, .. }
+                            if removed_data.contains(referenced_data_file)
+                    )
+            })
+            .collect::<Vec<_>>();
+        removed.extend(dependent);
         let snapshot_id = super::staging::new_snapshot_id(metadata);
-        let mut manifests =
-            super::overwrite::write_live_entry_groups(view, snapshot_id, entries).await?;
-        manifests
-            .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
+        let added = super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
+            view,
+            snapshot_id,
+            sources.as_ref(),
+            &removed,
+            added,
+        )
+        .await?;
         let mut summary =
             super::overwrite::snapshot_file_summary(&intent.changes().added, &removed)?;
         super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
         summary.insert("replace-partitions".into(), "true".into());
-        super::overwrite::prepare_snapshot_change(
+        super::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

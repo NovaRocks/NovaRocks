@@ -223,9 +223,9 @@ impl WriteRecipe {
             CommitOpKind::FastAppend | CommitOpKind::Overwrite | CommitOpKind::RowDelta
         ) {
             let source_io = operation.begin_attempt()?;
-            let mut inputs =
+            let inputs =
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
-            let live = inputs.live_set().await?;
+            let live = inputs.compact_live_entries().await?;
             let mut identities: BTreeSet<_> = match self.op_kind {
                 CommitOpKind::RowDeltaDvFromFiles => self.removed_dvs.clone(),
                 CommitOpKind::CowUpdate => self
@@ -259,7 +259,7 @@ impl WriteRecipe {
                     .filter(|(_, entry)| {
                         added.iter().any(|a| {
                             a.partition_spec_id() == entry.frozen.facts().partition_spec_id
-                                && a.file().partition() == entry.file.partition()
+                                && a.file().partition() == &entry.frozen.facts().partition
                         })
                     })
                     .map(|(key, _)| key.clone())

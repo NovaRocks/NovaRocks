@@ -547,6 +547,7 @@ pub struct DeleteFact {
     application: DeleteApplication,
     metrics: FileMetrics,
     provenance: Option<ManifestEntryProvenance>,
+    physical_ordinal: Option<usize>,
 }
 
 impl DeleteFact {
@@ -603,6 +604,7 @@ impl DeleteFact {
             },
             metrics: params.metrics,
             provenance: None,
+            physical_ordinal: None,
         })
     }
 
@@ -647,6 +649,10 @@ impl DeleteFact {
     }
     pub fn provenance(&self) -> Option<&ManifestEntryProvenance> {
         self.provenance.as_ref()
+    }
+    /// Physical ordinal from the original source, distinct from the observation ordinal.
+    pub(crate) fn physical_ordinal(&self) -> Option<usize> {
+        self.physical_ordinal
     }
     pub fn equality_scope(&self) -> EqualityScope {
         if self.partition().is_unpartitioned() {
@@ -693,28 +699,40 @@ impl DeleteObservation {
     pub fn from_manifests(
         manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
     ) -> Result<Self> {
-        match Self::from_manifests_checked(manifests, || Ok::<(), std::convert::Infallible>(())) {
+        let manifests = manifests.into_iter().map(|manifest| {
+            (
+                manifest.manifest_path,
+                manifest.entries.into_iter().map(|entry| (None, entry)),
+            )
+        });
+        match Self::from_source_entries_checked(
+            manifests,
+            || Ok::<(), std::convert::Infallible>(()),
+        ) {
             Ok(value) => Ok(value),
             Err(super::ConstructionFailure::Semantic(error)) => Err(error),
             Err(super::ConstructionFailure::Original(never)) => match never {},
         }
     }
-    pub(crate) fn from_manifests_checked<E>(
-        manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
+    pub(crate) fn from_source_entries_checked<E, I>(
+        manifests: impl IntoIterator<Item = (Arc<str>, I)>,
         mut active: impl FnMut() -> std::result::Result<(), E>,
-    ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
+    ) -> std::result::Result<Self, super::ConstructionFailure<E>>
+    where
+        I: IntoIterator<Item = (Option<usize>, RawDeleteEntry)>,
+    {
         active().map_err(super::ConstructionFailure::Original)?;
         let mut paths = HashSet::new();
         let mut dv_targets = HashSet::new();
         let mut facts = Vec::new();
-        for manifest in manifests {
+        for (manifest_path, entries) in manifests {
             active().map_err(super::ConstructionFailure::Original)?;
-            require_path(&manifest.manifest_path)?;
+            require_path(&manifest_path)?;
             // Java's manifest-list path dedup occurs before reading entries.
-            if !paths.insert(Arc::clone(&manifest.manifest_path)) {
+            if !paths.insert(Arc::clone(&manifest_path)) {
                 continue;
             }
-            for (entry_ordinal, entry) in manifest.entries.into_iter().enumerate() {
+            for (entry_ordinal, (physical_ordinal, entry)) in entries.into_iter().enumerate() {
                 active().map_err(super::ConstructionFailure::Original)?;
                 let Some(sequence) = entry.sequence.live_sequence()? else {
                     continue;
@@ -737,9 +755,10 @@ impl DeleteObservation {
                     .into());
                 }
                 fact.provenance = Some(ManifestEntryProvenance {
-                    manifest_path: Arc::clone(&manifest.manifest_path),
+                    manifest_path: Arc::clone(&manifest_path),
                     entry_ordinal,
                 });
+                fact.physical_ordinal = physical_ordinal;
                 facts.push(Arc::new(fact));
             }
         }

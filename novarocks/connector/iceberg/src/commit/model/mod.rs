@@ -31,7 +31,6 @@ pub use artifacts::{
     ArtifactWriter, AttemptArtifacts, CleanupScope,
 };
 pub use dependency::Dependency;
-#[cfg(test)]
 pub(crate) use fields::EntryFacts;
 pub use fields::{AddedContent, FrozenEntry, SeqField};
 pub use identity::{

@@ -72,13 +72,7 @@ impl super::staging::Preparer for SelectedRewritePreparer {
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         self.files.validate().map_err(selected_invalid)?;
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(view.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
-        let live = inputs.live_set().await?;
+        let (sources, live) = view.observe_live_sources().await?;
         let live_data = live
             .keys()
             .filter(|id| matches!(id, EntryIdentity::DataFile { .. }))
@@ -178,7 +172,7 @@ impl super::staging::Preparer for SelectedRewritePreparer {
         super::rewrite_data_files::prepare_physical_rewrite(
             view,
             intent,
-            live,
+            (sources.as_ref(), &live),
             &removed,
             data_rewrite,
         )
@@ -629,6 +623,23 @@ mod preparer_tests {
             .unwrap();
         let snapshot = staging.metadata().snapshot_for_ref("dev").unwrap();
         assert_eq!(snapshot.added_rows_count(), Some(0));
+        let before_list = crate::manifest::load_manifest_list(
+            metadata.snapshot_by_id(10).unwrap(),
+            writer.file_io(),
+            &metadata,
+        )
+        .await
+        .unwrap();
+        let after_list =
+            crate::manifest::load_manifest_list(snapshot, writer.file_io(), staging.metadata())
+                .await
+                .unwrap();
+        let retained_data = before_list
+            .entries()
+            .iter()
+            .find(|file| file.content == ManifestContentType::Data)
+            .unwrap();
+        assert!(after_list.entries().contains(retained_data));
         let output = live(&writer, staging.metadata(), snapshot.snapshot_id()).await;
         assert_eq!(output.len(), 4);
         assert!(!output.contains_key(&old));

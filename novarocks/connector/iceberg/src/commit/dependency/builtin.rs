@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Current admission dependencies deliberately do not require a history window.
+//! Current admission policies decide which source scope to observe.
 
 use super::super::model::{ArtifactWriter, Dependency, EntryIdentity, OperationIntent};
 use super::{Culprit, ValidationInputs, Verdict};
@@ -74,12 +74,12 @@ async fn validate_dependencies(
                 .then_some(Culprit::Snapshot(*id)),
             Dependency::RegisteredFilesNotLive(paths) => {
                 let parent = inputs.parent;
-                let live = inputs.live_set().await?;
+                let requested = paths.iter().map(String::as_str).collect();
+                let live = inputs.live_data_matches(&requested).await?;
                 paths.iter().find_map(|path| {
-                    let identity = EntryIdentity::DataFile { path: path.clone() };
-                    live.contains_key(&identity).then(|| Culprit::Entry {
-                        snapshot: parent.expect("nonempty live set has a parent"),
-                        identity,
+                    live.contains(path).then(|| Culprit::Entry {
+                        snapshot: parent.expect("live data has a parent"),
+                        identity: EntryIdentity::DataFile { path: path.clone() },
                     })
                 })
             }
@@ -106,7 +106,7 @@ mod tests {
         FormatVersion, Operation, PartitionSpec, Schema, Snapshot, SortOrder, Summary,
         TableMetadataBuilder,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     struct TestIo {
         io: FileIO,
@@ -279,6 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_registration_reports_exact_entry_and_history_reads_only_own_manifests() {
+        use super::super::history::{HistoryObservationError, physical_added_data};
         use crate::iceberg::spec::{
             DataContentType, DataFileBuilder, DataFileFormat, ManifestListWriter,
             ManifestWriterBuilder,
@@ -286,10 +287,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let io = TestIo::new();
         let mut metadata = metadata();
-        let mut inherited_manifest: Option<crate::iceberg::spec::ManifestFile> = None;
+        let mut inherited_manifests: Vec<crate::iceberg::spec::ManifestFile> = Vec::new();
         for (id, path) in [
             (11, "/external/first.parquet"),
             (12, "/external/second.parquet"),
+            (13, "/external/second.parquet"),
+            (14, "/external/first.parquet"),
         ] {
             let file = DataFileBuilder::default()
                 .content(DataContentType::Data)
@@ -315,7 +318,11 @@ mod tests {
                 metadata.default_partition_spec().as_ref().clone(),
             )
             .build_v2_data();
-            writer.add_file(file, id - 10).unwrap();
+            if id == 13 {
+                writer.add_existing_file(file, 12, 2, Some(2)).unwrap();
+            } else {
+                writer.add_file(file, id - 10).unwrap();
+            }
             let manifest = writer.write_manifest_file().await.unwrap();
             let list_path = dir
                 .path()
@@ -331,24 +338,28 @@ mod tests {
                     .await
                     .unwrap(),
                 id,
-                (id == 12).then_some(11),
+                (id > 11).then_some(id - 1),
                 id - 10,
             );
-            let mut manifests = Vec::new();
-            if let Some(inherited) = inherited_manifest.as_ref() {
-                manifests.push(inherited.clone());
+            let mut manifests = inherited_manifests;
+            if id == 13 {
+                manifests.retain(|descriptor| descriptor.added_snapshot_id != 12);
             }
             manifests.push(manifest.clone());
             list.add_manifests(manifests.into_iter()).unwrap();
             list.close().await.unwrap();
             let snapshot = Snapshot::builder()
                 .with_snapshot_id(id)
-                .with_parent_snapshot_id((id == 12).then_some(11))
+                .with_parent_snapshot_id((id > 11).then_some(id - 1))
                 .with_sequence_number(id - 10)
                 .with_timestamp_ms(metadata.last_updated_ms() + 1)
                 .with_manifest_list(list_path)
                 .with_summary(Summary {
-                    operation: Operation::Append,
+                    operation: if id == 12 || id == 13 {
+                        Operation::Replace
+                    } else {
+                        Operation::Append
+                    },
                     additional_properties: HashMap::new(),
                 })
                 .with_schema_id(metadata.current_schema_id())
@@ -360,28 +371,27 @@ mod tests {
                 .build()
                 .unwrap()
                 .metadata;
-            inherited_manifest = Some(
-                crate::manifest::load_manifest_list(
-                    metadata.snapshot_by_id(id).unwrap(),
-                    io.file_io(),
-                    &metadata,
-                )
-                .await
-                .unwrap()
-                .entries()
-                .last()
-                .unwrap()
-                .clone(),
-            );
+            inherited_manifests = crate::manifest::load_manifest_list(
+                metadata.snapshot_by_id(id).unwrap(),
+                io.file_io(),
+                &metadata,
+            )
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
         }
         let mut inputs = ValidationInputs::new(&metadata, Some(12), &io);
-        let live = inputs.live_set().await.unwrap();
+        let live = inputs.compact_live_entries().await.unwrap();
         assert_eq!(live.len(), 2);
         let identity = EntryIdentity::DataFile {
             path: "/external/first.parquet".into(),
         };
         assert_eq!(live[&identity].frozen.facts().added_snapshot_id, Some(11));
         assert_eq!(live[&identity].frozen.facts().record_count, 3);
+        assert_eq!(live[&identity].source_index, 0);
+        assert_eq!(live[&identity].ordinal, 0);
+        assert_eq!(live[&identity].logical_size, 100);
         assert_eq!(
             validate_dependencies(
                 &[Dependency::RegisteredFilesNotLive(vec![
@@ -414,12 +424,46 @@ mod tests {
             .unwrap(),
             Verdict::Holds
         );
-        let own = inputs
-            .own_snapshot_entries(metadata.snapshot_by_id(12).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(own.len(), 1);
-        assert_eq!(own[0].0.path(), "/external/second.parquet");
+        let corrupted = ValidationInputs::new(&metadata, Some(14), &io);
+        let duplicate_paths = BTreeSet::from(["/external/first.parquet"]);
+        assert!(
+            corrupted
+                .live_data_matches(&duplicate_paths)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate live Iceberg entry identity")
+        );
+        let unrelated_paths = BTreeSet::from(["/external/second.parquet"]);
+        assert_eq!(
+            corrupted.live_data_matches(&unrelated_paths).await.unwrap(),
+            BTreeSet::from(["/external/second.parquet".to_owned()]),
+        );
+
+        let observe =
+            |start, end| physical_added_data(&metadata, start, end, io.file_io(), || Ok(()));
+        let replaced = observe(Some(11), Some(13)).await.unwrap();
+        assert_eq!(replaced.window.endpoints(), (Some(11), Some(13)));
+        assert_eq!(
+            replaced.paths,
+            BTreeSet::from(["/external/second.parquet".to_owned()])
+        );
+        assert!(observe(Some(12), Some(13)).await.unwrap().paths.is_empty());
+        assert!(observe(Some(13), Some(13)).await.unwrap().paths.is_empty());
+        assert_eq!(
+            observe(None, Some(13)).await.unwrap().paths,
+            BTreeSet::from([
+                "/external/first.parquet".to_owned(),
+                "/external/second.parquet".to_owned()
+            ]),
+        );
+        assert!(matches!(
+            observe(Some(13), Some(11)).await,
+            Err(HistoryObservationError::Gap(HistoryGap::StartNotAncestor {
+                start: 13,
+                parent: Some(11)
+            }))
+        ));
     }
 
     #[test]

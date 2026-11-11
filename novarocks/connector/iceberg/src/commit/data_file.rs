@@ -21,7 +21,14 @@
 //! `DataFile` fields are `pub(crate)` in iceberg-rust 0.11, so every
 //! reconstruction goes through `DataFileBuilder`.
 
-use crate::iceberg::spec::{DataFile, DataFileBuilder};
+use std::collections::HashMap;
+
+use crate::iceberg::spec::{DataFile, DataFileBuilder, Datum, Struct};
+
+pub(super) struct ManifestBounds {
+    pub(super) lower: HashMap<i32, Datum>,
+    pub(super) upper: HashMap<i32, Datum>,
+}
 
 /// Clone a `DataFile`, overriding `first_row_id` with the given value.
 ///
@@ -32,12 +39,32 @@ pub(super) fn clone_data_file_with_first_row_id(
     partition_spec_id: i32,
     first_row_id: Option<i64>,
 ) -> Result<DataFile, String> {
+    clone_data_file_with_manifest_values(
+        src,
+        partition_spec_id,
+        src.partition().clone(),
+        first_row_id,
+        None,
+    )
+}
+
+pub(super) fn clone_data_file_with_manifest_values(
+    src: &DataFile,
+    partition_spec_id: i32,
+    partition: Struct,
+    first_row_id: Option<i64>,
+    bounds: Option<ManifestBounds>,
+) -> Result<DataFile, String> {
+    let ManifestBounds { lower, upper } = bounds.unwrap_or_else(|| ManifestBounds {
+        lower: src.lower_bounds().clone(),
+        upper: src.upper_bounds().clone(),
+    });
     let mut builder = DataFileBuilder::default();
     builder
         .content(src.content_type())
         .file_path(src.file_path().to_string())
         .file_format(src.file_format())
-        .partition(src.partition().clone())
+        .partition(partition)
         .partition_spec_id(partition_spec_id)
         .record_count(src.record_count())
         .file_size_in_bytes(src.file_size_in_bytes())
@@ -45,8 +72,8 @@ pub(super) fn clone_data_file_with_first_row_id(
         .value_counts(src.value_counts().clone())
         .null_value_counts(src.null_value_counts().clone())
         .nan_value_counts(src.nan_value_counts().clone())
-        .lower_bounds(src.lower_bounds().clone())
-        .upper_bounds(src.upper_bounds().clone())
+        .lower_bounds(lower)
+        .upper_bounds(upper)
         .key_metadata(src.key_metadata().map(|b| b.to_vec()))
         .split_offsets(src.split_offsets().map(|s| s.to_vec()))
         .equality_ids(src.equality_ids())
@@ -59,7 +86,7 @@ pub(super) fn clone_data_file_with_first_row_id(
     }
     builder
         .build()
-        .map_err(|e| format!("clone_data_file_with_first_row_id failed: {e}"))
+        .map_err(|e| format!("Cannot copy data file for manifest: {e}"))
 }
 
 /// Freeze every writer-provided physical fact. Logical DV identity includes

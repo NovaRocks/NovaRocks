@@ -15,38 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import org.apache.avro.{Schema => AvroSchema}
-import org.apache.avro.file.{CodecFactory, DataFileStream, DataFileWriter}
-import org.apache.avro.generic.{GenericData, GenericDatumReader, GenericDatumWriter, GenericRecord => AvroRecord}
+import org.apache.avro.generic.{GenericRecord => AvroRecord}
 
 object DeleteApplicabilityAnomalies {
   import DeleteApplicabilityFixture._
-  case class Container(schema: AvroSchema, metadata: Vector[(String, Array[Byte])], rows: Vector[AvroRecord])
-  def copy(r: AvroRecord): AvroRecord = GenericData.get().deepCopy(r.getSchema, r)
-  def readAvro(io: FileIO, path: String): Container = {
-    val reader = new DataFileStream[AvroRecord](io.newInputFile(path).newStream(), new GenericDatumReader[AvroRecord]())
-    try Container(reader.getSchema, reader.getMetaKeys.asScala.toVector
-      .filterNot(_.startsWith("avro.")).map(k => (k, reader.getMeta(k))),
-      reader.iterator().asScala.map(copy).toVector)
-    finally reader.close()
-  }
-  def writeAvro(io: FileIO, path: String, c: Container): Unit = {
-    val writer = new DataFileWriter[AvroRecord](new GenericDatumWriter[AvroRecord](c.schema))
-    c.metadata.foreach { case (k, v) => writer.setMeta(k, v) }
-    writer.setCodec(CodecFactory.nullCodec())
-    writer.create(c.schema, io.newOutputFile(path).create())
-    try c.rows.foreach(writer.append) finally writer.close()
-  }
-  def file(r: AvroRecord): AvroRecord = r.get("data_file").asInstanceOf[AvroRecord]
-  def patch(r: AvroRecord)(f: AvroRecord => Unit): AvroRecord = { val c = copy(r); f(c); c }
+  import DeleteApplicabilityAvro._
+
   def withSeq(r: AvroRecord, seq: Long): AvroRecord = patch(r)(_.put("sequence_number", Long.box(seq)))
   def withPartition(r: AvroRecord, p: Int): AvroRecord = patch(r) { c =>
     file(c).get("partition").asInstanceOf[AvroRecord].put(0, Int.box(p))
   }
-  def rawEntry(r: AvroRecord): JsonNode = mapper.readTree(r.toString)
-  def unique(t: Table, name: String, suffix: String): String =
-    t.location() + "/metadata/g02-" + name + "-" + java.util.UUID.randomUUID().toString + suffix
-
   // The public content writers provide real bytes. This layer changes only metadata,
   // preserving raw duplicates for the reader instead of normalizing them beforehand.
   def variant(seed: Seed, name: String, transform: Vector[AvroRecord] => Vector[AvroRecord],
