@@ -680,7 +680,7 @@ pub(super) fn is_target_file_metadata(name: &str) -> bool {
     name.eq_ignore_ascii_case("_spec_id") || name.eq_ignore_ascii_case("_partition")
 }
 
-pub(super) fn nullable_file_metadata_value(
+pub(crate) fn nullable_file_metadata_value(
     field: &ColumnDef,
 ) -> Result<novarocks_type_contract::FunctionValueType, String> {
     field
