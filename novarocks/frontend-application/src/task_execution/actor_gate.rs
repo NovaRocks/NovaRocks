@@ -755,7 +755,7 @@ pub(crate) mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use crate::task_protocol_config::DispatchLane;
+    use novarocks_attempt_protocol::config::DispatchLane;
     use novarocks_coordination_contract::{ExecutionEffect, MonotonicInstant};
     use novarocks_execution::task_execution::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,

@@ -217,7 +217,7 @@ use crate::task_execution::participation_convergence::ParticipationConvergenceIn
 use crate::task_execution::status_intake::{
     CountingWake, ObservationIntake, ObservationIntakeEntry, StatusIntake,
 };
-use crate::task_protocol_config::DispatchBudget;
+use novarocks_attempt_protocol::config::DispatchBudget;
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
     NovaRocksGrpc, NovaRocksGrpcServer,

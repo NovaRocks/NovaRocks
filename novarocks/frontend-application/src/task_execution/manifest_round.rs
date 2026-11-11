@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::task_protocol_config::DispatchBudget;
+use novarocks_attempt_protocol::config::DispatchBudget;
 use novarocks_query_application::api::{
     NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
@@ -137,21 +137,23 @@ pub(crate) fn assemble_manifest_round(
         summary_sources,
         admission_epochs,
         preparing_positions,
+        members,
     } = inputs;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
 
-    let mut backends = Vec::with_capacity(manifest.participations().len());
-    let mut convergence_targets = Vec::with_capacity(manifest.participations().len());
-    for participation in manifest.participations() {
-        let backend = participation.backend();
-        backends.push(backend.target().descriptor().clone());
-        convergence_targets.push(NativeAttemptConvergenceTarget::new(
-            participation.participation(),
-            backend.endpoint().clone(),
-        ));
-    }
+    let backends = manifest
+        .participations()
+        .iter()
+        .map(|participation| participation.backend().target().descriptor().clone())
+        .collect::<Vec<_>>();
+    let convergence_targets = members
+        .iter()
+        .map(|member| {
+            NativeAttemptConvergenceTarget::new(member.participation, member.endpoint.clone())
+        })
+        .collect::<Vec<_>>();
 
     let acks = TaskAckIntake::new(Arc::clone(&wake));
     let native = Arc::new(
@@ -1729,7 +1731,7 @@ mod tests {
             );
             let cancellation_after_gate_closes = if cancel_with_pending_gate {
                 use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
-                use crate::task_protocol_config::DispatchLane;
+                use novarocks_attempt_protocol::config::DispatchLane;
                 use novarocks_execution::task_execution::{
                     AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
                 };
@@ -3313,9 +3315,8 @@ mod tests {
     #[tokio::test]
     async fn same_cut_task_cause_does_not_wait_for_the_original_held_gate_carrier() {
         use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
-        use crate::{
-            native::task_transport::SubscriptionState, task_protocol_config::DispatchLane,
-        };
+        use crate::native::task_transport::SubscriptionState;
+        use novarocks_attempt_protocol::config::DispatchLane;
         use novarocks_execution_contract::{
             AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
             TaskOperationId,

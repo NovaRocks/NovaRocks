@@ -50,7 +50,7 @@ use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoError, ConnectorBlockingIoResponsibility,
     ConnectorBlockingIoSupervisor, ConnectorOperationJob as ConnectorBlockingIoJob,
 };
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 

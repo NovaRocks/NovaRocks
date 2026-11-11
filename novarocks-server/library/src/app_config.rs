@@ -28,11 +28,11 @@ use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
-use novarocks_execution::runtime::execution_runtime::ExchangeFlowLimits;
-use novarocks_execution_contract::{LeaseValidFor, MaxWait};
-use novarocks_frontend_application::task_protocol_config::{
+use novarocks_attempt_protocol::config::{
     DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
 };
+use novarocks_execution::runtime::execution_runtime::ExchangeFlowLimits;
+use novarocks_execution_contract::{LeaseValidFor, MaxWait};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,

@@ -30,7 +30,7 @@ use control_binding::NativeControlBinding;
 use source_cohort::NativeSourceCohortAdmission;
 pub(crate) use source_cohort::source_count as native_source_count;
 
-use crate::task_protocol_config::CoordinationBudgets;
+use novarocks_attempt_protocol::config::CoordinationBudgets;
 #[cfg(test)]
 use novarocks_coordination_contract::AttemptFailureClass;
 use novarocks_coordination_contract::RecoveryMode;
@@ -113,7 +113,7 @@ use crate::task_execution::manifest_projection::ManifestAttemptInputs;
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
 
 /// One logical execution's Abort port. Every physical attempt installs one
@@ -782,7 +782,7 @@ async fn acquire_replacement_admissions(
                     if let Some(permit) = permit {
                         pending_batch = Some(DispatchBatch::with_queued_at(
                             participation.backend_process_id(),
-                            crate::task_protocol_config::DispatchLane::Lifecycle,
+                            novarocks_attempt_protocol::config::DispatchLane::Lifecycle,
                             vec![intent.clone()],
                             vec![permit],
                             intent.queued_bytes(),

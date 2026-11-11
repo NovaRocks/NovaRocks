@@ -364,6 +364,7 @@ pub struct RunningAttemptPermit {
 /// activation. It cannot complete, fail, replace, or deliver results, and a
 /// stale activation is rejected by the actor after the supervisor consumes the
 /// running permit.
+#[derive(Clone)]
 pub(crate) struct RunningAttemptDriveAuthority {
     activation: AttemptActivationIdentity,
     mailbox: mpsc::Sender<ActorCommand>,

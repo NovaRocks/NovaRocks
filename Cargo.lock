@@ -3985,6 +3985,7 @@ dependencies = [
  "chrono",
  "hex",
  "libc",
+ "novarocks-attempt-protocol",
  "novarocks-catalog-application",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg",

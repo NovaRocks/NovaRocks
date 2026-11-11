@@ -47,7 +47,7 @@ use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::round::{PumpCloseUnresolved, TaskRound, TurnPump};
 use crate::task_execution::status_intake::StatusIntakeWake;
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
 /// How many splits one task may hold before the driver stops pulling for it.
 const DEFAULT_MAX_QUEUED_SPLITS_PER_TASK: u64 = 4096;

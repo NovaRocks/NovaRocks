@@ -56,7 +56,7 @@ use prometheus::{
 };
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
-use crate::task_protocol_config::DispatchLane;
+use novarocks_attempt_protocol::config::DispatchLane;
 #[cfg(test)]
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{

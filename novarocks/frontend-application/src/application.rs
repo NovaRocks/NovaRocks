@@ -35,7 +35,7 @@ pub(crate) mod workload_progress;
 use workload_progress::{FrontendWorkloadDeadlineSupervisor, FrontendWorkloadProgressPolicy};
 
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
-use crate::task_protocol_config::CoordinationBudgets;
+use novarocks_attempt_protocol::config::CoordinationBudgets;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
 #[cfg(test)]
@@ -54,7 +54,7 @@ use novarocks_workload_control::{
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;

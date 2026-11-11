@@ -33,7 +33,7 @@ use crate::task_execution::completion_facts::parent_released_children;
 use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::GoneObservation;
-use crate::task_protocol_config::DispatchBudget;
+use novarocks_attempt_protocol::config::DispatchBudget;
 use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
     AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, ParticipationRef,
@@ -661,17 +661,10 @@ impl QueryTaskExecution {
         &mut self,
         admissions: &[ReplacementWorkerAdmissionEvidence],
     ) -> Result<(), TaskExecutionError> {
-        let expected = self.owners.keys().copied().collect::<BTreeSet<_>>();
-        let actual = admissions
-            .iter()
-            .map(ReplacementWorkerAdmissionEvidence::participation)
-            .collect::<BTreeSet<_>>();
-        if admissions.len() != actual.len() || actual != expected {
-            return Err(TaskExecutionError::Schedule(
-                "qualified replacement admission set differs from the Task manifest participations"
-                    .to_owned(),
-            ));
-        }
+        super::manifest_projection::validate_replacement_admissions(
+            self.owners.keys().copied(),
+            admissions,
+        )?;
         let now = self.clock.now();
         for admission in admissions.iter() {
             self.owners

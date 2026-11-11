@@ -36,7 +36,7 @@ use super::driver::{
 };
 use super::transport::TaskUpdateTransport;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
 /// How many splits one batch pulls from a source.
 ///

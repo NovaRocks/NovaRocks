@@ -18,20 +18,30 @@
 //! Frozen protocol facts and original payload ownership from one bound manifest.
 
 use super::{
+    bridge::qa::AttemptQaBridge,
     creation::PricedTaskCreation,
     error::TaskExecutionError,
     graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
-    host::transport::AttemptEstablishMaterial,
+    host::transport::{AttemptEstablishMaterial, FrozenSendRequests},
     participation_owner::ParticipationEstablishSource,
 };
-use crate::query_execution::artifact::TaskManifestBinding;
+use crate::{
+    control_runtime::membership::FrozenMember, query_execution::artifact::TaskManifestBinding,
+};
 use novarocks_attempt_protocol::{
     config::{CoordinationBudgets, FrozenTransportLimits, TaskUpdateRetryPolicy},
     effect::PumpKind,
-    start::{FrozenAttemptPlan, PayloadRef},
+    ids::IdSeed,
+    start::{AttemptSources, AttemptStart, FrozenAttemptPlan, PayloadRef},
 };
-use novarocks_coordination_contract::AttemptAuthorizationLimits;
-use novarocks_execution_contract::{AdmissionEpochCapability, TaskIdentity};
+use novarocks_coordination_contract::{
+    AttemptActivation, AttemptCompletionPolicy, AttemptInheritedAdmission, AttemptLifecyclePolicy,
+    MonotonicInstant,
+};
+use novarocks_execution_contract::{AdmissionEpochCapability, ParticipationRef, TaskIdentity};
+use novarocks_query_application::coordination::{
+    NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
+};
 use novarocks_result_contract::PerKind;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{BackendProcessId, NativeCompatibilityId};
@@ -51,6 +61,7 @@ pub(crate) struct ManifestAttemptInputs<'a> {
     pub(crate) summary_sources: PerKind<BTreeSet<TaskIdentity>>,
     pub(crate) admission_epochs: BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     pub(crate) preparing_positions: BTreeMap<BackendProcessId, usize>,
+    pub(crate) members: Arc<[FrozenMember]>,
 }
 
 impl<'a> ManifestAttemptInputs<'a> {
@@ -77,6 +88,7 @@ impl<'a> ManifestAttemptInputs<'a> {
         }
         let mut admission_epochs = BTreeMap::new();
         let mut preparing_positions = BTreeMap::new();
+        let mut members = Vec::with_capacity(manifest.participations().len());
         for participation in manifest.participations() {
             let backend = participation.backend();
             if backend.native_compatibility_id() != compatibility {
@@ -98,7 +110,12 @@ impl<'a> ManifestAttemptInputs<'a> {
                     backend.process_id()
                 )));
             }
+            members.push(FrozenMember {
+                participation: participation.participation(),
+                endpoint: backend.endpoint().clone(),
+            });
         }
+        members.sort_unstable_by_key(|member| member.participation);
         Ok(Self {
             manifest,
             graph,
@@ -108,22 +125,34 @@ impl<'a> ManifestAttemptInputs<'a> {
             summary_sources,
             admission_epochs,
             preparing_positions,
+            members: members.into(),
         })
     }
 }
 
 pub(crate) struct AttemptPlanPolicy {
-    pub(crate) authorization_limits: AttemptAuthorizationLimits,
     pub(crate) coordination: CoordinationBudgets,
     pub(crate) retry: TaskUpdateRetryPolicy,
     pub(crate) initial_lease: Duration,
     pub(crate) steady_lease: Duration,
 }
 
+pub(crate) struct AttemptActivationInputs<'a> {
+    pub(crate) drive: &'a NativeAttemptDrive,
+    pub(crate) replacement_admissions: Option<&'a [ReplacementWorkerAdmissionEvidence]>,
+    pub(crate) ids: IdSeed,
+    pub(crate) initial_now: MonotonicInstant,
+    pub(crate) sources: AttemptSources,
+    pub(crate) retain_diagnostics: bool,
+    pub(crate) observe_dev_root: bool,
+}
+
 pub(crate) struct AttemptManifestProjection {
-    pub(crate) plan: FrozenAttemptPlan,
+    pub(crate) start: AttemptStart,
+    pub(crate) members: Arc<[FrozenMember]>,
     pub(crate) creations: BTreeMap<PayloadRef, PricedTaskCreation>,
-    pub(crate) establish: Arc<AttemptEstablishMaterial>,
+    pub(crate) requests: FrozenSendRequests,
+    pub(crate) qa: AttemptQaBridge,
 }
 
 impl AttemptManifestProjection {
@@ -133,6 +162,7 @@ impl AttemptManifestProjection {
     pub(crate) fn from_manifest_inputs(
         inputs: ManifestAttemptInputs<'_>,
         establish: &dyn ParticipationEstablishSource,
+        activation: AttemptActivationInputs<'_>,
         policy: AttemptPlanPolicy,
         pumps: Box<[(PayloadRef, PumpKind)]>,
         next_payload: &mut NonZeroU64,
@@ -146,12 +176,27 @@ impl AttemptManifestProjection {
             summary_sources,
             admission_epochs,
             preparing_positions,
+            members,
         } = inputs;
-        if policy.authorization_limits.activation.execution() != manifest.execution() {
+        let identity = activation.drive.identity();
+        if identity.execution() != manifest.execution() {
             return Err(TaskExecutionError::Schedule(
                 "attempt projection differs from the original bound manifest".into(),
             ));
         }
+        let inherited_admissions: Box<[_]> = match activation.replacement_admissions {
+            None => Box::new([]),
+            Some(admissions) => {
+                validate_replacement_admissions(graph.participations().copied(), admissions)?;
+                admissions
+                    .iter()
+                    .map(|admission| AttemptInheritedAdmission {
+                        participation: admission.participation(),
+                        receipt: admission.receipt(),
+                    })
+                    .collect()
+            }
+        };
         let window = policy.coordination.dispatch.create_permits();
         let deployment_window = NonZeroUsize::new(window).ok_or_else(|| {
             TaskExecutionError::Schedule("the attempt deployment window is empty".into())
@@ -170,15 +215,25 @@ impl AttemptManifestProjection {
             })
             .collect::<Result<_, _>>()?;
         let mut next = *next_payload;
-        let participations = graph.participations().copied().collect::<Vec<_>>();
         let (graph, creations) = graph.into_attempt_graph(&mut next)?;
-        let (establish_material, establish) =
-            AttemptEstablishMaterial::project(establish, participations, &mut next)?;
-        *next_payload = next;
-        Ok(Self {
+        let (establish_material, establish) = AttemptEstablishMaterial::project(
+            establish,
+            members.iter().map(|member| member.participation),
+            &mut next,
+        )?;
+        let establish = Arc::new(establish);
+        let start = AttemptStart {
+            activation: AttemptActivation {
+                identity,
+                policy: AttemptLifecyclePolicy {
+                    completion: AttemptCompletionPolicy::AcceptedRootSuccessSeal,
+                    retain_diagnostics: activation.retain_diagnostics,
+                },
+                inherited_admissions,
+            },
             plan: FrozenAttemptPlan {
                 graph,
-                authorization_limits: policy.authorization_limits,
+                authorization_limits: activation.drive.authorization_limits(),
                 writers,
                 summary_sources,
                 compatibility,
@@ -205,8 +260,39 @@ impl AttemptManifestProjection {
                 initial_lease: policy.initial_lease,
                 steady_lease: policy.steady_lease,
             },
+            ids: activation.ids,
+            initial_now: activation.initial_now,
+            sources: activation.sources,
+            observe_dev_root: activation.observe_dev_root,
+        };
+        *next_payload = next;
+        Ok(Self {
+            start,
+            members,
             creations,
-            establish: Arc::new(establish),
+            requests: FrozenSendRequests::with_establish(establish.clone()),
+            qa: AttemptQaBridge::new(Arc::new(activation.drive.clone()), compatibility, establish),
         })
     }
+}
+
+/// Project only the qualified receipts already retained by the logical owner.
+pub(crate) fn validate_replacement_admissions(
+    mut expected: impl ExactSizeIterator<Item = ParticipationRef>,
+    admissions: &[ReplacementWorkerAdmissionEvidence],
+) -> Result<(), TaskExecutionError> {
+    let actual = admissions
+        .iter()
+        .map(ReplacementWorkerAdmissionEvidence::participation)
+        .collect::<BTreeSet<_>>();
+    if admissions.len() != actual.len()
+        || expected.len() != actual.len()
+        || expected.any(|participant| !actual.contains(&participant))
+    {
+        return Err(TaskExecutionError::Schedule(
+            "qualified replacement admission set differs from the Task manifest participations"
+                .into(),
+        ));
+    }
+    Ok(())
 }

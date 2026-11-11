@@ -27,8 +27,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 }
 
 /// Native Task protocol bounds frozen by frontend process composition.
-pub mod task_protocol_config;
-
 mod native_workload;
 pub use native_workload::{
     FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,

@@ -756,7 +756,7 @@ impl fmt::Display for NativeAbortEffectSettleError {
 mod tests {
     use std::time::Duration;
 
-    use crate::task_protocol_config::DispatchLane;
+    use novarocks_attempt_protocol::config::DispatchLane;
     use novarocks_coordination_contract::ExecutionEffect;
     use novarocks_execution::task_execution::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,

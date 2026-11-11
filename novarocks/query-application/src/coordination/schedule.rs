@@ -731,6 +731,7 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
 /// The running permit remains private to the Supervisor. This capability has
 /// no terminal or result-delivery authority and becomes stale when that permit
 /// is consumed.
+#[derive(Clone)]
 pub struct NativeAttemptDrive {
     authority: RunningAttemptDriveAuthority,
 }

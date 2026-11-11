@@ -28,7 +28,7 @@ pub(super) mod attempt_receipt;
 use std::sync::Arc;
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;

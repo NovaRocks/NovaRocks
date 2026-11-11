@@ -1842,7 +1842,7 @@ mod destination_close_tests {
         assert!(preview.requires_control_progress());
         assert_eq!(
             preview.lane(),
-            crate::task_protocol_config::DispatchLane::Update
+            novarocks_attempt_protocol::config::DispatchLane::Update
         );
         producer
             .enqueue_update(close, super::super::intent::test_queue_permit())

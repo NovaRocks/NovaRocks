@@ -35,7 +35,7 @@ use crate::query_execution::artifact::{
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use crate::task_execution::completion_facts::StageState;
 use crate::task_execution::lease::RenewSchedule;
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
@@ -862,24 +862,27 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
     }
 }
 
-#[test]
-fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
+#[tokio::test]
+async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
     use super::manifest_projection::{
-        AttemptManifestProjection, AttemptPlanPolicy, ManifestAttemptInputs,
+        AttemptActivationInputs, AttemptManifestProjection, AttemptPlanPolicy,
+        ManifestAttemptInputs,
     };
     use novarocks_attempt_protocol::{
-        AttemptCore, Core,
-        config::CoordinationBudgets,
-        effect::OperationIntent as ProtocolIntent,
-        ids::IdSeed,
-        input::AttemptSourceId,
-        start::{AttemptSources, AttemptStart},
+        AttemptCore, Core, config::CoordinationBudgets, ids::IdSeed, input::AttemptSourceId,
+        start::AttemptSources,
     };
     use novarocks_coordination_contract::{
-        AttemptActivation, AttemptActivationIdentity, AttemptAuthorization,
-        AttemptAuthorizationLimits, AttemptCompletionPolicy, AttemptLifecyclePolicy,
+        AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision, AttemptRequestToken,
+        AttemptToLogical, AttemptToLogicalBody, ExecutionEffect, LogicalToAttemptBody,
     };
-    use novarocks_execution_contract::operation::OperationEnvelope;
+    use novarocks_execution_contract::AcquireParticipationAdmissionTicket;
+    use novarocks_query_application::{
+        coordination::LogicalExecutionActorConfig, test_support::LogicalExecutionTestHarness,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
 
     let schedule = chain_schedule(&[0, 1], &[1]);
     let edges = chain_edges();
@@ -895,9 +898,69 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
         fragments,
     )
     .unwrap();
+    let participants = manifest
+        .participations()
+        .iter()
+        .map(|member| member.participation())
+        .collect::<Vec<_>>();
     let compatibility = manifest.participations()[0]
         .backend()
         .native_compatibility_id();
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .unwrap();
+    control.mark_ready().unwrap();
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .unwrap();
+    let establish_limit = NonZeroUsize::new(3).unwrap();
+    let abort_limit = NonZeroUsize::new(5).unwrap();
+    let abort_wake = Arc::new(tokio::sync::Notify::new());
+    let abort_wake = Arc::new(super::status_intake::NotifyWake::new(abort_wake));
+    let (abort, _abort_intake) = super::abort_effect::NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        abort_wake,
+    );
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        manifest.execution(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(8).unwrap(),
+        participants.clone(),
+        NonZeroUsize::new(2).unwrap(),
+        establish_limit,
+        governed.owner,
+        stage,
+    )
+    .unwrap()
+    .with_abort_participation_effect_port(abort, abort_limit);
+    let mut logical = LogicalExecutionTestHarness::install(
+        tokio::runtime::Handle::current(),
+        config,
+        manifest.execution(),
+        participants,
+    )
+    .unwrap();
+    let activation = logical.activate_initial().await.unwrap();
+    let drive = logical.native_attempt_drive();
+    let authorization_limits = drive.authorization_limits();
+    assert_eq!(
+        authorization_limits.establish_per_participation,
+        establish_limit
+    );
+    assert_eq!(authorization_limits.abort_per_participation, abort_limit);
+
     let mut next = NonZeroU64::new(10).unwrap();
     let inputs = ManifestAttemptInputs::freeze(
         &manifest,
@@ -906,25 +969,44 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
         TransportBudget::DEFAULT,
     )
     .unwrap();
-    let projected = AttemptManifestProjection::from_manifest_inputs(
+    let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
+    let lease = super::lease::RequestedLeaseDurations::DEFAULT;
+    let mut projected = AttemptManifestProjection::from_manifest_inputs(
         inputs,
         &FakeEstablish,
-        AttemptPlanPolicy {
-            authorization_limits: AttemptAuthorizationLimits {
-                activation: AttemptActivationIdentity::from_parts(1, manifest.execution(), 1),
-                establish_per_participation: NonZeroUsize::MIN,
-                abort_per_participation: NonZeroUsize::MIN,
+        AttemptActivationInputs {
+            drive: &drive,
+            replacement_admissions: None,
+            ids: IdSeed::new(1, 100),
+            initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
+            sources: AttemptSources {
+                actor: source(1),
+                publication: source(2),
+                qa: source(3),
+                process: source(4),
+                native: source(5),
+                observation: source(6),
+                capacity: source(7),
+                membership: source(8),
+                mailbox: [4; 4],
             },
+            retain_diagnostics: true,
+            observe_dev_root: false,
+        },
+        AttemptPlanPolicy {
             coordination: CoordinationBudgets::DEFAULT,
             retry: Default::default(),
-            initial_lease: Duration::from_secs(30),
-            steady_lease: Duration::from_secs(5),
+            initial_lease: lease.initial(),
+            steady_lease: lease.steady(),
         },
         Box::new([]),
         &mut next,
     )
     .unwrap();
-    let plan = projected.plan;
+    drop(drive);
+    let plan = &projected.start.plan;
+    assert_eq!(projected.start.activation.identity, activation);
+    assert_eq!(plan.authorization_limits, authorization_limits);
     assert_eq!(plan.graph.root, manifest.root());
     assert_eq!(plan.graph.tasks.len(), manifest.tasks().len());
     assert_eq!(plan.graph.edges.len(), edges.len());
@@ -936,8 +1018,22 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
         next.get() as usize,
         10 + projected.creations.len() + plan.establish_material.len()
     );
+    assert!(
+        projected
+            .members
+            .iter()
+            .map(|member| &member.participation)
+            .eq(plan.establish_material.keys())
+    );
     for participant in manifest.participations() {
         let backend = participant.backend();
+        let participation = participant.participation();
+        let member = projected
+            .members
+            .iter()
+            .find(|member| member.participation == participation)
+            .unwrap();
+        assert_eq!(&member.endpoint, backend.endpoint());
         assert_eq!(
             plan.admission_epochs[&backend.process_id()],
             backend.admission_epoch_capability()
@@ -949,7 +1045,7 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
         assert!(
             !projected
                 .creations
-                .contains_key(&plan.establish_material[&participant.participation()].material)
+                .contains_key(&plan.establish_material[&participation].material)
         );
     }
     for task in plan.graph.tasks.values() {
@@ -958,56 +1054,69 @@ fn original_manifest_projects_the_core_plan_and_both_payload_owners() {
             task.identity
         );
     }
-    let (&participation, quote) = plan.establish_material.first_key_value().unwrap();
-    let operation_id = TaskOperationId::new_v7();
-    let envelope =
-        OperationEnvelope::with_default_wait(operation_id, OperationKind::UpdateParticipation);
-    let original = projected
-        .establish
-        .for_authorization(
-            &ProtocolIntent::EstablishParticipation {
-                envelope,
-                participation,
-                ticket: AdmissionTicketId::try_from_bytes([41; 16]).unwrap(),
-                initial_lease_sequence: LeaseSequence::INITIAL,
-                initial_lease_valid_for: LeaseValidFor::new(plan.initial_lease).unwrap(),
-                material: quote.material,
-                queued_bytes: quote.queued_bytes,
+    let participant = projected.members[0].participation;
+    let admission = AcquireParticipationAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        participant,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        compatibility,
+        plan.admission_epochs[&participant.backend_process_id()],
+    );
+    let authorization_request = |number, request| {
+        let id = NonZeroU64::new(number).unwrap();
+        AttemptToLogical {
+            activation,
+            action: AttemptActionId::new(id),
+            body: AttemptToLogicalBody::AuthorizationRequest {
+                token: AttemptRequestToken::new(id),
+                request,
             },
-            AttemptAuthorization::Establish {
-                participation,
-                operation_id,
-            },
-        )
+        }
+    };
+    let reply = projected
+        .qa
+        .handle_port(&authorization_request(
+            1,
+            AttemptAuthorization::BeginAdmission(admission),
+        ))
+        .await
         .unwrap();
-    assert_eq!(original.envelope(), envelope);
-    let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
-    <Core as AttemptCore>::new(AttemptStart {
-        activation: AttemptActivation {
-            identity: plan.authorization_limits.activation,
-            policy: AttemptLifecyclePolicy {
-                completion: AttemptCompletionPolicy::AcceptedRootSuccessSeal,
-                retain_diagnostics: true,
+    let LogicalToAttemptBody::AuthorizationReply {
+        decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
+        ..
+    } = reply.reply.body
+    else {
+        panic!("the same logical actor must authorize its manifest member");
+    };
+    let reply = projected
+        .qa
+        .handle_port(&authorization_request(
+            2,
+            AttemptAuthorization::SettleAdmission {
+                issue,
+                participation: participant,
+                operation_id: admission.envelope().operation_id(),
+                outcome: Some(OperationOutcome::ResourceExhausted),
+                receipt: None,
+                prior_transport_unknown: false,
             },
-            inherited_admissions: Box::new([]),
-        },
-        plan,
-        ids: IdSeed::new(1, 100),
-        initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
-        sources: AttemptSources {
-            actor: source(1),
-            publication: source(2),
-            qa: source(3),
-            process: source(4),
-            native: source(5),
-            observation: source(6),
-            capacity: source(7),
-            membership: source(8),
-            mailbox: [4; 4],
-        },
-        observe_dev_root: false,
-    })
-    .expect("Core accepts the exact bound manifest projection");
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reply.reply.body,
+        LogicalToAttemptBody::AuthorizationReply {
+            decision: Ok(AttemptAuthorizationDecision::AdmissionRetryable),
+            ..
+        }
+    ));
+    <Core as AttemptCore>::new(projected.start)
+        .expect("Core accepts the original QA limits and the exact manifest projection");
+    drop(projected.qa);
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 }
 
 #[test]

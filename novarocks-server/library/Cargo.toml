@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+novarocks-attempt-protocol.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-connector-paimon.workspace = true
