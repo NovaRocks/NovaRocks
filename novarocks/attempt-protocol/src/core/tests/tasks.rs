@@ -27,7 +27,7 @@ use crate::{
     },
     input::{
         AckPayload, AttemptInput, AttemptInputClaim, OperationReply, OperationReplyResult,
-        QueuedInputGrantRef, SendGeneration,
+        QueuedInputGrantRef, SendGeneration, UpdateAdmission,
     },
 };
 use novarocks_coordination_contract::{
@@ -35,10 +35,11 @@ use novarocks_coordination_contract::{
     AttemptToLogicalBody,
 };
 use novarocks_execution_contract::{
-    AdmissionTicketId, CreateTaskReceipt, DomainProgression, ExchangeDeliveryRequirement,
-    ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor, OperationEnvelope,
-    OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
-    ParticipationState, SafeDetail, TaskDomainReceipt, TaskFailure, UpdateTaskReceipt,
+    AdmissionTicketId, CancelReason, CreateTaskReceipt, DomainProgression,
+    ExchangeDeliveryRequirement, ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor,
+    OperationEnvelope, OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
+    ParticipationState, PlanNodeId, SafeDetail, SplitOffer, SplitSequence, TaskDomainReceipt,
+    TaskFailure, UpdateTaskReceipt,
     failure::{FailureClass, FailureFact, FailureReason},
     operation::OperationResult,
 };
@@ -412,7 +413,10 @@ struct DrainTrace {
     next: u64,
     replies: Vec<OperationObservation>,
     openings: BTreeMap<ParticipationRef, NonZeroU64>,
+    creates: BTreeMap<TaskIdentity, (OperationIntent, SendGeneration)>,
     closes: BTreeMap<TaskIdentity, usize>,
+    producer_opens: usize,
+    cancels: Vec<(TaskIdentity, CancelReason)>,
 }
 
 fn worker_accepted(
@@ -436,6 +440,18 @@ fn worker_accepted(
 
 impl DrainTrace {
     fn new() -> Self {
+        let mut trace = Self::with_dispatched_creates();
+        let identities: Vec<_> = trace.creates.keys().copied().collect();
+        for identity in identities {
+            trace.acknowledge_create(TaskStatus::created(identity).with_installed());
+        }
+        trace.pump();
+        assert!(trace.closes.is_empty());
+        trace.transport.blocked_update = Some(trace.producer.backend_process_id());
+        trace
+    }
+
+    fn with_dispatched_creates() -> Self {
         let mut start = start();
         let graph = &mut start.plan.graph;
         let root = graph.root;
@@ -498,12 +514,12 @@ impl DrainTrace {
             next: 100,
             replies: Vec::new(),
             openings: BTreeMap::new(),
+            creates: BTreeMap::new(),
             closes: BTreeMap::new(),
+            producer_opens: 0,
+            cancels: Vec::new(),
         };
-        trace.prepare_installed_tasks([root, middle, producer, sibling]);
-        trace.pump();
-        assert!(trace.closes.is_empty());
-        trace.transport.blocked_update = Some(producer.backend_process_id());
+        trace.dispatch_creates([root, middle, producer, sibling]);
         trace
     }
 
@@ -512,7 +528,7 @@ impl DrainTrace {
         AttemptActionId::new(id(self.next))
     }
 
-    fn prepare_installed_tasks(&mut self, tasks: [TaskIdentity; 4]) {
+    fn dispatch_creates(&mut self, tasks: [TaskIdentity; 4]) {
         let participants: Vec<ParticipationRef> = self
             .core
             .execution
@@ -609,7 +625,21 @@ impl DrainTrace {
             ));
         }
         self.run_round(None);
-        assert_eq!(self.replies.len(), tasks.len());
+        assert_eq!(self.creates.len(), tasks.len());
+    }
+
+    fn acknowledge_create(&mut self, status: TaskStatus) {
+        let identity = status.identity();
+        let (request, generation) = &self.creates[&identity];
+        self.replies.push(worker_accepted(
+            request,
+            *generation,
+            Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                identity,
+                Vec::new(),
+                status,
+            )))),
+        ));
     }
 
     fn begin_prefix(&mut self) {
@@ -682,22 +712,28 @@ impl DrainTrace {
                 }) => {
                     self.core.execution.observe_send_started(id);
                     for (operation, grant) in batch.operations.iter().zip(&batch.queued_inputs) {
+                        let generation = grant.generation();
                         let payload = match operation {
                             OperationIntent::CreateTask { identity, .. } => {
-                                Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
-                                    *identity,
-                                    Vec::new(),
-                                    TaskStatus::created(*identity).with_installed(),
-                                ))))
+                                assert!(
+                                    self.creates
+                                        .insert(*identity, (operation.clone(), generation))
+                                        .is_none(),
+                                    "the original Create was sent again for {identity}"
+                                );
+                                continue;
                             }
                             OperationIntent::UpdateTask {
                                 identity, domains, ..
                             } => Some(self.update_receipt(*identity, domains)),
-                            OperationIntent::CancelTask(_) => None,
+                            OperationIntent::CancelTask(cancel) => {
+                                self.cancels.push((cancel.identity(), cancel.reason()));
+                                None
+                            }
                             _ => panic!("unexpected operation {operation:?}"),
                         };
                         self.replies
-                            .push(worker_accepted(operation, grant.generation(), payload));
+                            .push(worker_accepted(operation, generation, payload));
                     }
                 }
                 RoundTailStep::Effect(AttemptEffect {
@@ -735,6 +771,10 @@ impl DrainTrace {
     ) -> AckPayload {
         let receipt = match domains {
             [TaskDomainIntent::OpenExchangeEdges { version, edges }] => {
+                if identity == self.producer {
+                    assert_eq!(edges.as_slice(), [ExchangeEdgeId::new(2).unwrap()]);
+                    self.producer_opens += 1;
+                }
                 TaskDomainReceipt::OpenExchangeEdges {
                     accepted_version: *version,
                     opened: edges.clone(),
@@ -851,6 +891,167 @@ impl DrainTrace {
     }
 }
 
+fn permutations<T: Copy>(events: &mut [T], position: usize, traces: &mut Vec<Vec<T>>) {
+    if position == events.len() {
+        traces.push(events.to_vec());
+        return;
+    }
+    for next in position..events.len() {
+        events.swap(position, next);
+        permutations(events, position + 1, traces);
+        events.swap(position, next);
+    }
+}
+
+#[test]
+fn original_authorized_close_and_create_reply_permutations() {
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        AuthorizeClose,
+        AcceptedAck,
+        Installed,
+        NeededSiblingReady,
+        QueueAvailable,
+    }
+
+    let mut traces = Vec::new();
+    permutations(
+        &mut [
+            Event::AuthorizeClose,
+            Event::AcceptedAck,
+            Event::Installed,
+            Event::NeededSiblingReady,
+            Event::QueueAvailable,
+        ],
+        0,
+        &mut traces,
+    );
+
+    let (mut closes, mut opens, mut late_ack) = (0, 0, 0);
+    for events in &traces {
+        let mut trace = DrainTrace::with_dispatched_creates();
+        let [closed, needed] = trace.middle;
+        let participation = trace
+            .core
+            .execution
+            .graph()
+            .task(closed.task_id())
+            .unwrap()
+            .participation();
+        trace.acknowledge_create(TaskStatus::created(trace.producer).with_installed());
+        trace.transport.blocked_update = Some(trace.producer.backend_process_id());
+        trace.pump();
+        let now = trace.core.execution.monotonic_now();
+        let installed = ReceivedObservation {
+            participation,
+            generation: trace.openings[&participation],
+            received_at: now,
+            opening: ObservationOpening {
+                started_at: now,
+                opened_at: Some(now),
+            },
+            event: ObservationEvent::Fact {
+                source_revision: None,
+                fact: ObservationFact::Status(
+                    TaskStatus::try_new(
+                        closed,
+                        TaskStatusVersion::new(2).unwrap(),
+                        TaskState::Planned,
+                        None,
+                        TaskOutputFacts::default(),
+                    )
+                    .unwrap()
+                    .with_installed(),
+                ),
+            },
+        };
+
+        let mut authorized = false;
+        for event in events {
+            match event {
+                Event::AuthorizeClose => {
+                    authorized = true;
+                    trace.authorize_close();
+                    trace.authorize_close();
+                }
+                Event::AcceptedAck => {
+                    late_ack += usize::from(authorized);
+                    trace.acknowledge_create(TaskStatus::created(closed));
+                }
+                Event::Installed => {
+                    trace.run_round(Some(
+                        ObservationBatch::new(vec![installed.clone(), installed.clone()]).unwrap(),
+                    ));
+                }
+                Event::NeededSiblingReady => {
+                    trace.acknowledge_create(TaskStatus::created(needed).with_installed());
+                }
+                Event::QueueAvailable => trace.transport.blocked_update = None,
+            }
+            trace.pump();
+            if authorized {
+                let action = trace.action();
+                assert!(
+                    trace
+                        .core
+                        .execution
+                        .begin_create_admission(closed, action)
+                        .unwrap()
+                        .is_none(),
+                    "{events:?}: local close restored A Create"
+                );
+            }
+        }
+
+        assert_eq!(
+            trace.closes,
+            BTreeMap::from([(closed, 1)]),
+            "{events:?}: lost or duplicated A close, or B was closed"
+        );
+        assert_eq!(trace.producer_opens, 1, "{events:?}: A blocked necessary B");
+        for (target, reason) in trace.cancels {
+            assert_eq!(
+                (target, reason),
+                (closed, CancelReason::UpstreamNoLongerNeeded),
+                "{events:?}: unexpected cancellation"
+            );
+        }
+        assert!(
+            !trace
+                .core
+                .execution
+                .task(closed.task_id())
+                .unwrap()
+                .create_pending(),
+            "{events:?}: replay eligibility revived"
+        );
+        let sequence = SplitSequence::new(1).unwrap();
+        let (disposition, intent) = trace
+            .core
+            .execution
+            .prepare_task_update(
+                closed,
+                TaskDomainIntent::SplitAssignment {
+                    node: PlanNodeId::new(5).unwrap(),
+                    offer: SplitOffer::batch(sequence, sequence, false).unwrap(),
+                    payload: PayloadRef(id(500)),
+                    queued_bytes: 128,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            UpdateAdmission::DiscardedNoLongerNeeded,
+            "{events:?}: late ownership restored ordinary input"
+        );
+        assert!(intent.is_none(), "{events:?}: discarded input was prepared");
+        closes += trace.closes.values().sum::<usize>();
+        opens += trace.producer_opens;
+    }
+    assert_eq!(traces.len(), 120);
+    assert_eq!((closes, opens, late_ack), (120, 120, 60));
+}
+
 #[test]
 fn original_normal_drain_and_backpressure_permutations() {
     #[derive(Clone, Copy, Debug)]
@@ -859,18 +1060,6 @@ fn original_normal_drain_and_backpressure_permutations() {
         QueueAvailable,
         NormalDrain,
         DuplicateAuthorization,
-    }
-
-    fn permutations(events: &mut [Event], position: usize, traces: &mut Vec<Vec<Event>>) {
-        if position == events.len() {
-            traces.push(events.to_vec());
-            return;
-        }
-        for next in position..events.len() {
-            events.swap(position, next);
-            permutations(events, position + 1, traces);
-            events.swap(position, next);
-        }
     }
 
     let mut traces = Vec::new();
