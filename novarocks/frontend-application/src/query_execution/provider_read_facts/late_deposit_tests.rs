@@ -1285,6 +1285,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
                 &mv_relation(snapshot),
                 &AdmittedRead::MvTarget {
                     materialization: frozen,
+                    original_source: None,
                     object_id: object.clone(),
                 }
             ),
@@ -1327,6 +1328,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
             &partition_relation,
             &AdmittedRead::MvTarget {
                 materialization: partitioned.clone(),
+                original_source: None,
                 object_id: object.clone(),
             }
         ),
@@ -1380,6 +1382,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
             &partition_relation,
             &AdmittedRead::MvTarget {
                 materialization: partitioned,
+                original_source: None,
                 object_id: object
             },
             "db.orders",
