@@ -82,6 +82,14 @@ impl AttemptEffectEnvelope {
             || self.is_qa_call()
             || self.is_process_call()
             || self.is_publication_call()
+            || self.is_transport_release()
+    }
+
+    pub(crate) fn is_transport_release(&self) -> bool {
+        matches!(
+            self.protocol.body,
+            EffectBody::ReleaseQueuedInput { .. } | EffectBody::ReleaseCreationPayload { .. }
+        )
     }
 
     pub(crate) fn is_process_call(&self) -> bool {

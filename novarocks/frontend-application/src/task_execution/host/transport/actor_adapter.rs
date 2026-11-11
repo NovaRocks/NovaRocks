@@ -39,7 +39,7 @@ use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::{
     actor_turn::InputAuthor,
     causal_input::CausalInputObligation,
-    exit_work::{PanicSink, run_future},
+    exit_work::{PanicSink, run_blocking, run_future},
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::identity::ConsumerId;
@@ -53,13 +53,17 @@ struct UnprovenBodyOutcome {
 }
 impl TransportCompletionObligation for ActorResultObligation {
     fn body_finished(self: Box<Self>, outcome: BodyOutcome) {
-        if let Err(original) = self.0.stage_actor_outcome(outcome) {
-            std::panic::resume_unwind(Box::new(UnprovenBodyOutcome {
-                _original: original,
-            }));
-        }
+        stage_actor_outcome(&self.0, outcome);
     }
 }
+fn stage_actor_outcome(registration: &TransportJoinRegistration, outcome: BodyOutcome) {
+    if let Err(original) = registration.stage_actor_outcome(outcome) {
+        std::panic::resume_unwind(Box::new(UnprovenBodyOutcome {
+            _original: original,
+        }));
+    }
+}
+
 /// The original Source binds the same admitted job, launch authority and
 /// canonical grants before returning it to the common host.
 pub(crate) struct BoundActorTransport {
@@ -283,6 +287,18 @@ pub(crate) fn handoff_actor_transport(
                 bound,
             })
         }),
+        ActorTransportWork::Call(bound) if effect.is_transport_release() => {
+            launch.spawn_blocking(runtime, exit, |exit, registration| {
+                let work = run_blocking(exit, move || bound.dispose(), panic);
+                move || {
+                    let outcome = match work.run() {
+                        Ok(()) => BodyOutcome::Call(super::call_source::AttemptCallReply::NoInput),
+                        Err(error) => BodyOutcome::RawFailure(Box::new(error)),
+                    };
+                    stage_actor_outcome(&registration, outcome);
+                }
+            })
+        }
         ActorTransportWork::Call(bound) => {
             launch.spawn(runtime, exit, |exit, registration| async move {
                 let outcome = match run_future(exit, bound.run(effect), panic).await {
@@ -290,11 +306,7 @@ pub(crate) fn handoff_actor_transport(
                     Ok(Err(error)) => BodyOutcome::RawFailure(error),
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };
-                if let Err(original) = registration.stage_actor_outcome(outcome) {
-                    std::panic::resume_unwind(Box::new(UnprovenBodyOutcome {
-                        _original: original,
-                    }));
-                }
+                stage_actor_outcome(&registration, outcome);
             })
         }
     };

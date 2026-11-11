@@ -20,7 +20,8 @@
 use super::{
     ActorSendReports, ActorTransportExecutor, AdmissionSource, AttemptCallSource, BodyOutcome,
     FrozenSendRequests, NativeProgressInput, NativeReceiptInput, PreparedActorSend, SendContext,
-    SendKey, SendMemberReport, SendReportRows, call_source::AttemptCallReply,
+    SendKey, SendMemberReport, SendReportRows,
+    call_source::{AttemptCallReply, TransportRelease},
     send_reports::close_unlaunched,
 };
 use crate::{
@@ -129,7 +130,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    calls: [Option<AttemptCallSource>; 3],
+    calls: [Option<AttemptCallSource>; 4],
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -160,7 +161,7 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        calls: [Option<AttemptCallSource>; 3],
+        calls: [Option<AttemptCallSource>; 4],
         send: AttemptSendSource,
         mut failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
@@ -444,10 +445,16 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
+            if let EffectBody::ReleaseCreationPayload { payload, .. } = original.protocol.body
+                && !self.admission.can_release_creation(payload)
+            {
+                return None;
+            }
             let call_lane = match original {
                 original if original.is_qa_call() => Some(0),
                 original if original.is_process_call() => Some(1),
                 original if original.is_publication_call() => Some(2),
+                original if original.is_transport_release() => Some(3),
                 _ => None,
             };
             if let Some(lane) = call_lane {
@@ -469,11 +476,6 @@ impl EffectSource for AttemptTransportSource {
                     return Some(result);
                 }
                 EffectBody::SendBatch { .. } => return self.prepare_send(original),
-                EffectBody::ReleaseCreationPayload { payload, .. }
-                    if !self.admission.can_release_creation(payload) =>
-                {
-                    return None;
-                }
                 _ => {}
             }
         }
@@ -543,6 +545,26 @@ impl EffectSource for AttemptTransportSource {
                     }
                 }
                 assert!(self.in_flight.insert(effect.protocol.id));
+                if effect.is_transport_release() {
+                    let release = || match effect.protocol.body {
+                        EffectBody::ReleaseQueuedInput { grant } => self
+                            .admission
+                            .release_grant(grant)
+                            .map(TransportRelease::QueuedInput),
+                        EffectBody::ReleaseCreationPayload { task, payload } => self
+                            .admission
+                            .take_creation(task, payload)
+                            .map(|seed| TransportRelease::Creation {
+                                request: self.requests.retire_creation(task, payload),
+                                seed,
+                            }),
+                        _ => unreachable!("original transport release"),
+                    };
+                    return Ok(self.calls[lane]
+                        .as_mut()
+                        .unwrap()
+                        .bind_with_release(ticket, result, release));
+                }
                 let receipt = match &effect.protocol.body {
                     EffectBody::Port(port) => match port.body {
                         novarocks_coordination_contract::AttemptToLogicalBody::AbortSettlement {
@@ -564,32 +586,7 @@ impl EffectSource for AttemptTransportSource {
                 assert!(self.in_flight.insert(effect.protocol.id));
                 Ok(self.admission.bind(ticket, result))
             }
-            Prepaid::Other => {
-                if let FrontendEffect::Attempt(effect) = &ticket.effect {
-                    match effect.protocol.body {
-                        EffectBody::ReleaseQueuedInput { grant } => {
-                            if let Some(original) = self.admission.release_grant(grant) {
-                                self.other.retain_transport_release(Box::new((
-                                    effect.protocol.id,
-                                    original,
-                                )));
-                            }
-                        }
-                        EffectBody::ReleaseCreationPayload { task, payload } => {
-                            if let Some(seed) = self.admission.take_creation(task, payload) {
-                                let original = self.requests.retire_creation(task, payload);
-                                self.other.retain_transport_release(Box::new((
-                                    effect.protocol.id,
-                                    original,
-                                    seed,
-                                )));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                self.other.try_bind_job(runtime, turn, ticket, result)
-            }
+            Prepaid::Other => self.other.try_bind_job(runtime, turn, ticket, result),
             Prepaid::Send(lane, prepared) => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
                     unreachable!()

@@ -162,6 +162,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) abort: Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
     pub(crate) process: super::transport::AttemptCallSource,
     pub(crate) publication: super::transport::AttemptCallSource,
+    pub(crate) release: super::transport::AttemptCallSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -374,6 +375,23 @@ impl AttemptActorRegistration {
             observer,
             self.publication_source,
             super::transport::AttemptCallOwner::Publication(owner),
+        )
+    }
+
+    pub(crate) fn prepare_transport_release_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
+        self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.native_source,
+            super::transport::AttemptCallOwner::Release,
         )
     }
 
@@ -635,6 +653,7 @@ impl AttemptActorRegistration {
             abort,
             process,
             publication,
+            release,
             send,
             executor: native,
             failure,
@@ -686,7 +705,7 @@ impl AttemptActorRegistration {
                     self.native_source,
                     self.scope.clone(),
                     admission,
-                    [Some(qa), Some(process), Some(publication)],
+                    [Some(qa), Some(process), Some(publication), Some(release)],
                     send,
                     (
                         FailureContext {

@@ -1663,18 +1663,18 @@ async fn transport_reaper_releases_physical_funding_before_waiting_for_reply_ali
 
 #[tokio::test]
 async fn actor_send_claims_core_guard_and_same_admission_grant_before_withdrawal() {
-    run_actor_send(true, None).await;
+    run_actor_send(ActorSendMode::Withdraw, None).await;
 }
 
 #[tokio::test]
 async fn actor_send_delivers_native_receipt_and_waits_for_its_final_alias() {
-    run_actor_send(false, None).await;
+    run_actor_send(ActorSendMode::Send, None).await;
 }
 
 #[tokio::test]
 async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
     run_actor_send(
-        false,
+        ActorSendMode::Send,
         Some(novarocks_execution_contract::OperationOutcome::Accepted),
     )
     .await;
@@ -1683,14 +1683,26 @@ async fn actor_send_failure_tracks_live_native_row_until_original_exit() {
 #[tokio::test]
 async fn actor_send_failure_retains_worker_owner_failure_and_unknown_residual() {
     run_actor_send(
-        false,
+        ActorSendMode::Send,
         Some(novarocks_execution_contract::OperationOutcome::OwnerFailed),
     )
     .await;
 }
 
+#[tokio::test]
+async fn actor_release_retires_the_exact_wc_grant_without_starting_a_send() {
+    run_actor_send(ActorSendMode::Release, None).await;
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ActorSendMode {
+    Send,
+    Withdraw,
+    Release,
+}
+
 async fn run_actor_send(
-    withdraw: bool,
+    mode: ActorSendMode,
     failure_verdict: Option<novarocks_execution_contract::OperationOutcome>,
 ) {
     use crate::control_runtime::membership::FrozenMember;
@@ -1744,10 +1756,13 @@ async fn run_actor_send(
 
     let roles = Roles::new();
     let fail_core = failure_verdict.is_some();
-    let mut peer = if withdraw {
-        None
-    } else {
+    let sends = mode == ActorSendMode::Send;
+    let withdraw = mode == ActorSendMode::Withdraw;
+    let release = mode == ActorSendMode::Release;
+    let mut peer = if sends {
         Some(crate::native::task_transport::tests::Loopback::start().await)
+    } else {
+        None
     };
     let mut wc = Governed::for_control_origin(peer.as_ref().map(|peer| &peer.control_endpoint));
     let handle = Handle::current();
@@ -1798,40 +1813,53 @@ async fn run_actor_send(
             payload: QueuedInputPayload::AlreadyRetained,
         },
     });
-    let queue = roles
-        .scope
-        .reserve_child_next(
-            generation(),
-            payer.id(),
-            transport::send_queue_resources(
-                &roles.layout,
-                backend,
-                TransportCapacityLane::Control,
-                1,
-                operation.queued_bytes(),
-            )
-            .unwrap(),
-            WorkKind::Settlement,
-        )
-        .unwrap();
-    let reservation = queue.reservation_id();
     let send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
-    let send = AttemptEffectEnvelope::new(AttemptEffect {
-        id: send_id,
-        class: EffectClass::Settlement,
-        body: EffectBody::SendBatch {
-            batch: DispatchBatch {
-                backend,
-                lane: protocol.lane(),
-                control_progress: true,
-                operations: Box::new([protocol]),
-                queued_bytes: operation.queued_bytes(),
-                queued_at: MonotonicInstant::from_origin(Duration::ZERO),
-                queued_inputs: Box::new([reference]),
+    let (send, queue) = if release {
+        (
+            AttemptEffectEnvelope::new(AttemptEffect {
+                id: send_id,
+                class: EffectClass::Cleanup,
+                body: EffectBody::ReleaseQueuedInput { grant: reference },
+            }),
+            None,
+        )
+    } else {
+        let queue = roles
+            .scope
+            .reserve_child_next(
+                generation(),
+                payer.id(),
+                transport::send_queue_resources(
+                    &roles.layout,
+                    backend,
+                    TransportCapacityLane::Control,
+                    1,
+                    operation.queued_bytes(),
+                )
+                .unwrap(),
+                WorkKind::Settlement,
+            )
+            .unwrap();
+        let reservation = queue.reservation_id();
+        let send = AttemptEffectEnvelope::new(AttemptEffect {
+            id: send_id,
+            class: EffectClass::Settlement,
+            body: EffectBody::SendBatch {
+                batch: DispatchBatch {
+                    backend,
+                    lane: protocol.lane(),
+                    control_progress: true,
+                    operations: Box::new([protocol]),
+                    queued_bytes: operation.queued_bytes(),
+                    queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                    queued_inputs: Box::new([reference]),
+                },
+                reservation: ReservationToken(NonZeroU64::new(reservation.get()).unwrap()),
             },
-            reservation: ReservationToken(NonZeroU64::new(reservation.get()).unwrap()),
-        },
-    });
+        });
+        (send, Some(queue))
+    };
+    let reservation = queue.as_ref().map(|queue| queue.reservation_id());
     struct ScopeOwner {
         scope: ScopeHandle,
         parent: WorkObligation,
@@ -2020,7 +2048,7 @@ async fn run_actor_send(
         ReportedWork::try_new(failure_work, failure_capacity, failure_report).unwrap();
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
-        [(admit, None), (send.clone(), Some(queue))],
+        [(admit, None), (send.clone(), queue)],
         [8; 4],
         Some(failure_work.work()),
     );
@@ -2042,6 +2070,16 @@ async fn run_actor_send(
         VecDeque::new(),
         VecDeque::from([inbox.reserve_result(&parent)]),
     ];
+    let release_source = release.then(|| {
+        transport::AttemptCallSource::new(
+            &parent,
+            &payer,
+            generation(),
+            observer(),
+            transport::AttemptCallOwner::Release,
+            inbox.reserve_result(&parent),
+        )
+    });
     let report_author = roles.cleanup(parent.id());
     let requests = transport::FrozenSendRequests::default();
     let endpoint = peer.as_ref().map_or_else(
@@ -2167,7 +2205,7 @@ async fn run_actor_send(
                 inbox.source(),
                 roles.scope.clone(),
                 admission,
-                [None, None, None],
+                [None, None, None, release_source],
                 transport::AttemptSendSource {
                     requests,
                     contexts,
@@ -2248,53 +2286,61 @@ async fn run_actor_send(
     }
     let send_input = send_command.fill(FrontendInput::Test(1)).unwrap();
     assert!(actor_runtime.poll_one(Tick(1)).unwrap());
-    assert_eq!(
-        actor_runtime
-            .step_reservations(actor, send_input, None, 1)
-            .unwrap()[0]
-            .0,
-        reservation
-    );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let mut started = false;
-        loop {
-            drive(&mut wc.driver);
-            advance_host();
-            if let Some((_, fact)) = inbox.try_commit_next() {
-                match fact {
-                    ExecutorFact::Withdrawn {
-                        effect,
-                        outcome: WithdrawalOutcome::DefinitelyUnsent,
-                    } if withdraw => {
-                        assert_eq!(effect, send_id);
-                        break;
+    if release {
+        advance_host();
+        // Handoff completes the effect. The original cleanup Join has its
+        // own retirement path, and the Core receives no synthetic send fact.
+        actor_runtime.retire_input(actor, send_input).unwrap();
+        assert!(inbox.try_commit_next().is_none());
+    } else {
+        assert_eq!(
+            actor_runtime
+                .step_reservations(actor, send_input, None, 1)
+                .unwrap()[0]
+                .0,
+            reservation.unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = false;
+            loop {
+                drive(&mut wc.driver);
+                advance_host();
+                if let Some((_, fact)) = inbox.try_commit_next() {
+                    match fact {
+                        ExecutorFact::Withdrawn {
+                            effect,
+                            outcome: WithdrawalOutcome::DefinitelyUnsent,
+                        } if withdraw => {
+                            assert_eq!(effect, send_id);
+                            break;
+                        }
+                        ExecutorFact::SendStarted { effect, .. } if sends => {
+                            assert_eq!(effect, send_id);
+                            assert!(!started);
+                            started = true;
+                        }
+                        ExecutorFact::Operation(observed) if sends => {
+                            assert!(started);
+                            assert_eq!(observed.generation, key.generation);
+                            assert_eq!(observed.reply.operation_id(), key.operation);
+                            assert_eq!(
+                                observed.reply.worker_outcome(),
+                                Some(novarocks_execution_contract::OperationOutcome::Accepted)
+                            );
+                            break;
+                        }
+                        other => panic!("unexpected composed send fact: {other:?}"),
                     }
-                    ExecutorFact::SendStarted { effect, .. } if !withdraw => {
-                        assert_eq!(effect, send_id);
-                        assert!(!started);
-                        started = true;
-                    }
-                    ExecutorFact::Operation(observed) if !withdraw => {
-                        assert!(started);
-                        assert_eq!(observed.generation, key.generation);
-                        assert_eq!(observed.reply.operation_id(), key.operation);
-                        assert_eq!(
-                            observed.reply.worker_outcome(),
-                            Some(novarocks_execution_contract::OperationOutcome::Accepted)
-                        );
-                        break;
-                    }
-                    other => panic!("unexpected composed send fact: {other:?}"),
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(starts.was_started(participation), !withdraw);
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(starts.was_started(participation), sends);
     drop(starts);
-    if !withdraw {
+    if sends {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 drive(&mut wc.driver);
@@ -2318,13 +2364,15 @@ async fn run_actor_send(
             .used,
         [0, 0]
     );
-    assert!(
-        actor_runtime
-            .step_reservations(actor, send_input, None, 1)
-            .unwrap()
-            .is_empty()
-    );
-    actor_runtime.retire_input(actor, send_input).unwrap();
+    if !release {
+        assert!(
+            actor_runtime
+                .step_reservations(actor, send_input, None, 1)
+                .unwrap()
+                .is_empty()
+        );
+        actor_runtime.retire_input(actor, send_input).unwrap();
+    }
     if fail_core {
         {
             let mut waiting = Box::pin(terminal_owner.terminal());
@@ -2356,7 +2404,7 @@ async fn run_actor_send(
     actor_runtime.close_timer_source(actor).unwrap();
     host.close_registration();
     advance_host();
-    if !withdraw {
+    if sends {
         assert!(
             !host.is_empty(),
             "the original Native row still has a reply alias"

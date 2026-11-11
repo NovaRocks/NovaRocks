@@ -340,7 +340,9 @@ impl TestActor for WithdrawalTarget {
                 novarocks_attempt_protocol::effect::EffectClass::Reply => {
                     novarocks_control_runtime_core::effect::EffectKind::Reply
                 }
-                _ => unreachable!("original transport command"),
+                novarocks_attempt_protocol::effect::EffectClass::Cleanup => {
+                    novarocks_control_runtime_core::effect::EffectKind::Cleanup
+                }
             };
             step.effect(
                 crate::task_execution::host::adapter::descriptor(

@@ -788,9 +788,33 @@ impl TransportJoinHandoff {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.install(exit, |exit, registration| {
+            runtime.spawn(make(exit, registration))
+        })
+    }
+
+    pub(crate) fn spawn_blocking<F>(
+        self,
+        runtime: &Handle,
+        exit: ExitObligation,
+        make: impl FnOnce(ExitObligation, TransportJoinRegistration) -> F,
+    ) -> Result<(), CustodyError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.install(exit, |exit, registration| {
+            runtime.spawn_blocking(make(exit, registration))
+        })
+    }
+
+    fn install(
+        self,
+        exit: ExitObligation,
+        spawn: impl FnOnce(ExitObligation, TransportJoinRegistration) -> JoinHandle<()>,
+    ) -> Result<(), CustodyError> {
         assert!(self.owns_exit(&exit), "same prepared transport exit");
         let Self { role, registration } = self;
-        match catch_unwind(AssertUnwindSafe(|| runtime.spawn(make(exit, registration)))) {
+        match catch_unwind(AssertUnwindSafe(|| spawn(exit, registration))) {
             Ok(join) => {
                 role.install_join(join);
                 Ok(())

@@ -18,8 +18,8 @@
 //! A paid reply lane for one original attempt port.
 
 use super::{
-    ActorTransportWork, BodyOutcome, prepare_actor_transport,
-    process_observation::AttemptProcessObserver,
+    ActorTransportWork, BodyOutcome, OriginalQueuedInput, prepare_actor_transport,
+    process_observation::AttemptProcessObserver, queued_job::CreationSeed,
 };
 use crate::{
     control_runtime::{
@@ -77,6 +77,7 @@ pub(crate) enum AttemptCallOwner {
     Qa(Arc<Mutex<AttemptQaBridge>>),
     Process(Arc<AttemptProcessObserver>),
     Publication(Arc<AttemptPublicationOwner>),
+    Release,
 }
 
 impl AttemptCallOwner {
@@ -85,6 +86,7 @@ impl AttemptCallOwner {
             Self::Qa(_) => effect.is_qa_call(),
             Self::Process(_) => effect.is_process_call(),
             Self::Publication(_) => effect.is_publication_call(),
+            Self::Release => effect.is_transport_release(),
         }
     }
 }
@@ -97,16 +99,43 @@ pub(crate) enum AttemptCallReply {
     Terminal(Box<TerminalPublication>),
     Convergence(ConvergencePublication),
     AbortSettled(AppliedAbortSettlement),
-    RootControlDelivered,
+    NoInput,
+}
+
+pub(super) enum TransportRelease {
+    QueuedInput(OriginalQueuedInput),
+    Creation {
+        request: Option<crate::task_execution::intent::OperationIntent>,
+        seed: CreationSeed,
+    },
+}
+impl TransportRelease {
+    fn dispose(self) {
+        match self {
+            Self::QueuedInput(original) => drop(original),
+            Self::Creation { request, seed } => {
+                drop(request);
+                drop(seed);
+            }
+        }
+    }
 }
 
 pub(crate) struct BoundAttemptCall {
     owner: AttemptCallOwner,
     abort: Option<(Arc<AbortSettlementOwner>, Option<Arc<AbortReceiptSlot>>)>,
+    release: Option<TransportRelease>,
 }
 impl BoundAttemptCall {
     pub(super) fn matches(&self, effect: &AttemptEffectEnvelope) -> bool {
         self.owner.matches(effect)
+    }
+
+    pub(super) fn dispose(self) {
+        assert!(matches!(self.owner, AttemptCallOwner::Release));
+        if let Some(original) = self.release {
+            original.dispose();
+        }
     }
 
     pub(super) async fn run(
@@ -195,11 +224,12 @@ impl BoundAttemptCall {
                     .await
                     .map(|result| match result {
                         Some((input, failure)) => AttemptCallReply::Input { input, failure },
-                        None => AttemptCallReply::RootControlDelivered,
+                        None => AttemptCallReply::NoInput,
                     })
                     .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>),
                 _ => unreachable!("same original publication effect"),
             },
+            AttemptCallOwner::Release => unreachable!("transport release uses blocking Work"),
         }
     }
 }
@@ -325,6 +355,9 @@ impl AttemptCallSource {
             return Ok(None);
         }
         let kind = match effect.protocol.body {
+            EffectBody::ReleaseQueuedInput { .. } | EffectBody::ReleaseCreationPayload { .. } => {
+                WorkKind::Cleanup
+            }
             EffectBody::EstablishAuthorization { .. }
             | EffectBody::Port(AttemptToLogical {
                 body:
@@ -392,6 +425,30 @@ impl AttemptCallSource {
         result: Position,
         receipt: Option<Arc<AbortReceiptSlot>>,
     ) -> PreparedEffectJob {
+        self.bind_with_captures(ticket, result, receipt, || None)
+    }
+
+    pub(super) fn bind_with_release(
+        &mut self,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+        take_original: impl FnOnce() -> Option<TransportRelease>,
+    ) -> PreparedEffectJob {
+        assert!(
+            self.owner
+                .as_ref()
+                .is_some_and(|owner| matches!(owner, AttemptCallOwner::Release))
+        );
+        self.bind_with_captures(ticket, result, None, take_original)
+    }
+
+    fn bind_with_captures(
+        &mut self,
+        ticket: &EffectTicket<FrontendEffect>,
+        result: Position,
+        receipt: Option<Arc<AbortReceiptSlot>>,
+        take_original: impl FnOnce() -> Option<TransportRelease>,
+    ) -> PreparedEffectJob {
         let (effect, work) = self.pending.take().expect("same original call prepayment");
         assert!(
             matches!(&ticket.effect, FrontendEffect::Attempt(original) if Arc::ptr_eq(original, &effect))
@@ -419,7 +476,11 @@ impl AttemptCallSource {
             )
         });
         prepare_actor_transport(effect, result, work, VecDeque::new(), self.observer, |_| {
-            ActorTransportWork::Call(BoundAttemptCall { owner, abort })
+            ActorTransportWork::Call(BoundAttemptCall {
+                owner,
+                abort,
+                release: take_original(),
+            })
         })
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
     }
@@ -541,7 +602,7 @@ impl AttemptCallSource {
                     });
                 }
             }
-            AttemptCallReply::RootControlDelivered => {}
+            AttemptCallReply::NoInput => {}
             AttemptCallReply::AbortSettled(applied) => {
                 if applied.result.is_err() {
                     original.outcome =
@@ -619,7 +680,11 @@ impl AttemptCallSource {
             && self.live.is_none()
             && self.failures.is_empty()
         {
-            Some((self.owner.take()?, self.abort.take(), self.terminal.take()))
+            let original = self.owner.take()?;
+            if matches!(original, AttemptCallOwner::Release) {
+                return None;
+            }
+            Some((original, self.abort.take(), self.terminal.take()))
         } else {
             None
         }
