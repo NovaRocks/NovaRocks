@@ -144,6 +144,7 @@ pub(crate) struct AttemptPumpSource {
     scan: usize,
     retirement_scan: RetirementScan,
     closing: bool,
+    retiring_failures: bool,
 }
 
 impl AttemptPumpSource {
@@ -304,6 +305,7 @@ impl AttemptPumpSource {
             scan: 0,
             retirement_scan: RetirementScan::default(),
             closing: false,
+            retiring_failures: false,
         })
     }
 
@@ -760,6 +762,7 @@ impl AttemptPumpSource {
                 Poll::Ready(Err(error)) => Err(Box::new(error)),
                 Poll::Ready(Ok(result)) => {
                     self.split_cleanup.take();
+                    self.retirement_scan.request();
                     let split = self.split.as_mut().expect("original split source");
                     if let Some(unresolved) =
                         split.original().and_then(|original| original.unresolved())
@@ -807,7 +810,8 @@ impl AttemptPumpSource {
             .lanes
             .iter()
             .all(|lane| lane.purpose != Purpose::SplitControl || lane.live.is_none());
-        self.split
+        let advanced = self
+            .split
             .as_mut()
             .expect("original split source")
             .progress(
@@ -818,16 +822,22 @@ impl AttemptPumpSource {
                 payloads,
                 dispose,
             )
-            .map_err(|error| Box::new(error) as Original)
+            .map_err(|error| Box::new(error) as Original)?;
+        if advanced {
+            self.retirement_scan.request();
+        }
+        Ok(advanced)
     }
 
     pub(crate) fn request_retirement_scan(&mut self) {
         self.retirement_scan.request();
     }
 
-    pub(crate) fn needs_retirement_scan(&self, closing: bool) -> bool {
+    pub(crate) fn needs_retirement_scan(&self, closing: bool, retire_failures: bool) -> bool {
         !self.is_drained()
-            && (closing && !self.closing || self.retirement_scan.has_work(self.lanes.len() + 1))
+            && (closing && !self.closing
+                || retire_failures && !self.retiring_failures
+                || self.retirement_scan.has_work(self.lanes.len() + 1))
     }
 
     pub(crate) fn progress(
@@ -841,6 +851,10 @@ impl AttemptPumpSource {
     ) -> SourceProgress {
         if !self.closing && (failed || closing) {
             self.closing = true;
+            self.retirement_scan.request();
+        }
+        if retire_failures && !self.retiring_failures {
+            self.retiring_failures = true;
             self.retirement_scan.request();
         }
         let mut units = 0;

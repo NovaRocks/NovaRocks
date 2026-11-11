@@ -1264,7 +1264,7 @@ impl EffectSource for AttemptTransportSource {
                     self.split_next = is_split;
                     pump_more |= (index == 0 || is_split) && pumps.has_split_work();
                     pump_more |= (index == 0 || !is_split)
-                        && pumps.needs_retirement_scan(failed || pumps_closing);
+                        && pumps.needs_retirement_scan(failed || pumps_closing, retire_failures);
                     break;
                 }
                 if is_split {
