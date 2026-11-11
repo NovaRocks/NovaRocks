@@ -43,7 +43,7 @@ pub(crate) struct OrderedObservationFailure {
 }
 
 impl OrderedObservationFailure {
-    pub(crate) fn dispose_queued(self) -> Result<(), ObservationError> {
+    pub(crate) fn dispose_queued(&self) -> Result<(), ObservationError> {
         for role in &self.progress {
             role.abandon_pending_after_failure();
         }
@@ -56,6 +56,9 @@ impl OrderedObservationFailure {
             original.dispose().map_err(ObservationError::Runtime)?;
         }
         Ok(())
+    }
+    pub(crate) async fn dispose_tail(self) -> Result<(), ObservationError> {
+        self.ingress.dispose_failed_tail().await
     }
 }
 

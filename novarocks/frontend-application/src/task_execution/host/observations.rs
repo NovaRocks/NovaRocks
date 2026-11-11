@@ -227,6 +227,7 @@ pub(crate) enum ObservationError {
     InvalidRootControl,
     InvalidOpening,
     ResumeRevisionExhausted,
+    FailedTailUnresolved,
     Oversized { charged: usize, reserved: usize },
     Runtime(ActorTurnError),
 }
@@ -381,7 +382,15 @@ pub(crate) trait ObservationSourcePool: Send + Sync + 'static {
     fn stream_claims_exited(&self, stream: StreamKey) -> bool;
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PublisherExit {
+    Live,
+    Exited,
+    Unknown,
+}
+
 struct ReadState {
+    publisher_exit: PublisherExit,
     opening_started_at: Option<MonotonicInstant>,
     opened_at: Option<MonotonicInstant>,
     last_liveness_at: MonotonicInstant,
@@ -401,6 +410,7 @@ struct ReadState {
 impl ReadState {
     fn new(at: MonotonicInstant) -> Self {
         Self {
+            publisher_exit: PublisherExit::Live,
             opening_started_at: None,
             opened_at: None,
             last_liveness_at: at,
@@ -608,12 +618,60 @@ enum PreparedValue {
     Control(RootControlRef),
     Observations(ObservationBatch),
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FailureTail {
+    Normal,
+    Pending,
+    Disposing,
+    Disposed,
+}
+
+struct UnsubmittedTail<I> {
+    queue: VecDeque<Entry>,
+    deferred: VecDeque<Entry>,
+    failed: Option<FailedFill<I>>,
+    failed_control: Option<FailedControlProjection>,
+}
+
+impl<I> UnsubmittedTail<I> {
+    fn retained_streams(&self) -> Vec<StreamKey> {
+        let mut streams = self
+            .queue
+            .iter()
+            .filter_map(|entry| match &entry.value {
+                EntryValue::Pending { key, .. } => Some(*key),
+                EntryValue::Observation(value) => Some(StreamKey {
+                    participation: value.participation,
+                    generation: value.generation,
+                }),
+                EntryValue::Control(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(failed) = &self.failed {
+            streams.extend_from_slice(&failed.streams);
+        }
+        streams
+    }
+
+    fn dispose(self) {
+        let Self {
+            queue,
+            deferred,
+            failed,
+            failed_control,
+        } = self;
+        drop((queue, deferred, failed, failed_control));
+    }
+}
+
 struct State<I> {
     streams: BTreeMap<StreamKey, ReadState>,
     queue: VecDeque<Entry>,
     deferred_controls: VecDeque<Entry>,
     queued_frames: usize,
     writer_busy: bool,
+    writer_poisoned: bool,
+    failure_tail: FailureTail,
     early: EarlyConsumption,
     in_flight: Option<InFlight>,
     failed: Option<FailedFill<I>>,
@@ -623,6 +681,44 @@ struct State<I> {
     metadata_retired: bool,
     closed: bool,
 }
+impl<I> State<I> {
+    fn take_unsubmitted_tail(&mut self) -> UnsubmittedTail<I> {
+        self.queued_frames = 0;
+        UnsubmittedTail {
+            queue: std::mem::take(&mut self.queue),
+            deferred: std::mem::take(&mut self.deferred_controls),
+            failed: self.failed.take(),
+            failed_control: self.failed_control.take(),
+        }
+    }
+
+    fn failed_tail_ready(&self) -> Result<bool, ObservationError> {
+        if self.writer_poisoned {
+            return Err(ObservationError::FailedTailUnresolved);
+        }
+        let mut ready = !self.writer_busy;
+        for stream in self.streams.values().filter(|stream| stream.polling) {
+            if stream.publisher_exit != PublisherExit::Live {
+                return Err(ObservationError::FailedTailUnresolved);
+            }
+            ready = false;
+        }
+        for entry in &self.queue {
+            if let EntryValue::Pending { key, .. } = &entry.value {
+                let stream = self.streams.get(key).expect("pending original stream");
+                match stream.publisher_exit {
+                    PublisherExit::Exited if entry.credit.is_some() => {}
+                    PublisherExit::Unknown | PublisherExit::Exited => {
+                        return Err(ObservationError::FailedTailUnresolved);
+                    }
+                    PublisherExit::Live => ready = false,
+                }
+            }
+        }
+        Ok(ready)
+    }
+}
+
 struct Inner<A: Actor> {
     state: Mutex<State<A::Input>>,
     observations: Mutex<StandingInputObligation<A>>,
@@ -726,6 +822,8 @@ impl<A: Actor> OrderedObservationInput<A> {
                 deferred_controls: VecDeque::new(),
                 queued_frames: 0,
                 writer_busy: false,
+                writer_poisoned: false,
+                failure_tail: FailureTail::Normal,
                 early: EarlyConsumption::default(),
                 in_flight: None,
                 failed: None,
@@ -779,6 +877,35 @@ impl<A: Actor> OrderedObservationInput<A> {
         self.0.changed.notify_waiters();
         Ok(())
     }
+    pub(crate) fn publisher_exited(&self, key: StreamKey) {
+        self.record_publisher_exit(key, PublisherExit::Exited);
+    }
+
+    pub(crate) fn publisher_exit_unknown(&self, key: StreamKey) {
+        // This runs during destruction, including while unwinding from the
+        // actual publisher. Keep its original failure if the writer lock
+        // was poisoned or a notification waker panics.
+        if let Ok(mut state) = self.0.state.lock()
+            && let Some(stream) = state.streams.get_mut(&key)
+        {
+            stream.publisher_exit = PublisherExit::Unknown;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.0.changed.notify_waiters();
+        }));
+    }
+
+    fn record_publisher_exit(&self, key: StreamKey, exit: PublisherExit) {
+        let mut state = self.0.state.lock().expect("ordered observation state");
+        let Some(stream) = state.streams.get_mut(&key) else {
+            return;
+        };
+        assert!(stream.publisher_exit == PublisherExit::Live);
+        stream.publisher_exit = exit;
+        drop(state);
+        self.0.changed.notify_waiters();
+    }
+
     pub(crate) fn register_stream(
         &self,
         key: StreamKey,
@@ -1472,7 +1599,30 @@ impl<A: Actor> OrderedObservationInput<A> {
         }
     }
     pub(crate) fn drive(&self) -> Result<(), ObservationError> {
+        struct WriterGuard<'a, A: Actor> {
+            ingress: &'a OrderedObservationInput<A>,
+            armed: bool,
+        }
+        impl<A: Actor> Drop for WriterGuard<'_, A> {
+            fn drop(&mut self) {
+                if self.armed {
+                    if let Ok(mut state) = self.ingress.0.state.lock() {
+                        state.closed = true;
+                        state.writer_poisoned = true;
+                    }
+                    // A second panic from a foreign waker cannot replace
+                    // the writer's original unwind and unresolved custody.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.ingress.0.changed.notify_waiters();
+                    }));
+                }
+            }
+        }
         loop {
+            let mut guard = WriterGuard {
+                ingress: self,
+                armed: false,
+            };
             let prepared = {
                 let mut state = self.0.state.lock().expect("ordered observation state");
                 if state.closed
@@ -1487,6 +1637,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                     return Ok(());
                 }
                 state.writer_busy = true;
+                guard.armed = true;
                 let control = matches!(
                     state.queue.front().map(|entry| &entry.value),
                     Some(EntryValue::Control(_))
@@ -1579,6 +1730,9 @@ impl<A: Actor> OrderedObservationInput<A> {
                                 _reference: reference,
                                 _credits: credits,
                             });
+                            drop(state);
+                            guard.armed = false;
+                            self.0.changed.notify_waiters();
                             return Err(error);
                         }
                     }
@@ -1631,6 +1785,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                     }
                 }
             };
+            guard.armed = false;
             self.0.changed.notify_waiters();
             self.0.progress.wake_by_ref();
             if let Some(error) = error {
@@ -1680,12 +1835,53 @@ impl<A: Actor> OrderedObservationInput<A> {
     }
 
     fn fence_failed_writer(&self) {
+        let mut state = self.0.state.lock().expect("ordered observation state");
+        state.closed = true;
+        if state.failure_tail == FailureTail::Normal {
+            state.failure_tail = FailureTail::Pending;
+        }
+        drop(state);
+        self.0.changed.notify_waiters();
+    }
+
+    async fn dispose_failed_tail(&self) -> Result<(), ObservationError> {
+        let tail = loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.0.state.lock().expect("ordered observation state");
+                match state.failure_tail {
+                    FailureTail::Disposed => return Ok(()),
+                    FailureTail::Pending if state.failed_tail_ready()? => {
+                        state.failure_tail = FailureTail::Disposing;
+                        break state.take_unsubmitted_tail();
+                    }
+                    FailureTail::Pending => {}
+                    FailureTail::Normal | FailureTail::Disposing => {
+                        return Err(ObservationError::FailedTailUnresolved);
+                    }
+                }
+            }
+            changed.await;
+        };
+        self.dispose_unsubmitted_tail(tail);
         self.0
             .state
             .lock()
             .expect("ordered observation state")
-            .closed = true;
+            .failure_tail = FailureTail::Disposed;
         self.0.changed.notify_waiters();
+        self.notify_source_progress();
+        Ok(())
+    }
+
+    fn dispose_unsubmitted_tail(&self, tail: UnsubmittedTail<A::Input>) {
+        let streams = tail.retained_streams();
+        // The actual values and credit-return callbacks must finish before
+        // clearing the generation's original retention. Panic keeps UNKNOWN.
+        tail.dispose();
+        self.retention_returned(&streams);
     }
 
     fn take_failed_source_payload(
@@ -1707,44 +1903,22 @@ impl<A: Actor> OrderedObservationInput<A> {
     /// in-flight inputs retired. Refusal preserves every original loan/standing.
     pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
         self.0.source.close_root_controls()?;
-        let (retired, streams) = {
+        let tail = {
             let mut state = self.0.state.lock().expect("ordered observation state");
             state.closed = true;
             if state.writer_busy
                 || state.in_flight.is_some()
                 || state.streams.values().any(|s| s.polling)
+                || matches!(
+                    state.failure_tail,
+                    FailureTail::Pending | FailureTail::Disposing
+                )
             {
                 return Err(ObservationError::Busy);
             }
-            let mut streams = state
-                .queue
-                .iter()
-                .filter_map(|entry| match &entry.value {
-                    EntryValue::Pending { key, .. } => Some(*key),
-                    EntryValue::Observation(value) => Some(StreamKey {
-                        participation: value.participation,
-                        generation: value.generation,
-                    }),
-                    EntryValue::Control(_) => None,
-                })
-                .collect::<Vec<_>>();
-            if let Some(failed) = state.failed.as_ref() {
-                streams.extend_from_slice(&failed.streams);
-            }
-            (
-                (
-                    std::mem::take(&mut state.queue),
-                    std::mem::take(&mut state.deferred_controls),
-                    state.failed.take(),
-                    state.failed_control.take(),
-                ),
-                streams,
-            )
+            state.take_unsubmitted_tail()
         };
-        // Actual frame values exit before their byte claims/pool loans. Only a
-        // successful complete refund may release this generation's retention.
-        drop(retired);
-        self.retention_returned(&streams);
+        self.dispose_unsubmitted_tail(tail);
         let keys = self
             .0
             .state

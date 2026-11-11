@@ -527,6 +527,7 @@ impl<A: Actor> GenerationExitObligation<A> {
             .expect("same original generation")
             .phase = GenerationPhase::Exited;
         self.consumed = true;
+        self.source.ingress.publisher_exited(self.key);
     }
 }
 impl<A: Actor> Drop for GenerationExitObligation<A> {
@@ -540,6 +541,7 @@ impl<A: Actor> Drop for GenerationExitObligation<A> {
                 .get_mut(&self.key.generation)
                 .expect("same unresolved generation")
                 .phase = GenerationPhase::Unknown;
+            self.source.ingress.publisher_exit_unknown(self.key);
         }
     }
 }

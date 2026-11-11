@@ -1386,7 +1386,22 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
         assert!(runtime.poll_one(Tick(0)).unwrap());
         let committed = runtime.committed_batches(actor, None, 4).unwrap()[0].1;
         drop(ingress.reserve_read(key).await.unwrap());
-        drop(ingress.reserve_read(key).await.unwrap());
+        ingress
+            .accept(
+                key,
+                ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Bookmark {
+                        generation: 1,
+                        sequence: 2,
+                        covered_prefix: 2,
+                        source_cut: 2,
+                    },
+                },
+                32,
+                ingress.reserve_read(key).await.unwrap(),
+            )
+            .unwrap();
         let queued = runtime
             .standing_input_inventory(actor, None, 8)
             .unwrap()

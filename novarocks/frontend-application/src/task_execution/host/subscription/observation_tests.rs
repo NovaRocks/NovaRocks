@@ -2644,3 +2644,37 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
     drive();
     assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
 }
+
+#[test]
+fn failed_tail_keeps_a_ready_credit_until_the_original_publisher_exits() {
+    let f = Fixture::new(2, 2);
+    let mut credit = Some(f.bank.credit(false, Some(f.key)).unwrap());
+    let mut read = ready(Box::new([42u8; 16]));
+    let mut cx = Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok((receipt, wire))) =
+        f.input
+            .poll_receive(f.key, &mut credit, Pin::new(&mut read), &mut cx)
+    else {
+        panic!("the original Ready owns its preread position");
+    };
+    assert!(credit.is_none());
+    f.input.fence_failed_writer();
+    {
+        let mut disposition = Box::pin(f.input.dispose_failed_tail());
+        assert!(disposition.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(f.input.close_after_exit(), Err(ObservationError::Busy));
+        f.input.job_closed(f.key).unwrap();
+        assert!(disposition.as_mut().poll(&mut cx).is_pending());
+        assert!(!f.bank.stream_claims_exited(f.key));
+        assert_eq!(f.input.retire_stream(f.key), Err(ObservationError::Busy));
+
+        // The publisher owns the raw payload outside the writer's FIFO.
+        // Closing the stream above does not prove its destruction.
+        drop((wire, receipt, read));
+        f.input.publisher_exited(f.key);
+        assert_eq!(disposition.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+    }
+    assert!(f.bank.stream_claims_exited(f.key));
+    f.input.retire_stream(f.key).unwrap();
+    f.finish();
+}

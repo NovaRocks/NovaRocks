@@ -161,12 +161,17 @@ impl FailureSupervisor {
                 .deliver_committed_root_after_failure()
                 .await
                 .map_err(Arc::new);
-            let observation_drain =
-                observations.map_or(Ok(()), OrderedObservationFailure::dispose_queued);
+            let observation_drain = observations
+                .as_ref()
+                .map_or(Ok(()), OrderedObservationFailure::dispose_queued);
             let aborts = context.lifecycle.started_aborts().await;
             for &request in &aborts {
                 port.abort_once(request).await;
             }
+            let observation_drain = match observations {
+                Some(original) if observation_drain.is_ok() => original.dispose_tail().await,
+                _ => observation_drain,
+            };
             // Starting or accepting an Abort does not prove remote exit.
             // The logical owner can apply any original positive facts it has.
             let unknown_participations = aborts
