@@ -864,7 +864,7 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
 
 #[tokio::test]
 async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
-    use super::host::publication::PublicationRecord;
+    use super::host::{geometry::AttemptHostGeometry, publication::PublicationRecord};
     use super::manifest_projection::{
         AttemptActivationInputs, AttemptManifestProjection, AttemptPlanPolicy,
         ManifestAttemptInputs,
@@ -874,10 +874,10 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         config::CoordinationBudgets,
         effect::Publication,
         ids::IdSeed,
-        input::{AttemptSourceId, PublicationApplied},
+        input::PublicationApplied,
         publication::{ProtocolMembership, ProtocolPublication},
-        start::AttemptSources,
     };
+    use novarocks_control_runtime_core::identity::ScopeId;
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision, AttemptRequestToken,
         AttemptToLogical, AttemptToLogicalBody, ExecutionEffect, LogicalToAttemptBody,
@@ -996,7 +996,19 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         establish_limit
     );
     assert_eq!(authorization_limits.abort_per_participation, abort_limit);
-    let source = |id| AttemptSourceId(NonZeroU64::new(id).unwrap());
+    let layout = crate::native::transport_capacity::NativeTransportCapacity::from_transport(
+        TransportBudget::DEFAULT,
+    )
+    .unwrap();
+    let geometry = AttemptHostGeometry::derive(
+        ScopeId::new(1).unwrap(),
+        NonZeroUsize::new(roster.len()).unwrap(),
+        CoordinationBudgets::DEFAULT.dispatch,
+        &layout,
+        &[],
+        true,
+    )
+    .unwrap();
     let lease = super::lease::RequestedLeaseDurations::DEFAULT;
     let mut projected = AttemptManifestProjection::from_prepared_manifest(
         prepared,
@@ -1006,19 +1018,7 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
             replacement_admissions: None,
             ids: IdSeed::new(1, 100),
             initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
-            sources: AttemptSources {
-                actor: source(1),
-                publication: source(2),
-                qa: source(3),
-                process: source(4),
-                native: source(5),
-                observation: source(6),
-                capacity: source(7),
-                membership: source(8),
-                subscription: source(9),
-                transport: source(10),
-                mailbox: [4; 4],
-            },
+            sources: geometry.sources,
             retain_diagnostics: true,
             observe_dev_root: false,
         },
@@ -1032,6 +1032,10 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
         &mut next,
     )
     .unwrap();
+    assert_eq!(
+        geometry.actor_config(&projected.start).unwrap().mailbox,
+        geometry.sources.mailbox,
+    );
     drop(drive);
     let plan = &projected.start.plan;
     assert_eq!(projected.start.activation.identity, activation);
