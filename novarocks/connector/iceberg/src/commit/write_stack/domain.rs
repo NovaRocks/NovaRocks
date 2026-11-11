@@ -36,6 +36,7 @@ use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 use novarocks_spi::connector::write_stack::{ConnectorManagedPublicationShape, WriteTargetOrdinal};
 use novarocks_spi::connector::{
     ConnectorDocumentPublicationDeclaration, ConnectorError, ConnectorErrorKind,
@@ -677,6 +678,128 @@ impl IcebergWriteTableFacts {
     }
 }
 
+/// An immutable metadata object and the snapshot interpretation fixed at begin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergMutationReadRecipe {
+    metadata_location: String,
+    metadata_identity: String,
+    snapshot: Option<IcebergMutationSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergMutationSnapshot {
+    manifest_list: String,
+    schema_id: i32,
+}
+
+impl IcebergMutationSnapshot {
+    pub fn try_new(manifest_list: String, schema_id: i32) -> Result<Self, ConnectorError> {
+        validate_location("mutation manifest list", &manifest_list)?;
+        if schema_id < 0 {
+            return Err(invalid(
+                "Iceberg mutation snapshot schema ID must be nonnegative",
+            ));
+        }
+        Ok(Self {
+            manifest_list,
+            schema_id,
+        })
+    }
+
+    pub fn manifest_list(&self) -> &str {
+        &self.manifest_list
+    }
+
+    pub const fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+}
+
+impl IcebergMutationReadRecipe {
+    pub fn try_new(
+        facts: &IcebergWriteTableFacts,
+        metadata_location: String,
+        metadata_identity: String,
+        snapshot: Option<IcebergMutationSnapshot>,
+    ) -> Result<Self, ConnectorError> {
+        validate_location("mutation metadata location", &metadata_location)?;
+        let canonical_digest = metadata_identity
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !canonical_digest || snapshot.is_some() != facts.base_snapshot_id().is_some() {
+            return Err(invalid(
+                "Iceberg mutation recipe differs from its pinned write endpoint",
+            ));
+        }
+        Ok(Self {
+            metadata_location,
+            metadata_identity,
+            snapshot,
+        })
+    }
+
+    pub fn metadata_location(&self) -> &str {
+        &self.metadata_location
+    }
+
+    pub fn metadata_identity(&self) -> &str {
+        &self.metadata_identity
+    }
+
+    pub const fn snapshot(&self) -> Option<&IcebergMutationSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// The caller reads this exact object through its original scoped binding.
+    pub fn validate_loaded(
+        &self,
+        facts: &IcebergWriteTableFacts,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Result<(), ConnectorError> {
+        let identity = crate::read_snapshot::metadata_identity(metadata).map_err(corrupt)?;
+        let actual = metadata
+            .refs()
+            .get(facts.target_ref())
+            .map(|reference| {
+                metadata
+                    .snapshot_by_id(reference.snapshot_id)
+                    .ok_or_else(|| corrupt("Iceberg mutation ref names a missing snapshot"))
+            })
+            .transpose()?;
+        if identity != self.metadata_identity
+            || metadata.uuid().to_string() != facts.table_uuid()
+            || metadata.location() != facts.table_location()
+            || metadata.current_schema_id() != facts.schema_id()
+            || metadata.default_partition_spec_id() != facts.default_partition_spec_id()
+            || actual.map(|snapshot| snapshot.snapshot_id()) != facts.base_snapshot_id()
+            || actual.map_or(0, |snapshot| snapshot.sequence_number())
+                != facts.base_sequence_number()
+        {
+            return Err(corrupt(
+                "Iceberg mutation metadata differs from the fixed write endpoint",
+            ));
+        }
+        if let (Some(expected), Some(actual)) = (&self.snapshot, actual) {
+            let schema = actual
+                .schema(metadata)
+                .map_err(|error| corrupt(error.to_string()))?;
+            if expected.manifest_list() != actual.manifest_list()
+                || expected.schema_id() != schema.schema_id()
+            {
+                return Err(corrupt(
+                    "Iceberg mutation snapshot differs from its fixed list or schema",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Physical output settings frozen for one logical writer.
 #[derive(Clone, Debug)]
 pub struct IcebergWriterOutput {
@@ -859,6 +982,9 @@ pub struct IcebergWriterHandle {
     output: IcebergWriterOutput,
     data: Option<IcebergDataBranchRecipe>,
     old_deletes: BTreeMap<String, IcebergOldDeleteMergeTarget>,
+    mutation_read: Option<IcebergMutationReadRecipe>,
+    position_group: Option<ConnectorMutationContributionGroupId>,
+    creation_scope: Option<IcebergCreationScope>,
     equality: Option<IcebergEqualityDeleteRecipe>,
 }
 
@@ -878,6 +1004,9 @@ impl IcebergWriterHandle {
             output,
             data: Some(data),
             old_deletes: BTreeMap::new(),
+            mutation_read: None,
+            position_group: None,
+            creation_scope: None,
             equality: None,
         })
     }
@@ -903,6 +1032,9 @@ impl IcebergWriterHandle {
             output,
             data: None,
             old_deletes: BTreeMap::new(),
+            mutation_read: None,
+            position_group: None,
+            creation_scope: None,
             equality: Some(equality),
         })
     }
@@ -958,6 +1090,9 @@ impl IcebergWriterHandle {
             output,
             data: None,
             old_deletes: frozen,
+            mutation_read: None,
+            position_group: None,
+            creation_scope: None,
             equality: None,
         })
     }
@@ -979,6 +1114,47 @@ impl IcebergWriterHandle {
     /// exactly on that branch.
     pub const fn equality(&self) -> Option<&IcebergEqualityDeleteRecipe> {
         self.equality.as_ref()
+    }
+
+    pub fn try_with_mutation_read(
+        mut self,
+        recipe: IcebergMutationReadRecipe,
+        group: Option<ConnectorMutationContributionGroupId>,
+    ) -> Result<Self, ConnectorError> {
+        let valid_branch = match self.branch {
+            IcebergWriteBranch::PositionDelete => group.is_none(),
+            IcebergWriteBranch::DeletionVector => group.is_some_and(|id| id.to_bytes() != [0; 32]),
+            _ => false,
+        };
+        if !valid_branch
+            || !self.old_deletes.is_empty()
+            || self.mutation_read.is_some()
+            || recipe.snapshot().is_some() != self.table.base_snapshot_id().is_some()
+        {
+            return Err(invalid(
+                "Iceberg fixed mutation input conflicts with the writer recipe",
+            ));
+        }
+        self.mutation_read = Some(recipe);
+        self.position_group = group;
+        Ok(self)
+    }
+
+    pub const fn position_group(&self) -> Option<ConnectorMutationContributionGroupId> {
+        self.position_group
+    }
+
+    pub fn with_creation_scope(mut self, scope: IcebergCreationScope) -> Self {
+        self.creation_scope = Some(scope);
+        self
+    }
+
+    pub const fn creation_scope(&self) -> Option<IcebergCreationScope> {
+        self.creation_scope
+    }
+
+    pub const fn mutation_read(&self) -> Option<&IcebergMutationReadRecipe> {
+        self.mutation_read.as_ref()
     }
 
     /// The exact old-delete artifacts a writer must re-read, keyed by the data
@@ -1515,6 +1691,259 @@ fn validate_merged_references(references: &[EntryIdentity]) -> Result<(), Connec
     Ok(())
 }
 
+/// A live data entry identified by its immutable list and physical ordinals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergDeleteTargetLocator {
+    manifest_list: String,
+    manifest_path: String,
+    manifest_ordinal: u64,
+    entry_ordinal: u64,
+    snapshot_id: i64,
+    data_file_path: String,
+    record_count: u64,
+}
+
+impl IcebergDeleteTargetLocator {
+    pub fn try_new(
+        manifest_list: String,
+        manifest_path: String,
+        manifest_ordinal: u64,
+        entry_ordinal: u64,
+        snapshot_id: i64,
+        data_file_path: String,
+        record_count: u64,
+    ) -> Result<Self, ConnectorError> {
+        validate_location("target manifest list", &manifest_list)?;
+        validate_location("target manifest", &manifest_path)?;
+        validate_location("target data file", &data_file_path)?;
+        if record_count == 0 {
+            return Err(invalid("Iceberg delete target must contain physical rows"));
+        }
+        Ok(Self {
+            manifest_list,
+            manifest_path,
+            manifest_ordinal,
+            entry_ordinal,
+            snapshot_id,
+            data_file_path,
+            record_count,
+        })
+    }
+
+    pub fn manifest_list(&self) -> &str {
+        &self.manifest_list
+    }
+
+    pub fn manifest_path(&self) -> &str {
+        &self.manifest_path
+    }
+
+    pub const fn manifest_ordinal(&self) -> u64 {
+        self.manifest_ordinal
+    }
+
+    pub const fn entry_ordinal(&self) -> u64 {
+        self.entry_ordinal
+    }
+
+    pub const fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub fn data_file_path(&self) -> &str {
+        &self.data_file_path
+    }
+
+    pub const fn record_count(&self) -> u64 {
+        self.record_count
+    }
+}
+
+/// Original position effect. Only its artifact, when present, names a new object.
+#[derive(Clone, Debug)]
+pub struct IcebergFinalDeleteEffect {
+    target: IcebergDeleteTargetLocator,
+    newly_deleted_rows: std::num::NonZeroU64,
+    kind: IcebergFinalDeleteKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum IcebergFinalDeleteKind {
+    RemoveDataFile {
+        old_exclusive_deletes: Box<[EntryIdentity]>,
+    },
+    ReplacePositions(IcebergDeletionVectorArtifact),
+}
+
+impl IcebergFinalDeleteEffect {
+    pub fn try_new(
+        target: IcebergDeleteTargetLocator,
+        newly_deleted_rows: u64,
+        kind: IcebergFinalDeleteKind,
+    ) -> Result<Self, ConnectorError> {
+        let newly_deleted_rows = std::num::NonZeroU64::new(newly_deleted_rows)
+            .filter(|rows| rows.get() <= target.record_count())
+            .ok_or_else(|| {
+                invalid("Iceberg new visible positions exceed the target row domain or are empty")
+            })?;
+        match &kind {
+            IcebergFinalDeleteKind::RemoveDataFile {
+                old_exclusive_deletes,
+            } => {
+                validate_merged_references(old_exclusive_deletes)?;
+            }
+            IcebergFinalDeleteKind::ReplacePositions(vector) => {
+                if vector.referenced_data_file() != target.data_file_path()
+                    || vector.cardinality() < newly_deleted_rows.get()
+                    || vector.cardinality() >= target.record_count()
+                {
+                    return Err(corrupt(
+                        "Iceberg replacement DV differs from its target or coverage",
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            target,
+            newly_deleted_rows,
+            kind,
+        })
+    }
+
+    pub const fn target(&self) -> &IcebergDeleteTargetLocator {
+        &self.target
+    }
+
+    pub const fn newly_deleted_rows(&self) -> u64 {
+        self.newly_deleted_rows.get()
+    }
+
+    pub const fn kind(&self) -> &IcebergFinalDeleteKind {
+        &self.kind
+    }
+}
+
+/// Identifies the logical step that froze a writer independently of placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergCreationScope {
+    session: IcebergWriteSessionId,
+    step_id: [u8; 16],
+    endpoint_digest: [u8; 32],
+}
+
+impl IcebergCreationScope {
+    pub fn try_new(
+        session: IcebergWriteSessionId,
+        step_id: [u8; 16],
+        endpoint_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        if session.to_bytes() == [0; 16] || step_id == [0; 16] {
+            return Err(invalid(
+                "Iceberg creation scope requires a session and logical step",
+            ));
+        }
+        Ok(Self {
+            session,
+            step_id,
+            endpoint_digest,
+        })
+    }
+
+    pub const fn session(&self) -> IcebergWriteSessionId {
+        self.session
+    }
+
+    pub const fn step_id(&self) -> [u8; 16] {
+        self.step_id
+    }
+
+    pub const fn endpoint_digest(&self) -> [u8; 32] {
+        self.endpoint_digest
+    }
+
+    pub fn identity(
+        self,
+        physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
+        path: &str,
+        format: IcebergFileFormat,
+    ) -> Result<[u8; 32], ConnectorError> {
+        use sha2::{Digest, Sha256};
+        validate_location("new object", path)?;
+        let path_len = u32::try_from(path.len()).map_err(|_| {
+            invalid("Iceberg new object path length exceeds the creation identity domain")
+        })?;
+        let format = match format {
+            IcebergFileFormat::Parquet => 1u8,
+            IcebergFileFormat::Puffin => 2u8,
+            _ => {
+                return Err(invalid(
+                    "Iceberg file format does not support managed creation",
+                ));
+            }
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"novarocks.iceberg.staged-object.v1\0");
+        hash.update(self.session.to_bytes());
+        hash.update(self.step_id);
+        hash.update(self.endpoint_digest);
+        hash.update(physical.execution_query_id());
+        hash.update(physical.execution_attempt_id().to_be_bytes());
+        hash.update(physical.task_key());
+        hash.update(physical.driver_id().to_be_bytes());
+        hash.update(physical.writer_ordinal().to_be_bytes());
+        hash.update(path_len.to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update([format]);
+        Ok(hash.finalize().into())
+    }
+}
+
+/// Content evidence for one newly and conditionally created physical object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergCreationReceipt {
+    create_id: [u8; 16],
+    identity: [u8; 32],
+    size: u64,
+    content_sha256: [u8; 32],
+}
+
+impl IcebergCreationReceipt {
+    pub fn try_new(
+        create_id: [u8; 16],
+        identity: [u8; 32],
+        size: u64,
+        content_sha256: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        if create_id == [0; 16] || size == 0 {
+            return Err(invalid(
+                "Iceberg creation receipt requires an object creation and nonempty content",
+            ));
+        }
+        Ok(Self {
+            create_id,
+            identity,
+            size,
+            content_sha256,
+        })
+    }
+
+    pub const fn create_id(&self) -> [u8; 16] {
+        self.create_id
+    }
+
+    pub const fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub const fn content_sha256(&self) -> [u8; 32] {
+        self.content_sha256
+    }
+}
+
 /// The one artifact a commit fragment describes.
 #[derive(Clone, Debug)]
 pub enum IcebergCommitArtifact {
@@ -1522,21 +1951,23 @@ pub enum IcebergCommitArtifact {
     PositionDeleteFile(IcebergPositionDeleteFileArtifact),
     DeletionVector(IcebergDeletionVectorArtifact),
     EqualityDeleteFile(IcebergEqualityDeleteFileArtifact),
+    FinalDelete(IcebergFinalDeleteEffect),
 }
 
-/// Exactly one staged Iceberg artifact.
-///
-/// A fragment carries no writer identity, no attempt id, and no aggregate
-/// summary: those are properties of an execution, not of an artifact, and
-/// putting them here would make two identical artifacts look different.
+/// One staged artifact or final position-delete effect.
+/// Physical creation evidence is independent of the logical entry identity.
 #[derive(Clone, Debug)]
 pub struct IcebergCommitFragment {
     artifact: IcebergCommitArtifact,
+    creation: Option<IcebergCreationReceipt>,
 }
 
 impl IcebergCommitFragment {
     pub const fn new(artifact: IcebergCommitArtifact) -> Self {
-        Self { artifact }
+        Self {
+            artifact,
+            creation: None,
+        }
     }
 
     pub fn data_file(artifact: IcebergDataFileArtifact) -> Self {
@@ -1553,6 +1984,32 @@ impl IcebergCommitFragment {
 
     pub fn equality_delete_file(artifact: IcebergEqualityDeleteFileArtifact) -> Self {
         Self::new(IcebergCommitArtifact::EqualityDeleteFile(artifact))
+    }
+
+    pub fn final_delete(effect: IcebergFinalDeleteEffect) -> Self {
+        Self::new(IcebergCommitArtifact::FinalDelete(effect))
+    }
+
+    pub fn try_with_creation(
+        mut self,
+        receipt: IcebergCreationReceipt,
+    ) -> Result<Self, ConnectorError> {
+        if self.creation.is_some()
+            || self
+                .metrics()
+                .map(IcebergArtifactMetrics::file_size_in_bytes)
+                != Some(receipt.size())
+        {
+            return Err(corrupt(
+                "Iceberg creation receipt differs from the written object",
+            ));
+        }
+        self.creation = Some(receipt);
+        Ok(self)
+    }
+
+    pub const fn creation(&self) -> Option<IcebergCreationReceipt> {
+        self.creation
     }
 
     pub const fn artifact(&self) -> &IcebergCommitArtifact {
@@ -1577,34 +2034,64 @@ impl IcebergCommitFragment {
                 length: file.content_range().size_in_bytes(),
                 referenced_data_file: file.referenced_data_file().to_string(),
             },
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::RemoveDataFile { .. } => EntryIdentity::DataFile {
+                    path: effect.target().data_file_path().to_owned(),
+                },
+                IcebergFinalDeleteKind::ReplacePositions(file) => EntryIdentity::DeletionVector {
+                    path: file.path().to_owned(),
+                    offset: file.content_range().offset(),
+                    length: file.content_range().size_in_bytes(),
+                    referenced_data_file: effect.target().data_file_path().to_owned(),
+                },
+            },
         }
     }
 
-    /// The physical object location; distinct DV entries may share it.
+    /// Primary entry path for diagnostics. Use new_object_path for ownership.
     pub fn path(&self) -> &str {
+        self.new_object_path().unwrap_or_else(|| {
+            self.referenced_data_file()
+                .expect("a pure removal always has a target")
+        })
+    }
+
+    pub fn new_object_path(&self) -> Option<&str> {
         match &self.artifact {
-            IcebergCommitArtifact::DataFile(file) => file.path(),
-            IcebergCommitArtifact::PositionDeleteFile(file) => file.path(),
-            IcebergCommitArtifact::DeletionVector(file) => file.path(),
-            IcebergCommitArtifact::EqualityDeleteFile(file) => file.path(),
+            IcebergCommitArtifact::DataFile(file) => Some(file.path()),
+            IcebergCommitArtifact::PositionDeleteFile(file) => Some(file.path()),
+            IcebergCommitArtifact::DeletionVector(file) => Some(file.path()),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => Some(file.path()),
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::RemoveDataFile { .. } => None,
+                IcebergFinalDeleteKind::ReplacePositions(file) => Some(file.path()),
+            },
         }
     }
 
-    pub fn partition(&self) -> &IcebergArtifactPartition {
+    pub fn partition(&self) -> Option<&IcebergArtifactPartition> {
         match &self.artifact {
-            IcebergCommitArtifact::DataFile(file) => file.partition(),
-            IcebergCommitArtifact::PositionDeleteFile(file) => file.partition(),
-            IcebergCommitArtifact::DeletionVector(file) => file.partition(),
-            IcebergCommitArtifact::EqualityDeleteFile(file) => file.partition(),
+            IcebergCommitArtifact::DataFile(file) => Some(file.partition()),
+            IcebergCommitArtifact::PositionDeleteFile(file) => Some(file.partition()),
+            IcebergCommitArtifact::DeletionVector(file) => Some(file.partition()),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => Some(file.partition()),
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::RemoveDataFile { .. } => None,
+                IcebergFinalDeleteKind::ReplacePositions(file) => Some(file.partition()),
+            },
         }
     }
 
-    pub fn metrics(&self) -> &IcebergArtifactMetrics {
+    pub fn metrics(&self) -> Option<&IcebergArtifactMetrics> {
         match &self.artifact {
-            IcebergCommitArtifact::DataFile(file) => file.metrics(),
-            IcebergCommitArtifact::PositionDeleteFile(file) => file.metrics(),
-            IcebergCommitArtifact::DeletionVector(file) => file.metrics(),
-            IcebergCommitArtifact::EqualityDeleteFile(file) => file.metrics(),
+            IcebergCommitArtifact::DataFile(file) => Some(file.metrics()),
+            IcebergCommitArtifact::PositionDeleteFile(file) => Some(file.metrics()),
+            IcebergCommitArtifact::DeletionVector(file) => Some(file.metrics()),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => Some(file.metrics()),
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::RemoveDataFile { .. } => None,
+                IcebergFinalDeleteKind::ReplacePositions(file) => Some(file.metrics()),
+            },
         }
     }
 
@@ -1619,6 +2106,7 @@ impl IcebergCommitFragment {
             }
             IcebergCommitArtifact::PositionDeleteFile(file) => Some(file.referenced_data_file()),
             IcebergCommitArtifact::DeletionVector(file) => Some(file.referenced_data_file()),
+            IcebergCommitArtifact::FinalDelete(effect) => Some(effect.target().data_file_path()),
         }
     }
 
@@ -1629,6 +2117,12 @@ impl IcebergCommitFragment {
             }
             IcebergCommitArtifact::PositionDeleteFile(file) => file.merged_old_references(),
             IcebergCommitArtifact::DeletionVector(file) => file.merged_old_references(),
+            IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
+                IcebergFinalDeleteKind::RemoveDataFile {
+                    old_exclusive_deletes,
+                } => old_exclusive_deletes,
+                IcebergFinalDeleteKind::ReplacePositions(file) => file.merged_old_references(),
+            },
         }
     }
 
@@ -1637,7 +2131,9 @@ impl IcebergCommitFragment {
         match &self.artifact {
             IcebergCommitArtifact::DataFile(_) => IcebergWriteBranch::Data,
             IcebergCommitArtifact::PositionDeleteFile(_) => IcebergWriteBranch::PositionDelete,
-            IcebergCommitArtifact::DeletionVector(_) => IcebergWriteBranch::DeletionVector,
+            IcebergCommitArtifact::DeletionVector(_) | IcebergCommitArtifact::FinalDelete(_) => {
+                IcebergWriteBranch::DeletionVector
+            }
             IcebergCommitArtifact::EqualityDeleteFile(_) => IcebergWriteBranch::EqualityDelete,
         }
     }

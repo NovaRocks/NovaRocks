@@ -65,11 +65,13 @@ use prost::Message;
 use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
-    IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergEqualityDeleteColumnFacts,
-    IcebergEqualityDeleteFileArtifact, IcebergEqualityDeleteRecipe,
-    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteTableFacts,
-    IcebergWriterHandle, IcebergWriterOutput,
+    IcebergContentRange, IcebergCreationReceipt, IcebergCreationScope, IcebergDataBranchRecipe,
+    IcebergDataFileArtifact, IcebergDeleteTargetLocator, IcebergDeletionVectorArtifact,
+    IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteFileArtifact,
+    IcebergEqualityDeleteRecipe, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
+    IcebergMutationReadRecipe, IcebergMutationSnapshot, IcebergPositionDeleteFileArtifact,
+    IcebergWriteBranch, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle,
+    IcebergWriterOutput,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -998,6 +1000,26 @@ impl IcebergWriteValueCodec {
             output: Some(self.encode_output(handle.output(), path.field("output"))?),
             data,
             old_deletes,
+            position_group_id: handle.position_group().map(|id| id.to_bytes().to_vec()),
+            creation_scope: handle
+                .creation_scope()
+                .map(|scope| dto::IcebergCreationScope {
+                    session_id: scope.session().to_bytes().to_vec(),
+                    step_id: scope.step_id().to_vec(),
+                    endpoint_digest: scope.endpoint_digest().to_vec(),
+                }),
+            mutation_read: handle
+                .mutation_read()
+                .map(|recipe| dto::IcebergMutationReadRecipe {
+                    metadata_location: recipe.metadata_location().to_owned(),
+                    metadata_identity: recipe.metadata_identity().to_owned(),
+                    snapshot: recipe
+                        .snapshot()
+                        .map(|snapshot| dto::IcebergMutationSnapshot {
+                            manifest_list: snapshot.manifest_list().to_owned(),
+                            schema_id: snapshot.schema_id(),
+                        }),
+                }),
             equality: handle
                 .equality()
                 .map(|recipe| self.encode_equality_recipe(recipe)),
@@ -1019,7 +1041,7 @@ impl IcebergWriteValueCodec {
             let table = self.decode_table(iceberg.table.as_ref(), path.field("table"), context)?;
             let output =
                 self.decode_output(iceberg.output.as_ref(), path.field("output"), context)?;
-            match branch {
+            let handle = match branch {
                 IcebergWriteBranch::Data => {
                     let recipe =
                         self.decode_recipe(iceberg.data.as_ref(), path.field("data"), context)?;
@@ -1030,9 +1052,48 @@ impl IcebergWriteValueCodec {
                             IcebergWriterHandle::try_new_data(arguments.0, arguments.1, arguments.2)
                         })?
                     }
-                    .map_err(|error| spi_codec_error(self.rejected(path, &error)))
+                    .map_err(|error| spi_codec_error(self.rejected(path.clone(), &error)))
                 }
                 IcebergWriteBranch::PositionDelete | IcebergWriteBranch::DeletionVector => {
+                    let mutation = iceberg
+                        .mutation_read
+                        .as_ref()
+                        .map(|recipe| {
+                            let metadata_location =
+                                copy_value_string(&recipe.metadata_location, context)?;
+                            let metadata_identity =
+                                copy_value_string(&recipe.metadata_identity, context)?;
+                            let snapshot = recipe
+                                .snapshot
+                                .as_ref()
+                                .map(|snapshot| {
+                                    let location =
+                                        copy_value_string(&snapshot.manifest_list, context)?;
+                                    IcebergMutationSnapshot::try_new(location, snapshot.schema_id)
+                                        .map_err(|error| {
+                                            spi_codec_error(self.rejected(
+                                                path.field("mutation_read").field("snapshot"),
+                                                &error,
+                                            ))
+                                        })
+                                })
+                                .transpose()?;
+                            IcebergMutationReadRecipe::try_new(
+                                &table,
+                                metadata_location,
+                                metadata_identity,
+                                snapshot,
+                            )
+                            .map_err(|error| {
+                                spi_codec_error(self.rejected(path.field("mutation_read"), &error))
+                            })
+                        })
+                        .transpose()?;
+                    let group = iceberg.position_group_id.as_ref().map(|bytes| {
+                        let field = ConnectorFieldPath::root("writer_handle").field("iceberg").field("position_group_id");
+                        crate::wire::write::require_exact_bytes(bytes, field)
+                            .map(novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes)
+                    }).transpose()?;
                     let mut targets = Vec::with_capacity(iceberg.old_deletes.len());
                     for (key, target) in &iceberg.old_deletes {
                         targets.push(
@@ -1049,17 +1110,17 @@ impl IcebergWriteValueCodec {
                     // base snapshot every target must agree with, and the exclusive
                     // ownership of each referenced data file.
                     {
-                        let arguments = (branch, table, output, targets);
                         observe_value_opaque(context, || {
-                            IcebergWriterHandle::try_new_delete(
-                                arguments.0,
-                                arguments.1,
-                                arguments.2,
-                                arguments.3,
-                            )
+                            let handle = IcebergWriterHandle::try_new_delete(
+                                branch, table, output, targets,
+                            )?;
+                            match mutation {
+                                Some(recipe) => handle.try_with_mutation_read(recipe, group),
+                                None => Ok(handle),
+                            }
                         })?
                     }
-                    .map_err(|error| spi_codec_error(self.rejected(path, &error)))
+                    .map_err(|error| spi_codec_error(self.rejected(path.clone(), &error)))
                 }
                 IcebergWriteBranch::EqualityDelete => {
                     let recipe = self.decode_equality_recipe(
@@ -1079,9 +1140,35 @@ impl IcebergWriteValueCodec {
                             )
                         })?
                     }
-                    .map_err(|error| spi_codec_error(self.rejected(path, &error)))
+                    .map_err(|error| spi_codec_error(self.rejected(path.clone(), &error)))
                 }
-            }
+            }?;
+            let Some(scope) = &iceberg.creation_scope else {
+                return Ok(handle);
+            };
+            let field = path.field("creation_scope");
+            let wire_path = ConnectorFieldPath::root("writer_handle")
+                .field("iceberg")
+                .field("creation_scope");
+            let session = crate::wire::write::require_exact_bytes(
+                &scope.session_id,
+                wire_path.field("session_id"),
+            )?;
+            let step = crate::wire::write::require_exact_bytes(
+                &scope.step_id,
+                wire_path.field("step_id"),
+            )?;
+            let endpoint = crate::wire::write::require_exact_bytes(
+                &scope.endpoint_digest,
+                wire_path.field("endpoint_digest"),
+            )?;
+            let scope = IcebergCreationScope::try_new(
+                IcebergWriteSessionId::from_bytes(session),
+                step,
+                endpoint,
+            )
+            .map_err(|error| spi_codec_error(self.rejected(field, &error)))?;
+            Ok(handle.with_creation_scope(scope))
         })();
         finish_value_decode(result, context)
     }
@@ -1132,25 +1219,76 @@ impl IcebergWriteValueCodec {
             }
             IcebergCommitArtifact::DeletionVector(file) => {
                 dto::iceberg_commit_fragment::Artifact::DeletionVector(
-                    dto::IcebergDeletionVectorArtifact {
-                        path: file.path().to_string(),
-                        partition: Some(self.encode_partition(file.partition())),
-                        metrics: Some(self.encode_metrics(file.metrics())),
-                        referenced_data_file: file.referenced_data_file().to_string(),
-                        content_range: Some(self.encode_content_range(file.content_range())),
-                        cardinality: file.cardinality(),
-                        merged_old_references: file
-                            .merged_old_references()
+                    self.encode_deletion_vector(file),
+                )
+            }
+            IcebergCommitArtifact::FinalDelete(effect) => {
+                use dto::iceberg_final_delete_effect::Effect;
+                let kind = match effect.kind() {
+                    IcebergFinalDeleteKind::RemoveDataFile {
+                        old_exclusive_deletes,
+                    } => Effect::RemoveDataFile(dto::IcebergRemoveDataFile {
+                        old_exclusive_deletes: old_exclusive_deletes
                             .iter()
                             .map(encode_merged_reference)
                             .collect(),
-                    },
-                )
+                    }),
+                    IcebergFinalDeleteKind::ReplacePositions(file) => {
+                        if fragment.creation().is_none() {
+                            return Err(self.missing(
+                                path.field("creation"),
+                                "materialized DV requires new-object evidence",
+                            ));
+                        }
+                        Effect::ReplacePositions(self.encode_deletion_vector(file))
+                    }
+                };
+                let target = effect.target();
+                dto::iceberg_commit_fragment::Artifact::FinalDelete(dto::IcebergFinalDeleteEffect {
+                    target: Some(dto::IcebergDeleteTargetLocator {
+                        manifest_list: target.manifest_list().to_owned(),
+                        manifest_path: target.manifest_path().to_owned(),
+                        manifest_ordinal: target.manifest_ordinal(),
+                        entry_ordinal: target.entry_ordinal(),
+                        snapshot_id: target.snapshot_id(),
+                        data_file_path: target.data_file_path().to_owned(),
+                        record_count: target.record_count(),
+                    }),
+                    newly_deleted_rows: effect.newly_deleted_rows(),
+                    effect: Some(kind),
+                })
             }
         };
         Ok(dto::IcebergCommitFragment {
             artifact: Some(artifact),
+            creation: fragment
+                .creation()
+                .map(|receipt| dto::IcebergCreationReceipt {
+                    create_id: receipt.create_id().to_vec(),
+                    identity: receipt.identity().to_vec(),
+                    size: receipt.size(),
+                    content_sha256: receipt.content_sha256().to_vec(),
+                }),
         })
+    }
+
+    fn encode_deletion_vector(
+        &self,
+        file: &IcebergDeletionVectorArtifact,
+    ) -> dto::IcebergDeletionVectorArtifact {
+        dto::IcebergDeletionVectorArtifact {
+            path: file.path().to_owned(),
+            partition: Some(self.encode_partition(file.partition())),
+            metrics: Some(self.encode_metrics(file.metrics())),
+            referenced_data_file: file.referenced_data_file().to_owned(),
+            content_range: Some(self.encode_content_range(file.content_range())),
+            cardinality: file.cardinality(),
+            merged_old_references: file
+                .merged_old_references()
+                .iter()
+                .map(encode_merged_reference)
+                .collect(),
+        }
     }
 
     fn decode_merged_reference(
@@ -1225,7 +1363,7 @@ impl IcebergWriteValueCodec {
                     "an Iceberg commit fragment describes exactly one artifact",
                 ))
             })?;
-            match artifact {
+            let value = match artifact {
                 dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
                     let path = path.field("data_file");
                     let artifact = {
@@ -1325,61 +1463,133 @@ impl IcebergWriteValueCodec {
                     .map_err(|error| spi_codec_error(self.rejected(path, &error)))?;
                     Ok(IcebergCommitFragment::equality_delete_file(artifact))
                 }
-                dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
-                    let path = path.field("deletion_vector");
-                    let content_range = file.content_range.as_ref().ok_or_else(|| {
-                        spi_codec_error(self.missing(
-                            path.field("content_range"),
-                            "an Iceberg deletion vector requires its blob range",
-                        ))
-                    })?;
-                    // `try_new` owns the facts only Iceberg can check: the blob must
-                    // fit inside its own Puffin file, and the cardinality must be
-                    // the record count it claims.
-                    let artifact = {
-                        let arguments = (
-                            copy_value_string(&file.path, context)?,
-                            self.decode_partition(
-                                file.partition.as_ref(),
-                                path.field("partition"),
-                                context,
-                            )?,
-                            self.decode_metrics(
-                                file.metrics.as_ref(),
-                                path.field("metrics"),
-                                context,
-                            )?,
-                            copy_value_string(&file.referenced_data_file, context)?,
-                            self.decode_content_range(
-                                content_range,
-                                path.field("content_range"),
-                                context,
-                            )?,
-                            file.cardinality,
-                            self.decode_merged_references(
-                                &file.merged_old_references,
-                                path.field("merged_old_references"),
-                                context,
-                            )?,
-                        );
-                        observe_value_opaque(context, || {
-                            IcebergDeletionVectorArtifact::try_new(
-                                arguments.0,
-                                arguments.1,
-                                arguments.2,
-                                arguments.3,
-                                arguments.4,
-                                arguments.5,
-                                arguments.6,
-                            )
-                        })?
-                    }
-                    .map_err(|error| spi_codec_error(self.rejected(path, &error)))?;
-                    Ok(IcebergCommitFragment::deletion_vector(artifact))
-                }
-            }
+                dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => self
+                    .decode_deletion_vector(file, path.field("deletion_vector"), context)
+                    .map(IcebergCommitFragment::deletion_vector),
+                dto::iceberg_commit_fragment::Artifact::FinalDelete(effect) => self
+                    .decode_final_delete(effect, path.field("final_delete"), context)
+                    .map(IcebergCommitFragment::final_delete),
+            }?;
+            let Some(receipt) = &fragment.creation else {
+                return Ok(value);
+            };
+            let path = path.field("creation");
+            let wire_path = ConnectorFieldPath::root("commit_fragment")
+                .field("iceberg")
+                .field("creation");
+            let id = crate::wire::write::require_exact_bytes(
+                &receipt.create_id,
+                wire_path.field("create_id"),
+            )?;
+            let identity = crate::wire::write::require_exact_bytes(
+                &receipt.identity,
+                wire_path.field("identity"),
+            )?;
+            let content = crate::wire::write::require_exact_bytes(
+                &receipt.content_sha256,
+                wire_path.field("content_sha256"),
+            )?;
+            IcebergCreationReceipt::try_new(id, identity, receipt.size, content)
+                .and_then(|receipt| value.try_with_creation(receipt))
+                .map_err(|error| spi_codec_error(self.rejected(path, &error)))
         })();
         finish_value_decode(result, context)
+    }
+
+    fn decode_deletion_vector(
+        &self,
+        file: &dto::IcebergDeletionVectorArtifact,
+        path: FieldPath,
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergDeletionVectorArtifact, ConnectorCodecError> {
+        let content_range = file.content_range.as_ref().ok_or_else(|| {
+            spi_codec_error(self.missing(
+                path.field("content_range"),
+                "an Iceberg deletion vector requires its blob range",
+            ))
+        })?;
+        // `try_new` owns the facts only Iceberg can check: the blob must
+        // fit inside its own Puffin file, and the cardinality must be
+        // the record count it claims.
+        let artifact = {
+            let arguments = (
+                copy_value_string(&file.path, context)?,
+                self.decode_partition(file.partition.as_ref(), path.field("partition"), context)?,
+                self.decode_metrics(file.metrics.as_ref(), path.field("metrics"), context)?,
+                copy_value_string(&file.referenced_data_file, context)?,
+                self.decode_content_range(content_range, path.field("content_range"), context)?,
+                file.cardinality,
+                self.decode_merged_references(
+                    &file.merged_old_references,
+                    path.field("merged_old_references"),
+                    context,
+                )?,
+            );
+            observe_value_opaque(context, || {
+                IcebergDeletionVectorArtifact::try_new(
+                    arguments.0,
+                    arguments.1,
+                    arguments.2,
+                    arguments.3,
+                    arguments.4,
+                    arguments.5,
+                    arguments.6,
+                )
+            })?
+        }
+        .map_err(|error| spi_codec_error(self.rejected(path, &error)))?;
+        Ok(artifact)
+    }
+
+    fn decode_final_delete(
+        &self,
+        value: &dto::IcebergFinalDeleteEffect,
+        path: FieldPath,
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergFinalDeleteEffect, ConnectorCodecError> {
+        use dto::iceberg_final_delete_effect::Effect;
+        let field = path.field("target");
+        let target = value.target.as_ref().ok_or_else(|| {
+            spi_codec_error(self.missing(field.clone(), "materialized delete requires its target"))
+        })?;
+        let manifest_list = copy_value_string(&target.manifest_list, context)?;
+        let manifest_path = copy_value_string(&target.manifest_path, context)?;
+        let data_file = copy_value_string(&target.data_file_path, context)?;
+        let target = observe_value_opaque(context, || {
+            IcebergDeleteTargetLocator::try_new(
+                manifest_list,
+                manifest_path,
+                target.manifest_ordinal,
+                target.entry_ordinal,
+                target.snapshot_id,
+                data_file,
+                target.record_count,
+            )
+        })?
+        .map_err(|error| spi_codec_error(self.rejected(field, &error)))?;
+        let kind = match value.effect.as_ref() {
+            Some(Effect::RemoveDataFile(remove)) => IcebergFinalDeleteKind::RemoveDataFile {
+                old_exclusive_deletes: self
+                    .decode_merged_references(
+                        &remove.old_exclusive_deletes,
+                        path.field("remove_data_file"),
+                        context,
+                    )?
+                    .into_boxed_slice(),
+            },
+            Some(Effect::ReplacePositions(vector)) => IcebergFinalDeleteKind::ReplacePositions(
+                self.decode_deletion_vector(vector, path.field("replace_positions"), context)?,
+            ),
+            None => {
+                return Err(spi_codec_error(
+                    self.missing(path, "materialized delete requires an effect"),
+                ));
+            }
+        };
+        observe_value_opaque(context, || {
+            IcebergFinalDeleteEffect::try_new(target, value.newly_deleted_rows, kind)
+        })?
+        .map_err(|error| spi_codec_error(self.rejected(path, &error)))
     }
 }
 
@@ -2204,6 +2414,103 @@ mod tests {
             }
             _ => panic!("the recovered fragment describes another artifact kind"),
         }
+    }
+
+    #[test]
+    fn position_materialization_writer_preserves_fixed_metadata_and_group() {
+        use novarocks_connector_contract::ConnectorMutationContributionGroupId;
+        let original = delete_handle(IcebergWriteBranch::DeletionVector);
+        let table = original.table().clone();
+        let handle = IcebergWriterHandle::try_new_delete(
+            original.branch(),
+            table.clone(),
+            original.output().clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let recipe = IcebergMutationReadRecipe::try_new(
+            &table,
+            "s3://warehouse/t/metadata/0002.metadata.json".into(),
+            format!("sha256:{}", "ab".repeat(32)),
+            table.base_snapshot_id().map(|_| {
+                IcebergMutationSnapshot::try_new("s3://warehouse/t/metadata/list.avro".into(), 3)
+                    .unwrap()
+            }),
+        )
+        .unwrap();
+        let group = ConnectorMutationContributionGroupId::from_bytes([6; 32]);
+        let scope = IcebergCreationScope::try_new(
+            IcebergWriteSessionId::from_bytes([5; 16]),
+            [7; 16],
+            [8; 32],
+        )
+        .unwrap();
+        let handle = handle
+            .try_with_mutation_read(recipe.clone(), Some(group))
+            .unwrap()
+            .with_creation_scope(scope);
+        let recovered = round_trip_handle(&facets("writer", 1), &handle);
+        assert_eq!(recovered.mutation_read(), Some(&recipe));
+        assert_eq!(recovered.position_group(), Some(group));
+        assert_eq!(recovered.creation_scope(), Some(scope));
+    }
+
+    #[test]
+    fn position_materialization_pure_removal_does_not_publish_a_new_object() {
+        let target = IcebergDeleteTargetLocator::try_new(
+            "s3://warehouse/t/metadata/list.avro".into(),
+            "s3://warehouse/t/metadata/data.avro".into(),
+            3,
+            9,
+            17,
+            "s3://warehouse/t/data/old.parquet".into(),
+            6,
+        )
+        .unwrap();
+        let effect = IcebergFinalDeleteEffect::try_new(
+            target.clone(),
+            4,
+            IcebergFinalDeleteKind::RemoveDataFile {
+                old_exclusive_deletes: Box::default(),
+            },
+        )
+        .unwrap();
+        let fragment = IcebergCommitFragment::final_delete(effect);
+        let facets = facets("remove", 1);
+        let raw = facets
+            .fragment_encoder
+            .encode_commit_fragment(&facets.adapter.wrap_commit_fragment(fragment.clone()))
+            .unwrap();
+        let decoded = facets
+            .fragment_decoder
+            .decode_commit_fragment(&parse_fragment(raw.clone()))
+            .unwrap();
+        let result = facets.adapter.commit_fragment(&decoded).unwrap();
+        let IcebergCommitArtifact::FinalDelete(result_effect) = result.artifact() else {
+            panic!("expected final delete effect");
+        };
+        assert_eq!(result_effect.target(), &target);
+        assert_eq!(result_effect.newly_deleted_rows(), 4);
+        assert!(matches!(
+            result_effect.kind(),
+            IcebergFinalDeleteKind::RemoveDataFile { .. }
+        ));
+        assert_eq!(result.new_object_path(), None);
+        assert_eq!(result.creation(), None);
+        let with_receipt = mutate_private_fragment(raw, |private| {
+            private.creation = Some(dto::IcebergCreationReceipt {
+                create_id: vec![1; 16],
+                identity: vec![2; 32],
+                size: 1,
+                content_sha256: vec![3; 32],
+            });
+        });
+        assert!(
+            facets
+                .fragment_decoder
+                .decode_commit_fragment(&parse_fragment(with_receipt))
+                .is_err()
+        );
     }
 
     fn assert_public_provider_error_path(error: &ConnectorWriteCodecError, private_path: &str) {

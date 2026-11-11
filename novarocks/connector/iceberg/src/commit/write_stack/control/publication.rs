@@ -834,7 +834,7 @@ impl IcebergWriteSessionControl {
         // Physical ownership deduplicates objects, while intent keeps full DV identities.
         let objects: BTreeSet<_> = validated
             .iter()
-            .map(|entry| entry.fragment.path().to_owned())
+            .filter_map(|entry| entry.fragment.new_object_path().map(str::to_owned))
             .collect();
         for path in objects {
             operation

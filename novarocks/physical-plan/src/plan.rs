@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use novarocks_type_contract::SemanticParameters;
 
 use novarocks_connector_contract::{
-    ConnectorEncodedPayload, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
-    ConnectorWriteRouteId, WriteTargetOrdinal,
+    ConnectorEncodedPayload, ConnectorMutationContributionGroupId, ConnectorRowMutationEffect,
+    ConnectorWriteFieldToken, ConnectorWriteRouteId, WriteTargetOrdinal,
 };
 
 use crate::{
@@ -813,6 +813,61 @@ pub struct ChangeStreamRoute {
     pub edge: EdgeId,
 }
 
+/// Exact imported values for one position route in a contribution group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PositionShardInput {
+    pub route: ConnectorWriteRouteId,
+    pub file: ValueId,
+    pub position: ValueId,
+    pub spec_id: ValueId,
+    pub partition: ValueId,
+}
+
+impl PositionShardInput {
+    pub const fn columns(self) -> [ValueId; 4] {
+        [self.file, self.position, self.spec_id, self.partition]
+    }
+}
+
+/// The authenticated Task is supplied by the receiving edge. Only the local
+/// author ordinal is emitted by the aggregation driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PositionShardOutput {
+    pub file: ValueId,
+    pub spec_id: ValueId,
+    pub partition: ValueId,
+    pub driver_ordinal: ValueId,
+    pub high32: ValueId,
+    pub container_key: ValueId,
+    pub index: ValueId,
+    pub count: ValueId,
+    pub bitmap: ValueId,
+}
+
+impl PositionShardOutput {
+    pub const fn columns(self) -> [ValueId; 9] {
+        [
+            self.file,
+            self.spec_id,
+            self.partition,
+            self.driver_ordinal,
+            self.high32,
+            self.container_key,
+            self.index,
+            self.count,
+            self.bitmap,
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionShardAggregation {
+    pub group: ConnectorMutationContributionGroupId,
+    pub target: WriteTargetOrdinal,
+    pub inputs: Box<[PositionShardInput]>,
+    pub output: PositionShardOutput,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     Scan {
@@ -923,6 +978,8 @@ pub enum NodeKind {
         events: Box<[ChangeEventSpec]>,
         effect_output: ValueId,
     },
+    /// Emit the complete file's position shards after all input routes end.
+    PositionShard(PositionShardAggregation),
     ExchangeSource {
         edge: EdgeId,
         imports: Box<[(ValueId, ValueId)]>,
@@ -1082,6 +1139,7 @@ impl NodeKind {
             | Self::Repeat { .. }
             | Self::AssertOneRow(_)
             | Self::ExchangeSource { .. }
+            | Self::PositionShard(_)
             | Self::TableWriter { .. } => {}
         }
     }

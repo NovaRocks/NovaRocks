@@ -754,9 +754,20 @@ pub(crate) fn validate_edge(
                 matches!(source.sink(), FragmentSink::Router { .. })
                     && edge.delivery == crate::DeliveryRequirement::MustDrain
             }
+            crate::OutputRole::PositionShards { group, target } => {
+                let shard_root = matches!(&root.kind, NodeKind::PositionShard(spec)
+                    if spec.group == group && spec.target == target
+                        && spec.output.columns().as_slice() == edge.source.projection.as_ref());
+                shard_root
+                    && edge.kind == crate::EdgeKind::Stream
+                    && edge.delivery == crate::DeliveryRequirement::MustDrain
+                    && edge.partitioning.destination == Distribution::Singleton
+            }
             crate::OutputRole::Relational => {
-                !matches!(root.kind, NodeKind::TableWriter { .. })
-                    && !matches!(source.sink(), FragmentSink::Router { .. })
+                !matches!(
+                    root.kind,
+                    NodeKind::TableWriter { .. } | NodeKind::PositionShard(_)
+                ) && !matches!(source.sink(), FragmentSink::Router { .. })
             }
         };
         if !role_matches {
@@ -967,8 +978,18 @@ pub(crate) fn distribution_values(
 
 pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut referenced = BTreeSet::new();
+    let mut position_groups = BTreeSet::new();
     for fragment in plan.fragments().values() {
         let path = format!("fragments[{}].sink", fragment.id().get());
+        if let Some(root) = fragment.nodes().get(&fragment.root())
+            && let NodeKind::PositionShard(spec) = &root.kind
+            && !position_groups.insert(spec.group)
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "position contribution group has more than one aggregation stage",
+            ));
+        }
         for summary in fragment.summaries() {
             if !referenced.insert(summary.edge) {
                 errors.push(ValidationError::new(
@@ -1083,6 +1104,31 @@ pub(crate) fn validate_router_writer_contract(
     let Some(writer) = destination.nodes().get(&destination.root()) else {
         return;
     };
+    if let NodeKind::PositionShard(spec) = &writer.kind {
+        let exact_route = spec.target == route.write_target_ordinal
+            && route.accepted_effects.iter().all(|effect| {
+                !matches!(
+                    effect,
+                    novarocks_connector_contract::ConnectorRowMutationEffect::Insert
+                )
+            })
+            && writer.inputs.iter().zip(&spec.inputs).any(|(node, input)| {
+                *node == edge.destination.node
+                    && input.route == route.route_id
+                    && input.columns().into_iter().eq(edge
+                        .destination
+                        .receive_mapping
+                        .iter()
+                        .map(|(_, imported)| *imported))
+            });
+        if !exact_route {
+            errors.push(ValidationError::new(
+                path,
+                "router edge differs from its exact position contribution",
+            ));
+        }
+        return;
+    }
     let NodeKind::TableWriter { target } = &writer.kind else {
         errors.push(ValidationError::new(
             path,

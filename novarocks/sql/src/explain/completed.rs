@@ -3232,6 +3232,11 @@ condition,
                         ))
                 ))
         )),
+        NodeKind::PositionShard(spec) => lines.push(format_args!(
+            "{pad}  target={}, contribution-routes={}",
+            spec.target.get(),
+            spec.inputs.len(),
+        )),
         NodeKind::TableWriter { target } => lines.push(format_args!(
             "{pad}  target={}, input=[{}], required-distribution={}, fields=[{}], output-schema={}, partial-aggregates=[{}]",
             target.write_target_ordinal.get(),
@@ -3810,6 +3815,7 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
             )?,
             NodeKind::AssertOneRow(_) => formatter.write_str("ASSERT ONE ROW")?,
             NodeKind::ChangeEventExpand { .. } => formatter.write_str("CHANGE EVENT EXPAND")?,
+            NodeKind::PositionShard(_) => formatter.write_str("POSITION SHARD AGGREGATION")?,
             NodeKind::ExchangeSource { edge, .. } => {
                 let label = context.plan.edges().get(edge).map_or("EXCHANGE", |edge| {
                     if matches!(

@@ -123,9 +123,10 @@ pub(crate) fn input_consumption(kind: &NodeKind, ordinal: usize) -> InputConsump
         NodeKind::NestLoopJoin { .. } if ordinal == 1 => InputConsumption::DrainedBeforeOutput,
         // The installed aggregate route has no streaming preaggregation
         // (local-compiler/src/aggregate.rs), including partial grouping.
-        NodeKind::Aggregate { .. } | NodeKind::Sort { .. } | NodeKind::TopN { .. } => {
-            InputConsumption::DrainedBeforeOutput
-        }
+        NodeKind::Aggregate { .. }
+        | NodeKind::Sort { .. }
+        | NodeKind::TopN { .. }
+        | NodeKind::PositionShard(_) => InputConsumption::DrainedBeforeOutput,
         NodeKind::SetOp {
             kind: SetOperationKind::Intersect | SetOperationKind::Except,
             ..

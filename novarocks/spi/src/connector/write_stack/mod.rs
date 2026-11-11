@@ -105,11 +105,12 @@ pub use runtime::{
     ConnectorWriterHandle,
 };
 pub use session::{
-    ConnectorManagedPublicationShape, ConnectorWriteAbortProduction, ConnectorWriteBeginRequest,
-    ConnectorWriteCleanupState, ConnectorWriteCohortRoutingBody, ConnectorWriteCohortRoutingProof,
-    ConnectorWriteColocation, ConnectorWriteControl, ConnectorWriteCopyOnWriteRoutingPlan,
-    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef,
-    ConnectorWriteLayoutPreference, ConnectorWriteNeededHandoffNotice, ConnectorWriteNeededReady,
+    ConnectorManagedPublicationShape, ConnectorMutationContributionGroup,
+    ConnectorWriteAbortProduction, ConnectorWriteBeginRequest, ConnectorWriteCleanupState,
+    ConnectorWriteCohortRoutingBody, ConnectorWriteCohortRoutingProof, ConnectorWriteColocation,
+    ConnectorWriteControl, ConnectorWriteCopyOnWriteRoutingPlan, ConnectorWriteFinishPublication,
+    ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef, ConnectorWriteLayoutPreference,
+    ConnectorWriteNeededHandoffNotice, ConnectorWriteNeededReady,
     ConnectorWriteNeededReadyReceiving, ConnectorWriteProviderDerivedValue,
     ConnectorWritePublicationCompletion, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
     ConnectorWriteRouteRequirements, ConnectorWriteSelectionBinding,
@@ -122,6 +123,6 @@ pub use target::{
     WriteTargetOrdinal, validate_dense_target_ordinals, validate_query_target_ordinals,
 };
 pub use writer::{
-    ConnectorBatchWriter, ConnectorOpenWriterRequest, ConnectorWriteExecution,
-    ConnectorWriteExecutionFactory, ConnectorWriterPhysicalContext,
+    ConnectorBatchWriter, ConnectorOpenWriterRequest, ConnectorPositionShardSource,
+    ConnectorWriteExecution, ConnectorWriteExecutionFactory, ConnectorWriterPhysicalContext,
 };

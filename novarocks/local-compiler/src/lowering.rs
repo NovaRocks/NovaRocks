@@ -2628,6 +2628,7 @@ fn unsupported_node_shape(kind: &NodeKind) -> &'static str {
         NodeKind::TopN { .. } => "grouped-state TopN reduction",
         NodeKind::SetOp { .. } => "INTERSECT or EXCEPT set operation",
         NodeKind::GenerateSeries { .. } => "generate_series source",
+        NodeKind::PositionShard(_) => "position shard aggregation",
         _ => "node family or occurrence shape",
     }
 }

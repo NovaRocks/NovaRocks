@@ -56,7 +56,10 @@ pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingF
 pub use identity::{
     ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
 };
-pub use mutation::{ConnectorRowMutationEffect, ConnectorWriteRouteId};
+pub use mutation::{
+    ConnectorMutationContributionGroupId, ConnectorRowMutationEffect, ConnectorWriteRouteId,
+    PositionShardWindow,
+};
 pub use owned_copy::{WriterOwnedCreationFailure, WriterOwnedResourceFacts};
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

@@ -136,6 +136,9 @@ pub(crate) fn decode_commit_fragment(
 #[derive(Clone, Copy)]
 enum MessageKind {
     WriterHandle,
+    MutationReadRecipe,
+    MutationSnapshot,
+    CreationScope,
     WriteTable,
     WriterOutput,
     DataRecipe,
@@ -151,6 +154,10 @@ enum MessageKind {
     Metrics,
     ColumnStats,
     CommitFragment,
+    CreationReceipt,
+    FinalDeleteEffect,
+    DeleteTargetLocator,
+    RemoveDataFile,
     DataFile,
     PositionDeleteFile,
     DeletionVector,
@@ -229,6 +236,14 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::WriterHandle, 4) => Some(singular(F::Message(M::DataRecipe))),
         (M::WriterHandle, 5) => Some(repeated(F::MapStringMessage(M::OldDeleteTarget))),
         (M::WriterHandle, 6) => Some(singular(F::Message(M::EqualityRecipe))),
+        (M::WriterHandle, 7) => Some(singular(F::Message(M::MutationReadRecipe))),
+        (M::WriterHandle, 8) => Some(singular(F::Message(M::CreationScope))),
+        (M::WriterHandle, 9) => Some(singular(F::Bytes)),
+        (M::CreationScope, 1..=3) => Some(singular(F::Bytes)),
+        (M::MutationReadRecipe, 1 | 2) => Some(singular(F::Text)),
+        (M::MutationReadRecipe, 3) => Some(singular(F::Message(M::MutationSnapshot))),
+        (M::MutationSnapshot, 1) => Some(singular(F::Text)),
+        (M::MutationSnapshot, 2) => Some(singular(F::Varint)),
 
         (M::WriteTable, 1..=6) => Some(singular(F::Text)),
         (M::WriteTable, 7..=11) => Some(singular(F::Varint)),
@@ -269,6 +284,17 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::CommitFragment, 2) => Some(FieldRule::oneof(F::Message(M::PositionDeleteFile))),
         (M::CommitFragment, 3) => Some(FieldRule::oneof(F::Message(M::DeletionVector))),
         (M::CommitFragment, 4) => Some(FieldRule::oneof(F::Message(M::EqualityDeleteFile))),
+        (M::CommitFragment, 5) => Some(FieldRule::oneof(F::Message(M::FinalDeleteEffect))),
+        (M::CommitFragment, 6) => Some(singular(F::Message(M::CreationReceipt))),
+        (M::CreationReceipt, 1 | 2 | 4) => Some(singular(F::Bytes)),
+        (M::CreationReceipt, 3) => Some(singular(F::Varint)),
+        (M::FinalDeleteEffect, 1) => Some(singular(F::Message(M::DeleteTargetLocator))),
+        (M::FinalDeleteEffect, 2) => Some(singular(F::Varint)),
+        (M::FinalDeleteEffect, 3) => Some(FieldRule::oneof(F::Message(M::RemoveDataFile))),
+        (M::FinalDeleteEffect, 4) => Some(FieldRule::oneof(F::Message(M::DeletionVector))),
+        (M::DeleteTargetLocator, 1 | 2 | 6) => Some(singular(F::Text)),
+        (M::DeleteTargetLocator, 3..=5 | 7) => Some(singular(F::Varint)),
+        (M::RemoveDataFile, 1) => Some(repeated(F::Message(M::MergedDeleteReference))),
         (M::DataFile, 1) => Some(singular(F::Text)),
         (M::DataFile, 2) => Some(singular(F::Varint)),
         (M::DataFile, 3) => Some(singular(F::Message(M::Partition))),
@@ -596,6 +622,61 @@ fn validate_writer_handle(
         let branch = named_branch(handle.branch, path.field("branch"))?;
         validate_table(handle.table.as_ref(), path.field("table"), context)?;
         validate_output(handle.output.as_ref(), path.field("output"), context)?;
+        if let Some(scope) = &handle.creation_scope {
+            let field = path.field("creation_scope");
+            require_exact_bytes::<16>(&scope.session_id, field.field("session_id"))?;
+            require_exact_bytes::<16>(&scope.step_id, field.field("step_id"))?;
+            require_exact_bytes::<32>(&scope.endpoint_digest, field.field("endpoint_digest"))?;
+        }
+        if let Some(group) = &handle.position_group_id {
+            require_exact_bytes::<32>(group, path.field("position_group_id"))?;
+        }
+        let expects_group =
+            handle.mutation_read.is_some() && branch == dto::IcebergWriteBranch::DeletionVector;
+        if expects_group != handle.position_group_id.is_some() {
+            return Err(inconsistent(
+                path.field("position_group_id"),
+                "group must belong to a fixed position materializer",
+            ));
+        }
+        if let Some(recipe) = &handle.mutation_read {
+            let field = path.field("mutation_read");
+            if !matches!(
+                branch,
+                dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector
+            ) || !handle.old_deletes.is_empty()
+            {
+                return Err(inconsistent(
+                    field,
+                    "fixed mutation input conflicts with the writer branch",
+                ));
+            }
+            bounded_text(
+                &recipe.metadata_location,
+                MAX_PATH_BYTES,
+                field.field("metadata_location"),
+                false,
+            )?;
+            bounded_text(
+                &recipe.metadata_identity,
+                71,
+                field.field("metadata_identity"),
+                false,
+            )?;
+            if let Some(snapshot) = &recipe.snapshot {
+                bounded_text(
+                    &snapshot.manifest_list,
+                    MAX_PATH_BYTES,
+                    field.field("snapshot").field("manifest_list"),
+                    false,
+                )?;
+                nonnegative(
+                    i64::from(snapshot.schema_id),
+                    field.field("snapshot").field("schema_id"),
+                )?;
+            }
+            context.observe_compile_step()?;
+        }
         match branch {
             dto::IcebergWriteBranch::Data => {
                 let recipe = handle.data.as_ref().ok_or_else(|| {
@@ -993,6 +1074,15 @@ fn validate_old_delete_ref(
     result
 }
 
+pub(crate) fn require_exact_bytes<const N: usize>(
+    value: &[u8],
+    path: ConnectorFieldPath,
+) -> Result<[u8; N], ConnectorCodecError> {
+    value
+        .try_into()
+        .map_err(|_| invalid(path, format!("expected exactly {N} bytes")))
+}
+
 fn validate_commit_fragment(
     fragment: &dto::IcebergCommitFragment,
     path: &ConnectorFieldPath,
@@ -1003,7 +1093,21 @@ fn validate_commit_fragment(
             .artifact
             .as_ref()
             .ok_or_else(|| missing(path.clone(), "commit fragment requires one artifact"))?;
+        if let Some(creation) = &fragment.creation {
+            let field = path.field("creation");
+            require_exact_bytes::<16>(&creation.create_id, field.field("create_id"))?;
+            require_exact_bytes::<32>(&creation.identity, field.field("identity"))?;
+            require_exact_bytes::<32>(&creation.content_sha256, field.field("content_sha256"))?;
+        }
         match artifact {
+            dto::iceberg_commit_fragment::Artifact::FinalDelete(effect) => {
+                validate_final_delete(
+                    effect,
+                    fragment.creation.is_some(),
+                    path.field("final_delete"),
+                    context,
+                )?;
+            }
             dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
                 bounded_text(
                     &file.path,
@@ -1045,26 +1149,7 @@ fn validate_commit_fragment(
                 )?;
             }
             dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
-                let base = path.field("deletion_vector");
-                validate_delete_artifact_common(
-                    &file.path,
-                    file.partition.as_ref(),
-                    file.metrics.as_ref(),
-                    &file.referenced_data_file,
-                    &file.merged_old_references,
-                    base.clone(),
-                    context,
-                )?;
-                validate_content_range(
-                    file.content_range.as_ref().ok_or_else(|| {
-                        missing(
-                            base.field("content_range"),
-                            "deletion vector requires a range",
-                        )
-                    })?,
-                    base.field("content_range"),
-                    context,
-                )?;
+                validate_deletion_vector(file, path.field("deletion_vector"), context)?;
             }
             dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(file) => {
                 let base = path.field("equality_delete_file");
@@ -1095,6 +1180,81 @@ fn validate_commit_fragment(
     result
 }
 
+fn validate_deletion_vector(
+    file: &dto::IcebergDeletionVectorArtifact,
+    base: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    validate_delete_artifact_common(
+        &file.path,
+        file.partition.as_ref(),
+        file.metrics.as_ref(),
+        &file.referenced_data_file,
+        &file.merged_old_references,
+        base.clone(),
+        context,
+    )?;
+    validate_content_range(
+        file.content_range.as_ref().ok_or_else(|| {
+            missing(
+                base.field("content_range"),
+                "deletion vector requires a range",
+            )
+        })?,
+        base.field("content_range"),
+        context,
+    )
+}
+
+fn validate_final_delete(
+    effect: &dto::IcebergFinalDeleteEffect,
+    created: bool,
+    path: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    use dto::iceberg_final_delete_effect::Effect;
+    let target = effect
+        .target
+        .as_ref()
+        .ok_or_else(|| missing(path.field("target"), "final delete requires its target"))?;
+    for (name, value) in [
+        ("manifest_list", target.manifest_list.as_str()),
+        ("manifest_path", target.manifest_path.as_str()),
+        ("data_file_path", target.data_file_path.as_str()),
+    ] {
+        bounded_text(
+            value,
+            MAX_PATH_BYTES,
+            path.field("target").field(name),
+            false,
+        )?;
+        context.observe_compile_step()?;
+    }
+    if effect.newly_deleted_rows == 0 || effect.newly_deleted_rows > target.record_count {
+        return Err(inconsistent(
+            path.field("newly_deleted_rows"),
+            "new positions are outside the target row domain",
+        ));
+    }
+    match effect.effect.as_ref() {
+        Some(Effect::RemoveDataFile(remove)) if !created => {
+            let field = path.field("remove_data_file");
+            validate_merged_references(
+                &remove.old_exclusive_deletes,
+                field.field("old_exclusive_deletes"),
+                context,
+            )
+        }
+        Some(Effect::ReplacePositions(vector)) if created => {
+            validate_deletion_vector(vector, path.field("replace_positions"), context)
+        }
+        _ => Err(inconsistent(
+            path,
+            "final delete effect and new-object creation receipt disagree",
+        )),
+    }
+}
+
 fn validate_delete_artifact_common(
     path_value: &str,
     partition: Option<&dto::IcebergArtifactPartition>,
@@ -1114,30 +1274,34 @@ fn validate_delete_artifact_common(
         )?;
         validate_partition(partition, path.field("partition"), context)?;
         validate_metrics(metrics, path.field("metrics"), context)?;
-        bounded_count(
-            merged.len(),
-            MAX_MERGED_OLD_REFERENCES,
-            path.field("merged_old_references"),
-        )?;
-        let mut previous: Option<LogicalDeleteReference<'_>> = None;
-        for (index, value) in merged.iter().enumerate() {
-            let entry_path = path.field("merged_old_references").index(index);
-            let identity = validate_merged_reference(value, entry_path.clone(), context)?;
-            if let Some(previous) = previous
-                && previous.compare(identity, context)? != std::cmp::Ordering::Less
-            {
-                return Err(inconsistent(
-                    entry_path,
-                    "merged old references must be sorted and unique",
-                ));
-            }
-            previous = Some(identity);
-            context.observe_compile_step()?;
-        }
-        Ok(())
+        validate_merged_references(merged, path.field("merged_old_references"), context)
     })();
     context.observe_compile_step()?;
     result
+}
+
+fn validate_merged_references(
+    values: &[dto::IcebergMergedDeleteReference],
+    path: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    bounded_count(values.len(), MAX_MERGED_OLD_REFERENCES, path.clone())?;
+    let mut previous: Option<LogicalDeleteReference<'_>> = None;
+    for (index, value) in values.iter().enumerate() {
+        let entry_path = path.index(index);
+        let identity = validate_merged_reference(value, entry_path.clone(), context)?;
+        if let Some(previous) = previous
+            && previous.compare(identity, context)? != std::cmp::Ordering::Less
+        {
+            return Err(inconsistent(
+                entry_path,
+                "merged old references must be sorted and unique",
+            ));
+        }
+        previous = Some(identity);
+        context.observe_compile_step()?;
+    }
+    Ok(())
 }
 
 // Match EntryIdentity's variant/field ordering without copying DTO strings.

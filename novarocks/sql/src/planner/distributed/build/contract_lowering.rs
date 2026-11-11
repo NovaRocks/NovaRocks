@@ -717,6 +717,7 @@ const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::TableWriter { .. } => "TableWriter",
         NodeKind::TableFinish(_) => "TableFinish",
         NodeKind::ChangeEventExpand { .. } => "ChangeEventExpand",
+        NodeKind::PositionShard(_) => "PositionShard",
     }
 }
 

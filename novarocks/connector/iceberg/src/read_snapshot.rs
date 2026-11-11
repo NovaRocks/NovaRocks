@@ -130,7 +130,7 @@ fn frozen_partition_types(
         .collect()
 }
 
-fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
+pub(crate) fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
     // This is a canonical fact identity, not the raw metadata object's digest.
     // SDK map/set iteration cannot change a pinned relation's identity.
     let bytes =

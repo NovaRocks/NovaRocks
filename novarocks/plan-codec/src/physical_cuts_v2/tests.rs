@@ -1353,3 +1353,28 @@ fn runtime_filter_bindings_are_one_admitted_root_extent_under_all_seven_envelope
         }
     }
 }
+
+#[test]
+fn position_contributions_and_final_shards_roundtrip_as_distinct_cut_roles() {
+    let control = Control::default();
+    let mut physical = cut();
+    let group = ConnectorMutationContributionGroupId::from_bytes([11; 32]);
+    let p::ExchangePayloadContract::ProviderRoute(route) = &physical.inbound[0].payload else {
+        panic!("expected provider route");
+    };
+    let route = route.clone();
+    let target = route.write_target_ordinal;
+    physical.inbound[0].payload = p::ExchangePayloadContract::PositionContribution { group, route };
+    physical.outbound[0].payload = p::ExchangePayloadContract::PositionShards { group, target };
+    let (mut encoded, _) = encode(&physical, &control, limits()).unwrap();
+    assert_eq!(decode(&encoded, &control, limits()).unwrap().0, physical);
+    let Some(wire::outbound_fragment_cut::Payload::PositionShards(payload)) =
+        &mut encoded.outbound[0].payload
+    else {
+        panic!("expected position shard cut");
+    };
+    assert_eq!(payload.contribution_group_id, [11; 32]);
+    assert_eq!(payload.write_target_ordinal, 4095);
+    payload.contribution_group_id = vec![0; 32];
+    assert!(decode(&encoded, &control, limits()).is_err());
+}

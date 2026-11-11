@@ -1183,6 +1183,10 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ProgramNodeKind::PositionShard { .. } => Err(program_failure(
+            FragmentBindingErrorKind::InvalidAssignment,
+            "Position shard aggregation has no installed runtime",
+        )),
         ProgramNodeKind::ChangeEventExpand { input, .. } => {
             let factory = CompiledChangeEventProcessorFactory::try_new(
                 Arc::clone(program),

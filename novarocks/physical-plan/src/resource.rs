@@ -429,6 +429,13 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
             crate::ExchangePayloadContract::ProviderRoute(writer) => {
                 usage.add_items(writer.fields.len())
             }
+            crate::ExchangePayloadContract::PositionContribution { group, route } => {
+                usage.add_items(route.fields.len());
+                usage.add_bytes(group.to_bytes().len());
+            }
+            crate::ExchangePayloadContract::PositionShards { group, .. } => {
+                usage.add_bytes(group.to_bytes().len());
+            }
             crate::ExchangePayloadContract::WriterResults(writer) => {
                 add_writer_result_cut_usage_core(
                     writer,
@@ -469,6 +476,13 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
             crate::ExchangePayloadContract::Relational => {}
             crate::ExchangePayloadContract::ProviderRoute(writer) => {
                 usage.add_items(writer.fields.len())
+            }
+            crate::ExchangePayloadContract::PositionContribution { group, route } => {
+                usage.add_items(route.fields.len());
+                usage.add_bytes(group.to_bytes().len());
+            }
+            crate::ExchangePayloadContract::PositionShards { group, .. } => {
+                usage.add_bytes(group.to_bytes().len());
             }
             crate::ExchangePayloadContract::WriterResults(writer) => {
                 add_writer_result_cut_usage_core(
@@ -1359,6 +1373,11 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                 }
                 usage.add_items(event.assignments.len());
             }
+        }
+        NodeKind::PositionShard(spec) => {
+            usage.add_items(spec.inputs.len());
+            usage.add_bytes(spec.group.to_bytes().len());
+            usage.add_bytes(spec.inputs.len().saturating_mul(32));
         }
         NodeKind::ExchangeSource { imports, .. } => usage.add_items(imports.len()),
         NodeKind::TableWriter { target } => {

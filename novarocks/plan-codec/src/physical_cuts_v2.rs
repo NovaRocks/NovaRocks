@@ -31,7 +31,8 @@ use crate::{
     physical_writer_schema_v2::{decode_role, role},
 };
 use novarocks_connector_contract::{
-    ConnectorWriteFieldToken, ConnectorWriteRouteId, WriteTargetOrdinal,
+    ConnectorMutationContributionGroupId, ConnectorWriteFieldToken, ConnectorWriteRouteId,
+    WriteTargetOrdinal,
 };
 use novarocks_physical_plan as p;
 use novarocks_proto_models::{physical_control_v2::Empty, physical_package_v2 as wire};
@@ -344,6 +345,8 @@ closed!(
 enum RawPayload<'a> {
     Relational,
     ProviderRoute(&'a wire::ChangeStreamWriterCut),
+    PositionContribution(&'a wire::PositionContributionCut),
+    PositionShards(&'a wire::PositionShardWriterCut),
     WriterResults(&'a wire::WriterResultCut),
     Summary(&'a wire::SummaryCut),
 }
@@ -354,6 +357,8 @@ fn raw_inbound_payload(
     Ok(match req(value)? {
         P::Relational(_) => RawPayload::Relational,
         P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
+        P::PositionContribution(v) => RawPayload::PositionContribution(v),
+        P::PositionShards(v) => RawPayload::PositionShards(v),
         P::WriterResult(v) => RawPayload::WriterResults(v),
         P::Summary(v) => RawPayload::Summary(v),
     })
@@ -365,6 +370,8 @@ fn raw_outbound_payload(
     Ok(match req(value)? {
         P::Relational(_) => RawPayload::Relational,
         P::ChangeStreamWriter(v) => RawPayload::ProviderRoute(v),
+        P::PositionContribution(v) => RawPayload::PositionContribution(v),
+        P::PositionShards(v) => RawPayload::PositionShards(v),
         P::WriterResult(v) => RawPayload::WriterResults(v),
         P::Summary(v) => RawPayload::Summary(v),
     })
@@ -407,6 +414,14 @@ fn count_summary_columns(
     }
     Ok(())
 }
+fn contribution_group(bytes: &[u8]) -> Result<ConnectorMutationContributionGroupId, E> {
+    let bytes = exact32(bytes)?;
+    if bytes == [0; 32] {
+        return Err(shape("position contribution group must be nonzero"));
+    }
+    Ok(ConnectorMutationContributionGroupId::from_bytes(bytes))
+}
+
 fn count_payload(
     c: &mut Count,
     physical: Option<&p::ExchangePayloadContract>,
@@ -419,6 +434,14 @@ fn count_payload(
         (Some(p::ExchangePayloadContract::ProviderRoute(v)), None) => {
             (Some(v), None, None, None, false)
         }
+        (Some(p::ExchangePayloadContract::PositionContribution { route, .. }), None) => {
+            c.string(32, 0, w)?;
+            (Some(route), None, None, None, false)
+        }
+        (Some(p::ExchangePayloadContract::PositionShards { .. }), None) => {
+            c.string(32, 0, w)?;
+            (None, None, None, None, false)
+        }
         (Some(p::ExchangePayloadContract::WriterResults(v)), None) => {
             (None, Some(v), None, None, false)
         }
@@ -428,6 +451,17 @@ fn count_payload(
             (None, None, None, None, true)
         }
         (None, Some(RawPayload::ProviderRoute(v))) => (None, None, Some(v), None, false),
+        (None, Some(RawPayload::PositionContribution(v))) => {
+            contribution_group(&v.contribution_group_id)?;
+            c.string(32, v.contribution_group_id.capacity(), w)?;
+            (None, None, Some(req(v.route.as_ref())?), None, false)
+        }
+        (None, Some(RawPayload::PositionShards(v))) => {
+            contribution_group(&v.contribution_group_id)?;
+            ordinal(v.write_target_ordinal)?;
+            c.string(32, v.contribution_group_id.capacity(), w)?;
+            (None, None, None, None, false)
+        }
         (None, Some(RawPayload::WriterResults(v))) => (None, None, None, Some(v), false),
         (None, Some(RawPayload::Summary(v))) => {
             count_summary_columns(c, None, Some(req(v.source.as_ref())?), w)?;
@@ -1332,6 +1366,14 @@ fn decode_payload(
         RawPayload::ProviderRoute(v) => {
             p::ExchangePayloadContract::ProviderRoute(decode_change(v, w)?)
         }
+        RawPayload::PositionContribution(v) => p::ExchangePayloadContract::PositionContribution {
+            group: contribution_group(&v.contribution_group_id)?,
+            route: decode_change(req(v.route.as_ref())?, w)?,
+        },
+        RawPayload::PositionShards(v) => p::ExchangePayloadContract::PositionShards {
+            group: contribution_group(&v.contribution_group_id)?,
+            target: ordinal(v.write_target_ordinal)?,
+        },
         RawPayload::WriterResults(v) => {
             p::ExchangePayloadContract::WriterResults(decode_result(v, t, w)?)
         }
@@ -1345,6 +1387,18 @@ macro_rules! encode_payload {
             p::ExchangePayloadContract::Relational => P::Relational(Empty {}),
             p::ExchangePayloadContract::ProviderRoute(v) => {
                 P::ChangeStreamWriter(encode_change(v, $w)?)
+            }
+            p::ExchangePayloadContract::PositionContribution { group, route } => {
+                P::PositionContribution(wire::PositionContributionCut {
+                    contribution_group_id: bytes_copy(&group.to_bytes(), $w)?,
+                    route: Some(encode_change(route, $w)?),
+                })
+            }
+            p::ExchangePayloadContract::PositionShards { group, target } => {
+                P::PositionShards(wire::PositionShardWriterCut {
+                    contribution_group_id: bytes_copy(&group.to_bytes(), $w)?,
+                    write_target_ordinal: target.get(),
+                })
             }
             p::ExchangePayloadContract::WriterResults(v) => {
                 P::WriterResult(encode_result(v, $e, $w)?)

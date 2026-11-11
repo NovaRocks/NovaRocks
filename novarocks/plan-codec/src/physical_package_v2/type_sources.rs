@@ -450,6 +450,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::GenerateSeries { .. }
             | p::NodeKind::AssertOneRow(_)
             | p::NodeKind::ChangeEventExpand { .. }
+            | p::NodeKind::PositionShard(_)
             | p::NodeKind::ExchangeSource { .. } => {}
         }
         walk.completed()?;

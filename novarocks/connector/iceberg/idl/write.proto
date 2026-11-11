@@ -155,7 +155,24 @@ message IcebergOldDeleteMergeTarget {
   repeated IcebergOldDeleteArtifactRef references = 6;
 }
 
-// The recipe intentionally carries no operation, cohort, query, attempt,
+message IcebergMutationSnapshot {
+  string manifest_list = 1;
+  int32 schema_id = 2;
+}
+
+message IcebergMutationReadRecipe {
+  string metadata_location = 1;
+  string metadata_identity = 2;
+  optional IcebergMutationSnapshot snapshot = 3;
+}
+
+message IcebergCreationScope {
+  bytes session_id = 1;
+  bytes step_id = 2;
+  bytes endpoint_digest = 3;
+}
+
+// The recipe intentionally carries no cohort, query, attempt,
 // backend, driver, or sink identity and no credential material.
 message IcebergWriterHandle {
   IcebergWriteBranch branch = 1;
@@ -164,6 +181,9 @@ message IcebergWriterHandle {
   optional IcebergDataBranchRecipe data = 4;
   map<string, IcebergOldDeleteMergeTarget> old_deletes = 5;
   optional IcebergEqualityDeleteRecipe equality = 6;
+  optional IcebergMutationReadRecipe mutation_read = 7;
+  optional IcebergCreationScope creation_scope = 8;
+  optional bytes position_group_id = 9;
 }
 
 // BE -> FE: one staged provider artifact.
@@ -215,6 +235,33 @@ message IcebergEqualityDeleteFileArtifact {
   repeated int32 equality_field_ids = 4;
 }
 
+message IcebergDeleteTargetLocator {
+  string manifest_list = 1;
+  string manifest_path = 2;
+  uint64 manifest_ordinal = 3;
+  uint64 entry_ordinal = 4;
+  int64 snapshot_id = 5;
+  string data_file_path = 6;
+  uint64 record_count = 7;
+}
+message IcebergRemoveDataFile {
+  repeated IcebergMergedDeleteReference old_exclusive_deletes = 1;
+}
+message IcebergFinalDeleteEffect {
+  IcebergDeleteTargetLocator target = 1;
+  uint64 newly_deleted_rows = 2;
+  oneof effect {
+    IcebergRemoveDataFile remove_data_file = 3;
+    IcebergDeletionVectorArtifact replace_positions = 4;
+  }
+}
+message IcebergCreationReceipt {
+  bytes create_id = 1;
+  bytes identity = 2;
+  uint64 size = 3;
+  bytes content_sha256 = 4;
+}
+
 // The fragment intentionally carries no writer, attempt, or aggregate result
 // identity. Those relationships stay in the existing public result carrier.
 message IcebergCommitFragment {
@@ -223,5 +270,7 @@ message IcebergCommitFragment {
     IcebergPositionDeleteFileArtifact position_delete_file = 2;
     IcebergDeletionVectorArtifact deletion_vector = 3;
     IcebergEqualityDeleteFileArtifact equality_delete_file = 4;
+    IcebergFinalDeleteEffect final_delete = 5;
   }
+  optional IcebergCreationReceipt creation = 6;
 }

@@ -323,6 +323,11 @@ pub(crate) fn validate_prepared_set<'a>(
 
     for (ordinal, neutral) in prepared.fragments() {
         let fragment = adapter.commit_fragment(neutral)?;
+        if matches!(fragment.artifact(), IcebergCommitArtifact::FinalDelete(_)) {
+            return Err(invalid(
+                "Iceberg position materialization has no installed publication owner",
+            ));
+        }
         let branch = sealed.get(ordinal).copied().ok_or_else(|| {
             invalid(format!(
                 "Iceberg commit fragment names write target {} which this session never sealed",
@@ -365,8 +370,8 @@ pub(crate) fn validate_prepared_set<'a>(
                 )));
             }
         }
-        if fragment.metrics().record_count() == 0
-            && matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(_))
+        if matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(file)
+            if file.metrics().record_count() == 0)
         {
             return Err(invalid(format!(
                 "Iceberg staged data file {} reports zero rows",
@@ -676,9 +681,13 @@ fn written_file_from_fragment(
     fragment: &IcebergCommitFragment,
     metadata: &TableMetadata,
 ) -> Result<WrittenFile, ConnectorError> {
-    let partition = fragment.partition();
+    let partition = fragment
+        .partition()
+        .ok_or_else(|| corrupt("Iceberg result has no written partition"))?;
     let partition_values = decode_partition_values(partition, metadata)?;
-    let metrics = fragment.metrics();
+    let metrics = fragment
+        .metrics()
+        .ok_or_else(|| corrupt("Iceberg result has no written metrics"))?;
     let record_count = metrics.record_count();
     let file_size_in_bytes = metrics.file_size_in_bytes();
     let stats = metrics.column_stats().cloned().unwrap_or_default();
@@ -735,6 +744,11 @@ fn written_file_from_fragment(
             None,
             Some(file.equality_field_ids().to_vec()),
         ),
+        IcebergCommitArtifact::FinalDelete(_) => {
+            return Err(invalid(
+                "Iceberg position materialization has no installed publication owner",
+            ));
+        }
     };
     Ok(WrittenFile {
         path: fragment.path().to_string(),
