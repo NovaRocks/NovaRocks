@@ -83,6 +83,11 @@ impl AttemptEffectEnvelope {
             || self.is_process_call()
             || self.is_publication_call()
             || self.is_transport_release()
+            || self.is_read_confirmation()
+    }
+
+    pub(crate) fn is_read_confirmation(&self) -> bool {
+        matches!(self.protocol.body, EffectBody::ConfirmReadState { .. })
     }
 
     pub(crate) fn is_transport_release(&self) -> bool {

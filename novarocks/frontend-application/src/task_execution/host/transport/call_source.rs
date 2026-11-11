@@ -38,6 +38,9 @@ use crate::{
         },
         host::{
             custody::ReturnedActorTransportResult,
+            observations::{
+                ObservationError, OrderedObservationInput, ReadConfirmationBorrow, StreamKey,
+            },
             publication::{AttemptPublicationOwner, OriginalHostFailure},
         },
     },
@@ -78,6 +81,7 @@ pub(crate) enum AttemptCallOwner {
     Process(Arc<AttemptProcessObserver>),
     Publication(Arc<AttemptPublicationOwner>),
     Release,
+    ReadConfirmation(OrderedObservationInput<FrontendActor>),
 }
 
 impl AttemptCallOwner {
@@ -87,6 +91,7 @@ impl AttemptCallOwner {
             Self::Process(_) => effect.is_process_call(),
             Self::Publication(_) => effect.is_publication_call(),
             Self::Release => effect.is_transport_release(),
+            Self::ReadConfirmation(_) => effect.is_read_confirmation(),
         }
     }
 }
@@ -125,6 +130,7 @@ pub(crate) struct BoundAttemptCall {
     owner: AttemptCallOwner,
     abort: Option<(Arc<AbortSettlementOwner>, Option<Arc<AbortReceiptSlot>>)>,
     release: Option<TransportRelease>,
+    confirmation: Option<Result<ReadConfirmationBorrow<FrontendActor>, ObservationError>>,
 }
 impl BoundAttemptCall {
     pub(super) fn matches(&self, effect: &AttemptEffectEnvelope) -> bool {
@@ -229,6 +235,31 @@ impl BoundAttemptCall {
                     .map_err(|error| Box::new(error) as Box<dyn std::any::Any + Send>),
                 _ => unreachable!("same original publication effect"),
             },
+            AttemptCallOwner::ReadConfirmation(_) => {
+                let EffectBody::ConfirmReadState {
+                    token,
+                    requested_at,
+                    ..
+                } = effect.protocol.body
+                else {
+                    unreachable!("original read confirmation effect");
+                };
+                let snapshot = match self.confirmation.expect("bound original read confirmation") {
+                    Ok(original) => original.snapshot(token, requested_at).await,
+                    Err(error) => Err(error),
+                };
+                let snapshot = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(ObservationError::Closed) => return Ok(AttemptCallReply::NoInput),
+                    Err(error) => return Err(Box::new(error)),
+                };
+                Ok(AttemptCallReply::Input {
+                    input: AttemptInput::Executor(
+                        novarocks_attempt_protocol::input::ExecutorFact::ReadState(snapshot),
+                    ),
+                    failure: None,
+                })
+            }
             AttemptCallOwner::Release => unreachable!("transport release uses blocking Work"),
         }
     }
@@ -476,10 +507,28 @@ impl AttemptCallSource {
             )
         });
         prepare_actor_transport(effect, result, work, VecDeque::new(), self.observer, |_| {
+            let confirmation = match (&owner, &ticket.effect) {
+                (AttemptCallOwner::ReadConfirmation(ingress), FrontendEffect::Attempt(effect)) => {
+                    let EffectBody::ConfirmReadState {
+                        participation,
+                        generation,
+                        ..
+                    } = effect.protocol.body
+                    else {
+                        unreachable!("original read confirmation effect");
+                    };
+                    Some(ingress.borrow_read_confirmation(StreamKey {
+                        participation,
+                        generation,
+                    }))
+                }
+                _ => None,
+            };
             ActorTransportWork::Call(BoundAttemptCall {
                 owner,
                 abort,
                 release: take_original(),
+                confirmation,
             })
         })
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
@@ -555,12 +604,17 @@ impl AttemptCallSource {
                 }
                 let input = FrontendInput::Attempt(Box::new(input));
                 if let Err(publication) = original.original.fill_with_receipt(None, input) {
-                    if original.effect.is_root_control_reply()
-                        && matches!(
-                            publication.error,
-                            ActorTurnError::ActorFailed | ActorTurnError::Closed
-                        )
-                    {
+                    let fenced = matches!(
+                        publication.error,
+                        ActorTurnError::ActorFailed | ActorTurnError::Closed
+                    );
+                    if fenced && original.effect.is_read_confirmation() {
+                        // The same actor's fence refused the bounded passive
+                        // snapshot. The original result role remains ours.
+                        assert!(matches!(&publication.event, FrontendInput::Attempt(input)
+                            if matches!(**input, AttemptInput::Executor(novarocks_attempt_protocol::input::ExecutorFact::ReadState(_)))));
+                        drop(publication);
+                    } else if fenced && original.effect.is_root_control_reply() {
                         // The actual QA delivery is already done. Keep the
                         // refused original Core input and retire its paid role
                         // after Join, even though the Core cannot consume it.

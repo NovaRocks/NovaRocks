@@ -130,7 +130,7 @@ pub(crate) struct AttemptTransportSource {
     native_source: ActorId,
     scope: ScopeHandle,
     admission: AdmissionSource,
-    calls: [Option<AttemptCallSource>; 4],
+    calls: [Option<AttemptCallSource>; 5],
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -161,7 +161,7 @@ impl AttemptTransportSource {
         native_source: ActorId,
         scope: ScopeHandle,
         admission: AdmissionSource,
-        calls: [Option<AttemptCallSource>; 4],
+        calls: [Option<AttemptCallSource>; 5],
         send: AttemptSendSource,
         mut failure: (FailureContext, AttemptFailureBinding),
         other: Box<dyn EffectSource>,
@@ -455,6 +455,7 @@ impl EffectSource for AttemptTransportSource {
                 original if original.is_process_call() => Some(1),
                 original if original.is_publication_call() => Some(2),
                 original if original.is_transport_release() => Some(3),
+                original if original.is_read_confirmation() => Some(4),
                 _ => None,
             };
             if let Some(lane) = call_lane {

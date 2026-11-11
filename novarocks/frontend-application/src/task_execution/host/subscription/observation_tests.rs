@@ -1696,7 +1696,7 @@ fn compact_controls_project_only_at_fill_and_metadata_refusal_keeps_original() {
     assert_eq!(layout.read_state, Layout::new::<ReadState>());
     assert_eq!(
         layout.read_confirmation,
-        Layout::new::<ReadConfirmationFuture<'static, Recorder>>()
+        Layout::new::<ReadStateConfirmation<'static, Recorder>>()
     );
     assert_eq!(
         layout.confirmation_waiter,
@@ -2677,7 +2677,25 @@ fn failed_tail_keeps_a_ready_credit_until_the_original_publisher_exits() {
         panic!("the original Ready owns its preread position");
     };
     assert!(credit.is_none());
+    let held = f.input.borrow_read_confirmation(f.key).unwrap();
+    let mut confirmation = Box::pin(held.snapshot(token(1), MonotonicInstant::ORIGIN));
+    let wakes = Arc::new(ConfirmationWake::default());
+    let waker = Waker::from(wakes.clone());
+    let mut confirmation_cx = Context::from_waker(&waker);
+    assert!(
+        confirmation
+            .as_mut()
+            .poll(&mut confirmation_cx)
+            .is_pending()
+    );
     f.input.fence_failed_writer();
+    assert!(wakes.0.load(std::sync::atomic::Ordering::SeqCst) != 0);
+    assert!(matches!(
+        confirmation.as_mut().poll(&mut confirmation_cx),
+        Poll::Ready(Err(ObservationError::Closed))
+    ));
+    drop(confirmation);
+    drop(held);
     {
         let mut disposition = Box::pin(f.input.dispose_failed_tail());
         assert!(disposition.as_mut().poll(&mut cx).is_pending());

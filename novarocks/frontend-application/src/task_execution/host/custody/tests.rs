@@ -1058,6 +1058,240 @@ async fn publication_host_returns_original_result_and_typed_failure() {
 }
 
 #[tokio::test]
+async fn read_confirmation_host_holds_the_exact_stream_through_executor_capture_exit() {
+    use crate::{
+        control_runtime::{
+            actor::FrontendActorKind,
+            host::{FrontendLanePolicy, HostBinding, HostRegistry},
+            metrics::FrontendHostObservations,
+            transport_withdrawal::AttemptEffectEnvelope,
+        },
+        task_execution::host::{
+            observations::{
+                ObservationBudget, ObservationError, OrderedObservationInput, RootControlBinding,
+                StreamKey,
+                tests::{Bank, ManualClock},
+            },
+            transport::{ActorTransportExecutor, AttemptCallOwner},
+        },
+    };
+    use novarocks_attempt_protocol::{
+        effect::{AttemptEffect, EffectBody, EffectClass},
+        input::ReceptionCoverage,
+    };
+    use novarocks_control_runtime::actor_turn::ProcessClock;
+    use novarocks_control_runtime_core::owned_storage::OwnedSlotKind;
+    use novarocks_coordination_contract::{
+        AttemptActivationIdentity, AttemptRequestToken, MonotonicInstant,
+    };
+    use novarocks_execution_contract::{ParticipationRef, TaskIdentity};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::{num::NonZeroU64, time::Duration};
+
+    let fixture = Fixture::new();
+    let generation = Generation::new(1).unwrap();
+    let budget = ObservationBudget {
+        queued_frames: 1,
+        total_positions: 3,
+        max_frame_bytes: 1024,
+        total_bytes: 1536,
+        control_bytes: 512,
+    };
+    let (mut parent, mut payer) = fixture
+        .scope
+        .reserve_next(
+            generation,
+            ReservationResources::new(
+                ResourceVector::default(),
+                OwnedSlotNeed {
+                    work_headers: 1,
+                    inputs: budget.total_positions,
+                    ..Default::default()
+                },
+            ),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    parent.start().unwrap();
+    let positions = (0..budget.total_positions)
+        .map(|_| {
+            let mut original = payer.take_position(OwnedSlotKind::Input).unwrap();
+            original.bind().unwrap();
+            original
+        })
+        .collect();
+    let execution = QueryExecutionId::new(QueryId::new(11, 1), AttemptId::new(1).unwrap()).unwrap();
+    let backend = BackendProcessId::new_v7();
+    let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let key = StreamKey {
+        participation,
+        generation: NonZeroU64::MIN,
+    };
+    let token = AttemptRequestToken::new(NonZeroU64::MIN);
+    let now = MonotonicInstant::from_origin(Duration::ZERO);
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id: AttemptActionId::new(NonZeroU64::MIN),
+        class: EffectClass::Settlement,
+        body: EffectBody::ConfirmReadState {
+            token,
+            participation,
+            generation: key.generation,
+            requested_at: now,
+        },
+    });
+    let inbox = WithdrawalInbox::with_effect(&fixture.scope, [effect]);
+    let root = TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        backend,
+    );
+    let binding = RootControlBinding::for_registered_source(
+        inbox.registration.clone(),
+        AttemptActivationIdentity::from_parts(1, execution, 1),
+        root,
+    )
+    .unwrap();
+    let bank = Bank::make(budget, positions, binding.clone());
+    let observation_source = ActorId::new(4).unwrap();
+    let standing = |class| {
+        inbox
+            .runtime
+            .reserve_admitted_input_for(&inbox.registration, observation_source, class, &parent)
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    };
+    let ingress = OrderedObservationInput::new(
+        standing(InputClass::Lifecycle),
+        standing(InputClass::Control),
+        bank.clone(),
+        binding,
+        Arc::new(ManualClock::default()),
+        |input| FrontendInput::Attempt(Box::new(input)),
+        Waker::noop().clone(),
+    )
+    .unwrap();
+    ingress.register_stream(key).unwrap();
+    let source = Arc::new(Mutex::new(AttemptCallSource::new(
+        &parent,
+        &payer,
+        generation,
+        observer(),
+        AttemptCallOwner::ReadConfirmation(ingress.clone()),
+        inbox.reserve_result(&parent),
+    )));
+    let published = Arc::new(AtomicUsize::new(0));
+    let host = HostRegistry::new(
+        inbox.runtime.clone(),
+        fixture.ledger.clone(),
+        Arc::new(FrontendHostObservations::new(Arc::new(
+            ProcessClock::default(),
+        ))),
+    );
+    let handle = Handle::current();
+    let mut exit = host
+        .register(HostBinding {
+            scope: fixture.scope.clone(),
+            registration: inbox.registration.clone(),
+            kind: FrontendActorKind::Test,
+            config: WithdrawalInbox::CONFIG,
+            policy: FrontendLanePolicy::attempt(1),
+            executor: Arc::new(ActorTransportExecutor(handle.clone())),
+            source: Box::new(CallFixtureSource {
+                source: source.clone(),
+                process: None,
+                process_pending: false,
+                scope: fixture.scope.clone(),
+                published: published.clone(),
+                closed: false,
+            }),
+            transport: Some(TransportRetirements::new(
+                inbox.runtime.clone(),
+                inbox.registration.clone(),
+                handle,
+                1,
+            )),
+            startup: None,
+            capacity: None,
+            membership: None,
+            owner_controls: None,
+            ordered_observations: None,
+        })
+        .unwrap_or_else(|_| panic!("original confirmation host"));
+    let drive = || {
+        while let Some(turn) = inbox.runtime.claim_host_actor() {
+            host.drive(Tick(1), turn);
+        }
+    };
+    let command = inbox.submit_command(&parent);
+    assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
+    drive();
+    ingress.job_closed(key).unwrap();
+    assert_eq!(ingress.retire_stream(key), Err(ObservationError::Busy));
+    inbox
+        .runtime
+        .retire_input(inbox.registration.actor(), command)
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while published.load(Ordering::SeqCst) == 0 {
+            drive();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, ExecutorFact::ReadState(snapshot)) = inbox.try_commit_next().unwrap() else {
+        panic!("same original confirmation");
+    };
+    assert_eq!(
+        (
+            snapshot.participation,
+            snapshot.generation,
+            snapshot.request
+        ),
+        (participation, key.generation, token)
+    );
+    assert_eq!(snapshot.snapshot_at, now);
+    assert_eq!(
+        snapshot.received_through_snapshot,
+        ReceptionCoverage::Complete
+    );
+    assert!(snapshot.closed);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !source.lock().unwrap().close_idle().unwrap() {
+            drive();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    ingress.retire_stream(key).unwrap();
+    ingress.close_after_exit().unwrap();
+    bank.retire_positions();
+    let original = source.lock().unwrap().take_drained_owner().unwrap();
+    drop(original);
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    fixture.scope.reap_ready(128).unwrap();
+    exit.request_close().unwrap();
+    drive();
+    tokio::time::timeout(Duration::from_secs(2), exit.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
+}
+
+#[tokio::test]
 async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use crate::{
         control_runtime::{

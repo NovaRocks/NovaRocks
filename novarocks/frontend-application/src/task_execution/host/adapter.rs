@@ -163,6 +163,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) process: super::transport::AttemptCallSource,
     pub(crate) publication: super::transport::AttemptCallSource,
     pub(crate) release: super::transport::AttemptCallSource,
+    pub(crate) read_confirmation: super::transport::AttemptCallSource,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
@@ -392,6 +393,29 @@ impl AttemptActorRegistration {
             observer,
             self.native_source,
             super::transport::AttemptCallOwner::Release,
+        )
+    }
+
+    pub(crate) fn prepare_read_confirmation_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: novarocks_control_runtime_core::identity::ConsumerId,
+        ingress: OrderedObservationInput<FrontendActor>,
+    ) -> Result<super::transport::AttemptCallSource, AttemptRegistrationError> {
+        if !ingress.root_binding().same_original(&self.root_control) {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "read confirmation Source belongs to another original activation",
+            ));
+        }
+        self.prepare_call_source(
+            runtime,
+            parent,
+            payer,
+            observer,
+            self.native_source,
+            super::transport::AttemptCallOwner::ReadConfirmation(ingress),
         )
     }
 
@@ -654,6 +678,7 @@ impl AttemptActorRegistration {
             process,
             publication,
             release,
+            read_confirmation,
             send,
             executor: native,
             failure,
@@ -705,7 +730,13 @@ impl AttemptActorRegistration {
                     self.native_source,
                     self.scope.clone(),
                     admission,
-                    [Some(qa), Some(process), Some(publication), Some(release)],
+                    [
+                        Some(qa),
+                        Some(process),
+                        Some(publication),
+                        Some(release),
+                        Some(read_confirmation),
+                    ],
                     send,
                     (
                         FailureContext {

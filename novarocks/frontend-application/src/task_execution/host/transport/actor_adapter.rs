@@ -39,7 +39,7 @@ use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::{
     actor_turn::InputAuthor,
     causal_input::CausalInputObligation,
-    exit_work::{PanicSink, run_blocking, run_future},
+    exit_work::{ExitWorkError, PanicSink, run_blocking, run_future},
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::identity::ConsumerId;
@@ -300,10 +300,16 @@ pub(crate) fn handoff_actor_transport(
             })
         }
         ActorTransportWork::Call(bound) => {
+            let confirms_read = effect.is_read_confirmation();
             launch.spawn(runtime, exit, |exit, registration| async move {
                 let outcome = match run_future(exit, bound.run(effect), panic).await {
                     Ok(Ok(reply)) => BodyOutcome::Call(reply),
                     Ok(Err(error)) => BodyOutcome::RawFailure(error),
+                    Err(ExitWorkError::NotStarted(_)) if confirms_read => {
+                        // The start fence rejected the exact read and its
+                        // captures already exited. There is no read fact.
+                        BodyOutcome::Call(super::call_source::AttemptCallReply::NoInput)
+                    }
                     Err(error) => BodyOutcome::RawFailure(Box::new(error)),
                 };
                 stage_actor_outcome(&registration, outcome);
