@@ -17,6 +17,7 @@
 
 //! Terminal delivery to the original logical attempt.
 
+use crate::control_runtime::membership::{MembershipErrors, ObservationErrors};
 use crate::task_execution::{
     error::TaskExecutionError,
     host::{failure_bridge::FailureBridge, publication::OriginalHostFailure},
@@ -222,16 +223,29 @@ impl TerminalOutbox {
 pub(crate) struct RegisteredAttemptTerminal {
     normal: Arc<TerminalOutbox>,
     failure: FailureBridge,
+    membership_errors: Option<MembershipErrors>,
     selected: Option<Result<NativeAttemptTerminal, TerminalProjectionError>>,
 }
 
 impl RegisteredAttemptTerminal {
-    pub(crate) fn new(normal: Arc<TerminalOutbox>, failure: FailureBridge) -> Self {
+    pub(crate) fn new(
+        normal: Arc<TerminalOutbox>,
+        failure: FailureBridge,
+        membership_errors: Option<MembershipErrors>,
+    ) -> Self {
         Self {
             normal,
             failure,
+            membership_errors,
             selected: None,
         }
+    }
+
+    pub(crate) fn take_membership_errors(&self) -> ObservationErrors {
+        self.membership_errors
+            .as_ref()
+            .map(MembershipErrors::take)
+            .unwrap_or_default()
     }
 
     pub(crate) async fn terminal(

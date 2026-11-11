@@ -25,6 +25,7 @@ mod purpose_tests;
 
 use super::{
     actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendLaneKey},
+    membership::AttemptMembershipSource,
     metrics::FrontendHostObservations,
 };
 use crate::task_execution::host::custody::{
@@ -261,6 +262,7 @@ struct HostMachine {
     ordered_observations: Option<OrderedObservationHost>,
     startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     capacity: Option<AttemptCapacitySource>,
+    membership: Option<AttemptMembershipSource>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -337,6 +339,7 @@ pub(crate) struct HostBinding {
     pub(crate) ordered_observations: Option<OrderedObservationHost>,
     pub(crate) startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     pub(crate) capacity: Option<AttemptCapacitySource>,
+    pub(crate) membership: Option<AttemptMembershipSource>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -387,6 +390,9 @@ impl HostRegistry {
                 .capacity
                 .as_ref()
                 .is_some_and(|capacity| !capacity.matches(&binding.registration))
+            || binding.membership.as_ref().is_some_and(|membership| {
+                !membership.matches(&binding.registration) || binding.startup.is_none()
+            })
         {
             return Err(HostRegistrationRefusal {
                 reason: "original actor Scope binding differs",
@@ -470,6 +476,17 @@ impl HostRegistry {
                 binding,
             });
         }
+        if binding
+            .membership
+            .as_ref()
+            .is_some_and(|source| source.visit_units() > binding.config.turn_budget)
+        {
+            return Err(HostRegistrationRefusal {
+                reason: "host turn cannot visit the original membership roster",
+                runtime_error: None,
+                binding,
+            });
+        }
         let mut state = self.state.lock().expect("frontend host registry lock");
         if !state.open || state.entries.contains_key(&binding.scope.id()) {
             return Err(HostRegistrationRefusal {
@@ -503,6 +520,7 @@ impl HostRegistry {
                 ordered_observations: binding.ordered_observations,
                 startup: binding.startup,
                 capacity: binding.capacity,
+                membership: binding.membership,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -773,6 +791,11 @@ impl HostRegistry {
                 budget -= 1;
                 startup_more = startup.progress(failed, machine.external_closed)?;
                 if startup.is_closed() {
+                    if startup.is_ready()
+                        && let Some(membership) = &mut machine.membership
+                    {
+                        membership.startup_complete();
+                    }
                     machine.startup = None;
                 }
             }
@@ -826,6 +849,21 @@ impl HostRegistry {
                 }
             }
         }
+        let mut membership_more = false;
+        if let Some(membership) = &mut machine.membership
+            && membership.needs_progress(failed, closing_capacity)
+        {
+            let units = membership.visit_units();
+            if budget < units {
+                membership_more = true;
+            } else {
+                budget -= units;
+                membership_more = membership.progress(failed, closing_capacity)?;
+                if membership.is_closed() {
+                    machine.membership = None;
+                }
+            }
+        }
         let mut retired = machine
             .source
             .progress_retirement(&self.runtime, turn, now, budget);
@@ -836,9 +874,10 @@ impl HostRegistry {
         budget -= retired.units;
         // The original Source can finish admission in this progress call.
         // Schedule the retained capacity role for its separate final visit.
-        capacity_more |= machine.capacity.is_some()
-            && !closing_capacity
-            && machine.source.result_admission_closed();
+        if !closing_capacity && machine.source.result_admission_closed() {
+            capacity_more |= machine.capacity.is_some();
+            membership_more |= machine.membership.is_some();
+        }
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
             retired.more |= transport.more;
@@ -848,8 +887,9 @@ impl HostRegistry {
             .ordered_observations
             .as_ref()
             .is_none_or(OrderedObservationHost::is_retired);
-        retired.retired &= machine.startup.is_none() && machine.capacity.is_none();
-        retired.more |= startup_more || capacity_more;
+        retired.retired &=
+            machine.startup.is_none() && machine.capacity.is_none() && machine.membership.is_none();
+        retired.more |= startup_more || capacity_more || membership_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -919,6 +959,9 @@ impl HostRegistry {
             }
             if let Some(capacity) = &mut machine.capacity {
                 capacity_more |= capacity.index_committed(&indexed.inputs)?;
+            }
+            if let Some(membership) = &mut machine.membership {
+                membership_more |= membership.index_committed(&indexed.inputs)?;
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -1137,6 +1180,7 @@ impl HostRegistry {
         let more = retired.more
             || startup_more
             || capacity_more
+            || membership_more
             || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
@@ -1475,6 +1519,7 @@ mod tests {
                 ordered_observations: None,
                 startup: Some(source),
                 capacity: None,
+                membership: None,
             })
             .unwrap_or_else(|_| panic!("install original host startup"));
         let drive_host = || {
@@ -1539,6 +1584,208 @@ mod tests {
         drive_host();
         exit.wait().await.unwrap();
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installed_host_opens_membership_only_after_start_and_retires_each_indexed_view() {
+        use crate::{
+            control_runtime::membership::{
+                FrozenMember, MembershipRegistry, MembershipTarget, membership_input,
+            },
+            task_execution::host::startup::{AttemptStartupSource, StartupInput},
+        };
+        use novarocks_attempt_protocol::input::{MembershipObservation, MembershipView};
+        use novarocks_control_runtime::coalescing_input::CoalescingInput;
+        use novarocks_execution_contract::{ParticipationRef, RuntimeEndpoint};
+        use novarocks_query_application::api::{
+            BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+        };
+        use novarocks_types::{
+            AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
+        };
+
+        struct Probe(Arc<Mutex<Vec<MembershipView>>>);
+        impl TestActor for Probe {
+            fn handle(
+                &mut self,
+                _: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                match input {
+                    FrontendInput::AttemptStartup(
+                        StartupInput::Bootstrap | StartupInput::StartProtocol,
+                    ) => {
+                        assert_eq!(envelope.class, InputClass::Lifecycle);
+                    }
+                    FrontendInput::Membership(update) => {
+                        assert_eq!(envelope.class, InputClass::Ordinary);
+                        self.0.lock().unwrap().push(update.0);
+                    }
+                    _ => panic!("unexpected input to the installed membership host"),
+                }
+            }
+        }
+
+        struct Port(Result<BackendProcessObservation, BackendTopologyError>);
+        impl BackendProcessObservationPort for Port {
+            fn observe_process_at_endpoint(
+                &self,
+                _: BackendProcessId,
+                _: &RuntimeEndpoint,
+            ) -> Result<BackendProcessObservation, BackendTopologyError> {
+                self.0.clone()
+            }
+        }
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let clock = Arc::new(FrontendClock(Arc::new(TestClock(Instant::now()))));
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(clock)),
+        );
+        let actor = ActorId::new(1).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let config = ActorConfig {
+            mailbox: [1; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(Probe(seen.clone()))),
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original actor registration: {error:?}"));
+        let standing = |source, class| {
+            runtime
+                .reserve_input(actor, source, class)
+                .unwrap()
+                .into_standing_input()
+                .unwrap()
+        };
+        let (startup, mut ready) =
+            AttemptStartupSource::new(registration.clone(), standing(actor, InputClass::Lifecycle));
+        let participant = ParticipationRef::new(
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let membership = MembershipTarget::register(
+            registration.clone(),
+            Arc::from([FrozenMember {
+                participation: participant,
+                endpoint: RuntimeEndpoint::new("127.0.0.1", 19091).unwrap(),
+            }]),
+            CoalescingInput::new(
+                standing(ActorId::new(2).unwrap(), InputClass::Ordinary),
+                membership_input,
+            ),
+        );
+        let registry = Arc::new(MembershipRegistry::new());
+        let mut exit = host
+            .register(HostBinding {
+                scope: scope.clone(),
+                registration,
+                kind: FrontendActorKind::Test,
+                config,
+                policy: FrontendLanePolicy {
+                    lane: |_| None,
+                    per_step_inventory: 1,
+                },
+                source: Box::new(MetadataSource {
+                    scope,
+                    closing: false,
+                    retire_batches: false,
+                }),
+                executor: Arc::new(NoExecutor),
+                transport: None,
+                ordered_observations: None,
+                startup: Some(startup),
+                capacity: None,
+                membership: Some(AttemptMembershipSource::new(
+                    registry.clone(),
+                    membership.target.clone(),
+                )),
+            })
+            .unwrap_or_else(|_| panic!("install original membership host"));
+        let drive = || {
+            host.drive(
+                Tick(1),
+                runtime.claim_host_actor().expect("original host wake"),
+            );
+        };
+        let poll = || assert!(runtime.poll_one(Tick(1)).unwrap());
+        let current = Port(Ok(BackendProcessObservation::Current));
+        registry.publish(0, &current);
+        assert!(registry.is_empty());
+        drive(); // Fill Bootstrap.
+        poll();
+        drive(); // Index Bootstrap.
+        drive(); // Retire Bootstrap.
+        drive(); // Fill StartProtocol.
+        poll();
+        drive(); // Index StartProtocol.
+        drive(); // Retire StartProtocol.
+        assert!(registry.is_empty());
+        drive(); // Return the startup position and open delivery.
+        ready.wait_ready().await.unwrap();
+        assert!(!registry.is_empty());
+
+        registry.publish(1, &current);
+        let first = membership.target.input.in_flight().unwrap().unwrap();
+        let original = BackendTopologyError::Unavailable {
+            message: "original observer refusal".into(),
+        };
+        registry.publish(2, &Port(Err(original.clone())));
+        assert_eq!(membership.errors.take(), [(participant, original)]);
+        assert_eq!(membership.target.input.in_flight().unwrap(), Some(first));
+        poll();
+        drive();
+        assert_eq!(membership.target.input.in_flight().unwrap(), Some(first));
+        drive();
+        let second = membership.target.input.in_flight().unwrap().unwrap();
+        assert_ne!(second, first);
+
+        exit.request_close().unwrap();
+        drive();
+        assert!(registry.is_empty());
+        assert_eq!(membership.target.input.in_flight().unwrap(), Some(second));
+        registry.publish(3, &current);
+        poll();
+        let views = seen.lock().unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].revision, 1);
+        assert_eq!(
+            views[0].processes[&participant],
+            MembershipObservation::ExactOriginal
+        );
+        assert_eq!(views[1].revision, 2);
+        assert_eq!(
+            views[1].processes[&participant],
+            MembershipObservation::Unobserved
+        );
+        drop(views);
+
+        for _ in 0..8 {
+            let Some(turn) = runtime.claim_host_actor() else {
+                break;
+            };
+            host.drive(Tick(1), turn);
+        }
+        assert!(registry.is_empty() && host.is_empty() && runtime.is_empty() && ledger.is_empty());
+        exit.wait().await.unwrap();
     }
 
     #[tokio::test]
@@ -1624,6 +1871,7 @@ mod tests {
                 ordered_observations: None,
                 startup: None,
                 capacity: Some(capacity),
+                membership: None,
             })
             .unwrap_or_else(|_| panic!("install original capacity Source"));
         let occupy = || {
@@ -1756,6 +2004,7 @@ mod tests {
                 transport: None,
                 startup: None,
                 capacity: None,
+                membership: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2136,6 +2385,7 @@ mod tests {
                 transport: None,
                 startup: None,
                 capacity: None,
+                membership: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2437,6 +2687,7 @@ mod tests {
                     transport: None,
                     startup: None,
                     capacity: None,
+                    membership: None,
                     ordered_observations: None,
                 })
                 .is_ok()

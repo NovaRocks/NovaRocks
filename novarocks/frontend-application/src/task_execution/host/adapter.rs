@@ -37,7 +37,7 @@ use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
         host::{EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding},
-        membership::{FrozenMember, MembershipTarget, membership_input},
+        membership::{FrozenMember, MembershipRegistration, MembershipTarget, membership_input},
     },
     native::transport_capacity::{
         NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
@@ -151,6 +151,7 @@ pub(crate) struct PreparedAttemptHost {
     pub(crate) binding: HostBinding,
     pub(crate) startup: AttemptStartup,
     pub(crate) controls: AttemptOwnerControls,
+    pub(crate) membership: MembershipRegistration,
     pub(crate) failure: PendingFailureBridge,
     pub(crate) terminal: Arc<crate::task_execution::bridge::terminal::TerminalOutbox>,
 }
@@ -547,6 +548,7 @@ impl AttemptActorRegistration {
         runtime: &ActorRuntime<FrontendActor>,
         startup_work: &WorkObligation,
         capacity: AttemptCapacitySource,
+        membership: MembershipRegistration,
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
         transport: AttemptTransportBinding,
@@ -555,6 +557,7 @@ impl AttemptActorRegistration {
         (
             AttemptRegistrationError,
             AttemptCapacitySource,
+            MembershipRegistration,
             Box<dyn EffectSource>,
             AttemptTransportBinding,
         ),
@@ -562,6 +565,10 @@ impl AttemptActorRegistration {
         if self.startup_reserved
             || !self.ordered_bound
             || self.read_progress_roles.is_none()
+            || !membership
+                .target
+                .registration
+                .same_registration(&self.original)
             || !capacity.matches(&self.original)
             || !self.binding.get().is_some_and(|binding| {
                 Arc::ptr_eq(&binding.capacity_registrant, &capacity.registrant)
@@ -582,6 +589,7 @@ impl AttemptActorRegistration {
                     "attempt startup requires its original bound Sources and Work",
                 ),
                 capacity,
+                membership,
                 source,
                 transport,
             ));
@@ -597,6 +605,7 @@ impl AttemptActorRegistration {
                 return Err((
                     AttemptRegistrationError::Runtime(error),
                     capacity,
+                    membership,
                     source,
                     transport,
                 ));
@@ -611,6 +620,7 @@ impl AttemptActorRegistration {
                 return Err((
                     AttemptRegistrationError::Runtime(error),
                     capacity,
+                    membership,
                     source,
                     transport,
                 ));
@@ -666,6 +676,7 @@ impl AttemptActorRegistration {
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
                 startup: Some(startup_source),
                 capacity: Some(capacity),
+                membership: None,
                 ordered_observations: Some(ordered_host),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),
@@ -699,6 +710,7 @@ impl AttemptActorRegistration {
             },
             startup,
             controls,
+            membership,
             failure: failure_bridge,
             terminal,
         })
@@ -716,7 +728,7 @@ impl AttemptActorRegistration {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         work: &WorkObligation,
-    ) -> Result<Arc<MembershipTarget>, AttemptRegistrationError> {
+    ) -> Result<MembershipRegistration, AttemptRegistrationError> {
         if self.members.is_none() || !self.scope.same_scope(work.scope()) {
             return Err(AttemptRegistrationError::InvalidConfig(
                 "attempt membership requires its unused original roster and Work",
@@ -725,13 +737,13 @@ impl AttemptActorRegistration {
         let standing = self
             .reserve_standing(runtime, self.membership_source, InputClass::Ordinary, work)
             .map_err(AttemptRegistrationError::Runtime)?;
-        Ok(Arc::new(MembershipTarget::new(
+        Ok(MembershipTarget::register(
             self.original.clone(),
             self.members
                 .take()
                 .expect("the original roster was checked"),
             CoalescingInput::new(standing, membership_input),
-        )))
+        ))
     }
 
     /// Reserve one stable Ordinary notification role for each frozen

@@ -27,14 +27,14 @@ use novarocks_control_runtime::{
     actor_turn::{ActorRegistration, ActorTurnError},
     coalescing_input::{CoalescingInput, Merge},
 };
-use novarocks_control_runtime_core::identity::ScopeId;
+use novarocks_control_runtime_core::identity::{InputId, ScopeId};
 use novarocks_execution_contract::{ParticipationRef, RuntimeEndpoint};
 use novarocks_query_application::api::{
     BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
 };
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, Weak},
     time::Instant,
 };
 use tokio::sync::{Notify, oneshot};
@@ -62,37 +62,181 @@ pub(crate) struct FrozenMember {
     pub(crate) participation: ParticipationRef,
     pub(crate) endpoint: RuntimeEndpoint,
 }
+pub(crate) type ObservationErrors = Vec<(ParticipationRef, BackendTopologyError)>;
+
+/// The logical receiver retains the rich original errors. The observer
+/// replaces them off the poller; the host only owns bounded membership facts.
+pub(crate) struct MembershipErrors(Arc<Mutex<ObservationErrors>>);
+
+impl MembershipErrors {
+    pub(crate) fn take(&self) -> ObservationErrors {
+        std::mem::take(&mut *self.0.lock().expect("frontend membership errors lock"))
+    }
+}
+
 pub(crate) struct MembershipTarget {
     pub(crate) registration: ActorRegistration,
     pub(crate) members: Arc<[FrozenMember]>,
     pub(crate) input: CoalescingInput<FrontendActor, MembershipUpdate>,
-    // Full original failures remain host-owned. They are never converted into
-    // positive Current/Replacement evidence or reconstructed from error text.
-    errors: Mutex<Vec<(ParticipationRef, BackendTopologyError)>>,
+    errors: Weak<Mutex<ObservationErrors>>,
 }
+
+pub(crate) struct MembershipRegistration {
+    pub(crate) target: Arc<MembershipTarget>,
+    pub(crate) errors: MembershipErrors,
+}
+
 impl MembershipTarget {
-    pub(crate) fn new(
+    pub(crate) fn register(
         registration: ActorRegistration,
         members: Arc<[FrozenMember]>,
         input: CoalescingInput<FrontendActor, MembershipUpdate>,
-    ) -> Self {
-        Self {
-            registration,
-            members,
-            input,
-            errors: Mutex::new(Vec::new()),
+    ) -> MembershipRegistration {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        MembershipRegistration {
+            target: Arc::new(Self {
+                registration,
+                members,
+                input,
+                errors: Arc::downgrade(&errors),
+            }),
+            errors: MembershipErrors(errors),
         }
     }
-    pub(crate) fn take_observation_errors(&self) -> Vec<(ParticipationRef, BackendTopologyError)> {
-        std::mem::take(&mut *self.errors.lock().expect("frontend membership errors lock"))
-    }
-    pub(crate) fn after_retire(&self) -> Result<(), ActorTurnError> {
+
+    #[cfg(test)]
+    fn after_retire(&self) -> Result<(), ActorTurnError> {
         self.input.after_retire().map(|_| ())
     }
+
     pub(crate) fn close_after_exit(&self) -> Result<(), ActorTurnError> {
         self.input.close_after_exit()
     }
 }
+
+/// The installed host is the only owner that retires this standing role.
+pub(crate) struct AttemptMembershipSource {
+    registry: Arc<MembershipRegistry>,
+    target: Arc<MembershipTarget>,
+    indexed: Option<InputId>,
+    startup_complete: bool,
+    open: bool,
+    closing: bool,
+    closed: bool,
+}
+
+impl AttemptMembershipSource {
+    pub(crate) fn new(registry: Arc<MembershipRegistry>, target: Arc<MembershipTarget>) -> Self {
+        Self {
+            registry,
+            target,
+            indexed: None,
+            startup_complete: false,
+            open: false,
+            closing: false,
+            closed: false,
+        }
+    }
+
+    pub(crate) fn matches(&self, registration: &ActorRegistration) -> bool {
+        self.target.registration.same_registration(registration)
+    }
+
+    pub(crate) fn startup_complete(&mut self) {
+        self.startup_complete = true;
+    }
+
+    pub(crate) fn index_committed(&mut self, inputs: &[InputId]) -> Result<bool, ActorTurnError> {
+        if inputs.is_empty() {
+            return Ok(false);
+        }
+        let Some(input) = self
+            .target
+            .input
+            .in_flight()?
+            .filter(|input| inputs.contains(input))
+        else {
+            return Ok(false);
+        };
+        assert!(self.indexed.replace(input).is_none());
+        Ok(true)
+    }
+
+    pub(crate) fn needs_progress(&self, failed: bool, closing: bool) -> bool {
+        self.indexed.is_some()
+            || (self.startup_complete && !self.open && !self.closing)
+            || self.closing
+            || closing
+            || failed
+    }
+
+    pub(crate) fn visit_units(&self) -> usize {
+        // Refilling, closing or disposing a view can visit its entire roster.
+        self.target.members.len().saturating_add(1)
+    }
+
+    pub(crate) fn progress(&mut self, failed: bool, closing: bool) -> Result<bool, ActorTurnError> {
+        if !failed && !closing && self.startup_complete && !self.open && !self.closing {
+            match self.registry.insert(self.target.clone()) {
+                Ok(()) => {
+                    self.open = true;
+                    return Ok(false);
+                }
+                Err((ActorTurnError::Closed, _)) => self.fence(),
+                Err((error, _)) => return Err(error),
+            }
+        }
+        if failed || closing {
+            self.fence();
+        }
+        if failed {
+            if let Some(original) = self.target.input.take_failed_role_payload()? {
+                // This is the one bounded neutral view from the original FIFO.
+                original.dispose()?;
+                return Ok(true);
+            }
+            self.target.input.retire_failed_after_exit()?;
+            self.indexed = None;
+        } else if let Some(input) = self.indexed {
+            match self.target.input.retire_indexed_after_exit(input) {
+                Ok(false) => return Ok(false),
+                Ok(true) | Err(ActorTurnError::Closed | ActorTurnError::ActorFailed) => {
+                    self.indexed = None;
+                    return Ok(self.closing);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if self.closing && self.target.input.in_flight()?.is_none() {
+            self.target.close_after_exit()?;
+            self.closed = true;
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn fence(&mut self) {
+        if self.closing {
+            return;
+        }
+        if self.open {
+            let original = self
+                .registry
+                .remove(&self.target.registration)
+                .expect("installed original membership route");
+            assert!(Arc::ptr_eq(&original, &self.target));
+            self.open = false;
+        }
+        // Removal excludes the observer's already-started fill. Closing the
+        // role preserves any actual input for indexed retirement.
+        self.target.input.close();
+        self.closing = true;
+    }
+}
+
 pub(crate) struct MembershipRegistry {
     delivery_open: RwLock<bool>,
     targets: Mutex<BTreeMap<ScopeId, Arc<MembershipTarget>>>,
@@ -109,20 +253,20 @@ impl MembershipRegistry {
     pub(crate) fn insert(
         &self,
         target: Arc<MembershipTarget>,
-    ) -> Result<(), Arc<MembershipTarget>> {
+    ) -> Result<(), (ActorTurnError, Arc<MembershipTarget>)> {
         let open = self
             .delivery_open
             .read()
             .expect("frontend membership delivery gate");
         if !*open {
-            return Err(target);
+            return Err((ActorTurnError::Closed, target));
         }
         let mut targets = self
             .targets
             .lock()
             .expect("frontend membership targets lock");
         if targets.contains_key(&target.registration.scope_id()) {
-            return Err(target);
+            return Err((ActorTurnError::InvalidConfig, target));
         }
         targets.insert(target.registration.scope_id(), target);
         drop(targets);
@@ -161,6 +305,7 @@ impl MembershipRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        drop(open);
         for target in targets {
             target.input.close();
         }
@@ -171,7 +316,7 @@ impl MembershipRegistry {
             .expect("frontend membership targets lock")
             .is_empty()
     }
-    fn publish(&self, revision: u64, port: &dyn BackendProcessObservationPort) {
+    pub(super) fn publish(&self, revision: u64, port: &dyn BackendProcessObservationPort) {
         // Clone only frozen neutral facts and the exact registration witness,
         // never an input/Source holder across an external observer call. A slow
         // service observation may outlive query Scope drain without pinning a
@@ -222,10 +367,9 @@ impl MembershipRegistry {
             let Some(target) = target else {
                 continue;
             };
-            *target
-                .errors
-                .lock()
-                .expect("frontend membership errors lock") = errors;
+            if let Some(original) = target.errors.upgrade() {
+                *original.lock().expect("frontend membership errors lock") = errors;
+            }
             // Both this original input holder and its fill are inside the read
             // gate. The holder drops before close obtains the write barrier.
             match target.input.notify(MembershipUpdate(MembershipView {
@@ -387,6 +531,7 @@ mod tests {
         runtime: ActorRuntime<FrontendActor>,
         registry: MembershipRegistry,
         target: Arc<MembershipTarget>,
+        _errors: MembershipErrors,
         seen: Arc<Mutex<Vec<MembershipView>>>,
         port: ObservationPort,
         participation: ParticipationRef,
@@ -425,14 +570,14 @@ mod tests {
             FrontendProcessId::new_v7(),
             backend,
         );
-        let target = Arc::new(MembershipTarget::new(
+        let MembershipRegistration { target, errors } = MembershipTarget::register(
             registration,
             Arc::from([FrozenMember {
                 participation,
                 endpoint: endpoint.clone(),
             }]),
             CoalescingInput::new(standing, membership_input),
-        ));
+        );
         let registry = MembershipRegistry::new();
         assert!(registry.insert(target.clone()).is_ok());
         Fixture {
@@ -441,6 +586,7 @@ mod tests {
             runtime,
             registry,
             target,
+            _errors: errors,
             seen,
             port: ObservationPort {
                 expected: backend,

@@ -179,6 +179,10 @@ impl AttemptStartupSource {
         Ok(false)
     }
 
+    pub(crate) fn is_ready(&self) -> bool {
+        *self.status.borrow() == StartupStatus::Ready
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         self.closed
     }

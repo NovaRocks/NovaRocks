@@ -220,7 +220,8 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let actor = registration.actor();
     let membership = registered
         .bind_membership(&runtime, &original_work)
-        .unwrap();
+        .unwrap()
+        .target;
     assert!(membership.registration.same_registration(&registration));
     assert!(Arc::ptr_eq(&membership.members, &members));
     assert!(matches!(

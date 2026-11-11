@@ -65,7 +65,8 @@ use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
 use membership::{
-    MembershipObserver, MembershipRegistry, MembershipShutdownError, MembershipTarget,
+    AttemptMembershipSource, MembershipErrors, MembershipObserver, MembershipRegistry,
+    MembershipShutdownError,
 };
 use metrics::{FrontendHostObservations, FrontendRuntimeMetrics};
 use novarocks_control_runtime::{
@@ -154,15 +155,22 @@ impl FrontendAttemptRuntime {
             AttemptOwnerControls,
             PendingFailureBridge,
             Arc<TerminalOutbox>,
+            MembershipErrors,
         ),
     > {
         let PreparedAttemptHost {
-            binding,
+            mut binding,
             startup,
             controls,
+            membership,
             failure,
             terminal,
         } = prepared;
+        assert!(binding.membership.is_none());
+        binding.membership = Some(AttemptMembershipSource::new(
+            self.members.clone(),
+            membership.target,
+        ));
         match self.register(binding) {
             Ok(exit) => Ok((
                 startup,
@@ -170,9 +178,17 @@ impl FrontendAttemptRuntime {
                 RegisteredAttemptTerminal::new(
                     terminal,
                     failure.bind(exit, self.backend_processes.clone()),
+                    Some(membership.errors),
                 ),
             )),
-            Err(refusal) => Err((refusal, startup, controls, failure, terminal)),
+            Err(refusal) => Err((
+                refusal,
+                startup,
+                controls,
+                failure,
+                terminal,
+                membership.errors,
+            )),
         }
     }
 
@@ -304,38 +320,6 @@ impl FrontendAttemptRuntime {
     }
     pub(crate) fn transport_capacity(&self) -> &NativeTransportCapacity {
         &self.layout
-    }
-    pub(crate) fn memberships(&self) -> &Arc<MembershipRegistry> {
-        &self.members
-    }
-    /// The observer may deliver its initial snapshot immediately after
-    /// insertion. StartProtocol must have retired before opening the route.
-    pub(crate) fn open_attempt_membership(
-        &self,
-        startup: &AttemptStartup,
-        target: Arc<MembershipTarget>,
-    ) -> Result<(), (ActorTurnError, Arc<MembershipTarget>)> {
-        let admission = (|| {
-            self.runtime.validate_registration(&target.registration)?;
-            if !startup.ready_for(&target.registration) {
-                return Err(ActorTurnError::InputNotReserved);
-            }
-            let snapshot = self.runtime.snapshot(target.registration.actor())?;
-            if snapshot.failed {
-                return Err(ActorTurnError::ActorFailed);
-            }
-            if !snapshot.external_open || snapshot.sealed {
-                return Err(ActorTurnError::Closed);
-            }
-            Ok(())
-        })();
-        match admission {
-            Ok(()) => self
-                .members
-                .insert(target)
-                .map_err(|target| (ActorTurnError::InvalidConfig, target)),
-            Err(error) => Err((error, target)),
-        }
     }
     pub(crate) fn metrics(&self, registry: &Registry) -> Result<FrontendRuntimeMetrics, String> {
         FrontendRuntimeMetrics::new(

@@ -2209,12 +2209,14 @@ async fn run_actor_send(
             )),
             startup: None,
             capacity: None,
+            membership: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("same host registration"));
     let mut terminal_owner = RegisteredAttemptTerminal::new(
         TerminalOutbox::new(activation),
         failure_bridge.bind(exit, processes.clone()),
+        None,
     );
     let advance_host = || {
         while let Some(turn) = actor_runtime.claim_host_actor() {

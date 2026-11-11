@@ -976,6 +976,7 @@ async fn publication_host_returns_original_result_and_typed_failure() {
             )),
             startup: None,
             capacity: None,
+            membership: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original publication host"));
@@ -1413,6 +1414,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
             )),
             startup: None,
             capacity: None,
+            membership: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("original QA host registration"));
@@ -1427,7 +1429,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         )),
     );
     let mut registered_terminal =
-        RegisteredAttemptTerminal::new(terminal.clone(), failure.bind(host_exit, processes));
+        RegisteredAttemptTerminal::new(terminal.clone(), failure.bind(host_exit, processes), None);
     let submit_pair = || {
         let commands = [inbox.submit_command(&parent), inbox.submit_command(&parent)];
         assert!(inbox.runtime.poll_one(Tick(1)).unwrap());
@@ -1892,6 +1894,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         )),
         startup: None,
         capacity: None,
+        membership: None,
         ordered_observations: None,
     })
     .unwrap_or_else(|_| panic!("same original host route"));
