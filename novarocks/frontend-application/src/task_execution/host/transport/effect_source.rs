@@ -39,6 +39,7 @@ use crate::{
         AbortIngressRetirement, AbortIngressRetirementProgress, AbortInputRetirement,
         AbortReceiptSlot, AbortSettlementOwner, DrainedAbortSubmissions,
     },
+    task_execution::host::RetirementScan,
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
     task_execution::host::failure_supervisor::{
@@ -144,8 +145,8 @@ pub(crate) struct AttemptTransportSource {
     abort_receipts: BTreeMap<(TaskOperationId, SendGeneration), Weak<AbortReceiptSlot>>,
     failed_sends: BTreeMap<AttemptActionId, Vec<(TaskOperationId, SendGeneration)>>,
     send_ready: VecDeque<AttemptActionId>,
-    send_scan: usize,
-    admission_scan: usize,
+    send_scan: RetirementScan,
+    admission_scan: RetirementScan,
     call_scan: usize,
     pending: Option<Prepaid>,
     failure: Option<FailureContext>,
@@ -153,7 +154,7 @@ pub(crate) struct AttemptTransportSource {
     abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
     abort_inputs: VecDeque<AbortInputRetirement>,
     abort_retirement: Option<AbortIngressRetirement>,
-    abort_scan: usize,
+    abort_scan: RetirementScan,
     in_flight: BTreeSet<AttemptActionId>,
     external_closed: bool,
     releases: Option<TransportReleases>,
@@ -203,15 +204,15 @@ impl AttemptTransportSource {
             abort_receipts: BTreeMap::new(),
             failed_sends: BTreeMap::new(),
             send_ready: VecDeque::with_capacity(capacity),
-            send_scan: 0,
-            admission_scan: 0,
+            send_scan: RetirementScan::default(),
+            admission_scan: RetirementScan::default(),
             call_scan: 0,
             pending: None,
             failure: Some(failure.0),
             abort_drain: failure.1.abort_drain.take(),
             abort_inputs: VecDeque::new(),
             abort_retirement: None,
-            abort_scan: 0,
+            abort_scan: RetirementScan::default(),
             supervisor: Some(Supervisor::Armed(failure.1)),
             in_flight: BTreeSet::new(),
             external_closed: false,
@@ -358,6 +359,7 @@ impl AttemptTransportSource {
                             Ok(drained) => {
                                 assert!(failed && self.abort_inputs.is_empty());
                                 self.abort_inputs = drained.retirements;
+                                self.abort_scan.request();
                                 if !drained.errors.is_empty() {
                                     self.other
                                         .retain_transport_failure(Box::new(drained.errors));
@@ -932,6 +934,7 @@ impl EffectSource for AttemptTransportSource {
                         let row = self.send_live.get_mut(&effect).unwrap();
                         assert!(row.result.replace(result).is_none());
                         self.send_ready.push_back(effect);
+                        self.send_scan.request();
                     } else {
                         let row = self.send_live.remove(&effect).unwrap();
                         assert!(row.result.is_none());
@@ -944,6 +947,7 @@ impl EffectSource for AttemptTransportSource {
                             }));
                     }
                 } else {
+                    self.admission_scan.request();
                     if let Err(refused) = self.admission.accept(result, &mut self.requests) {
                         self.other.retain_transport_failure(Box::new(refused));
                     }
@@ -953,6 +957,7 @@ impl EffectSource for AttemptTransportSource {
                 self.in_flight.remove(&effect);
                 if let Some(row) = self.send_live.get_mut(&effect) {
                     row.retired = true;
+                    self.send_scan.request();
                 } else if let Some(abort_keys) = self.failed_sends.remove(&effect) {
                     for key in abort_keys {
                         self.abort_receipts.remove(&key);
@@ -961,6 +966,7 @@ impl EffectSource for AttemptTransportSource {
                         .transport_event(effect, TransportSourceEvent::Retired);
                 } else {
                     assert!(self.admission.transport_retired(effect));
+                    self.admission_scan.request();
                 }
             }
             original => self.other.transport_event(effect, original),
@@ -1213,6 +1219,17 @@ impl EffectSource for AttemptTransportSource {
             .releases
             .as_ref()
             .is_none_or(TransportReleases::accepts_batch);
+        if turn.was_notified() || release_advanced {
+            self.abort_scan.request();
+            self.admission_scan.request();
+            self.send_scan.request();
+            if let Some(subscriptions) = &mut self.subscriptions {
+                subscriptions.request_retirement_scan();
+            }
+            if let Some(pumps) = &mut self.pumps {
+                pumps.request_retirement_scan();
+            }
+        }
         let subscription_progress = self.subscriptions.as_mut().map(|subscriptions| {
             let allowance = if release_accepting {
                 (budget - units).min(1)
@@ -1236,18 +1253,18 @@ impl EffectSource for AttemptTransportSource {
         let mut pump_more = false;
         let mut split_changed = false;
         let pumps_closing = closing || self.local_pumps_closing;
-        if let Some(pumps) = &mut self.pumps
-            && units < budget
-        {
+        if let Some(pumps) = &mut self.pumps {
             let releases = self
                 .releases
                 .as_mut()
                 .expect("original pump release executor");
             let split_first = self.split_next;
-            for is_split in [split_first, !split_first] {
+            for (index, is_split) in [split_first, !split_first].into_iter().enumerate() {
                 if units == budget {
                     self.split_next = is_split;
-                    pump_more |= !is_split || pumps.has_split_work();
+                    pump_more |= (index == 0 || is_split) && pumps.has_split_work();
+                    pump_more |= (index == 0 || !is_split)
+                        && pumps.needs_retirement_scan(failed || pumps_closing);
                     break;
                 }
                 if is_split {
@@ -1289,7 +1306,7 @@ impl EffectSource for AttemptTransportSource {
                     );
                     units += progress.units;
                     progressed |= progress.progressed;
-                    pump_more = progress.more;
+                    pump_more |= progress.more;
                 }
             }
             progressed |= split_changed;
@@ -1300,11 +1317,11 @@ impl EffectSource for AttemptTransportSource {
         } else {
             false
         };
-        if self.abort_scan == 0 {
-            self.abort_scan = self.abort_inputs.len();
-        }
-        if units < budget && self.abort_scan != 0 {
-            self.abort_scan -= 1;
+        if self
+            .abort_scan
+            .take_visits(self.abort_inputs.len(), (budget - units).min(1))
+            != 0
+        {
             units += 1;
             let mut original = self
                 .abort_inputs
@@ -1338,24 +1355,31 @@ impl EffectSource for AttemptTransportSource {
                 }
             }
         }
-        if self.admission_scan == 0 {
-            self.admission_scan = self.admission.awaiting_result_retirement();
-        }
-        if units < budget && self.admission_scan != 0 {
-            self.admission_scan -= 1;
+        if self.admission_scan.take_visits(
+            self.admission.awaiting_result_retirement(),
+            (budget - units).min(1),
+        ) != 0
+        {
             units += 1;
-            progressed |= self
+            let retired = self
                 .admission
                 .retire_result()
                 .expect("original admission result");
+            if retired {
+                self.admission_scan.request();
+                progressed = true;
+            }
         }
-        if self.send_scan == 0 {
-            self.send_scan = self.send_ready.len();
-        }
-        if units < budget && self.send_scan != 0 {
-            self.send_scan -= 1;
+        if self
+            .send_scan
+            .take_visits(self.send_ready.len(), (budget - units).min(1))
+            != 0
+        {
             units += 1;
-            progressed |= self.advance_send();
+            if self.advance_send() {
+                self.send_scan.request();
+                progressed = true;
+            }
         }
         if retire_failures
             && units < budget
@@ -1464,10 +1488,12 @@ impl EffectSource for AttemptTransportSource {
             || pump_more
             || split_changed
             || supervisor_advanced
-            || self.abort_scan != 0
+            || self.abort_scan.has_work(self.abort_inputs.len())
             || abort_retirement_more
-            || self.admission_scan != 0
-            || self.send_scan != 0
+            || self
+                .admission_scan
+                .has_work(self.admission.awaiting_result_retirement())
+            || self.send_scan.has_work(self.send_ready.len())
             || release_advanced
             || (budget == 0 || progressed)
                 && self

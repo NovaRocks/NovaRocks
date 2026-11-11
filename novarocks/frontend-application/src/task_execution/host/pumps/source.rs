@@ -31,6 +31,7 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::host::{
+        RetirementScan,
         custody::{
             ReturnedActorTransportResult, TransportRetirement, TransportSourceEvent,
             storage_layouts,
@@ -141,8 +142,7 @@ pub(crate) struct AttemptPumpSource {
     split_failure: Option<Arc<SplitFailureRecord>>,
     dynamic_failures: BTreeMap<HostFailureRef, TaskExecutionError>,
     scan: usize,
-    remaining: usize,
-    rescan: bool,
+    retirement_scan: RetirementScan,
     closing: bool,
 }
 
@@ -302,8 +302,7 @@ impl AttemptPumpSource {
             split_failure,
             dynamic_failures: BTreeMap::new(),
             scan: 0,
-            remaining: 0,
-            rescan: false,
+            retirement_scan: RetirementScan::default(),
             closing: false,
         })
     }
@@ -615,7 +614,7 @@ impl AttemptPumpSource {
         effect: AttemptActionId,
         event: TransportSourceEvent,
     ) -> Result<(), Original> {
-        self.rescan = true;
+        self.retirement_scan.request();
         let lane = self.lane(effect).expect("same original pump lane");
         let live = self.lanes[lane].live.as_mut().unwrap();
         match event {
@@ -690,7 +689,7 @@ impl AttemptPumpSource {
                         })
                 }))
         {
-            self.rescan = true;
+            self.retirement_scan.request();
             runtime
                 .notify_host_actor(&self.registration)
                 .expect("original pump wake");
@@ -822,6 +821,15 @@ impl AttemptPumpSource {
             .map_err(|error| Box::new(error) as Original)
     }
 
+    pub(crate) fn request_retirement_scan(&mut self) {
+        self.retirement_scan.request();
+    }
+
+    pub(crate) fn needs_retirement_scan(&self, closing: bool) -> bool {
+        !self.is_drained()
+            && (closing && !self.closing || self.retirement_scan.has_work(self.lanes.len() + 1))
+    }
+
     pub(crate) fn progress(
         &mut self,
         failed: bool,
@@ -833,7 +841,7 @@ impl AttemptPumpSource {
     ) -> SourceProgress {
         if !self.closing && (failed || closing) {
             self.closing = true;
-            self.rescan = true;
+            self.retirement_scan.request();
         }
         let mut units = 0;
         let mut progressed = false;
@@ -846,15 +854,10 @@ impl AttemptPumpSource {
             };
         }
         let visits = self.lanes.len() + 1;
-        if self.remaining == 0 {
-            self.remaining = visits;
-            self.rescan = false;
-        }
         let mut release = can_release;
-        while units < budget && self.remaining != 0 {
+        for _ in 0..self.retirement_scan.take_visits(visits, budget) {
             let lane = self.scan;
             self.scan = (self.scan + 1) % visits;
-            self.remaining -= 1;
             units += 1;
             if lane < self.lanes.len() {
                 progressed |= self
@@ -866,11 +869,13 @@ impl AttemptPumpSource {
                 progressed = true;
             }
         }
-        self.rescan |= progressed;
+        if progressed {
+            self.retirement_scan.request();
+        }
         SourceProgress {
             units,
             progressed,
-            more: self.remaining != 0 || self.rescan && !self.is_drained(),
+            more: self.retirement_scan.has_work(visits) && !self.is_drained(),
             retired: self.is_drained(),
         }
     }

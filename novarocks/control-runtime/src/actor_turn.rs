@@ -831,6 +831,7 @@ impl<A: Actor> Clone for ActorRuntime<A> {
 pub struct ActorHostTurn<A: Actor> {
     runtime: ActorRuntime<A>,
     node: Arc<ActorCell<A>>,
+    notified: bool,
     active: bool,
 }
 impl<A: Actor> std::fmt::Debug for ActorHostTurn<A> {
@@ -843,6 +844,11 @@ impl<A: Actor> std::fmt::Debug for ActorHostTurn<A> {
     }
 }
 impl<A: Actor> ActorHostTurn<A> {
+    /// An original notification can coincide with a scheduled continuation.
+    pub fn was_notified(&self) -> bool {
+        self.notified
+    }
+
     pub fn actor(&self) -> ActorId {
         self.node.id
     }
@@ -5604,7 +5610,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .expect("actual registered header owner");
             }
         }
-        let actor = state.effect_ready.claim()?;
+        let (actor, notified) = state.effect_ready.claim_with_notification()?;
         let node = state
             .actors
             .get(&actor)
@@ -5613,6 +5619,7 @@ impl<A: Actor> ActorRuntime<A> {
         Some(ActorHostTurn {
             runtime: self.clone(),
             node,
+            notified,
             active: true,
         })
     }

@@ -171,7 +171,7 @@ impl EffectSource for HostSource {
     fn progress_retirement(
         &mut self,
         _: &ActorRuntime<FrontendActor>,
-        _: &ActorHostTurn<FrontendActor>,
+        turn: &ActorHostTurn<FrontendActor>,
         _: Tick,
         budget: usize,
     ) -> SourceProgress {
@@ -182,6 +182,9 @@ impl EffectSource for HostSource {
                 .progress(&self.control)
                 .unwrap_or_else(|failure| std::panic::resume_unwind(Box::new(failure)));
         let accepts = self.releases.accepts_batch();
+        if turn.was_notified() || released {
+            self.subscriptions.request_retirement_scan();
+        }
         let allowance = if accepts {
             (budget - release_visit).min(1)
         } else {

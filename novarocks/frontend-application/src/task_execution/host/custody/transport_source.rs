@@ -25,7 +25,7 @@ use super::{
 use crate::{
     control_runtime::{actor::FrontendActor, transport_withdrawal::AttemptEffectEnvelope},
     native::apply_send_owner::RegistrationFailure,
-    task_execution::host::transport::SendReportReturn,
+    task_execution::host::{RetirementScan, transport::SendReportReturn},
 };
 use novarocks_control_runtime::actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime};
 use novarocks_coordination_contract::AttemptActionId;
@@ -78,14 +78,19 @@ struct Row {
     retirement: Box<TransportRetirement>,
 }
 
+enum RowStep {
+    Pending,
+    Scanning,
+    Advanced(Option<TransportSourceEvent>),
+}
+
 /// The Source preprices the number of resident rows with the attempt's
 /// original result-role inventory. A cursor inspection costs one host unit.
 /// The rows and their original Work stay here even on failed cleanup.
 pub(crate) struct TransportRetirements {
     rows: VecDeque<Row>,
     capacity: usize,
-    remaining: usize,
-    rescan: bool,
+    scan: RetirementScan,
     wake: Arc<HostWake>,
     waker: Waker,
     executor: Handle,
@@ -118,8 +123,7 @@ impl TransportRetirements {
         Self {
             rows: VecDeque::with_capacity(capacity),
             capacity,
-            remaining: 0,
-            rescan: false,
+            scan: RetirementScan::default(),
             wake,
             waker,
             executor,
@@ -185,73 +189,71 @@ impl TransportRetirements {
         mut receive: impl FnMut(AttemptActionId, TransportSourceEvent),
     ) -> TransportSourceProgress {
         assert!(turn.matches_registration(&self.wake.registration));
-        let woke = self.wake.marked.swap(false, Ordering::AcqRel);
-        if self.remaining == 0 {
-            self.remaining = self.rows.len();
-            self.rescan = false;
-        } else {
-            self.rescan |= woke;
+        if self.wake.marked.swap(false, Ordering::AcqRel) {
+            self.scan.request();
         }
         let mut progressed = false;
-        let units = self.remaining.min(budget);
+        let units = self.scan.take_visits(self.rows.len(), budget);
         let mut cx = Context::from_waker(&self.waker);
         for _ in 0..units {
             let mut row = self.rows.pop_front().expect("original scan inventory");
-            self.remaining -= 1;
-            let (changed, event) = row.advance(&self.executor, &mut cx);
-            let id = row.effect.protocol.id;
-            let retired = matches!(event, Some(TransportSourceEvent::Retired));
-            if !retired {
-                self.rows.push_back(row);
+            match row.advance(&self.executor, &mut cx) {
+                RowStep::Pending => self.rows.push_back(row),
+                RowStep::Scanning => {
+                    // Finish this row's bounded report pass before starting
+                    // another. Its remaining positions are a continuation.
+                    self.rows.push_front(row);
+                    self.scan.continue_visit();
+                }
+                RowStep::Advanced(event) => {
+                    let id = row.effect.protocol.id;
+                    if !matches!(event, Some(TransportSourceEvent::Retired)) {
+                        self.rows.push_back(row);
+                    }
+                    if let Some(event) = event {
+                        receive(id, event);
+                    }
+                    progressed = true;
+                }
             }
-            if let Some(event) = event {
-                receive(id, event);
-            }
-            progressed |= changed;
         }
-        self.rescan |= progressed;
+        if progressed {
+            self.scan.request();
+        }
         TransportSourceProgress {
             units,
             progressed,
-            more: self.remaining != 0 || self.rescan && !self.rows.is_empty(),
+            more: self.scan.has_work(self.rows.len()),
         }
     }
 }
 
 impl Row {
-    fn advance(
-        &mut self,
-        executor: &Handle,
-        cx: &mut Context<'_>,
-    ) -> (bool, Option<TransportSourceEvent>) {
+    fn advance(&mut self, executor: &Handle, cx: &mut Context<'_>) -> RowStep {
+        use RowStep::Advanced;
         use TransportSourceEvent as Event;
         match self.retirement.take_actor_result() {
             Ok(Some(result)) if Arc::ptr_eq(&result.effect, &self.effect) => {
-                return (true, Some(Event::Result(result)));
+                return Advanced(Some(Event::Result(result)));
             }
             Ok(Some(result)) | Err(result) => {
                 self.retirement.retain_unresolved();
-                return (true, Some(Event::RefusedResult(result)));
+                return Advanced(Some(Event::RefusedResult(result)));
             }
             Ok(None) => {}
         }
         if let Some(refused) = self.retirement.take_rejected_attachment() {
-            return (true, Some(Event::RejectedAttachment(refused)));
+            return Advanced(Some(Event::RejectedAttachment(refused)));
         }
         match self.retirement.poll_step(executor, cx) {
-            Poll::Pending => (false, None),
-            Poll::Ready(Ok(TransportRetirementStep::Scanned)) => {
-                // One internal report pass can need another bounded visit,
-                // even though this visit did not release an original.
-                cx.waker().wake_by_ref();
-                (false, None)
-            }
-            Poll::Ready(Ok(TransportRetirementStep::Advanced)) => (true, None),
+            Poll::Pending => RowStep::Pending,
+            Poll::Ready(Ok(TransportRetirementStep::Scanned)) => RowStep::Scanning,
+            Poll::Ready(Ok(TransportRetirementStep::Advanced)) => Advanced(None),
             Poll::Ready(Ok(TransportRetirementStep::Report(report))) => {
-                (true, Some(Event::Report(report)))
+                Advanced(Some(Event::Report(report)))
             }
-            Poll::Ready(Ok(TransportRetirementStep::Retired)) => (true, Some(Event::Retired)),
-            Poll::Ready(Err(error)) => (true, Some(Event::Failed(error))),
+            Poll::Ready(Ok(TransportRetirementStep::Retired)) => Advanced(Some(Event::Retired)),
+            Poll::Ready(Err(error)) => Advanced(Some(Event::Failed(error))),
         }
     }
 }

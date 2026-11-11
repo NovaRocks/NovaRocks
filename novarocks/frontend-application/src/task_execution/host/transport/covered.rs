@@ -31,6 +31,7 @@ use crate::{
     native::{data_runtime::FrontendDataRuntime, transport::Client},
     query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     task_execution::host::{
+        RetirementScan,
         custody::{ReturnedActorTransportResult, TransportSourceEvent},
         observations::{ObservationError, OrderedObservationInput, RootControlBinding, StreamKey},
         publication::OriginalHostFailure,
@@ -361,7 +362,7 @@ pub(crate) struct AttemptSubscriptions {
     active: BTreeMap<AttemptActionId, Active>,
     phase_roles: BTreeMap<StandingInputId, AttemptActionId>,
     active_order: VecDeque<AttemptActionId>,
-    active_remaining: usize,
+    active_scan: RetirementScan,
     close_order: VecDeque<ParticipationRef>,
     closing: bool,
     terminal_failures: BTreeMap<HostFailureRef, Arc<SubscriptionFailureRecord>>,
@@ -434,7 +435,7 @@ impl AttemptSubscriptions {
             active: BTreeMap::new(),
             phase_roles: BTreeMap::new(),
             active_order: VecDeque::new(),
-            active_remaining: 0,
+            active_scan: RetirementScan::default(),
             closing: false,
             terminal_failures: BTreeMap::new(),
         })
@@ -638,6 +639,7 @@ impl AttemptSubscriptions {
             self.active_order.reserve_exact(next - queued);
         }
         self.active_order.push_back(id);
+        self.active_scan.request();
         job
     }
 
@@ -666,6 +668,7 @@ impl AttemptSubscriptions {
             }
         }
         if advanced {
+            self.active_scan.request();
             self.runtime
                 .notify_host_actor(&self.registration)
                 .expect("original subscription host wake");
@@ -677,6 +680,7 @@ impl AttemptSubscriptions {
         effect: AttemptActionId,
         original: ReturnedActorTransportResult,
     ) -> Result<(), Box<dyn Any + Send>> {
+        self.active_scan.request();
         let row = self
             .active
             .get_mut(&effect)
@@ -708,6 +712,7 @@ impl AttemptSubscriptions {
     }
 
     pub(super) fn transport_retired(&mut self, effect: AttemptActionId) {
+        self.active_scan.request();
         let row = &self.active[&effect];
         self.calls
             .get_mut(&row.key.participation)
@@ -735,6 +740,10 @@ impl AttemptSubscriptions {
             .map(OriginalHostFailure::Subscription)
     }
 
+    pub(super) fn request_retirement_scan(&mut self) {
+        self.active_scan.request();
+    }
+
     pub(super) fn progress(
         &mut self,
         failed: bool,
@@ -743,7 +752,10 @@ impl AttemptSubscriptions {
         budget: usize,
         mut dispose: impl FnMut(ReleaseCapture),
     ) -> SourceProgress {
-        self.closing |= failed || closing;
+        if !self.closing && (failed || closing) {
+            self.closing = true;
+            self.active_scan.request();
+        }
         let mut units = 0;
         let mut progressed = false;
         if self.closing {
@@ -757,16 +769,14 @@ impl AttemptSubscriptions {
                 units += 1;
             }
         }
-        if self.active_remaining == 0 {
-            self.active_remaining = self.active_order.len();
-        }
-        let visits = self.active_remaining.min(budget - units);
+        let visits = self
+            .active_scan
+            .take_visits(self.active_order.len(), budget - units);
         for _ in 0..visits {
             let effect = self
                 .active_order
                 .pop_front()
                 .expect("original generation scan");
-            self.active_remaining -= 1;
             let (advanced, reaped) = self.advance_active(effect, failed, &mut dispose);
             progressed |= advanced;
             if !reaped {
@@ -812,10 +822,13 @@ impl AttemptSubscriptions {
                 units += 1;
             }
         }
+        if progressed {
+            self.active_scan.request();
+        }
         SourceProgress {
             units,
             progressed,
-            more: self.active_remaining != 0
+            more: self.active_scan.has_work(self.active_order.len())
                 || self.closing && !self.close_order.is_empty()
                 || progressed && !self.is_drained(),
             retired: self.is_drained(),
