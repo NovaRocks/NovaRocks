@@ -666,7 +666,7 @@ fn cancel_ctas(context: &mut ScenarioContext, observations: &SqlIntentOwner) -> 
             context
                 .handle()
                 .end_selected_query_lifecycle_fault(index, kind, &selected.token);
-        scopes_closed = combine(scopes_closed, close.map_err(Into::into));
+        scopes_closed = combine(scopes_closed, close);
     }
     let terminal = combine(outcome, scopes_closed).and_then(|()| {
         actor

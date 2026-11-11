@@ -547,7 +547,8 @@ enum AdmittedRead {
     Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
     RowMutationMatch {
         materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
-        original: novarocks_spi::connector::ConnectorTableMetadata,
+        original_identity: novarocks_spi::connector::ConnectorTableIdentity,
+        original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
         snapshot_id: Option<i64>,
     },
     PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
@@ -591,9 +592,11 @@ impl AdmittedRead {
 
         let (namespace, table) = match self {
             Self::PreparedSource(source) => return Ok(source.receipt.request().name().clone()),
-            Self::RowMutationMatch { original, .. } => (
-                original.identity.namespace.to_string(),
-                original.identity.table.to_string(),
+            Self::RowMutationMatch {
+                original_identity, ..
+            } => (
+                original_identity.namespace.to_string(),
+                original_identity.table.to_string(),
             ),
             Self::Relation(_) | Self::MvTarget { .. } => {
                 let identity = relation_identity(relation);
@@ -682,12 +685,13 @@ fn prepare_read_opening(
             {
                 return Err("mutation target scan differs from its signed selector".to_string().into());
             }
-            let original = binding.source_metadata.clone().ok_or_else(|| {
+            let original = binding.source_metadata.as_ref().ok_or_else(|| {
                 "mutation target scan lost its original table observation".to_string()
             })?;
             AdmittedRead::RowMutationMatch {
                 materialization: bindings.frozen_read_input(need.binding(), input)?,
-                original,
+                original_identity: original.identity.clone(),
+                original_source: original.source_read_facts().cloned(),
                 snapshot_id: *snapshot_id,
             }
         } else {
@@ -815,13 +819,13 @@ async fn prepare_observation(
     }
     let kind = if let AdmittedRead::RowMutationMatch {
         materialization,
-        original,
+        original_source,
         snapshot_id,
     } = &opening.admitted
     {
         K::RowMutationMatch {
             table: materialization.table.clone(),
-            original_source: original.source_read_facts().cloned().ok_or_else(|| {
+            original_source: original_source.clone().ok_or_else(|| {
                 "mutation target scan has no original provider access provenance".to_string()
             })?,
             snapshot_id: *snapshot_id,

@@ -278,11 +278,13 @@ fn mixed_actions(
         &table,
         &mixed_merge_sql(catalog, database, dop),
         &before,
-        dop,
-        5,
-        None,
-        dop_observation::Geometry::MixedSameFile,
-        "mixed MERGE U=2/I=3 across one old file",
+        dop_observation::MutationExpectation {
+            dop,
+            affected: 5,
+            reader_rows: None,
+            geometry: dop_observation::Geometry::MixedSameFile,
+            subject: "mixed MERGE U=2/I=3 across one old file",
+        },
     )?;
     assert_rows(
         control,
@@ -574,11 +576,13 @@ fn unmatched_inserts(
         &table,
         &unmatched_merge_sql(catalog, database, dop),
         &before,
-        dop,
-        386,
-        None,
-        dop_observation::Geometry::DataAndEmptyDelete,
-        "unmatched inserts retain duplicate SQL keys and omit FALSE/NULL actions",
+        dop_observation::MutationExpectation {
+            dop,
+            affected: 386,
+            reader_rows: None,
+            geometry: dop_observation::Geometry::DataAndEmptyDelete,
+            subject: "unmatched inserts retain duplicate SQL keys and omit FALSE/NULL actions",
+        },
     )?;
     let after = all_write_counters(context)?;
     // No target row matched. Nonzero finished-writer rows therefore identify

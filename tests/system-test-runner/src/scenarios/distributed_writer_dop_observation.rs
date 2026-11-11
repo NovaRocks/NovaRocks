@@ -55,6 +55,14 @@ impl Geometry {
     }
 }
 
+pub(in crate::scenarios::distributed_writer) struct MutationExpectation<'a> {
+    pub dop: i32,
+    pub affected: u64,
+    pub reader_rows: Option<u64>,
+    pub geometry: Geometry,
+    pub subject: &'a str,
+}
+
 pub(in crate::scenarios::distributed_writer) fn mutate_observed(
     context: &mut ScenarioContext,
     control: &mut SqlSession,
@@ -62,12 +70,15 @@ pub(in crate::scenarios::distributed_writer) fn mutate_observed(
     table: &str,
     sql: &str,
     before_writers: &[WriteCounters],
-    dop: i32,
-    affected: u64,
-    reader_rows: Option<u64>,
-    geometry: Geometry,
-    subject: &str,
+    expectation: MutationExpectation<'_>,
 ) -> Result<()> {
+    let MutationExpectation {
+        dop,
+        affected,
+        reader_rows,
+        geometry,
+        subject,
+    } = expectation;
     let before = snapshot_count(control, table)?;
     // The original collector sees one nominated statement at a time. Retain
     // the exact stdout prefix before arming this DELETE's reader observation.

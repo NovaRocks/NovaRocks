@@ -2495,11 +2495,13 @@ impl Scenario for DistributedWriterRowLevel {
             &dv,
             &row_level_contract::initial_delete_sql(true),
             &before,
-            row_level_contract::INITIAL_DELETE_DOP,
-            3,
-            None,
-            row_level_contract::dop_observation::Geometry::MultiFileDelete,
-            "first deletion-vector DELETE",
+            row_level_contract::dop_observation::MutationExpectation {
+                dop: row_level_contract::INITIAL_DELETE_DOP,
+                affected: 3,
+                reader_rows: None,
+                geometry: row_level_contract::dop_observation::Geometry::MultiFileDelete,
+                subject: "first deletion-vector DELETE",
+            },
         )?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
@@ -2579,11 +2581,13 @@ impl Scenario for DistributedWriterRowLevel {
             &positional,
             &row_level_contract::initial_delete_sql(false),
             &before,
-            row_level_contract::INITIAL_DELETE_DOP,
-            3,
-            None,
-            row_level_contract::dop_observation::Geometry::V2Delete,
-            "position-delete DELETE",
+            row_level_contract::dop_observation::MutationExpectation {
+                dop: row_level_contract::INITIAL_DELETE_DOP,
+                affected: 3,
+                reader_rows: None,
+                geometry: row_level_contract::dop_observation::Geometry::V2Delete,
+                subject: "position-delete DELETE",
+            },
         )?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         assert_committed_once(before_terminals, after_terminals, "position-delete DELETE")?;

@@ -175,11 +175,13 @@ pub(super) fn run(
         &table,
         &first_delete_sql(catalog, database, dop),
         &before_writers,
-        dop,
-        FIRST_DELETE_ROWS as u64,
-        Some(FIRST_DELETE_ROWS as u64),
-        super::dop_observation::Geometry::SameFileDelete,
-        "large delete from the one old file",
+        super::dop_observation::MutationExpectation {
+            dop,
+            affected: FIRST_DELETE_ROWS as u64,
+            reader_rows: Some(FIRST_DELETE_ROWS as u64),
+            geometry: super::dop_observation::Geometry::SameFileDelete,
+            subject: "large delete from the one old file",
+        },
     )?;
     assert_remaining(
         control,
