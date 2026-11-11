@@ -6038,6 +6038,170 @@ mod stage_demand_cut_tests {
     }
 
     #[test]
+    fn unsent_cancel_replay_preserves_the_original_unknown_send() {
+        use crate::{
+            effect::{EffectBody, QueuedInputPayload},
+            input::{
+                LocalDispatchResult, OperationObservation, OperationReplyResult, WithdrawalOutcome,
+            },
+        };
+        use novarocks_coordination_contract::AttemptActionId;
+        use novarocks_execution_contract::{OperationOutcome, operation::OperationResult};
+
+        let mut execution =
+            crate::test_support::execution_with_graph(crate::stage::demand::tests::graph());
+        let parent = identity(&execution, 1);
+        let producer = identity(&execution, 4);
+        apply(&mut execution, producer, 2, TaskState::Running);
+        apply(&mut execution, parent, 2, TaskState::Flushing);
+        drive(&mut execution);
+        let (operation, request) = execution.next_stage_cancel_admission(None).unwrap();
+        assert_eq!(request.identity(), producer);
+
+        let key = |n| NonZeroU64::new(n).unwrap();
+        let action = |n| AttemptActionId::new(key(n));
+        let first_send = action(2);
+        let replay_send = action(4);
+        let unresolved = |execution: &QueryTaskExecution| {
+            execution
+                .task(producer.task_id())
+                .unwrap()
+                .tracks_unknown_cancel(operation)
+        };
+        let emit = |execution: &mut QueryTaskExecution, admission, send, grant_key| {
+            let EffectBody::AdmitQueuedInput {
+                operation: OperationIntent::CancelTask(frozen),
+                generation,
+                payload: QueuedInputPayload::AlreadyRetained,
+                ..
+            } = admission
+            else {
+                panic!("expected the frozen Cancel admission");
+            };
+            assert_eq!(frozen.envelope(), request.envelope());
+            assert_eq!(frozen.identity(), request.identity());
+            assert_eq!(frozen.reason(), request.reason());
+            let grant = QueuedInputGrantRef::new(grant_key, generation);
+            assert!(matches!(
+                execution.observe_lifecycle_grant(operation, grant).unwrap(),
+                CreateGrantProgress::Queued
+            ));
+            let batch = execution.dispatcher.take_batch().unwrap();
+            assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+            execution.dispatcher.accept_emitted(&batch, send).unwrap();
+            grant
+        };
+
+        let admission = execution
+            .begin_stage_cancel_admission(request, action(1))
+            .unwrap()
+            .unwrap();
+        let first = emit(&mut execution, admission.body, first_send, key(10));
+        execution.observe_send_started(first_send);
+        let unknown = OperationObservation {
+            generation: first.generation(),
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CancelTask,
+                result: OperationReplyResult::Local {
+                    result: LocalDispatchResult::TransportUnknown,
+                    failure: None,
+                    protocol_failure: None,
+                    detail: None,
+                },
+            },
+        };
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        assert!(unresolved(&execution));
+
+        let replay = execution
+            .next_task_cancel_intent(producer)
+            .unwrap()
+            .unwrap();
+        let admission = execution
+            .begin_lifecycle_admission(replay, action(3))
+            .unwrap();
+        let second = emit(&mut execution, admission.body, replay_send, key(11));
+        assert!(second.generation() > first.generation());
+        // Stage Cancel keeps its control-progress lane during Stop. Its
+        // actual carrier can still prove that this send never started.
+        assert_eq!(
+            execution.next_stop_send_withdrawal(None),
+            Some((replay_send, false))
+        );
+
+        // Only the replay's own unused outcome can return its dispatch credit.
+        assert!(
+            execution
+                .begin_send_withdrawal_result(first_send, WithdrawalOutcome::DefinitelyUnsent)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(execution.dispatcher.in_flight_operations(), 1);
+        assert!(execution.dispatcher.tracks_input(operation, second));
+        let members = execution
+            .begin_send_withdrawal_result(replay_send, WithdrawalOutcome::DefinitelyUnsent)
+            .unwrap()
+            .unwrap();
+        let [member] = members.as_ref() else {
+            panic!("expected only the replay's original batch member");
+        };
+        assert_eq!(member.operation, operation);
+        assert_eq!(member.generation, second.generation());
+        assert!(matches!(
+            execution.settle_unsent_member(*member).unwrap(),
+            UnsentOwner::Local
+        ));
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        assert!(!execution.dispatcher.tracks_input(operation, second));
+        assert!(unresolved(&execution));
+
+        let accepted = OperationObservation {
+            generation: first.generation(),
+            reply: OperationAcknowledgement {
+                operation_id: operation,
+                kind: OperationKind::CancelTask,
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: None,
+                }),
+            },
+        };
+        // A verdict correlated to the withdrawn replay cannot resolve the
+        // original request. The first send's late verdict still can.
+        let wrong_generation = OperationObservation {
+            generation: second.generation(),
+            ..accepted.clone()
+        };
+        assert!(!execution.dispatched_reply_needs_observer(&wrong_generation));
+        assert!(matches!(
+            execution.apply_dispatched_reply(&wrong_generation),
+            (None, Ok(()))
+        ));
+        assert!(unresolved(&execution));
+
+        assert!(execution.dispatched_reply_needs_observer(&accepted));
+        assert!(matches!(
+            execution.apply_dispatched_reply(&accepted),
+            (None, Ok(()))
+        ));
+        assert!(!execution.dispatched_reply_needs_observer(&accepted));
+        assert!(!unresolved(&execution));
+        assert!(
+            execution
+                .next_task_cancel_intent(producer)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!execution.task_actual_stopped(producer));
+    }
+
+    #[test]
     fn stop_waits_for_the_original_stage_cancel_admission_result_before_releasing_its_debt() {
         use crate::effect::EffectBody;
         use novarocks_coordination_contract::AttemptActionId;

@@ -1143,6 +1143,307 @@ mod tests {
     }
 
     #[test]
+    fn failed_status_and_ready_root_control_use_their_common_source_order() {
+        use crate::{
+            AttemptCore,
+            effect::Publication,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::{AttemptToLogicalBody, SelectedTaskTermination};
+        use novarocks_execution_contract::{
+            SafeDetail, TaskFailure,
+            failure::{FailureClass, FailureFact, FailureReason},
+        };
+        use std::num::NonZeroU16;
+
+        for terminal_control in [false, true] {
+            for failure_first in [false, true] {
+                let start = start();
+                let now = start.initial_now;
+                let sources = start.sources;
+                let activation = start.activation.identity;
+                let mut core = Core::new(start).unwrap();
+                let root = core.execution.graph().root_identity();
+                let producer = core
+                    .execution
+                    .graph()
+                    .tasks()
+                    .find(|task| task.identity() != root)
+                    .unwrap()
+                    .identity();
+                let original = TerminationDetail::Failed(TaskFailure::new(
+                    FailureFact::new(
+                        FailureClass::Data,
+                        FailureReason::new(
+                            NonZeroU16::new(u16::MAX).unwrap(),
+                            NonZeroU16::new(1).unwrap(),
+                        ),
+                    ),
+                    SafeDetail::truncating("pending failure"),
+                ));
+                let expected_failure = SelectedTaskTermination::new(producer, original.clone());
+                let token = AttemptRequestToken::new(id(90));
+                let input_id = |n| AttemptInputId(id(n));
+                let handle = |core: &mut Core, source, n, observation_tail, input, budget| {
+                    core.handle(
+                        now,
+                        AttemptInputClaim {
+                            source,
+                            input: input_id(n),
+                            native_cut: Some(AttemptSourceCut {
+                                source: sources.native,
+                                tail: None,
+                            }),
+                            selected_cut: Some(AttemptSourceCut {
+                                source: sources.observation,
+                                tail: Some(input_id(observation_tail)),
+                            }),
+                        },
+                        input,
+                        &mut Units(budget),
+                    )
+                };
+                let mut next = 10;
+                let mut finish_prefix = |core: &mut Core, mut step: AttemptStep, tail| {
+                    let mut effects = Vec::new();
+                    for _ in 0..16 {
+                        let publication = step.effect.take().and_then(|effect| {
+                            let applied = match &effect.body {
+                                EffectBody::Publish(Publication::RootStatus(_)) => {
+                                    Some(PublicationApplied::RootStatus)
+                                }
+                                EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                                    Some(PublicationApplied::ProtocolBatch { published: true })
+                                }
+                                EffectBody::Port(port)
+                                    if matches!(
+                                        port.body,
+                                        AttemptToLogicalBody::SealResult { .. }
+                                    ) =>
+                                {
+                                    Some(PublicationApplied::SealResult)
+                                }
+                                EffectBody::Port(port)
+                                    if matches!(
+                                        port.body,
+                                        AttemptToLogicalBody::TerminalControlResult { .. }
+                                            | AttemptToLogicalBody::AttemptTerminal(_)
+                                    ) =>
+                                {
+                                    None
+                                }
+                                EffectBody::ReleaseCreationPayload { .. } => None,
+                                other => panic!(
+                                    "unexpected effect before the next common input: {other:?}"
+                                ),
+                            };
+                            effects.push(effect.body);
+                            applied.map(|applied| (effect.id, applied))
+                        });
+                        let (source, input) = match step.selection {
+                            InputSelection::Only(source) if source == sources.publication => {
+                                let (effect, applied) = publication.expect("selected publication");
+                                (
+                                    source,
+                                    AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                        effect,
+                                        result: Ok(applied),
+                                    }),
+                                )
+                            }
+                            InputSelection::Only(source) if source == sources.actor => {
+                                assert!(publication.is_none());
+                                (source, AttemptInput::Timer)
+                            }
+                            InputSelection::Only(source) if source == sources.observation => {
+                                assert!(publication.is_none());
+                                return effects;
+                            }
+                            InputSelection::Prefer(source) if source == sources.native => {
+                                assert!(publication.is_none());
+                                return effects;
+                            }
+                            selection => panic!("unexpected input selection: {selection:?}"),
+                        };
+                        step = handle(core, source, next, tail, input, 128).unwrap();
+                        next += 1;
+                    }
+                    panic!("the original prefix did not finish");
+                };
+                let observation = |frame| {
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(vec![frame]).unwrap(),
+                    ))
+                };
+                let control = || {
+                    let body = if terminal_control {
+                        LogicalToAttemptBody::TerminalControlDemand { token, root }
+                    } else {
+                        LogicalToAttemptBody::SealRequest { token }
+                    };
+                    AttemptInput::Port(LogicalToAttempt { activation, body })
+                };
+
+                let mut observed = |task: TaskIdentity, state, termination, sequence| {
+                    let participation = core
+                        .execution
+                        .graph()
+                        .task(task.task_id())
+                        .unwrap()
+                        .participation();
+                    core.subscriptions.activate(now, participation).unwrap();
+                    let SubscriptionStep::Effect(AttemptEffect {
+                        body: EffectBody::OpenSubscription(request),
+                        ..
+                    }) = core
+                        .subscriptions
+                        .advance(
+                            &core.execution,
+                            now,
+                            AttemptActionId::new(id(sequence)),
+                            AttemptRequestToken::new(id(sequence)),
+                            &mut Units(10),
+                        )
+                        .unwrap()
+                    else {
+                        panic!("expected the original subscription opening");
+                    };
+                    assert_eq!(request.participation, participation);
+                    ReceivedObservation {
+                        participation,
+                        generation: request.generation,
+                        received_at: now,
+                        opening: ObservationOpening {
+                            started_at: now,
+                            opened_at: Some(now),
+                        },
+                        event: ObservationEvent::Fact {
+                            source_revision: None,
+                            fact: ObservationFact::Status(
+                                TaskStatus::try_new(
+                                    task,
+                                    TaskStatusVersion::new(1).unwrap(),
+                                    state,
+                                    termination,
+                                    TaskOutputFacts::new(state == TaskState::Finished),
+                                )
+                                .unwrap(),
+                            ),
+                        },
+                    }
+                };
+                let finished = observed(root, TaskState::Finished, None, 51);
+                let failed = observed(producer, TaskState::Failed, Some(original), 52);
+                handle(&mut core, sources.actor, 1, 1, AttemptInput::Bootstrap, 128).unwrap();
+                let ready = handle(
+                    &mut core,
+                    sources.observation,
+                    1,
+                    1,
+                    observation(finished),
+                    128,
+                )
+                .unwrap();
+                finish_prefix(&mut core, ready, 1);
+                let (first, later) = if failure_first {
+                    (observation(failed.clone()), control())
+                } else {
+                    (control(), observation(failed.clone()))
+                };
+                let first_budget = if failure_first { 1 } else { 128 };
+                let prefix =
+                    handle(&mut core, sources.observation, 2, 3, first, first_budget).unwrap();
+                assert_eq!(prefix.selection, InputSelection::Only(sources.actor));
+                assert_eq!(core.execution.selected_task_failure(), None);
+                assert_eq!(
+                    prefix.root_control_processed,
+                    (!failure_first).then(|| input_id(2)),
+                );
+
+                // A later common input is already queued. It cannot be applied
+                // while the earlier frame or root-control cut still owns the turn.
+                assert!(handle(&mut core, sources.observation, 3, 3, later, 128).is_err());
+                let prefix = finish_prefix(&mut core, prefix, 3);
+                assert!(prefix.iter().any(|body| matches!(
+                    body,
+                    EffectBody::Publish(Publication::RootStatus(projection))
+                        if projection.status.identity() == root
+                            && projection.status.state() == TaskState::Finished
+                            && projection.failure == if failure_first {
+                                AttemptRootFailure::Authoritative(expected_failure.clone())
+                            } else {
+                                AttemptRootFailure::None
+                            }
+                )));
+
+                let control_effects = if failure_first {
+                    assert_eq!(
+                        core.execution.selected_task_failure(),
+                        Some(&expected_failure)
+                    );
+                    let accepted =
+                        handle(&mut core, sources.observation, 3, 3, control(), 128).unwrap();
+                    assert_eq!(accepted.root_control_processed, Some(input_id(3)));
+                    finish_prefix(&mut core, accepted, 3)
+                } else {
+                    assert_eq!(core.execution.selected_task_failure(), None);
+                    if terminal_control {
+                        assert_eq!(
+                            core.execution.result_terminal_control_recovery_deadline(),
+                            Some(now.saturating_add(Duration::from_secs(30))),
+                        );
+                    }
+                    handle(
+                        &mut core,
+                        sources.observation,
+                        3,
+                        3,
+                        observation(failed),
+                        128,
+                    )
+                    .unwrap();
+                    prefix
+                };
+                assert_eq!(
+                    core.execution.selected_task_failure(),
+                    Some(&expected_failure)
+                );
+
+                if terminal_control {
+                    assert!(core.execution.result_terminal_control_required());
+                    assert_eq!(
+                        core.execution.result_terminal_control_recovery_deadline(),
+                        None
+                    );
+                    assert!(control_effects.iter().any(|body| matches!(
+                        body,
+                        EffectBody::Port(port)
+                            if matches!(port.body, AttemptToLogicalBody::TerminalControlResult {
+                                token: reply, result: Ok(())
+                            } if reply == token)
+                    )));
+                } else {
+                    let expected = if failure_first {
+                        Err(AttemptFailure::TaskProtocol(Box::new(schedule(
+                            RootSealRefusal::AttemptCleanup.message(),
+                        ))))
+                    } else {
+                        Ok(std::sync::Arc::new([]) as _)
+                    };
+                    assert!(control_effects.iter().any(|body| matches!(
+                        body,
+                        EffectBody::Port(port)
+                            if matches!(&port.body, AttemptToLogicalBody::SealResult {
+                                token: reply, result
+                            } if *reply == token && result == &expected)
+                    )));
+                    assert_eq!(core.root.sealed(), !failure_first);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn actual_qa_replies_settle_all_original_debts_after_publication() {
         use crate::{
             effect::EffectClass,
