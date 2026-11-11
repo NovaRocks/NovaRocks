@@ -34,9 +34,9 @@ use novarocks_coordination_contract::{
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::{
     api::{
-        NativeActiveConvergenceClosure, NativeAttemptConvergence, NativeAttemptPreparationFailure,
-        NativeAttemptTerminal, NativeParticipationConvergence, PreReadyProcessReplacementWitness,
-        StatementNativeHealthFailure,
+        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
+        NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeParticipationConvergence,
+        PreReadyProcessReplacementWitness, StatementNativeHealthFailure,
     },
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
@@ -271,6 +271,26 @@ impl RegisteredAttemptTerminal {
             _ = self.failure.terminal() => false,
             _ = self.normal.normal_convergence() => true,
         }
+    }
+
+    /// Complete a submitted convergence through its original registered host.
+    /// A late Core loss transfers the same remote responsibility to the failure
+    /// bridge even if the normal protocol reports arrived first.
+    pub(crate) async fn finish_convergence(
+        &mut self,
+        request: NativeActiveConvergenceRequest,
+    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
+        let normal = self.normal_convergence_ready().await;
+        self.request_host_close().map_err(|error| {
+            StatementNativeHealthFailure::actual_exit_unproven(
+                "Native convergence could not close its original host",
+                Arc::new(error),
+            )
+        })?;
+        if normal && let Some(closure) = self.normal_closure_after_exit().await? {
+            return Ok(closure);
+        }
+        self.failure.converge(request).await
     }
 
     /// The application returns the original caller-held positions before

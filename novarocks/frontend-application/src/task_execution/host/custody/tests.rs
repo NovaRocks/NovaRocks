@@ -1353,7 +1353,8 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
 
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
-        NativeActiveConvergenceClosure, NativeAttemptConvergence, NativeParticipationConvergence,
+        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptConvergence,
+        NativeParticipationConvergence,
     };
 
     struct FrozenProcess {
@@ -1829,10 +1830,21 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     let bridge = qa.take_drained_owner().expect("original QA bridge retired");
     drop(qa);
     drop(bridge);
-    registered_terminal.request_host_close().unwrap();
-    drive_host();
+    use crate::query_execution::native_execution_adapter::source_cohort::tests as wc;
+    let (workload, driver, _capacity) = wc::fixture();
+    let query = workload
+        .try_begin_root(novarocks_workload_control::WorkRequest::new(
+            novarocks_workload_control::WorkClass::Query,
+        ))
+        .unwrap();
+    let request = NativeActiveConvergenceRequest::new(
+        query.owner.scope().cancellation().unwrap(),
+        std::time::Instant::now() + Duration::from_secs(1),
+    );
     {
-        let mut waiting = Box::pin(registered_terminal.normal_closure_after_exit());
+        let mut waiting = Box::pin(registered_terminal.finish_convergence(request.clone()));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drive_host();
         assert!(futures::poll!(waiting.as_mut()).is_pending());
     }
     parent.body_exited().unwrap();
@@ -1846,19 +1858,20 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     drive_host();
     let closure = tokio::time::timeout(
         Duration::from_secs(1),
-        registered_terminal.normal_closure_after_exit(),
+        registered_terminal.finish_convergence(request),
     )
     .await
     .unwrap()
     .unwrap();
     assert!(matches!(
         closure,
-        Some(NativeActiveConvergenceClosure::Evidence(
+        NativeActiveConvergenceClosure::Evidence(
             NativeAttemptConvergence::Participations(rows),
-        )) if rows.as_ref() == [NativeParticipationConvergence::never_established(participation)]
+        ) if rows.as_ref() == [NativeParticipationConvergence::never_established(participation)]
     ));
     registered_terminal.request_host_close().unwrap();
     assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
+    wc::finish(workload, query, driver);
     logical.abandon_running_attempt();
     tokio::time::timeout(Duration::from_secs(2), async {
         while logical
