@@ -19,18 +19,31 @@ use super::*;
 use crate::{
     AttemptCore,
     capacity::ReservationToken,
-    effect::{EffectClass, Publication},
-    execution::ack_phase::{admission_intent, dispatch_admission, queue_establish},
-    input::{AttemptInput, AttemptInputClaim, QueuedInputGrantRef, SendGeneration},
+    core::round_tail::RoundTailStep,
+    effect::{EffectClass, Publication, TaskDomainIntent},
+    execution::{
+        CreateGrantProgress, EdgeAdmissionProgress,
+        ack_phase::{admission_intent, dispatch_admission, queue_establish},
+    },
+    input::{
+        AckPayload, AttemptInput, AttemptInputClaim, OperationReply, OperationReplyResult,
+        QueuedInputGrantRef, SendGeneration,
+    },
 };
 use novarocks_coordination_contract::{
     AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
     AttemptToLogicalBody,
 };
 use novarocks_execution_contract::{
-    AdmissionTicketId, LeaseSequence, LeaseValidFor, OperationEnvelope, OperationOutcome,
-    ParticipationAdmissionTicketReceipt,
+    AdmissionTicketId, CreateTaskReceipt, DomainProgression, ExchangeDeliveryRequirement,
+    ExchangeEdgeId, LeaseReceipt, LeaseSequence, LeaseValidFor, OperationEnvelope,
+    OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
+    ParticipationState, SafeDetail, TaskDomainReceipt, TaskFailure, UpdateTaskReceipt,
+    failure::{FailureClass, FailureFact, FailureReason},
+    operation::OperationResult,
 };
+use novarocks_types::{TaskId, UniqueId};
+use std::num::NonZeroU16;
 
 struct DispatchTurn<'a> {
     budget: Units,
@@ -362,4 +375,610 @@ fn dispatch_continuation_preserves_original_effects_and_settlement_order() {
     assert!(yielded);
     assert!(!large_budget_yielded);
     assert_eq!(resumed, uninterrupted);
+}
+
+struct ExchangeTurn {
+    blocked_update: Option<BackendProcessId>,
+    refused: usize,
+}
+
+impl StepContext for ExchangeTurn {
+    fn charge(&mut self, _: usize) -> bool {
+        true
+    }
+
+    fn reserve_queue_stage(
+        &mut self,
+        lane: DispatchLane,
+        _: bool,
+        backend: BackendProcessId,
+        _: usize,
+        _: usize,
+    ) -> QueueStage {
+        if lane == DispatchLane::Update && self.blocked_update == Some(backend) {
+            self.refused += 1;
+            QueueStage::ProcessFull
+        } else {
+            QueueStage::Granted(ReservationToken(id(900)))
+        }
+    }
+}
+
+struct DrainTrace {
+    core: Core,
+    producer: TaskIdentity,
+    middle: [TaskIdentity; 2],
+    transport: ExchangeTurn,
+    next: u64,
+    replies: Vec<OperationObservation>,
+    openings: BTreeMap<ParticipationRef, NonZeroU64>,
+    closes: BTreeMap<TaskIdentity, usize>,
+}
+
+fn worker_accepted(
+    operation: &OperationIntent,
+    generation: SendGeneration,
+    payload: Option<AckPayload>,
+) -> OperationObservation {
+    OperationObservation {
+        generation,
+        reply: OperationReply {
+            operation_id: operation.operation_id(),
+            kind: operation.kind(),
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: payload,
+            }),
+        },
+    }
+}
+
+impl DrainTrace {
+    fn new() -> Self {
+        let mut start = start();
+        let graph = &mut start.plan.graph;
+        let root = graph.root;
+        let mut rows = graph.tasks.values();
+        let root_part = rows.next().unwrap().participation;
+        let middle = rows.next().unwrap().identity;
+        let leaf = rows.next().unwrap();
+        let producer = leaf.identity;
+        let producer_part = leaf.participation;
+        // Match the original three-stage chain. Root and leaf share a BE;
+        // the middle's two exact destinations live on distinct other BEs.
+        let root = TaskIdentity::new(
+            root.query_execution_id(),
+            root.stage_id(),
+            root.task_id(),
+            producer.backend_process_id(),
+        );
+        let sibling = TaskIdentity::new(
+            root.query_execution_id(),
+            middle.stage_id(),
+            TaskId::new(4).unwrap(),
+            root_part.backend_process_id(),
+        );
+        graph.root = root;
+        let root_task = graph.tasks.get_mut(&root.task_id()).unwrap();
+        root_task.identity = root;
+        root_task.participation = producer_part;
+        let mut sibling_task = graph.tasks[&middle.task_id()].clone();
+        sibling_task.identity = sibling;
+        sibling_task.participation = root_part;
+        sibling_task.task_key = UniqueId::new(4, 1);
+        sibling_task.creation.resource = PayloadRef(id(4));
+        graph.tasks.insert(sibling.task_id(), sibling_task);
+        graph.stages.insert(root.stage_id(), Box::from([root]));
+        graph
+            .stages
+            .insert(middle.stage_id(), Box::from([middle, sibling]));
+        let root_edge = graph
+            .edges
+            .get_mut(&ExchangeEdgeId::new(1).unwrap())
+            .unwrap();
+        root_edge.producers = Box::from([middle, sibling]);
+        root_edge.destinations = Box::from([root]);
+        let leaf_edge = graph
+            .edges
+            .get_mut(&ExchangeEdgeId::new(2).unwrap())
+            .unwrap();
+        leaf_edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+        leaf_edge.destinations = Box::from([middle, sibling]);
+
+        let core = Core::new(start).unwrap();
+        let mut trace = Self {
+            core,
+            producer,
+            middle: [middle, sibling],
+            transport: ExchangeTurn {
+                blocked_update: None,
+                refused: 0,
+            },
+            next: 100,
+            replies: Vec::new(),
+            openings: BTreeMap::new(),
+            closes: BTreeMap::new(),
+        };
+        trace.prepare_installed_tasks([root, middle, producer, sibling]);
+        trace.pump();
+        assert!(trace.closes.is_empty());
+        trace.transport.blocked_update = Some(producer.backend_process_id());
+        trace
+    }
+
+    fn action(&mut self) -> AttemptActionId {
+        self.next += 1;
+        AttemptActionId::new(id(self.next))
+    }
+
+    fn prepare_installed_tasks(&mut self, tasks: [TaskIdentity; 4]) {
+        let participants: Vec<ParticipationRef> = self
+            .core
+            .execution
+            .graph()
+            .participations()
+            .copied()
+            .collect();
+        for (index, participation) in participants.into_iter().enumerate() {
+            let execution = &mut self.core.execution;
+            let request = admission_intent(execution, participation);
+            let ticket = dispatch_admission(
+                execution,
+                request,
+                index as u64 + 1,
+                OperationOutcome::Accepted,
+            );
+            execution.apply_dispatched_reply(&ticket).1.unwrap();
+
+            let action = self.action();
+            let grant = QueuedInputGrantRef::new(id(self.next), SendGeneration::new(action));
+            let intent = queue_establish(&mut self.core.execution, participation, grant);
+            let OperationIntent::EstablishParticipation {
+                initial_lease_sequence,
+                initial_lease_valid_for,
+                ..
+            } = intent
+            else {
+                panic!("expected original Establish");
+            };
+            let send = self.action();
+            let execution = &mut self.core.execution;
+            let BatchDispatch::Ready(AttemptEffect {
+                body: EffectBody::SendBatch { batch, .. },
+                ..
+            }) = execution
+                .advance_send_batch(&mut self.core.dispatch, send, &mut self.transport, |_| {
+                    Ok(())
+                })
+                .unwrap()
+            else {
+                panic!("expected fixture Establish dispatch");
+            };
+            assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+            execution.observe_send_started(send);
+            execution
+                .establish_send_started(participation, intent.operation_id())
+                .unwrap();
+            let active = ParticipationReceipt::new(participation, ParticipationState::Active)
+                .with_lease(LeaseReceipt::new(
+                    initial_lease_sequence,
+                    initial_lease_valid_for,
+                    Duration::from_secs(9),
+                ));
+            execution
+                .apply_dispatched_reply(&worker_accepted(
+                    &intent,
+                    grant.generation(),
+                    Some(AckPayload::Participation(active)),
+                ))
+                .1
+                .unwrap();
+            let now = execution.monotonic_now();
+            self.core
+                .subscriptions
+                .activate(now, participation)
+                .unwrap();
+        }
+
+        for task in tasks {
+            let action = self.action();
+            let Some(AttemptEffect {
+                body:
+                    EffectBody::AdmitQueuedInput {
+                        operation,
+                        generation,
+                        ..
+                    },
+                ..
+            }) = self
+                .core
+                .execution
+                .begin_create_admission(task, action)
+                .unwrap()
+            else {
+                panic!("expected exact original Create admission for {task}");
+            };
+            let grant = QueuedInputGrantRef::new(id(self.next), generation);
+            assert!(matches!(
+                self.core
+                    .execution
+                    .observe_create_grant(operation.operation_id(), grant)
+                    .unwrap(),
+                CreateGrantProgress::Queued
+            ));
+        }
+        self.run_round(None);
+        assert_eq!(self.replies.len(), tasks.len());
+    }
+
+    fn begin_prefix(&mut self) {
+        let replies = std::mem::take(&mut self.replies);
+        let now = self.core.execution.monotonic_now();
+        let source = self.core.sources.native;
+        let first = self.next + 1;
+        self.next += replies.len() as u64;
+        let tail = (!replies.is_empty()).then(|| AttemptInputId(id(self.next)));
+        self.core
+            .begin_native_prefix(now, AttemptSourceCut { source, tail })
+            .unwrap();
+        for (offset, reply) in replies.into_iter().enumerate() {
+            let action = self
+                .core
+                .apply_native(
+                    now,
+                    source,
+                    AttemptInputId(id(first + offset as u64)),
+                    &ExecutorFact::Operation(reply),
+                    |_, _| panic!("there is no actor Abort in this trace"),
+                )
+                .unwrap();
+            assert!(action.is_none());
+        }
+    }
+
+    fn run_round(&mut self, observations: Option<ObservationBatch>) -> bool {
+        self.begin_prefix();
+        let now = self.core.execution.monotonic_now();
+        if let Some(observations) = observations {
+            assert!(
+                self.core
+                    .apply_observations(now, self.core.sources.observation, observations)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        self.core.begin_round_tail(true).unwrap();
+        for _ in 0..64 {
+            let action = self.action();
+            match self
+                .core
+                .advance_round_tail(
+                    now,
+                    action,
+                    AttemptRequestToken::new(id(self.next)),
+                    &mut self.transport,
+                )
+                .unwrap()
+            {
+                RoundTailStep::Complete(result) => {
+                    result.unwrap();
+                    return !self.replies.is_empty();
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    id,
+                    body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+                    ..
+                }) => {
+                    self.core.protocol_publication_applied(
+                        id,
+                        Ok(PublicationApplied::ProtocolBatch { published: true }),
+                    );
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    id,
+                    body: EffectBody::SendBatch { batch, .. },
+                    ..
+                }) => {
+                    self.core.execution.observe_send_started(id);
+                    for (operation, grant) in batch.operations.iter().zip(&batch.queued_inputs) {
+                        let payload = match operation {
+                            OperationIntent::CreateTask { identity, .. } => {
+                                Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                                    *identity,
+                                    Vec::new(),
+                                    TaskStatus::created(*identity).with_installed(),
+                                ))))
+                            }
+                            OperationIntent::UpdateTask {
+                                identity, domains, ..
+                            } => Some(self.update_receipt(*identity, domains)),
+                            OperationIntent::CancelTask(_) => None,
+                            _ => panic!("unexpected operation {operation:?}"),
+                        };
+                        self.replies
+                            .push(worker_accepted(operation, grant.generation(), payload));
+                    }
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    body: EffectBody::OpenSubscription(request),
+                    ..
+                }) => {
+                    assert_eq!(
+                        self.openings
+                            .insert(request.participation, request.generation),
+                        None
+                    );
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    body: EffectBody::AdjustReadWindow(request),
+                    ..
+                }) => {
+                    assert_eq!(self.openings[&request.participation], request.generation);
+                }
+                RoundTailStep::Effect(AttemptEffect {
+                    body:
+                        EffectBody::ReleaseCreationPayload { .. }
+                        | EffectBody::ReleaseQueuedInput { .. },
+                    ..
+                }) => {}
+                other => panic!("unexpected original round step {other:?}"),
+            }
+        }
+        panic!("exchange round did not settle");
+    }
+
+    fn update_receipt(
+        &mut self,
+        identity: TaskIdentity,
+        domains: &[TaskDomainIntent],
+    ) -> AckPayload {
+        let receipt = match domains {
+            [TaskDomainIntent::OpenExchangeEdges { version, edges }] => {
+                TaskDomainReceipt::OpenExchangeEdges {
+                    accepted_version: *version,
+                    opened: edges.clone(),
+                    progression: DomainProgression::Apply,
+                }
+            }
+            [
+                TaskDomainIntent::CloseExchangeDestination {
+                    version,
+                    edge,
+                    destination,
+                },
+            ] => {
+                if identity == self.producer {
+                    assert_eq!(*edge, ExchangeEdgeId::new(2).unwrap());
+                    *self.closes.entry(*destination).or_default() += 1;
+                }
+                TaskDomainReceipt::CloseExchangeDestination {
+                    accepted_version: *version,
+                    progression: DomainProgression::Apply,
+                }
+            }
+            _ => panic!("unexpected exchange input {domains:?}"),
+        };
+        AckPayload::Update(UpdateTaskReceipt::new(identity, vec![receipt]))
+    }
+
+    fn pump(&mut self) {
+        let tasks: Vec<_> = self
+            .core
+            .execution
+            .graph()
+            .tasks()
+            .map(|task| task.identity())
+            .collect();
+        for _ in 0..16 {
+            let mut progressed = self.run_round(None);
+            // Use the production edge input and task-update candidates after
+            // the tail, preserving the same cut before each dispatch.
+            let mut after = None;
+            while let Some(producer) = self.core.execution.edge_producer_after(after) {
+                let action = self.action();
+                match self
+                    .core
+                    .execution
+                    .advance_edge_admission(producer, action)
+                    .unwrap()
+                {
+                    EdgeAdmissionProgress::Admitting(effect) => {
+                        self.grant_update_or_cancel(effect);
+                        progressed = true;
+                        after = Some(producer);
+                    }
+                    EdgeAdmissionProgress::Discarded => progressed = true,
+                    EdgeAdmissionProgress::Blocked => after = Some(producer),
+                }
+            }
+            for &task in &tasks {
+                if let Some(cancel) = self.core.execution.next_task_cancel_intent(task).unwrap() {
+                    let action = self.action();
+                    let effect = self
+                        .core
+                        .execution
+                        .begin_lifecycle_admission(cancel, action)
+                        .unwrap();
+                    self.grant_update_or_cancel(effect);
+                    progressed = true;
+                }
+                let action = self.action();
+                let (queued, replay) = self
+                    .core
+                    .execution
+                    .advance_update_send(task, action)
+                    .unwrap();
+                assert!(replay.is_none());
+                progressed |= queued;
+            }
+            if !progressed {
+                return;
+            }
+        }
+        panic!("exchange dispatch did not become quiet");
+    }
+
+    fn grant_update_or_cancel(&mut self, effect: AttemptEffect) {
+        let EffectBody::AdmitQueuedInput {
+            operation,
+            generation,
+            ..
+        } = effect.body
+        else {
+            panic!("expected exact edge or cancel admission");
+        };
+        let grant = QueuedInputGrantRef::new(id(self.next), generation);
+        let result = self
+            .core
+            .execution
+            .observe_lifecycle_grant(operation.operation_id(), grant)
+            .unwrap();
+        assert!(matches!(
+            (operation, result),
+            (
+                OperationIntent::UpdateTask { .. },
+                CreateGrantProgress::Waiting
+            ) | (OperationIntent::CancelTask(_), CreateGrantProgress::Queued)
+        ));
+    }
+
+    fn authorize_close(&mut self) {
+        self.core
+            .execution
+            .stand_down_task_normally(self.middle[0])
+            .unwrap();
+    }
+}
+
+#[test]
+fn original_normal_drain_and_backpressure_permutations() {
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        AuthorizeClose,
+        QueueAvailable,
+        NormalDrain,
+        DuplicateAuthorization,
+    }
+
+    fn permutations(events: &mut [Event], position: usize, traces: &mut Vec<Vec<Event>>) {
+        if position == events.len() {
+            traces.push(events.to_vec());
+            return;
+        }
+        for next in position..events.len() {
+            events.swap(position, next);
+            permutations(events, position + 1, traces);
+            events.swap(position, next);
+        }
+    }
+
+    let mut traces = Vec::new();
+    permutations(
+        &mut [
+            Event::AuthorizeClose,
+            Event::QueueAvailable,
+            Event::NormalDrain,
+            Event::DuplicateAuthorization,
+        ],
+        0,
+        &mut traces,
+    );
+    let mut delivered = 0;
+    for events in &traces {
+        let mut trace = DrainTrace::new();
+        let mut available = false;
+        for event in events {
+            match event {
+                Event::AuthorizeClose | Event::DuplicateAuthorization => trace.authorize_close(),
+                Event::QueueAvailable => {
+                    available = true;
+                    trace.transport.blocked_update = None;
+                }
+                Event::NormalDrain => trace.core.execution.begin_normal_drain(),
+            }
+            trace.pump();
+            if !available {
+                assert!(trace.closes.is_empty(), "{events:?}");
+            }
+        }
+        assert_eq!(
+            trace.closes,
+            BTreeMap::from([(trace.middle[0], 1), (trace.middle[1], 1)]),
+            "{events:?}"
+        );
+        assert_eq!(
+            trace.transport.refused > 0,
+            !matches!(events[0], Event::QueueAvailable),
+            "{events:?}: a close preceding capacity must face real dispatch refusal"
+        );
+        delivered += trace.closes.values().sum::<usize>();
+    }
+    assert_eq!((traces.len(), delivered), (24, 48));
+
+    let failure = TerminationDetail::Failed(TaskFailure::new(
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(
+                NonZeroU16::new(u16::MAX).unwrap(),
+                NonZeroU16::new(1).unwrap(),
+            ),
+        ),
+        SafeDetail::truncating("exploration failure"),
+    ));
+    for close_first in [false, true] {
+        let mut trace = DrainTrace::new();
+        if close_first {
+            trace.authorize_close();
+        }
+        let identity = trace.middle[0];
+        let participation = trace
+            .core
+            .execution
+            .graph()
+            .task(identity.task_id())
+            .unwrap()
+            .participation();
+        // Observe Running, Failing and Failed in the actual subscription's
+        // first generation, preserving the Worker status order.
+        let now = trace.core.execution.monotonic_now();
+        let generation = trace.openings[&participation];
+        let mut observations = Vec::new();
+        for (version, state, termination) in [
+            (2, TaskState::Running, None),
+            (3, TaskState::Failing, Some(failure.clone())),
+            (4, TaskState::Failed, Some(failure.clone())),
+        ] {
+            let status = TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(version).unwrap(),
+                state,
+                termination,
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            observations.push(ReceivedObservation {
+                participation,
+                generation,
+                received_at: now,
+                opening: ObservationOpening {
+                    started_at: now,
+                    opened_at: Some(now),
+                },
+                event: ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Status(status),
+                },
+            });
+        }
+        trace.run_round(Some(ObservationBatch::new(observations).unwrap()));
+        if !close_first {
+            trace.authorize_close();
+        }
+        assert_eq!(
+            trace.core.execution.failure_cause(),
+            Some(&failure),
+            "close_first={close_first}"
+        );
+    }
 }
