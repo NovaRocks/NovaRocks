@@ -1302,7 +1302,8 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             .unwrap();
         owner.start().unwrap();
         let credits =
-            ObservationCredits::bind(budget, [participation], &owner, &mut positions).unwrap();
+            ObservationCredits::bind(budget, [participation], &owner, &mut positions, None)
+                .unwrap();
         let mut backing = positions.take_position(OwnedSlotKind::Capture).unwrap();
         backing.bind().unwrap();
         let binding = RootControlBinding::for_registered_source(

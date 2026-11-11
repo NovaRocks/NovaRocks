@@ -19,6 +19,7 @@
 //! accepted order is its actual FIFO fill order, including across mailbox
 //! classes. Rich storage/byte loans stay here until the runtime input retires.
 
+pub(crate) mod backing;
 pub(crate) mod credits;
 pub(crate) mod host_turn;
 pub(crate) mod read_progress;
@@ -32,6 +33,8 @@ use novarocks_attempt_protocol::{
         ReadStateSnapshot, ReceivedObservation, ReceptionCoverage,
     },
 };
+#[cfg(test)]
+use novarocks_control_runtime::obligation::OwnedPositionObligation;
 use novarocks_control_runtime::{
     actor::Actor,
     actor_turn::{
@@ -39,7 +42,6 @@ use novarocks_control_runtime::{
         StandingInputObligation,
     },
     causal_input::{CausalFillFailure, CausalInputObligation},
-    obligation::OwnedPositionObligation,
 };
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::{
@@ -144,8 +146,9 @@ impl RootControlRef {
 /// queued/deferred Entry storage, the batch (at most max_batch_items), and the
 /// old+new coexistence of logical -> AP -> actual Actor input projections. It
 /// must not infer byte funding from an OwnedPosition or enlarge any window.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ObservationMetadataLayout {
+    pub(crate) writer: Layout,
     pub(crate) entry: Layout,
     /// Upper bound for old and requested FIFO backing during a resize.
     pub(crate) queue_peak_bytes: usize,
@@ -163,12 +166,72 @@ pub(crate) struct ObservationMetadataLayout {
     pub(crate) total_positions: usize,
     pub(crate) max_batch_items: usize,
 }
+impl ObservationMetadataLayout {
+    fn for_actor<A: Actor>(budget: ObservationBudget) -> Result<Self, ObservationError> {
+        Ok(Self {
+            writer: backing::arc::<Inner<A>>()?,
+            entry: Layout::new::<Entry>(),
+            queue_peak_bytes: Layout::array::<Entry>(budget.total_positions)
+                .ok()
+                .and_then(|layout| layout.size().checked_mul(2))
+                .ok_or(ObservationError::Budget)?,
+            root_reference: Layout::new::<RootControlRef>(),
+            actor_input: Layout::new::<A::Input>(),
+            ap_projection: Layout::new::<AttemptInput>(),
+            logical_projection: Layout::new::<LogicalToAttempt<AttemptFailure>>(),
+            batch_item: Layout::new::<ReceivedObservation>(),
+            in_flight: Layout::new::<InFlight>(),
+            failed_fill: Layout::new::<FailedFill<A::Input>>(),
+            read_state: Layout::new::<ReadState>(),
+            read_confirmation: Layout::new::<ReadConfirmationFuture<'static, A>>(),
+            confirmation_waiter: Layout::new::<Notified<'static>>(),
+            read_progress: Layout::new::<ReadProgressSnapshot>(),
+            total_positions: budget.total_positions,
+            max_batch_items: ObservationBatch::MAX_ITEMS,
+        })
+    }
+
+    fn writer_bytes(&self) -> Result<usize, ObservationError> {
+        // The three batch arrays grow to at most the power-of-two batch cap.
+        // The frame array may also shrink into its final boxed slice.
+        let batch = backing::sum([
+            backing::array::<ReceivedObservation>(self.max_batch_items)?,
+            backing::array::<ObservationCredit>(self.max_batch_items)?,
+            backing::array::<StreamKey>(self.max_batch_items)?,
+        ])?
+        .checked_mul(2)
+        .ok_or(ObservationError::Budget)?;
+        backing::sum([
+            self.writer.size(),
+            self.queue_peak_bytes,
+            backing::tree::<StreamKey, ReadState>(self.total_positions)?,
+            backing::array::<StreamKey>(self.total_positions)?
+                .checked_mul(2)
+                .ok_or(ObservationError::Budget)?,
+            backing::arc::<()>()?
+                .size()
+                .checked_mul(self.total_positions)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or(ObservationError::Budget)?,
+            batch,
+            self.ap_projection.size(),
+            self.confirmation_waiter
+                .size()
+                .checked_mul(self.total_positions)
+                .ok_or(ObservationError::Budget)?,
+        ])
+    }
+}
 /// Checked by the original metadata author. This object retains its actual
 /// already-paid backing/claim, not a bool, layout, numeric id or lazy ref.
 /// Only retire_after_exit may positively consume it. Unconsumed Drop MUST keep
 /// the original backing unresolved/UNKNOWN; it must not manufacture exit.
 /// There is deliberately no default implementation or P10c-side constructor.
 pub(crate) trait ObservationMetadataObligation: Send {
+    fn backing_pin(&self) -> Option<backing::ObservationBackingPin> {
+        None
+    }
+
     fn retire_after_exit(self: Box<Self>) -> Result<(), MetadataRetirementRefusal>;
 }
 pub(crate) struct MetadataRetirementRefusal {
@@ -245,10 +308,12 @@ impl std::error::Error for ObservationError {}
 /// A real bound Input pool slot is lent to a read/queued/applying object. Its
 /// Drop returns that SAME obligation to the original Source pool; it never
 /// retires the Source's physical position. Only actual Source exit may do so.
+#[cfg(test)]
 pub(crate) struct InputSlotLoan {
     original: Option<OwnedPositionObligation>,
     refund: Option<Box<dyn FnOnce(OwnedPositionObligation) + Send>>,
 }
+#[cfg(test)]
 impl InputSlotLoan {
     pub(crate) fn from_source(
         original: OwnedPositionObligation,
@@ -264,6 +329,7 @@ impl InputSlotLoan {
         }
     }
 }
+#[cfg(test)]
 impl Drop for InputSlotLoan {
     fn drop(&mut self) {
         if let Some(original) = self.original.take() {
@@ -276,12 +342,19 @@ impl Drop for InputSlotLoan {
 /// An uncloneable claim in the SAME existing observation Source byte window.
 /// Actual holder Drop returns its bytes to the prepaid observation window.
 /// Refusal preserves the same live claim.
+#[cfg(test)]
 pub(crate) trait ObservationByteLoan: Send {
     fn reserved_bytes(&self) -> usize;
     fn shrink_to(&mut self, charged_bytes: usize) -> Result<(), ObservationError>;
 }
-/// Field order releases bytes before the pool slot becomes available again.
-pub(crate) struct ObservationCredit {
+pub(crate) enum ObservationCredit {
+    Original(credits::BoundCredit),
+    #[cfg(test)]
+    Fixture(TestObservationCredit),
+}
+
+#[cfg(test)]
+pub(crate) struct TestObservationCredit {
     bytes: Option<Box<dyn ObservationByteLoan>>,
     slot: Option<InputSlotLoan>,
     returned: Option<Box<dyn FnOnce() + Send>>,
@@ -290,17 +363,29 @@ impl ObservationCredit {
     /// returned is the original Source's metadata-only final return commit.
     /// Refund notifications/foreign calls belong to the prior byte/slot steps;
     /// they must not run after acknowledging the original claim.
+    #[cfg(test)]
     pub(crate) fn from_source(
         slot: InputSlotLoan,
         bytes: Box<dyn ObservationByteLoan>,
         returned: impl FnOnce() + Send + 'static,
     ) -> Self {
-        Self {
+        Self::Fixture(TestObservationCredit {
             bytes: Some(bytes),
             slot: Some(slot),
             returned: Some(Box::new(returned)),
+        })
+    }
+
+    fn charge(&mut self, actual: usize) -> Result<(), ObservationError> {
+        match self {
+            Self::Original(credit) => credit.shrink_to(actual),
+            #[cfg(test)]
+            Self::Fixture(credit) => credit.charge(actual),
         }
     }
+}
+#[cfg(test)]
+impl TestObservationCredit {
     fn charge(&mut self, actual: usize) -> Result<(), ObservationError> {
         let bytes = self
             .bytes
@@ -315,7 +400,8 @@ impl ObservationCredit {
         bytes.shrink_to(actual)
     }
 }
-impl Drop for ObservationCredit {
+#[cfg(test)]
+impl Drop for TestObservationCredit {
     fn drop(&mut self) {
         // This explicit sequence is the only positive return receipt. If either
         // actual destructor panics, returned is merely dropped, NEVER invoked;
@@ -673,6 +759,7 @@ struct State<I> {
     deferred_control: Option<Entry>,
     queued_frames: usize,
     writer_busy: bool,
+    retiring_batch: bool,
     writer_poisoned: bool,
     failure_tail: FailureTail,
     early: EarlyConsumption,
@@ -701,6 +788,15 @@ impl<I> State<I> {
         }
     }
 
+    fn take_finished_batch(&mut self) -> Option<InFlight> {
+        if !self.in_flight.as_ref().is_some_and(InFlight::finished) {
+            return None;
+        }
+        assert!(!self.retiring_batch);
+        self.retiring_batch = true;
+        self.in_flight.take()
+    }
+
     fn take_unsubmitted_tail(&mut self) -> UnsubmittedTail<I> {
         self.queued_frames = 0;
         UnsubmittedTail {
@@ -715,7 +811,7 @@ impl<I> State<I> {
         if self.writer_poisoned {
             return Err(ObservationError::FailedTailUnresolved);
         }
-        let mut ready = !self.writer_busy;
+        let mut ready = !self.writer_busy && !self.retiring_batch;
         for stream in self.streams.values().filter(|stream| stream.polling) {
             if stream.publisher_exit != PublisherExit::Live {
                 return Err(ObservationError::FailedTailUnresolved);
@@ -740,6 +836,7 @@ impl<I> State<I> {
 
 struct Inner<A: Actor> {
     state: Mutex<State<A::Input>>,
+    closing: Mutex<()>,
     observations: Mutex<StandingInputObligation<A>>,
     controls: Mutex<StandingInputObligation<A>>,
     source: Arc<dyn ObservationSourcePool>,
@@ -765,17 +862,47 @@ pub(crate) struct OpeningPoll<T> {
     pub(crate) opened_at: Option<MonotonicInstant>,
     pub(crate) result: Poll<Result<T, (ReceivedFrameReceipt, ObservationFailure)>>,
 }
-pub(crate) struct OrderedObservationInput<A: Actor>(Arc<Inner<A>>);
+// Drop the actual Arc (including any backing reachable only through it) before
+// returning this alias's independent pin. Weak aliases keep the Arc header.
+pub(crate) struct OrderedObservationInput<A: Actor>(
+    Arc<Inner<A>>,
+    Option<backing::ObservationBackingPin>,
+);
 impl<A: Actor> Clone for OrderedObservationInput<A> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
     }
 }
-pub(crate) struct WeakOrderedObservationInput<A: Actor>(Weak<Inner<A>>);
+pub(crate) struct WeakOrderedObservationInput<A: Actor>(
+    Weak<Inner<A>>,
+    Option<backing::ObservationBackingPin>,
+);
 
 impl<A: Actor> WeakOrderedObservationInput<A> {
     pub(crate) fn upgrade(&self) -> Option<OrderedObservationInput<A>> {
-        self.0.upgrade().map(OrderedObservationInput)
+        self.0
+            .upgrade()
+            .map(|inner| OrderedObservationInput(inner, self.1.clone()))
+    }
+}
+
+struct ObservationWriterGuard<'a, A: Actor> {
+    ingress: &'a OrderedObservationInput<A>,
+    armed: bool,
+}
+impl<A: Actor> Drop for ObservationWriterGuard<'_, A> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut state) = self.ingress.0.state.lock() {
+                state.closed = true;
+                state.writer_poisoned = true;
+            }
+            // A second panic from a foreign waker cannot replace
+            // the writer's original unwind and unresolved custody.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.ingress.0.changed.notify_waiters();
+            }));
+        }
     }
 }
 
@@ -813,60 +940,47 @@ impl<A: Actor> OrderedObservationInput<A> {
             {
                 return Err(ObservationError::Busy);
             }
-            source.retain_metadata(ObservationMetadataLayout {
-                entry: Layout::new::<Entry>(),
-                queue_peak_bytes: Layout::array::<Entry>(budget.total_positions)
-                    .ok()
-                    .and_then(|layout| layout.size().checked_mul(2))
-                    .ok_or(ObservationError::Budget)?,
-                root_reference: Layout::new::<RootControlRef>(),
-                actor_input: Layout::new::<A::Input>(),
-                ap_projection: Layout::new::<AttemptInput>(),
-                logical_projection: Layout::new::<LogicalToAttempt<AttemptFailure>>(),
-                batch_item: Layout::new::<ReceivedObservation>(),
-                in_flight: Layout::new::<InFlight>(),
-                failed_fill: Layout::new::<FailedFill<A::Input>>(),
-                read_state: Layout::new::<ReadState>(),
-                read_confirmation: Layout::new::<ReadConfirmationFuture<'static, A>>(),
-                confirmation_waiter: Layout::new::<Notified<'static>>(),
-                read_progress: Layout::new::<ReadProgressSnapshot>(),
-                total_positions: budget.total_positions,
-                max_batch_items: ObservationBatch::MAX_ITEMS,
-            })
+            source.retain_metadata(ObservationMetadataLayout::for_actor::<A>(budget)?)
         })();
         let metadata = match prepared {
             Ok(metadata) => metadata,
             Err(error) => return Err((error, observations, controls)),
         };
-        Ok(Self(Arc::new(Inner {
-            state: Mutex::new(State {
-                streams: BTreeMap::new(),
-                queue: VecDeque::new(),
-                deferred_control: None,
-                queued_frames: 0,
-                writer_busy: false,
-                writer_poisoned: false,
-                failure_tail: FailureTail::Normal,
-                early: EarlyConsumption::default(),
-                in_flight: None,
-                failed: None,
-                failed_control: None,
-                observations_closed: false,
-                controls_closed: false,
-                metadata_retired: false,
-                closed: false,
+        let pin = metadata.backing_pin();
+        Ok(Self(
+            Arc::new(Inner {
+                state: Mutex::new(State {
+                    streams: BTreeMap::new(),
+                    queue: VecDeque::new(),
+                    deferred_control: None,
+                    queued_frames: 0,
+                    writer_busy: false,
+                    retiring_batch: false,
+                    writer_poisoned: false,
+                    failure_tail: FailureTail::Normal,
+                    early: EarlyConsumption::default(),
+                    in_flight: None,
+                    failed: None,
+                    failed_control: None,
+                    observations_closed: false,
+                    controls_closed: false,
+                    metadata_retired: false,
+                    closed: false,
+                }),
+                closing: Mutex::new(()),
+                observations: Mutex::new(observations),
+                controls: Mutex::new(controls),
+                source,
+                root_binding,
+                metadata: Mutex::new(Some(metadata)),
+                budget,
+                clock,
+                project,
+                changed: Notify::new(),
+                progress,
             }),
-            observations: Mutex::new(observations),
-            controls: Mutex::new(controls),
-            source,
-            root_binding,
-            metadata: Mutex::new(Some(metadata)),
-            budget,
-            clock,
-            project,
-            changed: Notify::new(),
-            progress,
-        })))
+            pin,
+        ))
     }
     pub(crate) fn standing_ids(
         &self,
@@ -1449,7 +1563,7 @@ impl<A: Actor> OrderedObservationInput<A> {
         self.drive()
     }
     pub(crate) fn weak(&self) -> WeakOrderedObservationInput<A> {
-        WeakOrderedObservationInput(Arc::downgrade(&self.0))
+        WeakOrderedObservationInput(Arc::downgrade(&self.0), self.1.clone())
     }
 
     pub(crate) fn root_binding(&self) -> &RootControlBinding {
@@ -1599,15 +1713,12 @@ impl<A: Actor> OrderedObservationInput<A> {
         self.release_if_finished()
     }
     fn release_if_finished(&self) -> Result<(), ObservationError> {
-        let done = {
-            let mut state = self.0.state.lock().expect("ordered observation state");
-            if state.in_flight.as_ref().is_some_and(InFlight::finished) {
-                let done = state.in_flight.take().expect("finished original input");
-                Some(done)
-            } else {
-                None
-            }
-        };
+        let done = self
+            .0
+            .state
+            .lock()
+            .expect("ordered observation state")
+            .take_finished_batch();
         if let Some(done) = done {
             self.return_credits(done);
         }
@@ -1621,8 +1732,20 @@ impl<A: Actor> OrderedObservationInput<A> {
         } = done;
         // No guard decrements these counts on unwind. If payload/refund Drop
         // panics, the original generation remains retained and UNKNOWN.
+        let mut guard = ObservationWriterGuard {
+            ingress: self,
+            armed: true,
+        };
         drop(_credits);
         self.retention_returned(&streams);
+        drop(streams);
+        self.0
+            .state
+            .lock()
+            .expect("ordered observation state")
+            .retiring_batch = false;
+        guard.armed = false;
+        self.0.changed.notify_waiters();
     }
     fn retention_returned(&self, streams: &[StreamKey]) {
         let mut state = self.0.state.lock().expect("ordered observation state");
@@ -1635,27 +1758,8 @@ impl<A: Actor> OrderedObservationInput<A> {
         }
     }
     pub(crate) fn drive(&self) -> Result<(), ObservationError> {
-        struct WriterGuard<'a, A: Actor> {
-            ingress: &'a OrderedObservationInput<A>,
-            armed: bool,
-        }
-        impl<A: Actor> Drop for WriterGuard<'_, A> {
-            fn drop(&mut self) {
-                if self.armed {
-                    if let Ok(mut state) = self.ingress.0.state.lock() {
-                        state.closed = true;
-                        state.writer_poisoned = true;
-                    }
-                    // A second panic from a foreign waker cannot replace
-                    // the writer's original unwind and unresolved custody.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.ingress.0.changed.notify_waiters();
-                    }));
-                }
-            }
-        }
         loop {
-            let mut guard = WriterGuard {
+            let mut guard = ObservationWriterGuard {
                 ingress: self,
                 armed: false,
             };
@@ -1663,6 +1767,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                 let mut state = self.0.state.lock().expect("ordered observation state");
                 if state.closed
                     || state.writer_busy
+                    || state.retiring_batch
                     || state.in_flight.is_some()
                     || state.queue.is_empty()
                     || matches!(
@@ -1827,18 +1932,12 @@ impl<A: Actor> OrderedObservationInput<A> {
             if let Some(error) = error {
                 return Err(ObservationError::Runtime(error));
             }
-            let done = {
-                let mut state = self.0.state.lock().expect("ordered observation state");
-                if state.in_flight.as_ref().is_some_and(InFlight::finished) {
-                    let done = state
-                        .in_flight
-                        .take()
-                        .expect("finished early original input");
-                    Some(done)
-                } else {
-                    None
-                }
-            };
+            let done = self
+                .0
+                .state
+                .lock()
+                .expect("ordered observation state")
+                .take_finished_batch();
             let more = done.is_some();
             if let Some(done) = done {
                 self.return_credits(done);
@@ -1938,11 +2037,18 @@ impl<A: Actor> OrderedObservationInput<A> {
     /// Call only after original stream/bridge holders actually exited and all
     /// in-flight inputs retired. Refusal preserves every original loan/standing.
     pub(crate) fn close_after_exit(&self) -> Result<(), ObservationError> {
+        // A synchronous wake from a returned position may reenter close.
+        // Keep a single owner of the temporary retirement backing.
+        let _close = self.0.closing.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ObservationError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ObservationError::FailedTailUnresolved,
+        })?;
         self.0.source.close_root_controls()?;
         let tail = {
             let mut state = self.0.state.lock().expect("ordered observation state");
             state.closed = true;
             if state.writer_busy
+                || state.retiring_batch
                 || state.in_flight.is_some()
                 || state.streams.values().any(|s| s.polling)
                 || matches!(

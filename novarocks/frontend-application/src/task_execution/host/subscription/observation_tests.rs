@@ -1133,18 +1133,24 @@ fn refund_reentry_cannot_reap_a_generation_before_all_original_loans_return() {
     let f = Fixture::new(8, 4);
     f.frame(1);
     f.input.job_closed(f.key).unwrap();
+    f.input.root_control(f.bank.seal()).unwrap();
     let ingress = f.input.clone();
     let key = f.key;
     *f.bank.on_return.lock().unwrap() = Some(Box::new(move || {
         // The byte claim has refunded, but the original InputSlotLoan has not
         // returned yet. Even a synchronous refund wake cannot reap this Source.
         assert_eq!(ingress.retire_stream(key), Err(ObservationError::Busy));
+        ingress.drive().unwrap();
+        let state = ingress.0.state.lock().unwrap();
+        assert!(state.in_flight.is_none());
+        assert_eq!(state.queue.len(), 1);
     }));
     f.consume(false);
     assert_eq!(
         f.input.0.state.lock().unwrap().streams[&f.key].accepted_unretired,
         0
     );
+    f.consume(true);
     f.finish();
 }
 #[test]

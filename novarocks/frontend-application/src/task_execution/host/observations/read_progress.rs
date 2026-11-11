@@ -17,7 +17,7 @@
 
 //! A prepaid Ordinary input role for one frozen participation.
 
-use super::ObservationError;
+use super::{ObservationError, backing};
 use crate::control_runtime::actor::{FrontendActor, FrontendInput};
 use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact, ReadProgressSnapshot};
 use novarocks_control_runtime::{
@@ -52,6 +52,7 @@ pub(crate) struct ReadProgressInput {
     registration: ActorRegistration,
     participation: ParticipationRef,
     role: CoalescingInput<FrontendActor, ReadProgressUpdate>,
+    backing: Option<backing::ObservationBackingPin>,
 }
 
 impl ReadProgressInput {
@@ -75,7 +76,22 @@ impl ReadProgressInput {
                     ExecutorFact::ReadProgress(update.0.expect("actual read resume fact")),
                 )))
             }),
+            backing: None,
         }
+    }
+
+    pub(crate) fn with_backing(mut self, backing: Option<backing::ObservationBackingPin>) -> Self {
+        self.backing = backing;
+        self
+    }
+
+    pub(super) fn backing_bytes(participants: usize) -> Result<usize, ObservationError> {
+        let layout = CoalescingInput::<FrontendActor, ReadProgressUpdate>::backing_payload_layout();
+        let role = novarocks_type_contract::owned_resources::layout::arc_layout(layout)
+            .map_err(|_| ObservationError::Budget)?;
+        backing::sum([role.size(), std::mem::size_of::<AttemptInput>()])?
+            .checked_mul(participants)
+            .ok_or(ObservationError::Budget)
     }
 
     pub(super) fn standing_id(&self) -> StandingInputId {

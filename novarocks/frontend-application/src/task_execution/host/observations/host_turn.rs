@@ -17,7 +17,7 @@
 
 //! The original FE host indexes and retires the ordered writer's occurrence.
 
-use super::{ObservationError, OrderedObservationInput, read_progress::ReadProgressInput};
+use super::{ObservationError, OrderedObservationInput, backing, read_progress::ReadProgressInput};
 use crate::control_runtime::actor::FrontendActor;
 use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorRuntime, ActorTurnError, StandingInputId,
@@ -26,20 +26,20 @@ use novarocks_control_runtime_core::identity::InputId;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(crate) struct OrderedObservationHost {
-    ingress: OrderedObservationInput<FrontendActor>,
     registration: ActorRegistration,
     roles: [StandingInputId; 2],
     indexed: Option<IndexedObservation>,
     progress_roles: BTreeMap<StandingInputId, ReadProgressInput>,
     indexed_progress: VecDeque<(StandingInputId, InputId)>,
+    ingress: OrderedObservationInput<FrontendActor>,
 }
 
 /// Moves actual failed observation payloads into the existing credentialed
 /// supervisor without carrying any authority to publish or settle Core facts.
 pub(crate) struct OrderedObservationFailure {
-    ingress: OrderedObservationInput<FrontendActor>,
     roles: BTreeSet<StandingInputId>,
     progress: Vec<ReadProgressInput>,
+    ingress: OrderedObservationInput<FrontendActor>,
 }
 
 impl OrderedObservationFailure {
@@ -69,6 +69,18 @@ struct IndexedObservation {
 }
 
 impl OrderedObservationHost {
+    pub(super) fn backing_bytes(participants: usize) -> Result<usize, ObservationError> {
+        let failed_roles = participants
+            .checked_add(2)
+            .ok_or(ObservationError::Budget)?;
+        backing::sum([
+            backing::tree::<StandingInputId, ReadProgressInput>(participants)?,
+            backing::array::<(StandingInputId, InputId)>(participants)?,
+            backing::tree::<StandingInputId, ()>(failed_roles)?,
+            backing::array::<ReadProgressInput>(participants)?,
+        ])
+    }
+
     pub(crate) fn new(ingress: OrderedObservationInput<FrontendActor>) -> Self {
         let registration = ingress.0.root_binding.registration().clone();
         let roles = ingress.standing_ids();
@@ -229,14 +241,18 @@ impl OrderedObservationHost {
         // committed index cannot account for payloads disposed off-poller.
         self.indexed = None;
         self.indexed_progress.clear();
+        let mut roles = BTreeSet::new();
+        for role in self
+            .roles
+            .into_iter()
+            .chain(self.progress_roles.keys().copied())
+        {
+            roles.insert(role);
+        }
         OrderedObservationFailure {
-            ingress: self.ingress.clone(),
+            roles,
             progress: self.progress_roles.values().cloned().collect(),
-            roles: self
-                .roles
-                .into_iter()
-                .chain(self.progress_roles.keys().copied())
-                .collect(),
+            ingress: self.ingress.clone(),
         }
     }
 

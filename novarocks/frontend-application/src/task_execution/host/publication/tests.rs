@@ -450,7 +450,8 @@ async fn original_root_request_uses_ordered_control_author_and_shared_reply_cell
         root.backend_process_id(),
     );
     let credits =
-        ObservationCredits::bind(budget, [participant], &observations, &mut positions).unwrap();
+        ObservationCredits::bind(budget, [participant], &observations, &mut positions, None)
+            .unwrap();
     let mut capture = positions.take_position(OwnedSlotKind::Capture).unwrap();
     capture.bind().unwrap();
     let reserve = |class, work| {

@@ -18,8 +18,7 @@
 //! The observation Source's original input positions and frame byte window.
 
 use super::{
-    InputSlotLoan, ObservationBudget, ObservationByteLoan, ObservationCredit, ObservationError,
-    StreamKey,
+    ObservationBudget, ObservationCredit, ObservationError, StreamKey, backing,
     read_progress::{ReadProgressInput, ReadProgressReceipt},
 };
 use novarocks_attempt_protocol::input::ReadProgressSnapshot;
@@ -126,6 +125,7 @@ enum Claim {
 pub(crate) struct ObservationCredits {
     budget: ObservationBudget,
     state: Mutex<Credits>,
+    backing: Option<backing::ObservationBackingPin>,
 }
 
 impl ObservationCredits {
@@ -136,6 +136,7 @@ impl ObservationCredits {
         participants: impl IntoIterator<Item = ParticipationRef>,
         work: &WorkObligation,
         reservation: &mut ReservationObligation,
+        backing: Option<backing::ObservationBackingPin>,
     ) -> Result<Arc<Self>, ObservationError> {
         budget.validate()?;
         if !reservation.belongs_to_bound_work(work.scope(), work.id()) {
@@ -165,7 +166,10 @@ impl ObservationCredits {
                 }
             }
         }
-        let participants = participants.into_iter().collect();
+        let mut roster = BTreeSet::new();
+        for participation in participants {
+            roster.insert(participation);
+        }
         for position in &mut positions {
             position.bind().expect("new original observation position");
         }
@@ -173,7 +177,7 @@ impl ObservationCredits {
         Ok(Arc::new(Self {
             budget,
             state: Mutex::new(Credits {
-                participants,
+                participants: roster,
                 data: positions,
                 control,
                 window: Some(window),
@@ -183,6 +187,7 @@ impl ObservationCredits {
                 closed: false,
                 retiring: false,
             }),
+            backing,
         }))
     }
 
@@ -355,29 +360,25 @@ impl ObservationCredits {
         claim: Claim,
         reserved: usize,
     ) -> ObservationCredit {
-        let slot_owner = self.clone();
-        let claim_owner = self.clone();
-        ObservationCredit::from_source(
-            InputSlotLoan::from_source(position, move |position| {
-                let mut state = slot_owner.state.lock().expect("observation credit owner");
-                match claim {
-                    Claim::Read(_) => {
-                        state.data.push(position);
-                        drop(state);
-                        slot_owner.wake_readers();
-                    }
-                    Claim::Control => {
-                        assert!(state.control.replace(position).is_none());
-                    }
-                }
-            }),
-            Box::new(Bytes {
-                original: self.clone(),
-                claim,
-                reserved,
-            }),
-            move || claim_owner.return_claim(claim),
-        )
+        ObservationCredit::Original(BoundCredit {
+            original: self.clone(),
+            claim,
+            position: Some(position),
+            reserved,
+            _backing: self.backing.clone(),
+        })
+    }
+
+    pub(super) fn backing_bytes(
+        positions: usize,
+        participants: usize,
+    ) -> Result<usize, ObservationError> {
+        backing::sum([
+            backing::arc::<Self>()?.size(),
+            backing::array::<OwnedPositionObligation>(positions)?,
+            backing::tree::<ParticipationRef, ()>(participants)?,
+            backing::tree::<StreamKey, ReadClaims>(positions)?,
+        ])
     }
 
     /// Take one original waiter under the lock, then wake it outside. Bound a
@@ -471,18 +472,17 @@ impl Credits {
     }
 }
 
-struct Bytes {
+pub(crate) struct BoundCredit {
     original: Arc<ObservationCredits>,
     claim: Claim,
+    position: Option<OwnedPositionObligation>,
     reserved: usize,
+    // Drop the original credits Arc before releasing this borrower's pin.
+    _backing: Option<backing::ObservationBackingPin>,
 }
 
-impl ObservationByteLoan for Bytes {
-    fn reserved_bytes(&self) -> usize {
-        self.reserved
-    }
-
-    fn shrink_to(&mut self, charged_bytes: usize) -> Result<(), ObservationError> {
+impl BoundCredit {
+    pub(super) fn shrink_to(&mut self, charged_bytes: usize) -> Result<(), ObservationError> {
         let returned =
             self.reserved
                 .checked_sub(charged_bytes)
@@ -503,17 +503,30 @@ impl ObservationByteLoan for Bytes {
     }
 }
 
-impl Drop for Bytes {
+impl Drop for BoundCredit {
     fn drop(&mut self) {
-        if matches!(self.claim, Claim::Read(_)) {
-            // The following slot return notifies readers after both original
-            // resources are available, before the final claim receipt.
-            self.original
+        let position = self.position.take().expect("original observation position");
+        {
+            let mut state = self
+                .original
                 .state
                 .lock()
-                .expect("observation credit owner")
-                .data_bytes -= self.reserved;
+                .expect("observation credit owner");
+            match self.claim {
+                Claim::Read(_) => {
+                    state.data_bytes -= self.reserved;
+                    state.data.push(position);
+                }
+                Claim::Control => {
+                    assert!(state.control.replace(position).is_none());
+                }
+            }
         }
+        if matches!(self.claim, Claim::Read(_)) {
+            self.original.wake_readers();
+        }
+        // Synchronous wake failure leaves the original claim unresolved.
+        self.original.return_claim(self.claim);
     }
 }
 

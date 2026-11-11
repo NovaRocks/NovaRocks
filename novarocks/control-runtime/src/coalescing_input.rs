@@ -96,6 +96,12 @@ impl<A: Actor, T: Merge> CoalescedReceipt<A, T> {
 }
 
 impl<A: Actor, T: Merge> CoalescingInput<A, T> {
+    /// Payload geometry of the actual shared role. Its original payer must
+    /// include the Arc allocation overhead for the runtime's allocator.
+    pub fn backing_payload_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Inner<A, T>>()
+    }
+
     /// `standing` must be an idle, prepaid input position. Its original Source
     /// chooses the input class; constructing this wrapper grants no new credit.
     pub fn new(standing: StandingInputObligation<A>, project: fn(&T) -> A::Input) -> Self {

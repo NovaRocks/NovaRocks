@@ -341,7 +341,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
 
     let before_progress = inventory();
     let read_progress = registered
-        .bind_read_progress(&runtime, &observation_work)
+        .bind_read_progress(&runtime, &observation_work, None)
         .unwrap();
     assert!(
         read_progress
@@ -359,7 +359,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
             .all(|row| { row.source == lifecycle.source && row.class == InputClass::Ordinary })
     );
     assert!(matches!(
-        registered.bind_read_progress(&runtime, &observation_work),
+        registered.bind_read_progress(&runtime, &observation_work, None),
         Err(ObservationError::Busy)
     ));
     for role in read_progress.values() {
@@ -648,5 +648,142 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     }
     runtime.remove_actor(actor).unwrap();
     ledger.remove_scope(scope.id()).unwrap();
+    assert!(runtime.is_empty() && ledger.is_empty());
+}
+
+#[test]
+fn bound_observation_backing_waits_for_actual_strong_weak_and_progress_aliases() {
+    use crate::task_execution::host::observations::{
+        backing::OBSERVATION_BACKING_BYTES, credits::OBSERVATION_WINDOW_BYTES,
+    };
+
+    let runtime = ActorRuntime::<FrontendActor>::new();
+    let layout =
+        NativeTransportCapacity::from_transport(novarocks_task_codec::TransportBudget::DEFAULT)
+            .unwrap();
+    let budget = ObservationBudget::for_task_attempt();
+    let quota = budget
+        .byte_window()
+        .unwrap()
+        .checked_add(&ObservationBackingQuote::process_limit(budget, NonZeroUsize::MIN).unwrap())
+        .unwrap();
+    let ledger = RuntimeLedger::new(quota);
+    let generation = Generation::new(1).unwrap();
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let control_scope = ledger.open_scope_next(None, generation).unwrap();
+    let reserve = |scope: &ScopeHandle, resources, kind| {
+        scope
+            .reserve_next(generation, resources, kind, WorkAdmission::External)
+            .unwrap()
+            .bind(kind)
+            .unwrap()
+    };
+    let (mut failure, mut failure_capacity) =
+        reserve(&scope, ReservationResources::work_only(), WorkKind::Cleanup);
+    let start = start();
+    let participants = start
+        .plan
+        .establish_material
+        .keys()
+        .map(|participation| FrozenMember {
+            participation: *participation,
+            endpoint: novarocks_execution_contract::RuntimeEndpoint::new("127.0.0.1", 19091)
+                .unwrap(),
+        })
+        .collect();
+    let max_step_work = start.minimum_core_step_units().unwrap() + OUTPUT_UNITS;
+    let config = ActorConfig {
+        mailbox: start.sources.mailbox,
+        max_batches: 8,
+        max_effects_per_step: OUTPUT_UNITS,
+        max_dependencies_per_effect: 0,
+        turn_budget: 4 * (max_step_work + 1),
+        max_step_work,
+    };
+    let mut attempt = AttemptActor::register(
+        &runtime,
+        start,
+        &participants,
+        scope.clone(),
+        layout,
+        config,
+        &failure,
+    )
+    .unwrap();
+    let actor = attempt.original.actor();
+    let requests = RootControlRequests::new(
+        attempt.root_control_binding().clone(),
+        attempt.failure_publications().clone(),
+    );
+    let resources = attempt.observation_resources().unwrap();
+    let bytes = resources.quota.get(OBSERVATION_BACKING_BYTES);
+    let (mut work, mut positions) = reserve(&scope, resources, WorkKind::Settlement);
+    let (mut root_work, mut root_capacity) = reserve(
+        &control_scope,
+        ReservationResources::work_only(),
+        WorkKind::Settlement,
+    );
+    work.start().unwrap();
+    root_work.start().unwrap();
+    let ingress = attempt
+        .bind_observation_source(
+            &runtime,
+            ObservationSourceBacking {
+                work: &work,
+                positions: &mut positions,
+            },
+            &root_work,
+            &requests,
+            Arc::new(ManualClock::default()),
+            Waker::noop().clone(),
+        )
+        .unwrap();
+    let usage = || {
+        ledger
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES, OBSERVATION_BACKING_BYTES])
+            .unwrap()
+            .unwrap()
+            .used
+    };
+    assert_eq!(usage(), [budget.total_bytes as u64, bytes]);
+    assert!(positions.resources().unwrap().is_empty());
+
+    let extra = ingress.clone();
+    let weak = ingress.weak();
+    let progress = attempt.read_progress_roles.as_ref().unwrap()[0].clone();
+    ingress.close_after_exit().unwrap();
+    assert_eq!(usage(), [0, bytes]);
+    drop(attempt);
+    drop(ingress);
+    assert!(weak.upgrade().is_some());
+    drop(extra);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(usage(), [0, bytes]);
+    drop(weak);
+    assert_eq!(usage(), [0, bytes]);
+    drop(progress);
+    assert_eq!(usage(), [0, 0]);
+    drop(requests);
+
+    failure.start().unwrap();
+    for (work, reservation) in [
+        (&mut failure, &mut failure_capacity),
+        (&mut work, &mut positions),
+        (&mut root_work, &mut root_capacity),
+    ] {
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        reservation.finish().unwrap();
+    }
+    for original in [&scope, &control_scope] {
+        original.close_external().unwrap();
+        original.reap_ready(8).unwrap();
+    }
+    while let Some(turn) = runtime.claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    runtime.remove_actor(actor).unwrap();
+    ledger.remove_scope(scope.id()).unwrap();
+    ledger.remove_scope(control_scope.id()).unwrap();
     assert!(runtime.is_empty() && ledger.is_empty());
 }

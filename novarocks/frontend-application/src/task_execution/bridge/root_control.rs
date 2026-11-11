@@ -62,12 +62,12 @@ struct Requests {
     delivering: bool,
     closed: bool,
     writer_error: Option<ObservationError>,
+    ingress: Option<WeakOrderedObservationInput<FrontendActor>>,
 }
 
 pub(crate) struct RootControlRequests {
     binding: RootControlBinding,
     failure: Arc<FailurePublications>,
-    ingress: OnceLock<WeakOrderedObservationInput<FrontendActor>>,
     publisher: OnceLock<Weak<AttemptPublicationOwner>>,
     state: Mutex<Requests>,
 }
@@ -78,7 +78,6 @@ impl RootControlRequests {
         let original = Arc::new(Self {
             binding,
             failure,
-            ingress: OnceLock::new(),
             publisher: OnceLock::new(),
             state: Mutex::new(Requests {
                 next: 1,
@@ -87,6 +86,7 @@ impl RootControlRequests {
                 delivering: false,
                 closed: false,
                 writer_error: None,
+                ingress: None,
             }),
         });
         original.failure.bind_root_requests(&original);
@@ -131,7 +131,9 @@ impl RootControlRequests {
     pub(crate) fn bind_ingress(&self, ingress: &OrderedObservationInput<FrontendActor>) {
         assert!(self.binding.same_original(ingress.root_binding()));
         assert!(self.binding.reply_author().is_some());
-        assert!(self.ingress.set(ingress.weak()).is_ok());
+        let mut state = self.state.lock().expect("original root-control request");
+        assert!(!state.closed && state.ingress.is_none());
+        state.ingress = Some(ingress.weak());
     }
 
     /// Fence new QA requests without blocking the already accepted writer
@@ -143,7 +145,19 @@ impl RootControlRequests {
         if state.submitting || state.original.is_some() || state.delivering {
             return Err(ObservationError::Busy);
         }
+        let ingress = state.ingress.take();
+        drop(state);
+        drop(ingress);
         Ok(())
+    }
+
+    fn ingress(&self) -> Option<OrderedObservationInput<FrontendActor>> {
+        self.state
+            .lock()
+            .expect("original root-control request")
+            .ingress
+            .as_ref()
+            .and_then(WeakOrderedObservationInput::upgrade)
     }
 
     fn reserve_request(
@@ -388,12 +402,7 @@ impl RootControlRequests {
     }
 
     fn notify_close(&self, closed: bool) {
-        if closed
-            && let Some(ingress) = self
-                .ingress
-                .get()
-                .and_then(WeakOrderedObservationInput::upgrade)
-        {
+        if closed && let Some(ingress) = self.ingress() {
             ingress.notify_source_progress();
         }
     }
@@ -412,11 +421,7 @@ impl AcceptedRootControlPort for RootControlRequests {
         &self,
         request: AcceptedRootControlRequest,
     ) -> Result<(), AcceptedRootControlRequest> {
-        let Some(ingress) = self
-            .ingress
-            .get()
-            .and_then(WeakOrderedObservationInput::upgrade)
-        else {
+        let Some(ingress) = self.ingress() else {
             return Err(request);
         };
         let reference = self.reserve_request(request)?;

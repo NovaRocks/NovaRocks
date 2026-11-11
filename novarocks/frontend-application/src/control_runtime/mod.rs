@@ -57,6 +57,9 @@ use crate::task_execution::host::adapter::{
     AttemptActorRegistration, AttemptRegistrationError, PreparedAttemptHost,
 };
 use crate::task_execution::host::failure_bridge::PendingFailureBridge;
+use crate::task_execution::host::observations::{
+    ObservationBudget, ObservationError, backing::ObservationBackingQuote,
+};
 use crate::task_execution::host::startup::AttemptStartup;
 use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
@@ -93,6 +96,7 @@ pub(crate) struct FrontendControlRuntimeConfig {
 pub(crate) enum FrontendControlStartError {
     Transport(String),
     Ledger(RuntimeError),
+    Observation(ObservationError),
     Pollers(std::io::Error),
 }
 #[derive(Clone, Copy, Debug)]
@@ -198,13 +202,17 @@ impl FrontendControlRuntime {
             .map_err(FrontendControlStartError::Transport)?;
         let clock: Arc<dyn Clock> = Arc::new(FrontendClock(config.clock));
         let observation = RuntimeObservation::new(Some(clock.clone()));
-        let observation_windows =
-            crate::task_execution::host::observations::ObservationBudget::for_task_attempt()
-                .byte_windows(config.workload_scope_limit)
-                .map_err(FrontendControlStartError::Ledger)?;
+        let budget = ObservationBudget::for_task_attempt();
+        let observation_windows = budget
+            .byte_windows(config.workload_scope_limit)
+            .map_err(FrontendControlStartError::Ledger)?;
+        let observation_backing =
+            ObservationBackingQuote::process_limit(budget, config.workload_scope_limit)
+                .map_err(FrontendControlStartError::Observation)?;
         let limits = layout
             .process_limits()
             .checked_add(&observation_windows)
+            .and_then(|limits| limits.checked_add(&observation_backing))
             .map_err(|error| FrontendControlStartError::Ledger(error.into()))?;
         let ledger = RuntimeLedger::with_keyed_families_and_observation(
             limits,

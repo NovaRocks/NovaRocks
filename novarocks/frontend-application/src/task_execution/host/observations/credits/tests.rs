@@ -83,6 +83,7 @@ fn pool(
         streams.iter().map(|key| key.participation),
         &work,
         &mut reservation,
+        None,
     )
     .unwrap();
     for key in streams {
@@ -137,7 +138,13 @@ fn insufficient_observation_bytes_leave_the_original_positions_untouched() {
     work.start().unwrap();
     let original = reservation.resources().unwrap();
     assert!(matches!(
-        ObservationCredits::bind(budget, [stream().participation], &work, &mut reservation),
+        ObservationCredits::bind(
+            budget,
+            [stream().participation],
+            &work,
+            &mut reservation,
+            None
+        ),
         Err(ObservationError::Runtime(_))
     ));
     assert_eq!(reservation.resources().unwrap(), original);

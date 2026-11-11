@@ -24,10 +24,11 @@ use super::failure_supervisor::FailureSupervisor;
 use super::observations::{
     ObservationBudget, ObservationError, ObservationSourcePool, OrderedObservationInput,
     RootControlBinding,
+    backing::{ObservationBackingPin, ObservationBackingQuote, PaidObservationMetadata},
     credits::ObservationCredits,
     host_turn::OrderedObservationHost,
     read_progress::ReadProgressInput,
-    source::{BoundObservationSource, ObservationMetadataAuthor},
+    source::BoundObservationSource,
 };
 use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
@@ -70,9 +71,11 @@ use novarocks_control_runtime::{
     transaction::{RuntimeError, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
+    capacity::ReservationResources,
     effect::{EffectDescriptor, EffectKind},
     identity::{ActionId, ActorId, Generation, InputId, ReservationId, ScopedWorkRef, Tick},
     mailbox::{InputClass, InputEnvelope},
+    owned_storage::OwnedSlotNeed,
     scope::WorkKind,
 };
 use novarocks_coordination_contract::{LogicalToAttemptBody, MonotonicClock, MonotonicInstant};
@@ -125,7 +128,6 @@ pub(crate) struct AttemptActorRegistration {
 pub(crate) struct ObservationSourceBacking<'a> {
     pub(crate) work: &'a WorkObligation,
     pub(crate) positions: &'a mut ReservationObligation,
-    pub(crate) metadata: Arc<dyn ObservationMetadataAuthor>,
 }
 
 pub(crate) struct AttemptEffectAuthors {
@@ -654,6 +656,7 @@ impl AttemptActorRegistration {
         &mut self,
         runtime: &ActorRuntime<FrontendActor>,
         observation_work: &WorkObligation,
+        backing: Option<&ObservationBackingPin>,
     ) -> Result<BTreeMap<ParticipationRef, ReadProgressInput>, ObservationError> {
         if self.read_progress_roles.is_some() || self.startup_reserved {
             return Err(ObservationError::Busy);
@@ -681,11 +684,29 @@ impl AttemptActorRegistration {
             };
             roles.insert(
                 member.participation,
-                ReadProgressInput::new(&self.original, member.participation, standing),
+                ReadProgressInput::new(&self.original, member.participation, standing)
+                    .with_backing(backing.cloned()),
             );
         }
         self.read_progress_roles = Some(roles.values().cloned().collect());
         Ok(roles)
+    }
+
+    pub(crate) fn observation_resources(&self) -> Result<ReservationResources, ObservationError> {
+        let budget = ObservationBudget::for_task_attempt();
+        let backing = ObservationBackingQuote::new(budget, self.failure_members.len())?;
+        let quota = budget
+            .byte_window()
+            .and_then(|window| Ok(window.checked_add(backing.quota())?))
+            .map_err(|error| ObservationError::Runtime(error.into()))?;
+        Ok(ReservationResources::new(
+            quota,
+            OwnedSlotNeed {
+                work_headers: 1,
+                inputs: budget.total_positions,
+                ..Default::default()
+            },
+        ))
     }
 
     /// Assemble the attempt's real credits, stream publishers, and canonical
@@ -706,12 +727,22 @@ impl AttemptActorRegistration {
         {
             return Err(ObservationError::InvalidRootControl);
         }
-        let roles = self.bind_read_progress(runtime, backing.work)?;
+        let budget = ObservationBudget::for_task_attempt();
+        let quote = ObservationBackingQuote::new(budget, self.failure_members.len())?;
+        let metadata = PaidObservationMetadata::take_from(quote, backing.work, backing.positions)?;
+        let roles = match self.bind_read_progress(runtime, backing.work, Some(&metadata.pin())) {
+            Ok(roles) => roles,
+            Err(error) => {
+                metadata.retire_unpublished();
+                return Err(error);
+            }
+        };
         let credits = match ObservationCredits::bind(
-            ObservationBudget::for_task_attempt(),
+            budget,
             roles.keys().copied(),
             backing.work,
             backing.positions,
+            Some(metadata.pin()),
         ) {
             Ok(credits) => credits,
             Err(error) => {
@@ -720,6 +751,8 @@ impl AttemptActorRegistration {
                     role.close_after_exit()
                         .expect("unpublished read progress role");
                 }
+                drop(roles);
+                metadata.retire_unpublished();
                 return Err(error);
             }
         };
@@ -728,7 +761,7 @@ impl AttemptActorRegistration {
             requests.clone(),
             credits,
             roles,
-            backing.metadata,
+            metadata.clone(),
         );
         match self.bind_observations(
             runtime,
@@ -747,6 +780,8 @@ impl AttemptActorRegistration {
                 source
                     .retire_unpublished()
                     .expect("unpublished observation Source");
+                drop(source);
+                metadata.retire_unpublished();
                 Err(error)
             }
         }

@@ -20,7 +20,7 @@
 use super::{
     MetadataRetirementRefusal, ObservationBudget, ObservationCredit, ObservationError,
     ObservationMetadataLayout, ObservationMetadataObligation, ObservationSourcePool,
-    RootControlBinding, RootControlRef, StreamKey, credits::ObservationCredits,
+    RootControlBinding, RootControlRef, StreamKey, backing, credits::ObservationCredits,
     read_progress::ReadProgressInput,
 };
 use crate::task_execution::bridge::root_control::RootControlRequests;
@@ -82,6 +82,17 @@ impl SourcePositions {
 }
 
 impl BoundObservationSource {
+    pub(super) fn backing_bytes(participants: usize) -> Result<usize, ObservationError> {
+        backing::sum([
+            backing::arc::<Self>()?.size(),
+            backing::arc::<SourcePositions>()?.size(),
+            std::mem::size_of::<SourceMetadata>(),
+            backing::tree::<ParticipationRef, ReadProgressInput>(participants)?,
+            ReadProgressInput::backing_bytes(participants)?,
+            backing::array::<ReadProgressInput>(participants)?,
+        ])
+    }
+
     pub(crate) fn new(
         binding: RootControlBinding,
         requests: Arc<RootControlRequests>,
@@ -115,6 +126,10 @@ struct SourceMetadata {
 }
 
 impl ObservationMetadataObligation for SourceMetadata {
+    fn backing_pin(&self) -> Option<backing::ObservationBackingPin> {
+        self.original.as_ref()?.backing_pin()
+    }
+
     fn retire_after_exit(mut self: Box<Self>) -> Result<(), MetadataRetirementRefusal> {
         if let Err(error) = self.source.retire_after_exit() {
             return Err(MetadataRetirementRefusal {
