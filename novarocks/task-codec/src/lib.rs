@@ -41,7 +41,7 @@ pub mod participation_convergence;
 pub mod resource_preflight;
 pub mod status;
 
-pub use budget::TransportBudget;
+pub use budget::{TransportBudget, TransportMessageLimits};
 
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 

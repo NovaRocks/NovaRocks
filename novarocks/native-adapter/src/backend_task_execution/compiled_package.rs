@@ -183,6 +183,17 @@ impl CompiledTaskProgram {
             CompiledProgramOutput::Direct(program) => program,
         }
     }
+
+    /// Transfer the actual received program to a component execution fixture.
+    /// This creates no metadata authority and is absent from product builds.
+    #[cfg(any(test, novarocks_dev_controls))]
+    #[doc(hidden)]
+    pub fn into_local_program_for_test(self) -> LocalProgram {
+        match self.output {
+            CompiledProgramOutput::Native(source) => source.program,
+            CompiledProgramOutput::Direct(program) => program,
+        }
+    }
     fn native(program: LocalProgram, runtime_filters: CompiledRuntimeFilterEndpoints) -> Self {
         Self {
             output: CompiledProgramOutput::Native(ValidatedNativeProgram { program }),

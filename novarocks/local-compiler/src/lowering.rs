@@ -701,9 +701,10 @@ fn lower_with_creation<
                 }
                 true
             }
-            NodeKind::Values { .. } | NodeKind::ExchangeSource { .. } | NodeKind::Scan { .. } => {
-                node.inputs.is_empty()
-            }
+            NodeKind::SystemRelation { .. }
+            | NodeKind::Values { .. }
+            | NodeKind::ExchangeSource { .. }
+            | NodeKind::Scan { .. } => node.inputs.is_empty(),
             NodeKind::Project { .. }
             | NodeKind::Limit { .. }
             | NodeKind::AssertOneRow(_)
@@ -1325,6 +1326,9 @@ fn lower_with_creation<
         let source_id = DiagnosticSourceNodeId::new(source.get());
         allowed.insert(source_id);
         let (kind, layout) = match &node.kind {
+            NodeKind::SystemRelation { .. } => {
+                crate::system_relation::lower(package, node, &planned.slots, creation, work)?
+            }
             NodeKind::Values { .. } => {
                 work.flush()?;
                 lower_values_with_creation(

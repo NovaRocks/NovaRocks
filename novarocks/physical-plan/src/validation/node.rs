@@ -477,6 +477,7 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::NestLoopJoin { .. }
         | NodeKind::SetOp { .. }
         | NodeKind::Values { .. }
+        | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ChangeEventExpand { .. }
         | NodeKind::PositionShard(_) => None,
@@ -729,6 +730,7 @@ pub(crate) fn value_origin_allowed(
         }
         (
             NodeKind::Values { .. }
+            | NodeKind::SystemRelation { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
             | NodeKind::GenerateSeries { .. }
@@ -749,6 +751,7 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
     let valid = match &node.kind {
         NodeKind::Scan { .. }
         | NodeKind::Values { .. }
+        | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
         NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
@@ -1349,6 +1352,31 @@ pub(crate) fn validate_node_semantics(
                     path,
                     "INTERSECT and EXCEPT require singleton inputs or one exact shared partition space over every comparison ordinal",
                 ));
+            }
+        }
+        NodeKind::SystemRelation {
+            output_fields,
+            data,
+        } => {
+            if output_fields.len() != node.output.columns.len() {
+                errors.push(ValidationError::new(
+                    path,
+                    "system relation output width differs",
+                ));
+            }
+            for (field, value) in output_fields.iter().zip(node.output.columns.iter()) {
+                if let Some(value) = fragment.values().get(value)
+                    && (value.ty.data_type() != field.data_type()
+                        || value.ty.nullable() != field.is_nullable())
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "system relation field differs from its complete output type",
+                    ));
+                }
+            }
+            if let Err(message) = data.validate_schema(output_fields) {
+                errors.push(ValidationError::new(path, message));
             }
         }
         NodeKind::Values { rows } => {

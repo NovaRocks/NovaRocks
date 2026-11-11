@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget,
-    ConnectorListingCollector,
+    ConnectorError, ConnectorErrorKind, ConnectorListingCollector, ConnectorListingPageSize,
 };
 
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
@@ -103,76 +102,30 @@ pub(crate) fn preflight_rest_page<'a>(
     next: Option<&str>,
     seen: &std::collections::HashSet<String>,
 ) -> Result<(), ConnectorError> {
-    let bound = collector.bound();
-    let exhausted = |field, limit| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            format!("connector listing refused: it exceeds the {field} bound of {limit}"),
-        )
-    };
-    if collector.pages() >= bound.pages || (next.is_some() && collector.pages() + 1 >= bound.pages)
-    {
-        return Err(exhausted("pages", bound.pages));
+    if next.is_some_and(|token| seen.contains(token)) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "Iceberg REST catalog repeated a continuation token",
+        ));
     }
-    if let Some(token) = next {
-        if token.is_empty() || seen.contains(token) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "Iceberg REST catalog returned an empty or repeated continuation token",
-            ));
-        }
-        if token.len() > bound.continuation_token_bytes {
-            return Err(exhausted(
-                "continuation_token_bytes",
-                bound.continuation_token_bytes,
-            ));
-        }
-    }
-    let mut page_budget = ConnectorListingBudget::new(ConnectorListingBound {
-        entries: bound.entries - collector.len(),
-        total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
-        ..bound
-    })?;
-    page_budget.admit_names(names)?;
-    if next.is_some() && page_budget.entries() > bound.page_entries {
-        return Err(exhausted("page_entries", bound.page_entries));
-    }
-    Ok(())
+    collector.check_page(names.into_iter().count(), next)
 }
 
-/// Admit a REST response before retaining any of its names or following its
-/// token. Non-paging servers may return a larger final response within the
-/// whole-listing bound; continuing oversized pages remain invalid.
 pub(crate) fn accept_rest_page(
     collector: &mut ConnectorListingCollector<String>,
     names: Vec<String>,
     next: Option<String>,
     seen: &mut std::collections::HashSet<String>,
 ) -> Result<(), ConnectorError> {
-    if next.as_ref().is_some_and(|token| seen.contains(token)) {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg REST catalog repeated a continuation token",
-        ));
-    }
-    let bound = collector.bound();
-    ConnectorListingBudget::new(ConnectorListingBound {
-        entries: bound.entries - collector.len(),
-        total_name_bytes: bound.total_name_bytes - collector.total_name_bytes(),
-        ..bound
-    })?
-    .admit_names(names.iter().map(String::as_str))?;
-
-    if names.len() > bound.page_entries && next.is_none() {
-        collector.accept_page(Vec::new(), None)?;
-        for name in names {
-            collector.push(name)?;
-        }
-    } else {
-        collector.accept_page(names, next)?;
-    }
+    preflight_rest_page(
+        collector,
+        names.iter().map(String::as_str),
+        next.as_deref(),
+        seen,
+    )?;
+    collector.accept_page(names, next)?;
     if let Some(token) = collector.continuation_token() {
-        seen.insert(token.to_string());
+        seen.insert(token.to_owned());
     }
     Ok(())
 }
@@ -569,14 +522,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 
     async fn list_namespaces(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let mut collector = ConnectorListingCollector::new(bound)?;
         let mut seen = std::collections::HashSet::new();
         loop {
             let page = self
                 .endpoints
-                .list_namespaces_page(collector.continuation_token(), bound.page_entries)
+                .list_namespaces_page(collector.continuation_token(), bound.get())
                 .await?;
             preflight_rest_page(
                 &collector,
@@ -608,7 +561,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn list_namespaces_for_read(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let context = binding.request_context().ok_or_else(|| {
             ConnectorError::new(
@@ -623,7 +576,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         namespace: CatalogNamespaceName,
         binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let context = binding.request_context().ok_or_else(|| {
             ConnectorError::new(
@@ -640,7 +593,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         namespace: CatalogNamespaceName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.listing
             .run(&context, self.list_views(namespace, bound))
@@ -698,7 +651,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
         let mut collector = ConnectorListingCollector::new(bound)?;
@@ -706,7 +659,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         loop {
             let page = self
                 .endpoints
-                .list_tables_page(&ident, collector.continuation_token(), bound.page_entries)
+                .list_tables_page(&ident, collector.continuation_token(), bound.get())
                 .await?;
             // The SDK owns this response. Validate every borrowed name and the
             // continuation before allocating any NovaRocks-owned page vector.
@@ -751,31 +704,21 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             .await?;
         // A server without pagination support may ignore pageSize and return
         // a complete listing. A continuing oversized page still violates the
-        // page contract; every response must fit the frozen whole-listing bound.
+        // page contract; a final complete response has no listing quota.
         if page.identifiers.len() > page_size && page.next_page_token.is_some() {
             return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
+                ConnectorErrorKind::CorruptData,
                 format!(
                     "connector listing refused: Iceberg REST catalog returned more tables than \
                      the page_entries bound of {page_size}"
                 ),
             ));
         }
-        ConnectorListingBudget::new(ConnectorListingBound::V1)?
-            .admit_names(page.identifiers.iter().map(|table| table.name.as_str()))?;
-        if let Some(token) = page.next_page_token.as_deref() {
-            if token.is_empty() {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg REST catalog returned an empty continuation token",
-                ));
-            }
-            if token.len() > ConnectorListingBound::V1.continuation_token_bytes {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::ResourceExhausted,
-                    "connector listing refused: continuation_token_bytes bound exceeded",
-                ));
-            }
+        if page.next_page_token.as_deref() == Some("") {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg REST catalog returned an empty continuation token",
+            ));
         }
 
         let mut seen = std::collections::HashSet::with_capacity(page.identifiers.len());
@@ -1013,7 +956,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
         let mut collector = ConnectorListingCollector::new(bound)?;
@@ -1021,7 +964,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         loop {
             let page = self
                 .endpoints
-                .list_views_page(&ident, collector.continuation_token(), bound.page_entries)
+                .list_views_page(&ident, collector.continuation_token(), bound.get())
                 .await?;
             if page
                 .identifiers
@@ -1120,7 +1063,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorListingBound};
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorListingPageSize};
 
     use super::NovaRocksRestCatalog;
     use crate::catalog::{CatalogNamespaceName, NovaRocksCatalog};
@@ -1279,7 +1222,7 @@ mod tests {
 
     async fn list(
         server: &PagedTablesServer,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         server
             .catalog()
@@ -1289,18 +1232,17 @@ mod tests {
     }
 
     #[track_caller]
-    fn assert_refused(error: ConnectorError, bound: &str) {
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-        assert!(
-            error.message().contains(&format!("{bound} bound")),
-            "{error}"
-        );
+    fn assert_refused(error: ConnectorError, _bound: &str) {
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains("page"), "{error}");
     }
 
     #[tokio::test]
-    async fn production_table_listing_requests_v1_pages() {
+    async fn production_table_listing_requests_default_pages() {
         let server = PagedTablesServer::start(vec![vec!["t1"]]);
-        let tables = list(&server, ConnectorListingBound::V1).await.unwrap();
+        let tables = list(&server, ConnectorListingPageSize::DEFAULT)
+            .await
+            .unwrap();
         assert_eq!(tables, ["t1"]);
         assert_eq!(server.list_requests(), [page_request(256, None)]);
     }
@@ -1308,10 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn table_listing_follows_each_continuation_with_the_bound_page_size() {
         let server = PagedTablesServer::start(vec![vec!["t1", "t2"], vec!["t3", "t4"], vec!["t5"]]);
-        let bound = ConnectorListingBound {
-            page_entries: 2,
-            ..ConnectorListingBound::V1
-        };
+        let bound = ConnectorListingPageSize::new(2).unwrap();
         let tables = list(&server, bound).await.unwrap();
         assert_eq!(tables, ["t1", "t2", "t3", "t4", "t5"]);
         assert_eq!(
@@ -1325,40 +1264,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_over_bound_table_listing_is_refused_before_its_next_page() {
-        let server = PagedTablesServer::start(vec![vec!["t1", "t2"], vec!["t3", "t4"], vec!["t5"]]);
-        let bound = ConnectorListingBound {
-            entries: 3,
-            page_entries: 2,
-            ..ConnectorListingBound::V1
-        };
-        assert_refused(list(&server, bound).await.unwrap_err(), "entries");
-        assert_eq!(
-            server.list_requests(),
-            [page_request(2, None), page_request(2, Some("p1"))],
-            "the refused page's continuation must not be followed"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_continuation_past_the_page_bound_is_never_requested() {
-        let server = PagedTablesServer::start(vec![vec!["t1"], vec!["t2"], vec!["t3"]]);
-        let bound = ConnectorListingBound {
-            page_entries: 1,
-            pages: 2,
-            ..ConnectorListingBound::V1
-        };
-        assert_refused(list(&server, bound).await.unwrap_err(), "pages");
-        assert_eq!(server.list_requests().len(), 2);
-    }
-
-    #[tokio::test]
     async fn a_continuing_page_larger_than_requested_is_refused() {
         let server = PagedTablesServer::start(vec![vec!["t1", "t2", "t3"], vec!["t4"]]);
-        let bound = ConnectorListingBound {
-            page_entries: 2,
-            ..ConnectorListingBound::V1
-        };
+        let bound = ConnectorListingPageSize::new(2).unwrap();
         assert_refused(list(&server, bound).await.unwrap_err(), "page_entries");
         assert_eq!(server.list_requests(), [page_request(2, None)]);
     }
@@ -1368,36 +1276,26 @@ mod tests {
         let names: Vec<String> = (0..257).map(|index| format!("t{index:03}")).collect();
         let server = PagedTablesServer::start(vec![names.iter().map(String::as_str).collect()]);
         assert_eq!(
-            list(&server, ConnectorListingBound::V1).await.unwrap(),
+            list(&server, ConnectorListingPageSize::DEFAULT)
+                .await
+                .unwrap(),
             names
         );
         assert_eq!(server.list_requests(), [page_request(256, None)]);
     }
 
     #[tokio::test]
-    async fn an_oversized_final_page_is_admitted_at_the_whole_listing_bounds() {
+    async fn an_oversized_final_page_is_admitted_without_a_listing_quota() {
         let server = PagedTablesServer::start(vec![vec!["t1", "t2", "t3"]]);
-        let bound = ConnectorListingBound {
-            entries: 3,
-            page_entries: 2,
-            pages: 1,
-            total_name_bytes: 6,
-            ..ConnectorListingBound::V1
-        };
+        let bound = ConnectorListingPageSize::new(2).unwrap();
         assert_eq!(list(&server, bound).await.unwrap(), ["t1", "t2", "t3"]);
         assert_eq!(server.list_requests(), [page_request(2, None)]);
     }
 
     #[tokio::test]
-    async fn an_oversized_final_page_keeps_the_preceding_pages_charged() {
+    async fn an_oversized_final_page_preserves_all_preceding_pages() {
         let server = PagedTablesServer::start(vec![vec!["t1"], vec!["t2", "t3", "t4"]]);
-        let bound = ConnectorListingBound {
-            entries: 4,
-            page_entries: 2,
-            pages: 2,
-            total_name_bytes: 8,
-            ..ConnectorListingBound::V1
-        };
+        let bound = ConnectorListingPageSize::new(2).unwrap();
         assert_eq!(
             list(&server, bound).await.unwrap(),
             ["t1", "t2", "t3", "t4"]
@@ -1408,42 +1306,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_oversized_final_page_is_refused_whole_when_any_listing_bound_is_exceeded() {
-        for (bound, exceeded) in [
-            (
-                ConnectorListingBound {
-                    entries: 3,
-                    page_entries: 2,
-                    ..ConnectorListingBound::V1
-                },
-                "entries",
-            ),
-            (
-                ConnectorListingBound {
-                    name_bytes: 1,
-                    page_entries: 2,
-                    ..ConnectorListingBound::V1
-                },
-                "name_bytes",
-            ),
-            (
-                ConnectorListingBound {
-                    total_name_bytes: 4,
-                    page_entries: 2,
-                    ..ConnectorListingBound::V1
-                },
-                "total_name_bytes",
-            ),
-        ] {
-            let server = PagedTablesServer::start(vec![vec!["a"], vec!["b", "cc", "d"]]);
-            assert_refused(list(&server, bound).await.unwrap_err(), exceeded);
-            assert_eq!(
-                server.list_requests(),
-                [page_request(2, None), page_request(2, Some("p1"))]
-            );
-        }
-    }
     #[tokio::test]
     async fn namespaces_and_views_own_the_page_loop_and_replay_tokens() {
         for views in [false, true] {
@@ -1463,10 +1325,7 @@ mod tests {
                 format!("{{{items}{next}}}")
             });
             let catalog = server.catalog().await;
-            let bound = ConnectorListingBound {
-                page_entries: 1,
-                ..ConnectorListingBound::V1
-            };
+            let bound = ConnectorListingPageSize::new(1).unwrap();
             let names = if views {
                 catalog
                     .list_views(CatalogNamespaceName::new("db"), bound)
@@ -1508,7 +1367,7 @@ mod tests {
                 format!(r#"{{{items},"next-page-token":"{token}"}}"#)
             });
             let catalog = server.catalog().await;
-            let bound = ConnectorListingBound::V1;
+            let bound = ConnectorListingPageSize::DEFAULT;
             let error = match kind {
                 "namespaces" => catalog.list_namespaces(bound).await,
                 "views" => {
@@ -1525,76 +1384,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::CorruptData, "{error}");
             assert_eq!(server.list_requests().len(), 3);
-        }
-    }
-
-    #[tokio::test]
-    async fn unpaged_namespace_and_view_responses_are_refused_as_a_whole() {
-        for views in [false, true] {
-            let server = PagedTablesServer::start_response(move |_| {
-                if views {
-                    r#"{"identifiers":[{"namespace":["db"],"name":"one"},{"namespace":["db"],"name":"two"}]}"#.into()
-                } else {
-                    r#"{"namespaces":[["one"],["two"]]}"#.into()
-                }
-            });
-            let catalog = server.catalog().await;
-            let bound = ConnectorListingBound {
-                entries: 1,
-                page_entries: 1,
-                ..ConnectorListingBound::V1
-            };
-            let error = if views {
-                catalog
-                    .list_views(CatalogNamespaceName::new("db"), bound)
-                    .await
-            } else {
-                catalog.list_namespaces(bound).await
-            }
-            .unwrap_err();
-            assert_refused(error, "entries");
-            assert_eq!(server.list_requests().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn namespaces_and_views_check_token_and_page_limits_before_following() {
-        for views in [false, true] {
-            for (bound, expected) in [
-                (
-                    ConnectorListingBound {
-                        continuation_token_bytes: 1,
-                        ..ConnectorListingBound::V1
-                    },
-                    "continuation_token_bytes",
-                ),
-                (
-                    ConnectorListingBound {
-                        pages: 1,
-                        ..ConnectorListingBound::V1
-                    },
-                    "pages",
-                ),
-            ] {
-                let server = PagedTablesServer::start_response(move |_| {
-                    if views {
-                        r#"{"identifiers":[{"namespace":["db"],"name":"v"}],"next-page-token":"token"}"#.into()
-                    } else {
-                        r#"{"namespaces":[["db"]],"next-page-token":"token"}"#.into()
-                    }
-                });
-                let catalog = server.catalog().await;
-                let error = if views {
-                    catalog
-                        .list_views(CatalogNamespaceName::new("db"), bound)
-                        .await
-                } else {
-                    catalog.list_namespaces(bound).await
-                }
-                .unwrap_err();
-                assert_refused(error, expected);
-                assert_eq!(server.list_requests().len(), 1);
-            }
         }
     }
 
@@ -1623,7 +1412,7 @@ mod tests {
                 .list_views_for_request(
                     CatalogNamespaceName::new("db"),
                     context,
-                    ConnectorListingBound::V1,
+                    ConnectorListingPageSize::DEFAULT,
                 )
                 .await
                 .unwrap_err();
@@ -1640,6 +1429,58 @@ mod tests {
                 super::super::listing_admission::LISTING_CONCURRENCY
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unpaged_final_response_exceeds_former_entry_quota() {
+        let names: Vec<_> = (0..65_537).map(|i| format!("t{i:08}")).collect();
+        let server = PagedTablesServer::start(vec![names.iter().map(String::as_str).collect()]);
+        assert_eq!(
+            list(&server, ConnectorListingPageSize::DEFAULT)
+                .await
+                .unwrap(),
+            names
+        );
+        assert_eq!(server.list_requests(), [page_request(256, None)]);
+    }
+
+    #[tokio::test]
+    async fn advancing_empty_pages_end_on_the_original_stop() {
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stop = Arc::new(ConnectorStopOwner::new());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let source_stop = stop.clone();
+        let source_requests = requests.clone();
+        let server = PagedTablesServer::start_response(move |_| {
+            let index = source_requests.fetch_add(1, Ordering::SeqCst);
+            if index == 3 {
+                source_stop.request_stop();
+            }
+            format!(r#"{{"identifiers":[],"next-page-token":"p{index}"}}"#)
+        });
+        let catalog = server.catalog().await;
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + Duration::from_secs(5),
+            stop.view(),
+            1024,
+            4096,
+        )
+        .unwrap();
+        let error = catalog
+            .list_views_for_request(
+                CatalogNamespaceName::new("db"),
+                context,
+                ConnectorListingPageSize::DEFAULT,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            catalog.listing.available_positions(),
+            super::super::listing_admission::LISTING_CONCURRENCY
+        );
     }
 
     fn commit_response(status: u16) -> String {

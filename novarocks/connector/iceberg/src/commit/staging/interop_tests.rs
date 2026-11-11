@@ -2175,7 +2175,7 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     let mut upstream_listed = upstream
         .list_tables(
             crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
         )
         .await
         .unwrap()
@@ -2200,7 +2200,7 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
     let mut remaining = upstream
         .list_tables(
             crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
         )
         .await
         .unwrap()
@@ -2220,7 +2220,7 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
         upstream
             .list_tables(
                 crate::catalog::CatalogNamespaceName::new(namespace.join(".")),
-                novarocks_spi::connector::ConnectorListingBound::V1
+                novarocks_spi::connector::ConnectorListingPageSize::DEFAULT
             )
             .await
             .unwrap()

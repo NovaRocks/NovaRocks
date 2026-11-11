@@ -256,8 +256,6 @@ pub enum StatisticsSqlCommand {
     ShowTableStats {
         table: ObjectName,
     },
-    ShowBasicStatsMeta,
-    ShowHistogramStatsMeta,
     DropStats {
         table: ObjectName,
     },

@@ -28,12 +28,12 @@ pub struct ConnectorViewRequest {
     pub context: ConnectorRequestContext,
 }
 
-/// Enumerate one namespace's views. The provider refuses a listing that would
-/// exceed `bound`; it never truncates one.
+/// Enumerate one namespace's views. The provider returns the complete listing
+/// and uses `page_size` only as a pagination request.
 #[derive(Clone)]
 pub struct ConnectorListViewsRequest {
     pub namespace: ConnectorNamespaceIdentity,
-    pub bound: super::ConnectorListingBound,
+    pub page_size: super::ConnectorListingPageSize,
     pub context: ConnectorRequestContext,
 }
 
@@ -456,7 +456,7 @@ mod tests {
                 instance_id: capability.descriptor.instance_id.clone(),
                 namespace: Arc::from("db"),
             },
-            bound: crate::connector::ConnectorListingBound::V1,
+            page_size: crate::connector::ConnectorListingPageSize::DEFAULT,
             context: context(),
         };
         let error = capability

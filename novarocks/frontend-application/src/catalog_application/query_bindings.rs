@@ -604,11 +604,6 @@ pub(crate) enum MemoizedQueryRelation {
     SelectionRefused(Arc<novarocks_sql::compiler::CatalogRelationFact>),
 }
 
-pub(crate) type MemoizedSystemRelation = Result<
-    Option<Arc<novarocks_sql::planning::catalog::SqlInlineRelation>>,
-    novarocks_sql::compiler::SqlCompileError,
->;
-
 /// Exact application authority paired with one compiler request.
 pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
@@ -623,8 +618,6 @@ pub struct QueryTableBindingStore {
             >,
         >,
     >,
-    pub(crate) system_relations:
-        Mutex<HashMap<novarocks_types::naming::TableIdentity, MemoizedSystemRelation>>,
     pub(crate) relations: Mutex<
         HashMap<
             QueryRelationRequestKey,
@@ -653,7 +646,6 @@ impl QueryTableBindingStore {
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             relations: Mutex::new(HashMap::new()),
-            system_relations: Mutex::new(HashMap::new()),
             local_views: Mutex::new(None),
             #[cfg(test)]
             sealed_for_topology_replan: AtomicBool::new(false),

@@ -71,6 +71,27 @@ pub enum DmlExecutionError {
     Control(novarocks_type_contract::CompileControlError),
 }
 
+impl From<crate::catalog_application::resolver::TargetResolutionError> for DmlExecutionError {
+    fn from(error: crate::catalog_application::resolver::TargetResolutionError) -> Self {
+        match error {
+            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
+                Self::Engine(message)
+            }
+            other => Self::Application(other.into_service()),
+        }
+    }
+}
+impl From<crate::catalog_application::resolver::TargetResolutionError> for DmlError {
+    fn from(error: crate::catalog_application::resolver::TargetResolutionError) -> Self {
+        match error {
+            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
+                Self::executor(message)
+            }
+            other => Self::from_application(other.into_service()),
+        }
+    }
+}
+
 impl DmlExecutionError {
     pub(crate) fn from_distributed(
         error: crate::query_execution::contract::DistributedQueryError,
@@ -187,6 +208,9 @@ impl From<crate::query_execution::planning::time_travel::TimeTravelRewriteError>
 {
     fn from(error: crate::query_execution::planning::time_travel::TimeTravelRewriteError) -> Self {
         match error {
+            crate::query_execution::planning::time_travel::TimeTravelRewriteError::Source(
+                source,
+            ) => Self::Compilation(source),
             crate::query_execution::planning::time_travel::TimeTravelRewriteError::Engine(
                 error,
             ) => Self::Engine(error),

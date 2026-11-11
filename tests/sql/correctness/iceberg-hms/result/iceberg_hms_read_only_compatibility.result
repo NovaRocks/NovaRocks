@@ -61,7 +61,7 @@ id	p
 
 -- query 57
 -- types	varchar
-TABLE_NAME
+name
 
 -- query 58
 -- types	varchar	varchar
@@ -69,3 +69,7 @@ table_name	table_type
 v1	BASE TABLE
 v2	BASE TABLE
 v3	BASE TABLE
+
+-- query 59
+-- types	varchar
+table_name

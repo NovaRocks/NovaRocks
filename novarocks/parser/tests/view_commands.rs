@@ -54,10 +54,10 @@ fn create_view_owns_a_typed_embedded_query_and_span() {
 #[test]
 fn view_command_family_round_trips_through_the_typed_ast() {
     let source = "CREATE VIEW IF NOT EXISTS analytics.orders_v AS SELECT order_id FROM orders; \
-        DROP VIEW IF EXISTS analytics.orders_v; SHOW VIEWS FROM analytics; \
+        DROP VIEW IF EXISTS analytics.orders_v; \
         SHOW CREATE VIEW analytics.orders_v";
     let statements = parse(source).expect("view family should parse");
-    assert_eq!(statements.len(), 4);
+    assert_eq!(statements.len(), 3);
     assert!(matches!(
         statements[0],
         Statement::View(ViewStatement::Create(_))
@@ -68,17 +68,13 @@ fn view_command_family_round_trips_through_the_typed_ast() {
     ));
     assert!(matches!(
         statements[2],
-        Statement::View(ViewStatement::Show(_))
-    ));
-    assert!(matches!(
-        statements[3],
         Statement::View(ViewStatement::ShowCreate(_))
     ));
     let printed = print_statements(&statements);
     assert_eq!(
         printed,
         "CREATE VIEW IF NOT EXISTS analytics.orders_v AS SELECT order_id FROM orders; \
-         DROP VIEW IF EXISTS analytics.orders_v; SHOW VIEWS FROM analytics; \
+         DROP VIEW IF EXISTS analytics.orders_v; \
          SHOW CREATE VIEW analytics.orders_v"
     );
     let reparsed = parse(&printed).expect("printed views should parse");
@@ -133,6 +129,9 @@ fn view_drift_corpus_rejections_remain_parser_domain_failures() {
         "CREATE OR REPLACE VIEW IF NOT EXISTS broken AS SELECT 1",
         "CREATE VIEW broken () AS SELECT 1",
         "DROP VIEW broken FORCE",
+        "SHOW VIEWS",
+        "SHOW VIEWS FROM analytics",
+        "SHOW VIEWS IN analytics",
         "SHOW VIEWS LIKE 'broken%'",
         "SHOW VIEWS WHERE name = 'broken'",
         "SHOW CREATE VIEW",

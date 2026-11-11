@@ -29,6 +29,12 @@ pub const DEFAULT_DATABASE: &str = "default";
 /// NovaRocks itself keeps rather than one a provider owns.
 pub const DEFAULT_CATALOG: &str = "default_catalog";
 
+/// The built-in, read-only system catalog, resolved before external catalogs.
+pub const SYSTEM_CATALOG: &str = "system";
+
+/// The read-only metadata namespace bound to the selected catalog.
+pub const INFORMATION_SCHEMA: &str = "information_schema";
+
 #[derive(Clone, Debug)]
 pub struct LocalTableIdentity {
     pub database: String,
@@ -183,6 +189,18 @@ mod tests {
         assert_eq!(
             normalize_optional_identifier(Some("  `Catalog_1`  ")),
             Ok(Some("catalog_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn reserved_system_names_follow_identifier_normalization() {
+        assert_eq!(
+            normalize_identifier("`SyStEm`").unwrap(),
+            super::SYSTEM_CATALOG
+        );
+        assert_eq!(
+            normalize_identifier("INFORMATION_SCHEMA").unwrap(),
+            super::INFORMATION_SCHEMA
         );
     }
 

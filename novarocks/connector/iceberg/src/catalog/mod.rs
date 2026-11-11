@@ -78,7 +78,9 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::{ConnectorError, ConnectorListingBound, ConnectorMutationFailure};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorListingPageSize, ConnectorMutationFailure,
+};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
 pub(crate) use self::metadata_read::{CatalogMetadataLoad, CatalogMetadataValidator};
@@ -448,21 +450,18 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     // ---- A. Reads -------------------------------------------------------
     //
-    // Every enumeration is bounded at its source by the caller's
-    // `ConnectorListingBound`: a listing that would exceed it is refused with
-    // `ResourceExhausted`, never truncated. A source that can page does so
-    // with pages no larger than `bound.page_entries`; a source that cannot is
-    // checked as one complete listing.
+    // Enumerations return complete facts. Page size is a request granularity;
+    // continuing oversized pages and invalid continuation progress are corrupt.
 
     async fn list_namespaces(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_namespaces_for_read(
         &self,
         _binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.list_namespaces(bound).await
     }
@@ -483,14 +482,14 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn list_tables_for_read(
         &self,
         namespace: CatalogNamespaceName,
         _binding: crate::access_binding::IcebergReadBinding,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.list_tables(namespace, bound).await
     }
@@ -503,7 +502,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ) -> Result<CatalogTablePage, ConnectorError> {
         Err(ConnectorError::new(
             novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            "this Iceberg catalog has no bounded table pagination capability",
+            "this Iceberg catalog has no table pagination capability",
         ))
     }
 
@@ -674,7 +673,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         namespace: CatalogNamespaceName,
         context: novarocks_spi::connector::ConnectorRequestContext,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         use novarocks_spi::connector::ConnectorOperationControl;
         context.check_active()?;
@@ -707,7 +706,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn list_views(
         &self,
         namespace: CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError>;
 
     async fn load_view(

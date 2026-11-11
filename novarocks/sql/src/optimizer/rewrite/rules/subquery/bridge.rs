@@ -53,6 +53,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         .collect();
 
     let kind = match &expr.op {
+        Operator::LogicalSystemTable(op) => LogicalPlanKind::SystemTable(op.clone()),
         Operator::LogicalScan(op) => LogicalPlanKind::scan(PlanScanNode {
             database: op.database.clone(),
             table: op.table.clone(),

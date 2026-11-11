@@ -31,6 +31,85 @@ use std::time::{Duration, Instant};
 
 pub struct CatalogListing;
 
+fn require_listing_snapshot_capacity(context: &ScenarioContext) -> Result<()> {
+    let evidence: serde_json::Value =
+        serde_json::from_slice(context.effective_launch_config_evidence().artifact_bytes())?;
+    let roles = evidence["semantics"]["roles"]
+        .as_array()
+        .context("missing effective listing role configurations")?;
+    let value_at = |role: &serde_json::Value, path: &[&str]| -> Result<i64> {
+        let mut value = &role["effective_config"];
+        for key in path {
+            ensure!(
+                value["type"] == "table",
+                "missing listing config table before {}",
+                path.join(".")
+            );
+            value = &value["value"][*key];
+        }
+        ensure!(
+            value["type"] == "integer",
+            "listing config {} is not an integer",
+            path.join(".")
+        );
+        value["value"]
+            .as_i64()
+            .context("listing config integer is not represented")
+    };
+    let frontend = roles
+        .iter()
+        .filter(|role| role["role"] == "fe")
+        .collect::<Vec<_>>();
+    ensure!(
+        frontend.len() == 1,
+        "listing requires one effective FE config"
+    );
+    ensure!(
+        value_at(
+            frontend[0],
+            &[
+                "runtime",
+                "frontend_workload",
+                "client_result_all_objects_bytes"
+            ]
+        )? == 201326592,
+        "listing FE must retain the declared 192 MiB Client budget"
+    );
+    let backends = roles
+        .iter()
+        .filter(|role| role["role"] == "be")
+        .collect::<Vec<_>>();
+    ensure!(
+        backends.len() == 3,
+        "listing requires three effective BE configs"
+    );
+    for backend in backends {
+        ensure!(
+            value_at(backend, &["runtime", "result_retained_bytes_per_root"])? == 268435456
+                && value_at(backend, &["runtime", "result_retained_bytes_per_process"])?
+                    == 4294967296,
+            "listing BE must retain the declared 256 MiB Root and 4 GiB process budgets"
+        );
+    }
+    Ok(())
+}
+
+fn listing_fixture_launch_config() -> Result<ScenarioLaunchConfig> {
+    let credential = |purpose: &str| {
+        format!(
+            "[[connector.credentials]]\npurpose = '{purpose}'\nname = 'cl-fixture'\ngeneration = 'v1'\nkind = 's3'\naccess_key_id = 'cl-fixture'\naccess_key_secret = 'cl-fixture-test-only'\n"
+        )
+    };
+    Ok(ScenarioLaunchConfig {
+        config_overlay: CrossProcessConfigOverlay {
+            fe: Some(credential("object-store-metadata")),
+            be: Some(credential("object-store-data")),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
 impl Scenario for CatalogListing {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
@@ -48,22 +127,18 @@ impl Scenario for CatalogListing {
         true
     }
     fn launch_config(&self, _root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let credential = |purpose: &str| {
-            format!(
-                "[[connector.credentials]]\npurpose = '{purpose}'\nname = 'cl-fixture'\ngeneration = 'v1'\nkind = 's3'\naccess_key_id = 'cl-fixture'\naccess_key_secret = 'cl-fixture-test-only'\n"
-            )
-        };
-        Ok(ScenarioLaunchConfig {
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(credential("object-store-metadata")),
-                be: Some(credential("object-store-data")),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+        let mut config = listing_fixture_launch_config()?;
+        config.config_overlay.fe.as_mut().unwrap().push_str(
+            "\n[runtime.frontend_workload]\nclient_result_all_objects_bytes = 201326592\n",
+        );
+        config.config_overlay.be.as_mut().unwrap().push_str(
+            "\n[runtime]\nresult_retained_bytes_per_root = 268435456\nresult_retained_bytes_per_process = 4294967296\n",
+        );
+        Ok(config)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        require_listing_snapshot_capacity(context)?;
         let baseline = resource_baseline(context)?;
         let fixture = ListingRestFixture::start()?;
         let timeout = context
@@ -105,7 +180,7 @@ impl Scenario for CatalogListing {
                         scope.spawn(move || -> Result<()> {
                             barrier.wait();
                             let mut connection = SqlSession::new(user, port, deadline)?;
-                            let count = listing_sql(&mut connection, "SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%'", deadline).and_then(|result| listing_count(&result).map(Some))?;
+                            let count = listing_sql(&mut connection, "SELECT COUNT(*) FROM cl_normal.information_schema.tables WHERE TABLE_CATALOG='cl_normal' AND TABLE_SCHEMA LIKE 'cl_ns_%' AND TABLE_TYPE='BASE TABLE'", deadline).and_then(|result| listing_count(&result).map(Some))?;
                             ensure!(count == Some((NAMESPACES * MEMBERS) as u64), "incomplete information_schema table list");
                             Ok(())
                         })
@@ -124,23 +199,17 @@ impl Scenario for CatalogListing {
         listing_sql(&mut control, "USE cl_normal.cl_ns_0000", deadline)?;
         phases.push(record_listing_phase(context, "show-views", || {
             let views =
-                listing_sql(&mut control, "SHOW VIEWS", deadline).and_then(listing_views)?;
+                listing_sql(&mut control, "SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name", deadline).and_then(listing_views)?;
             ensure!(
                 views.len() == MEMBERS
                     && views[0] == "cl_view_000000"
                     && views[MEMBERS - 1] == "cl_view_000511",
-                "incomplete SHOW VIEWS output"
+                "incomplete view-row output"
             );
             Ok(json!({"rows":views.len(),"provider":fixture.snapshot()?}))
         })?);
-        for mode in [
-            ListingMode::PagedOverflow,
-            ListingMode::TerminalOverflow,
-            ListingMode::NameOverflow,
-            ListingMode::TokenOverflow,
-            ListingMode::TokenCycle,
-            ListingMode::PageOverflow,
-        ] {
+        {
+            let mode = ListingMode::TokenCycle;
             fixture.set_mode(mode)?;
             phases.push(record_listing_phase(context, "drop-refusal", || {
                 let error = listing_sql(
@@ -149,13 +218,9 @@ impl Scenario for CatalogListing {
                     deadline,
                 )
                 .err()
-                .context("over-bound discovery must refuse the whole DROP")?;
+                .context("cyclic discovery must refuse the whole DROP")?;
                 let diagnostic = listing_public_error(&error)?.message.clone();
-                let expected_kind = if mode == ListingMode::TokenCycle {
-                    "CorruptData"
-                } else {
-                    "ResourceExhausted"
-                };
+                let expected_kind = "CorruptData";
                 if !diagnostic.contains(expected_kind) {
                     return Err(error.context("DROP failed outside its listing boundary"));
                 }
@@ -167,15 +232,33 @@ impl Scenario for CatalogListing {
                 Ok(json!({"mode":format!("{mode:?}"),"provider":audit}))
             })?);
         }
+        fixture.set_mode(ListingMode::PagedOverflow)?;
+        phases.push(record_listing_phase(context,"views-beyond-old-entries",|| {
+            let views=listing_sql(&mut control,"SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name",deadline).and_then(listing_views)?;
+            ensure!(views.len()==65537 && views.iter().enumerate().all(|(index,name)|*name==format!("cl_view_{index:06}")),"view rows beyond the former entry quota were truncated or duplicated");
+            let audit=fixture.snapshot()?;
+            ensure!(audit.view_pages==257 && audit.table_pages==0 && audit.active_listing_requests==0 && audit.destructive_mutations==0 && audit.table_commits==0,"large view listing violated pagination or performed unrelated work: {audit:?}");
+            Ok(json!({"rows":views.len(),"provider":audit}))
+        })?);
+        fixture.set_mode(ListingMode::NameOverflow)?;
+        phases.push(record_listing_phase(context,"views-beyond-old-name-bytes",|| {
+            let views=listing_sql(&mut control,"SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name",deadline).and_then(listing_views)?;
+            ensure!(views.len()==257 && views[..256].iter().all(|name|name.len()==65536) && views.last().map(String::as_str)==Some("x"),"view names beyond the former byte quota were truncated or incomplete");
+            let name_bytes=views.iter().map(String::len).sum::<usize>();
+            ensure!(name_bytes==16777217,"large view names lost their original bytes");
+            let audit=fixture.snapshot()?;
+            ensure!(audit.view_pages==2 && audit.table_pages==0 && audit.active_listing_requests==0 && audit.destructive_mutations==0 && audit.table_commits==0,"large-name listing violated pagination or performed unrelated work: {audit:?}");
+            Ok(json!({"rows":views.len(),"name_bytes":name_bytes,"provider":audit}))
+        })?);
         fixture.set_mode(ListingMode::ExactEntries)?;
         phases.push(record_listing_phase(context, "exact-entries", || {
             let views =
-                listing_sql(&mut control, "SHOW VIEWS", deadline).and_then(listing_views)?;
+                listing_sql(&mut control, "SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name", deadline).and_then(listing_views)?;
             ensure!(
                 views.len() == 65536
                     && views.first().map(String::as_str) == Some("cl_view_000000")
                     && views.last().map(String::as_str) == Some("cl_view_065535"),
-                "exact-bound view list was truncated or incomplete"
+                "fixed-scale view list was truncated or incomplete"
             );
             Ok(json!({"rows":views.len(),"provider":fixture.snapshot()?}))
         })?);
@@ -315,7 +398,7 @@ pub(super) fn listing_views(result: StatementResult) -> Result<Vec<String>> {
         result.is_result_set()
             && result.columns.len() == 1
             && result.columns[0].type_signature.raw_type == "varchar",
-        "SHOW VIEWS lost its declared text column"
+        "view-row query lost its declared text column"
     );
     result
         .rows
@@ -324,7 +407,9 @@ pub(super) fn listing_views(result: StatementResult) -> Result<Vec<String>> {
             let mut values = row.into_iter();
             match (values.next(), values.next()) {
                 (Some(TrinoValue::Text(value)), None) => Ok(value),
-                actual => anyhow::bail!("SHOW VIEWS requires one non-null text cell: {actual:?}"),
+                actual => {
+                    anyhow::bail!("view-row query requires one non-null text cell: {actual:?}")
+                }
             }
         })
         .collect()
@@ -422,8 +507,8 @@ impl Scenario for ObjectStoreListingBoundary {
         true
     }
 
-    fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        CatalogListing.launch_config(root)
+    fn launch_config(&self, _root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        listing_fixture_launch_config()
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -451,22 +536,14 @@ impl Scenario for ObjectStoreListingBoundary {
             record_listing_phase(context, "opendal-list-body-boundary", || {
                 let error = listing_sql(&mut control, "ALTER TABLE cl_opendal.cl_ns_0000.cl_table_000000 ADD FILES FROM 's3://cl-fixture/import-source/'", deadline)
                     .err()
-                    .context("empty or oversized source listing must not commit ADD FILES")?;
+                    .context("empty source listing must not commit ADD FILES")?;
                 let diagnostic = listing_public_error(&error)?.message.clone();
-                if bytes == OBJECT_STORE_LIST_BODY_BYTES {
-                    if !(diagnostic.contains("no visible Parquet files")
-                        && !diagnostic.contains("ResourceExhausted"))
-                    {
-                        return Err(error.context(
-                            "exact-bound list did not reach the empty-source semantic check",
-                        ));
-                    }
-                } else {
-                    if !diagnostic.contains("ResourceExhausted") {
-                        return Err(
-                            error.context("oversized OpenDAL list lost its error classification")
-                        );
-                    }
+                if !(diagnostic.contains("no visible Parquet files")
+                    && !diagnostic.contains("ResourceExhausted"))
+                {
+                    return Err(error.context(
+                        "legal list response did not reach the empty-source semantic check",
+                    ));
                 }
                 let audit = fixture.snapshot()?;
                 ensure!(
@@ -510,7 +587,7 @@ impl Scenario for CatalogListingCancellation {
     }
     fn launch_config(&self, root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         let mut config = CatalogListing.launch_config(root)?;
-        // One synchronous SQL worker serializes SHOW VIEWS before the eight
+        // One synchronous SQL worker serializes view-row queries before the eight
         // actors can reach the catalog generation's listing admission.
         config
             .config_overlay
@@ -522,6 +599,7 @@ impl Scenario for CatalogListingCancellation {
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        require_listing_snapshot_capacity(context)?;
         let baseline = resource_baseline(context)?;
         let fixture = ListingRestFixture::start()?;
         let timeout = context
@@ -543,7 +621,7 @@ impl Scenario for CatalogListingCancellation {
         fixture.set_mode(ListingMode::Delayed)?;
         record_listing_phase(context, "listing-deadline", || {
             listing_sql(&mut control, "SET query_timeout=1", deadline)?;
-            let error = listing_sql(&mut control, "SHOW VIEWS", deadline)
+            let error = listing_sql(&mut control, "SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name", deadline)
                 .and_then(listing_views)
                 .err()
                 .context("delayed SDK listing must exceed its absolute deadline")?;
@@ -574,7 +652,7 @@ impl Scenario for CatalogListingCancellation {
         let mut victim = SqlSession::new(&user, port, deadline)?;
         listing_sql(&mut victim, "USE cl_cancel.cl_ns_0000", deadline)?;
         record_listing_phase(context, "listing-kill-query", || {
-            let pending = victim.submit("SHOW VIEWS")?;
+            let pending = victim.submit("SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name")?;
             let cancel = pending.cancel_handle();
             let terminal = AtomicBool::new(false);
             let response = std::thread::scope(|scope| {
@@ -743,7 +821,7 @@ impl Scenario for CatalogListingCancellation {
                                     })?;
                                 observe(actor, started, "use_done", None);
                                 observe(actor, started, "show_views", None);
-                                let pending = client.submit("SHOW VIEWS")?;
+                                let pending = client.submit("SELECT table_name FROM information_schema.tables WHERE table_schema='cl_ns_0000' AND table_type='VIEW' ORDER BY table_name")?;
                                 observe(
                                     actor,
                                     started,
@@ -974,5 +1052,35 @@ mod error_aggregation_tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(report);
         assert_eq!(dropped.load(Ordering::SeqCst), ACTORS * 2);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_overlay_keeps_the_snapshot_budget_and_original_worker_override() {
+        let launch = CatalogListingCancellation
+            .launch_config(std::path::Path::new("."))
+            .unwrap();
+        let fe: toml::Value = toml::from_str(launch.config_overlay.fe.as_ref().unwrap()).unwrap();
+        let be: toml::Value = toml::from_str(launch.config_overlay.be.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            fe["runtime"]["frontend_workload"]["client_result_all_objects_bytes"].as_integer(),
+            Some(201326592)
+        );
+        assert_eq!(
+            fe["runtime"]["query_blocking_worker_threads"].as_integer(),
+            Some(8)
+        );
+        assert_eq!(
+            be["runtime"]["result_retained_bytes_per_root"].as_integer(),
+            Some(268435456)
+        );
+        assert_eq!(
+            be["runtime"]["result_retained_bytes_per_process"].as_integer(),
+            Some(4294967296)
+        );
     }
 }

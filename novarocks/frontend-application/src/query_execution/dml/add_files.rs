@@ -273,7 +273,14 @@ impl AddFilesEngine for DmlExecutionKernel {
             request.current_catalog.as_deref(),
             &request.current_database,
         )
-        .map_err(plan_string_failure)?;
+        .map_err(|error| match error {
+            crate::catalog_application::resolver::TargetResolutionError::Message(message) => {
+                plan_string_failure(message)
+            }
+            crate::catalog_application::resolver::TargetResolutionError::Unsupported(error) => {
+                plan_connector_failure(error)
+            }
+        })?;
         if target.provider_id.as_str() != "iceberg" {
             return Err(plan_string_failure(format!(
                 "ADD FILES only supports iceberg tables: {}.{}",

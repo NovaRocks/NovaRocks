@@ -438,70 +438,6 @@ async fn original_gate_preserves_provider_failures_without_entering_a_view_or_re
     .await;
 }
 
-struct DefinitionSystemFacts {
-    calls: AtomicUsize,
-    deadline: Instant,
-    result: Result<
-        novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts,
-        novarocks_sql::compiler::SqlCompileError,
-    >,
-}
-impl novarocks_query_application::system_catalog_rewrite::SystemCatalogFactsPort
-    for DefinitionSystemFacts
-{
-    fn definition_system_catalog_facts_async<'a>(
-        &'a self,
-        request: &'a ConnectorRequestContext,
-        catalog: &'a str,
-        include_tables: bool,
-    ) -> futures::future::BoxFuture<
-        'a,
-        Result<
-            Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
-            novarocks_sql::compiler::SqlCompileError,
-        >,
-    > {
-        Box::pin(async move {
-            assert_eq!(catalog, "default_catalog");
-            assert!(!include_tables, "schemata needs namespace facts only");
-            assert_eq!(request.deadline(), self.deadline);
-            assert!(
-                request.io_admission().is_some(),
-                "the original admission must reach the typed source"
-            );
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.result.clone().map(Some)
-        })
-    }
-    fn definition_system_catalog_facts(
-        &self,
-        _: &ConnectorRequestContext,
-        _: &str,
-        _: bool,
-    ) -> Result<
-        Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
-        novarocks_sql::compiler::SqlCompileError,
-    > {
-        panic!("the named MV system gate cannot use a synchronous fallback")
-    }
-    fn local_system_catalog_facts(
-        &self,
-    ) -> Result<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts, String>
-    {
-        panic!("the named MV system gate cannot use legacy String facts")
-    }
-    fn external_system_catalog_facts(
-        &self,
-        _: &ConnectorRequestContext,
-        _: &str,
-        _: bool,
-    ) -> Result<
-        Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
-        String,
-    > {
-        panic!("the named MV system gate cannot use legacy String facts")
-    }
-}
 fn system_definition(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
     let statements = novarocks_parser::parse(sql).unwrap();
     let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
@@ -536,90 +472,77 @@ fn assert_no_system_table_probe(resolver: &CountedResolver) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn original_system_gate_keeps_one_typed_observation_and_the_same_inline_memo() {
-    with_gate(|gate, context| Box::pin(async move {
-        let resolver = fixture(Some(absent()), Some(None));
-        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
-        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
-        let typed = Arc::new(DefinitionSystemFacts {
-            calls: AtomicUsize::new(0),
-            deadline: context.deadline(),
-            result: Ok(novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts {
-                catalog_name: "default_catalog".into(),
-                schema_names: vec!["db".into(), "other_db".into()],
-                table_names: Vec::new(),
-            }),
-        });
-        let materializer = CatalogServiceMaterializer::new(
-            Some("default_catalog"), &service, bindings.clone(),
-            iceberg_table_binding_loader(&resolver, context.clone()),
-        ).with_local_views(QueryViewService::new().catalog_snapshot().unwrap())
-            .with_system_relations(novarocks_query_application::system_catalog::SystemCatalogRelations::new(
-                typed.clone(),
-                Arc::new(novarocks_query_application::system_catalog::SystemCatalogService::with_defaults()),
-            ))
-            .with_definition_inputs(context.clone(), crate::application::test_constant_policy(), novarocks_sql::compiler::SqlCompileControl::unbounded());
-        let preparation = system_definition("SELECT * FROM information_schema.schemata");
-        let [need] = preparation.needs() else { panic!("one definition system need") };
-        assert!(need.is_definition_context());
-        let first = drive(gate, materializer.resolve_original_relation_fact(need, &resolver, context.clone(), gate)).await.unwrap();
-        let second_need = another_system_need();
-        assert_ne!(need.id(), second_need.id());
-        let second = drive(gate, materializer.resolve_original_relation_fact(&second_need, &resolver, context.clone(), gate)).await.unwrap();
-        assert_eq!(second.id(), second_need.id());
-        let (novarocks_sql::compiler::CatalogRelationOutcome::Inline(first_data), novarocks_sql::compiler::CatalogRelationOutcome::Inline(second_data)) = (first.outcome(), second.outcome()) else { panic!("actual system registry must return checked Inline facts") };
-        assert!(Arc::ptr_eq(first_data, second_data));
-        assert_eq!(typed.calls.load(Ordering::SeqCst), 1);
-        let columns = preparation.continue_catalog(vec![first].into_boxed_slice()).unwrap()
-            .analyze_view_definition(novarocks_sql::compiler::builtin_sql_function_catalog(), crate::application::test_constant_policy()).unwrap();
-        assert_eq!(columns.len(), 5);
-        assert_eq!(columns[0].name.as_ref(), "catalog_name");
-        assert_eq!(columns[4].name.as_ref(), "sql_path");
-        assert_eq!(columns[4].value_type.data_type(), &arrow::datatypes::DataType::Utf8);
-        assert!(columns[4].value_type.nullable());
-        assert!(columns[0].value_type.nullable());
-        assert_no_system_table_probe(&resolver);
-        assert!(bindings.captured_bindings().is_empty());
-    })).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn original_system_gate_memo_keeps_the_same_typed_source_without_table_or_string_fallback() {
-    with_gate(|gate, context| Box::pin(async move {
-        let resolver = fixture(Some(absent()), Some(None));
-        let service = crate::catalog_application::query_catalog::new_query_catalog_service();
-        let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
-        let original = novarocks_failure_contract::SharedFailureCause::new(ConnectorError::new(
-            ConnectorErrorKind::Unavailable, "original typed system namespace source",
-        ));
-        let typed = Arc::new(DefinitionSystemFacts {
-            calls: AtomicUsize::new(0),
-            deadline: context.deadline(),
-            result: Err(novarocks_sql::compiler::SqlCompileError::CompilationSource(original.clone())),
-        });
-        let materializer = CatalogServiceMaterializer::new(
-            Some("default_catalog"), &service, bindings.clone(),
-            iceberg_table_binding_loader(&resolver, context.clone()),
-        ).with_local_views(QueryViewService::new().catalog_snapshot().unwrap())
-            .with_system_relations(novarocks_query_application::system_catalog::SystemCatalogRelations::new(
-                typed.clone(),
-                Arc::new(novarocks_query_application::system_catalog::SystemCatalogService::with_defaults()),
-            ))
-            .with_definition_inputs(context.clone(), crate::application::test_constant_policy(), novarocks_sql::compiler::SqlCompileControl::unbounded());
-        let preparation = system_definition("SELECT * FROM information_schema.schemata");
-        let [need] = preparation.needs() else { panic!("one definition system need") };
-        for request in [need.clone(), another_system_need()] {
-            let error = drive(gate, materializer.resolve_original_relation_fact(&request, &resolver, context.clone(), gate)).await.unwrap_err();
-            // This typed SQL boundary uses the existing from_compile policy.
-            // Its source is not reclassified through the table Provider adapter.
-            assert_eq!(error.original_failure(), Some(&original));
-            assert_eq!(error.original_failure().unwrap().downcast_ref::<ConnectorError>().unwrap().kind(), ConnectorErrorKind::Unavailable);
-            assert!(matches!(error.compile_control_error(), Some(novarocks_type_contract::CompileControlError::Source(cause)) if cause == original));
-        }
-        assert_eq!(typed.calls.load(Ordering::SeqCst), 1);
-        assert_no_system_table_probe(&resolver);
-        assert!(bindings.captured_bindings().is_empty());
-    })).await;
+async fn original_system_gate_resolves_declarations_without_provider_data_work() {
+    with_gate(|gate, context| {
+        Box::pin(async move {
+            let resolver = fixture(Some(absent()), Some(None));
+            let service = crate::catalog_application::query_catalog::new_query_catalog_service();
+            let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+            let materializer = CatalogServiceMaterializer::new(
+                Some("default_catalog"),
+                &service,
+                bindings.clone(),
+                iceberg_table_binding_loader(&resolver, context.clone()),
+            )
+            .with_local_views(QueryViewService::new().catalog_snapshot().unwrap())
+            .with_system_relations(Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .unwrap(),
+            ));
+            let preparation = system_definition("SELECT * FROM information_schema.schemata");
+            let [need] = preparation.needs() else {
+                panic!("one definition system need");
+            };
+            let first = drive(
+                gate,
+                materializer.resolve_original_relation_fact(need, &resolver, context.clone(), gate),
+            )
+            .await
+            .unwrap();
+            let second_need = another_system_need();
+            assert_ne!(need.id(), second_need.id());
+            let second = drive(
+                gate,
+                materializer.resolve_original_relation_fact(
+                    &second_need,
+                    &resolver,
+                    context.clone(),
+                    gate,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(second.id(), second_need.id());
+            let (
+                novarocks_sql::compiler::CatalogRelationOutcome::SystemTable(Ok(first_data)),
+                novarocks_sql::compiler::CatalogRelationOutcome::SystemTable(Ok(second_data)),
+            ) = (first.outcome(), second.outcome())
+            else {
+                panic!("system registry must return declarations");
+            };
+            assert_eq!(first_data, second_data);
+            assert_eq!(first_data.binding.catalog_name(), "default_catalog");
+            let columns = preparation
+                .continue_catalog(vec![first].into_boxed_slice())
+                .unwrap()
+                .analyze_view_definition(
+                    novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    crate::application::test_constant_policy(),
+                )
+                .unwrap();
+            assert_eq!(columns.len(), 5);
+            assert_eq!(columns[0].name.as_ref(), "catalog_name");
+            assert_eq!(columns[4].name.as_ref(), "sql_path");
+            assert_eq!(
+                columns[4].value_type.data_type(),
+                &arrow::datatypes::DataType::Utf8
+            );
+            assert!(columns[4].value_type.nullable());
+            assert_no_system_table_probe(&resolver);
+            assert!(bindings.captured_bindings().is_empty());
+        })
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

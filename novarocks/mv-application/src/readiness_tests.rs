@@ -699,15 +699,6 @@ async fn a_table_this_process_holds_no_projection_for_is_not_an_mv() {
     );
 }
 
-fn local_inventory_bound() -> crate::repository::MvProjectionInventoryBound {
-    crate::repository::MvProjectionInventoryBound {
-        entries: 64,
-        snapshot_bytes: 16 * 1024 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-    }
-}
-
 #[tokio::test]
 async fn encoded_projection_over_one_mebibyte_remains_a_ready_candidate() {
     use crate::persistence::keyed_documents::StoredKeyedMvProjection;
@@ -774,10 +765,7 @@ async fn encoded_projection_over_one_mebibyte_remains_a_ready_candidate() {
         service.load_ready(&target()).await.unwrap(),
         Some(installed.clone())
     );
-    let mut candidates = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut candidates = service.projection_inventory().await.unwrap();
     assert_eq!(candidates.next_ready().await.unwrap(), Some(installed));
     assert!(candidates.next_ready().await.unwrap().is_none());
 }
@@ -789,10 +777,7 @@ async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_
         .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
-    let mut inventory = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut inventory = service.projection_inventory().await.unwrap();
     let old = repository
         .find_keyed_by_target(&target())
         .await
@@ -807,19 +792,13 @@ async fn bounded_inventory_reloads_replacement_and_requires_its_exact_installed_
         .await
         .unwrap();
     assert!(inventory.next_ready().await.unwrap().is_none());
-    let mut inventory = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut inventory = service.projection_inventory().await.unwrap();
     assert!(inventory.next_listable().await.unwrap().is_none());
     service
         .observe_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(2))
         .await
         .unwrap();
-    let mut inventory = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut inventory = service.projection_inventory().await.unwrap();
     let fresh = inventory.next_ready().await.unwrap().unwrap();
     assert_eq!(fresh.version, changed.version);
     assert_eq!(
@@ -836,14 +815,8 @@ async fn bounded_inventory_never_displays_a_projection_deleted_after_enumeration
         .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
-    let mut ready = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
-    let mut listable = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut ready = service.projection_inventory().await.unwrap();
+    let mut listable = service.projection_inventory().await.unwrap();
     let old = repository
         .find_keyed_by_target(&target())
         .await
@@ -869,10 +842,7 @@ async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_rea
         )
         .await
         .unwrap();
-    let mut listable = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut listable = service.projection_inventory().await.unwrap();
     let first = listable.next_listable().await.unwrap().unwrap();
     let expected = match service.runtime.readiness(&target()) {
         TargetReadiness::ReadOnly(reason) => reason,
@@ -882,19 +852,13 @@ async fn bounded_listable_inventory_preserves_exact_read_only_and_quarantine_rea
         first.manageability,
         MvListedManageability::ReadOnly(expected)
     );
-    let mut ready = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut ready = service.projection_inventory().await.unwrap();
     assert!(ready.next_ready().await.unwrap().is_none());
     service
         .invalidate_current(target(), "exact quarantine reason".into())
         .await
         .unwrap();
-    let mut listable = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut listable = service.projection_inventory().await.unwrap();
     assert_eq!(
         listable
             .next_listable()
@@ -918,10 +882,7 @@ async fn bounded_listing_preserves_large_reasons_without_a_decode_quota() {
         .invalidate_current(target(), reason.clone())
         .await
         .unwrap();
-    let mut inventory = service
-        .bounded_projection_inventory(local_inventory_bound())
-        .await
-        .unwrap();
+    let mut inventory = service.projection_inventory().await.unwrap();
     let listed = inventory.next_listable().await.unwrap().unwrap();
     let MvListedManageability::Unavailable(actual) = listed.manageability else {
         panic!("invalidated target must retain its unavailable reason");
@@ -943,7 +904,6 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         .unwrap();
     let loaded = service.load_ready(&target()).await.unwrap().unwrap();
     let bound = MvDependencyReadBound {
-        inventory: local_inventory_bound(),
         entries: 4096,
         collection_bytes: 4 * 1024 * 1024,
     };

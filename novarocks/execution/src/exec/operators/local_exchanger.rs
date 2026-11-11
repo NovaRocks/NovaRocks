@@ -672,6 +672,10 @@ impl LocalExchanger {
                     .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))
             })
             .transpose()?;
+        let position_file = matches!(
+            self.partition,
+            LocalExchangePartitionSpec::HierarchicalFileInput(_)
+        );
         for row in 0..chunk.len() {
             if row.is_multiple_of(256) {
                 ctx.checkpoint()?;
@@ -704,7 +708,15 @@ impl LocalExchanger {
                         .chunk_schema()
                         .slot(*slot)
                         .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))?;
-                    if signed.field_schema().value_type() != expected.value_type() {
+                    // A ChangeEvent envelope may allow NULL at the file root.
+                    // Hashing uses the required shard file type, which still rejects a NULL row.
+                    let matches = if position_file {
+                        signed.field_schema().kind() == expected.value_type().kind()
+                            && signed.data_type() == expected.data_type()
+                    } else {
+                        signed.field_schema().value_type() == expected.value_type()
+                    };
+                    if !matches {
                         return Err(ExecutionFailure::from_domain(LocalPartitionContract));
                     }
                     Ok(expected.clone())

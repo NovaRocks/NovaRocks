@@ -718,7 +718,8 @@ impl PhysicalExpressionRoots {
                             }
                         }
                     }
-                    NodeKind::Limit { .. }
+                    NodeKind::SystemRelation { .. }
+                    | NodeKind::Limit { .. }
                     | NodeKind::SetOp { .. }
                     | NodeKind::Repeat { .. }
                     | NodeKind::AssertOneRow(_)

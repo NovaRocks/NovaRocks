@@ -5,6 +5,10 @@ domain: [frontend-mv, provider-spi, frontend-durable-records, crate-boundary, sq
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0227
+    scope: "Background table retention of fixed candidate/thin-inventory/name/token limits; document, StateStore, identity and lifecycle rules remain active"
+    link: "ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md"
 partially-supersedes:
   - id: ADR-0180
     scope: "Ruling 1 document-version, aggregate-private-property and snapshot-record capacity quotas, and the first reevaluation trigger; inline storage, identity, request shapes, lifecycle, evidence and external rollback boundaries remain active"

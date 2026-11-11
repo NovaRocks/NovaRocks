@@ -38,7 +38,6 @@ use uuid::Uuid;
 pub mod command;
 pub mod create_table_ddl;
 pub mod iceberg_ref_command;
-pub mod information_schema;
 pub mod model;
 pub mod query_bindings;
 pub mod query_catalog;
@@ -46,7 +45,6 @@ pub mod query_materializer;
 pub mod resolver;
 pub mod statement;
 pub(crate) mod statement_action;
-pub mod system_catalog_facts;
 
 /// Frontend's narrow best-effort observation of its MV accelerator state.
 pub struct MvCatalogReferenceReader;

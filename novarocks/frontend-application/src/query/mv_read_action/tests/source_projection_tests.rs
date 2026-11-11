@@ -495,9 +495,9 @@ impl SourceFixture {
                     crate::catalog_application::query_catalog::new_query_catalog_service(),
                 );
                 let trc_controls = host.clone();
-                let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                    trc_catalog.clone(),
-                    trc_controls.clone(),
+                let trc_system_relations = std::sync::Arc::new(
+                    novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                        .expect("sealed declaration fixture"),
                 );
                 crate::capabilities::MvBackgroundPorts::new(
                     Arc::new(
@@ -520,9 +520,9 @@ impl SourceFixture {
             let trc_catalog =
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
             let trc_controls = host.clone();
-            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                trc_catalog.clone(),
-                trc_controls.clone(),
+            let trc_system_relations = std::sync::Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed declaration fixture"),
             );
             IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),

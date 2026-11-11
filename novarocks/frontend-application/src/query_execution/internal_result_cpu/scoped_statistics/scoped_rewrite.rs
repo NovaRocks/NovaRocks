@@ -115,7 +115,12 @@ impl InternalResultCpu {
         runtime: tokio::runtime::Handle,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Result<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>, WorkError> {
-        if !window.is_for_scope(scope) || !window.is_root_backed_internal() {
+        let authorized_window = match window.class() {
+            ResultWindowClass::Client | ResultWindowClass::Local => true,
+            ResultWindowClass::Internal => window.is_root_backed_internal(),
+            ResultWindowClass::Closing => false,
+        };
+        if !window.is_for_scope(scope) || !authorized_window {
             return Err(WorkError::Conflict);
         }
         scope.check()?;

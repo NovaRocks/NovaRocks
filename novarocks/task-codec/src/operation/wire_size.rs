@@ -50,10 +50,14 @@ fn bytes(tag: u32, len: usize) -> SizeResult {
     if len == 0 { Ok(0) } else { message(tag, len) }
 }
 fn envelope(value: OperationEnvelope) -> SizeResult {
-    // The original TaskOperationId is exactly one non-nil UUID-v7 byte field.
+    envelope_wait(value.max_wait())
+}
+fn envelope_wait(wait: MaxWait) -> SizeResult {
+    // Every original operation identity is one UUID-v7 byte field. Pricing
+    // this fixed representation does not mint or substitute an identity.
     add(
         message(1, message(1, 16)?)?,
-        uint(2, value.max_wait().get().as_millis() as u64),
+        uint(2, wait.get().as_millis() as u64),
     )
 }
 fn operation(value: OperationEnvelope, tag: u32, body: usize) -> SizeResult {
@@ -144,19 +148,39 @@ pub fn create(value: OperationEnvelope, fragment_len: usize, metadata_len: usize
         add(bytes(4, fragment_len)?, bytes(5, metadata_len)?)?,
     )
 }
-pub fn update(value: &UpdateTask, control: bool) -> SizeResult {
-    let mut body = message(1, task(value.identity())?)?;
-    for domain in value.domains() {
-        // The control encoder removes exactly the TaskDomainUpdate oneof
-        // wrapper, retaining each original CloseExchangeDestination message.
+fn update_body(identity: TaskIdentity, domains: &[TaskDomainUpdate], control: bool) -> SizeResult {
+    let mut body = message(1, task(identity)?)?;
+    for value in domains {
         let domain = if control {
-            close_destination(domain)?
+            close_destination(value)?
         } else {
-            task_domain(domain)?
+            task_domain(value)?
         };
         body = add(body, message(2, domain)?)?;
     }
-    operation(value.envelope(), if control { 7 } else { 3 }, body)
+    Ok(body)
+}
+pub fn update(value: &UpdateTask, control: bool) -> SizeResult {
+    operation(
+        value.envelope(),
+        if control { 7 } else { 3 },
+        update_body(value.identity(), value.domains(), control)?,
+    )
+}
+/// Exact one-item request size before the pending domain enters its queue.
+/// UpdateTask::try_new uses this same default wait and UUID representation;
+/// no request identity or allocation is created for a preview.
+pub fn pending_update(identity: TaskIdentity, domain: &TaskDomainUpdate) -> SizeResult {
+    let control = matches!(domain, TaskDomainUpdate::CloseExchangeDestination { .. });
+    let body = update_body(identity, std::slice::from_ref(domain), control)?;
+    let operation = add(
+        message(
+            1,
+            envelope_wait(MaxWait::default_for(OperationKind::UpdateTask))?,
+        )?,
+        message(if control { 7 } else { 3 }, body)?,
+    )?;
+    batch_item(operation)
 }
 pub fn cancel(value: CancelTask, control: bool) -> SizeResult {
     operation(

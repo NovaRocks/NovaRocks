@@ -344,6 +344,11 @@ pub(crate) struct CreationLengths {
     metadata: usize,
     assignment: usize,
 }
+impl CreationLengths {
+    pub(crate) const fn metadata_bytes(self) -> usize {
+        self.metadata
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreationSizing {
@@ -763,12 +768,6 @@ impl FrozenCreationParts {
     }
 }
 
-/// The plan-carrier bytes one creation holds: its fragment's static plan and
-/// its task assignment, which the backend bounds together.
-pub(crate) fn plan_carrier_bytes(fragment: &FragmentArtifact, lengths: CreationLengths) -> usize {
-    fragment.content().len().saturating_add(lengths.assignment)
-}
-
 /// What one create operation occupies in a frontend queue.
 ///
 /// The operation's own encoded length is exact and computed from the two
@@ -845,9 +844,6 @@ impl CreateTaskIntent {
             &self.original.parts.fragment,
             self.original.parts.lengths(),
         )
-    }
-    pub(crate) fn plan_carrier_bytes(&self) -> usize {
-        plan_carrier_bytes(&self.original.parts.fragment, self.original.parts.lengths())
     }
     #[cfg(test)]
     pub(crate) fn same_original(&self, other: &Self) -> bool {

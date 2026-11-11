@@ -47,6 +47,18 @@ pub struct LocalViewSnapshot {
     entries: Arc<HashMap<SessionViewKey, StoredView>>,
 }
 impl LocalViewSnapshot {
+    /// Names from this immutable statement snapshot; no live registry read.
+    pub fn names_in_namespace<'a>(
+        &'a self,
+        catalog: &'a str,
+        namespace: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.entries
+            .keys()
+            .filter(move |key| key.catalog == catalog && key.database == namespace)
+            .map(|key| key.view.as_str())
+    }
+
     pub fn get(
         &self,
         identity: &novarocks_types::naming::TableIdentity,
@@ -71,8 +83,8 @@ impl LocalViewSnapshot {
 /// The family therefore owns no persistent key prefix, and a restart starts
 /// from an empty registry.
 ///
-/// That is a capability ceiling, not a rejection: `CREATE VIEW`, `DROP VIEW`
-/// and `SHOW VIEWS` behave as before within one process. A deployment that
+/// `CREATE VIEW` and `DROP VIEW` use this process-local registry; catalog
+/// enumeration reads an immutable snapshot of it. A deployment that
 /// needs durable views defines them in an external catalog, whose provider owns
 /// them as its own truth.
 pub struct QueryViewService {
@@ -144,6 +156,7 @@ impl QueryViewService {
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let local_views = self.catalog_snapshot()?;
         let parts = view_object_name_parts(&create_view.name);
+        crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
@@ -200,6 +213,7 @@ impl QueryViewService {
         context: ViewRequestContext<'_>,
     ) -> Result<ViewStatementResult, crate::api::CommandError> {
         let parts = view_object_name_parts(&drop_view.name);
+        crate::view_iceberg::require_mutable_view_target(&parts, context)?;
         if let Some(target) =
             crate::view_iceberg::resolve_external_target_parts(engine, &parts, context)?
         {
@@ -211,61 +225,6 @@ impl QueryViewService {
             )?)?;
         }
         Ok(ViewStatementResult::Ok)
-    }
-
-    fn prepare_show_views_input(
-        &self,
-        show_views: &novarocks_parser::ast::ShowViews,
-        context: ViewRequestContext<'_>,
-    ) -> Result<crate::view::PreparedShowViews, String> {
-        let database = show_views
-            .database
-            .as_ref()
-            .and_then(|database| view_object_name_parts(database).last().cloned())
-            .unwrap_or_else(|| context.current_database.to_string());
-        let normalized_database = normalize_identifier(&database)?;
-        let active_external_catalog = context
-            .current_catalog
-            .filter(|catalog| !catalog.eq_ignore_ascii_case(DEFAULT_CATALOG));
-        let source = match active_external_catalog {
-            Some(catalog) => {
-                let catalog = normalize_identifier(catalog)?;
-                context.connector_context.ok_or_else(|| {
-                    "SHOW VIEWS for an external catalog requires connector request context"
-                        .to_string()
-                })?;
-                crate::view::ShowViewsSource::External {
-                    catalog,
-                    namespace: normalized_database,
-                }
-            }
-            None => {
-                // Each name is counted against the local result bound before
-                // it is cloned out of the registry.
-                let bound = crate::api::LocalResultBound::V1;
-                let registry = self
-                    .registry
-                    .read()
-                    .map_err(|error| format!("view registry read lock: {error}"))?;
-                let mut names = Vec::new();
-                let mut bytes = 0_usize;
-                for key in registry.keys().filter(|key| {
-                    key.catalog == DEFAULT_CATALOG && key.database == normalized_database
-                }) {
-                    bytes = bytes
-                        .saturating_add(crate::api::LocalResultBound::cell_bytes(key.view.len()));
-                    bound
-                        .admit(names.len() + 1, bytes)
-                        .map_err(|error| format!("SHOW VIEWS: {error}"))?;
-                    names.push(key.view.clone());
-                }
-                crate::view::ShowViewsSource::Local(names)
-            }
-        };
-        Ok(crate::view::PreparedShowViews {
-            column_name: format!("Views_in_{database}"),
-            source,
-        })
     }
 
     fn registry_snapshot(&self) -> Result<Arc<HashMap<SessionViewKey, StoredView>>, String> {
@@ -283,14 +242,6 @@ impl ViewService for QueryViewService {
         })
     }
 
-    fn prepare_show_views(
-        &self,
-        statement: &novarocks_parser::ast::ShowViews,
-        context: ViewRequestContext<'_>,
-    ) -> Result<crate::view::PreparedShowViews, String> {
-        self.prepare_show_views_input(statement, context)
-    }
-
     fn execute_statement(
         &self,
         engine: &dyn ViewEngine,
@@ -300,9 +251,6 @@ impl ViewService for QueryViewService {
         match statement {
             ViewStatement::Create(create_view) => self.handle_create(engine, create_view, context),
             ViewStatement::Drop(drop_view) => self.handle_drop(engine, drop_view, context),
-            ViewStatement::Show(_) => Err("SHOW VIEWS requires its original governed read source"
-                .to_string()
-                .into()),
             ViewStatement::ShowCreate(show_create) => {
                 crate::view_iceberg::show_create_view(engine, &show_create.name, context)
             }

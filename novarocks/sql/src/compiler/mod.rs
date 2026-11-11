@@ -1684,13 +1684,15 @@ pub use crate::explain::completed::{
 pub use crate::explain::completed_tree::render_completed_plan_tree;
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{
-    FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_needs,
+    FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_inputs,
+    collect_provider_needs,
 };
 use completion_driver::{
     SqlCatalogCompletionState, SqlMaterializedViewCompletionState, SqlProviderReadCompletionState,
     SqlStatisticsCompletionState, resume_catalog, resume_materialized_view, resume_provider_read,
     resume_statistics,
 };
+pub(crate) use system_table_completion::install as install_system_table_snapshots;
 
 impl SqlCompiler {
     pub fn analyze(
@@ -3905,6 +3907,7 @@ mod completion_predicate;
 pub(crate) mod root_output;
 mod root_render_type;
 mod root_scalar_type;
+mod system_table_completion;
 pub use completion::*;
 pub use root_render_type::{
     ClientRenderSchemaError, RenderFamilyRequest, client_render_schema,
@@ -4008,6 +4011,3 @@ mod binding_value_type_source_properties {
 
 #[cfg(test)]
 mod decimal_largeint_refusal_tests;
-
-#[cfg(test)]
-mod inline_relation_tests;

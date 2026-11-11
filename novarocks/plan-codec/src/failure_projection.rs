@@ -73,6 +73,8 @@ enum CodecReason {
     EncodeInvalid = 39,
     EncodeSourceModel = 41,
     EncodeInvalidSource = 42,
+    SystemRelationShape = 43,
+    SystemRelationResource = 44,
 }
 impl CodecReason {
     fn fact(self, class: FailureClass) -> FailureFact {
@@ -410,6 +412,7 @@ impl FailureProjection for crate::physical_package_v2::PackageDecodeError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Control(source) => source.failure_fact(),
+            Self::SystemRelation(source) => source.failure_fact(),
             Self::Wire(source) => source.failure_fact(),
             Self::Metadata(source) => source.failure_fact(),
             Self::Type(source) => source.failure_fact(),
@@ -691,6 +694,7 @@ impl FailureProjection for crate::physical_package_v2::PackageEncodeError {
     fn failure_fact(&self) -> FailureFact {
         match self {
             Self::Control(source) => source.failure_fact(),
+            Self::SystemRelation(source) => source.failure_fact(),
             Self::Source(source) => source.failure_fact(),
             Self::Provider(source) => source.failure_fact(),
             Self::Metadata(source) => source.failure_fact(),
@@ -711,6 +715,25 @@ impl FailureProjection for crate::physical_package_v2::PackageEncodeError {
             Self::ExpressionControl(source) => source.failure_fact(),
             Self::Scan(source) => source.failure_fact(),
             Self::Writer(source) => source.failure_fact(),
+        }
+    }
+}
+
+impl FailureProjection for crate::physical_package_v2::SystemRelationError {
+    fn failure_fact(&self) -> FailureFact {
+        use crate::physical_package_v2::SystemRelationError as E;
+        match self {
+            E::Deferred => CodecReason::SystemRelationShape.fact(FailureClass::Invariant),
+            E::Control(e) => e.failure_fact(),
+            E::Kernel(e) => e.failure_fact(),
+            E::Constant(e) => e.failure_fact(),
+            E::Layout(_)
+            | E::Geometry(
+                novarocks_arrow_batch_codec::record_geometry::GeometryError::ResourceExhausted,
+            ) => CodecReason::SystemRelationResource.fact(FailureClass::Resource),
+            E::Invalid(_) | E::Arrow(_) | E::Geometry(_) => {
+                CodecReason::SystemRelationShape.fact(FailureClass::Data)
+            }
         }
     }
 }

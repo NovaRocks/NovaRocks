@@ -31,7 +31,6 @@ use super::{Fold, Literal, ObjectName, Query, Visit};
 pub enum ViewStatement {
     Create(CreateView),
     Drop(DropView),
-    Show(ShowViews),
     ShowCreate(ShowCreateView),
 }
 
@@ -40,7 +39,6 @@ impl ViewStatement {
         match self {
             Self::Create(value) => value.span,
             Self::Drop(value) => value.span,
-            Self::Show(value) => value.span,
             Self::ShowCreate(value) => value.span,
         }
     }
@@ -70,12 +68,6 @@ pub struct DropView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowViews {
-    pub database: Option<ObjectName>,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShowCreateView {
     pub name: ObjectName,
     pub span: Span,
@@ -85,7 +77,6 @@ pub(crate) fn write_sql(statement: &ViewStatement, output: &mut String) {
     match statement {
         ViewStatement::Create(value) => write_create(value, output),
         ViewStatement::Drop(value) => write_drop(value, output),
-        ViewStatement::Show(value) => write_show(value, output),
         ViewStatement::ShowCreate(value) => {
             output.push_str("SHOW CREATE VIEW ");
             output.push_str(&print_object_name(&value.name));
@@ -119,14 +110,6 @@ fn write_drop(value: &DropView, output: &mut String) {
     output.push_str(&print_object_name(&value.name));
 }
 
-fn write_show(value: &ShowViews, output: &mut String) {
-    output.push_str("SHOW VIEWS");
-    if let Some(database) = &value.database {
-        output.push_str(" FROM ");
-        output.push_str(&print_object_name(database));
-    }
-}
-
 pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement) {
     match statement {
         ViewStatement::Create(value) => {
@@ -137,11 +120,6 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &ViewStatement
             visitor.visit_query(&value.query);
         }
         ViewStatement::Drop(value) => visitor.visit_object_name(&value.name),
-        ViewStatement::Show(value) => {
-            if let Some(database) = &value.database {
-                visitor.visit_object_name(database);
-            }
-        }
         ViewStatement::ShowCreate(value) => visitor.visit_object_name(&value.name),
     }
 }
@@ -157,12 +135,6 @@ pub(crate) fn fold<F: Fold + ?Sized>(folder: &mut F, statement: ViewStatement) -
         ViewStatement::Drop(mut value) => {
             value.name = folder.fold_object_name(value.name);
             ViewStatement::Drop(value)
-        }
-        ViewStatement::Show(mut value) => {
-            value.database = value
-                .database
-                .map(|database| folder.fold_object_name(database));
-            ViewStatement::Show(value)
         }
         ViewStatement::ShowCreate(mut value) => {
             value.name = folder.fold_object_name(value.name);

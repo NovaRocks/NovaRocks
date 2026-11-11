@@ -505,7 +505,7 @@ impl ConnectorMetadata for IcebergMetadata {
         self.ensure_owner(&request.instance_id)?;
         let namespaces = self
             .runtime
-            .list_namespaces_for_request(&request.context, request.bound);
+            .list_namespaces_for_request(&request.context, request.page_size);
         self.validate_context(&request.context)?;
         namespaces
             .map_err(classified_control_error)?
@@ -530,7 +530,7 @@ impl ConnectorMetadata for IcebergMetadata {
             self.ensure_owner(&request.instance_id)?;
             let namespaces = self
                 .runtime
-                .list_namespaces_for_request_async(&request.context, request.bound)
+                .list_namespaces_for_request_async(&request.context, request.page_size)
                 .await;
             self.validate_context(&request.context)?;
             namespaces
@@ -639,7 +639,7 @@ impl ConnectorMetadata for IcebergMetadata {
         let tables = self.runtime.list_tables_for_request(
             &request.namespace.namespace,
             &request.context,
-            request.bound,
+            request.page_size,
         );
         self.validate_context(&request.context)?;
         tables
@@ -668,7 +668,7 @@ impl ConnectorMetadata for IcebergMetadata {
                 .list_tables_for_request_async(
                     &request.namespace.namespace,
                     &request.context,
-                    request.bound,
+                    request.page_size,
                 )
                 .await;
             self.validate_context(&request.context)?;
@@ -4812,7 +4812,7 @@ mod plan_splits_pruning_tests {
         }
         async fn list_namespaces(
             &self,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_namespaces(bound).await
         }
@@ -4825,7 +4825,7 @@ mod plan_splits_pruning_tests {
         async fn list_tables(
             &self,
             name: crate::catalog::CatalogNamespaceName,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_tables(name, bound).await
         }
@@ -4851,7 +4851,7 @@ mod plan_splits_pruning_tests {
         async fn list_views(
             &self,
             name: crate::catalog::CatalogNamespaceName,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_views(name, bound).await
         }

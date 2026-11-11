@@ -6,6 +6,9 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
+  - id: ADR-0227
+    scope: "SDK-listing fixed page/name/token capacity rejection and the OpenDAL 16 MiB list-response limit; public APIs, no-accounting-fork and actual-exit rules remain active"
+    link: "ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md"
   - id: ADR-0204
     scope: "Patch allowlist: remove paimon while its provider is suspended; no accounting forks and registry identity rules remain active"
     link: "ADR-0204-upstream-iceberg-backports-and-provider-suspension.md"
@@ -23,7 +26,6 @@ code-anchors:
   - "novarocks/worker/src/guarded_bytes.rs (bytes_with_exit_guard)"
   - "novarocks/execution/src/exec/chunk/root_array_storage.rs (ARROW_BUFFER_OWNER_METADATA_BOUND)"
   - "novarocks/connector/iceberg/src/catalog/listing_admission.rs (ListingAdmission)"
-  - "novarocks/fs/src/list_body_limit.rs (ListBodyLimitFetch)"
   - "novarocks/connector/iceberg/src/metadata.rs (frozen_copy_on_write_source_payload)"
   - "vendor/iceberg-0.11.0/src/spec/table_metadata.rs (TableMetadata::serialize)"
   - "novarocks/connector/iceberg/src/rest_protocol/mod.rs (Connector-owned REST request vocabulary)"

@@ -128,7 +128,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
 
     async fn list_namespaces(
         &self,
-        _bound: novarocks_spi::connector::ConnectorListingBound,
+        _bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
@@ -143,7 +143,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_tables(
         &self,
         _namespace: CatalogNamespaceName,
-        _bound: novarocks_spi::connector::ConnectorListingBound,
+        _bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }
@@ -175,7 +175,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn list_views(
         &self,
         _namespace: CatalogNamespaceName,
-        _bound: novarocks_spi::connector::ConnectorListingBound,
+        _bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.read()
     }

@@ -94,7 +94,7 @@ pub use noop_sink::NoopSinkFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;
 pub use result_buffer_sink::ResultBufferSinkFactory;
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) use result_sink::{ResultSinkBuffer, ResultSinkFactory};
 pub use root_result_sink::RootResultSinkFactory;
 pub(crate) use setop::UnionAllSharedState;

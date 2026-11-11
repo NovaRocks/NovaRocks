@@ -1183,7 +1183,10 @@ impl GovernedStatementResidual for MutationResidual {
 pub(crate) fn prepare(
     kernel: crate::query_execution::kernels::DmlExecutionKernel,
     input: MutationStatementInput,
-) -> Result<Box<dyn GovernedStatementAction>, String> {
+) -> Result<
+    Box<dyn GovernedStatementAction>,
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let root = input
         .context
         .execution()

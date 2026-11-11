@@ -37,8 +37,10 @@ use novarocks_physical_plan::{
 };
 #[cfg(test)]
 use novarocks_plan_codec::physical_package_v2::PackageDecodeLimits;
+#[cfg(test)]
+use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
 use novarocks_plan_codec::physical_package_v2::{
-    PackageEncodeError, PackageEncodeLimits, encode_fragment_package,
+    PackageEncodeError, PackageEncodeLimits, encode_fragment_package_with_creator,
 };
 use novarocks_plan_codec::resource_preflight_v2::{
     DecodeProjectionLimits, FragmentDecodeResourceModel, ResourceModelError,
@@ -305,6 +307,7 @@ pub(crate) fn extract_checked_packages(
 }
 
 /// The exact wire bytes of one checked package.
+#[cfg(test)]
 pub(crate) fn encode_checked_package(
     package: &FragmentPackage,
     carrier: &CompiledPackageCarrier,
@@ -321,6 +324,37 @@ pub(crate) fn encode_checked_package(
     // Qualify these exact final bytes before any Native artifact/Task exists.
     // The original statement owns control and progress; the model is startup
     // metadata and grants neither a resource budget nor a dispatch capability.
+    carrier
+        .receiver_model
+        .preflight(&bytes, carrier.receiver_limits, control)?;
+    Ok(bytes)
+}
+
+/// Original caller-funded wire projection, including the final prost Vec.
+pub(crate) fn encode_checked_package_with_creator(
+    package: &FragmentPackage,
+    carrier: &CompiledPackageCarrier,
+    control: &dyn PureCompileControl,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, CompileControlError>,
+) -> Result<Vec<u8>, PackageFreezeError> {
+    use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
+    let wire = encode_fragment_package_with_creator(package, carrier.limits(), creation, control)
+        .map_err(|error| match error {
+        ProjectionFailure::Host(cause)
+        | ProjectionFailure::Codec(PackageEncodeError::Control(cause)) => {
+            PackageFreezeError::Control(cause)
+        }
+        ProjectionFailure::Codec(other) => PackageFreezeError::Encode(other),
+    })?;
+    let layout = std::alloc::Layout::array::<u8>(wire.encoded_len()).map_err(|_| {
+        PackageFreezeError::Control(CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        ))
+    })?;
+    creation
+        .request_layout(layout)
+        .map_err(PackageFreezeError::Control)?;
+    let bytes = wire.encode_to_vec();
     carrier
         .receiver_model
         .preflight(&bytes, carrier.receiver_limits, control)?;

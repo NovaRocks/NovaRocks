@@ -1541,6 +1541,34 @@ impl Rule for ValuesToPhysical {
     }
 }
 
+/// Declaration-only metadata leaf; provider completion supplies data later.
+pub(crate) struct SystemTableToPhysical;
+impl Rule for SystemTableToPhysical {
+    fn name(&self) -> &str {
+        "SystemTableToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalSystemTable(_))
+    }
+    fn apply(
+        &self,
+        expr: &MExpr,
+        _memo: &mut Memo,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let Operator::LogicalSystemTable(table) = &expr.op else {
+            return Ok(vec![]);
+        };
+        Ok(vec![NewExpr {
+            op: Operator::PhysicalSystemTable(table.clone()),
+            children: expr.children.clone(),
+        }])
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 17. GenerateSeriesToPhysical
 // ---------------------------------------------------------------------------

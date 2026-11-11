@@ -33,7 +33,8 @@ pub use application::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
     CatalogConfigurationAdmission, CatalogConfigurationObservation, CatalogCreateCommand,
     CatalogDropCommand, CatalogMutationCommitted, CatalogMutationReceipt,
-    CatalogRuntimeObservation, CatalogRuntimePublisherSink,
+    CatalogRuntimeObservation, CatalogRuntimePublisherSink, validate_catalog_create_name,
+    validate_catalog_drop_name,
 };
 pub use attachment::CatalogReferenceReader;
 pub use attachment::{

@@ -132,9 +132,18 @@ impl CatalogCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, CommandError> {
         match command {
             CatalogSqlCommand::CreateCatalog(command) => {
+                let instance = ConnectorInstanceId::parse(&normalize_identifier(&command.name)?)
+                    .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
+                novarocks_catalog_application::validate_catalog_create_name(&instance).map_err(
+                    |error| {
+                        CommandError::from_failure_cause(
+                            novarocks_failure_contract::SharedFailureCause::new(error),
+                        )
+                    },
+                )?;
                 self.execute_create_catalog(lower_semantic_create_catalog(command)?)
             }
             CatalogSqlCommand::DropCatalog { name, if_exists } => {
@@ -183,10 +192,10 @@ impl CatalogCommandExecutor {
                 connector_context,
             ),
             CatalogSqlCommand::TruncateTable { .. } => {
-                Err("TRUNCATE belongs to the DML lifecycle executor".to_string())
+                Err(("TRUNCATE belongs to the DML lifecycle executor".to_string()).into())
             }
             CatalogSqlCommand::CreateTable(_) | CatalogSqlCommand::AlterIcebergTable(_) => {
-                Err("catalog command belongs to a dedicated semantic adapter".to_string())
+                Err(("catalog command belongs to a dedicated semantic adapter".to_string()).into())
             }
         }
     }
@@ -227,7 +236,7 @@ impl CatalogCommandExecutor {
         current_catalog: Option<&str>,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, CommandError> {
         match &command.action {
             IcebergTableSqlAction::Schema(change) => execute_alter_iceberg_schema(
                 self,
@@ -257,11 +266,12 @@ impl CatalogCommandExecutor {
                 current_database,
                 connector_context,
             ),
-            IcebergTableSqlAction::Reference(_) => {
-                Err("Iceberg reference command belongs to the ref command executor".to_string())
-            }
+            IcebergTableSqlAction::Reference(_) => Err(
+                ("Iceberg reference command belongs to the ref command executor".to_string())
+                    .into(),
+            ),
             IcebergTableSqlAction::AddFiles { .. } => {
-                Err("ADD FILES belongs to the DML lifecycle executor".to_string())
+                Err(("ADD FILES belongs to the DML lifecycle executor".to_string()).into())
             }
         }
     }
@@ -269,13 +279,15 @@ impl CatalogCommandExecutor {
     fn execute_create_catalog(
         &self,
         command: CatalogCreateCommand,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, CommandError> {
         let application = self.catalog_application.as_ref().ok_or_else(|| {
             "catalog statements require a configured frontend catalog application".to_string()
         })?;
-        application
-            .create_catalog(command)
-            .map_err(|error| error.to_string())?;
+        application.create_catalog(command).map_err(|error| {
+            CommandError::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(
+                error,
+            ))
+        })?;
         Ok(StatementResult::Ok)
     }
 }
@@ -316,7 +328,7 @@ fn execute_alter_iceberg_properties(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -332,7 +344,8 @@ fn execute_alter_iceberg_properties(
     )?;
     if target.provider_id.as_str() != "iceberg" {
         return Err(
-            "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
+            ("ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string())
+                .into(),
         );
     }
     let changes = match statement.op {
@@ -382,7 +395,7 @@ fn execute_alter_iceberg_schema(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &statement.table,
@@ -539,7 +552,7 @@ fn execute_alter_partition_spec(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_table_target(
         executor,
         &table_name,
@@ -547,10 +560,11 @@ fn execute_alter_partition_spec(
         current_database,
     )?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "ALTER TABLE ADD/DROP PARTITION COLUMN only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         executor.connector_control.as_ref(),
@@ -664,7 +678,7 @@ fn execute_show_create_table(
     current_catalog: Option<&str>,
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, CommandError> {
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &table_name,
@@ -672,10 +686,11 @@ fn execute_show_create_table(
         current_database,
     )?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "SHOW CREATE TABLE only supports Iceberg tables, got `{}` backend",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     let instance_id =
         ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
@@ -699,8 +714,9 @@ fn execute_show_create_table(
         .map_err(|error| error.to_string())?;
     if loaded.identity != identity || loaded.table.owner() != &identity.instance_id {
         return Err(
-            "SHOW CREATE TABLE received corrupt metadata for a different connector table"
-                .to_string(),
+            ("SHOW CREATE TABLE received corrupt metadata for a different connector table"
+                .to_string())
+            .into(),
         );
     }
     let ddl =
@@ -710,7 +726,7 @@ fn execute_show_create_table(
         vec![vec![target.table.clone(), ddl]],
     )
     .map(StatementResult::Query)
-    .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))
+    .map_err(|error| CommandError::from(format!("build SHOW CREATE TABLE result failed: {error}")))
 }
 
 #[cfg(test)]

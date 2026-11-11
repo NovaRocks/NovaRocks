@@ -63,7 +63,8 @@ const REQUIRED_BACKENDS: usize = 3;
 const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 const ORDINARY_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskOperations";
 const CONTROL_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations";
-const ORDINARY_BATCH_MAX: usize = 48 * 1024 * 1024;
+// Historical batching target: a larger legal request must still be accepted.
+const FORMER_ORDINARY_BATCH_TARGET: usize = 48 * 1024 * 1024;
 const ORDINARY_FRAME_MAX: usize = 64 * 1024 * 1024;
 const CONTROL_FRAME_MAX: usize = 1024 * 1024;
 
@@ -263,7 +264,11 @@ impl Scenario for QueryMessageBounds {
             .context("heartbeat omitted admission epoch")?;
         let binary =
             raw_acquire_admission_ticket(raw_participation(backend), compatibility_id, epoch);
-        for (size, accepted) in [(ORDINARY_BATCH_MAX, true), (ORDINARY_BATCH_MAX + 1, false)] {
+        for size in [
+            FORMER_ORDINARY_BATCH_TARGET,
+            FORMER_ORDINARY_BATCH_TARGET + 1,
+            ORDINARY_FRAME_MAX,
+        ] {
             let request = pad_ordinary(binary.clone(), size)?;
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
                 raw_unary_response(
@@ -273,30 +278,47 @@ impl Scenario for QueryMessageBounds {
                     request,
                     context.deadline(),
                 )?;
-            if accepted {
-                ensure!(
-                    response.grpc_status == 0
-                        && response
-                            .message
-                            .as_ref()
-                            .is_some_and(|body| body.receipts.len() == 1),
-                    "legal near-limit ordinary request failed: status={} detail={:?}",
-                    response.grpc_status,
-                    response.grpc_message
-                );
-            } else {
-                ensure!(
-                    response.grpc_status == tonic::Code::ResourceExhausted as u16,
-                    "over-limit ordinary request was not rejected: status={} detail={:?}",
-                    response.grpc_status,
-                    response.grpc_message
-                );
-            }
+            ensure!(
+                response.grpc_status == 0
+                    && response
+                        .message
+                        .as_ref()
+                        .is_some_and(|body| body.receipts.len() == 1),
+                "legal ordinary request failed: status={} detail={:?}",
+                response.grpc_status,
+                response.grpc_message
+            );
             context.action(format!(
-                "ordinary batch encoded_bytes={size} accepted={accepted} grpc_status={}",
+                "ordinary batch encoded_bytes={size} accepted=true grpc_status={}",
                 response.grpc_status
             ));
         }
+        // A declared over-limit gRPC frame can be refused by tonic before its
+        // body is consumed. Use the real HTTP body gate's Content-Length path
+        // for this distinct ingress claim: M+1 payload plus five framing bytes.
+        let mut size_probe = RawUnaryConnection::connect_until(&connector, context.deadline())?;
+        let size_client = size_probe.client();
+        let rejection = size_client.header_rejection_until(
+            ORDINARY_PATH,
+            &authorization,
+            "content-length",
+            &(ORDINARY_FRAME_MAX + 6).to_string(),
+            context.deadline(),
+        );
+        drop(size_client);
+        let over_ordinary =
+            super::native_compatibility::combine_raw_cleanup(rejection, size_probe.close())?;
+        ensure!(
+            over_ordinary.code() == tonic::Code::ResourceExhausted
+                && over_ordinary
+                    .metadata()
+                    .get("x-novarocks-ingress-rejection")
+                    == Some(&tonic::metadata::MetadataValue::from_static("body_limit")),
+            "ordinary over-limit body lost the typed ingress rejection: {over_ordinary}"
+        );
+        context.action(
+            "ordinary over-limit Content-Length returned ResourceExhausted/body_limit before DATA",
+        );
 
         let control = proto::TaskControlOperation {
             envelope: Some(raw_operation_envelope(15_000)),
@@ -2243,7 +2265,7 @@ fn padding_len(target: usize, base: usize) -> Result<usize> {
     );
     // Field 2047 has a two-byte key. A nonempty bytes field also has a
     // varint length. Solve that small self-reference without allocating the
-    // potentially 48 MiB padding on each candidate.
+    // potentially large padding on each candidate.
     let mut length = target - base - 3;
     for _ in 0..3 {
         let actual = base + 2 + varint_len(length) + length;

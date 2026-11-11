@@ -340,6 +340,7 @@ fn collect_plan_column_ids(plan: &LogicalPlanNode, max_id: &mut u32) {
             }
             collect_output_columns(&sort.output_columns, max_id);
         }
+        LogicalPlanKind::SystemTable(table) => collect_output_columns(&table.columns, max_id),
         LogicalPlanKind::Values(values) => {
             collect_output_columns(&values.columns, max_id);
             for row in &values.rows {

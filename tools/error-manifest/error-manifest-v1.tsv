@@ -42,8 +42,10 @@ sql.analyze.missing_column_name	Analyze
 sql.analyze.too_many_arguments	Analyze
 sql.analyze.type_mismatch	Analyze
 sql.analyze.unavailable_implementation	Analyze
+sql.analyze.unknown_catalog	Analyze
 sql.analyze.unknown_column	Analyze
 sql.analyze.unknown_function	Analyze
+sql.analyze.unknown_schema	Analyze
 sql.analyze.unknown_table	Analyze
 sql.analyze.unsupported_expression	Analyze
 sql.analyze.unsupported_query_shape	Analyze

@@ -88,6 +88,10 @@ pub struct DecodeProjectionLimits {
 pub struct DecodeResourceUsage {
     pub input_bytes: usize,
     pub root_inline_bytes: usize,
+    /// Exact top-level snapshot field spans, including their protobuf framing.
+    pub system_relation_input_bytes: usize,
+    /// Original generated-layout request contribution of those data fields.
+    pub system_relation_requested_heap_bytes_upper: usize,
     pub message_occurrences: usize,
     pub scalar_elements: usize,
     pub field_occurrences: usize,
@@ -143,6 +147,10 @@ impl FragmentDecodeResourceModel {
             let schema = schema::build::<
                 novarocks_proto_models::physical_package_v2::FragmentPackage,
             >(&mut work)?;
+            // The generated-schema author has completed its graph. Observe
+            // that exact tail before handing it to the separate depth author,
+            // using the same original control and accumulated work scope.
+            work.flush()?;
             let max_message_depth = scan::message_depth(&schema, &mut work)?;
             Ok(Self {
                 schema,

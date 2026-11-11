@@ -17,7 +17,6 @@
 
 //! Frontend adapter bound to the MV background runtime.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
@@ -25,12 +24,7 @@ use novarocks_mv_application::maintenance::{
     MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
 use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOccurrence};
-use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
-use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use novarocks_spi::connector::ConnectorRequestContext;
-
-type SourceRevisionKey = (String, String, String, Vec<u8>);
-type SourceRevision = (ObjectIdentity, NativeDataVersion);
 
 pub(crate) fn maintenance_facts_from_stats(
     stats: crate::mv::domain::maintenance::stats::TableMaintenanceStats,
@@ -66,111 +60,96 @@ pub(crate) async fn current_source_inputs_in(
     factory: &crate::mv::domain::staged_create::CurrentProjectionMetadataCpu,
     capture: &Arc<crate::mv::domain::staged_create::CurrentMetadataCapture>,
 ) -> Result<Vec<PublicationInput>, MvBackgroundEngineError> {
-    use novarocks_spi::connector::{
-        ConnectorControlResolver, ConnectorInstanceId, ConnectorReadSelector,
-        ConnectorTableIdentity, ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
-        ConnectorTableResolution,
+    let source = BackgroundCapture {
+        ports,
+        factory,
+        capture,
     };
-    let provider_error = |error: novarocks_spi::connector::ConnectorError| {
-        let cause = crate::mv::domain::readiness::connector_failure_cause(error);
-        MvBackgroundEngineError::new(
-            MvBackgroundEngineErrorKind::TransientUnavailable,
-            cause.detail(),
+    let observations =
+        crate::mv::domain::freshness::observe_current_sources(&source, occurrences, context)
+            .await
+            .map_err(provider_error)?;
+    scheduler_inputs(occurrences, observations)
+}
+
+fn provider_error(
+    error: crate::mv::domain::freshness::CurrentSourceObservationError,
+) -> MvBackgroundEngineError {
+    let kind = if matches!(
+        &error,
+        crate::mv::domain::freshness::CurrentSourceObservationError::Definition(_)
+    ) {
+        MvBackgroundEngineErrorKind::InvalidDefinition
+    } else {
+        MvBackgroundEngineErrorKind::TransientUnavailable
+    };
+    let error = error.into_connector();
+    let cause = crate::mv::domain::readiness::connector_failure_cause(error);
+    MvBackgroundEngineError::new(kind, cause.detail()).with_original_failure(cause)
+}
+
+struct BackgroundCapture<'a> {
+    ports: &'a IcebergMvCorePorts,
+    factory: &'a crate::mv::domain::staged_create::CurrentProjectionMetadataCpu,
+    capture: &'a Arc<crate::mv::domain::staged_create::CurrentMetadataCapture>,
+}
+#[async_trait::async_trait]
+impl crate::mv::domain::freshness::CurrentSourceCapture for BackgroundCapture<'_> {
+    async fn observe(
+        &self,
+        table: novarocks_spi::connector::ConnectorTableIdentity,
+        context: &ConnectorRequestContext,
+    ) -> Result<
+        novarocks_mv_application::freshness::MvSourceState,
+        crate::mv::domain::freshness::CurrentSourceObservationError,
+    > {
+        let pin = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            self.ports.connector_control(),
+            &table.instance_id,
+        )?;
+        crate::mv::domain::freshness::observe_current_source_with_pin(
+            &pin,
+            self.ports.storage_observation(),
+            self.factory,
+            self.capture,
+            table,
+            context,
         )
-        .with_original_failure(cause)
-    };
-    let mut revisions: BTreeMap<SourceRevisionKey, SourceRevision> = BTreeMap::new();
-    let mut inputs = Vec::with_capacity(occurrences.len());
-    for occurrence in occurrences {
-        let table = ConnectorTableIdentity {
-            instance_id: ConnectorInstanceId::parse(&occurrence.catalog_at_binding).map_err(
-                |error| {
-                    MvBackgroundEngineError::new(
-                        MvBackgroundEngineErrorKind::InvalidDefinition,
-                        error.to_string(),
-                    )
-                },
-            )?,
-            namespace: occurrence.namespace_at_binding.clone().into(),
-            table: occurrence.relation_at_binding.clone().into(),
-        };
-        let key = (
-            occurrence.catalog_at_binding.clone(),
-            occurrence.namespace_at_binding.clone(),
-            occurrence.relation_at_binding.clone(),
-            occurrence.object_id.as_bytes().to_vec(),
-        );
-        let (object_id, native_data_version) = if let Some(revision) = revisions.get(&key) {
-            revision.clone()
-        } else {
-            let lease = ConnectorControlResolver::acquire_current(
-                ports.connector_control(),
-                &table.instance_id,
-            )
-            .map_err(provider_error)?;
-            let binding = capture
-                .capture(
-                    &lease,
-                    factory,
-                    ConnectorTableObjectCaptureRequest {
-                        table: table.clone(),
-                        resolution: ConnectorTableResolution::StrictBaseTable,
-                        selector: ConnectorTableObjectSelector::Current,
-                        context: context.clone(),
-                    },
-                )
-                .await
-                .map_err(|failure| {
-                    let error = failure.into_application();
-                    let mut projected = MvBackgroundEngineError::new(
-                        MvBackgroundEngineErrorKind::TransientUnavailable,
-                        error.message(),
-                    );
-                    if let Some(cause) = error.original_failure() {
-                        projected = projected.with_original_failure(cause.clone());
-                    }
-                    projected
-                })?;
-            let metadata = &binding.metadata;
-            let observed = crate::mv::domain::storage_observation::observe_refresh_base(
-                ports.storage_observation(),
-                &lease,
-                metadata,
-                context.clone(),
-            )
-            .map_err(provider_error)?;
-            if observed.table() != &metadata.identity {
-                return Err(MvBackgroundEngineError::new(
-                    MvBackgroundEngineErrorKind::TransientUnavailable,
-                    "MV scheduler source observation identity differs from its captured metadata",
-                ));
-            }
-            let revision = lease
-                .binding()
-                .metadata()
-                .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
-                .map_err(provider_error)?;
-            if let Some(snapshot) = observed.current_snapshot_id()
-                && lease
-                    .binding()
-                    .metadata()
-                    .read_selector_from_exact_revision(&metadata.table, &revision)
-                    .map_err(provider_error)?
-                    != ConnectorReadSelector::SnapshotId(snapshot)
-            {
-                return Err(MvBackgroundEngineError::new(
-                    MvBackgroundEngineErrorKind::TransientUnavailable,
-                    "MV scheduler source observation and exact revision disagree",
-                ));
-            }
-            let revision = persist_exact_connector_revision(&revision).map_err(|error| {
+        .await
+    }
+}
+
+pub(crate) fn scheduler_inputs(
+    occurrences: &[RelationOccurrence],
+    observations: Vec<novarocks_mv_application::freshness::MvSourceObservation>,
+) -> Result<Vec<PublicationInput>, MvBackgroundEngineError> {
+    use novarocks_mv_application::freshness::MvSourceState;
+    let by_id = occurrences
+        .iter()
+        .map(|item| (item.occurrence_id, item))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut inputs = Vec::with_capacity(observations.len());
+    for observation in observations {
+        let occurrence = by_id
+            .get(&observation.relation_occurrence_id)
+            .ok_or_else(|| {
                 MvBackgroundEngineError::new(
                     MvBackgroundEngineErrorKind::InvalidDefinition,
-                    error.to_string(),
+                    "MV source observation names an unknown occurrence",
                 )
             })?;
-            revisions.insert(key, revision.clone());
-            revision
+        let (object_id, native_data_version) = match observation.state {
+            MvSourceState::Missing { cause } => {
+                return Err(MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::TransientUnavailable,
+                    cause.detail(),
+                )
+                .with_original_failure(cause));
+            }
+            MvSourceState::Present {
+                object_id,
+                native_data_version,
+            } => (object_id, native_data_version),
         };
         if object_id != occurrence.object_id {
             return Err(MvBackgroundEngineError::new(
@@ -188,4 +167,63 @@ pub(crate) async fn current_source_inputs_in(
         });
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use novarocks_failure_contract::SharedFailureCause;
+    use novarocks_mv_application::freshness::{MvSourceObservation, MvSourceState};
+    use novarocks_mv_application::persistence::identity::{
+        NativeDataVersion, ObjectIdentity, SchemaVersion,
+    };
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    fn occurrence() -> RelationOccurrence {
+        RelationOccurrence {
+            occurrence_id: 1,
+            catalog_at_binding: "ice".into(),
+            namespace_at_binding: "db".into(),
+            relation_at_binding: "t".into(),
+            qualifier_at_binding: "t".into(),
+            object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
+            schema_version: SchemaVersion::try_new(vec![1]).unwrap(),
+            fields: vec![],
+        }
+    }
+    #[test]
+    fn scheduler_adapter_keeps_missing_and_replaced_classification() {
+        let original = ConnectorError::new(ConnectorErrorKind::NotFound, "original missing source");
+        let cause = SharedFailureCause::new(original.clone());
+        let error = scheduler_inputs(
+            &[occurrence()],
+            vec![MvSourceObservation {
+                relation_occurrence_id: 1,
+                state: MvSourceState::Missing {
+                    cause: cause.clone(),
+                },
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            MvBackgroundEngineErrorKind::TransientUnavailable
+        );
+        assert_eq!(error.original_failure(), Some(&cause));
+        let error = scheduler_inputs(
+            &[occurrence()],
+            vec![MvSourceObservation {
+                relation_occurrence_id: 1,
+                state: MvSourceState::Present {
+                    object_id: ObjectIdentity::try_new(vec![2]).unwrap(),
+                    native_data_version: NativeDataVersion::try_new(vec![1]).unwrap(),
+                },
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);
+        assert_eq!(
+            error.message(),
+            "MV source occurrence 1 belongs to a replaced object"
+        );
+    }
 }

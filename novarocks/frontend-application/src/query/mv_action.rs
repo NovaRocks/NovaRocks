@@ -259,6 +259,18 @@ pub(crate) fn prepare_in(
     context: ConnectorRequestContext,
     completion: MvCommandCompletionReceiving,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
+    let target = request.target();
+    let catalog = target
+        .catalog
+        .as_deref()
+        .or(current_catalog.as_deref())
+        .unwrap_or(novarocks_types::naming::DEFAULT_CATALOG);
+    if novarocks_sql::system_table::is_system_table_name(catalog, &target.database) {
+        return Err(CommandError::new(
+            CommandErrorKind::Unsupported,
+            "system catalogs and information_schema are read-only",
+        ));
+    }
     let state_store = services.state_store.clone().ok_or_else(|| {
         CommandError::new(
             CommandErrorKind::Rejected,

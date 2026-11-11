@@ -51,7 +51,10 @@ pub(crate) fn resolve_target(
     statement: &OwnedDeleteStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     match statement {
         OwnedDeleteStatement::Predicate(statement) => {
             standard::resolve_target(state, statement, current_catalog, current_database)
@@ -145,6 +148,7 @@ impl PreparedDeleteWrite {
             Arc::clone(&self.write_session),
             self.match_read.as_slice(),
             provider_source,
+            crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
         ).await
     }
 
@@ -286,7 +290,7 @@ pub trait DeleteEngine: Send + Sync {
         input: DeleteStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     >;
 }
 
@@ -296,7 +300,7 @@ impl DeleteEngine for DmlExecutionKernel {
         input: DeleteStatementInput,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
-        String,
+        crate::catalog_application::resolver::TargetResolutionError,
     > {
         crate::query::delete_action::prepare(self.clone(), input)
     }

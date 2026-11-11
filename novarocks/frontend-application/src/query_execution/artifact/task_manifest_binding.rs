@@ -2099,7 +2099,7 @@ mod tests {
         let paired = paired
             .freeze_root_output(output)
             .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
-        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
             paired,
             &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,

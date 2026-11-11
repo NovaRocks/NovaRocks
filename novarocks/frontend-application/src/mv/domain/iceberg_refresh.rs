@@ -130,7 +130,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier};
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -164,7 +164,7 @@ impl IcebergMvCorePorts {
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     ) -> Self {
         Self {
             view_service,
@@ -183,7 +183,7 @@ impl IcebergMvCorePorts {
 
     pub(crate) fn system_relations(
         &self,
-    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+    ) -> &Arc<novarocks_query_application::system_tables::SystemTableRegistry> {
         &self.system_relations
     }
 

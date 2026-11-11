@@ -1484,6 +1484,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::Intersect(intersect) => intersect.output_columns.clone(),
         LogicalPlanKind::Except(except) => except.output_columns.clone(),
         LogicalPlanKind::Values(values) => values.columns.clone(),
+        LogicalPlanKind::SystemTable(table) => table.columns.clone(),
         LogicalPlanKind::GenerateSeries(generate) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: generate.column_name.clone(),

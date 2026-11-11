@@ -1126,6 +1126,7 @@ pub(crate) fn visit_relational_node_calls_observed<'a, E: From<FrozenCallError>>
             | NodeKind::Window(_)
             | NodeKind::SetOp { .. }
             | NodeKind::Values { .. }
+            | NodeKind::SystemRelation { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
             | NodeKind::GenerateSeries { .. }

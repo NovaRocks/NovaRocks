@@ -703,6 +703,7 @@ const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::Scan { .. } => "Scan",
         NodeKind::Values { .. } => "Values",
+        NodeKind::SystemRelation { .. } => "SystemRelation",
         NodeKind::Filter { .. } => "Filter",
         NodeKind::Project { .. } => "Project",
         NodeKind::Aggregate { .. } => "Aggregate",
@@ -2184,6 +2185,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         let lowered = match &plan.kind {
             PhysicalPlanKind::Scan(scan) => self.lower_scan(plan, scan),
             PhysicalPlanKind::Values(values) => self.lower_values(plan, values),
+            PhysicalPlanKind::SystemTable(table) => self.lower_system_table(plan, table),
             PhysicalPlanKind::Filter(filter) => self.lower_filter(plan, &filter.predicate),
             PhysicalPlanKind::Project(project) => self.lower_project(plan, &project.items),
             PhysicalPlanKind::Unpivot(unpivot) => self.lower_unpivot(plan, unpivot),
@@ -2297,6 +2299,29 @@ impl<'a> ContractLoweringVisitor<'a> {
                 )
                 .into_boxed_str(),
             });
+        }
+        if let PhysicalPlanKind::SystemTable(table) = &plan.kind {
+            self.plan_builder.add_annotation(PlanAnnotation {
+                subject,
+                key: "sql.relation".into(),
+                value: table.relation.declaration.qualified_name().into_boxed_str(),
+            });
+            for (key, value) in [
+                (
+                    "sql.system.required_columns",
+                    format!("{:?}", table.relation.required_columns),
+                ),
+                (
+                    "sql.system.key_constraint",
+                    format!("{:?}", table.key_constraint.columns()),
+                ),
+            ] {
+                self.plan_builder.add_annotation(PlanAnnotation {
+                    subject,
+                    key: key.into(),
+                    value: value.into_boxed_str(),
+                });
+            }
         }
         if let PhysicalPlanKind::Scan(scan) = &plan.kind {
             let relation = match &scan.alias {
@@ -6766,6 +6791,98 @@ impl<'a> ContractLoweringVisitor<'a> {
                 .group_key_columns
                 .iter()
                 .chain(&aggregate.output_layout.aggregate_columns)
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+
+    fn lower_system_table(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        table: &crate::planner::system_relation::PhysicalSystemTableNode,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        use crate::planner::system_relation::PhysicalSystemTableState;
+        use novarocks_physical_plan::{BuildError, SystemRelationData};
+        expect_children(plan, 0)?;
+        require_output_shape("SystemTable", &plan.output_columns, &table.relation.columns)?;
+        if table.relation.required_columns.len() != plan.output_columns.len() {
+            return Err(BuildError::SystemRelation("system relation ordinal width differs").into());
+        }
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut column_values = BTreeMap::new();
+        let mut output = Vec::with_capacity(plan.output_columns.len());
+        let mut fields = Vec::with_capacity(plan.output_columns.len());
+        for (ordinal, (column, &source_ordinal)) in plan
+            .output_columns
+            .iter()
+            .zip(&table.relation.required_columns)
+            .enumerate()
+        {
+            self.work.step()?;
+            let declared = table
+                .relation
+                .declaration
+                .columns
+                .get(source_ordinal)
+                .ok_or(BuildError::SystemRelation(
+                    "system relation ordinal is outside declaration",
+                ))?;
+            if column.value_type != declared.value_type {
+                return Err(BuildError::SystemRelation(
+                    "system relation complete type differs from declaration",
+                )
+                .into());
+            }
+            if column_values.contains_key(&column.column_id) {
+                return Err(ContractLoweringError::DuplicateColumnDefinition {
+                    node: "SystemTable",
+                    column: column.column_id,
+                });
+            }
+            let value = self.fragment_mut().add_value(
+                value_type(column),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: checked_ordinal("SystemTable output", ordinal)?,
+                },
+            )?;
+            column_values.insert(column.column_id, value);
+            output.push(value);
+            // The data schema keeps original declaration names, independent of SQL aliases.
+            fields.push(std::sync::Arc::new(
+                declared.value_type.try_to_field(&declared.name)?,
+            ));
+        }
+        let data = match &table.state {
+            PhysicalSystemTableState::Planning => SystemRelationData::Deferred,
+            PhysicalSystemTableState::Finalized { batches, storage } => {
+                SystemRelationData::Batches {
+                    batches: batches.clone(),
+                    storage: storage.clone(),
+                }
+            }
+        };
+        self.fragment_mut().add_system_relation(
+            node,
+            output.clone().into_boxed_slice(),
+            fields.into(),
+            data,
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns: column_values,
+            properties,
+            display_names: plan
+                .output_columns
+                .iter()
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -13040,6 +13157,7 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::Sort(_) => "Sort",
         PhysicalPlanKind::Limit(_) => "Limit",
         PhysicalPlanKind::Values(_) => "Values",
+        PhysicalPlanKind::SystemTable(_) => "SystemTable",
         PhysicalPlanKind::Repeat(_) => "Repeat",
         PhysicalPlanKind::Window(_) => "Window",
         PhysicalPlanKind::GenerateSeries(_) => "GenerateSeries",

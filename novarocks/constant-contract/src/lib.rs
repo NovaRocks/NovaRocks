@@ -2270,6 +2270,20 @@ fn list_range(row: Row<'_>) -> Result<(usize, usize), ConstantError> {
     Ok((start, end))
 }
 
+/// Validate decimal values and required children of already geometry-validated Arrow data.
+/// This operation has no SQL constant-pool policy or data-size ceiling.
+pub fn validate_array_values_with_creator<H>(
+    data: &ArrayData,
+    nullable: bool,
+    creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ConstantCreationFailure<H>> {
+    let mut creator = PoolCreator(creation);
+    let mut observer = PoolObserver::plain();
+    observer.creator = Some(&mut creator);
+    validate_values_owned(data, nullable, &mut observer, work)
+}
+
 enum RequiredFrame<'a> {
     Row(Row<'a>, bool),
     Range(&'a ArrayData, usize, usize, bool),

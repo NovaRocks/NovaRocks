@@ -435,6 +435,7 @@ fn finish_change_stream_write(
     write_session: &Arc<ConnectorWriteSession>,
     query_options: Option<novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<
     crate::query_execution::compiler::PreparedDmlWriteAssembly,
     crate::dml::error::DmlExecutionError,
@@ -501,6 +502,7 @@ fn finish_change_stream_write(
             },
         ),
         completion_control,
+        capacity,
     )?;
     Ok(
         crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
@@ -909,15 +911,19 @@ pub(super) fn resolve_update_target(
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
     let table_name: &ObjectName = match ref_suffix {
         Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err(format!(
+            return Err((format!(
                 "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ));
+            ))
+            .into());
         }
         Some(IcebergRefSuffix::Branch(_)) => {
             effective_name = ObjectName {
@@ -939,10 +945,11 @@ pub(super) fn resolve_update_target(
         current_database,
     )?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "UPDATE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
 
     Ok((target, target_ref))
@@ -1035,14 +1042,18 @@ pub(super) fn resolve_merge_target(
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
     let table_name: &ObjectName = match ref_suffix {
         Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err(format!(
+            return Err((format!(
                 "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ));
+            ))
+            .into());
         }
         Some(IcebergRefSuffix::Branch(_)) => {
             effective_name = ObjectName {
@@ -1063,10 +1074,11 @@ pub(super) fn resolve_merge_target(
         current_database,
     )?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "MERGE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     Ok((target, target_ref))
 }
@@ -1162,46 +1174,33 @@ fn finish_merge_mutation_preparation(
 }
 
 fn mutation_source_to_sql(
-    state: &DmlExecutionKernel,
     source: &Option<CowMutationSource>,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<Option<String>, String> {
     match source {
         None => Ok(None),
-        Some(source) => {
-            mutation_source_relation_to_sql(state, source, current_catalog, target).map(Some)
-        }
+        Some(source) => mutation_source_relation_to_sql(source, current_catalog, target).map(Some),
     }
 }
 
 fn mutation_source_relation_to_sql(
-    state: &DmlExecutionKernel,
     source: &CowMutationSource,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<String, String> {
     match source {
         CowMutationSource::Table { name, alias } => {
-            // The match SELECT runs with `current_database = target.namespace`
-            // and `current_catalog = Some(target.catalog)`. Resolve the source
-            // against the user's surface name to get its concrete (catalog,
-            // namespace, table). Emit a 1-part name when the source shares the
-            // target's namespace+catalog (lets refresh follow the
-            // current-catalog path), and a 2-part `<namespace>.<table>` name
-            // otherwise so the standalone analyzer can find it directly.
-            let resolved = crate::catalog_application::resolver::resolve_existing_table_target(
-                state,
-                name,
+            // Preserve the original catalog when the producer runs under the
+            // target's session context. SQL owns source admission in its catalog round.
+            let resolved = novarocks_types::naming::resolve_catalog_table_name(
+                &name.parts,
                 current_catalog,
                 &target.namespace,
             )?;
-            let mut sql =
-                if resolved.catalog == target.catalog && resolved.namespace == target.namespace {
-                    resolved.table.clone()
-                } else {
-                    format!("{}.{}", resolved.namespace, resolved.table)
-                };
+            let mut sql = novarocks_parser::printer::print_object_name(
+                &mutation_source_table_name(&resolved, target)?,
+            );
             if let Some(alias) = alias {
                 sql.push_str(" AS ");
                 sql.push_str(alias);
@@ -1261,7 +1260,7 @@ fn mutation_target_relation(
 }
 
 fn mutation_source_table_name(
-    resolved: &crate::catalog_application::resolver::TargetBackend,
+    resolved: &novarocks_types::naming::TableIdentity,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<ast::ObjectName, String> {
     let parts = if resolved.catalog != target.catalog {
@@ -1279,16 +1278,14 @@ fn mutation_source_table_name(
 }
 
 fn mutation_source_relation(
-    state: &DmlExecutionKernel,
     source: &PreparedMutationSource,
     current_catalog: Option<&str>,
     target: &crate::catalog_application::resolver::TargetBackend,
 ) -> Result<ast::TableFactor, String> {
     match source {
         PreparedMutationSource::Table { name, alias } => {
-            let resolved = crate::catalog_application::resolver::resolve_existing_table_target(
-                state,
-                name,
+            let resolved = novarocks_types::naming::resolve_catalog_table_name(
+                &name.parts,
                 current_catalog,
                 &target.namespace,
             )?;
@@ -1395,7 +1392,6 @@ fn build_update_match_query(
 }
 
 fn build_update_mor_producer(
-    state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedUpdateStatement,
     current_catalog: Option<&str>,
@@ -1419,7 +1415,7 @@ fn build_update_mor_producer(
         alias,
         stmt.source
             .as_ref()
-            .map(|source| mutation_source_relation(state, source, current_catalog, target))
+            .map(|source| mutation_source_relation(source, current_catalog, target))
             .transpose()?,
         update_assignment_projection(&stmt.assignments, target_columns)?,
         stmt.selection.clone(),
@@ -1554,7 +1550,6 @@ fn build_merge_match_query(
 }
 
 fn build_merge_mor_producer(
-    state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
@@ -1574,7 +1569,7 @@ fn build_merge_mor_producer(
         .clone()
         .unwrap_or_else(|| build::ident(MERGE_TARGET_DEFAULT_ALIAS, None));
     let alias = build::ident_at(alias.value, None, alias.span);
-    let mut source = mutation_source_relation(state, &stmt.source, current_catalog, target)?;
+    let mut source = mutation_source_relation(&stmt.source, current_catalog, target)?;
     match &mut source {
         ast::TableFactor::Table { alias, .. } | ast::TableFactor::Derived { alias, .. }
             if alias.is_none() =>
@@ -2890,6 +2885,7 @@ fn finish_cow_match_plan(
     declaration: &[novarocks_type_contract::FunctionValueType],
     query_options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<
     (
         novarocks_query_application::preparation::FrozenExecutionDescription,
@@ -2944,6 +2940,7 @@ fn finish_cow_match_plan(
         state.constant_policy(),
         None,
         completion_control,
+        capacity,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
@@ -3492,7 +3489,6 @@ impl MergeMatchRows {
 }
 
 fn build_exact_cow_merge_selection_query(
-    state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedMergeStatement,
     current_catalog: Option<&str>,
@@ -3590,8 +3586,7 @@ fn build_exact_cow_merge_selection_query(
             )
         })
         .collect::<Vec<_>>();
-    let source_table_sql =
-        mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
+    let source_table_sql = mutation_source_relation_to_sql(&stmt.source, current_catalog, target)?;
     let source_sql = match &stmt.source {
         CowMutationSource::Table { alias, .. } | CowMutationSource::Query { alias, .. } => {
             if alias.is_some() {
@@ -3797,49 +3792,6 @@ mod tests {
         )
         .unwrap()
     }
-    fn test_dml_kernel() -> DmlExecutionKernel {
-        test_dml_kernel_with_catalog(None)
-    }
-    fn test_dml_kernel_with_catalog(
-        catalog: Option<Arc<dyn novarocks_catalog_application::CatalogApplicationPort>>,
-    ) -> DmlExecutionKernel {
-        let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
-            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
-        {
-            let trc_catalog =
-                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
-            let trc_controls = Arc::clone(&connector_control);
-            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                trc_catalog.clone(),
-                trc_controls.clone(),
-            );
-            DmlExecutionKernel::new(
-                crate::query_execution::kernels::DmlPlanningServices::new(
-                    Arc::new(
-                        novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                            .expect("builtin function catalog"),
-                    ),
-                    trc_catalog.clone(),
-                    crate::application::test_constant_policy(),
-                    crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
-                        novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
-                        novarocks_plan_codec::physical_package_v2::PackageEncodeLimits::FROZEN,
-                    ),
-                    Arc::new(novarocks_query_application::view::QueryViewService::new()),
-                    trc_system_relations,
-                ),
-                catalog,
-                trc_controls.clone(),
-                std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
-                Arc::new(
-                    crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
-                ),
-                Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
-                crate::mv::domain::test_admission::test_readiness(),
-            )
-        }
-    }
-
     fn connector_context_for_test() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -4879,39 +4831,6 @@ mod tests {
         assert!(sql.contains("CASE WHEN"), "{sql}");
     }
 
-    struct ReadyMutationCatalog;
-    impl novarocks_catalog_application::CatalogApplicationPort for ReadyMutationCatalog {
-        fn create_catalog(
-            &self,
-            _: novarocks_catalog_application::CatalogCreateCommand,
-        ) -> Result<
-            novarocks_catalog_application::CatalogRuntimeObservation,
-            novarocks_catalog_application::CatalogApplicationError,
-        > {
-            panic!("query-shaping witness does not create catalogs")
-        }
-        fn drop_catalog(
-            &self,
-            _: novarocks_catalog_application::CatalogDropCommand,
-        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
-            panic!("query-shaping witness does not drop catalogs")
-        }
-        fn admit_catalog(
-            &self,
-            instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-        ) -> novarocks_catalog_application::CatalogAdmission {
-            novarocks_catalog_application::CatalogAdmission::Ready(
-                novarocks_catalog_application::CatalogRuntimeObservation {
-                    attachment_id: uuid::Uuid::nil(),
-                    instance_id: instance_id.clone(),
-                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                        .unwrap(),
-                    generation: 7,
-                },
-            )
-        }
-    }
-
     #[test]
     fn mor_source_names_retain_cross_catalog_identity() {
         let target = iceberg_target();
@@ -4920,12 +4839,7 @@ mod tests {
             ("ice", "db2", vec!["db2", "s"]),
             ("other", "db1", vec!["other", "db1", "s"]),
         ] {
-            let source = crate::catalog_application::resolver::TargetBackend {
-                catalog: catalog.into(),
-                namespace: namespace.into(),
-                table: "s".into(),
-                ..target.clone()
-            };
+            let source = novarocks_types::naming::TableIdentity::new(catalog, namespace, "s");
             let name = mutation_source_table_name(&source, &target).unwrap();
             assert_eq!(
                 name.parts
@@ -4939,12 +4853,10 @@ mod tests {
 
     #[test]
     fn mor_source_table_and_internal_names_keep_admitted_identity() {
-        let state = test_dml_kernel_with_catalog(Some(Arc::new(ReadyMutationCatalog)));
         let prepared = prepared_update(
             "UPDATE ice.db1.t AS t SET `odd name` = 7 FROM other.db2.source AS s WHERE t.id = s.id",
         );
         let source = mutation_source_relation(
-            &state,
             prepared.source.as_ref().unwrap(),
             Some("ice"),
             &iceberg_target(),
@@ -4997,7 +4909,6 @@ mod tests {
     #[test]
     fn mor_lowering_uses_ast_even_when_cow_source_slicing_fails() {
         use ast::SyntaxEq;
-        let state = test_dml_kernel();
         let columns = [col("id"), col("v")];
         let source = "UPDATE ice.db1.t SET v = 99 WHERE id = 1";
         let original = prepared_update(source);
@@ -5018,24 +4929,12 @@ mod tests {
         else {
             panic!("UPDATE");
         };
-        let (expected, _, _) = build_update_mor_producer(
-            &state,
-            &iceberg_target(),
-            &original,
-            Some("ice"),
-            &columns,
-            "main",
-        )
-        .unwrap();
-        let (actual, _, _) = build_update_mor_producer(
-            &state,
-            &iceberg_target(),
-            &lowered,
-            Some("ice"),
-            &columns,
-            "main",
-        )
-        .unwrap();
+        let (expected, _, _) =
+            build_update_mor_producer(&iceberg_target(), &original, Some("ice"), &columns, "main")
+                .unwrap();
+        let (actual, _, _) =
+            build_update_mor_producer(&iceberg_target(), &lowered, Some("ice"), &columns, "main")
+                .unwrap();
         assert!(actual.syntax_eq(&expected));
         let error = build_exact_cow_update_selection_query(
             &iceberg_target(),
@@ -5076,7 +4975,6 @@ mod tests {
             panic!("MERGE");
         };
         let (expected, _, _) = build_merge_mor_producer(
-            &state,
             &iceberg_target(),
             &original,
             Some("ice"),
@@ -5086,7 +4984,6 @@ mod tests {
         )
         .unwrap();
         let (actual, _, _) = build_merge_mor_producer(
-            &state,
             &iceberg_target(),
             &lowered,
             Some("ice"),
@@ -5097,7 +4994,6 @@ mod tests {
         .unwrap();
         assert!(actual.syntax_eq(&expected));
         let error = build_exact_cow_merge_selection_query(
-            &state,
             &iceberg_target(),
             &lowered,
             Some("ice"),
@@ -5155,7 +5051,6 @@ mod tests {
             );
             let prepared = prepared_merge(&source);
             let (mut query, _, _) = build_merge_mor_producer(
-                &test_dml_kernel(),
                 &iceberg_target(),
                 &prepared,
                 Some("ice"),
@@ -6011,10 +5906,7 @@ mod tests {
                     );
                     let trc_controls = registry;
                     let trc_system_relations =
-                        crate::query_execution::kernels::test_system_relations(
-                            trc_catalog.clone(),
-                            trc_controls.clone(),
-                        );
+                        std::sync::Arc::new(novarocks_query_application::system_tables::SystemTableRegistry::try_new([]).expect("sealed declaration fixture"));
                     DmlExecutionKernel::new(
 crate::query_execution::kernels::DmlPlanningServices::new(
 Arc::new(

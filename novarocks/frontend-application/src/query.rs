@@ -124,7 +124,6 @@ mod set_action;
 mod statement_action;
 pub(crate) mod statement_computation;
 pub(crate) mod statement_publication;
-pub(crate) mod view_read_action;
 pub(crate) mod write_action;
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -312,32 +311,26 @@ impl CatalogCommandConsumer for FrontendCatalogCommandConsumer {
                             novarocks_sql::semantic::command::IcebergTableSqlAction::Reference(_)
                         ) =>
                     {
-                        iceberg_ref
-                            .execute_command(
-                                &command,
-                                context.session().current_database(),
-                                command_context.connector_context(),
-                            )
-                            .map_err(Into::into)
+                        iceberg_ref.execute_command(
+                            &command,
+                            context.session().current_database(),
+                            command_context.connector_context(),
+                        )
                     }
                     novarocks_sql::semantic::CatalogSqlCommand::AlterIcebergTable(command) => {
-                        catalog
-                            .execute_iceberg_command(
-                                &command,
-                                context.session().current_catalog(),
-                                context.session().current_database(),
-                                command_context.connector_context(),
-                            )
-                            .map_err(Into::into)
-                    }
-                    command => catalog
-                        .execute_command(
+                        catalog.execute_iceberg_command(
                             &command,
                             context.session().current_catalog(),
                             context.session().current_database(),
                             command_context.connector_context(),
                         )
-                        .map_err(Into::into),
+                    }
+                    command => catalog.execute_command(
+                        &command,
+                        context.session().current_catalog(),
+                        context.session().current_database(),
+                        command_context.connector_context(),
+                    ),
                 }
             },
         )
@@ -359,25 +352,23 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         CommandError,
     > {
-        self.statistics
-            .prepare_statement_action(
-                &command,
-                request_context.session().current_catalog(),
-                request_context.session().current_database(),
-                request_context.execution(),
-                command_context.connector_context(),
-                request_context
-                    .session()
-                    .presentation()
-                    .copied()
-                    .ok_or_else(|| {
-                        CommandError::new(
-                            CommandErrorKind::Rejected,
-                            "statistics client result requires an explicit presentation",
-                        )
-                    })?,
-            )
-            .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))
+        self.statistics.prepare_statement_action(
+            &command,
+            request_context.session().current_catalog(),
+            request_context.session().current_database(),
+            request_context.execution(),
+            command_context.connector_context(),
+            request_context
+                .session()
+                .presentation()
+                .copied()
+                .ok_or_else(|| {
+                    CommandError::new(
+                        CommandErrorKind::Rejected,
+                        "statistics client result requires an explicit presentation",
+                    )
+                })?,
+        )
     }
 
     fn execute(
@@ -1480,10 +1471,10 @@ impl FrontendQuerySession {
         parsed_statement: ParsedStatement,
     ) -> Result<StatementResult, QueryServiceError> {
         let sql: Arc<str> = sql.into();
-        let ParsedStatement::Query(query) = &parsed_statement else {
+        let ParsedStatement::Query(_) = &parsed_statement else {
             return Err(internal_error("read admission requires a query statement"));
         };
-        let purpose = FrontendQueryPurpose::client_query(query);
+        let purpose = FrontendQueryPurpose::ClientRows;
         let (deadline, timeout_ms) = {
             let state = self.state.lock().map_err(poisoned_state)?;
             governed_query_deadline(&state)?
@@ -1775,26 +1766,6 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
-        if let ParsedStatement::View(novarocks_parser::ast::ViewStatement::Show(show)) =
-            &parsed_statement
-        {
-            let action = match self.service.query_compiler.prepare_show_views_action(
-                show.clone(),
-                context,
-                command_context,
-            ) {
-                Ok(action) => action,
-                Err(error) => {
-                    return Ok(self.governed_typed_error(
-                        routed_execution_service_error(product_command_error(error)),
-                        statement,
-                    ));
-                }
-            };
-            return self
-                .execute_observed_statement_action(statement, action)
-                .await;
-        }
         if let Ok(Some(ProductSqlCommand::Catalog(
             command @ (novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
             | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }),
@@ -1923,7 +1894,7 @@ impl FrontendQuerySession {
             ) {
                 Ok(action) => action,
                 Err(error) => {
-                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                    return Ok(self.governed_typed_error(error.into_service(), statement));
                 }
             };
             return self
@@ -1959,7 +1930,7 @@ impl FrontendQuerySession {
                 ) {
                     Ok(action) => action,
                     Err(error) => {
-                        return Ok(self.governed_typed_error(internal_error(error), statement));
+                        return Ok(self.governed_typed_error(error.into_service(), statement));
                     }
                 };
                 return self
@@ -2038,7 +2009,7 @@ impl FrontendQuerySession {
             ) {
                 Ok(action) => action,
                 Err(error) => {
-                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                    return Ok(self.governed_typed_error(error.into_service(), statement));
                 }
             };
             return self

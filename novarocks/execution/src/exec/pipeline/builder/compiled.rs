@@ -689,6 +689,21 @@ fn build_node(
     }
     let node_id = display_id(id)?;
     let mut build = match node.kind() {
+        ProgramNodeKind::SystemRelation { .. } => {
+            let source: Box<dyn OperatorFactory> = Box::new(
+                system_relation_source::CompiledSystemRelationSourceFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?,
+            );
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(1),
+            })
+        }
         ProgramNodeKind::Values { .. } => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(values_source::CompiledValuesSourceFactory::try_new(
@@ -1268,6 +1283,7 @@ fn build_node(
                 }
                 let label = match node.kind() {
                     ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
+                    ProgramNodeKind::SystemRelation { .. } => "SystemRelationSource".to_string(),
                     _ => factory.name().to_string(),
                 };
                 Box::new(ProfiledCompiledFactory {
@@ -1310,7 +1326,14 @@ fn build_position_shards(
         ));
     }
 
-    let mut key = None;
+    let key = output
+        .value_binding(output_slots[0])
+        .ok_or_else(|| invalid("Position shards have no frozen output file key"))?;
+    let key = FunctionValueType::try_from_typed_binding(key.clone())
+        .map_err(ExecutionFailure::from_domain)?;
+    if key.nullable() {
+        return Err(invalid("Position shard file key must be required"));
+    }
     let mut builds = Vec::with_capacity(inputs.len());
     let mut producers = 0usize;
     for input in inputs {
@@ -1330,12 +1353,13 @@ fn build_position_shards(
             .ok_or_else(|| invalid("Position contribution has no frozen file key type"))?;
         let ty = FunctionValueType::try_from_typed_binding(ty.clone())
             .map_err(ExecutionFailure::from_domain)?;
-        if key.as_ref().is_some_and(|expected| expected != &ty) {
+        if !key.same_physical_binding_ignoring_root_nullability_observed(&ty, || {
+            Ok::<_, ExecutionFailure>(())
+        })? {
             return Err(invalid(
                 "Position contributions have different file key types",
             ));
         }
-        key.get_or_insert(ty);
         let build = build_node(program, input.input, ctx, error, ordered)?;
         let dop = usize::try_from(build.pipeline.dop)
             .map_err(|_| invalid("Invalid position contribution producer width"))?;
@@ -1347,7 +1371,6 @@ fn build_position_shards(
 
     let dop = ctx.pipeline_dop;
     let partitions = usize::try_from(dop).map_err(|_| invalid("Invalid position shard DOP"))?;
-    let key = key.ok_or_else(|| invalid("Position shard has no file key"))?;
     let exchanger = LocalExchanger::new_with_limits(
         partitions,
         producers,
@@ -1544,6 +1567,8 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
     }
 }
 
+#[path = "compiled_system_relation.rs"]
+mod system_relation_source;
 #[path = "compiled_values.rs"]
 mod values_source;
 
@@ -1644,3 +1669,7 @@ mod compiled_window_metadata_tests;
 #[cfg(test)]
 #[path = "compiled_migration_shape_tests.rs"]
 mod migration_shape_tests;
+
+#[cfg(test)]
+#[path = "compiled_system_relation_tests.rs"]
+mod system_relation_tests;

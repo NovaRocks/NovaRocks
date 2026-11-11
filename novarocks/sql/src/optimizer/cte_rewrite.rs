@@ -276,6 +276,7 @@ fn opt_expr_output_columns(
         Operator::LogicalIntersect(node) => clone_columns(&node.output_columns, work),
         Operator::LogicalExcept(node) => clone_columns(&node.output_columns, work),
         Operator::LogicalValues(node) => clone_columns(&node.columns, work),
+        Operator::LogicalSystemTable(node) => clone_columns(&node.columns, work),
         Operator::LogicalGenerateSeries(node) => work.opaque(|| {
             vec![OutputColumn {
                 column_id: node.output_column_id,

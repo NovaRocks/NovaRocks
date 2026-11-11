@@ -63,7 +63,7 @@ impl NovaRocksCatalog for ObservationCatalog {
     }
     async fn list_namespaces(
         &self,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_namespaces(bound).await
     }
@@ -73,7 +73,7 @@ impl NovaRocksCatalog for ObservationCatalog {
     async fn list_tables(
         &self,
         name: CatalogNamespaceName,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_tables(name, bound).await
     }
@@ -125,7 +125,7 @@ impl NovaRocksCatalog for ObservationCatalog {
     async fn list_views(
         &self,
         name: CatalogNamespaceName,
-        bound: novarocks_spi::connector::ConnectorListingBound,
+        bound: novarocks_spi::connector::ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.inner.list_views(name, bound).await
     }

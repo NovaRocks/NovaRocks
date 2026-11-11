@@ -393,18 +393,12 @@ fn task_topology_views(
 
 /// Binds one task's facts into its creation seed.
 ///
-/// The static plan's own encoded size is checked here, before anything is
-/// sent: the backend bounds the static plan together with the task
-/// assignment, so a static plan already over that bound can never become a
-/// legal creation. The combined bound is checked again once the assignment's
-/// exact size is known.
 fn bind_creation_seed(
     topology: &Arc<AttemptTopology>,
     views: &BTreeMap<TaskId, TaskTopologyView>,
     sink_edges: Arc<[ExchangeEdgeId]>,
     node: &TaskNode,
     facts: TaskPlanFacts,
-    transport_budget: TransportBudget,
 ) -> Result<TaskCreationSeed, TaskExecutionError> {
     let TaskPlanFacts {
         fragment,
@@ -417,14 +411,6 @@ fn bind_creation_seed(
             node.fragment_id,
             fragment.facts().fragment_id()
         )));
-    }
-    let static_bytes = fragment.content().len();
-    if static_bytes > transport_budget.max_descriptor_encoded_bytes() {
-        return Err(CapacityBound::DescriptorBytes {
-            limit: transport_budget.max_descriptor_encoded_bytes(),
-            actual: static_bytes,
-        }
-        .into());
     }
     let view = views.get(&node.task_id()).cloned().ok_or_else(|| {
         TaskExecutionError::Schedule(format!("task {} has no view", node.identity))
@@ -729,7 +715,6 @@ pub(crate) fn build_task_graph_from_manifest(
             Arc::clone(&sink_bindings[&task.stage_id()]),
             task,
             facts,
-            transport_budget,
         )?;
         seeds.insert(task_id, seed);
     }

@@ -77,9 +77,8 @@ pub mod session_control;
 /// Statement-local external-effect boundary for safe topology retry.
 pub mod statement_effect;
 
-/// Read-only `information_schema` materialization contracts and providers.
-pub mod system_catalog;
-pub mod system_catalog_rewrite;
+/// Static system-table registration and statement-scoped snapshot contracts.
+pub mod system_tables;
 pub mod view;
 mod view_iceberg;
 mod view_service;

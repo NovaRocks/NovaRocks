@@ -3150,6 +3150,18 @@ condition,
             set_operation_kind(*kind),
             SetOpMappingsDisplay(input_mappings)
         )),
+        NodeKind::SystemRelation { output_fields, data } => {
+            let state = match data {
+                novarocks_physical_plan::SystemRelationData::Deferred => "deferred",
+                novarocks_physical_plan::SystemRelationData::Batches { .. } => "snapshot",
+            };
+            lines.push(format_args!("{pad}  system-relation columns={}, data={state}", output_fields.len()));
+            for (key, label) in [("sql.system.required_columns", "required-columns"), ("sql.system.key_constraint", "key-constraint")] {
+                if let Some(value) = context.annotations.value(AnnotationSubject::Node(fragment_id, node.id), key) {
+                    lines.push(format_args!("{pad}  {label}={value}"));
+                }
+            }
+        }
         NodeKind::Values { rows } => lines.push(format_args!(
             "{pad}  rows=[{}]",
             ValuesRowsDisplay { plan, fragment_id, fragment, rows }
@@ -3753,7 +3765,11 @@ fn annotation_visible(level: ExplainLevel, key: &str) -> bool {
 fn annotation_is_internal_display(key: &str) -> bool {
     matches!(
         key,
-        "sql.display_name" | "sql.relation" | "sql.mv_rewritten_from"
+        "sql.display_name"
+            | "sql.relation"
+            | "sql.mv_rewritten_from"
+            | "sql.system.required_columns"
+            | "sql.system.key_constraint"
     )
 }
 
@@ -3804,6 +3820,15 @@ impl fmt::Display for NodeHeaderDisplay<'_> {
                 novarocks_physical_plan::SetOperationKind::Intersect => "INTERSECT",
                 novarocks_physical_plan::SetOperationKind::Except => "EXCEPT",
             })?,
+            NodeKind::SystemRelation { .. } => {
+                formatter.write_str("SYSTEM RELATION")?;
+                if let Some(relation) = context.annotations.value(
+                    AnnotationSubject::Node(self.fragment_id, node.id),
+                    "sql.relation",
+                ) {
+                    write!(formatter, " {relation}")?;
+                }
+            }
             NodeKind::Values { .. } => formatter.write_str("VALUES")?,
             NodeKind::Repeat { .. } => formatter.write_str("REPEAT")?,
             NodeKind::Unpivot { .. } => formatter.write_str("UNPIVOT")?,

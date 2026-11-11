@@ -34,9 +34,7 @@ use novarocks_frontend_application::task_protocol_config::{
     DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
 };
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
-use novarocks_native_adapter::{
-    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-};
+use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
@@ -1224,6 +1222,8 @@ pub struct FrontendWorkloadRuntimeConfig {
     /// Warehouse-wide admitted compute queries. This is the Frontend's only
     /// query-load control: it covers planning through protocol terminality.
     pub concurrency_limit: usize,
+    /// Complete retained backing allowance per original Client holder.
+    pub client_result_all_objects_bytes: u64,
     /// FE Internal computation windows and their matching fixed CPU positions.
     pub internal_result_positions: usize,
     /// Complete retained backing allowance per Internal window.
@@ -1257,6 +1257,8 @@ impl Default for FrontendWorkloadRuntimeConfig {
     fn default() -> Self {
         Self {
             concurrency_limit: 256,
+            client_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
+                .all_objects_bytes[0],
             internal_result_positions: novarocks_workload_control::ResultCapacityConfig::V1
                 .positions[2],
             internal_result_all_objects_bytes: novarocks_workload_control::ResultCapacityConfig::V1
@@ -1382,10 +1384,8 @@ pub struct RuntimeConfig {
     pub task_dispatch_control_permits: usize,
     #[serde(default = "default_task_operation_max_batch_items")]
     pub task_operation_max_batch_items: usize,
-    #[serde(default = "default_task_operation_max_batch_encoded_bytes")]
-    pub task_operation_max_batch_encoded_bytes: usize,
-    #[serde(default = "default_task_descriptor_max_encoded_bytes")]
-    pub task_descriptor_max_encoded_bytes: usize,
+    #[serde(default = "default_task_operation_batch_target_encoded_bytes")]
+    pub task_operation_batch_target_encoded_bytes: usize,
     #[serde(default = "default_task_query_backend_max_queued_operations")]
     pub task_query_backend_max_queued_operations: usize,
     #[serde(default = "default_task_query_backend_max_queued_bytes")]
@@ -1606,6 +1606,15 @@ pub struct NativeIngressFrameEnvelope {
 }
 
 impl NativeIngressRuntimeConfig {
+    pub fn message_limits(&self) -> novarocks_native_adapter::TransportMessageLimits {
+        novarocks_native_adapter::TransportMessageLimits {
+            ordinary_request_max_bytes: self.ordinary_request_max_bytes,
+            ordinary_response_max_bytes: self.ordinary_response_max_bytes,
+            control_request_max_bytes: self.control_request_max_bytes,
+            control_response_max_bytes: self.control_response_max_bytes,
+        }
+    }
+
     pub fn to_adapter_config(
         &self,
     ) -> novarocks_native_adapter::native_server::NativeIngressConfig {
@@ -1707,28 +1716,10 @@ impl NativeIngressRuntimeConfig {
                 "runtime.native_ingress.control_response_max_bytes must not exceed ordinary_response_max_bytes"
             );
         }
-        let native_message_limit =
-            novarocks_native_adapter::native_server::NATIVE_MAX_MESSAGE_BYTES;
-        for (field, value) in [
-            (
-                "ordinary_request_max_bytes",
-                self.ordinary_request_max_bytes,
-            ),
-            (
-                "ordinary_response_max_bytes",
-                self.ordinary_response_max_bytes,
-            ),
-            ("control_request_max_bytes", self.control_request_max_bytes),
-            (
-                "control_response_max_bytes",
-                self.control_response_max_bytes,
-            ),
-        ] {
-            if value > native_message_limit {
-                bail!(
-                    "runtime.native_ingress.{field} must not exceed the Native message limit {native_message_limit}"
-                );
-            }
+        if self.message_limits().validate().is_none() {
+            bail!(
+                "runtime.native_ingress message lengths must be nonzero and fit the gRPC 4-byte length prefix"
+            );
         }
         self.frame_envelope()
     }
@@ -2006,12 +1997,8 @@ fn default_task_operation_max_batch_items() -> usize {
     FrontendTaskTransportBudget::DEFAULT.max_batch_items()
 }
 
-fn default_task_operation_max_batch_encoded_bytes() -> usize {
-    FrontendTaskTransportBudget::DEFAULT.max_batch_encoded_bytes()
-}
-
-fn default_task_descriptor_max_encoded_bytes() -> usize {
-    FrontendTaskTransportBudget::DEFAULT.max_descriptor_encoded_bytes()
+fn default_task_operation_batch_target_encoded_bytes() -> usize {
+    FrontendTaskTransportBudget::DEFAULT.batch_target_encoded_bytes()
 }
 
 fn default_task_query_backend_max_queued_operations() -> usize {
@@ -2119,12 +2106,8 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.task_operation_max_batch_items,
         ),
         (
-            "runtime.task_operation_max_batch_encoded_bytes",
-            runtime.task_operation_max_batch_encoded_bytes,
-        ),
-        (
-            "runtime.task_descriptor_max_encoded_bytes",
-            runtime.task_descriptor_max_encoded_bytes,
+            "runtime.task_operation_batch_target_encoded_bytes",
+            runtime.task_operation_batch_target_encoded_bytes,
         ),
         (
             "runtime.task_query_backend_max_queued_operations",
@@ -2214,17 +2197,6 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.participation_lease_max_ms must be at least runtime.participation_lease_min_ms"
         );
     }
-    if runtime.task_descriptor_max_encoded_bytes > runtime.task_operation_max_batch_encoded_bytes {
-        bail!(
-            "runtime.task_descriptor_max_encoded_bytes must not exceed runtime.task_operation_max_batch_encoded_bytes"
-        );
-    }
-    if runtime.task_operation_max_batch_encoded_bytes > runtime.task_query_backend_max_queued_bytes
-    {
-        bail!(
-            "runtime.task_operation_max_batch_encoded_bytes must not exceed runtime.task_query_backend_max_queued_bytes"
-        );
-    }
     if runtime.task_query_backend_max_queued_operations > runtime.task_backend_max_queued_operations
     {
         bail!(
@@ -2245,17 +2217,21 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.task_backend_max_queued_operations must fit one maximum ordinary batch and one maximum control batch"
         );
     }
-    let minimum_process_retained_bytes = runtime
-        .task_operation_max_batch_encoded_bytes
-        .checked_mul(4)
-        .ok_or_else(|| {
-            anyhow::anyhow!("runtime.task_operation_max_batch_encoded_bytes overflows retention")
-        })?;
-    if minimum_process_retained_bytes > runtime.task_backend_max_queued_bytes {
-        bail!(
-            "runtime.task_backend_max_queued_bytes must retain queued and encoded forms of one maximum ordinary batch and one maximum control batch"
-        );
-    }
+    let transport = FrontendTaskTransportBudget::try_new(
+        runtime.task_operation_max_batch_items,
+        runtime.task_operation_batch_target_encoded_bytes,
+        runtime.native_ingress.message_limits(),
+        runtime.task_query_backend_max_queued_operations,
+        runtime.task_query_backend_max_queued_bytes,
+        runtime.task_backend_max_queued_operations,
+        runtime.task_backend_max_queued_bytes,
+        runtime.task_max_tasks_per_participation,
+        runtime.task_max_active_tasks_per_backend,
+        Duration::from_millis(runtime.task_operation_queue_residence_ms),
+    )
+    .ok_or_else(|| anyhow::anyhow!("invalid runtime task transport policy"))?;
+    novarocks_frontend_application::NativeRequestWindows::for_transport(transport.into_codec())
+        .map_err(|error| anyhow::anyhow!("runtime.task_backend_max_queued_bytes / runtime.task_query_backend_max_queued_bytes: {error}"))?;
     let wait_ceiling = duration_millis(MaxWait::MAX_REPRESENTABLE);
     if runtime.task_operation_create_wait_cap_ms > wait_ceiling
         || runtime.task_operation_update_wait_cap_ms > wait_ceiling
@@ -2286,14 +2262,6 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     )
     .map_err(anyhow::Error::msg)
     .context("validate native result retained-byte limits")?;
-    let per_root = u64::try_from(runtime.result_retained_bytes_per_root)
-        .context("runtime.result_retained_bytes_per_root exceeds u64")?;
-    if per_root > FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES {
-        bail!(
-            "runtime.result_retained_bytes_per_root {per_root} exceeds the Native root-result payload limit {}",
-            FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
-        );
-    }
     Ok(())
 }
 
@@ -2707,9 +2675,8 @@ impl Default for RuntimeConfig {
             task_dispatch_lifecycle_permits: default_task_dispatch_lifecycle_permits(),
             task_dispatch_control_permits: default_task_dispatch_control_permits(),
             task_operation_max_batch_items: default_task_operation_max_batch_items(),
-            task_operation_max_batch_encoded_bytes: default_task_operation_max_batch_encoded_bytes(
-            ),
-            task_descriptor_max_encoded_bytes: default_task_descriptor_max_encoded_bytes(),
+            task_operation_batch_target_encoded_bytes:
+                default_task_operation_batch_target_encoded_bytes(),
             task_query_backend_max_queued_operations:
                 default_task_query_backend_max_queued_operations(),
             task_query_backend_max_queued_bytes: default_task_query_backend_max_queued_bytes(),
@@ -3227,9 +3194,7 @@ mod tests {
             64 * 1024 * 1024
         );
     }
-    use novarocks_native_adapter::{
-        FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-    };
+    use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_spi::connector::{
         CatalogCredentialPurpose, NodeLocalCredentialReference, StaticCredentialReference,
     };
@@ -3940,12 +3905,8 @@ access_key_secret = ""
             frozen.max_batch_items()
         );
         assert_eq!(
-            runtime.task_operation_max_batch_encoded_bytes,
-            frozen.max_batch_encoded_bytes()
-        );
-        assert_eq!(
-            runtime.task_descriptor_max_encoded_bytes,
-            frozen.max_descriptor_encoded_bytes()
+            runtime.task_operation_batch_target_encoded_bytes,
+            frozen.batch_target_encoded_bytes()
         );
         assert_eq!(
             runtime.task_query_backend_max_queued_operations,
@@ -3996,6 +3957,12 @@ access_key_secret = ""
 
     #[test]
     fn result_retained_config_rejects_zero_and_inverted_limits() {
+        let defaults = RuntimeConfig::default();
+        assert_eq!(defaults.result_retained_bytes_per_root, 16 * 1024 * 1024);
+        assert_eq!(
+            defaults.result_retained_bytes_per_process,
+            4 * 1024 * 1024 * 1024
+        );
         let mut runtime = RuntimeConfig {
             result_retained_bytes_per_root: 0,
             ..Default::default()
@@ -4021,16 +3988,12 @@ access_key_secret = ""
             .expect_err("a per-root cap above the process cap must fail");
         assert!(format!("{error:#}").contains("must not exceed"));
 
-        let above_wire = usize::try_from(FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES + 1)
-            .expect("the Native wire bound fits usize");
         runtime = RuntimeConfig {
-            result_retained_bytes_per_root: above_wire,
-            result_retained_bytes_per_process: above_wire,
+            result_retained_bytes_per_root: 256 * 1024 * 1024,
             ..Default::default()
         };
-        let error = validate_result_retained_config(&runtime)
-            .expect_err("a root payload above the Native decode envelope must fail");
-        assert!(format!("{error:#}").contains("Native root-result payload limit"));
+        validate_result_retained_config(&runtime)
+            .expect("retained inputs and outputs are not one wire payload");
     }
 
     #[test]
@@ -4039,7 +4002,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn task_execution_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 23] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 22] = [
             ("task_dispatch_create_permits", |runtime| {
                 runtime.task_dispatch_create_permits = 0;
             }),
@@ -4055,11 +4018,8 @@ access_key_secret = ""
             ("task_operation_max_batch_items", |runtime| {
                 runtime.task_operation_max_batch_items = 0;
             }),
-            ("task_operation_max_batch_encoded_bytes", |runtime| {
-                runtime.task_operation_max_batch_encoded_bytes = 0;
-            }),
-            ("task_descriptor_max_encoded_bytes", |runtime| {
-                runtime.task_descriptor_max_encoded_bytes = 0;
+            ("task_operation_batch_target_encoded_bytes", |runtime| {
+                runtime.task_operation_batch_target_encoded_bytes = 0;
             }),
             ("task_query_backend_max_queued_operations", |runtime| {
                 runtime.task_query_backend_max_queued_operations = 0;
@@ -4129,18 +4089,14 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each inverted pair explicit."
     )]
     fn task_execution_config_rejects_inverted_bounds() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 7] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 6] = [
             ("participation_lease_max_ms", |runtime| {
                 runtime.participation_lease_min_ms = 30_000;
                 runtime.participation_lease_max_ms = 29_999;
             }),
-            ("task_descriptor_max_encoded_bytes", |runtime| {
-                runtime.task_descriptor_max_encoded_bytes =
-                    runtime.task_operation_max_batch_encoded_bytes + 1;
-            }),
-            ("task_operation_max_batch_encoded_bytes", |runtime| {
+            ("task_query_backend_max_queued_bytes", |runtime| {
                 runtime.task_query_backend_max_queued_bytes =
-                    runtime.task_operation_max_batch_encoded_bytes - 1;
+                    runtime.native_ingress.ordinary_request_max_bytes;
             }),
             ("task_query_backend_max_queued_operations", |runtime| {
                 runtime.task_backend_max_queued_operations =
@@ -4154,9 +4110,9 @@ access_key_secret = ""
             }),
             ("task_backend_max_queued_bytes", |runtime| {
                 runtime.task_query_backend_max_queued_bytes =
-                    runtime.task_operation_max_batch_encoded_bytes;
+                    runtime.task_operation_batch_target_encoded_bytes;
                 runtime.task_backend_max_queued_bytes =
-                    runtime.task_operation_max_batch_encoded_bytes * 4 - 1;
+                    runtime.task_operation_batch_target_encoded_bytes * 4 - 1;
             }),
             ("participation_lease_max_ms", |runtime| {
                 runtime.participation_lease_max_ms =
@@ -4794,7 +4750,7 @@ control_request_max_bytes = 524288
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("Native message limit")
+                .contains("4-byte length prefix")
         );
 
         assert!(
@@ -4814,6 +4770,25 @@ control_request_max_bytes = 524288
                 .to_string()
                 .contains("frame envelope overflows")
         );
+    }
+
+    #[test]
+    fn native_ingress_accepts_message_lengths_above_the_old_ceiling() {
+        let config = NativeIngressRuntimeConfig {
+            ordinary_request_max_bytes: 64 * 1024 * 1024 + 1,
+            ordinary_response_max_bytes: 128 * 1024 * 1024,
+            ..NativeIngressRuntimeConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.to_adapter_config().ordinary_request_max_bytes,
+            64 * 1024 * 1024 + 1
+        );
+        let unrepresentable = NativeIngressRuntimeConfig {
+            ordinary_request_max_bytes: u32::MAX as usize + 1,
+            ..config
+        };
+        assert!(unrepresentable.validate().is_err());
     }
 
     #[test]

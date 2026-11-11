@@ -33,7 +33,7 @@ use novarocks_fs::{FsLocation, FsScheme};
 use novarocks_spi::connector::{
     ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorListingBound, ConnectorListingBudget,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorListingPageSize,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorUnanchoredCtasCleanup, ProviderBindingEpoch,
 };
@@ -273,10 +273,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                         admission
                             .run(&control, async {
                                 let mut locations = Vec::new();
-                                let mut budget =
-                                    ConnectorListingBudget::new(ConnectorListingBound::V1)?;
-                                let mut retained =
-                                    ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+
                                 let root_path = std::path::Path::new(&root_path);
                                 let mut entries = match tokio::fs::read_dir(root_path).await {
                                     Ok(entries) => entries,
@@ -296,25 +293,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                 {
                                     Self::validate_context(&control)?;
                                     let entry_path = entry.path();
-                                    let entry_name = entry_path.to_str().ok_or_else(|| {
+                                    entry_path.to_str().ok_or_else(|| {
                                         invalid("unanchored CTAS root path is not UTF-8")
                                     })?;
-                                    budget.admit_names(std::iter::once(entry_name))?;
-                                    entry_name
-                                        .len()
-                                        .checked_add(
-                                            1 + CTAS_UNANCHORED_PROVENANCE_FILE.len()
-                                                + "file://".len(),
-                                        )
-                                        .filter(|bytes| {
-                                            *bytes <= ConnectorListingBound::V1.name_bytes
-                                        })
-                                        .ok_or_else(|| {
-                                            ConnectorError::new(
-                                                ConnectorErrorKind::ResourceExhausted,
-                                                "unanchored CTAS sidecar name bound exceeded",
-                                            )
-                                        })?;
+
                                     let path = entry_path.join(CTAS_UNANCHORED_PROVENANCE_FILE);
                                     let is_file = match tokio::fs::metadata(&path).await {
                                         Ok(metadata) => metadata.is_file(),
@@ -330,27 +312,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                         }
                                     };
                                     if is_file {
-                                        let location_bytes = path
-                                            .to_str()
-                                            .ok_or_else(|| {
-                                                invalid("unanchored CTAS sidecar path is not UTF-8")
-                                            })?
-                                            .len()
-                                            + "file://".len();
-                                        if location_bytes > ConnectorListingBound::V1.name_bytes {
-                                            return Err(ConnectorError::new(
-                                                ConnectorErrorKind::ResourceExhausted,
-                                                "unanchored CTAS sidecar name bound exceeded",
-                                            ));
-                                        }
                                         let path_name = path.to_str().ok_or_else(|| {
                                             invalid("unanchored CTAS sidecar path is not UTF-8")
                                         })?;
-                                        retained.admit_qualified_names(
-                                            "file://",
-                                            std::iter::once(path_name),
-                                        )?;
-                                        let location = format!("file://{}", path.display());
+                                        let location = format!("file://{path_name}");
                                         locations.push(location);
                                     }
                                 }
@@ -370,8 +335,6 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                     .to_string();
                 let prefix = format!("{path}/");
                 let operator = access.operator();
-                let location_prefix = crate::fs_io::format_resolved_location(access.handle(), "")
-                    .map_err(unavailable)?;
                 let control = context.clone();
                 let admission = self.runtime.novarocks_catalog().listing_admission();
                 self.runtime
@@ -385,7 +348,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                     operator
                                         .lister_with(&prefix)
                                         .recursive(true)
-                                        .limit(ConnectorListingBound::V1.page_entries)
+                                        .limit(ConnectorListingPageSize::DEFAULT.get())
                                         .into_future(),
                                 )
                                 .await?
@@ -394,10 +357,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                         novarocks_fs::map_object_store_listing_error(error),
                                     )
                                 })?;
-                                let mut budget =
-                                    ConnectorListingBudget::new(ConnectorListingBound::V1)?;
-                                let mut retained =
-                                    ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+
                                 let mut locations = Vec::new();
                                 while let Some(entry) =
                                     until_context(&control, entries.next()).await?
@@ -407,27 +367,11 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                             novarocks_fs::map_object_store_listing_error(error),
                                         )
                                     })?;
-                                    budget.admit_names(std::iter::once(entry.path()))?;
+
                                     if !entry.path().ends_with(CTAS_UNANCHORED_PROVENANCE_FILE) {
                                         continue;
                                     }
-                                    let relative_path = entry.path().trim_start_matches('/');
-                                    location_prefix
-                                        .len()
-                                        .checked_add(relative_path.len())
-                                        .filter(|bytes| {
-                                            *bytes <= ConnectorListingBound::V1.name_bytes
-                                        })
-                                        .ok_or_else(|| {
-                                            ConnectorError::new(
-                                                ConnectorErrorKind::ResourceExhausted,
-                                                "unanchored CTAS sidecar name bound exceeded",
-                                            )
-                                        })?;
-                                    retained.admit_qualified_names(
-                                        &location_prefix,
-                                        std::iter::once(relative_path),
-                                    )?;
+
                                     let location = crate::fs_io::format_resolved_location(
                                         access.handle(),
                                         entry.path(),
@@ -514,10 +458,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                     admission
                         .run(&control, async {
                             let mut locations = Vec::new();
-                            let mut budget =
-                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
-                            let mut retained =
-                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+
                             let root_path = std::path::Path::new(&root_path);
                             let mut entries = match tokio::fs::read_dir(root_path).await {
                                 Ok(entries) => entries,
@@ -535,22 +476,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                             })? {
                                 Self::validate_context(&control)?;
                                 let entry_path = entry.path();
-                                let entry_name = entry_path.to_str().ok_or_else(|| {
+                                entry_path.to_str().ok_or_else(|| {
                                     invalid("unanchored CTAS root path is not UTF-8")
                                 })?;
-                                budget.admit_names(std::iter::once(entry_name))?;
-                                entry_name
-                                    .len()
-                                    .checked_add(
-                                        1 + CTAS_UNANCHORED_PROVENANCE_FILE.len() + "file://".len(),
-                                    )
-                                    .filter(|bytes| *bytes <= ConnectorListingBound::V1.name_bytes)
-                                    .ok_or_else(|| {
-                                        ConnectorError::new(
-                                            ConnectorErrorKind::ResourceExhausted,
-                                            "unanchored CTAS sidecar name bound exceeded",
-                                        )
-                                    })?;
+
                                 let path = entry_path.join(CTAS_UNANCHORED_PROVENANCE_FILE);
                                 let is_file = match tokio::fs::metadata(&path).await {
                                     Ok(metadata) => metadata.is_file(),
@@ -564,27 +493,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                     }
                                 };
                                 if is_file {
-                                    let location_bytes = path
-                                        .to_str()
-                                        .ok_or_else(|| {
-                                            invalid("unanchored CTAS sidecar path is not UTF-8")
-                                        })?
-                                        .len()
-                                        + "file://".len();
-                                    if location_bytes > ConnectorListingBound::V1.name_bytes {
-                                        return Err(ConnectorError::new(
-                                            ConnectorErrorKind::ResourceExhausted,
-                                            "unanchored CTAS sidecar name bound exceeded",
-                                        ));
-                                    }
                                     let path_name = path.to_str().ok_or_else(|| {
                                         invalid("unanchored CTAS sidecar path is not UTF-8")
                                     })?;
-                                    retained.admit_qualified_names(
-                                        "file://",
-                                        std::iter::once(path_name),
-                                    )?;
-                                    let location = format!("file://{}", path.display());
+                                    let location = format!("file://{path_name}");
                                     locations.push(location);
                                 }
                             }
@@ -604,8 +516,6 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                     .to_string();
                 let prefix = format!("{path}/");
                 let operator = access.operator();
-                let location_prefix = crate::fs_io::format_resolved_location(access.handle(), "")
-                    .map_err(unavailable)?;
                 let control = context.clone();
                 let admission = self.runtime.novarocks_catalog().listing_admission();
                 async move {
@@ -616,7 +526,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                 operator
                                     .lister_with(&prefix)
                                     .recursive(true)
-                                    .limit(ConnectorListingBound::V1.page_entries)
+                                    .limit(ConnectorListingPageSize::DEFAULT.get())
                                     .into_future(),
                             )
                             .await?
@@ -625,10 +535,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                     error,
                                 ))
                             })?;
-                            let mut budget =
-                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
-                            let mut retained =
-                                ConnectorListingBudget::new(ConnectorListingBound::V1)?;
+
                             let mut locations = Vec::new();
                             while let Some(entry) = until_context(&control, entries.next()).await? {
                                 let entry = entry.map_err(|error| {
@@ -636,25 +543,11 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                                         novarocks_fs::map_object_store_listing_error(error),
                                     )
                                 })?;
-                                budget.admit_names(std::iter::once(entry.path()))?;
+
                                 if !entry.path().ends_with(CTAS_UNANCHORED_PROVENANCE_FILE) {
                                     continue;
                                 }
-                                let relative_path = entry.path().trim_start_matches('/');
-                                location_prefix
-                                    .len()
-                                    .checked_add(relative_path.len())
-                                    .filter(|bytes| *bytes <= ConnectorListingBound::V1.name_bytes)
-                                    .ok_or_else(|| {
-                                        ConnectorError::new(
-                                            ConnectorErrorKind::ResourceExhausted,
-                                            "unanchored CTAS sidecar name bound exceeded",
-                                        )
-                                    })?;
-                                retained.admit_qualified_names(
-                                    &location_prefix,
-                                    std::iter::once(relative_path),
-                                )?;
+
                                 let location = crate::fs_io::format_resolved_location(
                                     access.handle(),
                                     entry.path(),
@@ -770,11 +663,11 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         let delete = async move {
             admission
                 .run(&context, async {
-                    delete_prefix_bounded_tracking(
+                    delete_prefix_in_batches_tracking(
                         access.operator(),
                         &path,
                         &context,
-                        ConnectorListingBound::V1,
+                        ConnectorListingPageSize::DEFAULT,
                         &started,
                     )
                     .await
@@ -931,11 +824,11 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
             .block_on(async move {
                 admission
                     .run(&context, async {
-                        delete_prefix_bounded_tracking(
+                        delete_prefix_in_batches_tracking(
                             access.operator(),
                             &path,
                             &context,
-                            ConnectorListingBound::V1,
+                            ConnectorListingPageSize::DEFAULT,
                             &started,
                         )
                         .await
@@ -986,48 +879,38 @@ async fn until_context<T>(
 }
 
 #[cfg(test)]
-async fn delete_prefix_bounded(
+async fn delete_prefix_in_batches(
     operator: opendal::Operator,
     path: &str,
     context: &ConnectorRequestContext,
-    bound: ConnectorListingBound,
+    bound: ConnectorListingPageSize,
 ) -> Result<(), ConnectorError> {
-    delete_prefix_bounded_tracking(operator, path, context, bound, &AtomicBool::new(false)).await
+    delete_prefix_in_batches_tracking(operator, path, context, bound, &AtomicBool::new(false)).await
 }
 
 /// Preserve source deletion order, retaining at most one small batch.
 /// Only a pass that began a delete can have an unknown destructive outcome.
-async fn delete_prefix_bounded_tracking(
+async fn delete_prefix_in_batches_tracking(
     operator: opendal::Operator,
     path: &str,
     context: &ConnectorRequestContext,
-    bound: ConnectorListingBound,
+    bound: ConnectorListingPageSize,
     delete_started: &AtomicBool,
 ) -> Result<(), ConnectorError> {
-    let mut budget = ConnectorListingBudget::new(bound)?;
     let normalized_root = path.trim_end_matches('/');
-    normalized_root
-        .len()
-        .checked_add(1 + CTAS_UNANCHORED_PROVENANCE_FILE.len())
-        .filter(|bytes| *bytes <= bound.name_bytes)
-        .ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "unanchored CTAS recovery marker name bound exceeded",
-            )
-        })?;
+
     let recovery_marker = format!("{normalized_root}/{CTAS_UNANCHORED_PROVENANCE_FILE}");
     let mut entries = until_context(
         context,
         operator
             .lister_with(path)
             .recursive(true)
-            .limit(bound.page_entries)
+            .limit(bound.get())
             .into_future(),
     )
     .await?
     .map_err(|error| ConnectorError::from(novarocks_fs::map_object_store_listing_error(error)))?;
-    let mut batch = Vec::with_capacity(bound.page_entries);
+    let mut batch = Vec::with_capacity(bound.get());
     // Keep the recovery marker until every listed child has been deleted.
     let mut provenance = None;
     let mut root_directory = None;
@@ -1039,7 +922,7 @@ async fn delete_prefix_bounded_tracking(
             root_directory = Some(entry.path().to_owned());
             continue;
         }
-        budget.admit_names(std::iter::once(entry.path()))?;
+
         if entry.path().trim_end_matches('/') == recovery_marker {
             provenance = Some(entry.path().to_owned());
             continue;
@@ -1050,7 +933,7 @@ async fn delete_prefix_bounded_tracking(
             ));
         }
         batch.push(entry.path().to_owned());
-        if batch.len() == bound.page_entries {
+        if batch.len() == bound.get() {
             delete_started.store(true, Ordering::Release);
             until_context(context, operator.delete_iter(std::mem::take(&mut batch)))
                 .await?
@@ -1129,14 +1012,11 @@ mod listing_tests {
         }
         operator.write("neighbor/keep", "data").await.unwrap();
         let stop = ConnectorStopOwner::new();
-        delete_prefix_bounded(
+        delete_prefix_in_batches(
             operator.clone(),
             "root/",
             &context(&stop),
-            ConnectorListingBound {
-                page_entries: 2,
-                ..ConnectorListingBound::V1
-            },
+            ConnectorListingPageSize::new(2).unwrap(),
         )
         .await
         .unwrap();
@@ -1145,40 +1025,7 @@ mod listing_tests {
     }
 
     #[tokio::test]
-    async fn cleanup_entry_bound_refuses_the_destructive_pass_without_truncation_success() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
-        for index in 0..3 {
-            operator
-                .write(&format!("root/file{index}"), "data")
-                .await
-                .unwrap();
-        }
-        let stop = ConnectorStopOwner::new();
-        let started = AtomicBool::new(false);
-        let error = delete_prefix_bounded_tracking(
-            operator.clone(),
-            "root/",
-            &context(&stop),
-            ConnectorListingBound {
-                entries: 2,
-                page_entries: 1,
-                ..ConnectorListingBound::V1
-            },
-            &started,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-        assert!(started.load(Ordering::Acquire));
-        assert!(matches!(
-            cleanup_delete_outcome(Ok(Err(error)), true).unwrap(),
-            ConnectorCtasUnanchoredCleanupOutcome::CommitUnknown { .. }
-        ));
-        assert!(!operator.list("root/").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cleanup_local_nested_directories_stream_and_preserve_marker_on_refusal() {
+    async fn cleanup_local_nested_directories_stream_to_complete_deletion() {
         let directory = tempfile::tempdir().unwrap();
         let operator = opendal::Operator::new(
             opendal::services::Fs::default().root(directory.path().to_str().unwrap()),
@@ -1191,72 +1038,15 @@ mod listing_tests {
             .await
             .unwrap();
         let stop = ConnectorStopOwner::new();
-        let bound = ConnectorListingBound {
-            page_entries: 1,
-            entries: 1,
-            ..ConnectorListingBound::V1
-        };
-        assert_eq!(
-            delete_prefix_bounded(operator.clone(), "root/", &context(&stop), bound)
-                .await
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert!(
-            operator
-                .exists(&format!("root/{CTAS_UNANCHORED_PROVENANCE_FILE}"))
-                .await
-                .unwrap()
-        );
-        delete_prefix_bounded(
+        delete_prefix_in_batches(
             operator.clone(),
             "root/",
             &context(&stop),
-            ConnectorListingBound {
-                page_entries: 1,
-                ..ConnectorListingBound::V1
-            },
+            ConnectorListingPageSize::new(1).unwrap(),
         )
         .await
         .unwrap();
         assert!(!directory.path().join("root").exists());
-    }
-
-    #[tokio::test]
-    async fn cleanup_listing_refusal_before_first_delete_keeps_exact_error_and_files() {
-        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
-        for index in 0..3 {
-            operator
-                .write(&format!("root/file{index}"), "data")
-                .await
-                .unwrap();
-        }
-        let stop = ConnectorStopOwner::new();
-        let started = AtomicBool::new(false);
-        let error = delete_prefix_bounded_tracking(
-            operator.clone(),
-            "root/",
-            &context(&stop),
-            ConnectorListingBound {
-                entries: 2,
-                page_entries: 256,
-                ..ConnectorListingBound::V1
-            },
-            &started,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            cleanup_delete_outcome(Ok(Err(error)), started.load(Ordering::Acquire))
-                .unwrap_err()
-                .kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert!(!started.load(Ordering::Acquire));
-        for index in 0..3 {
-            assert!(operator.exists(&format!("root/file{index}")).await.unwrap());
-        }
     }
 
     #[tokio::test]
@@ -1275,11 +1065,11 @@ mod listing_tests {
         let started = AtomicBool::new(false);
         let error = admission
             .run(&expired, async {
-                delete_prefix_bounded_tracking(
+                delete_prefix_in_batches_tracking(
                     operator.clone(),
                     "root/",
                     &expired,
-                    ConnectorListingBound::V1,
+                    ConnectorListingPageSize::DEFAULT,
                     &started,
                 )
                 .await
@@ -1305,11 +1095,11 @@ mod listing_tests {
         stop.request_stop();
         let started = AtomicBool::new(false);
         assert_eq!(
-            delete_prefix_bounded_tracking(
+            delete_prefix_in_batches_tracking(
                 operator.clone(),
                 "root/",
                 &context,
-                ConnectorListingBound::V1,
+                ConnectorListingPageSize::DEFAULT,
                 &started,
             )
             .await
@@ -1319,5 +1109,20 @@ mod listing_tests {
         );
         assert!(!started.load(Ordering::Acquire));
         assert!(operator.exists("root/keep").await.unwrap());
+    }
+    #[test]
+    fn cleanup_io_failure_keeps_the_original_fact_before_delete_and_unknown_after_delete() {
+        let original = ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "injected cleanup I/O failure",
+        );
+        let before = cleanup_delete_outcome(Ok(Err(original.clone())), false).unwrap_err();
+        assert_eq!(before.kind(), original.kind());
+        assert_eq!(before.message(), original.message());
+        let after = cleanup_delete_outcome(Ok(Err(original)), true).unwrap();
+        assert!(matches!(
+            after,
+            ConnectorCtasUnanchoredCleanupOutcome::CommitUnknown { .. }
+        ));
     }
 }

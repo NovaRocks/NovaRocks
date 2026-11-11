@@ -86,7 +86,7 @@ fn physical_outer(input: &p::PhysicalNode) -> Result<(usize, usize), Error> {
             spec.inputs.len(),
             bytes::<p::PositionShardInput>(spec.inputs.len())?,
         ),
-        p::NodeKind::Limit { .. } => (0, 0),
+        p::NodeKind::SystemRelation { .. } | p::NodeKind::Limit { .. } => (0, 0),
         p::NodeKind::GenerateSeries { step, .. } => (2 + usize::from(step.is_some()), 0),
         _ => return Err(invalid("physical node is outside the simple node family")),
     };
@@ -113,7 +113,8 @@ fn wire_outer(input: &wire::PhysicalNode) -> Result<(usize, usize), Error> {
                 v.contribution_group_id.capacity(),
             )?,
         ),
-        Some(wire::physical_node::Kind::Limit(_)) => (0, 0),
+        Some(wire::physical_node::Kind::SystemRelation(_))
+        | Some(wire::physical_node::Kind::Limit(_)) => (0, 0),
         Some(wire::physical_node::Kind::GenerateSeries(v)) => {
             (2 + usize::from(v.step_expr_id.is_some()), 0)
         }
@@ -220,7 +221,7 @@ fn prepare_encode(
             model.request::<u8>(32, 1)?;
             0
         }
-        p::NodeKind::Limit { .. } => 0,
+        p::NodeKind::SystemRelation { .. } | p::NodeKind::Limit { .. } => 0,
         _ => return Err(invalid("prepared physical kind is outside simple family")),
     };
     model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
@@ -300,7 +301,7 @@ fn prepare_encode(
                 reference(id.get(), values, w)?;
             }
         }
-        p::NodeKind::Limit { .. } => {
+        p::NodeKind::SystemRelation { .. } | p::NodeKind::Limit { .. } => {
             w.step()?;
         }
         _ => unreachable!(),
@@ -421,7 +422,8 @@ fn prepare_decode(
             }
             0
         }
-        Some(wire::physical_node::Kind::Limit(_)) => 0,
+        Some(wire::physical_node::Kind::SystemRelation(_))
+        | Some(wire::physical_node::Kind::Limit(_)) => 0,
         _ => return Err(invalid("prepared wire kind is outside simple family")),
     };
     model.delegated_work = mul(occurrences, expressions.lookup_work_upper_bound()?)?;
@@ -500,7 +502,8 @@ fn prepare_decode(
                 reference(id.get(), values, w)?;
             }
         }
-        Some(wire::physical_node::Kind::Limit(_)) => {
+        Some(wire::physical_node::Kind::SystemRelation(_))
+        | Some(wire::physical_node::Kind::Limit(_)) => {
             w.step()?;
         }
         _ => unreachable!(),
@@ -615,6 +618,20 @@ fn emit_encode(
             }
             wire::physical_node::Kind::Values(wire::ValuesNode { rows: output })
         }
+        p::NodeKind::SystemRelation { data, .. } => {
+            if matches!(data, p::SystemRelationData::Deferred) {
+                return Err(invalid(
+                    "execution package contains deferred system relation",
+                ));
+            }
+            let facts = data.resource_facts().map_err(Error::from)?;
+            wire::physical_node::Kind::SystemRelation(wire::SystemRelationNode {
+                batches: u64::try_from(facts.batches)
+                    .map_err(|_| invalid("system relation batch count overflow"))?,
+                rows: u64::try_from(facts.rows)
+                    .map_err(|_| invalid("system relation row count overflow"))?,
+            })
+        }
         p::NodeKind::Limit { limit, offset } => wire::physical_node::Kind::Limit(wire::LimitNode {
             limit: *limit,
             offset: *offset,
@@ -702,6 +719,10 @@ fn emit_decode(
                 rows: boxed(output, w)?,
             }
         }
+        Some(wire::physical_node::Kind::SystemRelation(_)) => p::NodeKind::SystemRelation {
+            output_fields: std::sync::Arc::default(),
+            data: p::SystemRelationData::Deferred,
+        },
         Some(wire::physical_node::Kind::Limit(v)) => p::NodeKind::Limit {
             limit: v.limit,
             offset: v.offset,

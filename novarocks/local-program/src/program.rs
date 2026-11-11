@@ -523,6 +523,9 @@ pub enum ProgramNodeKind {
     Values {
         values: StaticValues,
     },
+    SystemRelation {
+        batches: crate::StaticBatchSequence,
+    },
     /// Original integer-series computation over the subordinate bounds Values.
     GenerateSeries {
         input: ProgramNodeId,
@@ -698,7 +701,10 @@ impl ProgramNodeKind {
         mut visit: impl FnMut(ProgramNodeId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Values { .. } | Self::Scan { .. } | Self::ExchangeSource { .. } => {}
+            Self::Values { .. }
+            | Self::SystemRelation { .. }
+            | Self::Scan { .. }
+            | Self::ExchangeSource { .. } => {}
             Self::AssertNumRows { input, .. }
             | Self::Project { input, .. }
             | Self::Unpivot { input, .. }
@@ -741,6 +747,7 @@ impl ProgramNodeKind {
     ) -> Result<(), E> {
         match self {
             Self::Values { .. }
+            | Self::SystemRelation { .. }
             | Self::AssertNumRows { .. }
             | Self::Repeat { .. }
             | Self::UnionAll { .. }
@@ -2118,6 +2125,11 @@ fn validate_shape(
             work.step()?;
             if empty {
                 return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+        }
+        ProgramNodeKind::SystemRelation { batches } => {
+            if work.identity(batches.layout())? != work.identity(&node.output_layout)? {
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         ProgramNodeKind::Values { values } => {

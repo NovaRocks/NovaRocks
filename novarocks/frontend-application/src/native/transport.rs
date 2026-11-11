@@ -30,9 +30,6 @@ use novarocks_native_adapter::native_lane::{
 mod cold_dial;
 pub(super) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
 
-const MAX_MESSAGE_BYTES: usize =
-    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
-
 /// One best-effort response from a Backend catalog reachability prune.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogPruneDispatchOutcome {
@@ -86,6 +83,10 @@ pub(super) type AuthenticatedNovaRocksGrpcClient =
 
 /// The Root-only client keeps the original authenticated ResultData channel.
 pub(super) type AuthenticatedRootResultGrpc =
+    tonic::client::Grpc<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
+
+#[cfg(test)]
+pub(super) type AuthenticatedOperationTestGrpc =
     tonic::client::Grpc<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 /// A Native channel either fails before an outbound connection is attempted,
@@ -337,6 +338,7 @@ impl Client {
     pub(in crate::native) fn grpc_for_reserved_call(
         &self,
         call: novarocks_native_adapter::native_lane::ReservedNativeCall,
+        method: NativeRpcMethod,
     ) -> tonic::client::Grpc<
         InterceptedService<
             novarocks_native_adapter::native_lane::ReservedNativeCall,
@@ -347,8 +349,38 @@ impl Client {
             call,
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         ))
-        .max_encoding_message_size(MAX_MESSAGE_BYTES)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(self.method_message_limits(method).0)
+        .max_decoding_message_size(self.method_message_limits(method).1)
+    }
+
+    pub(super) fn method_message_limits(&self, method: NativeRpcMethod) -> (usize, usize) {
+        let control = method.contract().traffic
+            == NativeTrafficClass::Frontend(
+                novarocks_proto_codec::native_rpc::FrontendNativeLane::LifecycleControl,
+            );
+        let limits = self.data_runtime.task_message_limits();
+        (
+            limits.request_max_bytes(control),
+            limits.response_max_bytes(control),
+        )
+    }
+
+    /// Wire fixtures retain their original request facts on the same Codec
+    /// as production. This supplies no production source-free submission path.
+    #[cfg(test)]
+    pub(super) async fn operation_test_grpc_with_channel_identity(
+        &self,
+        method: NativeRpcMethod,
+    ) -> Result<(AuthenticatedOperationTestGrpc, CachedNativeChannel), ChannelAcquisitionError>
+    {
+        let acquired = channel(&self.data_runtime, self.channel_key(method)?).await?;
+        let grpc = tonic::client::Grpc::new(InterceptedService::new(
+            acquired.channel().clone(),
+            NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
+        ))
+        .max_encoding_message_size(self.method_message_limits(method).0)
+        .max_decoding_message_size(self.method_message_limits(method).1);
+        Ok((grpc, acquired))
     }
 
     pub(super) async fn grpc_with_channel_identity(
@@ -361,8 +393,8 @@ impl Client {
             acquired.channel().clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         )
-        .max_encoding_message_size(MAX_MESSAGE_BYTES)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        .max_encoding_message_size(self.method_message_limits(method).0)
+        .max_decoding_message_size(self.method_message_limits(method).1);
         Ok((grpc, acquired))
     }
 

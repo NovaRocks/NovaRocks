@@ -37,6 +37,7 @@ pub mod activity;
 mod bounded_dependencies;
 pub mod candidate;
 pub mod dependency;
+pub mod freshness;
 pub mod maintenance;
 pub mod management;
 pub mod persistence;

@@ -57,7 +57,6 @@ use execution_control::CpuWorkControl;
 mod creator_job;
 mod metadata_geometry;
 mod scoped_statistics;
-mod scoped_view_show;
 pub(crate) use creator_job::CreatorCpuJob;
 pub use metadata_geometry::InternalCpuActionQuote;
 pub use metadata_geometry::InternalCpuMetadataGeometry;

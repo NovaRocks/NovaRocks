@@ -92,8 +92,7 @@ pub use session::{
 };
 pub use statistics::{
     AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats, DropStats,
-    ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
-    StatisticsStatement,
+    ShowAnalyzeJobs, ShowTableStats, StatisticsStatement,
 };
 pub use table::{
     ColumnDefinition, CreateTable, LegacyRangePartition, LegacyRangePartitionDefinition,
@@ -101,7 +100,7 @@ pub use table::{
     TablePartitionTransform, TableProperty, TableStatement,
 };
 pub use validate::{validate_statement, validate_statements};
-pub use view::{CreateView, DropView, ShowCreateView, ShowViews, ViewStatement};
+pub use view::{CreateView, DropView, ShowCreateView, ViewStatement};
 pub use visit::{
     Fold, Visit, fold_binary_expr, fold_expr, fold_function_call, fold_ident, fold_literal,
     fold_nested_expr, fold_object_name, fold_query, fold_select, fold_show_backends,

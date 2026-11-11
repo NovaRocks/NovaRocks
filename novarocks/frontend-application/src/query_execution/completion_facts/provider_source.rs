@@ -35,6 +35,7 @@ type RejectedCompletionSources = (
     Arc<Facts>,
     Arc<FrontendProviderReadFacts>,
     Option<Arc<FrontendPlanningCpuSource>>,
+    Arc<super::system_source::FrontendSystemTableFacts>,
 );
 
 #[derive(Default)]
@@ -42,6 +43,7 @@ struct ProviderCompletionState {
     facts: Option<Arc<Facts>>,
     provider: Option<Arc<FrontendProviderReadFacts>>,
     owned_catalog_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+    system: Option<Arc<super::system_source::FrontendSystemTableFacts>>,
     provider_close_outcome: Option<Result<(), StatementNativeHealthFailure>>,
     outcome: Option<CompletionResult>,
     health: Option<StatementNativeHealthFailure>,
@@ -86,18 +88,21 @@ impl FrontendCompletionCustody {
         facts: Arc<Facts>,
         provider: Arc<FrontendProviderReadFacts>,
         owned_catalog_cpu: Option<Arc<FrontendPlanningCpuSource>>,
+        system: Arc<super::system_source::FrontendSystemTableFacts>,
     ) -> Result<(), RejectedCompletionSources> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.facts.is_some()
             || state.provider.is_some()
             || state.owned_catalog_cpu.is_some()
+            || state.system.is_some()
             || state.joined
         {
-            return Err((facts, provider, owned_catalog_cpu));
+            return Err((facts, provider, owned_catalog_cpu, system));
         }
         state.facts = Some(facts);
         state.provider = Some(provider);
         state.owned_catalog_cpu = owned_catalog_cpu;
+        state.system = Some(system);
         Ok(())
     }
     /// Borrow the already installed catalog port; no second fact source is created.
@@ -177,15 +182,41 @@ impl FrontendCompletionCustody {
         provider.resolve_provider_reads_typed(needs, taken).await
     }
 
+    pub(crate) async fn resolve_system_tables(
+        &self,
+        needs: &[novarocks_sql::compiler::SystemTableSnapshotNeed],
+    ) -> Result<
+        Vec<novarocks_sql::compiler::SystemTableSnapshotFact>,
+        novarocks_sql::compiler::SqlCompileError,
+    > {
+        use novarocks_query_application::preparation::SystemTableSnapshotFactPort;
+        let source = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.joined || state.health.is_some() {
+                return Err(novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                    "system snapshot custody is closed or unhealthy".into(),
+                ));
+            }
+            state.system.clone().ok_or_else(|| {
+                novarocks_sql::compiler::SqlCompileError::InvalidRequest(
+                    "original system snapshot Source is absent".into(),
+                )
+            })?
+        };
+        source.resolve_system_tables(needs).await
+    }
+
     pub(crate) fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        let owned_catalog_cpu = {
+        let (owned_catalog_cpu, system) = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(health) = &state.health {
                 return Some(health.clone());
             }
-            state.owned_catalog_cpu.clone()
+            (state.owned_catalog_cpu.clone(), state.system.clone())
         };
-        owned_catalog_cpu.and_then(|cpu| cpu.local_health_failure())
+        owned_catalog_cpu
+            .and_then(|cpu| cpu.local_health_failure())
+            .or_else(|| system.and_then(|source| source.local_health_failure()))
     }
 
     fn retain_health(&self, failure: StatementNativeHealthFailure) {
@@ -275,12 +306,16 @@ impl FrontendCompletionCustody {
         destination.install_completed_in(&mut state.outcome, input)
     }
     pub(crate) async fn close(&self) -> Result<(), StatementNativeHealthFailure> {
-        let (provider, owned_catalog_cpu) = {
+        let (provider, owned_catalog_cpu, system) = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.joined {
                 return Ok(());
             }
-            (state.provider.clone(), state.owned_catalog_cpu.clone())
+            (
+                state.provider.clone(),
+                state.owned_catalog_cpu.clone(),
+                state.system.clone(),
+            )
         };
         // Keep an already observed CPU cause before driving the other owner.
         // Health selects the original failure; it never skips real cleanup.
@@ -316,6 +351,11 @@ impl FrontendCompletionCustody {
                 self.retain_health(health);
             }
         }
+        if let Some(source) = &system
+            && let Err(health) = source.close().await
+        {
+            self.retain_health(health);
+        }
         // Only CPU sources created for this custody enter this slot. A Read
         // or EXPLAIN caller's borrowed CPU must remain available for its later
         // candidate/encoding turns and is never closed here.
@@ -328,7 +368,7 @@ impl FrontendCompletionCustody {
         if let Some(health) = &state.health {
             return Err(health.clone());
         }
-        if provider.is_some() || owned_catalog_cpu.is_some() {
+        if provider.is_some() || owned_catalog_cpu.is_some() || system.is_some() {
             state.joined = true;
         }
         Ok(())
@@ -344,28 +384,23 @@ impl FrontendCompletionCustody {
 #[cfg(test)]
 mod owned_catalog_cpu_tests {
     use super::*;
-    use novarocks_query_application::{
-        system_catalog::{
-            SystemCatalog, SystemCatalogInputRequirement, SystemCatalogInputs,
-            SystemCatalogRelations, SystemCatalogService, SystemTableData,
-        },
-        system_catalog_rewrite::{SystemCatalogFacts, SystemCatalogFactsPort},
-    };
-    use novarocks_sql::compiler::{
-        CatalogRelationNeed, SqlCapturedCatalogPreparation, SqlCompileControl, SqlSessionContext,
+    use novarocks_query_application::system_tables::{SystemTableLookup, SystemTableRegistry};
+    use novarocks_sql::{
+        compiler::{SqlCancellationObservation, SqlCompileControl, SqlSessionContext},
+        system_table::SystemTableBinding,
     };
     use std::sync::{
-        Condvar, Weak,
+        Condvar,
         atomic::{AtomicBool, Ordering},
     };
 
     #[derive(Default)]
     struct CatalogGate {
         entered: tokio::sync::Notify,
+        armed: AtomicBool,
         released: Mutex<bool>,
         changed: Condvar,
         returned: AtomicBool,
-        source_field: Mutex<Option<Weak<arrow::datatypes::Field>>>,
     }
     impl CatalogGate {
         fn release(&self) {
@@ -373,51 +408,23 @@ mod owned_catalog_cpu_tests {
             self.changed.notify_all();
         }
     }
+    impl SqlCancellationObservation for CatalogGate {
+        fn is_cancelled(&self) -> bool {
+            if self.armed.load(Ordering::Acquire) {
+                self.entered.notify_one();
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.changed.wait(released).unwrap();
+                }
+                self.returned.store(true, Ordering::Release);
+            }
+            false
+        }
+    }
     struct ReleaseOnDrop(Arc<CatalogGate>);
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
             self.0.release();
-        }
-    }
-    struct BlockingCatalog {
-        gate: Arc<CatalogGate>,
-        original: SystemCatalogService,
-    }
-    impl SystemCatalog for BlockingCatalog {
-        fn required_inputs(&self, db: &str, table: &str) -> Option<SystemCatalogInputRequirement> {
-            self.original.required_inputs(db, table)
-        }
-        fn resolve(
-            &self,
-            db: &str,
-            table: &str,
-            inputs: &SystemCatalogInputs<'_>,
-        ) -> Result<Option<SystemTableData>, String> {
-            self.gate.entered.notify_one();
-            let mut released = self.gate.released.lock().unwrap();
-            while !*released {
-                released = self.gate.changed.wait(released).unwrap();
-            }
-            drop(released);
-            let data = self.original.resolve(db, table, inputs)?;
-            let schema = data.as_ref().expect("registered system table").batches[0].schema();
-            *self.gate.source_field.lock().unwrap() = Some(Arc::downgrade(&schema.fields()[0]));
-            self.gate.returned.store(true, Ordering::Release);
-            Ok(data)
-        }
-    }
-    struct UnusedFacts;
-    impl SystemCatalogFactsPort for UnusedFacts {
-        fn local_system_catalog_facts(&self) -> Result<SystemCatalogFacts, String> {
-            panic!("CPU materialization cannot perform catalog I/O")
-        }
-        fn external_system_catalog_facts(
-            &self,
-            _: &ConnectorRequestContext,
-            _: &str,
-            _: bool,
-        ) -> Result<Option<SystemCatalogFacts>, String> {
-            panic!("CPU materialization cannot perform catalog I/O")
         }
     }
     fn query(sql: &str) -> novarocks_parser::ast::Query {
@@ -427,27 +434,10 @@ mod owned_catalog_cpu_tests {
         };
         query.clone()
     }
-    fn definition_need() -> CatalogRelationNeed {
-        let preparation = SqlCapturedCatalogPreparation::try_new_definition(
-            query("SELECT * FROM information_schema.schemata"),
-            "ice",
-            "db",
-            None,
-            SqlCompileControl::unbounded(),
-        )
-        .unwrap();
-        let [need] = preparation.needs() else {
-            panic!("one exact definition need")
-        };
-        assert!(need.is_definition_context());
-        need.clone()
-    }
-
     #[tokio::test]
     async fn dropped_catalog_cpu_borrow_remains_owned_until_real_close_without_a_provider() {
         assert_owned_catalog_cpu_close(None).await;
     }
-
     #[tokio::test]
     async fn retained_health_cannot_skip_the_owned_catalog_cpu_actual_close() {
         let health = StatementNativeHealthFailure::actual_exit_unproven(
@@ -456,39 +446,51 @@ mod owned_catalog_cpu_tests {
         );
         assert_owned_catalog_cpu_close(Some(health)).await;
     }
-
     async fn assert_owned_catalog_cpu_close(health: Option<StatementNativeHealthFailure>) {
         let (mut owners, supervisor) =
             crate::task_execution::blocking_io::tests::original_executors(
                 tokio::runtime::Handle::current(),
             );
+        let (_control, _root, capacity, _capacity_owner) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
         let cpu = FrontendPlanningCpuSource::new(supervisor.clone());
         let custody = FrontendCompletionCustody::new();
         custody.state.lock().unwrap().owned_catalog_cpu = Some(Arc::clone(&cpu));
         let gate = Arc::new(CatalogGate::default());
         let _release_on_drop = ReleaseOnDrop(Arc::clone(&gate));
-        let catalog = Arc::new(BlockingCatalog {
-            gate: Arc::clone(&gate),
-            original: SystemCatalogService::with_defaults(),
-        });
-        let original_catalog = Arc::downgrade(&catalog);
-        let source = SystemCatalogRelations::new(Arc::new(UnusedFacts), catalog);
-        let mut borrowed = Box::pin(cpu.system_relation(
-            source,
-            definition_need(),
-            SystemCatalogFacts {
-                catalog_name: "ice".into(),
-                schema_names: vec!["actual_schema".into()],
-                table_names: Vec::new(),
-            },
-            crate::application::test_constant_policy(),
-            SqlCompileControl::unbounded(),
-        ));
+        let registry = SystemTableRegistry::try_new([]).unwrap();
+        let SystemTableLookup::Declared(declaration) = registry.declare(
+            &SystemTableBinding::Catalog("ice".into()),
+            "information_schema",
+            "schemata",
+        ) else {
+            panic!("schemata declaration");
+        };
+        let original_declaration = Arc::downgrade(&declaration);
+        cpu.begin_system_snapshot(
+            declaration,
+            &[0, 1],
+            &capacity,
+            SqlCompileControl::new(None, gate.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        cpu.stage_system_row(&[
+            Some("ice"),
+            Some("actual_schema"),
+            Some("utf8"),
+            Some("utf8_general_ci"),
+            None,
+        ])
+        .unwrap()
+        .unwrap();
+        gate.armed.store(true, Ordering::Release);
+        let mut borrowed = Box::pin(cpu.materialize_system_batch());
         assert!(futures::poll!(borrowed.as_mut()).is_pending());
         gate.entered.notified().await;
         drop(borrowed);
         assert!(
-            original_catalog.upgrade().is_some(),
+            original_declaration.upgrade().is_some(),
             "original CPU input is still retained"
         );
         assert!(!gate.returned.load(Ordering::Acquire));
@@ -506,9 +508,6 @@ mod owned_catalog_cpu_tests {
             assert!(state.provider.is_none());
             assert!(Arc::ptr_eq(state.owned_catalog_cpu.as_ref().unwrap(), &cpu));
         }
-        assert!(original_catalog.upgrade().is_some());
-        // Cancelling this borrow must retain both the original close verdict
-        // and the actual CPU work for the next close borrow.
         drop(close);
         let mut close = Box::pin(custody.close());
         assert!(futures::poll!(close.as_mut()).is_pending());
@@ -518,9 +517,8 @@ mod owned_catalog_cpu_tests {
             assert!(
                 matches!(outcome, Err(ref failure) if std::ptr::addr_eq(failure.cause(), health.cause()))
             );
-            let repeated = custody.close().await;
             assert!(
-                matches!(repeated, Err(ref failure) if std::ptr::addr_eq(failure.cause(), health.cause()))
+                matches!(custody.close().await, Err(ref failure) if std::ptr::addr_eq(failure.cause(), health.cause()))
             );
         } else {
             outcome.expect("actual original catalog CPU close");
@@ -530,28 +528,28 @@ mod owned_catalog_cpu_tests {
             let state = custody.state.lock().unwrap();
             assert_eq!(state.joined, health.is_none());
             assert_eq!(state.health.is_some(), health.is_some());
-            assert!(Arc::ptr_eq(state.owned_catalog_cpu.as_ref().unwrap(), &cpu));
         }
-        // The unreceived Inline result remains in the same CPU source body,
-        // including its genuine original Field, after actual worker exit.
-        let original_field = gate.source_field.lock().unwrap().clone().unwrap();
+        let original_field = cpu
+            .system_snapshot_field_for_test()
+            .expect("original materialized field");
         assert!(original_field.upgrade().is_some());
         assert!(
             custody.resolve_catalog_relations(&[]).await.is_err(),
-            "a closed custody cannot rearm its CPU through catalog resolution"
+            "a closed custody cannot rearm its CPU"
         );
         drop(custody);
         assert!(
             original_field.upgrade().is_some(),
-            "the last original CPU alias still owns its output"
+            "last original CPU alias owns its output"
         );
         drop(cpu);
         drop(supervisor);
         owners.shutdown().await;
         assert!(
             original_field.upgrade().is_none(),
-            "actual source release retires the original output"
+            "actual Source release retires original output"
         );
+        assert!(original_declaration.upgrade().is_none());
     }
 
     #[tokio::test]

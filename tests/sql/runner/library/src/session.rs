@@ -668,6 +668,13 @@ pub(crate) fn run_trino_sql_scoped_until(
     Ok(execution.map_or_else(String::new, |execution| execution.text_output))
 }
 
+fn case_table_names_sql(catalog: &str, db_name: &str) -> String {
+    // Views remain owned by each case's explicit cleanup statements.
+    format!(
+        "SELECT table_name FROM `{catalog}`.information_schema.tables WHERE table_schema = '{db_name}' AND table_type = 'BASE TABLE';"
+    )
+}
+
 /// Names of the tables a case database currently holds.
 ///
 /// `DROP DATABASE ... FORCE` expands into a listing of the namespace's
@@ -675,9 +682,9 @@ pub(crate) fn run_trino_sql_scoped_until(
 /// The harness therefore enumerates and drops explicitly, which works on every
 /// catalog.
 ///
-/// The catalog qualifier is required: an unqualified `information_schema` name
-/// resolves against the local catalog, and a case database in an external
-/// catalog would come back empty.
+/// The catalog qualifier is required: a two-part `information_schema` name
+/// binds to the session catalog. A case database in another catalog must use
+/// that catalog's exact qualifier.
 fn case_table_names(
     conn: &ConnectionConfig,
     query_timeout: u64,
@@ -687,10 +694,7 @@ fn case_table_names(
     let Some(catalog) = conn.catalog.as_deref() else {
         return Ok(Vec::new());
     };
-    let sql = format!(
-        "SELECT table_name FROM `{catalog}`.information_schema.tables \
-         WHERE table_schema = '{db_name}';"
-    );
+    let sql = case_table_names_sql(catalog, db_name);
     let output = match run_trino_sql_until(conn, query_timeout, &sql, deadline) {
         Ok(output) => output,
         Err(error) => {
@@ -758,6 +762,13 @@ mod splitter_tests {
     use super::{format_statement_failure, split_sql_statements, statement_sha256};
     use std::time::Duration;
 
+    #[test]
+    fn case_cleanup_enumerates_only_base_tables_in_the_exact_catalog_namespace() {
+        assert_eq!(
+            super::case_table_names_sql("external", "owned_db"),
+            "SELECT table_name FROM `external`.information_schema.tables WHERE table_schema = 'owned_db' AND table_type = 'BASE TABLE';"
+        );
+    }
     #[test]
     fn statement_hash_is_stable_and_does_not_reveal_statement_text() {
         let statement = "SELECT 1";

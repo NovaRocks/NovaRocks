@@ -349,7 +349,7 @@ pub(crate) fn view_exists(
 pub(crate) fn list_views(
     runtime: &IcebergMetadataContext,
     namespace: &str,
-    bound: novarocks_spi::connector::ConnectorListingBound,
+    bound: novarocks_spi::connector::ConnectorListingPageSize,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, ConnectorError> {
     let catalog = Arc::clone(runtime.novarocks_catalog());
@@ -521,7 +521,7 @@ impl ConnectorViewMetadata for IcebergMetadata {
         let listed = list_views(
             self.runtime(),
             &request.namespace.namespace,
-            request.bound,
+            request.page_size,
             &request.context,
         );
         listed_view_identities(self, &request, listed)
@@ -711,7 +711,7 @@ mod tests {
         let listed = list_views(
             &runtime,
             "db",
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             &novarocks_spi::connector::ConnectorRequestContext::try_new(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 novarocks_spi::connector::ConnectorStopOwner::new().view(),
@@ -905,11 +905,7 @@ mod tests {
             let (executor, runtime) = rest_runtime(&server);
             let provider = view_provider(runtime);
             let mut request = listing_request(&provider, test_context());
-            request.bound = novarocks_spi::connector::ConnectorListingBound {
-                entries: 2,
-                page_entries: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            };
+            request.page_size = novarocks_spi::connector::ConnectorListingPageSize::new(1).unwrap();
             let identities = executor
                 .block_on(provider.list_views_async(request.clone(), listing_cpu(&provider)))
                 .expect("the complete original bounded listing is returned");
@@ -938,7 +934,7 @@ mod tests {
         }
 
         #[test]
-        fn governed_view_pages_keep_decode_namespace_and_whole_listing_refusals() {
+        fn governed_view_pages_keep_decode_namespace_and_page_protocol_failures() {
             for (reply, entries, expected) in [
                 (
                     Reply::bytes(200, b"not-json".to_vec()),
@@ -956,10 +952,10 @@ mod tests {
                 (
                     Reply::json(
                         200,
-                        &serde_json::json!({"identifiers":[{"namespace":["db"],"name":"a"},{"namespace":["db"],"name":"b"}]}),
+                        &serde_json::json!({"identifiers":[{"namespace":["db"],"name":"a"},{"namespace":["db"],"name":"b"}],"next-page-token":"next"}),
                     ),
                     1,
-                    ConnectorErrorKind::ResourceExhausted,
+                    ConnectorErrorKind::CorruptData,
                 ),
             ] {
                 let server = TestServer::start(
@@ -970,7 +966,8 @@ mod tests {
                 let (executor, runtime) = rest_runtime(&server);
                 let provider = view_provider(runtime);
                 let mut request = listing_request(&provider, test_context());
-                request.bound.entries = entries;
+                request.page_size =
+                    novarocks_spi::connector::ConnectorListingPageSize::new(entries).unwrap();
                 let error = executor
                     .block_on(provider.list_views_async(request, listing_cpu(&provider)))
                     .unwrap_err();
@@ -1201,7 +1198,7 @@ mod tests {
                 instance_id: provider.descriptor().instance_id.clone(),
                 namespace: Arc::from("db"),
             },
-            bound: novarocks_spi::connector::ConnectorListingBound::V1,
+            page_size: novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             context,
         }
     }

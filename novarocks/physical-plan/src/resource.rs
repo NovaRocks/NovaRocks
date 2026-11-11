@@ -1271,6 +1271,12 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                 usage.add_items(mapping.len());
             }
         }
+        NodeKind::SystemRelation { output_fields, .. } => {
+            usage.add_items(output_fields.len());
+            for field in output_fields.iter() {
+                validate_field_core(field, path, usage, errors, policy)?;
+            }
+        }
         NodeKind::Values { rows } => {
             usage.add_items(rows.len());
             for row in rows {
@@ -3080,3 +3086,86 @@ pub(crate) fn validate_call_request_table_observed(
 #[cfg(test)]
 #[path = "resource/call_request_tests.rs"]
 mod call_request_tests;
+
+#[cfg(test)]
+mod system_relation_resource_tests {
+    use super::*;
+    use crate::{
+        FragmentBuilder, FragmentId, FragmentSink, NodeId, PipelineDopDomain, SystemRelationData,
+        ValueOrigin,
+    };
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    fn snapshot(batches: Arc<[RecordBatch]>) -> Fragment {
+        let fields = Arc::from([Arc::new(Field::new("value", DataType::Int64, false))]);
+        let node = NodeId::new(0);
+        let mut b = FragmentBuilder::new(FragmentId::new(0));
+        let value = b
+            .add_value(
+                ValueType::new(DataType::Int64, false),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        b.add_system_relation(
+            node,
+            Box::from([value]),
+            fields,
+            SystemRelationData::Batches {
+                batches,
+                storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            },
+        )
+        .unwrap();
+        b.finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+            crate::StagePlacementPolicy::Singleton,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn batch_count_is_a_data_fact_not_a_structural_item() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let single = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..10000))],
+        )
+        .unwrap();
+        let split = (0..10000)
+            .map(|i| {
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![i]))])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let one = snapshot(Arc::from([single]));
+        let many = snapshot(Arc::from(split));
+        let mut errors = ValidationContext::new();
+        let a = fragment_usage(&one, &mut errors);
+        let b = fragment_usage(&many, &mut errors);
+        assert_eq!((a.items, a.bytes), (b.items, b.bytes));
+        for (fragment, count) in [(&one, 1), (&many, 10000)] {
+            let crate::NodeKind::SystemRelation { data, .. } =
+                &fragment.nodes()[&NodeId::new(0)].kind
+            else {
+                unreachable!()
+            };
+            let facts = data.resource_facts().unwrap();
+            assert_eq!(facts.batches, count);
+            assert_eq!(facts.rows, 10000);
+            assert!(facts.retained_bytes >= 10000 * 8);
+        }
+    }
+}

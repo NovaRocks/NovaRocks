@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorOperationControl,
+    ConnectorError, ConnectorErrorKind, ConnectorListingPageSize, ConnectorOperationControl,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -149,131 +149,21 @@ async fn optional_io_permit(
     }
 }
 
-pub(crate) const HADOOP_LISTING_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
-
-pub(crate) fn listing_refusal() -> Error {
-    Error::new(
-        ErrorKind::Unexpected,
-        "Hadoop catalog listing exceeds its bounded workspace",
-    )
-    .with_source(ConnectorError::new(
-        ConnectorErrorKind::ResourceExhausted,
-        "Hadoop catalog listing exceeds its bounded workspace",
-    ))
-}
-
-pub(crate) fn check_listing_path_size(bytes: usize) -> Result<()> {
-    if bytes > ConnectorListingBound::V1.name_bytes {
-        return Err(listing_refusal());
-    }
-    Ok(())
-}
-
-/// Reserve only after accounting for both the old and requested new backing.
-/// Unstable sorting needs no heap scratch and preserves the sorted/deduped
-/// values, including equal names.
-pub(crate) fn grow_listing_vec<T>(
-    values: &mut Vec<T>,
-    other_bytes: usize,
-    workspace_bytes: usize,
-    entries_limit: usize,
-) -> Result<()> {
-    if values.len() >= entries_limit {
-        return Err(Error::new(
-            ErrorKind::Unexpected,
-            "Hadoop catalog listing exceeds its entries bound",
-        )
-        .with_source(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "Hadoop catalog listing exceeds its entries bound",
-        )));
-    }
-    let old = values.capacity();
-    let requested = if values.len() == old {
-        old.checked_mul(2)
-            .map(|capacity| capacity.max(4).min(entries_limit))
-            .ok_or_else(listing_refusal)?
-    } else {
-        old
-    };
-    let peak_slots = if requested > old {
-        old.checked_add(requested).ok_or_else(listing_refusal)?
-    } else {
-        old
-    };
-    peak_slots
-        .checked_mul(std::mem::size_of::<T>())
-        .and_then(|slots| slots.checked_add(other_bytes))
-        .filter(|peak| *peak <= workspace_bytes)
-        .ok_or_else(listing_refusal)?;
-    if requested > old {
-        // reserve_exact's argument is additional to len, not capacity.
-        values
-            .try_reserve_exact(requested - values.len())
-            .map_err(|_| listing_refusal())?;
-    }
-    Ok(())
-}
-
 struct DirectoryListing {
-    bound: ConnectorListingBound,
-    workspace_bytes: usize,
-    name_bytes: usize,
-    directories: Vec<String>,
+    directories: std::collections::BTreeSet<String>,
 }
-
 impl DirectoryListing {
-    fn new(bound: ConnectorListingBound, workspace_bytes: usize) -> Result<Self> {
-        bound.validate().map_err(|error| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Invalid Hadoop catalog listing bound",
-            )
-            .with_source(error)
-        })?;
-        if workspace_bytes > HADOOP_LISTING_WORKSPACE_BYTES {
-            return Err(listing_refusal());
+    fn new() -> Self {
+        Self {
+            directories: std::collections::BTreeSet::new(),
         }
-        Ok(Self {
-            bound,
-            workspace_bytes,
-            name_bytes: 0,
-            directories: Vec::new(),
-        })
     }
-
     fn push(&mut self, name: &str) -> Result<()> {
-        // Deduplicate before admitting a copy, as the previous complete
-        // directory listing did before its caller checked the listing bound.
-        // The sorted Vec needs no auxiliary hash/tree allocations.
-        let index = match self
-            .directories
-            .binary_search_by(|directory| directory.as_str().cmp(name))
-        {
-            Ok(_) => return Ok(()),
-            Err(index) => index,
-        };
-        let name_bytes = self
-            .name_bytes
-            .checked_add(name.len())
-            .filter(|bytes| *bytes <= self.bound.total_name_bytes)
-            .ok_or_else(listing_refusal)?;
-        if name.len() > self.bound.name_bytes {
-            return Err(listing_refusal());
-        }
-        grow_listing_vec(
-            &mut self.directories,
-            name_bytes,
-            self.workspace_bytes,
-            self.bound.entries,
-        )?;
-        self.directories.insert(index, name.to_string());
-        self.name_bytes = name_bytes;
+        self.directories.insert(name.to_owned());
         Ok(())
     }
-
     fn finish(self) -> Vec<String> {
-        self.directories
+        self.directories.into_iter().collect()
     }
 }
 
@@ -361,7 +251,7 @@ pub struct IcebergFsStorage {
     #[serde(skip, default)]
     binding: Option<IcebergReadBinding>,
     #[serde(skip, default)]
-    listing: Option<(ConnectorListingBound, usize)>,
+    listing: Option<ConnectorListingPageSize>,
     #[serde(skip, default)]
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
     #[serde(skip, default)]
@@ -459,11 +349,8 @@ impl IcebergFsStorage {
     pub(crate) async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
         self.check_read_active("list_directories")?;
         let _io = optional_io_permit(self.admission.as_ref()).await?;
-        let (bound, workspace_bytes) = self
-            .listing
-            .unwrap_or((ConnectorListingBound::V1, HADOOP_LISTING_WORKSPACE_BYTES));
-        let mut directories = DirectoryListing::new(bound, workspace_bytes)?;
-        check_listing_path_size(path.len())?;
+        let bound = self.listing.unwrap_or(ConnectorListingPageSize::DEFAULT);
+        let mut directories = DirectoryListing::new();
         let _phase = self.non_http_phase(path).await?;
         let (access, mut relative_path) = self.resolve_path("list_directories", path).await?;
         if !relative_path.ends_with('/') {
@@ -476,7 +363,7 @@ impl IcebergFsStorage {
         let result = access
             .operator()
             .lister_with(&relative_path)
-            .limit(bound.page_entries)
+            .limit(bound.get())
             .await;
         self.check_read_active("list_directories")?;
         let mut entries = result.map_err(|error| {
@@ -1217,12 +1104,11 @@ async fn write_finalization_document_to_operator(
 pub(crate) async fn list_directories(
     location: &str,
     binding: IcebergReadBinding,
-    bound: ConnectorListingBound,
-    workspace_bytes: usize,
+    bound: ConnectorListingPageSize,
 ) -> Result<Vec<String>> {
     let storage = IcebergFsStorage {
         binding: Some(binding),
-        listing: Some((bound, workspace_bytes)),
+        listing: Some(bound),
         admission: None,
         creation: None,
     };
@@ -1258,7 +1144,7 @@ pub(crate) async fn catalog_read<T>(
 pub(crate) async fn visit_direct_files<F>(
     location: &str,
     binding: IcebergReadBinding,
-    bound: ConnectorListingBound,
+    bound: ConnectorListingPageSize,
     mut visit: F,
 ) -> Result<bool>
 where
@@ -1266,10 +1152,7 @@ where
 {
     let storage = IcebergFsStorage::new(binding.clone());
     storage.check_read_active("list version files")?;
-    bound.validate().map_err(|error| {
-        Error::new(ErrorKind::DataInvalid, "Invalid Hadoop listing bound").with_source(error)
-    })?;
-    check_listing_path_size(location.len())?;
+
     let _phase = storage.non_http_phase(location).await?;
     let (access, mut relative) = storage.resolve_path("list version files", location).await?;
     if !relative.ends_with('/') {
@@ -1279,21 +1162,17 @@ where
     #[cfg(test)]
     note_hadoop_test_list();
     let result = catalog_read(&binding, async {
-        operator
-            .lister_with(&relative)
-            .limit(bound.page_entries)
-            .await
+        operator.lister_with(&relative).limit(bound.get()).await
     })
     .await?;
     storage.check_read_active("list version files")?;
     let mut entries = result.map_err(listing_storage_error)?;
     let prefix = relative.trim_start_matches('/');
-    let mut count = 0usize;
     while let Some(entry) = catalog_read(&binding, entries.next()).await? {
         storage.check_read_active("list version files")?;
         let entry = entry.map_err(listing_storage_error)?;
         let path = entry.path().trim_start_matches('/');
-        check_listing_path_size(path.len())?;
+
         let name = path.strip_prefix(prefix).ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -1304,10 +1183,6 @@ where
         // its children. It is not a raw child entry and cannot spend their bound.
         if name.is_empty() {
             continue;
-        }
-        count += 1;
-        if count > bound.entries {
-            return Err(listing_refusal());
         }
         if entry.metadata().is_file() && !name.contains('/') && !visit(name)? {
             return Ok(false);
@@ -2053,81 +1928,39 @@ mod tests {
     }
 
     #[test]
-    fn directory_listing_checks_names_and_old_new_backing_before_growth() {
-        let bound = novarocks_spi::connector::ConnectorListingBound {
-            entries: 8,
-            name_bytes: 4,
-            total_name_bytes: 8,
-            ..novarocks_spi::connector::ConnectorListingBound::V1
-        };
-        let mut listing =
-            DirectoryListing::new(bound, 4 * std::mem::size_of::<String>() + 4).expect("listing");
-        for name in ["d", "b", "c", "a"] {
-            listing.push(name).expect("exact first backing boundary");
+    fn directory_listing_accepts_more_than_former_entries_and_workspace() {
+        let mut listing = DirectoryListing::new();
+        for index in 0..65_537 {
+            listing
+                .push(&format!("{index:08}-{}", "n".repeat(513)))
+                .unwrap();
         }
-        let capacity = listing.directories.capacity();
-        let pointer = listing.directories.as_ptr();
-        assert_eq!(
-            stopped_kind(&listing.push("e").expect_err("old/new backing peak")),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        assert_eq!(listing.directories.capacity(), capacity);
-        assert_eq!(listing.directories.as_ptr(), pointer);
-        assert_eq!(listing.name_bytes, 4);
-        assert!(listing.push("large").is_err());
-        // An already-retained name does not spend another entry or payload.
-        listing.push("a").expect("duplicate at exact boundary");
-        assert_eq!(listing.finish(), ["a", "b", "c", "d"]);
+        listing.push(&"x".repeat(65_537)).unwrap();
+        listing.push(&"x".repeat(65_537)).unwrap();
+        let names = listing.finish();
+        assert_eq!(names.len(), 65_538);
+        assert!(names.iter().map(String::len).sum::<usize>() > 32 * 1024 * 1024);
+        assert!(names.windows(2).all(|names| names[0] < names[1]));
     }
 
     #[tokio::test]
-    async fn bounded_directory_stream_preserves_filtering_and_refuses_whole_listing() {
-        let directory = tempfile::tempdir().expect("directory");
+    async fn directory_stream_keeps_filtering_and_accepts_any_complete_page() {
+        let directory = tempfile::tempdir().unwrap();
         for name in ["z", "a", ".hidden"] {
-            std::fs::create_dir(directory.path().join(name)).expect("child directory");
+            std::fs::create_dir(directory.path().join(name)).unwrap();
         }
-        std::fs::write(directory.path().join("ordinary-file"), b"file").expect("file");
-        std::fs::create_dir(directory.path().join("a/nested")).expect("nested directory");
+        std::fs::write(directory.path().join("ordinary-file"), b"file").unwrap();
+        std::fs::create_dir(directory.path().join("a/nested")).unwrap();
         let location = format!("file://{}/", directory.path().display());
-        let bound = novarocks_spi::connector::ConnectorListingBound {
-            entries: 3,
-            page_entries: 1,
-            ..novarocks_spi::connector::ConnectorListingBound::V1
-        };
-        let binding = local_test_binding(None, tokio::runtime::Handle::current());
         let complete = IcebergFsStorage {
-            binding: Some(binding.clone()),
-            listing: Some((bound, 4096)),
+            binding: Some(local_test_binding(None, tokio::runtime::Handle::current())),
+            listing: Some(novarocks_spi::connector::ConnectorListingPageSize::new(1).unwrap()),
             admission: None,
             creation: None,
         };
         assert_eq!(
-            complete
-                .list_directories(&location)
-                .await
-                .expect("complete enumeration"),
+            complete.list_directories(&location).await.unwrap(),
             [".hidden", "a", "z"]
-        );
-        let refused = IcebergFsStorage {
-            binding: Some(binding),
-            listing: Some((
-                novarocks_spi::connector::ConnectorListingBound {
-                    entries: 2,
-                    ..bound
-                },
-                4096,
-            )),
-            admission: None,
-            creation: None,
-        };
-        assert_eq!(
-            stopped_kind(
-                &refused
-                    .list_directories(&location)
-                    .await
-                    .expect_err("whole listing refusal")
-            ),
-            ConnectorErrorKind::ResourceExhausted
         );
     }
 
@@ -2150,7 +1983,7 @@ mod tests {
         let error = super::visit_direct_files(
             directory.path().to_str().expect("directory path"),
             binding,
-            novarocks_spi::connector::ConnectorListingBound::V1,
+            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             |_| {
                 visited += 1;
                 stop.request_stop();

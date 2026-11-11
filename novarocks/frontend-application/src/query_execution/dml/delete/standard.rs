@@ -57,16 +57,17 @@ pub(super) fn resolve_target(
     stmt: &Delete,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(TargetBackend, String), String> {
+) -> Result<(TargetBackend, String), crate::catalog_application::resolver::TargetResolutionError> {
     // Detect branch/tag suffix in the target table name.
     let target_name = sql_object_name(&stmt.target);
     let (stripped_parts, ref_suffix) = split_ref_suffix(&target_name.parts);
     let effective_name;
     let table_name: &SqlObjectName = match ref_suffix {
         Some(IcebergRefSuffix::Tag(ref tag_name)) => {
-            return Err(format!(
+            return Err((format!(
                 "iceberg ref: tag '{tag_name}' is read-only; use a branch as DML target"
-            ));
+            ))
+            .into());
         }
         Some(IcebergRefSuffix::Branch(_)) => {
             effective_name = SqlObjectName {
@@ -85,10 +86,11 @@ pub(super) fn resolve_target(
     let target =
         resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "phase 1 DELETE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     Ok((target, target_ref))
 }
@@ -96,7 +98,7 @@ pub(super) fn resolve_target(
 fn delete_where_expr<'a>(
     stmt: &'a Delete,
     target_binding: &crate::connector::write_target::ConnectorWriteTargetBinding,
-) -> Result<&'a Expr, String> {
+) -> Result<&'a Expr, crate::dml::error::DmlExecutionError> {
     let where_clause = stmt.selection.as_ref().ok_or_else(|| {
         "DELETE requires a WHERE clause; for full table replacement use \
          INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
@@ -428,12 +430,49 @@ fn sql_object_name(name: &ParserObjectName) -> SqlObjectName {
 /// Phase 1 supports the following node shapes; everything else is rejected
 /// with an explicit error pointing at the unsupported construct so the caller
 /// can rewrite the WHERE clause.
-fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
+fn validate_where(
+    expr: &Expr,
+    columns: &[ColumnDef],
+) -> Result<(), crate::dml::error::DmlExecutionError> {
+    struct QueryOccurrence(bool);
+    impl ast::Visit for QueryOccurrence {
+        fn visit_query(&mut self, _: &Query) {
+            self.0 = true;
+        }
+
+        fn visit_expr(&mut self, expr: &Expr) {
+            if !self.0 {
+                ast::walk_expr(self, expr);
+            }
+        }
+    }
+
+    // Reject unsupported query occurrences before a scalar shortcut or literal
+    // validator can hide the capability refusal at a nested expression site.
+    let mut queries = QueryOccurrence(false);
+    ast::Visit::visit_expr(&mut queries, expr);
+    if queries.0 {
+        return Err(crate::dml::error::DmlExecutionError::Compilation(
+            novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                    "subqueries are unsupported in DELETE predicates",
+                ),
+            ),
+        ));
+    }
+    validate_where_predicate(expr, columns)
+}
+
+fn validate_where_predicate(
+    expr: &Expr,
+    columns: &[ColumnDef],
+) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
         Expr::Binary(binary) => match binary.operator {
             BinaryOperator::And | BinaryOperator::Or => {
-                validate_where(&binary.left, columns)?;
-                validate_where(&binary.right, columns)
+                validate_where_predicate(&binary.left, columns)?;
+                validate_where_predicate(&binary.right, columns)
             }
             BinaryOperator::Equal
             | BinaryOperator::NotEqual
@@ -453,11 +492,12 @@ fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
                 }
                 let (col_name, value_expr, _flipped) =
                     extract_comparison(&binary.left, &binary.right)?;
-                validate_literal_for_column(value_expr, columns, &col_name)
+                validate_literal_for_column(value_expr, columns, &col_name).map_err(Into::into)
             }
             other => Err(format!(
                 "phase 1 DELETE WHERE does not support binary operator `{other:?}`"
-            )),
+            )
+            .into()),
         },
         Expr::InList(in_list) => {
             let col_name = expr_to_column_name(&in_list.expr)?;
@@ -472,13 +512,16 @@ fn validate_where(expr: &Expr, columns: &[ColumnDef]) -> Result<(), String> {
                 IsPredicate::Null | IsPredicate::NotNull
             ) =>
         {
-            expr_to_column_name(&predicate.expr).map(|_| ())
+            expr_to_column_name(&predicate.expr)
+                .map(|_| ())
+                .map_err(Into::into)
         }
-        Expr::Nested(nested) => validate_where(&nested.expression, columns),
+        Expr::Nested(nested) => validate_where_predicate(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
-        )),
+        )
+        .into()),
     }
 }
 
@@ -826,6 +869,9 @@ mod tests {
             for literal in [below, above] {
                 let error = super::validate_where(&where_expr(&format!("n = {literal}")), &columns)
                     .expect_err("the restricted DELETE surface retains exact-domain parsing");
+                let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+                    panic!("expected the original literal validation error");
+                };
                 assert!(error.contains(&format!("literal `{literal}`")), "{error}");
                 assert!(error.contains("fit in target type"), "{error}");
             }
@@ -856,7 +902,44 @@ mod tests {
         let where_clause = where_expr("v = 'x'");
         let error = super::validate_where(&where_clause, &columns_with_variant())
             .expect_err("a bare variant comparison is not supported");
+        let crate::dml::error::DmlExecutionError::Engine(error) = error else {
+            panic!("expected the original variant validation error");
+        };
         assert!(error.contains("LargeBinary"), "{error}");
+    }
+
+    #[test]
+    fn delete_subquery_refusal_preserves_unsupported_source_before_completion() {
+        for predicate in [
+            "id IN (SELECT 1 FROM system.information_schema.tables)",
+            "id = 1 AND (id IN (SELECT 1 FROM system.information_schema.tables))",
+            "EXISTS (SELECT 1 FROM system.information_schema.tables)",
+            "id = (SELECT 1 FROM system.information_schema.tables)",
+            "(SELECT 1 FROM system.information_schema.tables) IS NULL",
+            "coalesce((SELECT 1 FROM system.information_schema.tables), 1) = 1",
+            "id IN (1, (SELECT 1 FROM system.information_schema.tables))",
+        ] {
+            let error = super::validate_where(&where_expr(predicate), &columns_with_variant())
+                .expect_err("the restricted DELETE path does not support subqueries");
+            let crate::dml::error::DmlExecutionError::Compilation(source) = error else {
+                panic!("capability refusal must retain its typed source");
+            };
+            let connector = source
+                .downcast_ref::<novarocks_spi::connector::ConnectorError>()
+                .expect("original capability author");
+            assert_eq!(
+                connector.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn delete_query_like_string_literal_is_not_a_subquery() {
+        let columns = [column("label", DataType::Utf8)];
+        let predicate = where_expr("label = 'SELECT * FROM system.metadata.materialized_views'");
+        super::validate_where(&predicate, &columns)
+            .expect("query-looking literal text has no parser-owned query occurrence");
     }
 
     /// DELETE takes its sink and distribution from the Provider's signed

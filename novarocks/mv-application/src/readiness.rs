@@ -21,10 +21,7 @@ use crate::management::MvCurrentManagementAdmission;
 use crate::persistence::documents::MvDocumentError;
 use crate::process_runtime::{ProcessRuntime, ProjectionOrder, TargetReadiness};
 use crate::product::MvTarget;
-use crate::repository::{
-    MvProjectionInventoryBound, MvProjectionInventoryEntry, MvRepositoryError,
-    MvRepositoryErrorKind,
-};
+use crate::repository::{MvProjectionInventoryEntry, MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{CatalogHandle, ConnectorRequestContext, LakePublicationId};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -328,11 +325,10 @@ impl MvKeyedReadinessService {
     > {
         self.legacy().load_ready_settled(target).await
     }
-    pub async fn bounded_projection_inventory(
+    pub async fn projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
-        self.legacy().bounded_projection_inventory(bound).await
+    ) -> Result<MvKeyedProjectionInventory, MvRepositoryError> {
+        self.legacy().projection_inventory().await
     }
     pub async fn list_ready_projections(
         &self,
@@ -571,17 +567,16 @@ impl MvKeyedCandidateReader {
             .collect())
     }
 }
-pub struct MvBoundedKeyedProjectionInventory {
+pub struct MvKeyedProjectionInventory {
     service: MvKeyedReadinessExecution,
     entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
-    bound: MvProjectionInventoryBound,
 }
 #[derive(Debug)]
 pub struct ListedKeyedMvProjection {
     pub loaded: crate::state_store_repository::keyed::LoadedKeyedMvProjection,
     pub manageability: MvListedManageability,
 }
-impl MvBoundedKeyedProjectionInventory {
+impl MvKeyedProjectionInventory {
     pub fn order_by_namespace_and_name(&mut self) {
         self.entries.as_mut_slice().sort_by(|a, b| {
             a.target
@@ -602,7 +597,7 @@ impl MvBoundedKeyedProjectionInventory {
             let Some(loaded) = self
                 .service
                 .repository
-                .find_keyed_by_target_bounded(&entry.target, self.bound)
+                .find_keyed_by_target(&entry.target)
                 .await?
             else {
                 continue;
@@ -621,7 +616,6 @@ impl MvBoundedKeyedProjectionInventory {
         &mut self,
     ) -> Result<Option<ListedKeyedMvProjection>, MvRepositoryError> {
         for entry in self.entries.by_ref() {
-            let bound = self.bound;
             let state = self
                 .service
                 .runtime
@@ -643,7 +637,7 @@ impl MvBoundedKeyedProjectionInventory {
             let Some(loaded) = self
                 .service
                 .repository
-                .find_keyed_by_target_bounded(&entry.target, bound)
+                .find_keyed_by_target(&entry.target)
                 .await?
             else {
                 continue;
@@ -793,18 +787,16 @@ impl MvKeyedReadinessExecution {
         }
         self.load_ready(target).await
     }
-    pub async fn bounded_projection_inventory(
+    pub async fn projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
-        Ok(MvBoundedKeyedProjectionInventory {
+    ) -> Result<MvKeyedProjectionInventory, MvRepositoryError> {
+        Ok(MvKeyedProjectionInventory {
             service: self.clone(),
             entries: self
                 .repository
-                .list_keyed_projection_inventory(bound)
+                .list_keyed_projection_inventory()
                 .await?
                 .into_iter(),
-            bound,
         })
     }
     pub async fn list_ready_projections(
@@ -1168,20 +1160,14 @@ mod keyed_tests {
                 .len(),
             1
         );
-        let bound = MvProjectionInventoryBound {
-            entries: 4,
-            snapshot_bytes: 64 * 1024,
-            single_name_bytes: 1024,
-            continuation_token_bytes: 4096,
-        };
-        let mut inventory = service.bounded_projection_inventory(bound).await.unwrap();
+
+        let mut inventory = service.projection_inventory().await.unwrap();
         assert!(inventory.next_ready().await.unwrap().is_some());
         assert!(inventory.next_ready().await.unwrap().is_none());
         let dependencies = service
             .list_ready_dependencies_by_downstream_bounded(
                 &loaded,
                 MvDependencyReadBound {
-                    inventory: bound,
                     entries: 8,
                     collection_bytes: 64 * 1024,
                 },
@@ -1319,28 +1305,7 @@ impl ReadinessRepository {
             }
         }
     }
-    async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<
-        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
-        MvRepositoryError,
-    > {
-        match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository
-                    .find_keyed_by_target_bounded(target, bound)
-                    .await
-            }
-            ReadinessExecution::Original(execution) => {
-                self.repository
-                    .in_requests(execution.as_ref())
-                    .find_keyed_by_target_bounded(target, bound)
-                    .await
-            }
-        }
-    }
+
     async fn list_keyed_projections(
         &self,
     ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
@@ -1357,16 +1322,13 @@ impl ReadinessRepository {
     }
     async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository.list_keyed_projection_inventory(bound).await
-            }
+            ReadinessExecution::Legacy => self.repository.list_keyed_projection_inventory().await,
             ReadinessExecution::Original(execution) => {
                 self.repository
                     .in_requests(execution.as_ref())
-                    .list_keyed_projection_inventory(bound)
+                    .list_keyed_projection_inventory()
                     .await
             }
         }

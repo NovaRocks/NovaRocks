@@ -135,20 +135,20 @@ fn empty_completion_owners(
     // uses the real keyed StateStore owner rather than a legacy adapter.
     let (product, repository) =
         runtime.block_on(crate::mv::domain::test_admission::keyed_product());
-    let inventory = crate::mv::domain::readiness::MvReadinessPort::from_product(
+    let inventory = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
         product.keyed_readiness_service().unwrap(),
         runtime,
         product.management_entrance().unwrap(),
-    );
+    ));
     drop(repository);
     drop(product);
     {
         let trc_catalog =
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
         let trc_controls = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
-        let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-            trc_catalog.clone(),
-            trc_controls.clone(),
+        let trc_system_relations = std::sync::Arc::new(
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                .expect("sealed declaration fixture"),
         );
         CompletionFactOwners::new(
             trc_catalog.clone(),
@@ -160,6 +160,7 @@ fn empty_completion_owners(
             blocking,
             Arc::new(novarocks_query_application::view::QueryViewService::new()),
             trc_system_relations,
+            Arc::clone(&inventory),
         )
     }
 }

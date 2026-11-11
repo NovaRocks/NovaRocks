@@ -38,8 +38,6 @@ pub enum StatementKind {
     ShowAnalyzeJobs,
     CancelAnalyze,
     ShowTableStats,
-    ShowBasicStatsMeta,
-    ShowHistogramStatsMeta,
     DropStats,
     DropHistogram,
     DropMultipleColumnsStats,
@@ -87,7 +85,6 @@ pub enum StatementKind {
     ExplainMaterializedViewRefresh,
     CreateView,
     DropView,
-    ShowViews,
     ShowCreateView,
     Insert,
     Delete,
@@ -116,8 +113,6 @@ impl StatementKind {
                 ast::StatisticsStatement::ShowAnalyzeJobs(_) => Self::ShowAnalyzeJobs,
                 ast::StatisticsStatement::CancelAnalyze(_) => Self::CancelAnalyze,
                 ast::StatisticsStatement::ShowTableStats(_) => Self::ShowTableStats,
-                ast::StatisticsStatement::ShowBasicStatsMeta(_) => Self::ShowBasicStatsMeta,
-                ast::StatisticsStatement::ShowHistogramStatsMeta(_) => Self::ShowHistogramStatsMeta,
                 ast::StatisticsStatement::DropStats(_) => Self::DropStats,
                 ast::StatisticsStatement::DropHistogram(_) => Self::DropHistogram,
                 ast::StatisticsStatement::DropMultipleColumnsStats(_) => {
@@ -221,7 +216,6 @@ impl StatementKind {
             ast::Statement::View(statement) => match statement {
                 ast::ViewStatement::Create(_) => Self::CreateView,
                 ast::ViewStatement::Drop(_) => Self::DropView,
-                ast::ViewStatement::Show(_) => Self::ShowViews,
                 ast::ViewStatement::ShowCreate(_) => Self::ShowCreateView,
             },
             ast::Statement::Table(statement) => match statement {
@@ -269,13 +263,10 @@ impl StatementKind {
             | Self::ShowProcessList
             | Self::ShowAnalyzeJobs
             | Self::ShowTableStats
-            | Self::ShowBasicStatsMeta
-            | Self::ShowHistogramStatsMeta
             | Self::ShowCreateTable
             | Self::ShowOptimize
             | Self::ShowMaterializedViews
             | Self::ExplainMaterializedViewRefresh
-            | Self::ShowViews
             | Self::ShowCreateView => true,
             Self::Empty
             | Self::Analyze

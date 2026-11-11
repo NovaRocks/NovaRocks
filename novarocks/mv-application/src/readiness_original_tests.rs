@@ -296,14 +296,6 @@ async fn original_service(
         trace,
     )
 }
-fn bound() -> crate::repository::MvProjectionInventoryBound {
-    crate::repository::MvProjectionInventoryBound {
-        entries: 4,
-        snapshot_bytes: 1024 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-    }
-}
 
 #[tokio::test]
 async fn readiness_original_view_keeps_same_context_through_install_candidates_inventory_and_delete()
@@ -320,13 +312,12 @@ async fn readiness_original_view_keeps_same_context_through_install_candidates_i
     ));
     let loaded = view.load_ready_settled(&target()).await.unwrap().unwrap();
     let candidates = view.candidate_reader();
-    let mut inventory = view.bounded_projection_inventory(bound()).await.unwrap();
-    let mut listable = view.bounded_projection_inventory(bound()).await.unwrap();
+    let mut inventory = view.projection_inventory().await.unwrap();
+    let mut listable = view.projection_inventory().await.unwrap();
     let dependencies = view
         .list_ready_dependencies_by_downstream_bounded(
             &loaded,
             crate::repository::MvDependencyReadBound {
-                inventory: bound(),
                 entries: 32,
                 collection_bytes: 1024 * 1024,
             },
@@ -510,7 +501,7 @@ async fn readiness_original_capability_missing_and_expired_guard_never_fall_back
         .await
         .unwrap();
     let candidates = view.candidate_reader();
-    let mut inventory = view.bounded_projection_inventory(bound()).await.unwrap();
+    let mut inventory = view.projection_inventory().await.unwrap();
     let guard = view.reserve_projection_delete(target()).await.unwrap();
     drop(view);
     drop(context);
@@ -651,7 +642,7 @@ async fn readiness_request_factory_is_sampled_per_transaction_not_per_inventory_
             .unwrap(),
         MvKeyedProjectionInstallOutcome::Installed(_)
     ));
-    let mut inventory = view.bounded_projection_inventory(bound()).await.unwrap();
+    let mut inventory = view.projection_inventory().await.unwrap();
     let candidates = view.candidate_reader();
     let before_next = requests.reads.load(Ordering::SeqCst);
     assert!(inventory.next_ready().await.unwrap().is_some());

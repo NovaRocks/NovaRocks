@@ -114,10 +114,7 @@ pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
             ast::MaterializedViewStatement::Show(_)
                 | ast::MaterializedViewStatement::ExplainRefresh(_)
         ),
-        ParsedStatement::View(statement) => !matches!(
-            statement,
-            ast::ViewStatement::Show(_) | ast::ViewStatement::ShowCreate(_)
-        ),
+        ParsedStatement::View(statement) => !matches!(statement, ast::ViewStatement::ShowCreate(_)),
         ParsedStatement::Statistics(statement) => matches!(
             statement,
             ast::StatisticsStatement::AnalyzeTable(_)
@@ -367,8 +364,6 @@ mod tests {
         for sql in [
             "SHOW ANALYZE JOBS",
             "SHOW TABLE STATS lake.db.events",
-            "SHOW BASIC STATS META",
-            "SHOW HISTOGRAM STATS META",
             "CANCEL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
             "KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419",
             "DROP STATS lake.db.events",
