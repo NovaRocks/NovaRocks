@@ -5065,7 +5065,7 @@ mod tests {
             // Supply exactly the external target's facts through a local
             // relation, retaining the production-generated expression tree.
             select.from[0].joins[0].relation = test_relation(
-                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number) AS t",
+                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
             );
             let error = analyze_mutation_query(query).unwrap_err();
             let error = crate::dml::error::DmlExecutionError::from_compile(error)
@@ -5118,7 +5118,7 @@ mod tests {
             Some(test_expr("t.id = 1")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, CAST((NULL) AS BIGINT) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((NULL) AS BIGINT) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
         for assignments in [
             vec![prepared_assignment("missing", "1")],
             vec![prepared_assignment("p", "1"), prepared_assignment("P", "2")],
@@ -5138,7 +5138,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, s.v AS __nr_new_v FROM ice.db1.t AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, s.v AS __nr_new_v FROM ice.db1.t AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     #[test]
@@ -5186,7 +5186,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, CAST((src_v) AS INT) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((src_v) AS INT) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {

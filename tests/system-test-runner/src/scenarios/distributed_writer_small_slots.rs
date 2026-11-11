@@ -360,9 +360,9 @@ mod tests {
         assert_eq!(specs.len(), PARTITION_OBSERVATION_INDEX);
         specs.push(partition_observation(3));
         specs.push(selected_update_observation(3));
-        assert_eq!(specs.len(), 6);
+        assert_eq!(specs.len(), SELECTED_UPDATE_OBSERVATION_INDEX + 1);
         assert_eq!(
-            specs[..4]
+            specs[..PARTITION_OBSERVATION_INDEX]
                 .iter()
                 .map(|spec| spec.sql.clone())
                 .collect::<Vec<_>>(),
@@ -381,7 +381,6 @@ mod tests {
                 .iter()
                 .all(|(_, _, attempt)| attempt.is_none())
         );
-        assert_eq!(row_level_contract::observation_specs(3).len(), 4);
         let selected = &specs[SELECTED_UPDATE_OBSERVATION_INDEX];
         assert_eq!(
             selected.sql,

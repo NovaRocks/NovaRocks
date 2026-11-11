@@ -381,64 +381,88 @@ async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
     assert_eq!(fixture.catalog.commits().len(), 1);
 }
 
-// A real local Parquet object represented by the existing neutral fragment API,
-// then finished by the real control. Reuses the cross-cutting write-stack test
-// constructors rather than inventing writer/loader protocol state.
-fn keyed_data_finish<'a>(
+// Stage a real local Parquet object through the writer sealed by this session,
+// then hand its original creation receipt to the publication owner.
+async fn keyed_data_finish<'a>(
     fixture: &Fixture,
     plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
     prepared: &PreparedKeyed,
 ) -> (ConnectorWriteFinishRequest<'a>, String) {
-    use crate::commit::write_stack::domain::{IcebergCommitFragment, IcebergDataFileArtifact};
-    use crate::commit::write_stack::test_support::{sample_metrics, sample_partition};
-    let path = format!(
-        "{}/keyed-data.parquet",
-        iceberg_handle(fixture, plan)
-            .staging_dir()
-            .trim_end_matches('/')
-    );
-    let local = std::path::Path::new(path.strip_prefix("file://").unwrap());
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    use crate::commit::write_stack::execution::IcebergWriteStackExecution;
+    use crate::commit::write_stack::test_support::received_write_proof;
+    use novarocks_spi::connector::write_stack::{
+        ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
+    };
+
+    let [target] = plan.targets() else {
+        panic!("keyed data publication must seal one writer target");
+    };
+    let schema = Arc::new(arrow::datatypes::Schema::new(
+        target
+            .input()
+            .fields_iter()
+            .map(|binding| binding.field().clone())
+            .collect::<Vec<_>>(),
+    ));
     let batch = arrow::record_batch::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
     )
     .unwrap();
-    let mut writer =
-        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(local).unwrap(), schema, None)
-            .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
     let adapter = crate::commit::write_stack::runtime::build_write_adapter(
         fixture.provider.descriptor().clone(),
         fixture.catalog_handle.clone(),
     );
-    let fragment = adapter.wrap_commit_fragment(IcebergCommitFragment::data_file(
-        IcebergDataFileArtifact::try_new(
-            path.clone(),
-            crate::delete_file::IcebergFileFormat::Parquet,
-            sample_partition(),
-            sample_metrics(1, std::fs::metadata(local).unwrap().len()),
-            None,
-        )
-        .unwrap(),
-    ));
-    let expected = plan.expected_targets();
-    assert_eq!(expected.len(), 1);
+    let execution = IcebergWriteStackExecution::new(
+        fixture.catalog_handle.clone(),
+        adapter.clone(),
+        fixture
+            .provider
+            .runtime()
+            .resources()
+            .planning_binding()
+            .clone(),
+    );
+    let physical = ConnectorWriterPhysicalContext::new(
+        *Uuid::now_v7().as_bytes(),
+        1,
+        [2; 16],
+        0,
+        target.ordinal().get(),
+    );
+    let mut writer = execution
+        .open_writer(ConnectorOpenWriterRequest {
+            resources: None,
+            handle: target.handle().clone(),
+            target: target.ordinal(),
+            expected_schema: schema,
+            physical,
+            context: context(),
+        })
+        .await
+        .unwrap();
+    writer.append(batch).await.unwrap();
+    let fragments = writer.finish().await.unwrap();
+    let [fragment] = fragments.as_slice() else {
+        panic!("one keyed data row must produce one commit fragment");
+    };
+    let path = adapter
+        .commit_fragment(fragment)
+        .unwrap()
+        .new_object_path()
+        .unwrap()
+        .to_owned();
+    let received = ConnectorPreparedWriteSet::try_new(
+        1,
+        vec![(target.ordinal(), fragment.clone())],
+        &plan.expected_targets(),
+    )
+    .unwrap()
+    .with_received_production(received_write_proof(target.ordinal(), physical));
     (
         ConnectorWriteFinishRequest {
             commit: plan.commit_session(),
-            prepared: ConnectorPreparedWriteSet::try_new(
-                1,
-                vec![(expected[0], fragment)],
-                &expected,
-            )
-            .unwrap(),
+            prepared: received,
             statistics: vec![],
             publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
             context: context(),
@@ -453,7 +477,7 @@ async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
-    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared);
+    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared).await;
     fixture.catalog.clear();
     fixture
         .catalog
@@ -512,7 +536,7 @@ async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
-    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared);
+    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared).await;
     fixture.catalog.clear();
     fixture
         .catalog

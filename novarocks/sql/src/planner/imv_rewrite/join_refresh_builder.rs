@@ -263,6 +263,14 @@ impl JoinRefreshTargetLocatorBinding {
     }
 }
 
+struct JoinRefreshLocatorColumns<'a> {
+    file_path: ColumnId,
+    row_position: ColumnId,
+    row_id: ColumnId,
+    last_updated_sequence: ColumnId,
+    file_metadata: &'a [OutputColumn],
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The coalesce builder receives separately validated descriptor, locator, and output-identity facts."
@@ -413,6 +421,13 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
             ));
         }
     }
+    let locator_columns = JoinRefreshLocatorColumns {
+        file_path: ColumnId(locator_file_column_id),
+        row_position: ColumnId(locator_pos_column_id),
+        row_id: ColumnId(locator_row_id_column_id),
+        last_updated_sequence: ColumnId(locator_last_updated_seq_column_id),
+        file_metadata: &file_metadata,
+    };
     let locator_join = build_locator_join_shell(
         key_shape_checked,
         desc,
@@ -420,17 +435,13 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &apply_key_input,
         &net_column,
         locator_apply_key.column_id,
-        ColumnId(locator_file_column_id),
-        ColumnId(locator_pos_column_id),
-        ColumnId(locator_row_id_column_id),
-        ColumnId(locator_last_updated_seq_column_id),
-        &file_metadata,
+        &locator_columns,
     )?;
     let locator_checked = build_locator_assert_filter(
         locator_join,
         &net_column,
-        ColumnId(locator_file_column_id),
-        ColumnId(locator_pos_column_id),
+        locator_columns.file_path,
+        locator_columns.row_position,
         function_catalog,
         policy,
         constant_policy,
@@ -443,11 +454,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &apply_key_input,
         &apply_key_output,
         &net_column,
-        ColumnId(locator_file_column_id),
-        ColumnId(locator_pos_column_id),
-        ColumnId(locator_row_id_column_id),
-        ColumnId(locator_last_updated_seq_column_id),
-        &file_metadata,
+        &locator_columns,
     )
     .map_err(crate::compiler::SqlCompileError::from)
 }
@@ -753,11 +760,7 @@ fn build_locator_join_shell(
     left_apply_key: &OutputColumn,
     net_column: &OutputColumn,
     right_apply_key_id: ColumnId,
-    locator_file_column_id: ColumnId,
-    locator_pos_column_id: ColumnId,
-    locator_row_id_column_id: ColumnId,
-    locator_last_updated_seq_column_id: ColumnId,
-    file_metadata: &[OutputColumn],
+    locator_columns: &JoinRefreshLocatorColumns<'_>,
 ) -> Result<LogicalPlanNode, String> {
     let right_apply_key = target_apply_key_declaration(locator, left_apply_key)?;
     let right_scan = build_target_locator_scan(
@@ -765,11 +768,11 @@ fn build_locator_join_shell(
         locator,
         left_apply_key,
         right_apply_key_id,
-        locator_file_column_id,
-        locator_pos_column_id,
-        locator_row_id_column_id,
-        locator_last_updated_seq_column_id,
-        file_metadata,
+        locator_columns.file_path,
+        locator_columns.row_position,
+        locator_columns.row_id,
+        locator_columns.last_updated_sequence,
+        locator_columns.file_metadata,
     )?;
     let delete_only = binary(
         column_ref(net_column),
@@ -1005,11 +1008,7 @@ fn build_final_coalesce_project(
     apply_key_input: &OutputColumn,
     apply_key_output: &OutputColumn,
     net_column: &OutputColumn,
-    locator_file_column_id: ColumnId,
-    locator_pos_column_id: ColumnId,
-    locator_row_id_column_id: ColumnId,
-    locator_last_updated_seq_column_id: ColumnId,
-    file_metadata: &[OutputColumn],
+    locator_columns: &JoinRefreshLocatorColumns<'_>,
 ) -> Result<LogicalPlanNode, String> {
     let action_output = mapped_output_column(
         desc,
@@ -1032,41 +1031,41 @@ fn build_final_coalesce_project(
     // names.
     items.push(ProjectItem {
         expr: locator_column_ref(
-            locator_row_id_column_id,
+            locator_columns.row_id,
             crate::common::ICEBERG_ROW_ID_COL,
             DataType::Int64,
         ),
         output_name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-        output_column_id: locator_row_id_column_id,
+        output_column_id: locator_columns.row_id,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
-            locator_last_updated_seq_column_id,
+            locator_columns.last_updated_sequence,
             crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
             DataType::Int64,
         ),
         output_name: crate::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-        output_column_id: locator_last_updated_seq_column_id,
+        output_column_id: locator_columns.last_updated_sequence,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
-            locator_file_column_id,
+            locator_columns.file_path,
             crate::common::ICEBERG_FILE_PATH_COL,
             DataType::Utf8,
         ),
         output_name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
-        output_column_id: locator_file_column_id,
+        output_column_id: locator_columns.file_path,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
-            locator_pos_column_id,
+            locator_columns.row_position,
             crate::common::ICEBERG_ROW_POS_COL,
             DataType::Int64,
         ),
         output_name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
-        output_column_id: locator_pos_column_id,
+        output_column_id: locator_columns.row_position,
     });
-    for field in file_metadata {
+    for field in locator_columns.file_metadata {
         let mut item = project_item_from_source_to_output(field, field);
         item.expr.value_type = field
             .value_type

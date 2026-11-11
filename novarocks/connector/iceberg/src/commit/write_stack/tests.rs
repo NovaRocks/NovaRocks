@@ -192,13 +192,13 @@ fn fixed_delete_recipe(table: &IcebergWriteTableFacts) -> super::domain::Iceberg
         table,
         "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
         format!("sha256:{}", "a".repeat(64)),
-        Some(
+        table.base_snapshot_id().map(|snapshot| {
             super::domain::IcebergMutationSnapshot::try_new(
-                "s3://b/wh/db/t/metadata/snap-77.avro".to_owned(),
-                1,
+                format!("s3://b/wh/db/t/metadata/snap-{snapshot}.avro"),
+                table.schema_id(),
             )
-            .unwrap(),
-        ),
+            .unwrap()
+        }),
     )
     .unwrap()
 }
@@ -5448,13 +5448,24 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 "s3://b/wh/db/t/data".into(),
                 "main".into(),
                 snapshot,
-                4,
+                snapshot.map_or(0, |_| 4),
                 1,
                 0,
-                3,
+                if flavor == IcebergWriteFlavor::RowMutationPositionDelete {
+                    2
+                } else {
+                    3
+                },
             )
             .unwrap();
-            let plan = plan_ordinary_branches(flavor, &material).unwrap();
+            let position_mutation = flavor != IcebergWriteFlavor::EqualityDelete;
+            let plan = if position_mutation {
+                plan_row_mutation_branches(&material)
+            } else {
+                plan_ordinary_branches(flavor, &material)
+            }
+            .unwrap();
+            assert_eq!(plan.flavor, flavor);
             let (handle, _) = plan_branch_session(
                 IcebergWriteSessionId::new(),
                 IcebergBranchSessionPlanInput {
@@ -5472,6 +5483,12 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 },
             )
             .unwrap();
+            let handle = if position_mutation {
+                let recipe = fixed_delete_recipe(handle.table());
+                handle.with_mutation_read(recipe)
+            } else {
+                handle
+            };
             let inconsistent =
                 ConnectorPreparedWriteSet::try_new(1, Vec::new(), &handle.expected_targets())
                     .unwrap();
