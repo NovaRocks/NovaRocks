@@ -1021,6 +1021,7 @@ async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
             sources: geometry.sources,
             retain_diagnostics: true,
             observe_dev_root: false,
+            observe_lifecycle_diagnostics: false,
         },
         AttemptPlanPolicy {
             coordination: CoordinationBudgets::DEFAULT,

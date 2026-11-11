@@ -140,6 +140,14 @@ pub(crate) trait EffectSource: Send + 'static {
     fn close_ordered_observations(&mut self, original: OrderedObservationHost) {
         std::panic::resume_unwind(Box::new(original));
     }
+    /// Stop the already admitted local pumps while the QA reply loan is live.
+    fn begin_local_convergence(&mut self) {
+        unreachable!("attempt has no original local convergence Source");
+    }
+    /// True only after the original pump work, captures and releases exit.
+    fn local_convergence_exited(&self) -> bool {
+        false
+    }
     fn return_unclaimed_result(&mut self, result: CausalInputObligation<FrontendActor>);
     /// Core consumption is proved by these original committed runtime inputs;
     /// it is not a capture, result-consumer, or producer-exit acknowledgement.
@@ -154,6 +162,26 @@ pub(crate) trait EffectSource: Send + 'static {
         original: TransportSourceEvent,
     ) {
         std::panic::resume_unwind(Box::new(original));
+    }
+    /// A Source may need room to retain or dispose a rich return before
+    /// polling the original retirement row that owns it.
+    fn transport_retirement_ready(&self) -> bool {
+        true
+    }
+    fn transport_roles_drained(&mut self) {}
+    fn attempt_notice_ready(
+        &self,
+        _notice: &crate::task_execution::host::adapter::AttemptNotice,
+    ) -> bool {
+        true
+    }
+    fn consume_attempt_notice(
+        &mut self,
+        notice: Arc<crate::task_execution::host::adapter::AttemptNotice>,
+    ) {
+        if notice.requires_reporting() {
+            self.retain_transport_release(Box::new(notice));
+        }
     }
     /// The immutable failure custodian takes these same originals; it must
     /// arrange actual unused withdrawal/cleanup and retain all partial custody.
@@ -240,6 +268,13 @@ impl FrontendLanePolicy {
                         participation: *participation,
                         generation: *generation,
                     }),
+                    EffectBody::StartPump { pump, .. }
+                    | EffectBody::StopPump { pump }
+                    | EffectBody::PumpUpdateAdmitted { pump, .. }
+                    | EffectBody::PumpOperationReleased { pump, .. }
+                    | EffectBody::PumpOperationSettled { pump, .. } => {
+                        Some(FrontendLaneKey::Pump(*pump))
+                    }
                     EffectBody::Publish(_) => Some(FrontendLaneKey::Publication),
                     // Independent effects keep their own ready marker. In
                     // particular, Withdraw must be able to reach an original
@@ -282,6 +317,8 @@ struct HostMachine {
     scan_remaining: Option<usize>,
     rescan_requested: bool,
     pending: Option<PendingHandoff>,
+    local_source_handoffs_pending: usize,
+    local_sources_closing: bool,
     failure_handed_off: bool,
     external_closed: bool,
     attempt_timer: Option<InputId>,
@@ -574,6 +611,8 @@ impl HostRegistry {
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
+                local_source_handoffs_pending: 0,
+                local_sources_closing: false,
                 failure_handed_off: false,
                 external_closed: false,
                 attempt_timer: None,
@@ -855,13 +894,17 @@ impl HostRegistry {
                 }
             }
         }
-        let transport = machine.transport.as_mut().map(|transport| {
-            // One original row visit per host turn leaves the original
-            // indexing allowance available to make the Core and effects run.
-            transport.progress(turn, budget.min(1), |effect, event| {
-                machine.source.transport_event(effect, event);
-            })
-        });
+        let transport = machine
+            .transport
+            .as_mut()
+            .filter(|_| machine.source.transport_retirement_ready())
+            .map(|transport| {
+                // One original row visit per host turn leaves the original
+                // indexing allowance available to make the Core and effects run.
+                transport.progress(turn, budget.min(1), |effect, event| {
+                    machine.source.transport_event(effect, event);
+                })
+            });
         if let Some(transport) = &transport {
             budget -= transport.units;
         }
@@ -891,6 +934,7 @@ impl HostRegistry {
         }
         let mut capacity_more = false;
         let source_closing = machine.source.result_admission_closed();
+        let notifications_closing = source_closing || machine.local_sources_closing;
         let attempt = entry.kind == FrontendActorKind::Attempt;
         let mut timer_more = false;
         if attempt {
@@ -938,13 +982,13 @@ impl HostRegistry {
             }
         }
         if let Some(capacity) = &mut machine.capacity
-            && capacity.needs_progress(failed, source_closing)
+            && capacity.needs_progress(failed, notifications_closing)
         {
             if budget == 0 {
                 capacity_more = true;
             } else {
                 budget -= 1;
-                capacity_more = capacity.progress(failed, source_closing)?;
+                capacity_more = capacity.progress(failed, notifications_closing)?;
                 if capacity.is_closed() {
                     machine.capacity = None;
                 }
@@ -952,14 +996,14 @@ impl HostRegistry {
         }
         let mut membership_more = false;
         if let Some(membership) = &mut machine.membership
-            && membership.needs_progress(failed, source_closing)
+            && membership.needs_progress(failed, notifications_closing)
         {
             let units = membership.visit_units();
             if budget < units {
                 membership_more = true;
             } else {
                 budget -= units;
-                membership_more = membership.progress(failed, source_closing)?;
+                membership_more = membership.progress(failed, notifications_closing)?;
                 if membership.is_closed() {
                     machine.membership = None;
                 }
@@ -973,7 +1017,24 @@ impl HostRegistry {
                 controls_more = true;
             } else {
                 budget -= AttemptOwnerControlSource::VISIT_UNITS;
-                controls_more = controls.progress(failed, source_closing)?;
+                let local_exited = !failed
+                    && !source_closing
+                    && controls.waiting_for_local_exit()
+                    && machine.capacity.is_none()
+                    && machine.membership.is_none()
+                    && machine.source.local_convergence_exited()
+                    && machine.pending.is_none()
+                    && machine.dispatch.is_empty()
+                    && machine
+                        .transport
+                        .as_ref()
+                        .is_none_or(TransportRetirements::is_empty)
+                    && machine
+                        .ordered_observations
+                        .as_ref()
+                        .is_none_or(OrderedObservationHost::ready_for_close)
+                    && self.runtime.snapshot(entry.registration.actor())?.inputs == 0;
+                controls_more = controls.progress(failed, source_closing, local_exited)?;
                 if controls.is_closed() {
                     machine.owner_controls = None;
                 }
@@ -987,6 +1048,11 @@ impl HostRegistry {
             "Source work uses the original finite host allowance"
         );
         budget -= retired.units;
+        controls_more |= retired.progressed
+            && machine
+                .owner_controls
+                .as_ref()
+                .is_some_and(AttemptOwnerControlSource::waiting_for_local_exit);
         // The original Source can finish admission in this progress call.
         // Schedule the remaining roles for their separate final visit.
         if !source_closing && machine.source.result_admission_closed() {
@@ -998,8 +1064,11 @@ impl HostRegistry {
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
             retired.more |= transport.more;
-            retired.retired &= machine.transport.as_ref().unwrap().is_empty();
         }
+        retired.retired &= machine
+            .transport
+            .as_ref()
+            .is_none_or(TransportRetirements::is_empty);
         if machine.ordered_observations.is_some()
             && machine.source.can_close_ordered_observations(failed)
         {
@@ -1113,6 +1182,9 @@ impl HostRegistry {
                 |metadata| {
                     if let FrontendEffect::Attempt(effect) = metadata {
                         machine.withdrawals.index(effect);
+                        if must_handoff_before_local_close(effect) {
+                            machine.local_source_handoffs_pending += 1;
+                        }
                     }
                 }
             ));
@@ -1209,6 +1281,54 @@ impl HostRegistry {
                             .effect_completed(ticket)
                             .map_err(|refusal| HostError::Runtime(refusal.error))?;
                         observation_advanced = true;
+                    } else {
+                        original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    }
+                    continue;
+                }
+                if let FrontendEffect::AttemptNotice(notice) = metadata {
+                    if machine.source.attempt_notice_ready(notice)
+                        && let Some(ticket) = original_dispatch!(
+                            machine.dispatch.claim_candidate(&self.runtime, &candidate)
+                        )
+                    {
+                        machine.source.consume_attempt_notice(notice.clone());
+                        self.runtime
+                            .effect_completed(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        observation_advanced |= notice.requires_reporting();
+                    } else {
+                        original_dispatch!(machine.dispatch.defer_candidate(&candidate));
+                    }
+                    continue;
+                }
+                if let FrontendEffect::Attempt(effect) = metadata
+                    && matches!(
+                        effect.protocol.body,
+                        novarocks_attempt_protocol::effect::EffectBody::PrepareLocalConvergence
+                    )
+                {
+                    // The Core has fenced new pump and subscription commands.
+                    // Every earlier command must reach its original Source.
+                    if machine.local_source_handoffs_pending == 0
+                        && let Some(ticket) = original_dispatch!(
+                            machine.dispatch.claim_candidate(&self.runtime, &candidate)
+                        )
+                    {
+                        if let Some(observations) = &machine.ordered_observations {
+                            observations.fence_root_controls();
+                        }
+                        machine.local_sources_closing = true;
+                        machine.source.begin_local_convergence();
+                        machine
+                            .owner_controls
+                            .as_mut()
+                            .expect("original local exit input author")
+                            .request_local_exit();
+                        self.runtime
+                            .effect_completed(ticket)
+                            .map_err(|refusal| HostError::Runtime(refusal.error))?;
+                        controls_more = true;
                     } else {
                         original_dispatch!(machine.dispatch.defer_candidate(&candidate));
                     }
@@ -1329,6 +1449,10 @@ impl HostRegistry {
                     handoff_refused = true;
                 }
                 Ok(()) => {
+                    if matches!(&pending.ticket.effect, FrontendEffect::Attempt(effect) if must_handoff_before_local_close(effect))
+                    {
+                        machine.local_source_handoffs_pending -= 1;
+                    }
                     let lane = machine.policy.classify(&pending.ticket.effect);
                     let receipt = self
                         .runtime
@@ -1380,6 +1504,15 @@ impl HostRegistry {
         })
     }
 }
+fn must_handoff_before_local_close(
+    effect: &super::transport_withdrawal::AttemptEffectEnvelope,
+) -> bool {
+    effect.is_pump_call()
+        || effect.is_subscription_open()
+        || effect.is_subscription_control()
+        || effect.is_read_confirmation()
+}
+
 fn owner_failed_dispatch(
     runtime: &ActorRuntime<FrontendActor>,
     registration: &ActorRegistration,
@@ -1546,6 +1679,7 @@ mod tests {
         scope: ScopeHandle,
         closing: bool,
         retire_batches: bool,
+        local_exited: Option<Arc<AtomicBool>>,
     }
     impl EffectSource for MetadataSource {
         fn prepay_result(
@@ -1576,6 +1710,11 @@ mod tests {
         }
         fn result_admission_closed(&self) -> bool {
             self.closing
+        }
+        fn local_convergence_exited(&self) -> bool {
+            self.local_exited
+                .as_ref()
+                .is_some_and(|exited| exited.load(Ordering::Acquire))
         }
         fn progress_retirement(
             &mut self,
@@ -1678,6 +1817,7 @@ mod tests {
                     scope,
                     closing: false,
                     retire_batches: false,
+                    local_exited: None,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -1818,6 +1958,7 @@ mod tests {
                     scope,
                     closing: false,
                     retire_batches: false,
+                    local_exited: None,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -1909,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn installed_host_retires_owner_control_occurrences_before_reuse_or_close() {
         use crate::task_execution::bridge::control::AttemptOwnerControls;
-        use novarocks_attempt_protocol::input::AttemptInput;
+        use novarocks_attempt_protocol::input::{AttemptInput, ExecutorFact};
         use novarocks_coordination_contract::{
             AttemptActivationIdentity, AttemptConvergenceMode, AttemptStopReason,
             LogicalToAttemptBody,
@@ -1933,6 +2074,14 @@ mod tests {
                 let FrontendInput::Attempt(input) = input else {
                     panic!("unexpected input to the owner-control host");
                 };
+                if matches!(
+                    *input,
+                    AttemptInput::Executor(ExecutorFact::LocalConvergenceExited)
+                ) {
+                    assert_eq!(envelope.class, InputClass::Lifecycle);
+                    self.0.lock().unwrap().push(envelope.input);
+                    return;
+                }
                 let AttemptInput::Port(input) = *input else {
                     panic!("unexpected attempt input to the owner-control host");
                 };
@@ -2014,11 +2163,19 @@ mod tests {
             1,
         );
         let mut controls = AttemptOwnerControls::new(activation, standing(), standing());
-        let source = controls.bind_host(registration.clone());
+        let mut source = controls.bind_host(registration.clone()).with_local_exit(
+            runtime
+                .reserve_input(actor, actor, InputClass::Lifecycle)
+                .unwrap()
+                .into_standing_input()
+                .unwrap(),
+        );
+        source.request_local_exit();
+        let local_exited = Arc::new(AtomicBool::new(false));
         let mut exit = host
             .register(HostBinding {
                 scope: scope.clone(),
-                registration,
+                registration: registration.clone(),
                 kind: FrontendActorKind::Test,
                 config,
                 policy: FrontendLanePolicy {
@@ -2029,6 +2186,7 @@ mod tests {
                     scope,
                     closing: false,
                     retire_batches: false,
+                    local_exited: Some(local_exited.clone()),
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -2071,6 +2229,16 @@ mod tests {
                 .unwrap();
         }
 
+        assert_eq!(*seen.lock().unwrap(), [first]);
+        assert!(!runtime.poll_one(Tick(1)).unwrap());
+        local_exited.store(true, Ordering::Release);
+        runtime.notify_host_actor(&registration).unwrap();
+        drive(); // Only the original Source exit makes the prepaid fact eligible.
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        let local = seen.lock().unwrap()[1];
+        drive(); // Index the local-exit occurrence.
+        drive(); // Return its original Lifecycle role after retirement.
+
         let second = begin(&mut controls, &tightened).unwrap().unwrap();
         let stop = controls
             .stop_for_cancellation(CancellationReason::Requested)
@@ -2097,7 +2265,7 @@ mod tests {
         assert!(!host.is_empty());
 
         assert!(runtime.poll_one(Tick(1)).unwrap());
-        assert_eq!(*seen.lock().unwrap(), [first, second, stop]);
+        assert_eq!(*seen.lock().unwrap(), [first, local, second, stop]);
         for _ in 0..6 {
             let Some(turn) = runtime.claim_host_actor() else {
                 break;
@@ -2233,6 +2401,7 @@ mod tests {
                     scope,
                     closing: false,
                     retire_batches: false,
+                    local_exited: None,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -2391,6 +2560,7 @@ mod tests {
                     scope: scope.clone(),
                     closing: false,
                     retire_batches: false,
+                    local_exited: None,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -2526,6 +2696,7 @@ mod tests {
                     scope: source_scope,
                     closing: false,
                     retire_batches: true,
+                    local_exited: None,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
@@ -3185,7 +3356,9 @@ mod tests {
         let held_captures = CaptureProbe(captures.clone());
         assert!(
             attempts
-                .register(
+                .begin_attempt_registration()
+                .unwrap()
+                .register_binding(
                     HostBinding {
                         scope: scope.clone(),
                         registration: registration.clone(),

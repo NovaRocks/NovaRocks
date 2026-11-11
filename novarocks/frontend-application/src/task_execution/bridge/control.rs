@@ -20,7 +20,7 @@
 use crate::control_runtime::actor::{FrontendActor, FrontendInput};
 use novarocks_attempt_protocol::{
     failure::{AttemptFailure, AttemptFailureSite, ProtocolFailure},
-    input::AttemptInput,
+    input::{AttemptInput, ExecutorFact},
 };
 use novarocks_control_runtime::actor_turn::{
     ActorRegistration, ActorTurnError, StandingInputObligation,
@@ -136,6 +136,10 @@ impl AttemptOwnerControls {
         Ok(Some(input))
     }
 
+    pub(crate) fn cancellation_submitted(&self) -> bool {
+        self.stopped
+    }
+
     /// Preserve the original projection on reentry. The caller retries a
     /// tightened request after the preceding Control occurrence has retired.
     pub(crate) fn begin_convergence(
@@ -197,6 +201,7 @@ impl AttemptOwnerControls {
             original,
             inputs: self.inputs.clone(),
             indexed: [None; 2],
+            local_exit: None,
             closed: false,
         }
     }
@@ -244,9 +249,45 @@ pub(crate) struct AttemptOwnerControlSource {
     original: ActorRegistration,
     inputs: Arc<ControlInputs>,
     indexed: [Option<InputId>; 2],
+    local_exit: Option<LocalExitInput>,
     closed: bool,
 }
+
+/// This Lifecycle position belongs solely to the installed host. It remains
+/// paid until the Core has handled the real local exit and its effects retire.
+struct LocalExitInput {
+    position: Position,
+    requested: bool,
+    submitted: bool,
+    indexed: bool,
+}
+
 impl AttemptOwnerControlSource {
+    pub(crate) fn with_local_exit(mut self, position: Position) -> Self {
+        assert!(position.matches_registration(&self.original));
+        self.local_exit = Some(LocalExitInput {
+            position,
+            requested: false,
+            submitted: false,
+            indexed: false,
+        });
+        self
+    }
+
+    pub(crate) fn request_local_exit(&mut self) {
+        let local = self
+            .local_exit
+            .as_mut()
+            .expect("original local exit position");
+        assert!(!std::mem::replace(&mut local.requested, true));
+    }
+
+    pub(crate) fn waiting_for_local_exit(&self) -> bool {
+        self.local_exit
+            .as_ref()
+            .is_some_and(|local| local.requested && !local.submitted)
+    }
+
     pub(crate) fn matches(&self, original: &ActorRegistration) -> bool {
         self.original.same_registration(original)
     }
@@ -264,16 +305,37 @@ impl AttemptOwnerControlSource {
                 found = true;
             }
         }
+        if let Some(local) = &mut self.local_exit
+            && local
+                .position
+                .in_flight()?
+                .is_some_and(|input| inputs.contains(&input))
+        {
+            assert!(local.submitted && !local.indexed);
+            local.indexed = true;
+            found = true;
+        }
         Ok(found)
     }
 
-    pub(crate) const VISIT_UNITS: usize = 2;
+    pub(crate) const VISIT_UNITS: usize = 3;
 
     pub(crate) fn needs_progress(&self, failed: bool, closing: bool) -> bool {
-        failed || closing || self.indexed.iter().any(Option::is_some)
+        failed
+            || closing
+            || self.indexed.iter().any(Option::is_some)
+            || self
+                .local_exit
+                .as_ref()
+                .is_some_and(|local| local.requested && (!local.submitted || local.indexed))
     }
 
-    pub(crate) fn progress(&mut self, failed: bool, closing: bool) -> Result<bool, ActorTurnError> {
+    pub(crate) fn progress(
+        &mut self,
+        failed: bool,
+        closing: bool,
+        local_exited: bool,
+    ) -> Result<bool, ActorTurnError> {
         if failed || closing {
             self.inputs.fence();
         }
@@ -304,7 +366,33 @@ impl AttemptOwnerControlSource {
             }
             idle &= retired;
         }
-        if idle && self.inputs.fenced.load(Ordering::Acquire) {
+        if let Some(local) = &mut self.local_exit {
+            if failed {
+                match local.position.take_failed_role_payload() {
+                    Ok(Some(original)) => {
+                        original.dispose()?;
+                        return Ok(true);
+                    }
+                    Ok(None) | Err(ActorTurnError::InputAuthorMismatch) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let close = failed || closing || local.indexed;
+            if close && local.position.retire_ready_after_exit()? {
+                local.position.close_after_exit()?;
+                self.local_exit = None;
+            } else if local_exited && local.requested && !local.submitted && !close {
+                let value = FrontendInput::Attempt(Box::new(AttemptInput::Executor(
+                    ExecutorFact::LocalConvergenceExited,
+                )));
+                match local.position.fill(value) {
+                    Ok(_) => local.submitted = true,
+                    Err((ActorTurnError::ActorFailed | ActorTurnError::Closed, _)) => {}
+                    Err((error, _)) => return Err(error),
+                }
+            }
+        }
+        if idle && self.local_exit.is_none() && self.inputs.fenced.load(Ordering::Acquire) {
             self.inputs.close_positions()?;
             self.closed = true;
         }

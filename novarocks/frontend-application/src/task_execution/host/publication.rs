@@ -22,29 +22,42 @@
 use super::pumps::{DiagnosticRecords, PumpRecordError};
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendEffect},
+    query_execution::{
+        lifecycle_diagnostics::{
+            RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+        },
+        runtime_filter_terminal_rollup::{
+            RuntimeFilterParticipantTerminalTelemetry, project_release_contribution,
+            rollup_projected_release_contributions,
+        },
+    },
     task_execution::{
         bridge::root_control::{RootControlRequests, reply_kind},
         error::TaskExecutionError,
         execution::ReleasedRuntimeFilterContributions,
+        intent::{AckPayload, OperationAcknowledgement},
         profile_diagnostics::{ProfileSplitDiagnostic, TaskFinalInfoCollector},
         protocol_facts::AttemptProtocolFactsPublisher,
     },
 };
 use novarocks_attempt_protocol::{
-    effect::Publication,
+    effect::{Publication, PumpKind},
     failure::{
         AttemptFailure, AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure,
     },
     input::{AttemptInput, ExecutorFact, PublicationApplied},
-    publication::{DiagnosticPublication, DiagnosticSources, SplitDiagnosticObservation},
-    start::PayloadRef,
+    publication::{
+        DiagnosticPublication, DiagnosticSources, RuntimeFilterDiagnostic,
+        SplitDiagnosticObservation,
+    },
+    start::{AttemptStart, PayloadRef},
 };
 use novarocks_control_runtime::actor_turn::{ActorRuntime, ActorTurnError, EffectTicket};
 use novarocks_coordination_contract::{
     AttemptActionId, AttemptActivationIdentity, AttemptRootFailure, AttemptToLogical,
 };
 use novarocks_execution_contract::{
-    ParticipationRef, SafeDetail, TaskIdentity, failure::FailureProjection,
+    ParticipationRef, ReleaseOutcome, SafeDetail, TaskIdentity, failure::FailureProjection,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::{
@@ -53,7 +66,8 @@ use novarocks_query_application::{
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
-use std::sync::Arc;
+use novarocks_types::BackendProcessId;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A read-only projection of the original Source's frozen graph binding.
 /// This carries no grant, executable callback, or new sampling authority.
@@ -81,13 +95,290 @@ pub(crate) enum OriginalDiagnosticPayload {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DiagnosticPayloadAddress {
+    RuntimeFilter {
+        backend: BackendProcessId,
+        reference: PayloadRef,
+    },
+    SplitProfile(PayloadRef),
+}
+
 /// Implemented only by the original preadmitted Source's canonical records.
 /// Records remain retained by its publication/result legs until this resolver
 /// transfers the exact rich values to the original watch/consumer. Consuming
 /// the core input alone cannot retire them. No fallback to current is legal.
 pub(crate) trait OriginalDiagnosticRecords: Send + Sync {
     fn binding(&self) -> OriginalDiagnosticBinding<'_>;
-    fn payload(&self, reference: PayloadRef) -> Option<OriginalDiagnosticPayload>;
+    fn payload(&self, address: DiagnosticPayloadAddress) -> Option<OriginalDiagnosticPayload>;
+    fn publication_complete(&self) {}
+}
+
+type SplitProfileLookup = (PayloadRef, Arc<OnceLock<SplitSourceProfile>>);
+
+struct ReleaseDiagnostic {
+    reference: PayloadRef,
+    telemetry: QueryTerminalProfileContributionTelemetry,
+}
+
+/// Move the original reply aliases to the credentialed disposal executor.
+pub(crate) struct RetainedReleaseDiagnostics(Box<[Option<ReleaseDiagnostic>]>);
+
+struct ReleaseDiagnosticRows {
+    profile: Option<RetainedReleaseDiagnostics>,
+    lifecycle: Option<Box<[Option<LifecycleReleaseDiagnostic>]>>,
+}
+
+struct LifecycleReleaseDiagnostic {
+    reference: PayloadRef,
+    telemetry: RuntimeFilterParticipantTerminalTelemetry,
+}
+
+/// Exact immutable manifest binding and one preallocated release cell per
+/// participant. A terminal release is first-wins for that participant, and
+/// only the Core can select its reference for publication.
+pub(crate) struct AttemptDiagnosticSources {
+    activation: AttemptActivationIdentity,
+    root: TaskIdentity,
+    participations: Box<[ParticipationRef]>,
+    fragments: Box<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
+    split: Option<SplitProfileLookup>,
+    observe_lifecycle: bool,
+    releases: Mutex<ReleaseDiagnosticRows>,
+}
+
+impl AttemptDiagnosticSources {
+    pub(crate) fn new(start: &AttemptStart, split: Option<SplitProfileLookup>) -> Arc<Self> {
+        let plan = &start.plan;
+        let observe_lifecycle = start.observe_lifecycle_diagnostics;
+        let expected_split = plan.pumps.iter().find_map(|&(reference, kind)| {
+            (kind == PumpKind::SplitAssignment).then_some(reference)
+        });
+        assert_eq!(
+            expected_split,
+            split.as_ref().map(|(reference, _)| *reference)
+        );
+        let participations: Box<_> = plan.establish_material.keys().copied().collect();
+        assert!(
+            participations
+                .windows(2)
+                .all(|pair| pair[0].backend_process_id() < pair[1].backend_process_id()),
+            "the original attempt has one participation per backend"
+        );
+        let profile = start.activation.policy.retain_diagnostics.then(|| {
+            RetainedReleaseDiagnostics(
+                std::iter::repeat_with(|| None)
+                    .take(participations.len())
+                    .collect(),
+            )
+        });
+        let lifecycle = observe_lifecycle.then(|| {
+            std::iter::repeat_with(|| None)
+                .take(participations.len())
+                .collect()
+        });
+        Arc::new(Self {
+            activation: start.activation.identity,
+            root: plan.graph.root,
+            participations,
+            fragments: plan
+                .graph
+                .tasks
+                .values()
+                .map(|task| (task.identity, task.fragment_id))
+                .collect(),
+            split,
+            observe_lifecycle,
+            releases: Mutex::new(ReleaseDiagnosticRows { profile, lifecycle }),
+        })
+    }
+
+    /// Bind one physical send's paid receipt to its original participation.
+    /// The ref is minted in the same host namespace before the producer starts.
+    pub(crate) fn release_report(
+        self: &Arc<Self>,
+        participation: ParticipationRef,
+        reference: PayloadRef,
+    ) -> Option<DiagnosticReleaseReport> {
+        let index = self.participations.binary_search(&participation).ok()?;
+        Some(DiagnosticReleaseReport {
+            source: Arc::clone(self),
+            index,
+            reference,
+        })
+    }
+
+    pub(crate) fn take_release_records(&self) -> Option<RetainedReleaseDiagnostics> {
+        self.releases
+            .lock()
+            .expect("original release diagnostics")
+            .profile
+            .take()
+    }
+
+    /// Resolve only the Core's accepted original references at final
+    /// convergence, then transfer the value-only diagnostics once.
+    pub(crate) fn take_lifecycle_rollup(
+        &self,
+        selection: Option<&RuntimeFilterDiagnostic>,
+    ) -> Option<RuntimeFilterTerminalRollupSnapshot> {
+        let mut rows = self
+            .releases
+            .lock()
+            .expect("original release diagnostics")
+            .lifecycle
+            .take()?;
+        let incomplete = || {
+            Some(RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            ))
+        };
+        let Some(selection) = selection.filter(|selection| selection.complete) else {
+            return incomplete();
+        };
+        let mut selected = Vec::with_capacity(selection.contributions.len());
+        let mut previous = None;
+        for &(backend, reference) in &selection.contributions {
+            let Ok(index) = self
+                .participations
+                .binary_search_by_key(&backend, |part| part.backend_process_id())
+            else {
+                return incomplete();
+            };
+            let Some(row) = rows[index]
+                .take()
+                .filter(|row| row.reference.0 == reference)
+            else {
+                return incomplete();
+            };
+            if previous.is_some_and(|previous| previous >= index) {
+                return incomplete();
+            }
+            previous = Some(index);
+            selected.push(row.telemetry);
+        }
+        Some(RuntimeFilterTerminalRollupSnapshot::Available(
+            rollup_projected_release_contributions(selected),
+        ))
+    }
+}
+
+impl OriginalDiagnosticRecords for AttemptDiagnosticSources {
+    fn binding(&self) -> OriginalDiagnosticBinding<'_> {
+        OriginalDiagnosticBinding {
+            activation: self.activation,
+            root: self.root,
+            participations: &self.participations,
+            fragments: &self.fragments,
+        }
+    }
+
+    fn payload(&self, address: DiagnosticPayloadAddress) -> Option<OriginalDiagnosticPayload> {
+        match address {
+            DiagnosticPayloadAddress::RuntimeFilter { backend, reference } => {
+                let index = self
+                    .participations
+                    .binary_search_by_key(&backend, |part| part.backend_process_id())
+                    .ok()?;
+                let releases = self.releases.lock().expect("original release diagnostics");
+                let original = releases.profile.as_ref()?.0[index].as_ref()?;
+                (original.reference == reference).then(|| {
+                    OriginalDiagnosticPayload::RuntimeFilter {
+                        activation: self.activation,
+                        participation: self.participations[index],
+                        telemetry: original.telemetry.clone(),
+                    }
+                })
+            }
+            DiagnosticPayloadAddress::SplitProfile(reference) => {
+                let (original, profile) = self.split.as_ref()?;
+                if *original != reference {
+                    return None;
+                }
+                Some(OriginalDiagnosticPayload::SplitProfile {
+                    activation: self.activation,
+                    root: self.root,
+                    profile: *profile.get()?,
+                })
+            }
+        }
+    }
+
+    fn publication_complete(&self) {
+        drop(self.take_release_records());
+    }
+}
+
+/// One report's writer. This travels with its original paid Native input and
+/// borrows the canonical acknowledgement before the passive fact can become
+/// visible. Only a settled Release can contribute to the Core's frontier.
+pub(crate) struct DiagnosticReleaseReport {
+    source: Arc<AttemptDiagnosticSources>,
+    index: usize,
+    reference: PayloadRef,
+}
+
+impl DiagnosticReleaseReport {
+    pub(crate) fn record(
+        &self,
+        ack: &OperationAcknowledgement,
+        reference: Option<PayloadRef>,
+    ) -> bool {
+        if !ack.is_applied() {
+            return true;
+        }
+        let AckPayload::Release {
+            receipt,
+            outcome: ReleaseOutcome::Released | ReleaseOutcome::AlreadyTerminal,
+            runtime_filter: Some(telemetry),
+        } = ack.payload()
+        else {
+            return true;
+        };
+        if reference != Some(self.reference)
+            || receipt.participation() != self.source.participations[self.index]
+        {
+            return false;
+        }
+        let lifecycle = self
+            .source
+            .observe_lifecycle
+            .then(|| LifecycleReleaseDiagnostic {
+                reference: self.reference,
+                telemetry: project_release_contribution(
+                    receipt.participation().backend_process_id(),
+                    telemetry,
+                ),
+            });
+        let mut releases = self
+            .source
+            .releases
+            .lock()
+            .expect("original release diagnostics");
+        if releases
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.0[self.index].is_some())
+            || releases
+                .lifecycle
+                .as_ref()
+                .is_some_and(|rows| rows[self.index].is_some())
+        {
+            return false;
+        }
+        // Once the one-shot publication or failed source is closed, a late
+        // operation can settle without taking a new canonical reply alias.
+        if let Some(profile) = &mut releases.profile {
+            profile.0[self.index] = Some(ReleaseDiagnostic {
+                reference: self.reference,
+                telemetry: telemetry.clone(),
+            });
+        }
+        if let Some(rows) = &mut releases.lifecycle {
+            rows[self.index] = lifecycle;
+        }
+        true
+    }
 }
 
 /// Constructible only by resolving the core's complete immutable selection.
@@ -140,7 +431,10 @@ impl DiagnosticSourceSnapshot {
                 activation,
                 participation,
                 telemetry,
-            }) = records.payload(reference)
+            }) = records.payload(DiagnosticPayloadAddress::RuntimeFilter {
+                backend,
+                reference: PayloadRef(reference),
+            })
             else {
                 return Err(invalid());
             };
@@ -174,7 +468,7 @@ impl DiagnosticSourceSnapshot {
                     activation,
                     root,
                     profile,
-                }) = records.payload(reference)
+                }) = records.payload(DiagnosticPayloadAddress::SplitProfile(reference))
                 else {
                     return Err(invalid());
                 };
@@ -313,6 +607,13 @@ impl AttemptPublicationOwner {
         self.activation
     }
 
+    pub(crate) async fn register_computation_cut(
+        &self,
+        ready: ComputationReadyToken,
+    ) -> Result<(), PublicationError> {
+        self.record.lock().await.register_computation_cut(ready)
+    }
+
     pub(crate) fn matches_root(&self, binding: &super::observations::RootControlBinding) -> bool {
         self.root.as_ref().is_some_and(|root| root.matches(binding))
     }
@@ -402,20 +703,29 @@ impl AttemptPublicationOwner {
         &self,
         publication: &Publication,
     ) -> Result<PublicationApplied, PublicationError> {
-        let sources = match publication {
-            Publication::Diagnostics(cut) => {
-                let records = self
-                    .diagnostics
-                    .as_deref()
-                    .ok_or(PublicationError::MissingDiagnosticSources)?;
-                Some(
-                    DiagnosticSourceSnapshot::resolve(cut, records)
-                        .map_err(PublicationError::Protocol)?,
-                )
-            }
-            _ => None,
+        let Publication::Diagnostics(cut) = publication else {
+            return self.record.lock().await.publish(publication, None);
         };
-        self.record.lock().await.publish(publication, sources)
+        let records = self.diagnostics.as_deref();
+        let sources = records
+            .ok_or(PublicationError::MissingDiagnosticSources)
+            .and_then(|records| {
+                DiagnosticSourceSnapshot::resolve(cut, records).map_err(PublicationError::Protocol)
+            });
+        let (result, profile) = {
+            let mut record = self.record.lock().await;
+            let result = sources.and_then(|sources| record.publish(publication, Some(sources)));
+            (result, record.profile.take())
+        };
+        // The one-shot cut is now settled. The receiver retains a published
+        // snapshot, and a failed cut closes its watch. Leaving the sender in
+        // the record would keep reply aliases through host exit, which itself
+        // waits for the original send retirement.
+        drop(profile);
+        if let Some(records) = records {
+            records.publication_complete();
+        }
+        result
     }
 }
 

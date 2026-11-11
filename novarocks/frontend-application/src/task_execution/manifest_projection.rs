@@ -177,6 +177,16 @@ pub(crate) struct PreparedManifestAttempt {
     pub(crate) publications: ManifestPublications,
 }
 
+impl PreparedManifestAttempt {
+    pub(crate) fn participants(&self) -> usize {
+        self.inputs.members.len()
+    }
+
+    pub(crate) fn graph(&self) -> &TaskGraph {
+        &self.inputs.graph
+    }
+}
+
 pub(crate) struct AttemptPlanPolicy {
     pub(crate) coordination: CoordinationBudgets,
     pub(crate) retry: TaskUpdateRetryPolicy,
@@ -192,6 +202,7 @@ pub(crate) struct AttemptActivationInputs<'a> {
     pub(crate) sources: AttemptSources,
     pub(crate) retain_diagnostics: bool,
     pub(crate) observe_dev_root: bool,
+    pub(crate) observe_lifecycle_diagnostics: bool,
 }
 
 pub(crate) struct AttemptManifestProjection {
@@ -314,6 +325,7 @@ impl AttemptManifestProjection {
             initial_now: activation.initial_now,
             sources: activation.sources,
             observe_dev_root: activation.observe_dev_root,
+            observe_lifecycle_diagnostics: activation.observe_lifecycle_diagnostics,
         };
         *next_payload = next;
         Ok(Self {

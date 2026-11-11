@@ -33,6 +33,7 @@ use novarocks_execution_contract::{
     ParticipationAdmissionTicketReceipt, ParticipationRef, TaskIdentity, TaskOperationId,
     TaskStatus,
 };
+use novarocks_types::BackendProcessId;
 use std::num::NonZeroU64;
 
 /// Process-local request identity in the original activation.
@@ -360,5 +361,14 @@ pub enum AttemptToLogicalBody<F> {
     ConvergenceProgress {
         local_exited: bool,
         closure: Option<std::sync::Arc<AttemptConvergenceClosure>>,
+        lifecycle_runtime_filters: Option<std::sync::Arc<RuntimeFilterDiagnostic>>,
     },
+}
+
+/// Exact contribution references selected by the original attempt Core.
+/// These references grant no authority to read or retain the original data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterDiagnostic {
+    pub contributions: Vec<(BackendProcessId, NonZeroU64)>,
+    pub complete: bool,
 }

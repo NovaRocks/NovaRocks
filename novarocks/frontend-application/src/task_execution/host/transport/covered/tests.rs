@@ -66,7 +66,7 @@ use novarocks_execution_contract::TaskIdentity;
 use novarocks_types::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
-use novarocks_workload_control::{WorkClass, WorkRequest};
+use novarocks_workload_control::{CancellationReason, WorkClass, WorkError, WorkRequest};
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicBool, Ordering},
@@ -218,6 +218,78 @@ impl EffectSource for HostSource {
 }
 
 #[tokio::test]
+async fn subscription_staging_retires_only_its_unpublished_children() {
+    let (wc_owner, mut wc_driver, capacity) = wc::fixture();
+    let wc_root = wc_owner
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let scope = wc_root.owner.scope();
+    wc::bind(&scope, &mut wc_driver);
+    let cohort = wc::cohort(&scope, 1, &mut wc_driver);
+    let data = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    let mut peer = Loopback::start().await;
+    let execution = QueryExecutionId::new(QueryId::new(17, 2), AttemptId::new(1).unwrap()).unwrap();
+    let frontend = FrontendProcessId::new_v7();
+    let mut processes = [BackendProcessId::new_v7(), BackendProcessId::new_v7()];
+    processes.sort_unstable();
+    let backends: Arc<[BackendProcessDescriptor]> =
+        Arc::from(processes.map(|process| peer.descriptor(process)));
+    let roster = backends
+        .iter()
+        .map(|backend| FrozenMember {
+            participation: ParticipationRef::new(execution, frontend, backend.process_id()),
+            endpoint: backend.endpoint().clone(),
+        })
+        .collect::<Vec<_>>();
+    let compatibility = backends[0].native_compatibility_id();
+    assert!(matches!(
+        stage_subscription_endpoints(
+            &roster,
+            FrozenSubscriptionStageInputs {
+                backends: &backends,
+                compatibility,
+                data: &data,
+                scope: &scope,
+                cohort: &cohort,
+                execution,
+            }
+        ),
+        Err(SubscriptionEndpointError::Source {
+            participation,
+            original: SubscriptionSourceError::Work(WorkError::Capacity(_)),
+        }) if participation == roster[1].participation
+    ));
+    assert_eq!(cohort.remaining(), 0);
+    wc::drive(&mut wc_driver);
+    assert_eq!(wc_owner.snapshot().scopes.len(), 1);
+
+    let pending_cohort = wc::cohort(&scope, 2, &mut wc_driver);
+    let one_backend = Arc::from([backends[0].clone()]);
+    let pending = stage_subscription_endpoints(
+        &roster[..1],
+        FrozenSubscriptionStageInputs {
+            backends: &one_backend,
+            compatibility,
+            data: &data,
+            scope: &scope,
+            cohort: &pending_cohort,
+            execution,
+        },
+    )
+    .unwrap();
+    assert_eq!(wc_owner.snapshot().scopes.len(), 2);
+    assert_eq!(pending_cohort.remaining(), 1);
+    wc_root.owner.cancel(CancellationReason::Requested);
+    drop(pending);
+    wc::drive(&mut wc_driver);
+    assert_eq!(wc_owner.snapshot().scopes.len(), 1);
+    assert_eq!(pending_cohort.remaining(), 1);
+    drop((pending_cohort, cohort, capacity, scope));
+    wc::finish(wc_owner, wc_root, wc_driver);
+    assert!(peer.settle().await);
+}
+
+#[tokio::test]
 async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_exit() {
     let generation = Generation::new(1).unwrap();
     let budget = ObservationBudget {
@@ -276,6 +348,46 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     let backend = BackendProcessId::new_v7();
     let execution = QueryExecutionId::new(QueryId::new(17, 1), AttemptId::new(1).unwrap()).unwrap();
     let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let handle = tokio::runtime::Handle::current();
+    let (wc_owner, mut wc_driver, capacity) = wc::fixture();
+    let wc_root = wc_owner
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let wc_scope = wc_root.owner.scope();
+    wc::bind(&wc_scope, &mut wc_driver);
+    let cohort = wc::cohort(&wc_scope, 2, &mut wc_driver);
+    let data = FrontendDataRuntime::new(handle.clone());
+    let mut peer = Loopback::start().await;
+    let backends: Arc<[BackendProcessDescriptor]> = Arc::from([peer.descriptor(backend)]);
+    let descriptor = &backends[0];
+    let frozen = || FrozenSubscriptionStageInputs {
+        backends: &backends,
+        compatibility: descriptor.native_compatibility_id(),
+        data: &data,
+        scope: &wc_scope,
+        cohort: &cohort,
+        execution,
+    };
+    let roster = [FrozenMember {
+        participation,
+        endpoint: descriptor.endpoint().clone(),
+    }];
+    let wrong_roster = [FrozenMember {
+        participation,
+        endpoint: descriptor.control_endpoint().clone(),
+    }];
+    assert!(matches!(
+        stage_subscription_endpoints(&wrong_roster, frozen()),
+        Err(SubscriptionEndpointError::Roster)
+    ));
+    assert_eq!(cohort.remaining(), 2);
+    let refused = stage_subscription_endpoints(&roster, frozen()).unwrap();
+    let staged = stage_subscription_endpoints(&roster, frozen()).unwrap();
+    let staged_id = staged.entries[0].owner.as_ref().unwrap().scope().id();
+    assert_eq!(cohort.remaining(), 0);
+    assert_eq!(wc_owner.snapshot().scopes.len(), 3);
+    assert!(peer.subscription_requests().is_empty());
+
     let request = Arc::new(SubscriptionRequest {
         participation,
         generation: NonZeroU64::MIN,
@@ -312,7 +424,6 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     );
     let runtime = inbox.runtime();
     let registration = inbox.registration();
-    let handle = tokio::runtime::Handle::current();
     let transport =
         TransportRetirements::new(runtime.clone(), registration.clone(), handle.clone(), 3);
     let root = TaskIdentity::new(
@@ -388,46 +499,22 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     root.bind_reply_author(reply_author);
     requests.bind_ingress(&ingress);
     let weak_ingress = ingress.weak();
-    let (wc_owner, mut wc_driver, capacity) = wc::fixture();
-    let wc_root = wc_owner
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
-        .unwrap();
-    let wc_scope = wc_root.owner.scope();
-    wc::bind(&wc_scope, &mut wc_driver);
-    let cohort = wc::cohort(&wc_scope, 1, &mut wc_driver);
-    let data = FrontendDataRuntime::new(handle.clone());
-    let mut peer = Loopback::start().await;
-    let backends: Arc<[BackendProcessDescriptor]> = Arc::from([peer.descriptor(backend)]);
-    let descriptor = &backends[0];
-    let frozen = || FrozenSubscriptionInputs {
-        backends: &backends,
-        compatibility: descriptor.native_compatibility_id(),
-        data: &data,
-        scope: &wc_scope,
-        cohort: &cohort,
-        ingress: &ingress,
-    };
     assert!(matches!(
-        bind_subscription_endpoints(
-            &[FrozenMember {
-                participation,
-                endpoint: descriptor.control_endpoint().clone(),
-            }],
-            frozen()
+        refused.bind(
+            &wrong_roster,
+            descriptor.native_compatibility_id(),
+            &ingress
         ),
         Err(SubscriptionEndpointError::Roster)
     ));
-    assert_eq!(cohort.remaining(), 1);
-    let endpoints = bind_subscription_endpoints(
-        &[FrozenMember {
-            participation,
-            endpoint: descriptor.endpoint().clone(),
-        }],
-        frozen(),
-    )
-    .unwrap();
+    wc::drive(&mut wc_driver);
+    assert_eq!(wc_owner.snapshot().scopes.len(), 2);
+    let endpoints = staged
+        .bind(&roster, descriptor.native_compatibility_id(), &ingress)
+        .unwrap();
     assert_eq!(cohort.remaining(), 0);
     let original = endpoints[&participation].source.clone();
+    assert_eq!(original.scope().unwrap().id(), staged_id);
     let observer = ConsumerId::new(1).unwrap();
     let (parent, payer) = funding.parent();
     let subscriptions = AttemptSubscriptions::bind(

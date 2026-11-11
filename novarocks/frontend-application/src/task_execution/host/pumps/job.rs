@@ -17,7 +17,10 @@
 
 //! Work bodies bound to the exact effect selected by the attempt host.
 
-use super::{DiagnosticRecords, DynamicFilterRecords, PumpRecordError};
+use super::{
+    DiagnosticRecords, DynamicFilterRecords, PumpRecordError,
+    split::{BoundSplitRunner, SplitPump},
+};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use novarocks_attempt_protocol::{effect::EffectBody, input::ExecutorFact};
 use std::sync::Arc;
@@ -29,6 +32,8 @@ pub(crate) enum PumpOutcome {
 
 pub(crate) enum BoundPumpWork {
     Start(Arc<AttemptEffectEnvelope>),
+    StartSplit(Arc<AttemptEffectEnvelope>, BoundSplitRunner),
+    ControlSplit(Arc<AttemptEffectEnvelope>, Arc<SplitPump>),
     Stop(Arc<AttemptEffectEnvelope>, Arc<DynamicFilterRecords>),
     Read(Arc<AttemptEffectEnvelope>, Arc<DynamicFilterRecords>),
     Admit(Arc<AttemptEffectEnvelope>, Arc<DynamicFilterRecords>),
@@ -40,6 +45,8 @@ impl BoundPumpWork {
     pub(crate) fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
         let original = match self {
             Self::Start(effect)
+            | Self::StartSplit(effect, _)
+            | Self::ControlSplit(effect, _)
             | Self::Stop(effect, _)
             | Self::Read(effect, _)
             | Self::Admit(effect, _)
@@ -50,13 +57,17 @@ impl BoundPumpWork {
     }
 
     pub(crate) fn runs_blocking(&self) -> bool {
-        matches!(self, Self::Admit(..) | Self::Dispose(..) | Self::Stop(..))
+        matches!(
+            self,
+            Self::Admit(..) | Self::Dispose(..) | Self::Stop(..) | Self::ControlSplit(..)
+        )
     }
 
     pub(crate) async fn run(self) -> Result<Option<ExecutorFact>, PumpRecordError> {
         match self {
             // The original feedback domain is configured before Core starts.
             Self::Start(_) => Ok(None),
+            Self::StartSplit(_, runner) => runner.run().await.map(Some),
             Self::Read(effect, original) => {
                 let EffectBody::ReadDynamicFilters {
                     request,
@@ -86,6 +97,15 @@ impl BoundPumpWork {
 
     pub(crate) fn run_blocking(self) -> Result<Option<ExecutorFact>, PumpRecordError> {
         match self {
+            Self::ControlSplit(effect, original) => {
+                match &effect.protocol.body {
+                    EffectBody::StopPump { .. } => original.request_stop(),
+                    notice => original
+                        .apply_notice(notice)
+                        .map_err(PumpRecordError::Split)?,
+                }
+                Ok(None)
+            }
             Self::Stop(_, original) => {
                 original.close_external();
                 Ok(None)

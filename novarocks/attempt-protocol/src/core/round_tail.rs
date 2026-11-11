@@ -243,7 +243,9 @@ impl Core {
                         return Ok(Some(RoundTailStep::Effect(AttemptEffect {
                             id: action,
                             class: if running {
-                                EffectClass::Business
+                                // Once published, the original Start settles
+                                // even if an orderly Stop fences new work.
+                                EffectClass::Settlement
                             } else {
                                 EffectClass::Cleanup
                             },

@@ -1556,7 +1556,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         participation,
         AttemptParticipationConvergence::NeverEstablished,
     )]));
-    let progress = |id, local_exited, closure| {
+    let progress = |id, local_exited, closure, lifecycle_runtime_filters| {
         AttemptEffectEnvelope::new(AttemptEffect {
             id: AttemptActionId::new(NonZeroU64::new(id).unwrap()),
             class: EffectClass::Reply,
@@ -1565,12 +1565,17 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
                 AttemptToLogicalBody::ConvergenceProgress {
                     local_exited,
                     closure,
+                    lifecycle_runtime_filters,
                 },
             )),
         })
     };
-    let remote = progress(8, false, Some(closure.clone()));
-    let local = progress(9, true, None);
+    let selection = Arc::new(novarocks_coordination_contract::RuntimeFilterDiagnostic {
+        complete: false,
+        contributions: Vec::new(),
+    });
+    let remote = progress(8, false, Some(closure.clone()), None);
+    let local = progress(9, true, None, Some(selection.clone()));
     let mailbox = [8; 4];
     let inbox = WithdrawalInbox::with_commands(
         &fixture.scope,
@@ -1815,6 +1820,11 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
     assert!(Arc::ptr_eq(&terminal.normal_convergence().await, &closure));
     assert!(registered_terminal.normal_convergence_ready().await);
+    assert!(
+        registered_terminal
+            .lifecycle_runtime_filter_diagnostic()
+            .is_none()
+    );
     retire_commands(&[local_command]);
     drive_host();
     inbox.assert_no_result();
@@ -1870,6 +1880,12 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
         ) if rows.as_ref() == [NativeParticipationConvergence::never_established(participation)]
     ));
     registered_terminal.request_host_close().unwrap();
+    assert!(std::ptr::eq(
+        registered_terminal
+            .lifecycle_runtime_filter_diagnostic()
+            .unwrap(),
+        selection.as_ref(),
+    ));
     assert!(host.is_empty() && inbox.runtime.is_empty() && fixture.ledger.is_empty());
     wc::finish(workload, query, driver);
     logical.abandon_running_attempt();
@@ -2024,7 +2040,8 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
                         .lock()
                         .unwrap()
                         .accept(result, &mut self.requests.lock().unwrap())
-                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
+                        .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)))
+                        .expect("original admitted input");
                     self.completed.lock().unwrap().push_back(input);
                 }
                 super::TransportSourceEvent::Retired => {
@@ -2175,6 +2192,13 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         .unwrap();
     inbox.assert_no_result();
     assert!(!admission.lock().unwrap().can_release_creation(payload));
+    assert!(
+        admission
+            .lock()
+            .unwrap()
+            .take_unclaimed_creation()
+            .is_none()
+    );
     refused.handoff().unwrap().withdraw();
 
     let drive = |wc: &mut transport::GovernedQueuedInputFixture| {
@@ -2223,6 +2247,7 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         !admission.lock().unwrap().retire_result().unwrap(),
         "uncommitted result still owns its paid role"
     );
+    assert!(admission.lock().unwrap().take_unclaimed_grant().is_none());
     let frozen = requests
         .lock()
         .unwrap()
@@ -2311,21 +2336,30 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
         assert!(admission.take_grant(grant, replay).is_none());
         assert!(admission.take_grant(second, key).is_none());
         let first = admission.take_grant(grant, key).expect("same first grant");
-        let replay = admission
-            .take_grant(second, replay)
-            .expect("same replay grant");
+        assert!(admission.take_unclaimed_creation().is_none());
+        let replay_grant = admission
+            .take_unclaimed_grant()
+            .expect("same unbound replay grant");
+        assert_eq!(replay_grant.key(), replay);
+        assert!(admission.take_unclaimed_grant().is_none());
         assert_eq!(
             first.retain_payload().unwrap().capacity_bytes().unwrap(),
             backing_bytes as u64
         );
         assert_eq!(
-            replay.retain_payload().unwrap().capacity_bytes().unwrap(),
+            replay_grant
+                .retain_payload()
+                .unwrap()
+                .capacity_bytes()
+                .unwrap(),
             0
         );
-        drop((first, replay));
-        let seed = admission
-            .take_creation(task, payload)
+        drop((first, replay_grant));
+        let (original_task, original_payload, seed) = admission
+            .take_unclaimed_creation()
             .expect("original source row");
+        assert_eq!((original_task, original_payload), (task, payload));
+        assert!(admission.take_unclaimed_creation().is_none());
         assert!(
             seed.lock().unwrap().is_none(),
             "the seed was frozen exactly once"

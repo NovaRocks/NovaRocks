@@ -30,7 +30,7 @@ use super::observations::{
     read_progress::ReadProgressInput,
     source::BoundObservationSource,
 };
-use super::pumps::{AttemptPumpSource, DiagnosticRecords, DynamicFilterRecords};
+use super::pumps::{AttemptPumpSource, DiagnosticRecords, DynamicFilterRecords, split::SplitPump};
 use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
@@ -102,6 +102,7 @@ use std::{
 pub(super) const OUTPUT_UNITS: usize = 3;
 
 pub(crate) struct AttemptActor {
+    actor: ActorId,
     core: Core,
     scope: ScopeHandle,
     capacity: NativeTransportCapacity,
@@ -128,6 +129,7 @@ pub(crate) struct AttemptActorRegistration {
     failure_publications: Arc<FailurePublications>,
     failure_work: ScopedWorkRef,
     dynamic_pump: Option<PayloadRef>,
+    split_pump: Option<PayloadRef>,
     retain_diagnostics: bool,
     root_control: RootControlBinding,
     ordered_host: Option<OrderedObservationHost>,
@@ -182,6 +184,8 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) subscriptions: super::transport::AttemptSubscriptions,
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) pumps: AttemptPumpSource,
+    pub(crate) diagnostics: Arc<super::publication::AttemptDiagnosticSources>,
+    pub(crate) next_payload: NonZeroU64,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
 }
@@ -331,6 +335,12 @@ pub(crate) struct AttemptNotice {
     pub(crate) round_failure: Option<AttemptFailure>,
 }
 
+impl AttemptNotice {
+    pub(crate) fn requires_reporting(&self) -> bool {
+        self.diagnostic_failure.is_some() || self.round_failure.is_some()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum AttemptRegistrationError {
     InvalidConfig(&'static str),
@@ -340,6 +350,25 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    pub(crate) fn prepare_auxiliary_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+    ) -> Result<
+        (
+            super::auxiliary::AttemptAuxiliarySource,
+            super::auxiliary::AttemptInfrastructureHealth,
+        ),
+        ActorTurnError,
+    > {
+        let input =
+            self.reserve_standing(runtime, self.original.actor(), InputClass::Lifecycle, work)?;
+        Ok(super::auxiliary::AttemptAuxiliarySource::new(
+            self.original.clone(),
+            input,
+        ))
+    }
+
     pub(crate) fn prepare_pump_source(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -348,9 +377,11 @@ impl AttemptActorRegistration {
         observer: ConsumerId,
         dynamic: Option<Arc<DynamicFilterRecords>>,
         diagnostics: Option<Arc<DiagnosticRecords>>,
+        split: Option<&Arc<SplitPump>>,
     ) -> Result<AttemptPumpSource, AttemptRegistrationError> {
         if self.dynamic_pump.is_some() != dynamic.is_some()
             || self.retain_diagnostics != diagnostics.is_some()
+            || self.split_pump != split.map(|pump| pump.reference())
         {
             return Err(AttemptRegistrationError::InvalidConfig(
                 "pump Sources differ from the original attempt plan",
@@ -359,12 +390,14 @@ impl AttemptActorRegistration {
         AttemptPumpSource::bind(
             runtime,
             &self.original,
-            self.native_source,
+            // Pump callbacks are independent facts, outside the Native ACK prefix.
+            self.transport_source,
             parent,
             payer,
             observer,
             self.dynamic_pump.zip(dynamic),
             diagnostics,
+            split,
         )
         .map_err(AttemptRegistrationError::Runtime)
     }
@@ -483,19 +516,16 @@ impl AttemptActorRegistration {
         )
     }
 
-    pub(crate) fn prepare_subscriptions(
+    pub(crate) fn bind_staged_subscriptions(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
         parent: &WorkObligation,
         payer: &ReservationObligation,
         observer: novarocks_control_runtime_core::identity::ConsumerId,
-        frozen: super::transport::FrozenSubscriptionInputs<'_>,
+        staged: super::transport::StagedSubscriptionEndpoints,
+        ingress: &OrderedObservationInput<FrontendActor>,
     ) -> Result<PreparedNativeSubscriptions, AttemptRegistrationError> {
-        if !frozen
-            .ingress
-            .root_binding()
-            .same_original(&self.root_control)
-            || frozen.compatibility != self.compatibility
+        if !ingress.root_binding().same_original(&self.root_control)
             || !self.scope.same_scope(parent.scope())
             || !payer.belongs_to_bound_work(&self.scope, parent.id())
         {
@@ -503,10 +533,10 @@ impl AttemptActorRegistration {
                 "subscription Source differs from the original activation or payer",
             ));
         }
-        let data = frozen.data.clone();
-        let endpoints =
-            super::transport::bind_subscription_endpoints(&self.failure_members, frozen)
-                .map_err(AttemptRegistrationError::Subscription)?;
+        let data = staged.data().clone();
+        let endpoints = staged
+            .bind(&self.failure_members, self.compatibility, ingress)
+            .map_err(AttemptRegistrationError::Subscription)?;
         let mut control = match self.prepare_call_source(
             runtime,
             parent,
@@ -881,8 +911,13 @@ impl AttemptActorRegistration {
                 ));
             }
         };
-        let mut controls = match self.prepare_owner_controls(runtime, startup_work) {
-            Ok(controls) => controls,
+        let mut local_exit = match self.reserve_standing(
+            runtime,
+            self.original.actor(),
+            InputClass::Lifecycle,
+            startup_work,
+        ) {
+            Ok(position) => position,
             Err(error) => {
                 input
                     .close_after_exit()
@@ -896,7 +931,27 @@ impl AttemptActorRegistration {
                 ));
             }
         };
-        let owner_controls = controls.bind_host(self.original.clone());
+        let mut controls = match self.prepare_owner_controls(runtime, startup_work) {
+            Ok(controls) => controls,
+            Err(error) => {
+                local_exit
+                    .close_after_exit()
+                    .expect("unpublished local exit position");
+                input
+                    .close_after_exit()
+                    .expect("unpublished startup position");
+                return Err((
+                    AttemptRegistrationError::Runtime(error),
+                    capacity,
+                    membership,
+                    source,
+                    transport,
+                ));
+            }
+        };
+        let owner_controls = controls
+            .bind_host(self.original.clone())
+            .with_local_exit(local_exit);
         self.startup_reserved = true;
         let AttemptTransportBinding {
             retirement,
@@ -911,6 +966,8 @@ impl AttemptActorRegistration {
             subscriptions,
             send,
             pumps,
+            diagnostics,
+            next_payload,
             executor: native,
             failure,
         } = transport;
@@ -932,7 +989,7 @@ impl AttemptActorRegistration {
             native.0.clone(),
             residual,
         )
-        .with_abort_drain(abort, abort_drain);
+        .with_abort_drain(abort.clone(), abort_drain);
         let ordered_host = self
             .ordered_host
             .take()
@@ -989,7 +1046,8 @@ impl AttemptActorRegistration {
                         source,
                     )
                     .with_releases(native.0.clone(), retirement.host_waker())
-                    .with_pumps(pumps),
+                    .with_abort_retirement(&abort, retirement.host_waker())
+                    .with_pumps(pumps, diagnostics, next_payload),
                 ),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
                     native,
@@ -1077,9 +1135,11 @@ impl AttemptActorRegistration {
         Ok(roles)
     }
 
-    pub(crate) fn observation_resources(&self) -> Result<ReservationResources, ObservationError> {
+    pub(crate) fn observation_resources(
+        participants: usize,
+    ) -> Result<ReservationResources, ObservationError> {
         let budget = ObservationBudget::for_task_attempt();
-        let backing = ObservationBackingQuote::new(budget, self.failure_members.len())?;
+        let backing = ObservationBackingQuote::new(budget, participants)?;
         let quota = budget
             .byte_window()
             .and_then(|window| Ok(window.checked_add(backing.quota())?))
@@ -1367,6 +1427,42 @@ impl AttemptActorRegistration {
             registrant,
         ))
     }
+
+    pub(crate) fn bind_source_parent(
+        &mut self,
+        runtime: &ActorRuntime<FrontendActor>,
+        work: &WorkObligation,
+        payer: &ReservationObligation,
+    ) -> Result<AttemptCapacitySource, AttemptRegistrationError> {
+        // An unused position establishes CR's exact registration/work
+        // provenance. The author keeps that provenance after the position
+        // is revoked. Work lifetime remains owned by AttemptHostFunding.
+        let original = runtime
+            .reserve_admitted_input_for(
+                &self.original,
+                self.native_source,
+                InputClass::Lifecycle,
+                work,
+            )
+            .map_err(AttemptRegistrationError::Runtime)?;
+        let author = original.author();
+        original
+            .revoke_unused()
+            .map_err(AttemptRegistrationError::Runtime)?;
+        let author = author.map_err(AttemptRegistrationError::Runtime)?;
+        self.bind(
+            runtime,
+            AttemptEffectAuthors {
+                business: author.clone(),
+                publication: author.clone(),
+                reply: author.clone(),
+                cleanup: author.clone(),
+                settlement: author,
+            },
+            payer,
+            work,
+        )
+    }
 }
 
 impl AttemptActor {
@@ -1429,9 +1525,15 @@ impl AttemptActor {
             .pumps
             .iter()
             .find_map(|(id, kind)| (*kind == PumpKind::DynamicFilters).then_some(*id));
+        let split_pump = start
+            .plan
+            .pumps
+            .iter()
+            .find_map(|(id, kind)| (*kind == PumpKind::SplitAssignment).then_some(*id));
         let retain_diagnostics = start.activation.policy.retain_diagnostics;
         let core = Core::new(start).map_err(AttemptRegistrationError::Core)?;
         let adapter = Self {
+            actor,
             core,
             scope: scope.clone(),
             capacity: capacity.clone(),
@@ -1477,6 +1579,7 @@ impl AttemptActor {
             failure_publications,
             failure_work: failure_work.reference(),
             dynamic_pump,
+            split_pump,
             retain_diagnostics,
             root_control,
             ordered_host: None,
@@ -1505,6 +1608,11 @@ impl AttemptActor {
         let class = input.class;
         let input = match value {
             FrontendInput::Timer => AttemptInput::Timer,
+            FrontendInput::AttemptInfrastructureFailed => {
+                assert_eq!(input.source, self.actor);
+                assert_eq!(class, InputClass::Lifecycle);
+                std::panic::panic_any(AttemptFailure::OwnerFailed);
+            }
             FrontendInput::AttemptStartup(StartupInput::Bootstrap) => AttemptInput::Bootstrap,
             FrontendInput::AttemptStartup(StartupInput::StartProtocol) => {
                 AttemptInput::StartProtocol
@@ -1819,4 +1927,4 @@ fn project_cut(cut: InputSourceCut) -> AttemptSourceCut {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -45,7 +45,7 @@ use novarocks_execution_contract::{AdmissionEpochCapability, OperationKind};
 use novarocks_types::NativeCompatibilityId;
 use std::num::NonZeroUsize;
 
-fn start() -> AttemptStart {
+pub(in crate::task_execution::host) fn start() -> AttemptStart {
     let legacy = crate::task_execution::tests::manifest_unstarted_regression_fixture();
     let graph = legacy.execution().graph();
     let root = graph.root_identity();
@@ -145,6 +145,7 @@ fn start() -> AttemptStart {
             mailbox: [8; 4],
         },
         observe_dev_root: false,
+        observe_lifecycle_diagnostics: false,
     }
 }
 
@@ -716,7 +717,7 @@ fn bound_observation_backing_waits_for_actual_strong_weak_and_progress_aliases()
         attempt.root_control_binding().clone(),
         attempt.failure_publications().clone(),
     );
-    let resources = attempt.observation_resources().unwrap();
+    let resources = AttemptActorRegistration::observation_resources(participants.len()).unwrap();
     let bytes = resources.quota.get(OBSERVATION_BACKING_BYTES);
     let (mut work, mut positions) = reserve(&scope, resources, WorkKind::Settlement);
     let (mut root_work, mut root_capacity) = reserve(

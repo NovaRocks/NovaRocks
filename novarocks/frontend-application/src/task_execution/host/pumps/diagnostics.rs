@@ -140,6 +140,15 @@ impl DiagnosticRecords {
             record.started = true;
         }
         let result = self.transport.final_task_info(task).await;
+        match &result {
+            Ok(FinalTaskInfoRead::Available(_)) => {}
+            Ok(FinalTaskInfoRead::Unavailable(outcome)) => {
+                tracing::debug!(%task, ?outcome, "Final task info is unavailable");
+            }
+            Err(error) => {
+                tracing::warn!(%task, %error, "Final task info could not be read");
+            }
+        }
         let mut records = self.records.lock().expect("diagnostic canonical records");
         let record = records
             .reads

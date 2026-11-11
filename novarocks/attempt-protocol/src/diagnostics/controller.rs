@@ -648,7 +648,7 @@ mod tests {
         assert!(cut.sources.runtime_filters.complete);
         assert_eq!(
             cut.sources.runtime_filters.contributions,
-            vec![(parts[0].backend_process_id(), reference(5))]
+            vec![(parts[0].backend_process_id(), reference(5).0)]
         );
         assert!(matches!(
             cut.tasks[0].1,

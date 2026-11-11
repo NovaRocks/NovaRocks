@@ -18,6 +18,7 @@
 //! Loss handoff to the original logical execution convergence owner.
 
 use super::{
+    auxiliary::{AttemptInfrastructureFailure, AttemptInfrastructureHealth},
     failure_publication::FailurePublications,
     failure_supervisor::FailureCleanupRequest,
     transport::{FailureAbortAttempt, FailureResidualPort},
@@ -34,7 +35,13 @@ use novarocks_query_application::api::{
     NativeActiveConvergenceRequest, NativeAttemptConvergence, NativeAttemptPreparationFailure,
     NativeAttemptTerminal, NativeParticipationConvergence, StatementNativeHealthFailure,
 };
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    future::{Future, pending},
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 use tokio::sync::oneshot;
 
 struct Residual {
@@ -66,6 +73,7 @@ pub(crate) struct PendingFailureBridge {
     members: Arc<[FrozenMember]>,
     publications: Arc<FailurePublications>,
     receiver: oneshot::Receiver<Residual>,
+    infrastructure: Option<AttemptInfrastructureHealth>,
 }
 impl PendingFailureBridge {
     pub(crate) fn new(
@@ -93,9 +101,18 @@ impl PendingFailureBridge {
                 members,
                 publications,
                 receiver,
+                infrastructure: None,
             },
             Box::new(ResidualSender(sender)),
         )
+    }
+
+    pub(crate) fn with_infrastructure_health(
+        mut self,
+        health: AttemptInfrastructureHealth,
+    ) -> Self {
+        assert!(self.infrastructure.replace(health).is_none());
+        self
     }
 
     pub(crate) fn bind(
@@ -117,6 +134,7 @@ impl PendingFailureBridge {
             deadline: None,
             closure: None,
             failure: None,
+            infrastructure: self.infrastructure,
         }
     }
 }
@@ -138,6 +156,7 @@ pub(crate) struct FailureBridge {
     deadline: Option<Instant>,
     closure: Option<NativeActiveConvergenceClosure>,
     failure: Option<StatementNativeHealthFailure>,
+    infrastructure: Option<AttemptInfrastructureHealth>,
 }
 impl FailureBridge {
     pub(crate) async fn terminal(&mut self) -> NativeAttemptTerminal {
@@ -179,6 +198,9 @@ impl FailureBridge {
                 self.loss = Some(lost);
                 return Ok(false);
             }
+            failure = wait_infrastructure(&mut self.infrastructure) => {
+                return Err(self.retain_infrastructure(failure));
+            }
             exited = self.exit.wait() => exited,
         };
         if let Err(error) = exited {
@@ -219,7 +241,13 @@ impl FailureBridge {
             return Err(original.clone());
         }
         if let Some(receiver) = self.receiver.as_mut() {
-            let residual = receiver.await;
+            let residual = tokio::select! {
+                biased;
+                failure = wait_infrastructure(&mut self.infrastructure) => {
+                    return Err(self.retain_infrastructure(failure));
+                }
+                original = receiver => original,
+            };
             self.receiver.take();
             match residual {
                 Ok(original) => self.residual = Some(original),
@@ -258,7 +286,14 @@ impl FailureBridge {
         }
         // A remote deadline can expire while local work is live. Only this
         // same host's actual Actor and Scope removal opens the local gate.
-        if let Err(error) = self.exit.wait().await {
+        let exited = tokio::select! {
+            biased;
+            failure = wait_infrastructure(&mut self.infrastructure) => {
+                return Err(self.retain_infrastructure(failure));
+            }
+            original = self.exit.wait() => original,
+        };
+        if let Err(error) = exited {
             return Err(
                 self.retain_failure("Native failure host exit was not observed", Arc::new(error))
             );
@@ -338,6 +373,25 @@ impl FailureBridge {
         let failure = StatementNativeHealthFailure::actual_exit_unproven(detail, cause);
         self.failure = Some(failure.clone());
         failure
+    }
+
+    fn retain_infrastructure(
+        &mut self,
+        original: Arc<AttemptInfrastructureFailure>,
+    ) -> StatementNativeHealthFailure {
+        self.retain_failure(
+            "Native attempt host infrastructure custody is unresolved",
+            original,
+        )
+    }
+}
+
+async fn wait_infrastructure(
+    health: &mut Option<AttemptInfrastructureHealth>,
+) -> Arc<AttemptInfrastructureFailure> {
+    match health {
+        Some(health) => health.failed().await,
+        None => pending().await,
     }
 }
 

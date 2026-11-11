@@ -719,7 +719,12 @@ fn pending_row(
             id,
             transport::SendReportRows {
                 started: transport::NativeProgressInput::new(start),
-                members: Box::new([transport::SendMemberReport::new(receipt, None, None, None)]),
+                members: Box::new([transport::SendMemberReport::new(
+                    receipt,
+                    None,
+                    Default::default(),
+                    None,
+                )]),
             },
         ));
         let author = result.event_author().unwrap();
@@ -2144,28 +2149,25 @@ async fn run_actor_send(
     });
     let cleanup = Arc::new(Mutex::new(CleanupState::default()));
     let release_parent = Arc::new(AtomicBool::new(!fail_core));
-    let (abort_ingress, abort_sender, abort_drain) = if fail_core {
-        use crate::task_execution::bridge::abort::{AbortSettlementOwner, AttemptAbortIngress};
-        let role = actor_runtime
-            .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &parent)
-            .unwrap()
-            .into_standing_input()
-            .unwrap();
-        let ingress = Arc::new(AttemptAbortIngress::new(
-            inbox.registration().clone(),
-            activation,
-            [(participation, role)],
-            tokio::sync::watch::channel(0).0,
-            None,
-        ));
+    use crate::task_execution::bridge::abort::{AbortSettlementOwner, AttemptAbortIngress};
+    let role = actor_runtime
+        .reserve_admitted_input_for(inbox.registration(), actor, InputClass::Control, &parent)
+        .unwrap()
+        .into_standing_input()
+        .unwrap();
+    let ingress = Arc::new(AttemptAbortIngress::new(
+        inbox.registration().clone(),
+        activation,
+        [(participation, role)],
+        tokio::sync::watch::channel(0).0,
+        None,
+    ));
+    let abort = Arc::new(AbortSettlementOwner::new(ingress.clone()));
+    let (abort_sender, abort_drain) = if fail_core {
         let (handoff, drain) = tokio::sync::oneshot::channel();
-        (
-            Some(ingress.clone()),
-            Some((Arc::new(AbortSettlementOwner::new(ingress)), handoff)),
-            Some(drain),
-        )
+        (Some((abort.clone(), handoff)), Some(drain))
     } else {
-        (None, None, None)
+        (None, None)
     };
     let failure_port = transport::NativeFailureCleanup::new(
         contexts.clone(),
@@ -2185,6 +2187,12 @@ async fn run_actor_send(
         observer(),
         handle.clone(),
     );
+    let retirement = custody::TransportRetirements::new(
+        actor_runtime.clone(),
+        inbox.registration().clone(),
+        handle.clone(),
+        1,
+    );
     let exit = host
         .register(HostBinding {
             scope: roles.scope.clone(),
@@ -2199,53 +2207,50 @@ async fn run_actor_send(
                 max_step_work: 1,
             },
             policy: FrontendLanePolicy::attempt(1),
-            source: Box::new(transport::AttemptTransportSource::new(
-                actor_runtime.clone(),
-                inbox.registration().clone(),
-                inbox.source(),
-                roles.scope.clone(),
-                admission,
-                [None, None, None, release_source, None, None],
-                None,
-                transport::AttemptSendSource {
-                    requests,
-                    contexts,
-                    report_references: BTreeMap::new(),
-                    report_author,
-                    idle: send_idle,
-                },
-                (
-                    FailureContext {
-                        lifecycle,
-                        publications: publications.clone(),
+            source: Box::new(
+                transport::AttemptTransportSource::new(
+                    actor_runtime.clone(),
+                    inbox.registration().clone(),
+                    inbox.source(),
+                    roles.scope.clone(),
+                    admission,
+                    [None, None, None, release_source, None, None],
+                    None,
+                    transport::AttemptSendSource {
+                        requests,
+                        contexts,
+                        report_author,
+                        idle: send_idle,
                     },
-                    transport::AttemptFailureBinding {
-                        supervisor,
-                        port: Box::new(failure_port),
-                        abort_drain,
-                    },
-                ),
-                Box::new(ScopeOwner {
-                    scope: roles.scope.clone(),
-                    parent,
-                    payer,
-                    closing: false,
-                    exited: false,
-                    finished: false,
-                    receipt: receipt.clone(),
-                    release_parent: release_parent.clone(),
-                }),
-            )),
+                    (
+                        FailureContext {
+                            lifecycle,
+                            publications: publications.clone(),
+                        },
+                        transport::AttemptFailureBinding {
+                            supervisor,
+                            port: Box::new(failure_port),
+                            abort_drain,
+                        },
+                    ),
+                    Box::new(ScopeOwner {
+                        scope: roles.scope.clone(),
+                        parent,
+                        payer,
+                        closing: false,
+                        exited: false,
+                        finished: false,
+                        receipt: receipt.clone(),
+                        release_parent: release_parent.clone(),
+                    }),
+                )
+                .with_abort_retirement(&abort, retirement.host_waker()),
+            ),
             executor: Arc::new(transport::AttemptTransportExecutor {
                 native: transport::ActorTransportExecutor(handle.clone()),
                 other: Arc::new(OtherExecutor),
             }),
-            transport: Some(custody::TransportRetirements::new(
-                actor_runtime.clone(),
-                inbox.registration().clone(),
-                handle,
-                1,
-            )),
+            transport: Some(retirement),
             startup: None,
             capacity: None,
             membership: None,
@@ -2428,7 +2433,7 @@ async fn run_actor_send(
         })
         .await
         .unwrap();
-        assert!(abort_ingress.unwrap().close_after_exit().unwrap());
+        // The installed Host owns the same Abort position through exit.
         let deadline = if failure_verdict == Some(OperationOutcome::Accepted) {
             Instant::now()
         } else {

@@ -23,6 +23,7 @@ use super::{
     PreparedActorSend, SendContext, SendKey, SendMemberReport, SendReportRows,
     call_source::{AttemptCallReply, TransportRelease},
     releases::{ReleaseCapture, TransportReleases},
+    send_binding::NativeSplitPayloadStore,
     send_reports::close_unlaunched,
 };
 use crate::{
@@ -35,7 +36,8 @@ use crate::{
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::bridge::abort::{
-        AbortInputRetirement, AbortReceiptSlot, DrainedAbortSubmissions,
+        AbortIngressRetirement, AbortIngressRetirementProgress, AbortInputRetirement,
+        AbortReceiptSlot, AbortSettlementOwner, DrainedAbortSubmissions,
     },
     task_execution::host::custody::{ReturnedActorTransportResult, TransportSourceEvent},
     task_execution::host::failure_publication::FailureContext,
@@ -43,12 +45,11 @@ use crate::{
         FailureCleanupPort, FailureSupervisor, RunningFailureSupervisor,
     },
     task_execution::host::observations::host_turn::OrderedObservationHost,
-    task_execution::host::publication::OriginalHostFailure,
+    task_execution::host::publication::{AttemptDiagnosticSources, OriginalHostFailure},
     task_execution::host::pumps::AttemptPumpSource,
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent},
-    failure::HostFailureRef,
     input::SendGeneration,
     start::PayloadRef,
 };
@@ -73,23 +74,16 @@ use novarocks_execution_contract::TaskOperationId;
 use novarocks_types::BackendProcessId;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    num::NonZeroU64,
     sync::{Arc, Weak},
     task::{Poll, Waker},
 };
 
 type Position = CausalInputObligation<FrontendActor>;
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct NativeReportReferences {
-    pub(crate) filter: Option<PayloadRef>,
-    pub(crate) workload: Option<HostFailureRef>,
-}
-
 pub(crate) struct AttemptSendSource {
     pub(crate) requests: FrozenSendRequests,
     pub(crate) contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
-    pub(crate) report_references:
-        BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
     pub(crate) report_author: ReportedWork,
     pub(crate) idle: [VecDeque<Position>; 2],
 }
@@ -138,9 +132,12 @@ pub(crate) struct AttemptTransportSource {
     calls: [Option<AttemptCallSource>; 6],
     subscriptions: Option<AttemptSubscriptions>,
     pumps: Option<AttemptPumpSource>,
+    diagnostics: Option<Arc<AttemptDiagnosticSources>>,
+    next_payload: Option<NonZeroU64>,
+    split_next: bool,
+    local_pumps_closing: bool,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
-    report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
     report_author: Option<ReportedWork>,
     send_idle: [VecDeque<Position>; 2],
     send_live: BTreeMap<AttemptActionId, SendInFlight>,
@@ -155,6 +152,7 @@ pub(crate) struct AttemptTransportSource {
     supervisor: Option<Supervisor>,
     abort_drain: Option<tokio::sync::oneshot::Receiver<DrainedAbortSubmissions>>,
     abort_inputs: VecDeque<AbortInputRetirement>,
+    abort_retirement: Option<AbortIngressRetirement>,
     abort_scan: usize,
     in_flight: BTreeSet<AttemptActionId>,
     external_closed: bool,
@@ -193,9 +191,12 @@ impl AttemptTransportSource {
             calls,
             subscriptions,
             pumps: None,
+            diagnostics: None,
+            next_payload: None,
+            split_next: false,
+            local_pumps_closing: false,
             requests: send.requests,
             contexts: send.contexts,
-            report_references: send.report_references,
             report_author: Some(send.report_author),
             send_idle: send.idle,
             send_live: BTreeMap::new(),
@@ -209,6 +210,7 @@ impl AttemptTransportSource {
             failure: Some(failure.0),
             abort_drain: failure.1.abort_drain.take(),
             abort_inputs: VecDeque::new(),
+            abort_retirement: None,
             abort_scan: 0,
             supervisor: Some(Supervisor::Armed(failure.1)),
             in_flight: BTreeSet::new(),
@@ -224,17 +226,65 @@ impl AttemptTransportSource {
         self
     }
 
-    pub(crate) fn with_pumps(mut self, pumps: AttemptPumpSource) -> Self {
-        assert!(self.releases.is_some());
-        assert!(pumps.matches(&self.registration));
-        assert!(self.pumps.replace(pumps).is_none());
+    pub(crate) fn with_abort_retirement(
+        mut self,
+        owner: &AbortSettlementOwner,
+        wake: Waker,
+    ) -> Self {
+        assert!(
+            self.abort_retirement
+                .replace(owner.ingress_retirement(wake))
+                .is_none()
+        );
         self
     }
 
-    fn transport_drained(&self) -> bool {
-        self.subscriptions
+    pub(crate) fn with_pumps(
+        mut self,
+        pumps: AttemptPumpSource,
+        diagnostics: Arc<AttemptDiagnosticSources>,
+        next_payload: NonZeroU64,
+    ) -> Self {
+        assert!(self.releases.is_some());
+        assert!(pumps.matches(&self.registration));
+        assert!(self.pumps.replace(pumps).is_none());
+        self.diagnostics = Some(diagnostics);
+        self.next_payload = Some(next_payload);
+        self
+    }
+
+    fn take_unclaimed_release(&mut self) -> Option<TransportRelease> {
+        if !self.send_live.is_empty()
+            || !self.failed_sends.is_empty()
+            || !self.calls[3]
+                .as_ref()
+                .is_none_or(AttemptCallSource::is_quiescent)
+        {
+            return None;
+        }
+        if let Some(original) = self.admission.take_unclaimed_grant() {
+            return Some(TransportRelease::QueuedInput(original));
+        }
+        if self
+            .pumps
             .as_ref()
-            .is_none_or(AttemptSubscriptions::is_drained)
+            .is_some_and(AttemptPumpSource::has_split_work)
+        {
+            return None;
+        }
+        let (task, payload, seed) = self.admission.take_unclaimed_creation()?;
+        Some(TransportRelease::Creation {
+            request: self.requests.retire_creation(task, payload),
+            seed,
+        })
+    }
+
+    fn transport_drained(&self) -> bool {
+        self.abort_retirement.is_none()
+            && self
+                .subscriptions
+                .as_ref()
+                .is_none_or(AttemptSubscriptions::is_drained)
             && self
                 .pumps
                 .as_ref()
@@ -330,7 +380,7 @@ impl AttemptTransportSource {
     }
 
     fn reserve_reports(
-        &self,
+        &mut self,
         effect: &AttemptEffectEnvelope,
     ) -> Result<Arc<ActorSendReports>, ActorTurnError> {
         let EffectBody::SendBatch { batch, .. } = &effect.protocol.body else {
@@ -341,6 +391,8 @@ impl AttemptTransportSource {
             .as_ref()
             .expect("original live report author")
             .work();
+        let next_payload = &mut self.next_payload;
+        let diagnostics = self.diagnostics.as_ref();
         let reserve = || {
             let position = self.runtime.reserve_admitted_input_for(
                 &self.registration,
@@ -381,19 +433,37 @@ impl AttemptTransportSource {
                     }
                     _ => None,
                 };
-                let references = self
-                    .report_references
-                    .get(&(key.operation, key.generation))
-                    .copied()
-                    .unwrap_or_default();
+                let mut filter = None;
+                let diagnostic = if let Some(diagnostics) = diagnostics
+                    && let OperationIntent::ReleaseParticipation(request) = operation
+                {
+                    let next = next_payload
+                        .as_mut()
+                        .expect("original Native payload namespace");
+                    let reference = PayloadRef(*next);
+                    *next = next
+                        .checked_add(1)
+                        .expect("Native payload identities exhausted");
+                    filter = Some(reference);
+                    Some(
+                        diagnostics
+                            .release_report(request.participation(), reference)
+                            .expect("original release participation"),
+                    )
+                } else {
+                    None
+                };
                 let mut member = SendMemberReport::new(
                     receipt,
-                    references.filter,
-                    references.workload,
+                    filter,
+                    self.admission.failure_records(),
                     first_poll,
                 );
                 if let OperationIntent::AbortParticipation(request) = operation {
                     member.retain_abort_receipt(request.participation());
+                }
+                if let Some(report) = diagnostic {
+                    member.bind_release_diagnostic(report);
                 }
                 Ok(member)
             })();
@@ -465,18 +535,34 @@ impl AttemptTransportSource {
             .pop_front()
             .expect("original send result scan");
         let row = self.send_live.get_mut(&effect).expect("same original send");
-        let ready = row.retired
-            && row.result.as_ref().is_some_and(|result| {
-                result
-                    .original
-                    .retire_ready_after_exit()
-                    .expect("original send result")
-            })
-            && self
-                .scope
-                .reap_observed_header(&row.header)
-                .expect("original send header");
-        if !ready {
+        let result = row.result.as_ref().expect("original send result");
+        if !row.retired {
+            self.send_ready.push_back(effect);
+            return false;
+        }
+        if !result
+            .original
+            .retire_ready_after_exit()
+            .expect("original send result")
+        {
+            self.send_ready.push_back(effect);
+            return match result.original.take_failed_payload() {
+                Ok(Some(original)) => {
+                    original.dispose().expect("original failed send input");
+                    true
+                }
+                Ok(None)
+                | Err(ActorTurnError::ActorNotRetired | ActorTurnError::InputAuthorMismatch) => {
+                    false
+                }
+                Err(error) => std::panic::resume_unwind(Box::new(error)),
+            };
+        }
+        if !self
+            .scope
+            .reap_observed_header(&row.header)
+            .expect("original send header")
+        {
             self.send_ready.push_back(effect);
             return false;
         }
@@ -741,6 +827,18 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        if let TransportSourceEvent::Report(report) = event {
+            if report.is_disposable() {
+                retain_release(
+                    &mut self.releases,
+                    &mut self.other,
+                    ReleaseCapture::Original(Box::new(report)),
+                );
+            } else {
+                self.other.retain_transport_failure(Box::new(report));
+            }
+            return;
+        }
         if let Some(pumps) = self.pumps.as_mut().filter(|source| source.owns(effect)) {
             if let Err(original) = pumps.transport_event(effect, event) {
                 self.other.retain_transport_failure(original);
@@ -779,7 +877,7 @@ impl EffectSource for AttemptTransportSource {
                             .take_failure(reference)
                             .map(OriginalHostFailure::Task)
                             .or_else(|| self.subscriptions.as_ref()?.take_failure(reference))
-                            .or_else(|| self.pumps.as_ref()?.take_failure(reference))
+                            .or_else(|| self.pumps.as_mut()?.take_failure(reference))
                             .or_else(|| {
                                 self.calls
                                     .iter_mut()
@@ -810,9 +908,24 @@ impl EffectSource for AttemptTransportSource {
             return;
         }
         match event {
-            TransportSourceEvent::Result(result) => {
+            TransportSourceEvent::Result(mut result) => {
                 if self.send_live.contains_key(&effect) {
-                    let resolved = matches!(&result.outcome, Some(BodyOutcome::ReceiptsRecorded))
+                    let fenced = matches!(&result.outcome, Some(BodyOutcome::Unused(_)))
+                        && matches!(&result.withdrawal, Some(Err(refused)) if matches!(
+                            refused.error, ActorTurnError::ActorFailed | ActorTurnError::Closed
+                        ));
+                    if fenced {
+                        let Some(Err(original)) = result.withdrawal.take() else {
+                            unreachable!("original fenced withdrawal");
+                        };
+                        retain_release(
+                            &mut self.releases,
+                            &mut self.other,
+                            ReleaseCapture::Original(Box::new(original)),
+                        );
+                    }
+                    let resolved = fenced
+                        || matches!(&result.outcome, Some(BodyOutcome::ReceiptsRecorded))
                         || (matches!(&result.outcome, Some(BodyOutcome::Unused(_)))
                             && matches!(&result.withdrawal, Some(Ok(_))));
                     if resolved {
@@ -863,17 +976,24 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn owner_failed_pending(&mut self, pending: PendingHandoff) {
-        if let FrontendEffect::Attempt(effect) = &pending.ticket.effect
-            && let Some(pumps) = self
-                .pumps
-                .as_ref()
-                .filter(|source| source.owns(effect.protocol.id))
+        if matches!(&pending.ticket.effect, FrontendEffect::Attempt(effect) if effect.uses_join_custody())
+            && pending.job.captures.is::<super::BoundActorTransport>()
         {
             let releases = self
                 .releases
                 .as_ref()
-                .expect("original pump release executor");
-            pumps.owner_failed_pending(&self.runtime, releases.executor(), pending);
+                .expect("original Native release executor");
+            let PendingHandoff { ticket, job } = pending;
+            match super::handoff_actor_transport(releases.executor(), job) {
+                Ok(_) => {
+                    if let Err(original) = self.runtime.effect_completed(ticket) {
+                        self.other.retain_transport_failure(Box::new(original));
+                    }
+                }
+                Err(job) => self
+                    .other
+                    .owner_failed_pending(PendingHandoff { ticket, job }),
+            }
             return;
         }
         self.other.owner_failed_pending(pending);
@@ -921,6 +1041,67 @@ impl EffectSource for AttemptTransportSource {
         self.other.result_admission_closed()
     }
 
+    fn transport_retirement_ready(&self) -> bool {
+        self.releases
+            .as_ref()
+            .is_none_or(TransportReleases::accepts_batch)
+    }
+
+    fn attempt_notice_ready(
+        &self,
+        notice: &crate::task_execution::host::adapter::AttemptNotice,
+    ) -> bool {
+        !notice.requires_reporting()
+            || self
+                .releases
+                .as_ref()
+                .is_none_or(TransportReleases::accepts_batch)
+    }
+
+    fn consume_attempt_notice(
+        &mut self,
+        notice: Arc<crate::task_execution::host::adapter::AttemptNotice>,
+    ) {
+        if notice.requires_reporting() {
+            self.releases
+                .as_mut()
+                .expect("original attempt notice release")
+                .retain(ReleaseCapture::Notice(notice));
+        }
+    }
+
+    fn begin_local_convergence(&mut self) {
+        if let Some(qa) = &self.calls[0] {
+            qa.close_abort_ingress();
+        }
+        self.local_pumps_closing = true;
+    }
+
+    fn local_convergence_exited(&self) -> bool {
+        self.local_pumps_closing
+            && self.in_flight.is_empty()
+            && self.send_live.is_empty()
+            && self.failed_sends.is_empty()
+            && self.admission.awaiting_result_retirement() == 0
+            && self
+                .calls
+                .iter()
+                .flatten()
+                .all(AttemptCallSource::is_quiescent)
+            && self
+                .subscriptions
+                .as_ref()
+                .is_none_or(AttemptSubscriptions::local_exited)
+            && self
+                .pumps
+                .as_ref()
+                .is_none_or(AttemptPumpSource::local_exited)
+            && self
+                .releases
+                .as_ref()
+                .is_none_or(TransportReleases::is_empty)
+    }
+
     fn can_close_ordered_observations(&self, failed: bool) -> bool {
         self.result_admission_closed()
             && self.releases.is_some()
@@ -957,6 +1138,29 @@ impl EffectSource for AttemptTransportSource {
             }
         }
         let closing = self.result_admission_closed();
+        let failed = self
+            .runtime
+            .snapshot(self.registration.actor())
+            .expect("original attempt transport host")
+            .failed;
+        if (failed || closing)
+            && units < budget
+            && self.calls[2]
+                .as_ref()
+                .is_none_or(AttemptCallSource::is_quiescent)
+            && let Some(releases) = self
+                .releases
+                .as_mut()
+                .filter(|source| source.accepts_batch())
+            && let Some(original) = self
+                .diagnostics
+                .as_ref()
+                .and_then(|records| records.take_release_records())
+        {
+            releases.retain(ReleaseCapture::Original(Box::new(original)));
+            units += 1;
+            progressed = true;
+        }
         // A terminal already in flight can still claim an exact raw error
         // from any call Source. Dispose unselected rows only after all paid
         // call results retire and no further result loan can be issued.
@@ -1010,11 +1214,6 @@ impl EffectSource for AttemptTransportSource {
             .as_ref()
             .is_none_or(TransportReleases::accepts_batch);
         let subscription_progress = self.subscriptions.as_mut().map(|subscriptions| {
-            let failed = self
-                .runtime
-                .snapshot(self.registration.actor())
-                .expect("original subscription host")
-                .failed;
             let allowance = if release_accepting {
                 (budget - units).min(1)
             } else {
@@ -1022,7 +1221,7 @@ impl EffectSource for AttemptTransportSource {
             };
             subscriptions.progress(
                 failed,
-                closing || self.external_closed,
+                closing || self.external_closed || self.local_pumps_closing,
                 retire_failures,
                 allowance,
                 |original| {
@@ -1034,28 +1233,66 @@ impl EffectSource for AttemptTransportSource {
             units += progress.units;
             progressed |= progress.progressed;
         }
-        let pump_progress = self.pumps.as_mut().map(|pumps| {
+        let mut pump_more = false;
+        let mut split_changed = false;
+        let pumps_closing = closing || self.local_pumps_closing;
+        if let Some(pumps) = &mut self.pumps
+            && units < budget
+        {
             let releases = self
                 .releases
                 .as_mut()
                 .expect("original pump release executor");
-            let failed = self
-                .runtime
-                .snapshot(self.registration.actor())
-                .expect("original pump host")
-                .failed;
-            pumps.progress(
-                failed,
-                closing,
-                retire_failures,
-                (budget - units).min(1),
-                releases.accepts_batch(),
-                |original| releases.retain(ReleaseCapture::Original(original)),
-            )
-        });
-        if let Some(progress) = &pump_progress {
-            units += progress.units;
-            progressed |= progress.progressed;
+            let split_first = self.split_next;
+            for is_split in [split_first, !split_first] {
+                if units == budget {
+                    self.split_next = is_split;
+                    pump_more |= !is_split || pumps.has_split_work();
+                    break;
+                }
+                if is_split {
+                    if !pumps.has_split_work() {
+                        continue;
+                    }
+                    let mut payloads = NativeSplitPayloadStore {
+                        requests: &mut self.requests,
+                        admission: &mut self.admission,
+                        next: self
+                            .next_payload
+                            .as_mut()
+                            .expect("original Native payload namespace"),
+                    };
+                    let executor = releases.executor().clone();
+                    let wake = releases.wake().clone();
+                    units += 1;
+                    match pumps.progress_split(
+                        failed,
+                        pumps_closing,
+                        pumps_closing || failed && self.supervisor.is_none(),
+                        releases.accepts_batch(),
+                        &mut payloads,
+                        &executor,
+                        &wake,
+                        |original| releases.retain(ReleaseCapture::Original(original)),
+                    ) {
+                        Ok(changed) => split_changed = changed,
+                        Err(error) => self.other.retain_transport_failure(error),
+                    }
+                } else {
+                    let progress = pumps.progress(
+                        failed,
+                        pumps_closing,
+                        retire_failures,
+                        1,
+                        releases.accepts_batch(),
+                        |original| releases.retain(ReleaseCapture::Original(original)),
+                    );
+                    units += progress.units;
+                    progressed |= progress.progressed;
+                    pump_more = progress.more;
+                }
+            }
+            progressed |= split_changed;
         }
         let supervisor_advanced = if units < budget && self.supervisor.is_some() {
             units += 1;
@@ -1082,6 +1319,25 @@ impl EffectSource for AttemptTransportSource {
                 self.abort_inputs.push_back(original);
             }
         }
+        let mut abort_retirement_more = false;
+        if closing && let Some(retirement) = &mut self.abort_retirement {
+            if units == budget {
+                abort_retirement_more = true;
+            } else {
+                units += 1;
+                match retirement
+                    .progress()
+                    .expect("original Abort role retirement")
+                {
+                    AbortIngressRetirementProgress::Blocked => {}
+                    AbortIngressRetirementProgress::Advanced => abort_retirement_more = true,
+                    AbortIngressRetirementProgress::Complete => {
+                        self.abort_retirement = None;
+                        progressed = true;
+                    }
+                }
+            }
+        }
         if self.admission_scan == 0 {
             self.admission_scan = self.admission.awaiting_result_retirement();
         }
@@ -1100,6 +1356,40 @@ impl EffectSource for AttemptTransportSource {
             self.send_scan -= 1;
             units += 1;
             progressed |= self.advance_send();
+        }
+        if retire_failures
+            && units < budget
+            && self.send_live.is_empty()
+            && self.failed_sends.is_empty()
+            && self.admission.is_quiescent()
+            && self
+                .releases
+                .as_ref()
+                .is_none_or(TransportReleases::accepts_batch)
+            && let Some(original) = self.admission.take_unselected_failure()
+        {
+            retain_release(
+                &mut self.releases,
+                &mut self.other,
+                ReleaseCapture::Original(Box::new(original)),
+            );
+            units += 1;
+            progressed = true;
+        }
+        if closing
+            && units < budget
+            && self
+                .releases
+                .as_ref()
+                .is_some_and(TransportReleases::accepts_batch)
+            && let Some(original) = self.take_unclaimed_release()
+        {
+            self.releases
+                .as_mut()
+                .expect("original Native release executor")
+                .retain(ReleaseCapture::Transport(original));
+            units += 1;
+            progressed = true;
         }
         if self.result_admission_closed() && units < budget {
             if self
@@ -1160,6 +1450,9 @@ impl EffectSource for AttemptTransportSource {
                 progressed = true;
             }
         }
+        if closing && self.transport_drained() {
+            self.other.transport_roles_drained();
+        }
         let mut progress = self
             .other
             .progress_retirement(runtime, turn, now, budget - units);
@@ -1168,9 +1461,11 @@ impl EffectSource for AttemptTransportSource {
         progress.more |= subscription_progress
             .as_ref()
             .is_some_and(|progress| release_accepting && progress.more)
-            || pump_progress.as_ref().is_some_and(|progress| progress.more)
+            || pump_more
+            || split_changed
             || supervisor_advanced
             || self.abort_scan != 0
+            || abort_retirement_more
             || self.admission_scan != 0
             || self.send_scan != 0
             || release_advanced

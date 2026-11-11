@@ -57,8 +57,8 @@ use novarocks_control_runtime_core::{
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_execution_contract::{BackendProcessDescriptor, ParticipationRef};
 use novarocks_query_application::execution_error::ExecutionFailureInput;
-use novarocks_types::{BackendProcessId, NativeCompatibilityId};
-use novarocks_workload_control::WorkScope;
+use novarocks_types::{BackendProcessId, NativeCompatibilityId, QueryExecutionId};
+use novarocks_workload_control::{WorkOwner, WorkScope};
 use std::{
     any::Any,
     collections::{BTreeMap, VecDeque},
@@ -83,6 +83,82 @@ pub(crate) struct FrozenSubscriptionInputs<'a> {
     pub(crate) ingress: &'a OrderedObservationInput<FrontendActor>,
 }
 
+pub(crate) struct FrozenSubscriptionStageInputs<'a> {
+    pub(crate) backends: &'a Arc<[BackendProcessDescriptor]>,
+    pub(crate) compatibility: NativeCompatibilityId,
+    pub(crate) data: &'a FrontendDataRuntime,
+    pub(crate) scope: &'a WorkScope,
+    pub(crate) cohort: &'a NativeSourceCohort,
+    pub(crate) execution: QueryExecutionId,
+}
+
+struct StagedSubscriptionEndpoint {
+    participation: ParticipationRef,
+    backend: usize,
+    owner: Option<WorkOwner>,
+}
+
+/// The original WC children are staged before actor registration. There are
+/// no channels, registered generations, or ingress aliases in this holder.
+pub(crate) struct StagedSubscriptionEndpoints {
+    backends: Arc<[BackendProcessDescriptor]>,
+    compatibility: NativeCompatibilityId,
+    data: FrontendDataRuntime,
+    execution: QueryExecutionId,
+    entries: Vec<StagedSubscriptionEndpoint>,
+}
+
+impl StagedSubscriptionEndpoints {
+    pub(crate) fn data(&self) -> &FrontendDataRuntime {
+        &self.data
+    }
+
+    pub(crate) fn bind(
+        mut self,
+        roster: &[FrozenMember],
+        compatibility: NativeCompatibilityId,
+        ingress: &OrderedObservationInput<FrontendActor>,
+    ) -> Result<Arc<SubscriptionEndpoints>, SubscriptionEndpointError> {
+        if self.execution != ingress.root_binding().activation().execution()
+            || self.compatibility != compatibility
+            || self.entries.len() != roster.len()
+            || !self.entries.iter().zip(roster).all(|(entry, member)| {
+                entry.participation == member.participation
+                    && self.backends[entry.backend].endpoint() == &member.endpoint
+            })
+        {
+            return Err(SubscriptionEndpointError::Roster);
+        }
+
+        let endpoints = self
+            .entries
+            .iter_mut()
+            .map(|entry| {
+                let source = SubscriptionSource::from_owner(
+                    entry.participation,
+                    entry.owner.take().expect("original staged WC child"),
+                    ingress.clone(),
+                );
+                let client =
+                    Client::for_backend_in(self.backends.clone(), entry.backend, self.data.clone());
+                (entry.participation, SubscriptionEndpoint { source, client })
+            })
+            .collect();
+        Ok(Arc::new(endpoints))
+    }
+}
+
+impl Drop for StagedSubscriptionEndpoints {
+    fn drop(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(owner) = entry.owner.take() {
+                // No subscription job can depend on an unpublished child.
+                owner.complete_after_terminal_cancel_settled();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum SubscriptionEndpointError {
     Roster,
@@ -93,18 +169,17 @@ pub(crate) enum SubscriptionEndpointError {
 }
 
 /// Open no channel and consume no WC child until the entire frozen roster
-/// matches. The same Client can also author sends to that original process.
-pub(crate) fn bind_subscription_endpoints(
+/// matches. Stage the actual children before installing any runtime source.
+pub(crate) fn stage_subscription_endpoints(
     roster: &[FrozenMember],
-    original: FrozenSubscriptionInputs<'_>,
-) -> Result<Arc<SubscriptionEndpoints>, SubscriptionEndpointError> {
+    original: FrozenSubscriptionStageInputs<'_>,
+) -> Result<StagedSubscriptionEndpoints, SubscriptionEndpointError> {
     let backends: BTreeMap<_, _> = original
         .backends
         .iter()
         .enumerate()
         .map(|(index, backend)| (backend.process_id(), index))
         .collect();
-    let execution = original.ingress.root_binding().activation().execution();
     if roster.is_empty()
         || backends.len() != original.backends.len()
         || backends.len() != roster.len()
@@ -115,7 +190,7 @@ pub(crate) fn bind_subscription_endpoints(
                     >= pair[1].participation.backend_process_id()
         })
         || !roster.iter().all(|member| {
-            member.participation.query_execution_id() == execution
+            member.participation.query_execution_id() == original.execution
                 && backends
                     .get(&member.participation.backend_process_id())
                     .is_some_and(|&index| {
@@ -127,32 +202,49 @@ pub(crate) fn bind_subscription_endpoints(
     {
         return Err(SubscriptionEndpointError::Roster);
     }
-    let mut endpoints = BTreeMap::new();
+    let mut staged = StagedSubscriptionEndpoints {
+        backends: original.backends.clone(),
+        compatibility: original.compatibility,
+        data: original.data.clone(),
+        execution: original.execution,
+        entries: Vec::with_capacity(roster.len()),
+    };
     for member in roster {
         let participation = member.participation;
-        let source = match SubscriptionSource::from_cohort(
+        staged.entries.push(StagedSubscriptionEndpoint {
             participation,
-            original.scope,
-            original.cohort,
-            original.ingress.clone(),
-        ) {
-            Ok(source) => source,
-            Err(original) => {
-                retire_unpublished_endpoints(&endpoints);
-                return Err(SubscriptionEndpointError::Source {
-                    participation,
-                    original,
-                });
-            }
-        };
-        let client = Client::for_backend_in(
-            original.backends.clone(),
-            backends[&participation.backend_process_id()],
-            original.data.clone(),
-        );
-        endpoints.insert(participation, SubscriptionEndpoint { source, client });
+            backend: backends[&participation.backend_process_id()],
+            owner: None,
+        });
+        let entry = staged.entries.last_mut().expect("original staged receiver");
+        original
+            .cohort
+            .take_child_in(original.scope, &mut entry.owner)
+            .map_err(|original| SubscriptionEndpointError::Source {
+                participation,
+                original: SubscriptionSourceError::Work(original),
+            })?
+            .notify();
     }
-    Ok(Arc::new(endpoints))
+    Ok(staged)
+}
+
+pub(crate) fn bind_subscription_endpoints(
+    roster: &[FrozenMember],
+    original: FrozenSubscriptionInputs<'_>,
+) -> Result<Arc<SubscriptionEndpoints>, SubscriptionEndpointError> {
+    stage_subscription_endpoints(
+        roster,
+        FrozenSubscriptionStageInputs {
+            backends: original.backends,
+            compatibility: original.compatibility,
+            data: original.data,
+            scope: original.scope,
+            cohort: original.cohort,
+            execution: original.ingress.root_binding().activation().execution(),
+        },
+    )?
+    .bind(roster, original.compatibility, original.ingress)
 }
 
 /// An unpublished endpoint has no generation or in-flight request. Return
@@ -367,6 +459,7 @@ impl AttemptSubscriptions {
             backing::arc::<SubscriptionEndpoints>()?.size(),
             backing::tree::<ParticipationRef, SubscriptionEndpoint>(participants)?,
             backing::tree::<BackendProcessId, usize>(participants)?,
+            backing::array::<StagedSubscriptionEndpoint>(participants)?,
             backing::tree::<ParticipationRef, AttemptCallSource>(participants)?,
             sized(
                 backing::arc::<SubscriptionSource<FrontendActor>>()?.size(),
@@ -815,6 +908,14 @@ impl AttemptSubscriptions {
             dispose(ReleaseCapture::Original(Box::new(row.failure)));
         }
         (true, true)
+    }
+
+    pub(super) fn local_exited(&self) -> bool {
+        // Retained original failure evidence can outlive the actual readers.
+        self.closing
+            && self.close_order.is_empty()
+            && self.active.is_empty()
+            && self.calls.is_empty()
     }
 
     pub(super) fn is_drained(&self) -> bool {

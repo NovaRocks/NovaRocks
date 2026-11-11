@@ -46,6 +46,8 @@ pub(crate) enum PumpRecordError {
     AlreadyStarted,
     MissingFeedback,
     ResultAlreadyBound,
+    Split(split::SplitRecordError),
+    SplitCloseUnresolved(crate::task_execution::round::PumpCloseUnresolved),
 }
 impl std::fmt::Display for PumpRecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

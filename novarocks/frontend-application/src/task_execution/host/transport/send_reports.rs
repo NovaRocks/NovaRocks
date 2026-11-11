@@ -17,12 +17,15 @@
 
 use super::{
     NativeReceiptInput, SendKey,
-    receipt_input::{NativeReceiptError, RetiredNativeReceipt},
+    admission_source::FailureRecords,
+    receipt_input::{NativeReceiptError, RetiredNativeReceipt, retire_passive_report_position},
 };
 use crate::task_execution::bridge::abort::AbortReceiptSlot;
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
     task_execution::{
+        error::TaskExecutionError,
+        host::publication::DiagnosticReleaseReport,
         intent::{AckPayload, OperationAcknowledgement, OperationIntent},
         operation::OperationDispatchResult,
     },
@@ -41,6 +44,7 @@ use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
 use std::{
     alloc::Layout,
+    num::NonZeroU64,
     sync::{Arc, Mutex},
     task::Poll,
 };
@@ -67,7 +71,7 @@ impl NativeProgressInput {
     }
 
     fn retire_after_exit(&mut self) -> Result<Poll<Option<SendReportReturn>>, ActorTurnError> {
-        if !self.position.retire_ready_after_exit()? {
+        if !retire_passive_report_position(&self.position)? {
             return Ok(Poll::Pending);
         }
         self.position.close_after_exit()?;
@@ -82,7 +86,7 @@ pub(crate) struct SendMemberReport {
     receipt: Option<NativeReceiptInput>,
     abort_receipt: Option<Arc<AbortReceiptSlot>>,
     filter: Option<PayloadRef>,
-    workload: Option<HostFailureRef>,
+    failures: FailureRecords,
     pub(crate) first_poll: Option<(ParticipationRef, NativeProgressInput)>,
     pub(crate) receipt_delivery: Option<Result<InputId, ActorTurnError>>,
     pub(crate) refused_receipt: Option<(NativeReceiptError, OperationAcknowledgement)>,
@@ -91,19 +95,27 @@ impl SendMemberReport {
     pub(crate) fn new(
         receipt: NativeReceiptInput,
         filter: Option<PayloadRef>,
-        workload: Option<HostFailureRef>,
+        failures: FailureRecords,
         first_poll: Option<(ParticipationRef, NativeProgressInput)>,
     ) -> Self {
         Self {
             receipt: Some(receipt),
             abort_receipt: None,
             filter,
-            workload,
+            failures,
             first_poll,
             receipt_delivery: None,
             refused_receipt: None,
         }
     }
+
+    pub(super) fn bind_release_diagnostic(&mut self, report: DiagnosticReleaseReport) {
+        self.receipt
+            .as_mut()
+            .expect("original release report position")
+            .bind_release_diagnostic(report);
+    }
+
     pub(super) fn retain_abort_receipt(&mut self, participation: ParticipationRef) {
         let key = self
             .receipt
@@ -132,9 +144,14 @@ impl SendMemberReport {
         };
         let workload = if ack.dispatch_result() == OperationDispatchResult::NonWorkerRejected
             && ack.local_failure().is_none()
-            && ack.governance_failure().is_some()
         {
-            self.workload
+            ack.governance_failure().map(|cause| {
+                let reference = HostFailureRef(
+                    NonZeroU64::new(key.generation.admission_effect().get())
+                        .expect("original queued admission action"),
+                );
+                (reference, TaskExecutionError::Workload(cause.clone()))
+            })
         } else {
             None
         };
@@ -142,7 +159,12 @@ impl SendMemberReport {
             .receipt
             .as_mut()
             .expect("live original receipt position");
-        match receipt.record(key, ack, filter, workload) {
+        match receipt.record(
+            key,
+            ack,
+            filter,
+            workload.as_ref().map(|(reference, _)| *reference),
+        ) {
             Ok(()) => {
                 if let Some(original) = &self.abort_receipt {
                     original.record(
@@ -151,7 +173,28 @@ impl SendMemberReport {
                             .expect("original prepared Abort receipt"),
                     );
                 }
-                self.receipt_delivery = Some(receipt.submit());
+                // Core can select this exact failure immediately after fill.
+                // The canonical ACK itself stays in the original report.
+                let retained = workload.map(|(reference, cause)| {
+                    assert!(
+                        self.failures
+                            .lock()
+                            .unwrap()
+                            .insert(reference, cause)
+                            .is_none()
+                    );
+                    reference
+                });
+                let delivery = receipt.submit();
+                if matches!(
+                    delivery,
+                    Err(ActorTurnError::ActorFailed | ActorTurnError::Closed)
+                ) && let Some(reference) = retained
+                {
+                    // No Core consumer could have seen the rejected input.
+                    assert!(self.failures.lock().unwrap().remove(&reference).is_some());
+                }
+                self.receipt_delivery = Some(delivery);
             }
             Err(refusal) => self.refused_receipt = Some(refusal),
         }
@@ -441,6 +484,21 @@ pub(crate) enum SendReportReturn {
     },
 }
 
+impl SendReportReturn {
+    pub(super) fn is_disposable(&self) -> bool {
+        match self {
+            Self::Receipt { delivery_error, .. } => matches!(
+                delivery_error,
+                None | Some(ActorTurnError::ActorFailed | ActorTurnError::Closed)
+            ),
+            Self::ProgressRefused { error, .. } => {
+                matches!(error, ActorTurnError::ActorFailed | ActorTurnError::Closed)
+            }
+            Self::ReceiptRefused { .. } => false,
+        }
+    }
+}
+
 pub(crate) enum SendReportRetirementStep {
     Advanced(Option<SendReportReturn>),
     Pending,
@@ -580,6 +638,225 @@ mod tests {
     use std::{num::NonZeroU64, time::Duration};
 
     #[test]
+    fn release_report_retains_only_the_exact_canonical_diagnostic_alias() {
+        use crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot;
+        use crate::task_execution::host::{
+            adapter::tests::start,
+            publication::{
+                AttemptDiagnosticSources, DiagnosticPayloadAddress, OriginalDiagnosticPayload,
+                OriginalDiagnosticRecords,
+            },
+        };
+        use novarocks_attempt_protocol::{
+            effect::PumpKind,
+            input::{AckPayload as PassiveAck, OperationReplyResult},
+            publication::RuntimeFilterDiagnostic,
+        };
+        use novarocks_execution_contract::{
+            OperationOutcome, ParticipationReceipt, ParticipationState, ReleaseOutcome,
+            operation::OperationResult,
+        };
+        use novarocks_proto_codec::lifecycle::terminal::CanonicalTerminalTelemetry;
+        use novarocks_proto_models::novarocks::QueryTerminalProfileContributionTelemetry as RawTelemetry;
+        use novarocks_spi::connector::read_stack::SplitSourceProfile;
+        use std::sync::OnceLock;
+
+        #[derive(Debug)]
+        struct OriginalTelemetry(RawTelemetry);
+        impl CanonicalTerminalTelemetry for OriginalTelemetry {
+            fn terminal_telemetry(&self, ordinal: usize) -> &RawTelemetry {
+                assert_eq!(ordinal, 0);
+                &self.0
+            }
+
+            fn release_alias(self: Arc<Self>) {
+                drop(self);
+            }
+        }
+
+        let mut start = start();
+        start.activation.policy.retain_diagnostics = true;
+        start.observe_lifecycle_diagnostics = true;
+        let split_ref = PayloadRef(NonZeroU64::new(11).unwrap());
+        start.plan.pumps = Box::new([(split_ref, PumpKind::SplitAssignment)]);
+        let part = *start.plan.establish_material.first_key_value().unwrap().0;
+        let profile = Arc::new(OnceLock::new());
+        let sources = AttemptDiagnosticSources::new(&start, Some((split_ref, profile.clone())));
+        start.activation.policy.retain_diagnostics = false;
+        let lifecycle = AttemptDiagnosticSources::new(&start, Some((split_ref, profile.clone())));
+        let binding = sources.binding();
+        assert_eq!(binding.activation, start.activation.identity);
+        assert_eq!(binding.root, start.plan.graph.root);
+        assert_eq!(binding.participations, &[part]);
+        assert_eq!(
+            binding.fragments,
+            &[(
+                binding.root,
+                start.plan.graph.tasks[&binding.root.task_id()].fragment_id
+            )]
+        );
+        assert!(
+            sources
+                .payload(DiagnosticPayloadAddress::SplitProfile(split_ref))
+                .is_none()
+        );
+        let original_profile = SplitSourceProfile {
+            files_considered: 23,
+            ..SplitSourceProfile::default()
+        };
+        profile.set(original_profile).unwrap();
+        assert!(matches!(
+            sources.payload(DiagnosticPayloadAddress::SplitProfile(split_ref)),
+            Some(OriginalDiagnosticPayload::SplitProfile { activation, root, profile })
+                if activation == binding.activation && root == binding.root && profile == original_profile
+        ));
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let inbox = WithdrawalInbox::new(&scope);
+        let (mut work, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let operation = TaskOperationId::new_v7();
+        let report = |id| {
+            let id = NonZeroU64::new(id).unwrap();
+            let key = SendKey {
+                operation,
+                generation: SendGeneration::new(AttemptActionId::new(id)),
+            };
+            let reference = PayloadRef(id);
+            let mut report = SendMemberReport::new(
+                NativeReceiptInput::new(
+                    key,
+                    OperationKind::ReleaseParticipation,
+                    inbox.reserve_standing(&work),
+                ),
+                Some(reference),
+                FailureRecords::default(),
+                None,
+            );
+            report.bind_release_diagnostic(sources.release_report(part, reference).unwrap());
+            (key, reference, report)
+        };
+        let (earlier, earlier_ref, mut earlier_report) = report(17);
+        let (later, later_ref, mut later_report) = report(19);
+        let mut telemetry = crate::task_execution::tests::fixture_runtime_filter_contribution();
+        let original = Arc::new(OriginalTelemetry(telemetry.as_proto().clone()));
+        let backing: Arc<dyn CanonicalTerminalTelemetry> = original.clone();
+        telemetry.bind_canonical_owner(Arc::downgrade(&backing), 0);
+        drop(backing);
+        let ack = |outcome, telemetry| {
+            OperationAcknowledgement::worker_receipt(
+                operation,
+                OperationKind::ReleaseParticipation,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: ParticipationReceipt::new(part, ParticipationState::TerminalRetained),
+                    outcome,
+                    runtime_filter: Some(telemetry),
+                },
+            )
+        };
+        let lookup = |reference| DiagnosticPayloadAddress::RuntimeFilter {
+            backend: part.backend_process_id(),
+            reference,
+        };
+        earlier_report.record(earlier, ack(ReleaseOutcome::NotReady, telemetry.clone()));
+        assert!(sources.payload(lookup(earlier_ref)).is_none());
+        let later_ack = ack(ReleaseOutcome::Released, telemetry);
+        assert!(
+            lifecycle
+                .release_report(part, later_ref)
+                .unwrap()
+                .record(&later_ack, Some(later_ref))
+        );
+        assert!(lifecycle.payload(lookup(later_ref)).is_none());
+        assert!(lifecycle.take_release_records().is_none());
+        later_report.record(later, later_ack);
+        let Some(OriginalDiagnosticPayload::RuntimeFilter {
+            telemetry: retained,
+            ..
+        }) = sources.payload(lookup(later_ref))
+        else {
+            panic!("canonical alias is available before the Core can select it");
+        };
+        assert!(std::ptr::eq(retained.as_proto(), &original.0));
+        assert!(
+            sources
+                .payload(DiagnosticPayloadAddress::SplitProfile(later_ref))
+                .is_none()
+        );
+        assert!(sources.payload(lookup(earlier_ref)).is_none());
+        inbox.commit(earlier_report.receipt_delivery.take().unwrap().unwrap());
+        let fact = inbox.commit(later_report.receipt_delivery.take().unwrap().unwrap());
+        assert!(matches!(
+            fact,
+            ExecutorFact::Operation(observation)
+                if observation.generation == later.generation
+                    && matches!(&observation.reply.result,
+                        OperationReplyResult::Worker(OperationResult::Verdict {
+                            acknowledgement: Some(PassiveAck::Release {
+                                runtime_filter: Some(reference), ..
+                            }),
+                            ..
+                        }) if *reference == later_ref)
+        ));
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        for mut report in [earlier_report, later_report] {
+            assert!(matches!(
+                report
+                    .receipt
+                    .take()
+                    .unwrap()
+                    .retire_ready_after_exit()
+                    .unwrap(),
+                Poll::Ready(Some(_))
+            ));
+        }
+        assert_eq!(Arc::strong_count(&original), 3);
+        sources.publication_complete();
+        assert!(sources.payload(lookup(later_ref)).is_none());
+        assert_eq!(Arc::strong_count(&original), 2);
+        drop(retained);
+        assert_eq!(Arc::strong_count(&original), 1);
+        drop(original);
+        let selection = RuntimeFilterDiagnostic {
+            complete: true,
+            contributions: vec![(part.backend_process_id(), later_ref.0)],
+        };
+        let Some(RuntimeFilterTerminalRollupSnapshot::Available(rollup)) =
+            sources.take_lifecycle_rollup(Some(&selection))
+        else {
+            panic!("the opt-in lifecycle projection no longer needs the canonical reply");
+        };
+        assert_eq!(rollup.participants.len(), 1);
+        assert_eq!(
+            rollup.participants[0].participant.process_id,
+            part.backend_process_id()
+        );
+        assert_eq!(
+            lifecycle.take_lifecycle_rollup(Some(&selection)),
+            Some(RuntimeFilterTerminalRollupSnapshot::Available(rollup))
+        );
+        assert!(sources.take_lifecycle_rollup(Some(&selection)).is_none());
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        inbox.finish();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
     fn abort_report_preserves_the_raw_worker_receipt_before_input_retirement() {
         use novarocks_execution_contract::{
             OperationOutcome, ParticipationReceipt, ParticipationState,
@@ -615,7 +892,7 @@ mod tests {
                 inbox.reserve_standing(&work),
             ),
             None,
-            None,
+            FailureRecords::default(),
             None,
         );
         report.retain_abort_receipt(part);
@@ -708,7 +985,7 @@ mod tests {
                             inbox.reserve_standing(&work),
                         ),
                         None,
-                        None,
+                        FailureRecords::default(),
                         Some((participation, progress())),
                     ),
                     SendMemberReport::new(
@@ -718,7 +995,7 @@ mod tests {
                             inbox.reserve_standing(&work),
                         ),
                         None,
-                        None,
+                        FailureRecords::default(),
                         None,
                     ),
                 ]),

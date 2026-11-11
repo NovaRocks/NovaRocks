@@ -1075,6 +1075,10 @@ impl AttemptReady {
         self.split_assignment_plan.take()
     }
 
+    pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {
+        &mut self.split_assignment_plan
+    }
+
     pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {
         if self.close_job.is_none()
             && let Some(plan) = self.split_assignment_plan.as_mut()

@@ -66,7 +66,7 @@ use std::{
     alloc::Layout,
     collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 #[derive(Debug)]
@@ -165,8 +165,10 @@ impl SplitRunnerPublication {
 struct SplitResults {
     selected_failure: Option<(HostFailureRef, AttemptFailure)>,
     original_failure: Option<TaskExecutionError>,
-    profile: Option<SplitSourceProfile>,
 }
+
+#[derive(Default)]
+pub(crate) struct SplitFailureRecord(Mutex<SplitResults>);
 
 /// One original opened assignment plan, its delivery tickets, and immutable
 /// outcomes. The transport Source retains this while its runner or any
@@ -175,7 +177,8 @@ pub(crate) struct SplitPump {
     pump: PayloadRef,
     executor: Arc<SplitAssignmentExecutor>,
     deliveries: Arc<SplitDeliveryRecords>,
-    results: Mutex<SplitResults>,
+    results: Arc<SplitFailureRecord>,
+    profile: Arc<OnceLock<SplitSourceProfile>>,
 }
 
 impl SplitPump {
@@ -186,6 +189,7 @@ impl SplitPump {
         tasks: BTreeMap<UniqueId, TaskIdentity>,
         wake: Arc<dyn StatusIntakeWake>,
         data_runtime: FrontendDataRuntime,
+        profile: Arc<OnceLock<SplitSourceProfile>>,
     ) -> Option<Arc<Self>> {
         let deliveries = SplitDeliveryRecords::new(execution, tasks, wake);
         let executor =
@@ -197,7 +201,8 @@ impl SplitPump {
             pump,
             executor,
             deliveries,
-            results: Mutex::new(SplitResults::default()),
+            results: Arc::default(),
+            profile,
         }))
     }
 
@@ -256,6 +261,10 @@ impl SplitPump {
         &self.deliveries
     }
 
+    pub(crate) fn failure_record(&self) -> Arc<SplitFailureRecord> {
+        self.results.clone()
+    }
+
     pub(crate) fn apply_notice(&self, body: &EffectBody) -> Result<(), SplitRecordError> {
         match body {
             EffectBody::PumpUpdateAdmitted {
@@ -288,7 +297,7 @@ impl SplitPump {
         reference: HostFailureRef,
         original: TaskExecutionError,
     ) -> AttemptFailure {
-        let mut results = self.results.lock().expect("original split results");
+        let mut results = self.results.0.lock().expect("original split results");
         if let Some((selected, failure)) = &results.selected_failure {
             assert_eq!(*selected, reference, "same original split runner");
             return failure.clone();
@@ -299,11 +308,18 @@ impl SplitPump {
         failure
     }
 
+    #[cfg(test)]
+    pub(crate) fn profile_lookup(&self) -> (PayloadRef, Arc<OnceLock<SplitSourceProfile>>) {
+        (self.pump, self.profile.clone())
+    }
+}
+
+impl SplitFailureRecord {
     pub(crate) fn project_failure(
         &self,
         reference: HostFailureRef,
     ) -> Option<ExecutionFailureInput> {
-        let results = self.results.lock().expect("original split results");
+        let results = self.0.lock().expect("original split results");
         if results.selected_failure.as_ref()?.0 != reference {
             return None;
         }
@@ -311,18 +327,11 @@ impl SplitPump {
     }
 
     pub(crate) fn take_failure(&self, reference: HostFailureRef) -> Option<TaskExecutionError> {
-        let mut results = self.results.lock().expect("original split results");
+        let mut results = self.0.lock().expect("original split results");
         if results.selected_failure.as_ref()?.0 != reference {
             return None;
         }
         results.original_failure.take()
-    }
-
-    pub(crate) fn profile(&self, reference: PayloadRef) -> Option<SplitSourceProfile> {
-        if reference != self.pump {
-            return None;
-        }
-        self.results.lock().expect("original split results").profile
     }
 }
 
@@ -342,6 +351,9 @@ impl BoundSplitRunner {
         }
         let result = self.original.executor.clone().run_admitted(&self).await;
         self.original.deliveries.close_external();
+        if let Some(unresolved) = self.original.unresolved() {
+            return Err(PumpRecordError::SplitCloseUnresolved(unresolved));
+        }
         Ok(ExecutorFact::PumpFinished {
             pump: self.original.pump,
             result: result
@@ -371,13 +383,8 @@ impl OriginalSplitPublisher for BoundSplitRunner {
     ) -> Result<(), TaskExecutionError> {
         let observation = match observation {
             SplitAssignmentProfileRead::Available(profile) => {
-                let mut results = self
-                    .original
-                    .results
-                    .lock()
-                    .expect("original split results");
                 assert!(
-                    results.profile.replace(profile).is_none(),
+                    self.original.profile.set(profile).is_ok(),
                     "one original split profile"
                 );
                 SplitDiagnosticObservation::Available(self.original.pump)
@@ -960,6 +967,7 @@ async fn dormant_split_cleanup_keeps_the_original_provider_close_and_work_exit()
         BTreeMap::new(),
         Arc::new(CountingWake::default()),
         data_runtime,
+        Arc::default(),
     )
     .unwrap();
     assert!(!original.has_started());
@@ -1024,7 +1032,7 @@ async fn dormant_split_cleanup_keeps_the_original_provider_close_and_work_exit()
     assert_eq!(closes.load(Ordering::SeqCst), 1);
     assert_eq!(enumerations.load(Ordering::SeqCst), 0);
     assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
-    assert!(original.profile(original.reference()).is_none());
+    assert!(original.profile_lookup().1.get().is_none());
     assert!(original.deliveries().take_remaining_after_close().is_none());
     report.consume(observer).unwrap();
     assert!(custody.try_retire().unwrap());

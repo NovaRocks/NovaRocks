@@ -379,6 +379,280 @@ fn dispatch_continuation_preserves_original_effects_and_settlement_order() {
     assert_eq!(resumed, uninterrupted);
 }
 
+#[test]
+fn cleanup_settles_unused_establish_and_waits_for_emitted_establish_withdrawal() {
+    use crate::{input::WithdrawalOutcome, terminal::GatePreparation};
+    use novarocks_coordination_contract::{
+        AttemptConvergenceMode, AttemptIssueSettlement, AttemptToLogical,
+    };
+
+    let start = start();
+    let now = start.initial_now;
+    let sources = start.sources;
+    let activation = start.activation.identity;
+    let mut core = Core::new(start).unwrap();
+    let (emitted, unused) = {
+        let mut participants = core.execution.graph().participations().copied();
+        (participants.next().unwrap(), participants.next().unwrap())
+    };
+    for (participation, sequence) in [(emitted, 1), (unused, 2)] {
+        let admission = admission_intent(&mut core.execution, participation);
+        let ticket = dispatch_admission(
+            &mut core.execution,
+            admission,
+            sequence,
+            OperationOutcome::Accepted,
+        );
+        core.execution.apply_dispatched_reply(&ticket).1.unwrap();
+    }
+    let authorize = |core: &mut Core, participation, n| {
+        let action = AttemptActionId::new(id(n));
+        let token = AttemptRequestToken::new(id(n));
+        let guard = AttemptAuthorizationRef::new(id(n));
+        let grant = QueuedInputGrantRef::new(id(n), SendGeneration::new(action));
+        let intent = queue_establish(&mut core.execution, participation, grant);
+        assert!(matches!(
+            core.authorize_candidate(&intent, token, action).unwrap(),
+            AuthorizationStep::Request(AttemptEffect {
+                body: EffectBody::EstablishAuthorization { .. },
+                ..
+            })
+        ));
+        let result = core
+            .apply_qa_reply(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token,
+                    decision: Ok(AttemptAuthorizationDecision::EstablishAuthorized(guard)),
+                },
+            })
+            .unwrap();
+        let operation = intent.operation_id();
+        assert!(matches!(result, QaReply::Authorized(original) if original == operation));
+        (operation, guard, grant)
+    };
+    let (emitted_operation, emitted_guard, emitted_grant) = authorize(&mut core, emitted, 20);
+    let mut next_input = 1;
+    let mut reservation_target = Some(emitted.backend_process_id());
+    let mut step = |core: &mut Core, source, input| {
+        let claim = AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(next_input)),
+            native_cut: Some(AttemptSourceCut {
+                source: sources.native,
+                tail: None,
+            }),
+            selected_cut: Some(AttemptSourceCut {
+                source: sources.observation,
+                tail: None,
+            }),
+        };
+        next_input += 1;
+        core.handle(
+            now,
+            claim,
+            input,
+            &mut DispatchTurn {
+                budget: Units(4096),
+                reservation_target: &mut reservation_target,
+            },
+        )
+        .unwrap()
+    };
+    let publication_applied = |effect| {
+        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+            effect,
+            result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+        })
+    };
+    let expect_unsent = |port: AttemptToLogical<AttemptFailure>, expected| {
+        let AttemptToLogicalBody::EstablishSettlement {
+            token,
+            authorization,
+            participation,
+            operation_id,
+            settlement: AttemptIssueSettlement::DefinitelyUnsent,
+        } = port.body
+        else {
+            panic!("expected definitely-unsent Establish settlement");
+        };
+        assert_eq!((authorization, participation, operation_id), expected);
+        token
+    };
+    let settlement_reply = |token, authorization| {
+        AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::EstablishSettlementReply {
+                token,
+                authorization,
+                result: Ok(()),
+            },
+        })
+    };
+
+    step(&mut core, sources.actor, AttemptInput::Bootstrap);
+    for _ in 0..3 {
+        assert!(
+            step(&mut core, sources.actor, AttemptInput::Timer)
+                .effect
+                .is_none()
+        );
+    }
+    let Some(AttemptEffect {
+        id: publication,
+        body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+        ..
+    }) = step(&mut core, sources.actor, AttemptInput::Timer).effect
+    else {
+        panic!("expected the original publication before dispatch");
+    };
+    let Some(AttemptEffect {
+        id: send,
+        class: EffectClass::Business,
+        body: EffectBody::SendBatch { batch, .. },
+    }) = step(
+        &mut core,
+        sources.publication,
+        publication_applied(publication),
+    )
+    .effect
+    else {
+        panic!("expected one emitted Establish batch");
+    };
+    assert_eq!(batch.queued_inputs.as_ref(), [emitted_grant]);
+    assert!(matches!(
+        batch.operations.as_ref(),
+        [operation] if operation.operation_id() == emitted_operation
+    ));
+    assert_eq!(
+        step(&mut core, sources.actor, AttemptInput::Timer).round_result,
+        Some(Ok(()))
+    );
+    let (unused_operation, unused_guard, unused_grant) = authorize(&mut core, unused, 21);
+    assert_eq!(core.execution.dispatcher().queued_items(), 1);
+
+    let closing = step(
+        &mut core,
+        sources.actor,
+        AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Cleanup,
+                remote_deadline: now.saturating_add(Duration::from_secs(5)),
+                computation_ready: None,
+                retain_diagnostics: false,
+            },
+        }),
+    );
+    assert!(closing.stop_producing);
+    let Some(AttemptEffect {
+        id: withdrawal,
+        class: EffectClass::Cleanup,
+        body: EffectBody::Withdraw { effect },
+    }) = step(&mut core, sources.actor, AttemptInput::Timer).effect
+    else {
+        panic!("expected withdrawal of the emitted batch");
+    };
+    assert_eq!(effect, send);
+
+    let closing = step(&mut core, sources.actor, AttemptInput::Timer);
+    let Some(AttemptEffect {
+        class: EffectClass::Settlement,
+        body: EffectBody::Port(port),
+        ..
+    }) = closing.effect
+    else {
+        panic!("the unused guard must settle without a transport report");
+    };
+    let token = expect_unsent(port, (unused_guard, unused, unused_operation));
+    assert_eq!(closing.selection, InputSelection::Only(sources.qa));
+    let stale = step(
+        &mut core,
+        sources.qa,
+        settlement_reply(token, emitted_guard),
+    );
+    assert_eq!(stale.selection, InputSelection::Only(sources.qa));
+    assert!(stale.effect.is_none());
+    let waiting = step(&mut core, sources.qa, settlement_reply(token, unused_guard));
+    assert!(waiting.effect.is_none());
+    assert_eq!(
+        core.authorizations.preparation(),
+        GatePreparation::Applied { ready: false }
+    );
+
+    assert_eq!(core.execution.dispatcher().queued_items(), 1);
+
+    // A report for the Withdraw request itself cannot retire the SendBatch.
+    core.apply_transport_withdrawal(
+        now,
+        &ExecutorFact::Withdrawn {
+            effect: withdrawal,
+            outcome: WithdrawalOutcome::DefinitelyUnsent,
+        },
+        |_| panic!("Establish does not settle an Abort"),
+    )
+    .unwrap();
+    assert!(!core.authorizations.close_needs_drive());
+    assert_eq!(
+        core.execution
+            .dispatcher()
+            .lane_in_flight(emitted.backend_process_id(), DispatchLane::Lifecycle),
+        1
+    );
+    let actual = step(
+        &mut core,
+        sources.transport,
+        AttemptInput::Executor(ExecutorFact::Withdrawn {
+            effect: send,
+            outcome: WithdrawalOutcome::DefinitelyUnsent,
+        }),
+    );
+    assert!(actual.effect.is_none());
+    assert_eq!(core.execution.dispatcher().in_flight_operations(), 0);
+    assert!(core.authorizations.close_needs_drive());
+
+    let mut next = (sources.actor, AttemptInput::Timer);
+    let mut returned_unused_grant = false;
+    let mut settled_emitted_guard = false;
+    for _ in 0..32 {
+        let progress = step(&mut core, next.0, next.1);
+        next = (sources.actor, AttemptInput::Timer);
+        if let Some(effect) = progress.effect {
+            match effect.body {
+                EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                    next = (sources.publication, publication_applied(effect.id));
+                }
+                EffectBody::ReleaseCreationPayload { .. } => {}
+                EffectBody::ReleaseQueuedInput { grant } => {
+                    assert_eq!(grant, unused_grant);
+                    assert!(!std::mem::replace(&mut returned_unused_grant, true));
+                }
+                EffectBody::Port(port) => {
+                    assert_eq!(effect.class, EffectClass::Settlement);
+                    let token = expect_unsent(port, (emitted_guard, emitted, emitted_operation));
+                    assert!(!std::mem::replace(&mut settled_emitted_guard, true));
+                    next = (sources.qa, settlement_reply(token, emitted_guard));
+                }
+                body => panic!("unexpected cleanup effect: {body:?}"),
+            }
+        }
+        if returned_unused_grant
+            && settled_emitted_guard
+            && core.authorizations.preparation() == (GatePreparation::Applied { ready: true })
+        {
+            break;
+        }
+    }
+    assert!(returned_unused_grant);
+    assert!(settled_emitted_guard);
+    assert_eq!(
+        core.authorizations.preparation(),
+        GatePreparation::Applied { ready: true }
+    );
+    assert_eq!(core.execution.dispatcher().queued_items(), 0);
+    assert_eq!(core.execution.dispatcher().in_flight_operations(), 0);
+}
+
 struct ExchangeTurn {
     blocked_create: Option<BackendProcessId>,
     blocked_update: Option<BackendProcessId>,

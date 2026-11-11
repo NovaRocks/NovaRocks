@@ -49,10 +49,12 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     num::NonZeroU64,
+    ops::Bound::{Excluded, Unbounded},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::Waker,
 };
 use tokio::sync::watch;
 
@@ -78,6 +80,19 @@ struct Ingress {
     closed: AtomicBool,
     capacity: watch::Sender<u64>,
     worker_closed: Option<Arc<dyn Fn(ParticipationRef) + Send + Sync>>,
+    close_wake: OnceLock<Waker>,
+}
+
+impl Ingress {
+    fn release_booking(&self, slot: &Slot) {
+        assert!(slot.booked.swap(false, Ordering::AcqRel));
+        publish_capacity(&self.capacity);
+        if self.closed.load(Ordering::Acquire)
+            && let Some(wake) = self.close_wake.get()
+        {
+            wake.wake_by_ref();
+        }
+    }
 }
 
 /// The original QA submission remains here even after the Core has processed
@@ -125,6 +140,7 @@ impl AttemptAbortIngress {
                 closed: AtomicBool::new(false),
                 capacity,
                 worker_closed,
+                close_wake: OnceLock::new(),
             }),
         }
     }
@@ -188,30 +204,65 @@ impl AttemptAbortIngress {
         }
     }
 
-    /// The original standing roles close after their last booked occurrence
-    /// actually retires. Other custodians may still hold the same ingress
-    /// allocation while the runtime needs these roles gone to seal the actor.
-    pub(crate) fn close_after_exit(&self) -> Result<bool, ActorTurnError> {
-        self.close_external();
-        if self
-            .original
-            .slots
-            .values()
-            .any(|slot| slot.booked.load(Ordering::Acquire))
-        {
+    fn close_slot(slot: &Slot) -> Result<bool, ActorTurnError> {
+        if slot.booked.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let mut position = match slot.position.try_lock() {
+            Ok(position) => position,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("original Abort Control position"),
+        };
+        if slot.booked.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if let Some(original) = position.as_mut() {
+            original.close_after_exit()?;
+            position.take();
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_after_exit(&self) -> Result<bool, ActorTurnError> {
+        self.close_external();
         for slot in self.original.slots.values() {
-            let mut position = slot
-                .position
-                .lock()
-                .expect("original Abort Control position");
-            if let Some(original) = position.as_mut() {
-                original.close_after_exit()?;
-                position.take();
+            if !Self::close_slot(slot)? {
+                return Ok(false);
             }
         }
         Ok(true)
+    }
+}
+
+/// Visits at most one original paid role per host visit.
+pub(crate) struct AbortIngressRetirement {
+    ingress: Arc<AttemptAbortIngress>,
+    after: Option<ParticipationRef>,
+}
+
+pub(crate) enum AbortIngressRetirementProgress {
+    Blocked,
+    Advanced,
+    Complete,
+}
+
+impl AbortIngressRetirement {
+    pub(crate) fn progress(&mut self) -> Result<AbortIngressRetirementProgress, ActorTurnError> {
+        self.ingress.close_external();
+        let slots = &self.ingress.original.slots;
+        let next = match self.after {
+            Some(after) => slots.range((Excluded(after), Unbounded)).next(),
+            None => slots.first_key_value(),
+        };
+        let Some((&participation, slot)) = next else {
+            return Ok(AbortIngressRetirementProgress::Complete);
+        };
+        if !AttemptAbortIngress::close_slot(slot)? {
+            return Ok(AbortIngressRetirementProgress::Blocked);
+        }
+        self.after = Some(participation);
+        Ok(AbortIngressRetirementProgress::Advanced)
     }
 }
 
@@ -249,7 +300,7 @@ impl AbortParticipationEffectPort for AttemptAbortIngress {
             return AbortParticipationEffectAdmission::Backpressured;
         }
         if self.original.closed.load(Ordering::Acquire) {
-            slot.booked.store(false, Ordering::Release);
+            self.original.release_booking(slot);
             return AbortParticipationEffectAdmission::Closed;
         }
         let action =
@@ -260,7 +311,7 @@ impl AbortParticipationEffectPort for AttemptAbortIngress {
                 });
         let Ok(action) = action else {
             self.close_external();
-            slot.booked.store(false, Ordering::Release);
+            self.original.release_booking(slot);
             return AbortParticipationEffectAdmission::Closed;
         };
         AbortParticipationEffectAdmission::Admitted(Box::new(AbortReservation {
@@ -317,11 +368,14 @@ impl AbortParticipationEffectReservation for AbortReservation {
             .position
             .lock()
             .expect("original Abort Control position");
-        match position
-            .as_ref()
-            .expect("booked original Control position")
-            .fill(input)
-        {
+        let Some(position) = position.as_ref() else {
+            // Closure can win after the first admission check but before
+            // this exact position is accessed.
+            drop(current);
+            drop(original);
+            return;
+        };
+        match position.fill(input) {
             Ok(input) => {
                 *current = Some(Submitted {
                     action: self.action,
@@ -343,8 +397,7 @@ impl Drop for AbortReservation {
     fn drop(&mut self) {
         if self.owns_position {
             let slot = &self.original.slots[&self.identity.participation()];
-            assert!(slot.booked.swap(false, Ordering::AcqRel));
-            publish_capacity(&self.original.capacity);
+            self.original.release_booking(slot);
         }
     }
 }
@@ -383,8 +436,7 @@ impl AbortInputRetirement {
             }
         }
         self.input = None;
-        assert!(slot.booked.swap(false, Ordering::AcqRel));
-        publish_capacity(&self.original.capacity);
+        self.original.release_booking(slot);
         Ok(true)
     }
 }
@@ -494,6 +546,14 @@ impl AbortSettlementOwner {
 
     pub(crate) fn close_external(&self) {
         self.ingress.close_external();
+    }
+
+    pub(crate) fn ingress_retirement(&self, wake: Waker) -> AbortIngressRetirement {
+        assert!(self.ingress.original.close_wake.set(wake).is_ok());
+        AbortIngressRetirement {
+            ingress: self.ingress.clone(),
+            after: None,
+        }
     }
 
     /// Only the original failure Work runs this drain. The same gate that

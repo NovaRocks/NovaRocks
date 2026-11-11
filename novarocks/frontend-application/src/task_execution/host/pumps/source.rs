@@ -20,11 +20,14 @@
 use super::{
     BoundPumpWork, DiagnosticRecords, DiagnosticRegistration, DynamicFilterRecords,
     DynamicReadRegistration, PumpOutcome,
+    split::{SplitFailureRecord, SplitPump, SplitRunnerPublication},
+    split_source::{OriginalSplitCleanup, SplitPayloadStore, SplitSource},
 };
+use crate::task_execution::error::TaskExecutionError;
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendEffect, FrontendInput},
-        host::{PendingHandoff, PreparedEffectJob, SourceProgress},
+        host::{PreparedEffectJob, SourceProgress},
         transport_withdrawal::AttemptEffectEnvelope,
     },
     task_execution::host::{
@@ -34,9 +37,7 @@ use crate::{
         },
         observations::{ObservationError, backing},
         publication::OriginalHostFailure,
-        transport::{
-            BodyOutcome, BoundActorTransport, handoff_actor_transport, prepare_actor_pump,
-        },
+        transport::{BodyOutcome, BoundActorTransport, prepare_actor_pump},
     },
 };
 use novarocks_attempt_protocol::{
@@ -64,7 +65,14 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_query_application::execution_error::ExecutionFailureInput;
-use std::{alloc::Layout, any::Any, num::NonZeroU64, sync::Arc};
+use std::{
+    alloc::Layout,
+    any::Any,
+    collections::BTreeMap,
+    num::NonZeroU64,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+};
 use tokio::runtime::Handle;
 
 type Position = CausalInputObligation<FrontendActor>;
@@ -81,6 +89,8 @@ enum Purpose {
     DynamicReply,
     DiagnosticRead,
     DiagnosticDisposal,
+    SplitStart,
+    SplitControl,
 }
 
 struct Lane {
@@ -126,6 +136,10 @@ pub(crate) struct AttemptPumpSource {
     pending: Option<Pending>,
     dynamic: Option<Dynamic>,
     diagnostics: Option<Arc<DiagnosticRecords>>,
+    split: Option<SplitSource>,
+    split_cleanup: Option<OriginalSplitCleanup>,
+    split_failure: Option<Arc<SplitFailureRecord>>,
+    dynamic_failures: BTreeMap<HostFailureRef, TaskExecutionError>,
     scan: usize,
     remaining: usize,
     rescan: bool,
@@ -186,6 +200,7 @@ impl AttemptPumpSource {
         observer: ConsumerId,
         dynamic: Option<(PayloadRef, Arc<DynamicFilterRecords>)>,
         diagnostics: Option<Arc<DiagnosticRecords>>,
+        split: Option<&Arc<SplitPump>>,
     ) -> Result<Self, ActorTurnError> {
         let scope = parent.scope();
         if !registration.matches_scope(scope) || !payer.belongs_to_bound_work(scope, parent.id()) {
@@ -212,35 +227,66 @@ impl AttemptPumpSource {
                     .then_some(diagnostic_lanes)
                     .into_iter()
                     .flatten(),
+            )
+            .chain(
+                split
+                    .map(|_| [Purpose::SplitStart, Purpose::SplitControl])
+                    .into_iter()
+                    .flatten(),
             );
-        let mut lanes: Vec<Lane> =
-            Vec::with_capacity(Self::role_count(dynamic.is_some(), diagnostics.is_some()));
-        for purpose in purposes {
-            let position = match Position::reserve_admitted(
-                runtime,
-                registration,
-                source,
-                InputClass::Lifecycle,
-                parent,
-            ) {
-                Ok(position) => position,
-                Err(error) => {
-                    for lane in &mut lanes {
-                        lane.idle
-                            .as_mut()
-                            .unwrap()
-                            .close_after_exit()
-                            .expect("unused original pump position");
-                    }
-                    return Err(error);
-                }
+        let reserve =
+            |class| Position::reserve_admitted(runtime, registration, source, class, parent);
+        let mut lanes = Vec::with_capacity(
+            Self::role_count(dynamic.is_some(), diagnostics.is_some())
+                + 2 * usize::from(split.is_some()),
+        );
+        let mut callbacks = Vec::with_capacity(2 * usize::from(split.is_some()));
+        let bound = (|| {
+            for purpose in purposes {
+                lanes.push(Lane {
+                    purpose,
+                    idle: Some(reserve(InputClass::Lifecycle)?),
+                    live: None,
+                });
+            }
+            let Some(original) = split else {
+                return Ok(None);
             };
-            lanes.push(Lane {
-                purpose,
-                idle: Some(position),
-                live: None,
-            });
-        }
+            callbacks.push(reserve(InputClass::Lifecycle)?);
+            callbacks.push(reserve(InputClass::Ordinary)?);
+            let delivery = runtime
+                .reserve_admitted_input_for(registration, source, InputClass::Ordinary, parent)?
+                .into_standing_input()
+                .map_err(|(error, original)| {
+                    original
+                        .revoke_unused()
+                        .expect("unused split delivery input");
+                    error
+                })?;
+            let profile = callbacks.pop().expect("original split profile");
+            let failure = callbacks.pop().expect("original split failure");
+            Ok(Some(SplitSource::new(
+                original.clone(),
+                delivery,
+                SplitRunnerPublication::new(failure, profile),
+            )))
+        })();
+        let split_failure = split.map(|original| original.failure_record());
+        let split = match bound {
+            Ok(split) => split,
+            Err(error) => {
+                for position in lanes
+                    .iter_mut()
+                    .filter_map(|lane| lane.idle.as_mut())
+                    .chain(&mut callbacks)
+                {
+                    position
+                        .close_after_exit()
+                        .expect("unused original pump position");
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             registration: registration.clone(),
             scope: scope.clone(),
@@ -251,6 +297,10 @@ impl AttemptPumpSource {
             pending: None,
             dynamic: dynamic.map(|(pump, records)| Dynamic { pump, records }),
             diagnostics,
+            split,
+            split_cleanup: None,
+            split_failure,
+            dynamic_failures: BTreeMap::new(),
             scan: 0,
             remaining: 0,
             rescan: false,
@@ -268,6 +318,11 @@ impl AttemptPumpSource {
 
     fn purpose(&self, effect: &AttemptEffectEnvelope) -> Option<Purpose> {
         let dynamic = self.dynamic.as_ref();
+        let split = self
+            .split
+            .as_ref()
+            .and_then(SplitSource::original)
+            .map(|pump| pump.reference());
         match effect.protocol.body {
             EffectBody::StartPump {
                 pump,
@@ -277,6 +332,18 @@ impl AttemptPumpSource {
                 if dynamic.is_some_and(|row| row.pump == pump) =>
             {
                 Some(Purpose::DynamicControl)
+            }
+            EffectBody::StartPump {
+                pump,
+                kind: PumpKind::SplitAssignment,
+            } if split == Some(pump) => Some(Purpose::SplitStart),
+            EffectBody::StopPump { pump }
+            | EffectBody::PumpUpdateAdmitted { pump, .. }
+            | EffectBody::PumpOperationReleased { pump, .. }
+            | EffectBody::PumpOperationSettled { pump, .. }
+                if split == Some(pump) =>
+            {
+                Some(Purpose::SplitControl)
             }
             EffectBody::ReadDynamicFilters { .. }
             | EffectBody::AdmitDynamicFilterFeedback { .. }
@@ -321,7 +388,7 @@ impl AttemptPumpSource {
             // stop still owes the exact result for any issued request.
             WorkKind::Settlement
         };
-        let work = match self.reserve_work(kind) {
+        let work = match self.reserve_work(self.generation, kind) {
             Ok(work) => work,
             Err(
                 RuntimeError::Scope(error) | RuntimeError::Capacity(CapacityError::Scope(error)),
@@ -354,7 +421,11 @@ impl AttemptPumpSource {
         }
     }
 
-    fn reserve_work(&self, kind: WorkKind) -> Result<ReportedWork, RuntimeError> {
+    fn reserve_work(
+        &self,
+        generation: Generation,
+        kind: WorkKind,
+    ) -> Result<ReportedWork, RuntimeError> {
         let resources = ReservationResources::new(
             ResourceVector::default(),
             OwnedSlotNeed {
@@ -366,11 +437,11 @@ impl AttemptPumpSource {
         );
         let guard = self
             .scope
-            .reserve_child_next(self.generation, self.parent, resources, kind)?;
+            .reserve_child_next(generation, self.parent, resources, kind)?;
         let (work, mut payer) = guard.bind(kind).expect("original pump guard");
         let report = ReportSlot::reserve_next(
             &mut payer,
-            self.generation,
+            generation,
             1,
             [(self.observer, ConsumerKind::Observer)],
         )
@@ -394,7 +465,7 @@ impl AttemptPumpSource {
             work,
             self.observer,
             self.generation,
-            |custody| self.bind_work(effect.clone(), custody),
+            |custody| self.bind_work(lane, effect.clone(), custody),
         )
         .unwrap_or_else(|refused| std::panic::resume_unwind(Box::new(refused)));
         assert!(
@@ -411,7 +482,32 @@ impl AttemptPumpSource {
         job
     }
 
-    fn bind_work(&self, effect: Arc<AttemptEffectEnvelope>, custody: ExitCustody) -> BoundPumpWork {
+    fn bind_work(
+        &mut self,
+        lane: usize,
+        effect: Arc<AttemptEffectEnvelope>,
+        custody: ExitCustody,
+    ) -> BoundPumpWork {
+        match self.lanes[lane].purpose {
+            Purpose::SplitStart => {
+                let runner = self
+                    .split
+                    .as_mut()
+                    .expect("original split source")
+                    .bind_runner(effect.protocol.id, custody)
+                    .expect("original split runner");
+                return BoundPumpWork::StartSplit(effect, runner);
+            }
+            Purpose::SplitControl => {
+                let original = self
+                    .split
+                    .as_ref()
+                    .and_then(SplitSource::original)
+                    .expect("original split control");
+                return BoundPumpWork::ControlSplit(effect, original.clone());
+            }
+            _ => {}
+        }
         let key = NonZeroU64::new(effect.protocol.id.get()).expect("original action identity");
         let failure = HostFailureRef(key);
         match effect.protocol.body {
@@ -514,19 +610,6 @@ impl AttemptPumpSource {
         self.lane(effect).is_some()
     }
 
-    pub(crate) fn owner_failed_pending(
-        &self,
-        runtime: &ActorRuntime<FrontendActor>,
-        executor: &Handle,
-        pending: PendingHandoff,
-    ) {
-        handoff_actor_transport(executor, pending.job)
-            .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
-        runtime
-            .effect_completed(pending.ticket)
-            .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original)));
-    }
-
     pub(crate) fn transport_event(
         &mut self,
         effect: AttemptActionId,
@@ -589,19 +672,23 @@ impl AttemptPumpSource {
         inputs: &[InputId],
     ) {
         if !inputs.is_empty()
-            && self.lanes.iter().any(|lane| {
-                lane.live
-                    .as_ref()
-                    .and_then(|live| live.position.as_ref())
-                    .is_some_and(|position| {
-                        position
-                            .in_flight()
-                            .expect("original pump result positions")
-                            .into_iter()
-                            .flatten()
-                            .any(|input| inputs.contains(&input))
-                    })
-            })
+            && (self
+                .split
+                .as_ref()
+                .is_some_and(|split| inputs.iter().any(|&input| split.owns_input(input)))
+                || self.lanes.iter().any(|lane| {
+                    lane.live
+                        .as_ref()
+                        .and_then(|live| live.position.as_ref())
+                        .is_some_and(|position| {
+                            position
+                                .in_flight()
+                                .expect("original pump result positions")
+                                .into_iter()
+                                .flatten()
+                                .any(|input| inputs.contains(&input))
+                        })
+                }))
         {
             self.rescan = true;
             runtime
@@ -614,26 +701,125 @@ impl AttemptPumpSource {
         &self,
         reference: HostFailureRef,
     ) -> Option<ExecutionFailureInput> {
-        self.dynamic.as_ref()?.records.project_failure(reference)
+        self.dynamic
+            .as_ref()
+            .and_then(|dynamic| dynamic.records.project_failure(reference))
+            .or_else(|| {
+                self.dynamic_failures
+                    .get(&reference)
+                    .map(TaskExecutionError::preparation_input)
+            })
+            .or_else(|| self.split_failure.as_ref()?.project_failure(reference))
     }
 
-    pub(crate) fn take_failure(&self, reference: HostFailureRef) -> Option<OriginalHostFailure> {
+    pub(crate) fn take_failure(
+        &mut self,
+        reference: HostFailureRef,
+    ) -> Option<OriginalHostFailure> {
         self.dynamic
-            .as_ref()?
-            .records
-            .take_failure(reference)
+            .as_ref()
+            .and_then(|dynamic| dynamic.records.take_failure(reference))
+            .or_else(|| self.dynamic_failures.remove(&reference))
+            .or_else(|| self.split_failure.as_ref()?.take_failure(reference))
             .map(OriginalHostFailure::Task)
     }
 
     pub(crate) fn is_drained(&self) -> bool {
+        self.local_exited() && self.split_failure.is_none() && self.dynamic_failures.is_empty()
+    }
+
+    pub(crate) fn local_exited(&self) -> bool {
         (self.closing || self.lanes.is_empty())
             && self.dynamic.is_none()
             && self.diagnostics.is_none()
+            && self.split.as_ref().is_none_or(SplitSource::is_drained)
             && self
                 .lanes
                 .iter()
                 .all(|lane| lane.idle.is_none() && lane.live.is_none())
             && self.pending.is_none()
+    }
+
+    pub(crate) fn has_split_work(&self) -> bool {
+        self.split.as_ref().is_some_and(|split| !split.is_drained())
+    }
+
+    pub(crate) fn progress_split(
+        &mut self,
+        failed: bool,
+        closing: bool,
+        core_drained: bool,
+        can_release: bool,
+        payloads: &mut impl SplitPayloadStore,
+        executor: &Handle,
+        wake: &Waker,
+        dispose: impl FnOnce(Original),
+    ) -> Result<bool, Original> {
+        if let Some(cleanup) = &mut self.split_cleanup {
+            return match cleanup.poll_retired(&self.scope, &mut Context::from_waker(wake)) {
+                Poll::Pending => Ok(false),
+                Poll::Ready(Err(error)) => Err(Box::new(error)),
+                Poll::Ready(Ok(result)) => {
+                    self.split_cleanup.take();
+                    let split = self.split.as_mut().expect("original split source");
+                    if let Some(unresolved) =
+                        split.original().and_then(|original| original.unresolved())
+                    {
+                        return Err(Box::new(unresolved));
+                    }
+                    split
+                        .runner_retired(None)
+                        .map_err(|error| Box::new(error) as Original)?;
+                    result
+                        .map(|()| true)
+                        .map_err(|error| Box::new(error) as Original)
+                }
+            };
+        }
+        let Some(split) = &self.split else {
+            return Ok(false);
+        };
+        if split.dormant_cleanup_ready() {
+            let generation = self
+                .scope
+                .gates()
+                .map_err(|error| Box::new(error) as Original)?
+                .generation;
+            let work = match self.reserve_work(generation, WorkKind::Cleanup) {
+                Ok(work) => work,
+                Err(
+                    RuntimeError::Scope(ScopeError::GenerationMismatch)
+                    | RuntimeError::Capacity(CapacityError::Scope(ScopeError::GenerationMismatch)),
+                ) => return Ok(true),
+                Err(error) => return Err(Box::new(error)),
+            };
+            let split = self.split.as_mut().expect("original split source");
+            self.split_cleanup = Some(OriginalSplitCleanup::start(
+                split,
+                executor,
+                work,
+                self.observer,
+            ));
+            return Ok(true);
+        }
+        // The original control effect can still have the Native delivery
+        // as a capture even after the provider runner itself has returned.
+        let controls_exited = self
+            .lanes
+            .iter()
+            .all(|lane| lane.purpose != Purpose::SplitControl || lane.live.is_none());
+        self.split
+            .as_mut()
+            .expect("original split source")
+            .progress(
+                failed,
+                closing,
+                core_drained && controls_exited,
+                can_release,
+                payloads,
+                dispose,
+            )
+            .map_err(|error| Box::new(error) as Original)
     }
 
     pub(crate) fn progress(
@@ -712,6 +898,20 @@ impl AttemptPumpSource {
                 let live = role.live.take().unwrap();
                 let position = live.position.expect("original returned pump position");
                 assert!(role.idle.replace(position).is_none());
+                if role.purpose == Purpose::SplitStart {
+                    let split = self.split.as_mut().expect("original split source");
+                    if split
+                        .original()
+                        .is_some_and(|original| original.unresolved().is_some())
+                    {
+                        // The original provider obligation stays with SplitSource.
+                        // The raw health failure was returned by the runner.
+                        return Ok(true);
+                    }
+                    split
+                        .runner_retired(Some(live.effect.protocol.id))
+                        .expect("original split runner retirement");
+                }
                 match live.effect.protocol.body {
                     EffectBody::ReadDynamicFilters { request, .. } => self
                         .dynamic_records()
@@ -743,8 +943,11 @@ impl AttemptPumpSource {
 
     fn take_released(&mut self, retire_failures: bool) -> Option<Original> {
         if let Some(dynamic) = &self.dynamic
-            && let Some(original) = dynamic.records.take_retired(self.closing, retire_failures)
+            && let Some((failure, original)) = dynamic.records.take_retired(self.closing)
         {
+            if let Some((reference, failure)) = failure {
+                assert!(self.dynamic_failures.insert(reference, failure).is_none());
+            }
             return Some(original);
         }
         if let Some(diagnostics) = &self.diagnostics
@@ -752,7 +955,7 @@ impl AttemptPumpSource {
         {
             return Some(original);
         }
-        if !self.closing || !retire_failures || self.lanes.iter().any(|lane| lane.live.is_some()) {
+        if !self.closing || self.lanes.iter().any(|lane| lane.live.is_some()) {
             return None;
         }
         if let Some(dynamic) = self.dynamic.take() {
@@ -765,12 +968,197 @@ impl AttemptPumpSource {
                 return Some(original);
             }
         }
-        self.diagnostics
-            .take()
-            .map(|original| Box::new(original) as Original)
+        if let Some(original) = self.diagnostics.take() {
+            return Some(Box::new(original));
+        }
+        // The local pump cut may precede delivery of the terminal selected
+        // from these failures. Only final result-admission closure releases them.
+        if retire_failures {
+            if let Some((_, original)) = self.dynamic_failures.pop_first() {
+                return Some(Box::new(original));
+            }
+            if self.split.as_ref().is_none_or(SplitSource::is_drained) {
+                return self
+                    .split_failure
+                    .take()
+                    .map(|original| Box::new(original) as Original);
+            }
+        }
+        None
     }
 }
 
 fn executor_input(fact: ExecutorFact) -> FrontendInput {
     FrontendInput::Attempt(Box::new(AttemptInput::Executor(fact)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        native::data_runtime::FrontendDataRuntime,
+        query_execution::{
+            split_assignment::SplitAssignmentDriverError,
+            split_assignment_round::failure_observation_plan,
+        },
+        task_execution::{
+            blocking_io::tests::{OriginalExecutorsFixture, until},
+            error::TaskExecutionError,
+            host::{
+                custody::tests::WithdrawalInbox,
+                pumps::{split::SplitPayloadRegistration, split_source::SplitPayloadError},
+            },
+            status_intake::CountingWake,
+        },
+    };
+    use novarocks_control_runtime::transaction::RuntimeLedger;
+    use novarocks_control_runtime_core::scope::WorkAdmission;
+    use novarocks_proto_codec::lifecycle::QueryExecutionId;
+    use novarocks_types::{AttemptId, QueryId};
+    use std::{
+        collections::BTreeMap,
+        sync::{atomic::Ordering, mpsc},
+        time::Duration,
+    };
+
+    struct NoPayloads;
+    impl SplitPayloadStore for NoPayloads {
+        fn install(
+            &mut self,
+            _: &SplitPayloadRegistration,
+        ) -> Result<Option<PayloadRef>, SplitPayloadError> {
+            panic!("dormant split does not produce a delivery")
+        }
+        fn detach(&mut self, _: PayloadRef) -> Result<Option<Original>, SplitPayloadError> {
+            panic!("dormant split has no retained request")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn original_source_joins_dormant_split_close_before_returning_its_roles() {
+        let handle = Handle::current();
+        let data = FrontendDataRuntime::new(handle.clone());
+        let blocking = data.connector_blocking_io().clone();
+        let mut workers = OriginalExecutorsFixture::install(&blocking);
+        let execution =
+            QueryExecutionId::new(QueryId::new(19, 25), AttemptId::new(1).unwrap()).unwrap();
+        let (release, released) = mpsc::channel();
+        let (plan, enumerations, closes) =
+            failure_observation_plan(execution, blocking, Some(released));
+        let original = SplitPump::prepare(
+            PayloadRef(NonZeroU64::MIN),
+            execution,
+            plan,
+            BTreeMap::new(),
+            Arc::new(CountingWake::default()),
+            data,
+            Arc::default(),
+        )
+        .unwrap();
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut parent, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Cleanup,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Cleanup)
+            .unwrap();
+        parent.start().unwrap();
+        let inbox = WithdrawalInbox::with_commands(&scope, [], [16; 4]);
+        let mut source = AttemptPumpSource::bind(
+            inbox.runtime(),
+            inbox.registration(),
+            inbox.source(),
+            &parent,
+            &payer,
+            ConsumerId::new(1).unwrap(),
+            None,
+            None,
+            Some(&original),
+        )
+        .unwrap();
+        let wake = Waker::noop();
+        let mut payloads = NoPayloads;
+        assert!(
+            source
+                .progress_split(false, true, true, true, &mut payloads, &handle, wake, drop)
+                .unwrap()
+        );
+        assert!(
+            source
+                .progress_split(false, true, true, true, &mut payloads, &handle, wake, drop)
+                .unwrap()
+        );
+        until(|| closes.load(Ordering::SeqCst) == 1);
+        assert!(
+            !source
+                .progress_split(false, true, true, true, &mut payloads, &handle, wake, drop)
+                .unwrap()
+        );
+        source.progress(false, true, true, 4, true, drop);
+        assert!(!source.is_drained());
+        assert!(!scope.join_ready().unwrap());
+
+        release.send(()).unwrap();
+        let mut original_failure = None;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !source.is_drained() {
+                if let Err(error) = source.progress_split(
+                    false,
+                    true,
+                    true,
+                    true,
+                    &mut payloads,
+                    &handle,
+                    wake,
+                    drop,
+                ) {
+                    assert!(original_failure.is_none());
+                    original_failure = Some(
+                        *error
+                            .downcast::<TaskExecutionError>()
+                            .expect("original provider failure"),
+                    );
+                }
+                source.progress(false, true, true, 4, true, drop);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            original_failure,
+            Some(TaskExecutionError::SplitAssignment(
+                SplitAssignmentDriverError::SourceClose { .. }
+            ))
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+        inbox.assert_no_result();
+        parent.body_exited().unwrap();
+        parent.captures_exited().unwrap();
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 32).unwrap();
+        assert!(scope.join_ready().unwrap());
+        inbox
+            .runtime()
+            .close_actor_admission(inbox.registration().actor())
+            .unwrap();
+        while let Some(turn) = inbox.runtime().claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        inbox
+            .runtime()
+            .seal_actor(inbox.registration().actor())
+            .unwrap();
+        inbox.finish();
+        workers.shutdown().await;
+    }
 }

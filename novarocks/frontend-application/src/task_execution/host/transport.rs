@@ -63,13 +63,14 @@ pub(crate) use call_source::{AttemptCallOwner, AttemptCallSource};
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
 pub(crate) use covered::{
-    AttemptSubscriptions, FrozenSubscriptionInputs, SubscriptionEndpoint,
-    SubscriptionEndpointError, SubscriptionEndpoints, bind_subscription_endpoints,
-    retire_unpublished_endpoints,
+    AttemptSubscriptions, FrozenSubscriptionInputs, FrozenSubscriptionStageInputs,
+    StagedSubscriptionEndpoints, SubscriptionEndpoint, SubscriptionEndpointError,
+    SubscriptionEndpoints, bind_subscription_endpoints, retire_unpublished_endpoints,
+    stage_subscription_endpoints,
 };
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
-    FailedSendResult, NativeReportReferences,
+    FailedSendResult,
 };
 pub(crate) use establish_material::AttemptEstablishMaterial;
 pub(crate) use failure_abort::{

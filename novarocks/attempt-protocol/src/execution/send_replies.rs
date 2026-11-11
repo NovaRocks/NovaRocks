@@ -226,6 +226,9 @@ impl QueryTaskExecution {
             .ok_or(TaskExecutionError::UnknownOperation)?;
         self.rollback_unsent(target, member.operation);
         if let OperationTarget::Task { stage, task } = target {
+            if self.terminal_cleanup_started {
+                self.finish_split_no_more_input(member.operation);
+            }
             self.settle_task_drain(stage, task);
         }
         Ok(match (target, member.shape) {

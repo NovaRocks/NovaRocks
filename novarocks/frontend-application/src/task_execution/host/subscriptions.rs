@@ -20,10 +20,11 @@
 //! generation selection remain in the pure attempt owner.
 
 use super::observations::{ObservationError, OrderedObservationInput, StreamKey};
-use crate::{
-    native::task_transport::wire::{self, CoveredEventValidationError, CoveredRequestedVersions},
-    query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
+use crate::native::task_transport::wire::{
+    self, CoveredEventValidationError, CoveredRequestedVersions,
 };
+#[cfg(test)]
+use crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort;
 use novarocks_attempt_protocol::{
     input::{
         AttemptInput, ExecutorFact, ObservationEvent, ObservationFact, ObservationFailure,
@@ -317,8 +318,7 @@ pub(crate) enum SubscriptionSourceError {
     JobsStillLive,
 }
 impl<A: Actor> SubscriptionSource<A> {
-    /// This executes on the admitted executor, outside every caller/Core lock.
-    /// The cohort is already paid; take_child_in moves its real child once.
+    #[cfg(test)]
     pub(crate) fn from_cohort(
         participation: ParticipationRef,
         parent: &WorkScope,
@@ -329,18 +329,26 @@ impl<A: Actor> SubscriptionSource<A> {
         let notification = cohort
             .take_child_in(parent, &mut owner)
             .map_err(SubscriptionSourceError::Work)?;
-        let source = Arc::new(Self {
+        let source = Self::from_owner(participation, owner.expect("original WC child"), ingress);
+        notification.notify();
+        Ok(source)
+    }
+
+    pub(crate) fn from_owner(
+        participation: ParticipationRef,
+        owner: WorkOwner,
+        ingress: OrderedObservationInput<A>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             participation,
             ingress,
             state: Mutex::new(SourceState {
-                owner,
+                owner: Some(owner),
                 open: true,
                 max_generation: None,
                 jobs: BTreeMap::new(),
             }),
-        });
-        notification.notify();
-        Ok(source)
+        })
     }
     pub(crate) fn scope(&self) -> Result<WorkScope, SubscriptionSourceError> {
         self.state

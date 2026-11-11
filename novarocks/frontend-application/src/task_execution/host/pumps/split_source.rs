@@ -31,11 +31,26 @@ use novarocks_attempt_protocol::{
 };
 use novarocks_control_runtime::{
     actor_turn::{ActorTurnError, StandingInputObligation},
+    completion::ReportSlot,
     exit_custody::{ExitCustody, ExitCustodyPhase},
+    exit_work::{ExitWorkError, PanicPayload, PanicSink, run_future},
+    obligation::WorkRetirementObserver,
+    reported_work::ReportedWork,
+    transaction::ScopeHandle,
 };
-use novarocks_control_runtime_core::identity::InputId;
+use novarocks_control_runtime_core::identity::{ConsumerId, InputId};
 use novarocks_coordination_contract::AttemptActionId;
-use std::{any::Any, sync::Arc};
+use std::{
+    any::Any,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use tokio::{
+    runtime::Handle,
+    task::{JoinError, JoinHandle},
+};
 
 type Original = Box<dyn Any + Send>;
 type DeliveryInput = StandingInputObligation<FrontendActor>;
@@ -421,5 +436,88 @@ pub(crate) struct BoundSplitCleanup {
 impl BoundSplitCleanup {
     pub(crate) async fn run(self) -> Result<(), TaskExecutionError> {
         self.original.close_unstarted(self.custody).await
+    }
+}
+
+type CleanupResult = Result<(), TaskExecutionError>;
+
+#[derive(Debug)]
+pub(crate) enum SplitCleanupFailure {
+    Join(JoinError, Option<PanicPayload>),
+    Work(ExitWorkError),
+}
+
+/// The dormant provider close has no Core effect ticket. Its original
+/// Cleanup Work and Join are still retired by the same attempt Source.
+pub(crate) struct OriginalSplitCleanup {
+    join: Option<JoinHandle<Result<CleanupResult, ExitWorkError>>>,
+    custody: ExitCustody,
+    header: WorkRetirementObserver,
+    report: ReportSlot,
+    observer: ConsumerId,
+    panic: PanicSink,
+}
+
+impl OriginalSplitCleanup {
+    pub(crate) fn start(
+        split: &mut SplitSource,
+        executor: &Handle,
+        work: ReportedWork,
+        observer: ConsumerId,
+    ) -> Self {
+        let header = work.work().retirement_observer();
+        let report = work.report().clone();
+        let (custody, exit) = ExitCustody::from_admitted(work);
+        let original = split
+            .bind_dormant_cleanup(custody.clone())
+            .expect("original dormant split cleanup");
+        let panic = PanicSink::new();
+        let join = executor.spawn(run_future(exit, original.run(), panic.clone()));
+        Self {
+            join: Some(join),
+            custody,
+            header,
+            report,
+            observer,
+            panic,
+        }
+    }
+
+    pub(crate) fn poll_retired(
+        &mut self,
+        scope: &ScopeHandle,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<CleanupResult, SplitCleanupFailure>> {
+        let Some(join) = &mut self.join else {
+            return Poll::Pending;
+        };
+        let outcome = std::task::ready!(Pin::new(join).poll(cx));
+        self.join = None;
+        let original = match outcome {
+            Ok(Ok(original)) => original,
+            Ok(Err(error)) => return Poll::Ready(Err(SplitCleanupFailure::Work(error))),
+            Err(error) => {
+                return Poll::Ready(Err(SplitCleanupFailure::Join(error, self.panic.take())));
+            }
+        };
+        assert!(
+            self.custody
+                .actual_exit_ready()
+                .expect("original dormant cleanup exit")
+        );
+        self.report
+            .consume(self.observer)
+            .expect("original dormant cleanup report");
+        assert!(
+            self.custody
+                .try_retire()
+                .expect("original dormant cleanup retirement")
+        );
+        assert!(
+            scope
+                .reap_observed_header(&self.header)
+                .expect("original dormant cleanup header")
+        );
+        Poll::Ready(Ok(original))
     }
 }

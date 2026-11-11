@@ -63,6 +63,11 @@ impl GrantedInputs {
                 .is_some_and(|input| input.key() == expected)
     }
 
+    /// During Source close, only still-unbound grants remain here.
+    pub(super) fn take_unclaimed(&mut self) -> Option<OriginalQueuedInput> {
+        self.originals.pop_first().map(|(_, original)| original)
+    }
+
     /// ReleaseQueuedInput carries only the reference. Return the original
     /// unbound grant to the Source's credentialed disposal carrier.
     pub(crate) fn take_for_release(

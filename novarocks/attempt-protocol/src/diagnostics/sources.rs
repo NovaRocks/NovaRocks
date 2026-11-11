@@ -28,6 +28,7 @@ use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::ParticipationRef;
 use std::{
     collections::BTreeMap,
+    num::NonZeroU64,
     ops::Bound::{Excluded, Unbounded},
 };
 
@@ -144,7 +145,7 @@ impl DiagnosticSourcesState {
 pub(crate) struct DiagnosticSourceAssembly {
     frontier: DiagnosticSourceFrontier,
     after: Option<ParticipationRef>,
-    output: Vec<(novarocks_types::BackendProcessId, PayloadRef)>,
+    output: Vec<(novarocks_types::BackendProcessId, NonZeroU64)>,
     done: bool,
 }
 impl DiagnosticSourceAssembly {
@@ -183,7 +184,7 @@ impl DiagnosticSourceAssembly {
             && ordinal <= self.frontier.contributions
         {
             self.output
-                .push((participation.backend_process_id(), reference));
+                .push((participation.backend_process_id(), reference.0));
         }
         true
     }
@@ -212,7 +213,7 @@ mod tests {
     use super::*;
     use crate::{capacity::QueueStage, config::DispatchLane};
     use novarocks_types::BackendProcessId;
-    use std::{num::NonZeroU64, time::Duration};
+    use std::time::Duration;
 
     struct Turn(usize);
     impl StepContext for Turn {
@@ -287,7 +288,7 @@ mod tests {
         assert_eq!(cut.selected_at, now(5));
         assert_eq!(
             cut.runtime_filters.contributions,
-            vec![(p[2].backend_process_id(), reference(3))]
+            vec![(p[2].backend_process_id(), reference(3).0)]
         );
         assert!(!cut.runtime_filters.complete);
         assert_eq!(cut.split, SplitDiagnosticObservation::Pending);
@@ -296,8 +297,8 @@ mod tests {
         assert_eq!(
             later.runtime_filters.contributions,
             vec![
-                (p[0].backend_process_id(), reference(1)),
-                (p[2].backend_process_id(), reference(3))
+                (p[0].backend_process_id(), reference(1).0),
+                (p[2].backend_process_id(), reference(3).0)
             ]
         );
         assert_eq!(
@@ -404,7 +405,7 @@ mod tests {
             finish(state.freeze(now(1)), &state)
                 .runtime_filters
                 .contributions,
-            vec![(p[0].backend_process_id(), reference(2))]
+            vec![(p[0].backend_process_id(), reference(2).0)]
         );
     }
 }

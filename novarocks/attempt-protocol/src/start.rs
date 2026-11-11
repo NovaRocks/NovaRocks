@@ -113,6 +113,8 @@ pub struct AttemptStart {
     pub sources: AttemptSources,
     /// Whether the original host registered a development root observer.
     pub observe_dev_root: bool,
+    /// Whether the original host collects the final lifecycle RF rollup.
+    pub observe_lifecycle_diagnostics: bool,
 }
 
 impl AttemptStart {

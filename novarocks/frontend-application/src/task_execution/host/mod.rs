@@ -23,6 +23,7 @@ pub(crate) mod subscriptions;
 pub(crate) mod publication;
 pub(crate) mod pumps;
 
+pub(crate) mod auxiliary;
 pub(crate) mod custody;
 pub(crate) mod failure_bridge;
 pub(crate) mod failure_lifecycle;
@@ -30,6 +31,7 @@ pub(crate) mod failure_publication;
 pub(crate) mod failure_supervisor;
 pub(crate) mod funding;
 pub(crate) mod geometry;
+pub(crate) mod install;
 
 pub(crate) mod transport;
 

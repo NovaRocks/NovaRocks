@@ -119,7 +119,7 @@ pub(super) enum TransportRelease {
     },
 }
 impl TransportRelease {
-    fn dispose(self) {
+    pub(super) fn dispose(self) {
         match self {
             Self::QueuedInput(original) => drop(original),
             Self::Creation { request, seed } => {
@@ -184,11 +184,13 @@ impl BoundAttemptCall {
                         AttemptToLogicalBody::ConvergenceProgress {
                             local_exited,
                             closure,
+                            lifecycle_runtime_filters,
                         } => AttemptCallReply::Convergence(ConvergencePublication {
                             activation: port.activation,
                             action: port.action,
                             local_exited: *local_exited,
                             closure: closure.clone(),
+                            lifecycle_runtime_filters: lifecycle_runtime_filters.clone(),
                         }),
                         _ => unreachable!("validated original logical publication"),
                     });

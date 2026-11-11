@@ -515,6 +515,7 @@ async fn paid_diagnostic_source_reports_actual_exit_before_its_original_result()
         ConsumerId::new(1).unwrap(),
         None,
         Some(records.clone()),
+        None,
     )
     .unwrap();
     let position = source.prepay(&effect).unwrap().unwrap();

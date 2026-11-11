@@ -19,6 +19,7 @@
 
 pub(crate) mod protocol_cursor;
 
+pub use novarocks_coordination_contract::RuntimeFilterDiagnostic;
 use novarocks_coordination_contract::{AttemptComputationCut, SelectedTaskTermination};
 use novarocks_execution_contract::{OperationOutcome, TaskIdentity, TaskStatus};
 use novarocks_result_contract::PerKind;
@@ -85,12 +86,6 @@ pub enum SplitDiagnosticObservation {
     Available(crate::start::PayloadRef),
     Failed,
     SourceGone,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeFilterDiagnostic {
-    pub contributions: Vec<(novarocks_types::BackendProcessId, crate::start::PayloadRef)>,
-    pub complete: bool,
 }
 
 /// The complete Source selection from the actual diagnostic boundary. Hosts

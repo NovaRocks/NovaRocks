@@ -383,6 +383,10 @@ fn start_source_close_in(
 }
 
 impl RoundSplitAssignmentPlan {
+    pub(crate) fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     /// Everything but the delivery transport.
     ///
     /// The transport arrives at [`SplitAssignmentRoundGuard::install`] because

@@ -26,6 +26,7 @@ use crate::{
     authorization::gate::{CloseProgress, QaReply},
     capacity::StepContext,
     convergence::RemoteConvergenceDirective,
+    diagnostics::sources::DiagnosticSourceAssembly,
     effect::{AttemptEffect, EffectBody, EffectClass, Publication},
     error::TaskExecutionError,
     execution::CreateGrantProgress,
@@ -43,7 +44,7 @@ use novarocks_coordination_contract::{
     AttemptToLogical, AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
 };
 use novarocks_execution_contract::{TaskOperationId, TaskStatus};
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputSelection {
@@ -104,10 +105,13 @@ struct RootWork {
 pub(super) struct Turn {
     phase: Phase,
     observe_dev_root: bool,
+    observe_lifecycle_diagnostics: bool,
+    lifecycle_diagnostics: Option<DiagnosticSourceAssembly>,
     next: u64,
     root: Option<RootWork>,
     observation: Option<super::ObservationPass>,
     latest_input_time: Option<MonotonicInstant>,
+    local_close_requested: bool,
     local_exited: bool,
     reported_local_exit: bool,
     reported_remote_closure: bool,
@@ -121,9 +125,10 @@ pub(super) struct Turn {
 }
 
 impl Turn {
-    pub(super) fn new(observe_dev_root: bool) -> Self {
+    pub(super) fn new(observe_dev_root: bool, observe_lifecycle_diagnostics: bool) -> Self {
         Self {
             observe_dev_root,
+            observe_lifecycle_diagnostics,
             ..Self::default()
         }
     }
@@ -218,6 +223,10 @@ impl AttemptCore for Core {
                 ));
         self.diagnostic_before_input(now, cancelling);
         self.apply_claim(now, claim, input, context, &mut result)?;
+        if self.execution.failure_cause().is_some() && self.convergence.upgrade_to_cleanup() {
+            self.turn.convergence_changed = true;
+            self.request_stop(&mut result);
+        }
         if dynamic_progress {
             self.execution.signal_dynamic_feedback_progress();
         }
@@ -268,6 +277,11 @@ impl AttemptCore for Core {
             Phase::Idle
                 if self.execution.has_pending_terminal_cleanup()
                     || self.execution.has_task_input_cleanup()
+                    || self.execution.has_released_native_input()
+                    || (self.stop.business_closed()
+                        && self.candidates.enabled
+                        && (self.execution.split_pump_lifecycle_due(false)
+                            || self.execution.split_task_after(None).is_some()))
                     || self.execution.has_split_notices() =>
             {
                 Some(self.execution.monotonic_now())
@@ -425,7 +439,9 @@ impl Core {
                     && !self.stand_down_due(now)
                     && !self.authorizations.close_needs_drive()
                     && self.convergence_due(now)
-                    && (self.start_convergence_pass() || self.convergence_progress_ready())
+                    && (self.start_convergence_pass()
+                        || self.convergence_progress_ready()
+                        || self.local_close_due())
                 {
                     self.turn.phase = Phase::Converge;
                     return self.drive_convergence(now, context, result);
@@ -718,7 +734,10 @@ impl Core {
                         self.execution
                             .with_diagnostics(|collector, _| collector.stop_starting());
                     }
-                    let mode = if self.turn.split_failed || self.aborts.taking_over() {
+                    let mode = if self.turn.split_failed
+                        || self.aborts.taking_over()
+                        || self.execution.failure_cause().is_some()
+                    {
                         AttemptConvergenceMode::Cleanup
                     } else {
                         *mode
@@ -828,6 +847,7 @@ impl Core {
 
     fn convergence_due(&self, now: MonotonicInstant) -> bool {
         self.convergence_progress_ready()
+            || self.local_close_due()
             || (self.convergence.mode().is_some()
                 && self.convergence.closure().is_none()
                 && (self.turn.convergence_changed
@@ -860,6 +880,25 @@ impl Core {
                 || (self.convergence.closure().is_some() && !self.turn.reported_remote_closure))
     }
 
+    pub(super) fn local_sources_closing(&self) -> bool {
+        self.turn.local_close_requested
+    }
+
+    fn local_close_due(&self) -> bool {
+        self.convergence.closure().is_some()
+            && self.diagnostic_local_ready()
+            && !self.turn.local_close_requested
+            && !self.turn.local_exited
+            && (!self.stop.business_closed()
+                || (!self.stop.pending()
+                    && !self.authorizations.close_needs_drive()
+                    && !self.execution.has_pending_terminal_cleanup()
+                    && !self.execution.has_task_input_cleanup()
+                    && !self.execution.has_released_native_input()
+                    && self.execution.split_local_close_ready()
+                    && !self.execution.has_dynamic_feedback_work(false)))
+    }
+
     fn drive_convergence(
         &mut self,
         now: MonotonicInstant,
@@ -874,12 +913,57 @@ impl Core {
                 .then(|| self.convergence.closure().cloned())
                 .flatten();
             let local_exited = self.turn.local_exited && self.diagnostic_local_ready();
+            let final_report = (self.turn.reported_remote_closure || closure.is_some())
+                && (self.turn.reported_local_exit || local_exited);
+            let lifecycle_runtime_filters =
+                if final_report && self.turn.observe_lifecycle_diagnostics {
+                    let sources = self.execution.diagnostic_sources();
+                    let assembly = self
+                        .turn
+                        .lifecycle_diagnostics
+                        .get_or_insert_with(|| DiagnosticSourceAssembly::new(sources.freeze(now)));
+                    while !assembly.complete() {
+                        if !assembly.advance(sources, context) {
+                            return Ok(());
+                        }
+                    }
+                    let selected = self
+                        .turn
+                        .lifecycle_diagnostics
+                        .take()
+                        .expect("original lifecycle diagnostics")
+                        .finish()
+                        .expect("completed lifecycle diagnostics");
+                    Some(Arc::new(selected.runtime_filters))
+                } else {
+                    None
+                };
             self.turn.reported_remote_closure |= closure.is_some();
             self.turn.reported_local_exit |= local_exited;
             result.effect = Some(self.port_effect(AttemptToLogicalBody::ConvergenceProgress {
                 local_exited,
                 closure,
+                lifecycle_runtime_filters,
             })?);
+            return Ok(());
+        }
+        if self.local_close_due() {
+            if !context.charge(1) {
+                return Ok(());
+            }
+            self.turn.phase = Phase::Idle;
+            if !self.stop.business_closed() {
+                self.request_stop(result);
+                return Ok(());
+            }
+            let (id, _) = self.turn.issue()?;
+            self.execution.close_local_split_notices();
+            self.turn.local_close_requested = true;
+            result.effect = Some(AttemptEffect {
+                id,
+                class: EffectClass::Cleanup,
+                body: EffectBody::PrepareLocalConvergence,
+            });
             return Ok(());
         }
         if self.convergence.waiting_for_process() || !context.charge(1) {

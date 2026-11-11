@@ -19,7 +19,10 @@
 use super::SendKey;
 use crate::{
     control_runtime::actor::{FrontendActor, FrontendInput},
-    task_execution::intent::{OperationAcknowledgement, attempt_receipt::AttemptReceiptError},
+    task_execution::{
+        host::publication::DiagnosticReleaseReport,
+        intent::{OperationAcknowledgement, attempt_receipt::AttemptReceiptError},
+    },
 };
 use novarocks_attempt_protocol::{
     failure::HostFailureRef,
@@ -37,6 +40,7 @@ use std::task::Poll;
 pub(crate) enum NativeReceiptError {
     WrongSend,
     AlreadyRecorded,
+    WrongDiagnosticRelease,
     Projection(AttemptReceiptError),
 }
 
@@ -80,6 +84,7 @@ pub(crate) struct NativeReceiptInput {
     key: SendKey,
     kind: OperationKind,
     position: StandingInputObligation<FrontendActor>,
+    release_diagnostic: Option<DiagnosticReleaseReport>,
     receipt: Option<Receipt>,
 }
 impl NativeReceiptInput {
@@ -104,8 +109,14 @@ impl NativeReceiptInput {
             key,
             kind,
             position,
+            release_diagnostic: None,
             receipt: None,
         }
+    }
+
+    pub(super) fn bind_release_diagnostic(&mut self, report: DiagnosticReleaseReport) {
+        assert_eq!(self.kind, OperationKind::ReleaseParticipation);
+        assert!(self.release_diagnostic.replace(report).is_none());
     }
 
     /// Freeze the passive fact on the executor before filling the mailbox.
@@ -135,6 +146,11 @@ impl NativeReceiptInput {
             Ok(observation) => observation,
             Err(error) => return Err((NativeReceiptError::Projection(error), original)),
         };
+        if let Some(report) = &self.release_diagnostic
+            && !report.record(&original, filter)
+        {
+            return Err((NativeReceiptError::WrongDiagnosticRelease, original));
+        }
         self.receipt = Some(Receipt::Prepared {
             original,
             value: FrontendInput::Attempt(Box::new(AttemptInput::Executor(
@@ -181,11 +197,30 @@ impl NativeReceiptInput {
     pub(in crate::task_execution::host) fn retire_ready_after_exit(
         &mut self,
     ) -> Result<Poll<Option<RetiredNativeReceipt>>, ActorTurnError> {
-        if !self.position.retire_ready_after_exit()? {
+        if !retire_passive_report_position(&self.position)? {
             return Ok(Poll::Pending);
         }
         self.position.close_after_exit()?;
         Ok(Poll::Ready(self.receipt.take().map(Receipt::into_retired)))
+    }
+}
+
+/// Called by the original report custodian after the actual sender Join.
+pub(super) fn retire_passive_report_position(
+    position: &StandingInputObligation<FrontendActor>,
+) -> Result<bool, ActorTurnError> {
+    if position.retire_ready_after_exit()? {
+        return Ok(true);
+    }
+    match position.take_failed_role_payload() {
+        Ok(Some(original)) => {
+            original.dispose()?;
+            position.retire_ready_after_exit()
+        }
+        Ok(None) | Err(ActorTurnError::ActorNotRetired | ActorTurnError::InputAuthorMismatch) => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
 }
 

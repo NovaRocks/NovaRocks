@@ -28,7 +28,9 @@ use crate::query_execution::split_assignment_round::{
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use super::{
-    completion::accept_final_info, graph::TaskNode, round::TaskRound,
+    completion::accept_final_info,
+    graph::{TaskGraph, TaskNode},
+    round::TaskRound,
     status_intake::StatusIntakeWake,
 };
 use crate::native::task_result_transport::{FinalTaskInfoRead, TaskResultTransport};
@@ -168,13 +170,17 @@ impl TaskFinalInfoCollector {
         round: &TaskRound,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Self {
+        Self::from_graph(transport, enabled, round.execution().graph(), wake)
+    }
+
+    pub(crate) fn from_graph(
+        transport: Arc<dyn TaskResultTransport>,
+        enabled: bool,
+        graph: &TaskGraph,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Self {
         let expected: Arc<[TaskIdentity]> = if enabled {
-            round
-                .execution()
-                .graph()
-                .tasks()
-                .map(TaskNode::identity)
-                .collect()
+            graph.tasks().map(TaskNode::identity).collect()
         } else {
             Arc::from([])
         };
@@ -184,19 +190,12 @@ impl TaskFinalInfoCollector {
             unread: expected.iter().copied().collect(),
             terminal_cursor: 0,
             expected,
-            expected_fragments: round
-                .execution()
-                .graph()
+            expected_fragments: graph
                 .tasks()
                 .map(|task| (task.identity(), task.fragment_id()))
                 .collect(),
-            expected_participations: round
-                .execution()
-                .graph()
-                .participations()
-                .copied()
-                .collect(),
-            root: round.root_task(),
+            expected_participations: graph.participations().copied().collect(),
+            root: graph.root_identity(),
             missing: BTreeMap::new(),
             publication: None,
             final_info_closure: None,

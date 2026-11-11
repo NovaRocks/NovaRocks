@@ -17,19 +17,24 @@
 
 //! Terminal delivery to the original logical attempt.
 
+use super::control::AttemptOwnerControls;
 use crate::control_runtime::membership::{MembershipErrors, ObservationErrors};
 use crate::task_execution::{
     error::TaskExecutionError,
-    host::{failure_bridge::FailureBridge, publication::OriginalHostFailure},
+    host::{
+        failure_bridge::FailureBridge, publication::OriginalHostFailure, startup::AttemptStartup,
+    },
 };
 use novarocks_attempt_protocol::{
     error::{ParticipantObservationFailure, TaskExecutionError as ProtocolError},
     failure::{AttemptFailure, AttemptFailureSite, HostFailureRef, ProtocolFailure},
     operation::OperationDispatchResult,
 };
+use novarocks_control_runtime::actor_turn::ActorTurnError;
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptActivationIdentity, AttemptConvergenceClosure,
+    AttemptActionId, AttemptActivationIdentity, AttemptConvergenceClosure, AttemptConvergenceMode,
     AttemptParticipationConvergence, AttemptTerminal, AttemptToLogical, AttemptToLogicalBody,
+    MonotonicClock, RuntimeFilterDiagnostic,
 };
 use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::{
@@ -40,6 +45,7 @@ use novarocks_query_application::{
     },
     execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
+use novarocks_workload_control::CancellationView;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 
@@ -84,12 +90,15 @@ pub(crate) struct ConvergencePublication {
     pub(crate) action: AttemptActionId,
     pub(crate) local_exited: bool,
     pub(crate) closure: Option<Arc<AttemptConvergenceClosure>>,
+    pub(crate) lifecycle_runtime_filters: Option<Arc<RuntimeFilterDiagnostic>>,
 }
+
+type ConvergenceReceipt<T> = (T, Option<Arc<RuntimeFilterDiagnostic>>);
 
 #[derive(Default)]
 struct ConvergenceOutbox {
-    local: OnceLock<AttemptActionId>,
-    remote: OnceLock<Arc<AttemptConvergenceClosure>>,
+    local: OnceLock<ConvergenceReceipt<AttemptActionId>>,
+    remote: OnceLock<ConvergenceReceipt<Arc<AttemptConvergenceClosure>>>,
     ready: Notify,
 }
 
@@ -97,30 +106,54 @@ impl ConvergenceOutbox {
     fn publish(&self, original: ConvergencePublication) -> Result<(), ConvergencePublication> {
         if (!original.local_exited && original.closure.is_none())
             || (original.closure.is_none() && self.local.get().is_some())
+            || (original.lifecycle_runtime_filters.is_some()
+                && ((!original.local_exited && self.local.get().is_none())
+                    || (original.closure.is_none() && self.remote.get().is_none())))
         {
             return Err(original);
         }
         if let Some(closure) = &original.closure
-            && self.remote.set(Arc::clone(closure)).is_err()
+            && self
+                .remote
+                .set((
+                    Arc::clone(closure),
+                    original.lifecycle_runtime_filters.clone(),
+                ))
+                .is_err()
         {
             return Err(original);
         }
         if original.local_exited {
-            self.local.get_or_init(|| original.action);
+            // The final combined occurrence carries its selection with the
+            // remote receipt. A final local-only occurrence owns it here.
+            self.local.get_or_init(|| {
+                let selection = original
+                    .closure
+                    .is_none()
+                    .then_some(original.lifecycle_runtime_filters)
+                    .flatten();
+                (original.action, selection)
+            });
         }
         self.ready.notify_one();
         Ok(())
     }
 
-    fn report(&self) -> Option<&Arc<AttemptConvergenceClosure>> {
-        self.local.get()?;
-        self.remote.get()
+    fn report(
+        &self,
+    ) -> Option<(
+        &Arc<AttemptConvergenceClosure>,
+        Option<&Arc<RuntimeFilterDiagnostic>>,
+    )> {
+        let (_, local) = self.local.get()?;
+        let (closure, remote) = self.remote.get()?;
+        Some((closure, local.as_ref().or(remote.as_ref())))
     }
 
     /// The Core cut is separate from removal of the actual Host registration.
     async fn wait(&self) -> Arc<AttemptConvergenceClosure> {
         loop {
-            if let Some(closure) = self.report() {
+            if let Some((closure, _)) = self.report() {
                 return Arc::clone(closure);
             }
             self.ready.notified().await;
@@ -225,6 +258,7 @@ pub(crate) struct RegisteredAttemptTerminal {
     failure: FailureBridge,
     membership_errors: Option<MembershipErrors>,
     selected: Option<Result<NativeAttemptTerminal, TerminalProjectionError>>,
+    lifecycle_runtime_filters: Option<Arc<RuntimeFilterDiagnostic>>,
 }
 
 impl RegisteredAttemptTerminal {
@@ -238,6 +272,7 @@ impl RegisteredAttemptTerminal {
             failure,
             membership_errors,
             selected: None,
+            lifecycle_runtime_filters: None,
         }
     }
 
@@ -246,6 +281,10 @@ impl RegisteredAttemptTerminal {
             .as_ref()
             .map(MembershipErrors::take)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn lifecycle_runtime_filter_diagnostic(&self) -> Option<&RuntimeFilterDiagnostic> {
+        self.lifecycle_runtime_filters.as_deref()
     }
 
     pub(crate) async fn terminal(
@@ -287,6 +326,14 @@ impl RegisteredAttemptTerminal {
                 Arc::new(error),
             )
         })?;
+        self.closure_after_close(normal, request).await
+    }
+
+    async fn closure_after_close(
+        &mut self,
+        normal: bool,
+        request: NativeActiveConvergenceRequest,
+    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
         if normal && let Some(closure) = self.normal_closure_after_exit().await? {
             return Ok(closure);
         }
@@ -309,18 +356,222 @@ impl RegisteredAttemptTerminal {
         if !self.failure.normal_host_exit().await? {
             return Ok(None);
         }
-        let remote = self.normal.convergence.report().ok_or_else(|| {
-            StatementNativeHealthFailure::actual_exit_unproven(
-                "Native host exited without its original normal convergence reports",
-                Arc::new(MissingNormalConvergence),
-            )
-        })?;
+        let (remote, lifecycle_runtime_filters) =
+            self.normal.convergence.report().ok_or_else(|| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "Native host exited without its original normal convergence reports",
+                    Arc::new(MissingNormalConvergence),
+                )
+            })?;
+        self.lifecycle_runtime_filters = lifecycle_runtime_filters.cloned();
         Ok(Some(project_convergence(remote)))
     }
 
     pub(crate) fn failure_bridge_mut(&mut self) -> &mut FailureBridge {
         &mut self.failure
     }
+}
+
+type PublishAbortRoute = Box<dyn FnOnce(&AttemptStartup) -> Result<(), ActorTurnError> + Send>;
+
+/// QA borrows this owner after registration. The Host keeps the original
+/// input positions and work even if either borrowed QA future is dropped.
+#[must_use]
+pub(crate) struct RegisteredActiveAttempt {
+    startup: AttemptStartup,
+    controls: AttemptOwnerControls,
+    terminal: RegisteredAttemptTerminal,
+    clock: Arc<dyn MonotonicClock>,
+    publish_abort_route: Option<PublishAbortRoute>,
+    route_error: Option<ActorTurnError>,
+    run_outcome: Option<NativeAttemptTerminal>,
+    normal_at_close: Option<bool>,
+}
+
+impl RegisteredActiveAttempt {
+    pub(crate) fn new(
+        startup: AttemptStartup,
+        controls: AttemptOwnerControls,
+        terminal: RegisteredAttemptTerminal,
+        clock: Arc<dyn MonotonicClock>,
+        publish_abort_route: impl FnOnce(&AttemptStartup) -> Result<(), ActorTurnError> + Send + 'static,
+    ) -> Self {
+        Self {
+            startup,
+            controls,
+            terminal,
+            clock,
+            publish_abort_route: Some(Box::new(publish_abort_route)),
+            route_error: None,
+            run_outcome: None,
+            normal_at_close: None,
+        }
+    }
+
+    pub(crate) fn take_membership_errors(&self) -> ObservationErrors {
+        self.terminal.take_membership_errors()
+    }
+
+    pub(crate) fn lifecycle_runtime_filter_diagnostic(&self) -> Option<&RuntimeFilterDiagnostic> {
+        self.terminal.lifecycle_runtime_filter_diagnostic()
+    }
+
+    async fn publish_abort_route(&mut self) -> Result<(), ActorTurnError> {
+        if let Some(error) = self.route_error {
+            return Err(error);
+        }
+        self.startup.wait_ready().await?;
+        if let Some(publish) = self.publish_abort_route.take()
+            && let Err(error) = publish(&self.startup)
+        {
+            self.route_error = Some(error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn run(&mut self, cancellation: CancellationView) -> NativeAttemptTerminal {
+        if let Some(original) = &self.run_outcome {
+            return original.clone();
+        }
+        let outcome = match self.publish_abort_route().await {
+            Ok(()) => self.wait_for_terminal(&cancellation).await,
+            Err(ActorTurnError::ActorFailed) => self.original_terminal().await,
+            Err(error) => active_bridge_failure(&error),
+        };
+        self.run_outcome = Some(outcome.clone());
+        outcome
+    }
+
+    async fn wait_for_terminal(
+        &mut self,
+        cancellation: &CancellationView,
+    ) -> NativeAttemptTerminal {
+        tokio::select! {
+            biased;
+            terminal = self.terminal.terminal() => return terminal.unwrap_or_else(|error| active_bridge_failure(&error)),
+            reason = cancellation.cancelled(), if !self.controls.cancellation_submitted() => {
+                match self.controls.stop_for_cancellation(reason) {
+                    Ok(_) | Err(ActorTurnError::ActorFailed | ActorTurnError::Closed) => {}
+                    Err(error) => return active_bridge_failure(&error),
+                }
+            }
+        }
+        self.original_terminal().await
+    }
+
+    async fn original_terminal(&mut self) -> NativeAttemptTerminal {
+        self.terminal
+            .terminal()
+            .await
+            .unwrap_or_else(|error| active_bridge_failure(&error))
+    }
+
+    /// Reentry preserves the original remote deadline, paid input and close
+    /// request. Returning caller positions does not prove local Host exit.
+    pub(crate) async fn converge(
+        &mut self,
+        request: NativeActiveConvergenceRequest,
+        retain_diagnostics: bool,
+        release_caller_positions: impl FnOnce() -> Result<(), ActorTurnError>,
+    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
+        let normal = if let Some(normal) = self.normal_at_close {
+            normal
+        } else {
+            let normal = match self.publish_abort_route().await {
+                Ok(()) => self.wait_to_close(&request, retain_diagnostics).await?,
+                Err(error) => self.close_raced(error).await?,
+            };
+            release_caller_positions().map_err(|error| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "Native convergence could not return its original caller positions",
+                    Arc::new(error),
+                )
+            })?;
+            self.terminal.request_host_close().map_err(|error| {
+                StatementNativeHealthFailure::actual_exit_unproven(
+                    "Native convergence could not close its original host",
+                    Arc::new(error),
+                )
+            })?;
+            self.normal_at_close = Some(normal);
+            normal
+        };
+        self.terminal.closure_after_close(normal, request).await
+    }
+
+    async fn wait_to_close(
+        &mut self,
+        request: &NativeActiveConvergenceRequest,
+        retain_diagnostics: bool,
+    ) -> Result<bool, StatementNativeHealthFailure> {
+        loop {
+            if let Some(reason) = request.cancellation().reason()
+                && let Err(error) = self.controls.stop_for_cancellation(reason)
+            {
+                return self.close_raced(error).await;
+            }
+            let failed = matches!(self.run_outcome, Some(NativeAttemptTerminal::Failed(_)));
+            let normal = !failed
+                && !self.controls.cancellation_submitted()
+                && (request.computation_ready().is_some()
+                    || matches!(self.run_outcome, Some(NativeAttemptTerminal::Completed)));
+            let mode = if normal {
+                AttemptConvergenceMode::Normal
+            } else {
+                AttemptConvergenceMode::Cleanup
+            };
+            match self.controls.begin_convergence(
+                request,
+                mode,
+                retain_diagnostics && !self.controls.cancellation_submitted(),
+                self.clock.as_ref(),
+            ) {
+                Ok(_) => {}
+                Err(ActorTurnError::StandingInputBusy) => {
+                    tokio::select! {
+                        normal = self.terminal.normal_convergence_ready() => return Ok(normal),
+                        _ = request.cancellation().cancelled(), if !self.controls.cancellation_submitted() => continue,
+                        idle = self.controls.wait_convergence_idle() => {
+                            if let Err(error) = idle {
+                                return self.close_raced(error).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => return self.close_raced(error).await,
+            }
+            tokio::select! {
+                normal = self.terminal.normal_convergence_ready() => return Ok(normal),
+                _ = request.cancellation().cancelled(), if !self.controls.cancellation_submitted() => {}
+            }
+        }
+    }
+
+    async fn close_raced(
+        &mut self,
+        error: ActorTurnError,
+    ) -> Result<bool, StatementNativeHealthFailure> {
+        if matches!(error, ActorTurnError::ActorFailed | ActorTurnError::Closed)
+            && !self.terminal.failure.normal_host_exit().await?
+        {
+            return Ok(false);
+        }
+        Err(StatementNativeHealthFailure::actual_exit_unproven(
+            "Native convergence lost its original attempt control",
+            Arc::new(error),
+        ))
+    }
+}
+
+fn active_bridge_failure(error: &impl std::fmt::Debug) -> NativeAttemptTerminal {
+    let detail = format!("Native attempt bridge failed: {error:?}");
+    NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(failure_input(
+        QueryFailureReason::PreparationProtocol,
+        &detail,
+        ExecutionFailureSite::Coordinator,
+    )))
 }
 
 #[derive(Debug)]

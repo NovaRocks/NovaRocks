@@ -55,6 +55,7 @@ struct Active {
     task: TaskIdentity,
     delivery: SplitDeliveryRef,
     released: bool,
+    reported_unknown: bool,
 }
 
 #[derive(Debug, Default)]
@@ -65,15 +66,23 @@ pub(super) struct SplitDeliveries {
     tasks: BTreeMap<TaskIdentity, SplitDeliveryRef>,
     active: BTreeMap<TaskOperationId, Active>,
     notices: VecDeque<EffectBody>,
+    unsettled: usize,
+    local_close: bool,
 }
 
 impl SplitDeliveries {
+    fn notice(&mut self, body: EffectBody) {
+        if !self.local_close {
+            self.notices.push_back(body);
+        }
+    }
+
     fn admission(
         &mut self,
         delivery: SplitDeliveryRef,
         settlement: Option<SplitDeliverySettlement>,
     ) {
-        self.notices.push_back(EffectBody::PumpUpdateAdmitted {
+        self.notice(EffectBody::PumpUpdateAdmitted {
             pump: self.source.expect("registered split pump"),
             delivery,
             settlement,
@@ -156,6 +165,10 @@ impl QueryTaskExecution {
         };
         if domains.next().is_some() || self.task_by_identity_ref(task).is_none() {
             return Err(TaskExecutionError::UnknownOperation);
+        }
+        if self.split.local_close {
+            // The local owner retains any late original payload for disposal.
+            return Ok(());
         }
         if let Some(previous) = self.split.tasks.get(&task) {
             if *previous == delivery {
@@ -246,14 +259,17 @@ impl QueryTaskExecution {
             action,
             QueuedInputPayload::NewTaskUpdate(payload),
         )?;
-        self.split.active.insert(
+        let previous = self.split.active.insert(
             operation,
             Active {
                 task,
                 delivery,
                 released: false,
+                reported_unknown: false,
             },
         );
+        assert!(previous.is_none());
+        self.split.unsettled += 1;
         Ok(Some(effect))
     }
 
@@ -289,6 +305,7 @@ impl QueryTaskExecution {
                 .active
                 .remove(&operation)
                 .expect("unreleased split");
+            self.split.unsettled -= 1;
             self.split.discard(row.task, row.delivery, settlement);
         }
     }
@@ -299,13 +316,12 @@ impl QueryTaskExecution {
         };
         if !row.released {
             row.released = true;
-            self.split
-                .notices
-                .push_back(EffectBody::PumpOperationReleased {
-                    pump: self.split.source.expect("registered split pump"),
-                    delivery: row.delivery,
-                    operation,
-                });
+            let delivery = row.delivery;
+            self.split.notice(EffectBody::PumpOperationReleased {
+                pump: self.split.source.expect("registered split pump"),
+                delivery,
+                operation,
+            });
         }
     }
 
@@ -347,16 +363,23 @@ impl QueryTaskExecution {
     }
 
     fn settle_split(&mut self, operation: TaskOperationId, settlement: SplitDeliverySettlement) {
-        let delivery = self.split.active[&operation].delivery;
+        let row = self
+            .split
+            .active
+            .get_mut(&operation)
+            .expect("original split");
+        let delivery = row.delivery;
+        if !row.reported_unknown {
+            self.split.unsettled -= 1;
+        }
         let retained = matches!(settlement, SplitDeliverySettlement::Unknown(_));
-        self.split
-            .notices
-            .push_back(EffectBody::PumpOperationSettled {
-                pump: self.split.source.expect("registered split pump"),
-                delivery,
-                operation,
-                settlement,
-            });
+        row.reported_unknown = retained;
+        self.split.notice(EffectBody::PumpOperationSettled {
+            pump: self.split.source.expect("registered split pump"),
+            delivery,
+            operation,
+            settlement,
+        });
         if !retained {
             let row = self
                 .split
@@ -369,6 +392,20 @@ impl QueryTaskExecution {
 
     pub(crate) fn has_split_notices(&self) -> bool {
         !self.split.notices.is_empty()
+    }
+
+    pub(crate) fn split_local_close_ready(&self) -> bool {
+        matches!(self.split.state, PumpState::Dormant | PumpState::Finished)
+            && self.split.pending.is_empty()
+            && self.split.unsettled == 0
+            && self.split.notices.is_empty()
+    }
+
+    pub(crate) fn close_local_split_notices(&mut self) {
+        assert!(self.split_local_close_ready());
+        // An observed Unknown may still reconcile on the Native path. Its
+        // original split delivery now belongs to the draining local host.
+        self.split.local_close = true;
     }
 
     pub(crate) fn take_split_notice(&mut self) -> Option<EffectBody> {

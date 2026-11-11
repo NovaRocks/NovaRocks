@@ -21,8 +21,8 @@ use super::*;
 use crate::native::task_result_transport::{DynamicFilterRead, DynamicFilterReadError};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::host::publication::{
-    DiagnosticSourceSnapshot, OriginalDiagnosticBinding, OriginalDiagnosticPayload,
-    OriginalDiagnosticRecords,
+    DiagnosticPayloadAddress, DiagnosticSourceSnapshot, OriginalDiagnosticBinding,
+    OriginalDiagnosticPayload, OriginalDiagnosticRecords,
 };
 use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 use crate::task_execution::status_intake::CountingWake;
@@ -91,7 +91,11 @@ impl OriginalDiagnosticRecords for OriginalRecords {
             fragments: &self.fragments,
         }
     }
-    fn payload(&self, reference: PayloadRef) -> Option<OriginalDiagnosticPayload> {
+    fn payload(&self, address: DiagnosticPayloadAddress) -> Option<OriginalDiagnosticPayload> {
+        let reference = match address {
+            DiagnosticPayloadAddress::RuntimeFilter { reference, .. }
+            | DiagnosticPayloadAddress::SplitProfile(reference) => reference,
+        };
         Some(match self.rows.get(&reference)? {
             OwnedPayload::RuntimeFilter(activation, participation, telemetry) => {
                 OriginalDiagnosticPayload::RuntimeFilter {
@@ -188,7 +192,7 @@ fn core_publication_resolves_pre_cut_rows_after_later_rf_and_split_changes() {
     cut.sources
         .runtime_filters
         .contributions
-        .push((records.parts[0].backend_process_id(), reference(1)));
+        .push((records.parts[0].backend_process_id(), reference(1).0));
     cut.sources.split = SplitDiagnosticObservation::Available(reference(2));
     // Later rich records exist before charged expansion/resolution completes.
     // The old rows are still owned; no current-source sampling API is offered.
@@ -228,7 +232,7 @@ fn core_publication_resolves_pre_cut_rows_after_later_rf_and_split_changes() {
     );
     assert!(matches!(split, ProfileSplitDiagnostic::Available(profile) if profile == before));
     // A later cut can select the new rows; it does not rewrite the first one.
-    cut.sources.runtime_filters.contributions[0].1 = reference(3);
+    cut.sources.runtime_filters.contributions[0].1 = reference(3).0;
     cut.sources.runtime_filters.complete = true;
     cut.sources.split = SplitDiagnosticObservation::Available(reference(4));
     let (rf, split) = DiagnosticSourceSnapshot::resolve(&cut, &records)
@@ -325,7 +329,7 @@ fn core_publication_rejects_foreign_wrong_kind_and_changed_selection_refs() {
     cut.sources
         .runtime_filters
         .contributions
-        .push((novarocks_types::BackendProcessId::new_v7(), reference(1)));
+        .push((novarocks_types::BackendProcessId::new_v7(), reference(1).0));
     assert!(DiagnosticSourceSnapshot::resolve(&cut, &records).is_err());
     let telemetry = crate::task_execution::tests::fixture_runtime_filter_contribution();
     records.rows.insert(
@@ -333,7 +337,7 @@ fn core_publication_rejects_foreign_wrong_kind_and_changed_selection_refs() {
         OwnedPayload::RuntimeFilter(foreign, records.parts[0], telemetry.clone()),
     );
     cut.sources.runtime_filters.contributions[0] =
-        (records.parts[0].backend_process_id(), reference(2));
+        (records.parts[0].backend_process_id(), reference(2).0);
     assert!(
         DiagnosticSourceSnapshot::resolve(&cut, &records).is_err(),
         "same backend cannot authorize a foreign activation row"

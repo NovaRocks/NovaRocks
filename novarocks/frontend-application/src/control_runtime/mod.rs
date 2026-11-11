@@ -90,7 +90,7 @@ use std::{
     any::Any,
     collections::BTreeMap,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
@@ -147,6 +147,16 @@ pub(crate) struct FrontendAttemptRuntime {
     host_observation: Arc<FrontendHostObservations>,
     unresolved_replacements: Mutex<BTreeMap<ScopeId, UnresolvedReplacementQualification>>,
 }
+
+/// Keeps process shutdown from fencing the CR and host registries between
+/// the original attempt's scope admission and publication of its host.
+pub(crate) struct AttemptRegistrationGuard<'a> {
+    owner: &'a FrontendAttemptRuntime,
+    _open: MutexGuard<'a, bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AttemptRegistrationClosed;
 
 #[derive(Debug)]
 pub(crate) enum ReplacementQualificationScopeError {
@@ -271,6 +281,32 @@ impl FrontendAttemptRuntime {
         );
     }
 
+    pub(crate) fn begin_attempt_registration(
+        &self,
+    ) -> Result<AttemptRegistrationGuard<'_>, AttemptRegistrationClosed> {
+        let open = self
+            .registration_open
+            .lock()
+            .expect("frontend registration gate");
+        if !*open {
+            return Err(AttemptRegistrationClosed);
+        }
+        Ok(AttemptRegistrationGuard {
+            owner: self,
+            _open: open,
+        })
+    }
+}
+
+impl AttemptRegistrationGuard<'_> {
+    pub(crate) fn register_binding(
+        &self,
+        binding: HostBinding,
+        funding: &mut Option<AttemptHostFunding>,
+    ) -> Result<HostExit, HostRegistrationRefusal> {
+        self.owner.host.register_with_funding(binding, funding)
+    }
+
     /// Install the real host route before that host can post Bootstrap.
     /// Refusal returns the Source and its still-unpublished original position.
     pub(crate) fn register_attempt(
@@ -303,17 +339,17 @@ impl FrontendAttemptRuntime {
         } = prepared;
         assert!(binding.membership.is_none());
         binding.membership = Some(AttemptMembershipSource::new(
-            self.members.clone(),
+            self.owner.members.clone(),
             membership.target,
         ));
         let mut funding = Some(funding);
-        match self.register(binding, &mut funding) {
+        match self.register_binding(binding, &mut funding) {
             Ok(exit) => Ok((
                 startup,
                 controls,
                 RegisteredAttemptTerminal::new(
                     terminal,
-                    failure.bind(exit, self.backend_processes.clone()),
+                    failure.bind(exit, self.owner.backend_processes.clone()),
                     Some(membership.errors),
                 ),
             )),
@@ -327,25 +363,6 @@ impl FrontendAttemptRuntime {
                 funding.expect("registration refusal returns the original funding"),
             )),
         }
-    }
-
-    fn register(
-        &self,
-        binding: HostBinding,
-        funding: &mut Option<AttemptHostFunding>,
-    ) -> Result<HostExit, HostRegistrationRefusal> {
-        let open = self
-            .registration_open
-            .lock()
-            .expect("frontend registration gate");
-        if !*open {
-            return Err(HostRegistrationRefusal {
-                reason: "frontend registration is closed",
-                runtime_error: None,
-                binding,
-            });
-        }
-        self.host.register_with_funding(binding, funding)
     }
 }
 

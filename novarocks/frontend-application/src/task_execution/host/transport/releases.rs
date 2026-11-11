@@ -17,8 +17,9 @@
 
 //! Actual retirement of rich transport captures returned to the host.
 
-use super::AttemptCallSource;
+use super::{AttemptCallSource, call_source::TransportRelease};
 use crate::task_execution::host::{
+    adapter::AttemptNotice,
     custody::{CustodyError, HostDisposal},
     observations::{ObservationError, backing, host_turn::OrderedObservationHost},
 };
@@ -29,6 +30,7 @@ use std::{
     any::Any,
     collections::VecDeque,
     mem::ManuallyDrop,
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 use tokio::{runtime::Handle, task::JoinError};
@@ -37,16 +39,20 @@ type Original = Box<dyn Any + Send>;
 
 pub(super) enum ReleaseCapture {
     Original(Original),
+    Transport(TransportRelease),
     Subscription(WorkOwner),
     Observations(OrderedObservationHost),
+    Notice(Arc<AttemptNotice>),
 }
 
 impl ReleaseCapture {
     pub(super) fn dispose(self) {
         match self {
             Self::Original(original) => drop(original),
+            Self::Transport(original) => original.dispose(),
             Self::Subscription(owner) => owner.complete_after_terminal_cancel_settled(),
             Self::Observations(owner) => owner.close_on_executor(),
+            Self::Notice(notice) => crate::task_execution::host::auxiliary::report_notice(&notice),
         }
     }
 }
@@ -100,6 +106,10 @@ impl TransportReleases {
 
     pub(super) fn executor(&self) -> &Handle {
         &self.executor
+    }
+
+    pub(super) fn wake(&self) -> &Waker {
+        &self.wake
     }
 
     pub(super) fn retain(&mut self, original: ReleaseCapture) {

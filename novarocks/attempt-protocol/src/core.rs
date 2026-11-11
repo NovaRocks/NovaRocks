@@ -135,6 +135,7 @@ impl Core {
             initial_now,
             sources,
             observe_dev_root,
+            observe_lifecycle_diagnostics,
         } = start;
         let FrozenAttemptPlan {
             graph,
@@ -262,7 +263,7 @@ impl Core {
         Ok(Self {
             activation: activation.identity,
             sources,
-            turn: turn::Turn::new(observe_dev_root),
+            turn: turn::Turn::new(observe_dev_root, observe_lifecycle_diagnostics),
             maximum_send_members: transport.max_batch_items,
             observation_source: observation,
             execution,
@@ -640,6 +641,9 @@ impl Core {
     }
 
     pub(crate) fn next_subscription_deadline(&self) -> Option<MonotonicInstant> {
+        if self.local_sources_closing() {
+            return None;
+        }
         let now = self.execution.monotonic_now();
         if self.execution.has_subscription_reconciliation() {
             return Some(now);
@@ -654,6 +658,9 @@ impl Core {
         token: AttemptRequestToken,
         context: &mut dyn StepContext,
     ) -> Result<SubscriptionStep, TaskExecutionError> {
+        if self.local_sources_closing() {
+            return Ok(SubscriptionStep::Idle);
+        }
         if self.acknowledgements.run_round_tail() != Ok(true) || !self.permits_residual_protocol() {
             return Err(schedule(
                 "subscription drive crossed an unfinished round phase",
@@ -1005,6 +1012,7 @@ mod tests {
             ids: IdSeed::new(1, 100),
             initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
             observe_dev_root: false,
+            observe_lifecycle_diagnostics: false,
             sources: AttemptSources {
                 actor: AttemptSourceId(id(3)),
                 publication: AttemptSourceId(id(4)),
@@ -3257,6 +3265,63 @@ mod tests {
     }
 
     #[test]
+    fn original_task_failure_upgrades_incomplete_normal_convergence() {
+        use crate::{
+            AttemptCore,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::AttemptConvergenceMode;
+
+        let start = start();
+        let sources = start.sources;
+        let now = start.initial_now;
+        let mut core = round_with_start(start);
+        let apply = |core: &mut Core, input, sequence| {
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source: sources.actor,
+                    input: AttemptInputId(id(sequence)),
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: None,
+                    }),
+                },
+                input,
+                &mut Units(32),
+            )
+            .unwrap()
+        };
+        apply(&mut core, AttemptInput::Bootstrap, 1);
+        let deadline = now.saturating_add(Duration::from_secs(2));
+        core.convergence
+            .begin(AttemptConvergenceMode::Normal, deadline);
+        let root = core.execution.graph().root_identity();
+        let cause = TerminationDetail::Aborted(AbortCause::QueryFailed);
+        let original = frame(&mut core, root, TaskState::Aborted, Some(cause.clone()));
+        core.apply_observations(
+            now,
+            sources.observation,
+            ObservationBatch::new(vec![original]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(core.execution.failure_cause(), Some(&cause));
+        core.acknowledgements.begin_settlement(Ok(())).unwrap();
+        core.acknowledgements.finish().unwrap().unwrap();
+        let upgraded = apply(&mut core, AttemptInput::Timer, 2);
+        assert!(upgraded.stop_producing);
+        assert_eq!(
+            core.convergence.mode(),
+            Some(AttemptConvergenceMode::Cleanup)
+        );
+        assert_eq!(core.convergence.next_deadline(), Some(deadline));
+    }
+
+    #[test]
     fn quiesce_continuation_keeps_the_native_suffix_and_common_frames_behind_its_original_cut() {
         use crate::{
             AttemptCore,
@@ -3861,13 +3926,15 @@ mod tests {
     fn convergence_waits_for_exact_process_read_and_reports_local_exit_separately() {
         use crate::{
             AttemptCore,
+            effect::Publication,
             execution::ack_phase::{admission_intent, dispatch_admission},
-            input::{AttemptInput, AttemptInputClaim, MembershipObservation},
+            input::{AttemptInput, AttemptInputClaim, MembershipObservation, PublicationApplied},
         };
         use novarocks_coordination_contract::{AttemptConvergenceMode, AttemptToLogicalBody};
         use novarocks_execution_contract::OperationOutcome;
 
-        let start = start();
+        let mut start = start();
+        start.observe_lifecycle_diagnostics = true;
         let now = start.initial_now;
         let sources = start.sources;
         let activation = start.activation.identity;
@@ -3882,6 +3949,14 @@ mod tests {
         );
         core.execution.apply_dispatched_reply(&original).1.unwrap();
         let step = |core: &mut Core, source, n, input| {
+            let budget = if matches!(
+                input,
+                AttemptInput::Executor(ExecutorFact::LocalConvergenceExited)
+            ) {
+                2
+            } else {
+                16
+            };
             core.handle(
                 now,
                 AttemptInputClaim {
@@ -3891,10 +3966,13 @@ mod tests {
                         source: sources.native,
                         tail: None,
                     }),
-                    selected_cut: None,
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: None,
+                    }),
                 },
                 input,
-                &mut Units(16),
+                &mut Units(budget),
             )
             .unwrap()
         };
@@ -3952,19 +4030,70 @@ mod tests {
         let remote = step(&mut core, sources.actor, 6, AttemptInput::Timer);
         assert!(
             matches!(remote.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress { local_exited: false, closure: Some(_) }))
+            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress {
+                local_exited: false, closure: Some(_), lifecycle_runtime_filters: None,
+            }))
+        );
+        let mut stopped = false;
+        let mut applied = None;
+        let prepared = (7..64)
+            .find(|&input| {
+                let (source, event) = applied
+                    .take()
+                    .map_or((sources.actor, AttemptInput::Timer), |fact| {
+                        (sources.publication, AttemptInput::Executor(fact))
+                    });
+                let result = step(&mut core, source, input, event);
+                stopped |= result.stop_producing;
+                if let Some(AttemptEffect {
+                    id,
+                    body: EffectBody::Publish(publication),
+                    ..
+                }) = &result.effect
+                {
+                    let receipt = match publication {
+                        Publication::ProtocolBatch(_) => {
+                            PublicationApplied::ProtocolBatch { published: true }
+                        }
+                        Publication::RootStatus(_) => PublicationApplied::RootStatus,
+                        other => panic!("unexpected pre-close publication: {other:?}"),
+                    };
+                    applied = Some(ExecutorFact::PublicationApplied {
+                        effect: *id,
+                        result: Ok(receipt),
+                    });
+                }
+                matches!(
+                    result.effect,
+                    Some(AttemptEffect {
+                        body: EffectBody::PrepareLocalConvergence,
+                        ..
+                    })
+                )
+            })
+            .expect("the original local Source receives a close command");
+        assert!(
+            stopped,
+            "the local command follows the original business fence"
         );
         let local = step(
             &mut core,
             sources.actor,
-            7,
+            prepared + 1,
             AttemptInput::Executor(ExecutorFact::LocalConvergenceExited),
         );
         assert!(
-            matches!(local.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
-            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress { local_exited: true, closure: None }))
+            local.effect.is_none(),
+            "lifecycle assembly uses a charged continuation"
         );
-        let done = step(&mut core, sources.actor, 8, AttemptInput::Timer);
+        let final_report = step(&mut core, sources.actor, prepared + 2, AttemptInput::Timer);
+        assert!(
+            matches!(final_report.effect, Some(AttemptEffect { body: EffectBody::Port(port), .. })
+            if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress {
+                local_exited: true, closure: None, lifecycle_runtime_filters: Some(ref selection),
+            } if !selection.complete && selection.contributions.is_empty()))
+        );
+        let done = step(&mut core, sources.actor, prepared + 3, AttemptInput::Timer);
         assert!(done.effect.is_none());
         assert_eq!(core.next_deadline(), None);
     }

@@ -126,16 +126,16 @@ impl AttemptHostGeometry {
         let (split_lifecycle, split_ordinary) = pumps.callback_positions();
 
         // Every Join role has a Lifecycle causal reply (predecessor and
-        // event). Standalone Lifecycle positions are startup, the shared
-        // ordered observation writer and one phase publisher per live
+        // event). Standalone Lifecycle positions are startup, local exit,
+        // the infrastructure failure marker, the ordered observation writer
+        // and one phase publisher per live
         // covered subscription. The split callbacks have their own roles.
         let lifecycle = sum([
             transport_joins
                 .checked_mul(CAUSAL_INPUT_POSITIONS)
                 .ok_or(OVERFLOW)?,
             report_positions,
-            1,
-            1,
+            4,
             participants.get(),
             split_lifecycle,
         ])
@@ -334,10 +334,10 @@ mod tests {
         assert_eq!(geometry.admission_results, [96, 60]);
         assert_eq!(geometry.send_results, [96, 60]);
         assert_eq!(geometry.transport_joins, 329);
-        // 658 causal positions, 2412 send reports, 5 standing, 3 split callbacks.
-        assert_eq!(geometry.sources.mailbox, [3078, 6, 7, 1]);
+        // 658 causal positions, 2412 send reports, 7 standing, 3 split callbacks.
+        assert_eq!(geometry.sources.mailbox, [3080, 6, 7, 1]);
         let config = geometry.config_with_core_floor(1).unwrap();
-        assert_eq!(config.max_batches, 3092);
+        assert_eq!(config.max_batches, 3094);
         assert_eq!(config.max_step_work, 261);
         assert_eq!(config.turn_budget, 1048);
         assert_eq!(config.max_effects_per_step, OUTPUT_UNITS);
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(first.admission_results, [4, 6]);
         assert_eq!(first.send_results, [4, 6]);
         assert_eq!(first.transport_joins, 28);
-        assert_eq!(first.sources.mailbox, [94, 5, 4, 1]);
+        assert_eq!(first.sources.mailbox, [96, 5, 4, 1]);
         assert!(first.sources.membership.0 < second.sources.actor.0);
         assert!(geometry(u64::MAX).is_err());
     }

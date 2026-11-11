@@ -71,6 +71,7 @@ use std::{
 };
 
 type Position = CausalInputObligation<FrontendActor>;
+pub(super) type FailureRecords = Arc<Mutex<BTreeMap<HostFailureRef, TaskExecutionError>>>;
 
 struct PayloadCharge {
     backing_bytes: usize,
@@ -124,7 +125,7 @@ pub(crate) struct AdmissionSource {
     headers: BTreeMap<AttemptActionId, AdmissionHeader>,
     payloads: BTreeMap<PayloadRef, PayloadCharge>,
     grants: GrantedInputs,
-    failures: BTreeMap<HostFailureRef, TaskExecutionError>,
+    failures: FailureRecords,
 }
 
 impl AdmissionSource {
@@ -153,7 +154,7 @@ impl AdmissionSource {
             headers: BTreeMap::new(),
             payloads: BTreeMap::new(),
             grants: GrantedInputs::default(),
-            failures: BTreeMap::new(),
+            failures: FailureRecords::default(),
         })
     }
 
@@ -252,12 +253,38 @@ impl AdmissionSource {
         self.grants.take_for_release(grant)
     }
 
+    pub(super) fn is_quiescent(&self) -> bool {
+        self.pending.is_none() && self.headers.is_empty() && self.results.is_empty()
+    }
+
+    pub(crate) fn take_unclaimed_grant(&mut self) -> Option<OriginalQueuedInput> {
+        if !self.is_quiescent() {
+            return None;
+        }
+        self.grants.take_unclaimed()
+    }
+
+    /// Split owns its own detachment. The closed Source calls this after all
+    /// split payloads and unbound queue grants have left their original stores.
+    pub(crate) fn take_unclaimed_creation(
+        &mut self,
+    ) -> Option<(TaskIdentity, PayloadRef, CreationSeed)> {
+        if !self.is_quiescent() || !self.grants.is_empty() {
+            return None;
+        }
+        let (&payload, row) = self.payloads.first_key_value()?;
+        let &(task, _) = row.creation.as_ref().expect("original creation row");
+        let seed = self
+            .take_creation(task, payload)
+            .expect("same original creation");
+        Some((task, payload, seed))
+    }
+
     pub(super) fn is_drained(&self) -> bool {
-        self.pending.is_none()
-            && self.headers.is_empty()
+        self.is_quiescent()
             && self.grants.is_empty()
             && self.payloads.is_empty()
-            && self.failures.is_empty()
+            && self.failures.lock().unwrap().is_empty()
             && self.idle.iter().all(VecDeque::is_empty)
     }
 
@@ -278,17 +305,29 @@ impl AdmissionSource {
         batch.bind(&mut self.grants, window, registration)
     }
 
+    pub(super) fn failure_records(&self) -> FailureRecords {
+        self.failures.clone()
+    }
+
+    pub(super) fn take_unselected_failure(
+        &mut self,
+    ) -> Option<(HostFailureRef, TaskExecutionError)> {
+        self.failures.lock().unwrap().pop_first()
+    }
+
     pub(super) fn project_failure(
         &self,
         reference: HostFailureRef,
     ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
         self.failures
+            .lock()
+            .unwrap()
             .get(&reference)
             .map(TaskExecutionError::preparation_input)
     }
 
     pub(crate) fn take_failure(&mut self, failure: HostFailureRef) -> Option<TaskExecutionError> {
-        self.failures.remove(&failure)
+        self.failures.lock().unwrap().remove(&failure)
     }
 
     fn payload_ref(payload: QueuedInputPayload) -> Option<PayloadRef> {
@@ -498,7 +537,7 @@ impl AdmissionSource {
         &mut self,
         mut result: ReturnedActorTransportResult,
         requests: &mut FrozenSendRequests,
-    ) -> Result<InputId, AdmissionResultRefusal> {
+    ) -> Result<Option<InputId>, AdmissionResultRefusal> {
         if !self
             .headers
             .get(&result.effect.protocol.id)
@@ -557,7 +596,13 @@ impl AdmissionSource {
                     generation,
                     failure,
                 };
-                assert!(self.failures.insert(original, error).is_none());
+                assert!(
+                    self.failures
+                        .lock()
+                        .unwrap()
+                        .insert(original, error)
+                        .is_none()
+                );
                 result
                     .original
                     .fill_with_receipt(
@@ -574,7 +619,19 @@ impl AdmissionSource {
             }
         };
         let input = match publication {
-            Ok(input) => input,
+            Ok(input) => Some(input),
+            Err(cause)
+                if matches!(
+                    cause.error,
+                    ActorTurnError::ActorFailed | ActorTurnError::Closed
+                ) =>
+            {
+                // The original admission body has joined. Its rejected event
+                // is passive, and the grant/payload remain with this Source.
+                assert!(cause.predecessor.is_none() && cause.predecessor_input.is_none());
+                drop(cause);
+                None
+            }
             Err(cause) => {
                 return Err(AdmissionResultRefusal {
                     result,
@@ -702,17 +759,28 @@ impl AdmissionSource {
         };
         let effect = result.effect.protocol.id;
         let header = self.headers.get(&effect).expect("same original job header");
-        let ready = result
-            .original
-            .retire_ready_after_exit()
-            .and_then(|input_idle| {
-                if !input_idle || !header.transport_retired {
-                    return Ok(false);
+        let mut disposed = false;
+        let ready = (|| {
+            if !header.transport_retired {
+                return Ok(false);
+            }
+            if !result.original.retire_ready_after_exit()? {
+                match result.original.take_failed_payload() {
+                    Ok(Some(original)) => {
+                        original.dispose()?;
+                        disposed = true;
+                    }
+                    Ok(None)
+                    | Err(ActorTurnError::ActorNotRetired | ActorTurnError::InputAuthorMismatch) => {
+                    }
+                    Err(error) => return Err(error),
                 }
-                self.scope
-                    .reap_observed_header(&header.original)
-                    .map_err(ActorTurnError::from)
-            });
+                return Ok(false);
+            }
+            self.scope
+                .reap_observed_header(&header.original)
+                .map_err(ActorTurnError::from)
+        })();
         match ready {
             Ok(true) => {
                 self.headers.remove(&effect);
@@ -721,7 +789,7 @@ impl AdmissionSource {
             }
             pending => {
                 self.results.push_back((lane, result));
-                pending
+                pending.map(|_| disposed)
             }
         }
     }

@@ -334,8 +334,10 @@ impl DynamicFilterRecords {
     pub(super) fn take_retired(
         &self,
         closing: bool,
-        retire_failures: bool,
-    ) -> Option<Box<dyn std::any::Any + Send>> {
+    ) -> Option<(
+        Option<(HostFailureRef, TaskExecutionError)>,
+        Box<dyn std::any::Any + Send>,
+    )> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
         let closing = records.feedback_closed || closing;
         let id = records.reads.iter().find_map(|(id, r)| {
@@ -344,13 +346,16 @@ impl DynamicFilterRecords {
                 && r.admission_job
                     .as_ref()
                     .is_none_or(OriginalJobRecord::retired)
-                && (retire_failures || r.terminal_error.is_none())
+                && (closing || r.terminal_error.is_none())
                 && (!available || r.admission_job.is_some() || closing))
                 .then_some(*id)
         })?;
-        Some(Box::new(
-            records.reads.remove(&id).expect("same retired read"),
-        ))
+        let mut original = records.reads.remove(&id).expect("same retired read");
+        let failure = original
+            .terminal_error
+            .take()
+            .map(|error| (original.failure, error));
+        Some((failure, Box::new(original)))
     }
 
     pub(super) fn read_count(&self) -> usize {
@@ -523,7 +528,7 @@ mod tests {
         report.consume(observer).unwrap();
         assert!(custody.try_retire().unwrap());
         records.resolve_result(request, false).unwrap();
-        assert!(records.take_retired(true, true).is_some());
+        assert!(records.take_retired(true).is_some());
         ledger.reap_scope_ready(scope.id(), 8).unwrap();
         scope.close_external().unwrap();
         assert!(scope.join_ready().unwrap());
