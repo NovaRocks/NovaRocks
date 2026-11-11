@@ -416,11 +416,45 @@ fn validate_where(
     expr: &Expr,
     columns: &[ColumnDef],
 ) -> Result<(), crate::dml::error::DmlExecutionError> {
+    struct QueryOccurrence(bool);
+    impl ast::Visit for QueryOccurrence {
+        fn visit_query(&mut self, _: &Query) {
+            self.0 = true;
+        }
+
+        fn visit_expr(&mut self, expr: &Expr) {
+            if !self.0 {
+                ast::walk_expr(self, expr);
+            }
+        }
+    }
+
+    // Reject unsupported query occurrences before a scalar shortcut or literal
+    // validator can hide the capability refusal at a nested expression site.
+    let mut queries = QueryOccurrence(false);
+    ast::Visit::visit_expr(&mut queries, expr);
+    if queries.0 {
+        return Err(crate::dml::error::DmlExecutionError::Compilation(
+            novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                    "subqueries are unsupported in DELETE predicates",
+                ),
+            ),
+        ));
+    }
+    validate_where_predicate(expr, columns)
+}
+
+fn validate_where_predicate(
+    expr: &Expr,
+    columns: &[ColumnDef],
+) -> Result<(), crate::dml::error::DmlExecutionError> {
     match expr {
         Expr::Binary(binary) => match binary.operator {
             BinaryOperator::And | BinaryOperator::Or => {
-                validate_where(&binary.left, columns)?;
-                validate_where(&binary.right, columns)
+                validate_where_predicate(&binary.left, columns)?;
+                validate_where_predicate(&binary.right, columns)
             }
             BinaryOperator::Equal
             | BinaryOperator::NotEqual
@@ -464,20 +498,7 @@ fn validate_where(
                 .map(|_| ())
                 .map_err(Into::into)
         }
-        Expr::Nested(nested) => validate_where(&nested.expression, columns),
-        // This restricted DELETE path rejects subqueries before SQL completion
-        // can resolve their relations. Preserve that capability refusal as a
-        // typed source rather than flattening it into an internal error.
-        Expr::InSubquery(_) | Expr::Exists(_) | Expr::Subquery(_) => {
-            Err(crate::dml::error::DmlExecutionError::Compilation(
-                novarocks_failure_contract::SharedFailureCause::new(
-                    novarocks_spi::connector::ConnectorError::new(
-                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                        "subqueries are unsupported in DELETE predicates",
-                    ),
-                ),
-            ))
-        }
+        Expr::Nested(nested) => validate_where_predicate(&nested.expression, columns),
         other => Err(format!(
             "phase 1 DELETE WHERE supports comparison / IN / IS NULL / AND / OR \
              over primitive columns; rewrite this clause and retry. Unsupported: {other:?}"
@@ -875,6 +896,10 @@ mod tests {
             "id IN (SELECT 1 FROM system.information_schema.tables)",
             "id = 1 AND (id IN (SELECT 1 FROM system.information_schema.tables))",
             "EXISTS (SELECT 1 FROM system.information_schema.tables)",
+            "id = (SELECT 1 FROM system.information_schema.tables)",
+            "(SELECT 1 FROM system.information_schema.tables) IS NULL",
+            "coalesce((SELECT 1 FROM system.information_schema.tables), 1) = 1",
+            "id IN (1, (SELECT 1 FROM system.information_schema.tables))",
         ] {
             let error = super::validate_where(&where_expr(predicate), &columns_with_variant())
                 .expect_err("the restricted DELETE path does not support subqueries");
@@ -889,6 +914,14 @@ mod tests {
                 novarocks_spi::connector::ConnectorErrorKind::Unsupported
             );
         }
+    }
+
+    #[test]
+    fn delete_query_like_string_literal_is_not_a_subquery() {
+        let columns = [column("label", DataType::Utf8)];
+        let predicate = where_expr("label = 'SELECT * FROM system.metadata.materialized_views'");
+        super::validate_where(&predicate, &columns)
+            .expect("query-looking literal text has no parser-owned query occurrence");
     }
 
     /// DELETE takes its sink and distribution from the Provider's signed
