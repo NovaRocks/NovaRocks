@@ -4334,6 +4334,158 @@ mod bounded_drain_tests {
     }
 
     #[test]
+    fn too_late_create_withdrawal_keeps_credit_until_the_same_workers_reply() {
+        use crate::{
+            capacity::ReservationToken,
+            dispatch::{BatchDispatch, BatchDispatchPass},
+            effect::{AttemptEffect, EffectBody, EffectClass},
+            input::{AckPayload, OperationObservation, OperationReplyResult, WithdrawalOutcome},
+        };
+        use novarocks_execution_contract::{
+            CreateTaskReceipt, OperationOutcome, operation::OperationResult,
+        };
+
+        struct SendTurn(Turn);
+        impl StepContext for SendTurn {
+            fn charge(&mut self, units: usize) -> bool {
+                self.0.charge(units)
+            }
+
+            fn reserve_queue_stage(
+                &mut self,
+                lane: DispatchLane,
+                control: bool,
+                _: BackendProcessId,
+                records: usize,
+                _: usize,
+            ) -> QueueStage {
+                assert_eq!(lane, DispatchLane::Create);
+                assert!(!control);
+                assert_eq!(records, 1);
+                QueueStage::Granted(ReservationToken(NonZeroU64::new(3).unwrap()))
+            }
+        }
+
+        let mut execution = many_tasks(1);
+        let task = identity(&execution, 1);
+        let participation = execution.task(task.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let original_grant = grant(1);
+        let EffectBody::AdmitQueuedInput {
+            operation,
+            generation,
+            ..
+        } = execution
+            .begin_create_admission(task, original_grant.generation().admission_effect())
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("expected the original Create admission");
+        };
+        assert_eq!(generation, original_grant.generation());
+        let operation = operation.operation_id();
+        assert!(matches!(
+            execution
+                .observe_create_grant(operation, original_grant)
+                .unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        let send = grant(2).generation().admission_effect();
+        let BatchDispatch::Ready(AttemptEffect {
+            id: effect,
+            class: EffectClass::Business,
+            body: EffectBody::SendBatch { batch, .. },
+        }) = execution
+            .advance_send_batch(
+                &mut BatchDispatchPass::new(),
+                send,
+                &mut SendTurn(Turn(32)),
+                |_| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("expected one emitted business Create send");
+        };
+        assert_eq!(effect, send);
+        assert_eq!(batch.operations.len(), 1);
+        assert_eq!(batch.operations[0].operation_id(), operation);
+        assert_eq!(batch.queued_inputs.as_ref(), [original_grant]);
+
+        let revision = execution.accepted_protocol_revision();
+        let assert_pending = |execution: &QueryTaskExecution| {
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .lane_in_flight(task.backend_process_id(), DispatchLane::Create),
+                1
+            );
+            assert!(execution.dispatcher.tracks_input(operation, original_grant));
+            assert!(execution.operation_targets.contains_key(&operation));
+            let remote = execution.task(task.task_id()).unwrap();
+            assert!(remote.has_released_operation());
+            assert!(!remote.create_ownership_proven());
+            assert_eq!(execution.accepted_protocol_revision(), revision);
+        };
+        assert_pending(&execution);
+        assert_eq!(
+            execution.next_stop_send_withdrawal(None),
+            Some((effect, true))
+        );
+        assert_pending(&execution);
+        // Handoff won before the Core received its start fact.
+        assert!(
+            execution
+                .begin_send_withdrawal_result(effect, WithdrawalOutcome::TooLate)
+                .unwrap()
+                .is_none()
+        );
+        assert_pending(&execution);
+        assert_eq!(
+            execution.next_stop_send_withdrawal(None),
+            Some((effect, false))
+        );
+
+        let status = TaskStatus::created(task).with_installed();
+        let receipt =
+            OperationObservation {
+                generation: batch.queued_inputs[0].generation(),
+                reply: OperationAcknowledgement {
+                    operation_id: operation,
+                    kind: OperationKind::CreateTask,
+                    result: OperationReplyResult::Worker(OperationResult::Verdict {
+                        outcome: OperationOutcome::Accepted,
+                        detail: None,
+                        acknowledgement: Some(AckPayload::Create(Box::new(
+                            CreateTaskReceipt::new(task, Vec::new(), status.clone()),
+                        ))),
+                    }),
+                },
+            };
+        assert!(execution.dispatched_reply_needs_observer(&receipt));
+        for _ in 0..2 {
+            assert!(matches!(
+                execution.apply_dispatched_reply(&receipt),
+                (None, Ok(()))
+            ));
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .lane_in_flight(task.backend_process_id(), DispatchLane::Create),
+                0
+            );
+            assert!(!execution.dispatcher.tracks_input(operation, original_grant));
+            assert!(!execution.operation_targets.contains_key(&operation));
+            let remote = execution.task(task.task_id()).unwrap();
+            assert!(remote.create_ownership_proven());
+            assert!(!remote.has_released_operation());
+            assert_eq!(remote.status(), Some(&status));
+            assert_eq!(execution.accepted_protocol_revision(), revision + 1);
+            assert!(!execution.dispatched_reply_needs_observer(&receipt));
+        }
+    }
+
+    #[test]
     fn older_create_receipt_preserves_each_emitted_batch_members_own_outcome() {
         use crate::effect::EffectBody;
         use crate::input::{
