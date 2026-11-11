@@ -3491,7 +3491,9 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
         assert_eq!(
@@ -3503,7 +3505,9 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
         for metadata in [&to, &current] {
@@ -3516,6 +3520,18 @@ mod plan_splits_pruning_tests {
                         .is_nullable()
                 );
             }
+            let spec = metadata.schema().field_with_name("_spec_id").unwrap();
+            assert_eq!(spec.data_type(), &arrow::datatypes::DataType::Int32);
+            assert!(!spec.is_nullable());
+            let partition = metadata.schema().field_with_name("_partition").unwrap();
+            assert!(partition.is_nullable());
+            let arrow::datatypes::DataType::Struct(fields) = partition.data_type() else {
+                panic!("expected a mutation partition struct");
+            };
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name(), "future_partition");
+            assert_eq!(fields[0].data_type(), &arrow::datatypes::DataType::Int32);
+            assert!(fields[0].is_nullable());
         }
         assert_eq!(
             to.execution_schema()
@@ -3530,17 +3546,19 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
-        assert_eq!(to.planning_facts.column_facts().len(), 6);
+        assert_eq!(to.planning_facts.column_facts().len(), 8);
         assert_eq!(
             to.planning_facts
                 .column_facts()
                 .iter()
                 .map(|f| f.field_ordinal())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5]
+            [0, 1, 2, 3, 4, 5, 6, 7]
         );
         assert_eq!(to.planning_facts.column_facts()[1].write_default(), None);
         assert_eq!(

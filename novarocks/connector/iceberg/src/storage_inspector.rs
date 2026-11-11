@@ -685,8 +685,12 @@ fn selected_source_schema_observation(
     let document =
         crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(table)?;
     let expected = crate::scalar_integer_domain::sql_schema_from_document(schema, &document)?;
-    let pseudo_columns = crate::metadata::metadata_column_names(table);
-    if admitted.schema().fields().len() != expected.fields().len() + pseudo_columns.len() {
+    let mut pseudo_fields =
+        crate::metadata::metadata_arrow_fields(&crate::metadata::metadata_column_names(table))?;
+    if let Some(mutation) = crate::metadata::mutation_metadata_schema(table, schema)? {
+        pseudo_fields.extend(mutation.arrow_fields()?);
+    }
+    if admitted.schema().fields().len() != expected.fields().len() + pseudo_fields.len() {
         return Err(corrupt(
             "source schema fields differ from the selected To projection",
         ));
@@ -730,9 +734,9 @@ fn selected_source_schema_observation(
             nullable: !field.required,
         });
     }
-    for (ordinal, name) in pseudo_columns.iter().enumerate() {
+    for (ordinal, expected) in pseudo_fields.iter().enumerate() {
         validate_context(context)?;
-        if admitted.schema().field(fields.len() + ordinal).name() != name {
+        if admitted.schema().field(fields.len() + ordinal) != expected.as_ref() {
             return Err(corrupt(
                 "source schema metadata suffix differs from its Provider author",
             ));
