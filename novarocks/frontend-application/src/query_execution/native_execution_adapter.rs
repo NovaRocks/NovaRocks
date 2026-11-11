@@ -2215,7 +2215,7 @@ impl ProductionManifestAttemptProjection {
         .map_err(|error| projection_message(error.to_string()))?;
         let result_transport = Arc::new(
             NativeTaskResultTransport::new(
-                &backends,
+                backends,
                 self.runtime.data_runtime.clone(),
                 TaskReadGrace::new(self.runtime.transport_budget().frontend_queue_residence()),
             )

@@ -1,6 +1,9 @@
 //! Narrow FE-to-BE native transport adapters.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
@@ -224,7 +227,10 @@ pub(crate) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'stat
 
 #[derive(Clone)]
 enum FrozenClientEndpoints {
-    Backend(Box<FrozenBackendDescriptor>),
+    Backend {
+        roster: Arc<[FrozenBackendDescriptor]>,
+        index: usize,
+    },
     Single {
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
@@ -249,8 +255,19 @@ impl Client {
         descriptor: FrozenBackendDescriptor,
         data_runtime: FrontendDataRuntime,
     ) -> Self {
+        Self::for_backend_in(Arc::from([descriptor]), 0, data_runtime)
+    }
+
+    /// Select one descriptor from the actual frozen Native manifest roster.
+    /// Cloning a Client retains the same address and backing.
+    pub(crate) fn for_backend_in(
+        roster: Arc<[FrozenBackendDescriptor]>,
+        index: usize,
+        data_runtime: FrontendDataRuntime,
+    ) -> Self {
+        assert!(index < roster.len());
         Self {
-            endpoints: FrozenClientEndpoints::Backend(Box::new(descriptor)),
+            endpoints: FrozenClientEndpoints::Backend { roster, index },
             data_runtime,
         }
     }
@@ -282,10 +299,12 @@ impl Client {
             ));
         }
         match &self.endpoints {
-            FrozenClientEndpoints::Backend(descriptor) => match domain {
-                NativeEndpointDomain::BackendData => Ok(descriptor.endpoint().native_endpoint()),
+            FrozenClientEndpoints::Backend { roster, index } => match domain {
+                NativeEndpointDomain::BackendData => {
+                    Ok(roster[*index].endpoint().native_endpoint())
+                }
                 NativeEndpointDomain::BackendControl => {
-                    Ok(descriptor.control_endpoint().native_endpoint())
+                    Ok(roster[*index].control_endpoint().native_endpoint())
                 }
                 NativeEndpointDomain::FrontendMembership => Err(ChannelAcquisitionError::fatal(
                     "backend descriptor cannot address frontend membership",
@@ -320,7 +339,7 @@ impl Client {
 
     pub(crate) fn backend_process_id(&self) -> BackendProcessId {
         match &self.endpoints {
-            FrozenClientEndpoints::Backend(descriptor) => descriptor.process_id(),
+            FrozenClientEndpoints::Backend { roster, index } => roster[*index].process_id(),
             FrozenClientEndpoints::Single { peer, .. } => *peer,
         }
     }

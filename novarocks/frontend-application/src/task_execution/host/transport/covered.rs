@@ -25,12 +25,14 @@ use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendEffect, FrontendInput},
         host::{PreparedEffectJob, SourceProgress},
+        membership::FrozenMember,
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    native::transport::Client,
+    native::{data_runtime::FrontendDataRuntime, transport::Client},
+    query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     task_execution::host::{
         custody::{ReturnedActorTransportResult, TransportSourceEvent},
-        observations::{ObservationError, RootControlBinding, StreamKey},
+        observations::{ObservationError, OrderedObservationInput, RootControlBinding, StreamKey},
         publication::OriginalHostFailure,
         subscriptions::{
             SubscriptionFailureRecord, SubscriptionGeneration, SubscriptionPhasePublisher,
@@ -53,8 +55,10 @@ use novarocks_control_runtime_core::{
     mailbox::InputClass,
 };
 use novarocks_coordination_contract::AttemptActionId;
-use novarocks_execution_contract::ParticipationRef;
+use novarocks_execution_contract::{BackendProcessDescriptor, ParticipationRef};
 use novarocks_query_application::execution_error::ExecutionFailureInput;
+use novarocks_types::{BackendProcessId, NativeCompatibilityId};
+use novarocks_workload_control::WorkScope;
 use std::{
     any::Any,
     collections::{BTreeMap, VecDeque},
@@ -69,6 +73,101 @@ pub(crate) struct SubscriptionEndpoint {
 }
 
 pub(crate) type SubscriptionEndpoints = BTreeMap<ParticipationRef, SubscriptionEndpoint>;
+
+pub(crate) struct FrozenSubscriptionInputs<'a> {
+    pub(crate) backends: &'a Arc<[BackendProcessDescriptor]>,
+    pub(crate) compatibility: NativeCompatibilityId,
+    pub(crate) data: &'a FrontendDataRuntime,
+    pub(crate) scope: &'a WorkScope,
+    pub(crate) cohort: &'a NativeSourceCohort,
+    pub(crate) ingress: &'a OrderedObservationInput<FrontendActor>,
+}
+
+#[derive(Debug)]
+pub(crate) enum SubscriptionEndpointError {
+    Roster,
+    Source {
+        participation: ParticipationRef,
+        original: SubscriptionSourceError,
+    },
+}
+
+/// Open no channel and consume no WC child until the entire frozen roster
+/// matches. The same Client can also author sends to that original process.
+pub(crate) fn bind_subscription_endpoints(
+    roster: &[FrozenMember],
+    original: FrozenSubscriptionInputs<'_>,
+) -> Result<Arc<SubscriptionEndpoints>, SubscriptionEndpointError> {
+    let backends: BTreeMap<_, _> = original
+        .backends
+        .iter()
+        .enumerate()
+        .map(|(index, backend)| (backend.process_id(), index))
+        .collect();
+    let execution = original.ingress.root_binding().activation().execution();
+    if roster.is_empty()
+        || backends.len() != original.backends.len()
+        || backends.len() != roster.len()
+        || roster.windows(2).any(|pair| {
+            pair[0].participation.frontend_process_id()
+                != pair[1].participation.frontend_process_id()
+                || pair[0].participation.backend_process_id()
+                    >= pair[1].participation.backend_process_id()
+        })
+        || !roster.iter().all(|member| {
+            member.participation.query_execution_id() == execution
+                && backends
+                    .get(&member.participation.backend_process_id())
+                    .is_some_and(|&index| {
+                        let backend = &original.backends[index];
+                        backend.endpoint() == &member.endpoint
+                            && backend.native_compatibility_id() == original.compatibility
+                    })
+        })
+    {
+        return Err(SubscriptionEndpointError::Roster);
+    }
+    let mut endpoints = BTreeMap::new();
+    for member in roster {
+        let participation = member.participation;
+        let source = match SubscriptionSource::from_cohort(
+            participation,
+            original.scope,
+            original.cohort,
+            original.ingress.clone(),
+        ) {
+            Ok(source) => source,
+            Err(original) => {
+                retire_unpublished_endpoints(&endpoints);
+                return Err(SubscriptionEndpointError::Source {
+                    participation,
+                    original,
+                });
+            }
+        };
+        let client = Client::for_backend_in(
+            original.backends.clone(),
+            backends[&participation.backend_process_id()],
+            original.data.clone(),
+        );
+        endpoints.insert(participation, SubscriptionEndpoint { source, client });
+    }
+    Ok(Arc::new(endpoints))
+}
+
+/// An unpublished endpoint has no generation or in-flight request. Return
+/// only the children already transferred into this particular roster.
+pub(crate) fn retire_unpublished_endpoints(endpoints: &SubscriptionEndpoints) {
+    for endpoint in endpoints.values() {
+        endpoint.source.close_admission();
+        endpoint
+            .source
+            .take_owner_after_jobs()
+            .expect("unpublished subscription has no jobs")
+            .expect("one original WC child")
+            .complete_after_terminal_cancel_settled();
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum SubscriptionControlError {
@@ -267,6 +366,7 @@ impl AttemptSubscriptions {
             std::alloc::Layout::new::<Self>().size(),
             backing::arc::<SubscriptionEndpoints>()?.size(),
             backing::tree::<ParticipationRef, SubscriptionEndpoint>(participants)?,
+            backing::tree::<BackendProcessId, usize>(participants)?,
             backing::tree::<ParticipationRef, AttemptCallSource>(participants)?,
             sized(
                 backing::arc::<SubscriptionSource<FrontendActor>>()?.size(),

@@ -173,6 +173,12 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) failure: FailureSupervisor,
 }
 
+pub(crate) struct PreparedNativeSubscriptions {
+    pub(crate) original: super::transport::AttemptSubscriptions,
+    pub(crate) control: super::transport::AttemptCallSource,
+    pub(crate) endpoints: Arc<super::transport::SubscriptionEndpoints>,
+}
+
 struct CapacityReleased;
 impl Merge for CapacityReleased {
     fn merge(&mut self, _: Self) {}
@@ -306,6 +312,7 @@ pub(crate) enum AttemptRegistrationError {
     InvalidConfig(&'static str),
     Core(AttemptFailure),
     Runtime(ActorTurnError),
+    Subscription(super::transport::SubscriptionEndpointError),
 }
 
 impl AttemptActorRegistration {
@@ -429,31 +436,36 @@ impl AttemptActorRegistration {
         parent: &WorkObligation,
         payer: &ReservationObligation,
         observer: novarocks_control_runtime_core::identity::ConsumerId,
-        endpoints: Arc<super::transport::SubscriptionEndpoints>,
-    ) -> Result<
-        (
-            super::transport::AttemptSubscriptions,
-            super::transport::AttemptCallSource,
-        ),
-        AttemptRegistrationError,
-    > {
-        if !endpoints
-            .keys()
-            .copied()
-            .eq(self.failure_members.iter().map(|row| row.participation))
+        frozen: super::transport::FrozenSubscriptionInputs<'_>,
+    ) -> Result<PreparedNativeSubscriptions, AttemptRegistrationError> {
+        if !frozen
+            .ingress
+            .root_binding()
+            .same_original(&self.root_control)
+            || !self.scope.same_scope(parent.scope())
+            || !payer.belongs_to_bound_work(&self.scope, parent.id())
         {
             return Err(AttemptRegistrationError::InvalidConfig(
-                "subscription endpoints differ from the original roster",
+                "subscription Source differs from the original activation or payer",
             ));
         }
-        let mut control = self.prepare_call_source(
+        let endpoints =
+            super::transport::bind_subscription_endpoints(&self.failure_members, frozen)
+                .map_err(AttemptRegistrationError::Subscription)?;
+        let mut control = match self.prepare_call_source(
             runtime,
             parent,
             payer,
             observer,
             self.subscription_source,
             super::transport::AttemptCallOwner::SubscriptionControl(endpoints.clone()),
-        )?;
+        ) {
+            Ok(original) => original,
+            Err(error) => {
+                super::transport::retire_unpublished_endpoints(&endpoints);
+                return Err(error);
+            }
+        };
         match super::transport::AttemptSubscriptions::bind(
             runtime.clone(),
             self.original.clone(),
@@ -462,15 +474,20 @@ impl AttemptActorRegistration {
             parent,
             payer,
             observer,
-            endpoints,
+            endpoints.clone(),
         ) {
-            Ok(subscriptions) => Ok((subscriptions, control)),
+            Ok(original) => Ok(PreparedNativeSubscriptions {
+                original,
+                control,
+                endpoints,
+            }),
             Err(error) => {
                 assert!(
                     control
                         .close_idle()
                         .expect("original unpublished subscription control")
                 );
+                super::transport::retire_unpublished_endpoints(&endpoints);
                 Err(AttemptRegistrationError::Runtime(error))
             }
         }

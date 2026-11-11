@@ -62,7 +62,11 @@ pub(crate) use call_source::{AttemptCallOwner, AttemptCallSource};
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
-pub(crate) use covered::{AttemptSubscriptions, SubscriptionEndpoint, SubscriptionEndpoints};
+pub(crate) use covered::{
+    AttemptSubscriptions, FrozenSubscriptionInputs, SubscriptionEndpoint,
+    SubscriptionEndpointError, SubscriptionEndpoints, bind_subscription_endpoints,
+    retire_unpublished_endpoints,
+};
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
     FailedSendResult, NativeReportReferences,

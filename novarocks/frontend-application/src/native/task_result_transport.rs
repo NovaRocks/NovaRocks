@@ -225,7 +225,7 @@ impl fmt::Debug for NativeTaskResultTransport {
 )]
 impl NativeTaskResultTransport {
     pub(crate) fn new(
-        backends: &[BackendProcessDescriptor],
+        backends: Arc<[BackendProcessDescriptor]>,
         data_runtime: FrontendDataRuntime,
         grace: TaskReadGrace,
     ) -> Result<Self, String> {
@@ -234,9 +234,9 @@ impl NativeTaskResultTransport {
         }
         let mut clients = BTreeMap::new();
         let mut endpoints = BTreeMap::new();
-        for descriptor in backends {
+        for (index, descriptor) in backends.iter().enumerate() {
             let process_id = descriptor.process_id();
-            let client = Client::for_backend(descriptor.clone(), data_runtime.clone());
+            let client = Client::for_backend_in(backends.clone(), index, data_runtime.clone());
             if clients.insert(process_id, client).is_some() {
                 return Err(format!("duplicate backend process {process_id}"));
             }

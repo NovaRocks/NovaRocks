@@ -366,19 +366,39 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     let wc_scope = wc_root.owner.scope();
     wc::bind(&wc_scope, &mut wc_driver);
     let cohort = wc::cohort(&wc_scope, 1, &mut wc_driver);
-    let original =
-        SubscriptionSource::from_cohort(participation, &wc_scope, &cohort, ingress.clone())
-            .unwrap();
     let mut data = FrontendDataRuntime::new(handle.clone());
     let mut peer = Loopback::start().await;
-    let client = Client::for_backend(peer.descriptor(backend), data.clone());
-    let endpoints = Arc::new(BTreeMap::from([(
-        participation,
-        SubscriptionEndpoint {
-            source: original.clone(),
-            client,
-        },
-    )]));
+    let backends: Arc<[BackendProcessDescriptor]> = Arc::from([peer.descriptor(backend)]);
+    let descriptor = &backends[0];
+    let frozen = || FrozenSubscriptionInputs {
+        backends: &backends,
+        compatibility: descriptor.native_compatibility_id(),
+        data: &data,
+        scope: &wc_scope,
+        cohort: &cohort,
+        ingress: &ingress,
+    };
+    assert!(matches!(
+        bind_subscription_endpoints(
+            &[FrozenMember {
+                participation,
+                endpoint: descriptor.control_endpoint().clone(),
+            }],
+            frozen()
+        ),
+        Err(SubscriptionEndpointError::Roster)
+    ));
+    assert_eq!(cohort.remaining(), 1);
+    let endpoints = bind_subscription_endpoints(
+        &[FrozenMember {
+            participation,
+            endpoint: descriptor.endpoint().clone(),
+        }],
+        frozen(),
+    )
+    .unwrap();
+    assert_eq!(cohort.remaining(), 0);
+    let original = endpoints[&participation].source.clone();
     let observer = ConsumerId::new(1).unwrap();
     let subscriptions = AttemptSubscriptions::bind(
         runtime.clone(),
