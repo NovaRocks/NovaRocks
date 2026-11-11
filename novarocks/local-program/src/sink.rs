@@ -18,7 +18,7 @@
 //! Pure output topology. Destination addresses, transmitters and queues are
 //! task-owned bindings; only branch semantics and frozen expressions live here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -36,6 +36,10 @@ use crate::{ImmutableExpressions, ProgramExprId, StaticLayout};
 pub enum ProgramOutputRole {
     Relational,
     ProviderRoute {
+        target: novarocks_connector_contract::WriteTargetOrdinal,
+    },
+    PositionContribution {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
         target: novarocks_connector_contract::WriteTargetOrdinal,
     },
     PositionShards {
@@ -506,15 +510,26 @@ fn validate_router_core<E: From<StaticSinkError>>(
         return Err(StaticSinkError::InvalidRouter.into());
     }
     let mut covered = BTreeSet::new();
-    let mut targets = BTreeSet::new();
+    let mut targets = BTreeMap::new();
     for route in routes {
         let index = usize::try_from(route.branch).map_err(|_| StaticSinkError::InvalidRouter)?;
         let branch = branches.get(index).ok_or(StaticSinkError::InvalidRouter)?;
-        let ProgramOutputRole::ProviderRoute { target } = branch.contract.role else {
-            return Err(StaticSinkError::InvalidRouter.into());
+        let (target, group) = match branch.contract.role {
+            ProgramOutputRole::ProviderRoute { target } => (target, None),
+            ProgramOutputRole::PositionContribution { group, target }
+                if group.to_bytes() != [0; 32] =>
+            {
+                (target, Some(group))
+            }
+            _ => return Err(StaticSinkError::InvalidRouter.into()),
         };
+        // Position contributions are distinct router branches feeding the
+        // same aggregation group and eventual writer target.
+        let target_matches = targets
+            .insert(target, group)
+            .is_none_or(|previous| group.is_some() && previous == group);
         let valid = covered.insert(index)
-            && targets.insert(target)
+            && target_matches
             && branch.contract.delivery
                 == novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
             && !route.accepted_effects.is_empty();
@@ -1089,6 +1104,47 @@ mod router_contract_tests {
             StaticSinkProgram::try_change_stream_router(branches, arena, SlotId::new(1), duplicate)
                 .is_err()
         );
+    }
+    #[test]
+    fn repeated_router_target_requires_the_same_position_contribution_group() {
+        use novarocks_connector_contract::ConnectorMutationContributionGroupId;
+
+        let (_, arena, mut routes) = fixture();
+        routes.push(StaticRouterRoute {
+            layout: crate::ProgramWriteLayoutPreference::None,
+            branch: 1,
+            accepted_effects: Arc::from([ConnectorRowMutationEffect::Delete]),
+        });
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let contribution = |id| ProgramOutputRole::PositionContribution {
+            group: ConnectorMutationContributionGroupId::from_bytes([id; 32]),
+            target,
+        };
+        let direct = ProgramOutputRole::ProviderRoute { target };
+        for (roles, valid) in [
+            ([contribution(1), contribution(1)], true),
+            ([contribution(1), contribution(2)], false),
+            ([contribution(0), contribution(0)], false),
+            ([contribution(1), direct], false),
+            ([direct, direct], false),
+        ] {
+            let branches = roles
+                .into_iter()
+                .zip([1, 2])
+                .map(|(role, node)| branch(node, vec![SlotId::new(2)], role))
+                .collect();
+            assert_eq!(
+                StaticSinkProgram::try_change_stream_router(
+                    branches,
+                    arena.clone(),
+                    SlotId::new(1),
+                    routes.clone(),
+                )
+                .is_ok(),
+                valid,
+                "{roles:?}",
+            );
+        }
     }
     #[test]
     fn route_layout_hints_only_name_unique_projected_provider_occurrences() {

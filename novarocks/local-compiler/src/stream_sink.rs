@@ -20,7 +20,8 @@
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
 use novarocks_local_program::*;
 use novarocks_physical_plan::{
-    Distribution, EdgeId, FragmentPackage, FragmentSink, OutboundFragmentCut, ValueId,
+    Distribution, EdgeId, ExchangePayloadContract, FragmentPackage, FragmentSink,
+    OutboundFragmentCut, ValueId,
 };
 use novarocks_type_contract::{
     BucketLayoutAlgorithm, CompileCheckpoints, CompileControlError, CompilePhase, ControlShape,
@@ -44,20 +45,27 @@ pub(crate) struct LoweredStreamSink {
     pub requirements: Vec<BindingRequirement>,
     pub flow: SinkFlow,
 }
-pub(crate) fn cut_role(
-    role: novarocks_physical_plan::OutputRole,
-) -> Result<ProgramOutputRole, FragmentCompileError> {
-    Ok(match role {
-        novarocks_physical_plan::OutputRole::Relational => ProgramOutputRole::Relational,
-        novarocks_physical_plan::OutputRole::ProviderRoute { target } => {
-            ProgramOutputRole::ProviderRoute { target }
+pub(crate) fn cut_role(payload: &ExchangePayloadContract) -> ProgramOutputRole {
+    match payload {
+        ExchangePayloadContract::Relational => ProgramOutputRole::Relational,
+        ExchangePayloadContract::ProviderRoute(route) => ProgramOutputRole::ProviderRoute {
+            target: route.write_target_ordinal,
+        },
+        ExchangePayloadContract::PositionContribution { group, route } => {
+            ProgramOutputRole::PositionContribution {
+                group: *group,
+                target: route.write_target_ordinal,
+            }
         }
-        novarocks_physical_plan::OutputRole::Summary(kind) => ProgramOutputRole::Summary(kind),
-        novarocks_physical_plan::OutputRole::WriterResults => ProgramOutputRole::WriterResults,
-        novarocks_physical_plan::OutputRole::PositionShards { group, target } => {
-            ProgramOutputRole::PositionShards { group, target }
+        ExchangePayloadContract::PositionShards { group, target } => {
+            ProgramOutputRole::PositionShards {
+                group: *group,
+                target: *target,
+            }
         }
-    })
+        ExchangePayloadContract::Summary(summary) => ProgramOutputRole::Summary(summary.kind()),
+        ExchangePayloadContract::WriterResults(_) => ProgramOutputRole::WriterResults,
+    }
 }
 pub(crate) fn cut_delivery(
     delivery: novarocks_physical_plan::DeliveryRequirement,
@@ -388,7 +396,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
             )?;
             (columns, layout)
         };
-        let role = cut_role(cut.payload.role())?;
+        let role = cut_role(&cut.payload);
         let delivery = cut_delivery(cut.delivery);
         let branch = StaticStreamBranch::try_new(
             i32::try_from(cut.destination_node.get()).map_err(|_| {

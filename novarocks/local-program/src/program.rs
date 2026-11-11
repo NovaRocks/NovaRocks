@@ -1791,6 +1791,7 @@ impl LocalProgramGraph {
                     if matches!(
                         branch.contract().role,
                         crate::ProgramOutputRole::ProviderRoute { .. }
+                            | crate::ProgramOutputRole::PositionContribution { .. }
                     ) {
                         let mut includes_effect = branch.output_columns().is_empty();
                         for slot in branch.output_columns() {
