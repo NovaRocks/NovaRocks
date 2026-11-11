@@ -27,7 +27,9 @@ use crate::{
         SendGeneration,
     },
 };
-use novarocks_coordination_contract::{AttemptComputationCut, StatusObservation};
+use novarocks_coordination_contract::{
+    AttemptComputationCut, SelectedTaskTermination, StatusObservation,
+};
 use novarocks_execution_contract::{
     CreateTaskReceipt, LeaseReceipt, OperationKind, OperationOutcome, ParticipationReceipt,
     ParticipationState, SafeDetail, TaskFailure, TaskFailurePhase, TaskResourceFacts,
@@ -269,6 +271,24 @@ impl TerminalTrace {
         }
     }
 
+    fn apply_snapshot(
+        &mut self,
+        stream: &ReceivedObservation,
+        status: &TaskStatus,
+    ) -> Result<(), AttemptFailure> {
+        let mut observation = stream.clone();
+        let ObservationEvent::Fact {
+            fact: ObservationFact::Status(snapshot),
+            ..
+        } = &mut observation.event
+        else {
+            panic!("expected the original Task status stream");
+        };
+        assert_eq!(snapshot.identity(), status.identity());
+        *snapshot = status.clone();
+        self.apply(None, Some(observation))
+    }
+
     fn open_diagnostic_window(&mut self) {
         let now = self.core.execution.monotonic_now();
         let deadline = now.saturating_add(Duration::from_secs(1));
@@ -386,6 +406,20 @@ fn status_frame(trace: &mut TerminalTrace, status: TaskStatus) -> ReceivedObserv
     }
 }
 
+fn originating_failure(detail: &str, phase: TaskFailurePhase) -> TerminationDetail {
+    TerminationDetail::Failed(TaskFailure::new_in_phase(
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(
+                NonZeroU16::new(u16::MAX).unwrap(),
+                NonZeroU16::new(1).unwrap(),
+            ),
+        ),
+        SafeDetail::new(detail).unwrap(),
+        phase,
+    ))
+}
+
 #[test]
 fn first_terminal_create_reply_and_stream_duplicate_queue_one_diagnostic_read() {
     for preparation_failure in [false, true] {
@@ -402,17 +436,10 @@ fn first_terminal_create_reply_and_stream_duplicate_queue_one_diagnostic_read() 
         let (state, cause, installed) = if preparation_failure {
             (
                 TaskState::Failed,
-                Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
-                    FailureFact::new(
-                        FailureClass::Data,
-                        FailureReason::new(
-                            NonZeroU16::new(u16::MAX).unwrap(),
-                            NonZeroU16::new(1).unwrap(),
-                        ),
-                    ),
-                    SafeDetail::new("original preparation failure").unwrap(),
+                Some(originating_failure(
+                    "original preparation failure",
                     TaskFailurePhase::Preparation,
-                ))),
+                )),
                 false,
             )
         } else {
@@ -541,4 +568,161 @@ fn stream_first_terminal_order_survives_duplicates_and_late_create_reply() {
     trace.apply(None, None).unwrap();
     assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
     trace.expect_diagnostic_reads(&order);
+}
+
+#[test]
+fn live_metrics_and_derived_refinement_queue_only_the_first_terminal() {
+    let mut trace = TerminalTrace::new();
+    let task = trace
+        .core
+        .execution
+        .graph()
+        .tasks()
+        .last()
+        .unwrap()
+        .identity();
+    let derived = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+    let live_status = |version| {
+        TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(version).unwrap(),
+            TaskState::Aborting,
+            Some(derived.clone()),
+            TaskOutputFacts::default(),
+        )
+        .unwrap()
+        .with_resources(TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(version)))
+    };
+    let stream = status_frame(&mut trace, live_status(2));
+    trace.open_diagnostic_window();
+    for version in [2, 3] {
+        let live = live_status(version);
+        let revision = trace.core.execution.accepted_protocol_revision();
+        trace.apply_snapshot(&stream, &live).unwrap();
+        assert_eq!(trace.status(task), Some(&live));
+        assert!(trace.core.execution.accepted_protocol_revision() > revision);
+        assert!(!trace.core.execution.diagnostics().read_ready());
+    }
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&SelectedTaskTermination::new(task, derived)),
+    );
+
+    let failure = originating_failure("original runtime failure", TaskFailurePhase::Execution);
+    let terminal = TaskStatus::try_new(
+        task,
+        TaskStatusVersion::new(9).unwrap(),
+        TaskState::Failed,
+        Some(failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    trace.apply_snapshot(&stream, &terminal).unwrap();
+    assert_eq!(trace.status(task), Some(&terminal));
+    assert!(trace.core.execution.diagnostics().read_ready());
+    let selected = SelectedTaskTermination::new(task, failure);
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    let revision = trace.core.execution.accepted_protocol_revision();
+
+    trace.apply_snapshot(&stream, &terminal).unwrap();
+    assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+    let overwrite = TaskStatus::try_new(
+        task,
+        TaskStatusVersion::new(10).unwrap(),
+        TaskState::Failed,
+        Some(originating_failure(
+            "replacement runtime failure",
+            TaskFailurePhase::Execution,
+        )),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trace.apply_snapshot(&stream, &overwrite),
+        Err(AttemptFailure::TaskProtocol(error))
+            if matches!(*error, TaskExecutionError::Observation(StatusObservation::TerminalOverwrite))
+    ));
+    assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+    assert_eq!(trace.status(task), Some(&terminal));
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    trace.expect_diagnostic_reads(&[task]);
+}
+
+#[test]
+fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
+    let mut trace = TerminalTrace::new();
+    let (peer, origin) = {
+        let mut tasks = trace.core.execution.graph().tasks();
+        let _root = tasks.next().unwrap();
+        let origin = tasks.next().unwrap().identity();
+        let peer = tasks.next().unwrap().identity();
+        (peer, origin)
+    };
+    let peer_failure = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+    let peer_terminal = TaskStatus::try_new(
+        peer,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Aborted,
+        Some(peer_failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    let original_failure =
+        originating_failure("different task origin", TaskFailurePhase::Execution);
+    let origin_terminal = TaskStatus::try_new(
+        origin,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Failed,
+        Some(original_failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    let peer_stream = status_frame(&mut trace, peer_terminal.clone());
+    let origin_stream = status_frame(&mut trace, origin_terminal.clone());
+    trace.open_diagnostic_window();
+
+    trace.apply_snapshot(&peer_stream, &peer_terminal).unwrap();
+    assert_eq!(trace.status(peer), Some(&peer_terminal));
+    assert_eq!(trace.status(origin), None);
+    assert!(trace.core.execution.diagnostics().read_ready());
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&SelectedTaskTermination::new(peer, peer_failure)),
+    );
+    let first_revision = trace.core.execution.accepted_protocol_revision();
+
+    trace
+        .apply_snapshot(&origin_stream, &origin_terminal)
+        .unwrap();
+    assert_eq!(trace.status(origin), Some(&origin_terminal));
+    let selected = SelectedTaskTermination::new(origin, original_failure);
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    let selected_revision = trace.core.execution.accepted_protocol_revision();
+    assert!(selected_revision > first_revision);
+
+    for (stream, terminal) in [
+        (&peer_stream, &peer_terminal),
+        (&origin_stream, &origin_terminal),
+    ] {
+        trace.apply_snapshot(stream, terminal).unwrap();
+        assert_eq!(trace.status(terminal.identity()), Some(terminal));
+        assert_eq!(
+            trace.core.execution.accepted_protocol_revision(),
+            selected_revision
+        );
+        assert_eq!(
+            trace.core.execution.selected_task_failure(),
+            Some(&selected)
+        );
+    }
+    trace.expect_diagnostic_reads(&[peer, origin]);
 }
