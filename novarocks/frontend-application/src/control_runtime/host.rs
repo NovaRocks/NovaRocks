@@ -1471,7 +1471,16 @@ mod tests {
     }
 
     async fn drive_startup(close_before_bootstrap: bool) {
-        use crate::task_execution::host::startup::{AttemptStartupSource, StartupInput};
+        use crate::{
+            query_execution::native_execution_adapter::LogicalAbortRouter,
+            task_execution::{
+                bridge::abort::AttemptAbortIngress,
+                host::startup::{AttemptStartupSource, StartupInput},
+            },
+        };
+        use novarocks_coordination_contract::AttemptActivationIdentity;
+        use novarocks_query_application::coordination::AbortParticipationEffectPort;
+        use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
         struct StartupProbe(Arc<Mutex<Vec<StartupInput>>>);
         impl TestActor for StartupProbe {
@@ -1528,6 +1537,26 @@ mod tests {
         assert!(runtime.claim_host_actor().is_none());
         assert!(!startup.ready_for(&registration));
 
+        let execution =
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(1).unwrap()).unwrap();
+        let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
+        let aborts = LogicalAbortRouter::new();
+        let route = aborts.reserve_route(execution).unwrap();
+        let endpoint = Arc::new(AttemptAbortIngress::new(
+            registration.clone(),
+            activation,
+            [],
+            aborts.capacity_author(),
+            None,
+        ));
+        let capacity = aborts.subscribe_capacity();
+        let assert_unpublished =
+            |startup: &crate::task_execution::host::startup::AttemptStartup| {
+                assert!(route.publish_registered(startup, endpoint.clone()).is_err());
+                assert!(!capacity.has_changed().unwrap());
+            };
+        assert_unpublished(&startup);
+
         let mut exit = host
             .register(HostBinding {
                 scope: scope.clone(),
@@ -1565,6 +1594,7 @@ mod tests {
             assert_eq!(startup.wait_ready().await, Err(ActorTurnError::Closed));
             assert_eq!(runtime.snapshot(actor).unwrap().inputs, 1);
             assert!(!startup.ready_for(&registration));
+            assert_unpublished(&startup);
             assert!(runtime.poll_one(Tick(1)).unwrap());
             drive_host(); // Index the already queued Bootstrap.
             drive_host(); // Retire its actual occurrence.
@@ -1588,6 +1618,7 @@ mod tests {
             [StartupInput::Bootstrap, StartupInput::StartProtocol]
         );
         assert!(!startup.ready_for(&registration));
+        assert_unpublished(&startup);
         {
             let wait = startup.wait_ready();
             tokio::pin!(wait);
@@ -1600,9 +1631,21 @@ mod tests {
         }
         drive_host(); // Index StartProtocol.
         drive_host(); // Retire StartProtocol.
+        assert_unpublished(&startup);
         drive_host(); // Return the original standing position.
         startup.wait_ready().await.unwrap();
         assert!(startup.ready_for(&registration));
+        let wrong_execution =
+            QueryExecutionId::new(QueryId::new(1, 1), AttemptId::new(2).unwrap()).unwrap();
+        let wrong_route = aborts.reserve_route(wrong_execution).unwrap();
+        assert!(
+            wrong_route
+                .publish_registered(&startup, endpoint.clone())
+                .is_err()
+        );
+        assert!(!capacity.has_changed().unwrap());
+        route.publish_registered(&startup, endpoint).unwrap();
+        assert!(capacity.has_changed().unwrap());
         assert!(
             runtime
                 .standing_input_inventory(actor, None, 1)

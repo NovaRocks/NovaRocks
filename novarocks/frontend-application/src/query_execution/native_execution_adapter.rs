@@ -193,7 +193,7 @@ impl LogicalAbortRouter {
         Ok((route, intake))
     }
 
-    pub(crate) fn install_registered_attempt(
+    pub(crate) fn prepare_registered_attempt(
         self: &Arc<Self>,
         attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
         runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
@@ -226,7 +226,6 @@ impl LogicalAbortRouter {
         let settlement = Arc::new(
             crate::task_execution::bridge::abort::AbortSettlementOwner::new(ingress.clone()),
         );
-        route.publish(ingress.clone());
         Ok((route, ingress, settlement))
     }
 
@@ -267,6 +266,19 @@ pub(crate) struct LogicalAbortRoute {
 }
 
 impl LogicalAbortRoute {
+    pub(crate) fn publish_registered(
+        &self,
+        startup: &crate::task_execution::host::startup::AttemptStartup,
+        endpoint: Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
+    ) -> Result<(), novarocks_control_runtime::actor_turn::ActorTurnError> {
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
+        if !endpoint.ready_for_route(startup, self.execution) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        self.publish(endpoint);
+        Ok(())
+    }
+
     pub(crate) fn publish(&self, endpoint: Arc<dyn AbortParticipationEffectPort>) {
         {
             let mut routes = self

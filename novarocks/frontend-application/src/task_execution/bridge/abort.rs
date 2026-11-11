@@ -129,6 +129,16 @@ impl AttemptAbortIngress {
         }
     }
 
+    pub(crate) fn ready_for_route(
+        &self,
+        startup: &crate::task_execution::host::startup::AttemptStartup,
+        execution: novarocks_types::QueryExecutionId,
+    ) -> bool {
+        self.original.activation.execution() == execution
+            && startup.ready_for(&self.original.registration)
+            && !self.original.closed.load(Ordering::Acquire)
+    }
+
     /// The exact Core-selected logical action is the authority to take this
     /// QA submission. A mismatching operation or action leaves the slot intact.
     pub(crate) fn take_submission(

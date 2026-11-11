@@ -385,7 +385,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     let before_abort_route = inventory();
     let abort_router = crate::query_execution::native_execution_adapter::LogicalAbortRouter::new();
     let (abort_route, abort_ingress, abort_settlement) = abort_router
-        .install_registered_attempt(&mut registered, &runtime, &original_work)
+        .prepare_registered_attempt(&mut registered, &runtime, &original_work)
         .unwrap();
     let abort_positions: Vec<_> = inventory()
         .into_iter()
@@ -399,7 +399,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     );
     assert!(
         abort_router
-            .install_registered_attempt(&mut registered, &runtime, &original_work)
+            .prepare_registered_attempt(&mut registered, &runtime, &original_work)
             .is_err()
     );
 
