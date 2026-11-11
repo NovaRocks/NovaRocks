@@ -1559,10 +1559,73 @@ mod tests {
             core.next_subscription_deadline()
                 .is_some_and(|deadline| deadline <= at(15))
         );
+        let SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::OpenSubscription(reopened),
+            ..
+        }) = core
+            .advance_subscription(at(15), effect(14), token(14), &mut Units(2))
+            .unwrap()
+        else {
+            panic!("expected a new generation after the original stream's actual exit");
+        };
+        assert_eq!(reopened.generation.get(), generation.get() + 1);
+        core.apply_subscription_input(
+            at(15),
+            &ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                participation,
+                generation: reopened.generation,
+                opening_started_at: at(15),
+                opened_at: Some(at(15)),
+            }),
+        )
+        .unwrap();
+        let confirmation = core
+            .advance_subscription(at(20), effect(15), token(15), &mut Units(1))
+            .unwrap();
         assert!(matches!(
-            core.advance_subscription(at(15), effect(14), token(14), &mut Units(2)).unwrap(),
-            SubscriptionStep::Effect(AttemptEffect { body: EffectBody::OpenSubscription(request), .. })
-                if request.generation.get() == generation.get() + 1
+            confirmation,
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::ConfirmReadState { generation, token: request, .. },
+                ..
+            }) if generation == reopened.generation && request == token(15)
+        ));
+
+        core.apply_subscription_input(at(21), &snapshot(12, at(9)))
+            .unwrap();
+        assert_eq!(core.next_subscription_deadline(), None);
+        assert!(matches!(
+            core.advance_subscription(at(21), effect(16), token(16), &mut Units(1))
+                .unwrap(),
+            SubscriptionStep::Idle
+        ));
+        let current = ReadStateSnapshot {
+            request: token(15),
+            participation,
+            generation: reopened.generation,
+            snapshot_at: at(20),
+            opening_started_at: Some(at(15)),
+            opened_at: Some(at(15)),
+            had_liveness: false,
+            last_liveness_at: at(15),
+            pauses: ReadPauseCoverage {
+                from: at(15),
+                through: at(20),
+                paused: Duration::ZERO,
+            },
+            reading_paused: false,
+            resume_revision: 0,
+            closed: false,
+            received_through_snapshot: ReceptionCoverage::Complete,
+        };
+        core.apply_subscription_input(at(21), &ExecutorFact::ReadState(current))
+            .unwrap();
+        assert!(matches!(
+            core.advance_subscription(at(21), effect(16), token(16), &mut Units(1))
+                .unwrap(),
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::CloseSubscription { generation, .. },
+                ..
+            }) if generation == reopened.generation
         ));
     }
 
