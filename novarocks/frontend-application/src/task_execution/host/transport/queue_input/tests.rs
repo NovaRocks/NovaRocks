@@ -45,6 +45,12 @@ pub(crate) struct Governed {
 }
 impl Governed {
     pub(crate) fn new() -> Self {
+        Self::with_origin(None)
+    }
+
+    pub(crate) fn with_origin(
+        endpoint: Option<&novarocks_execution_contract::RuntimeEndpoint>,
+    ) -> Self {
         // Use the existing Native author's actual proposal-observer geometry;
         // this fixture creates no alternate WC grant or process quota wallet.
         let source =
@@ -84,11 +90,11 @@ impl Governed {
         // Use the same Native origin author as governed_wire; the listener
         // retains this exact fixture endpoint through its real cleanup.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = novarocks_execution_contract::RuntimeEndpoint::from_socket_addr(
+        let local_endpoint = novarocks_execution_contract::RuntimeEndpoint::from_socket_addr(
             listener.local_addr().unwrap(),
         );
         let origin = novarocks_native_adapter::FrontendNativeTransport::plaintext()
-            .selected_network_origin(endpoint.native_endpoint())
+            .selected_network_origin(endpoint.unwrap_or(&local_endpoint).native_endpoint())
             .unwrap()
             .into_owned();
         let mut binding = scope.begin_control_binding().unwrap();

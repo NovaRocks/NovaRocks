@@ -55,7 +55,7 @@ mod source_ports;
 // Only these controlled original-object entry points are exposed to the host.
 pub(crate) use actor_adapter::{
     ActorTransportExecutor, ActorTransportHandoff, ActorTransportWork, BoundActorTransport,
-    actor_transport_layouts, handoff_actor_transport, prepare_actor_transport,
+    actor_transport_layouts, handoff_actor_transport, prepare_actor_pump, prepare_actor_transport,
 };
 pub(crate) use admission_source::{AdmissionResultRefusal, AdmissionSource};
 pub(crate) use call_source::{AttemptCallOwner, AttemptCallSource};
@@ -72,8 +72,12 @@ pub(crate) use effect_source::{
     FailedSendResult, NativeReportReferences,
 };
 pub(crate) use establish_material::AttemptEstablishMaterial;
-pub(crate) use failure_abort::{FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup};
+pub(crate) use failure_abort::{
+    FailureAbortAttempt, FailureResidualPort, NativeFailureCleanup, PreparedSingleSend,
+    SingleSendContext, SingleSendError, SingleSendResult,
+};
 pub(crate) use granted_inputs::GrantedInputs;
+pub(crate) use prepare::PreparationFailure;
 pub(crate) use process_observation::AttemptProcessObserver;
 #[cfg(test)]
 pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;

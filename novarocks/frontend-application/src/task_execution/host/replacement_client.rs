@@ -15,30 +15,160 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Queue-stage admission for the non-actor replacement qualification Source.
+//! Native admission acquisition for the non-actor replacement qualification.
 //!
 //! The logical owner supplies its original immutable admission request and
-//! one WC input for this send. Retry, cancellation, expiry and settlement
-//! stay with that owner. This boundary reserves only the original shared FE
-//! queue stage. Its result goes to the Source's ordinary SendBatch binding.
+//! send generation. This client drives the original WC queue input, process
+//! queue, Native action and Apply custody for one physical send. Retry and
+//! qualification settlement stay with the logical owner.
 
-use super::transport::{OriginalQueuedInput, SendKey};
+use super::transport::{
+    OriginalQueuedInput, PreparedSingleSend, SendKey, SingleSendContext, SingleSendError,
+    SingleSendResult, send_queue_resources,
+};
 use crate::native::transport_capacity::{
     NativeTransportCapacity, TransportCapacityError, TransportCapacityLane,
 };
-use crate::task_execution::intent::OperationIntent;
+use crate::task_execution::{
+    intent::{AckPayload, OperationAcknowledgement, OperationIntent},
+    operation::OperationDispatchResult,
+};
 use novarocks_control_runtime::{
     capacity_notification::CapacityRegistrant,
-    obligation::StepRegistration,
-    reported_work::ReportedWork,
+    obligation::{StepRegistration, WorkObligation},
     transaction::{RuntimeError, RuntimeLedger},
 };
 use novarocks_control_runtime_core::{
     identity::Generation,
     scope::{WorkAdmission, WorkKind},
 };
-use novarocks_execution_contract::AcquireParticipationAdmissionTicket;
+use novarocks_execution_contract::{
+    AcquireParticipationAdmissionTicket, OperationOutcome, ParticipationAdmissionTicketReceipt,
+};
+use novarocks_workload_control::WorkError;
 use std::{future::poll_fn, task::Poll};
+use tokio::{sync::watch, time::Instant};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementSendStop {
+    Cancelled,
+    Expired,
+}
+
+pub(crate) struct ReplacementAdmissionReceipt {
+    pub(crate) dispatch: OperationDispatchResult,
+    pub(crate) worker_outcome: Option<OperationOutcome>,
+    pub(crate) ticket: Option<ParticipationAdmissionTicketReceipt>,
+    pub(crate) governance: Option<WorkError>,
+}
+
+impl ReplacementAdmissionReceipt {
+    fn observe(original: &OperationAcknowledgement) -> Self {
+        Self {
+            dispatch: original.dispatch_result(),
+            worker_outcome: original.worker_outcome(),
+            ticket: match original.payload() {
+                AckPayload::AdmissionTicket(ticket) => Some(*ticket),
+                _ => None,
+            },
+            governance: original.governance_failure().cloned(),
+        }
+    }
+}
+
+#[must_use = "the original qualification settles the typed admission and stop fact"]
+pub(crate) struct ReplacementAdmissionSend {
+    pub(crate) original: SingleSendResult<ReplacementAdmissionReceipt>,
+    pub(crate) stopped: Option<ReplacementSendStop>,
+}
+
+#[derive(Debug)]
+#[must_use = "retain any unresolved original Native retirement proof"]
+pub(crate) enum ReplacementSendError {
+    StoppedBeforeHandoff(ReplacementSendStop),
+    Queue(ReplacementQueueError),
+    Send(SingleSendError<ReplacementAdmissionReceipt>),
+}
+
+/// Submit one frozen Acquire generation from the existing qualification
+/// future. The caller supplies its original cancellation receiver and
+/// absolute expiry. After launch the caller must drive this future through
+/// retirement, including when cancellation or expiry wins the handoff.
+pub(crate) async fn send_replacement_admission(
+    context: SingleSendContext<'_>,
+    qualification: &WorkObligation,
+    generation: Generation,
+    request: AcquireParticipationAdmissionTicket,
+    key: SendKey,
+    cancellation: &mut watch::Receiver<bool>,
+    expiry: Instant,
+) -> Result<ReplacementAdmissionSend, ReplacementSendError> {
+    if *cancellation.borrow() {
+        return Err(ReplacementSendError::StoppedBeforeHandoff(
+            ReplacementSendStop::Cancelled,
+        ));
+    }
+    if expiry <= Instant::now() {
+        return Err(ReplacementSendError::StoppedBeforeHandoff(
+            ReplacementSendStop::Expired,
+        ));
+    }
+    if !context.scope.same_scope(qualification.scope()) {
+        return Err(ReplacementSendError::Send(SingleSendError::WrongOwner));
+    }
+    let ledger = context.ledger;
+    let layout = context.layout;
+    let operation = OperationIntent::AcquireParticipationAdmissionTicket(request);
+    let prepared =
+        PreparedSingleSend::new(context, operation, key).map_err(ReplacementSendError::Send)?;
+    let admission = prepared
+        .admit()
+        .map_err(|error| ReplacementSendError::Send(SingleSendError::Governance(error)))?;
+    let input = tokio::select! {
+        biased;
+        stop = wait_for_stop(cancellation, expiry) => {
+            return Err(ReplacementSendError::StoppedBeforeHandoff(stop));
+        }
+        original = admission => original
+            .map_err(|error| ReplacementSendError::Send(SingleSendError::Governance(error)))?,
+    };
+    let (guard, _) = tokio::select! {
+        biased;
+        stop = wait_for_stop(cancellation, expiry) => {
+            return Err(ReplacementSendError::StoppedBeforeHandoff(stop));
+        }
+        original = reserve_replacement_send(ledger, layout, qualification, generation, request, key, &input) => {
+            original.map_err(ReplacementSendError::Queue)?
+        }
+    };
+    let mut stopped = None;
+    let original = prepared
+        .run(
+            guard,
+            input,
+            generation,
+            expiry,
+            async { stopped = Some(wait_for_stop(cancellation, expiry).await) },
+            ReplacementAdmissionReceipt::observe,
+        )
+        .await
+        .map_err(ReplacementSendError::Send)?;
+    Ok(ReplacementAdmissionSend { original, stopped })
+}
+
+pub(crate) async fn wait_for_stop(
+    cancellation: &mut watch::Receiver<bool>,
+    expiry: Instant,
+) -> ReplacementSendStop {
+    if *cancellation.borrow() {
+        return ReplacementSendStop::Cancelled;
+    }
+    tokio::select! {
+        biased;
+        _ = cancellation.changed() => ReplacementSendStop::Cancelled,
+        _ = tokio::time::sleep_until(expiry) => ReplacementSendStop::Expired,
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum ReplacementQueueError {
@@ -62,7 +192,7 @@ pub(crate) enum ReplacementQueueError {
 pub(crate) async fn reserve_replacement_send(
     ledger: &RuntimeLedger,
     layout: &NativeTransportCapacity,
-    qualification: &ReportedWork,
+    qualification: &WorkObligation,
     generation: Generation,
     request: AcquireParticipationAdmissionTicket,
     send: SendKey,
@@ -77,14 +207,14 @@ pub(crate) async fn reserve_replacement_send(
     } else {
         (TransportCapacityLane::Ordinary, WorkKind::Business)
     };
-    let mut resources = layout
-        .queue_resources(intent.backend_process_id(), lane, 1, intent.queued_bytes())
-        .map_err(ReplacementQueueError::Layout)?;
-    // queue_resources already prices the Work header. This send's one
-    // producer report and capture position travel with its original Work.
-    resources.owned_slots.completions = 1;
-    resources.owned_slots.captures = 1;
-    let parent = qualification.work();
+    let resources = send_queue_resources(
+        layout,
+        intent.backend_process_id(),
+        lane,
+        1,
+        intent.queued_bytes(),
+    )
+    .map_err(ReplacementQueueError::Layout)?;
     let mut registrant: Option<CapacityRegistrant> = None;
     poll_fn(|cx| {
         let registrant = match registrant.as_mut() {
@@ -97,11 +227,11 @@ pub(crate) async fn reserve_replacement_send(
                 Err(error) => return Poll::Ready(Err(ReplacementQueueError::Runtime(error))),
             },
         };
-        match parent.scope().reserve_next_or_wait(
+        match qualification.scope().reserve_next_or_wait(
             generation,
             resources.clone(),
             kind,
-            WorkAdmission::Derived(parent.id()),
+            WorkAdmission::Derived(qualification.id()),
             registrant,
         ) {
             Ok(original) => Poll::Ready(Ok((original, kind))),

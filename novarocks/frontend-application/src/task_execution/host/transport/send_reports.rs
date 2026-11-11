@@ -189,9 +189,10 @@ pub(crate) struct ActorSendReports {
     rows: Mutex<Option<SendReportRows>>,
 }
 
-/// A cleanup send has one original reply cell and no failed-Core mailbox leg.
-pub(super) struct AbortReply {
+/// A non-actor send has one original reply cell.
+pub(super) struct SingleSendReply {
     pub(super) key: SendKey,
+    pub(super) kind: novarocks_execution_contract::OperationKind,
     pub(super) value: Mutex<Option<OperationAcknowledgement>>,
     pub(super) outcome: Mutex<Option<super::source_ports::BodyOutcome>>,
 }
@@ -199,27 +200,24 @@ pub(super) struct AbortReply {
 #[derive(Clone)]
 pub(super) enum SendReports {
     Actor(Arc<ActorSendReports>),
-    Abort(Arc<AbortReply>),
+    Single(Arc<SingleSendReply>),
 }
 
 impl SendReports {
     pub(super) fn actor(&self) -> Option<&Arc<ActorSendReports>> {
         match self {
             Self::Actor(reports) => Some(reports),
-            Self::Abort(_) => None,
+            Self::Single(_) => None,
         }
     }
 
     pub(super) fn record_ack(&self, key: SendKey, ack: OperationAcknowledgement) {
         match self {
             Self::Actor(reports) => reports.record_ack(key, ack),
-            Self::Abort(reply) => {
+            Self::Single(reply) => {
                 assert_eq!(key, reply.key);
                 assert_eq!(ack.operation_id(), key.operation);
-                assert_eq!(
-                    ack.kind(),
-                    novarocks_execution_contract::OperationKind::AbortParticipation
-                );
+                assert_eq!(ack.kind(), reply.kind);
                 assert!(reply.value.lock().unwrap().replace(ack).is_none());
             }
         }

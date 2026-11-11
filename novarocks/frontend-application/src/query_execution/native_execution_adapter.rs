@@ -19,7 +19,7 @@
 //! boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -31,9 +31,11 @@ use source_cohort::NativeSourceCohortAdmission;
 pub(crate) use source_cohort::source_count as native_source_count;
 
 use novarocks_attempt_protocol::config::CoordinationBudgets;
+use novarocks_attempt_protocol::input::SendGeneration;
+use novarocks_control_runtime_core::identity::ConsumerId;
 #[cfg(test)]
 use novarocks_coordination_contract::AttemptFailureClass;
-use novarocks_coordination_contract::RecoveryMode;
+use novarocks_coordination_contract::{AttemptActionId, RecoveryMode};
 use novarocks_execution_contract::{
     AcquireParticipationAdmissionTicket, LeaseValidFor, OperationOutcome, ParticipationRef,
     TaskOperationId,
@@ -71,15 +73,15 @@ use novarocks_types::NativeCompatibilityId;
 use novarocks_workload_control::WorkOwner;
 use tokio::sync::watch;
 
+use crate::control_runtime::{ReplacementQualificationScope, ReplacementQualificationScopeError};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_result_transport::{
     NativeBoundedRootReadPort, NativeTaskResultTransport, TaskReadGrace,
 };
-use crate::native::task_transport::{
-    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
-};
+use crate::native::task_transport::wire::AttemptWireFacts;
+use crate::native::transport::Client;
 use crate::query_execution::artifact::{
     ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
     SnapshotBoundDormantAttemptInputs, TaskExecutionPreparedQuery, TaskManifestBinding,
@@ -105,14 +107,16 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
 use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
-use crate::task_execution::intent::{
-    AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
-    TaskOperationSubmit,
+use crate::task_execution::host::{
+    replacement_client::{
+        ReplacementSendError, ReplacementSendStop, send_replacement_admission, wait_for_stop,
+    },
+    transport::{PreparationFailure, SendKey, SingleSendContext, SingleSendError},
 };
 use crate::task_execution::manifest_projection::ManifestAttemptInputs;
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
-use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use crate::task_execution::status_intake::StatusIntakeWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
 
@@ -396,22 +400,32 @@ impl LogicalReplacementQualificationPort {
     }
 
     async fn qualify(self, submission: ReplacementQualificationEffectSubmission) {
-        let cancellation = submission.subscribe_cancellation();
-        let result = self
-            .qualify_request(submission.request(), cancellation)
-            .await;
-        match result {
-            Ok(reservation) => match QualifiedReplacementReservation::try_new(
-                submission.request(),
-                Box::new(reservation),
-            ) {
-                Ok(reservation) => {
-                    let _ = submission.qualified(reservation);
-                }
+        let request = submission.request().clone();
+        let mut cancellation = submission.subscribe_cancellation();
+        let expiry = tokio::time::Instant::from_std(request.absolute_expiry());
+        let qualification = self.qualify_request(&request, cancellation.clone());
+        tokio::pin!(qualification);
+        tokio::select! {
+            biased;
+            result = &mut qualification => match result {
+                Ok(reservation) => match QualifiedReplacementReservation::try_new(
+                    submission.request(),
+                    Box::new(reservation),
+                ) {
+                    Ok(reservation) => {
+                        let _ = submission.qualified(reservation);
+                    }
+                    Err(error) => submission.refused(error),
+                },
                 Err(error) => submission.refused(error),
             },
-            Err(error) => {
-                submission.refused(error);
+            stop = wait_for_stop(&mut cancellation, expiry) => {
+                // The original QA result may settle before transport exits.
+                // Keep driving the same qualification and its physical Join.
+                submission.refused(replacement_send_stopped(stop));
+                if let Ok(reservation) = qualification.await {
+                    Box::new(reservation).abandon();
+                }
             }
         }
         self.inner.busy.store(false, Ordering::Release);
@@ -726,29 +740,40 @@ async fn acquire_replacement_admissions(
         }
         backends.push(target.descriptor().clone());
     }
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    let acks = TaskAckIntake::new(wake);
-    let sink = NativeTaskOperationSink::new(
-        &backends,
-        runtime.transport_budget(),
-        AttemptWireFacts {
-            native_compatibility_id: runtime.native_compatibility_id,
-        },
-        acks.handle(),
-        runtime.data_runtime.clone(),
-        qualification
-            .native_action_authority()
-            .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?
-            .clone(),
-    )
-    .map_err(|error| ReplacementQualificationFailure::DomainRefused(error.failure_fact()))?;
+    let backends: Arc<[_]> = backends.into();
+    let authority = qualification
+        .native_action_authority()
+        .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
     let valid_for =
         LeaseValidFor::new(crate::task_execution::participation_owner::ADMISSION_TICKET_VALID_FOR)
             .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
+    let attempt_runtime = &runtime.attempt_runtime;
+    let scope = attempt_runtime
+        .open_replacement_qualification()
+        .map_err(|error| match error {
+            ReplacementQualificationScopeError::Closed => {
+                ReplacementQualificationFailure::EffectOwnerClosed
+            }
+            ReplacementQualificationScopeError::Runtime(error) => {
+                tracing::warn!(?error, "replacement qualification scope admission failed");
+                ReplacementQualificationFailure::InvalidReservation
+            }
+        })?;
+    let parent = scope.parent();
+    let layout = attempt_runtime.transport_capacity();
+    let executor = runtime.data_runtime.handle();
+    let expiry = tokio::time::Instant::from_std(qualification.absolute_expiry());
+    let wire = AttemptWireFacts {
+        native_compatibility_id: runtime.native_compatibility_id,
+    };
+    let mut admissions = PendingReplacementAdmissions::new(runtime.data_runtime.clone());
+    let mut unresolved = None;
     let acquire = async {
-        let mut admissions = PendingReplacementAdmissions::new(runtime.data_runtime.clone());
-        for participation in qualification.replacement_participations() {
+        for (index, participation) in qualification
+            .replacement_participations()
+            .iter()
+            .enumerate()
+        {
             if *cancellation.borrow() {
                 return Err(ReplacementQualificationFailure::Rejected);
             }
@@ -763,157 +788,143 @@ async fn acquire_replacement_admissions(
                     .expect("replacement participation target checked above")
                     .admission_epoch_capability(),
             );
-            let intent = OperationIntent::AcquireParticipationAdmissionTicket(request);
+            let client =
+                Client::for_backend_in(backends.clone(), index, runtime.data_runtime.clone());
             let mut retry_delay = runtime.task_update_retry_policy.initial_backoff();
-            // These are fields of the same original qualification future,
-            // already held by its stable QA owner. Local backpressure never
-            // recreates this request, paid ticket, or queue source.
-            let mut queue_preparation =
-                crate::task_execution::intent::TaskOperationQueuePreparation::new();
-            let mut pending_batch = None;
+            let mut send_generation = NonZeroU64::MIN;
             loop {
-                if *cancellation.borrow() {
-                    return Err(ReplacementQualificationFailure::Rejected);
-                }
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if pending_batch.is_none() {
-                    let permit = match sink
-                        .try_reserve_queue(intent.queue_request(), &mut queue_preparation)
-                    {
-                        TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
-                        TaskOperationQueueAdmission::TargetFull
-                        | TaskOperationQueueAdmission::ProcessFull => None,
-                        TaskOperationQueueAdmission::Rejected(error) => {
-                            return Err(ReplacementQualificationFailure::DomainRefused(
-                                error.failure_fact(),
-                            ));
-                        }
-                    };
-                    if let Some(permit) = permit {
-                        pending_batch = Some(DispatchBatch::with_queued_at(
-                            participation.backend_process_id(),
-                            novarocks_attempt_protocol::config::DispatchLane::Lifecycle,
-                            vec![intent.clone()],
-                            vec![permit],
-                            intent.queued_bytes(),
-                            qualification.issued_at(),
-                        ));
-                    } else {
-                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
-                        continue;
+                let key = SendKey {
+                    operation: request.envelope().operation_id(),
+                    generation: SendGeneration::new(AttemptActionId::new(send_generation)),
+                };
+                let context = SingleSendContext {
+                    ledger: attempt_runtime.ledger(),
+                    scope: parent.scope(),
+                    layout,
+                    transport: layout.transport_budget(),
+                    authority,
+                    wire: &wire,
+                    client: &client,
+                    apply: runtime.data_runtime.apply_send_port(),
+                    clock: &runtime.clock,
+                    observer: ConsumerId::new(1).unwrap(),
+                    executor,
+                };
+                let sent = match send_replacement_admission(
+                    context,
+                    parent,
+                    ReplacementQualificationScope::GENERATION,
+                    request,
+                    key,
+                    &mut cancellation,
+                    expiry,
+                )
+                .await
+                {
+                    Ok(sent) => sent,
+                    Err(ReplacementSendError::StoppedBeforeHandoff(stop)) => {
+                        return Err(replacement_send_stopped(stop));
                     }
-                }
-                let batch = pending_batch
-                    .take()
-                    .expect("same original replacement batch");
-                match sink.try_submit(batch) {
-                    TaskOperationSubmit::Accepted => {}
-                    TaskOperationSubmit::Backpressured(batch) => {
-                        pending_batch = Some(batch);
-                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
-                        continue;
-                    }
-                    TaskOperationSubmit::AdmissionFailed { error, .. } => {
+                    Err(ReplacementSendError::Send(SingleSendError::Governance(error))) => {
                         return Err(ReplacementQualificationFailure::DomainRefused(
                             error.failure_fact(),
                         ));
                     }
-                    TaskOperationSubmit::Rejected { .. } => {
-                        return Err(ReplacementQualificationFailure::Rejected);
-                    }
-                }
-                let acknowledgement = wait_for_replacement_acknowledgement(
-                    &acks,
-                    &notify,
-                    notified.as_mut(),
-                    &mut cancellation,
-                    request.envelope().operation_id(),
-                )
-                .await?;
-                match (acknowledgement.worker_outcome(), acknowledgement.payload()) {
-                    (
-                        Some(OperationOutcome::Accepted | OperationOutcome::Idempotent),
-                        AckPayload::AdmissionTicket(receipt),
-                    ) => {
-                        admissions.push(QualifiedWorkerAdmission::try_new(
-                            qualification.identity().replacement(),
-                            request,
-                            *receipt,
-                        )?);
-                        break;
-                    }
-                    (None, _) => {
-                        // Replay the exact admission without turning immediate
-                        // transport refusal into an unbounded RPC spin. The
-                        // qualification's outer expiry still bounds this wait.
-                        tokio::select! {
-                            _ = tokio::time::sleep(retry_delay) => {},
-                            _ = cancellation.changed() => {
-                                return Err(ReplacementQualificationFailure::Rejected);
-                            }
+                    Err(error) => {
+                        tracing::warn!(?error, "replacement admission transport failed");
+                        if matches!(&error, ReplacementSendError::Send(original) if original.exit_unproven())
+                        {
+                            unresolved = Some(error);
+                            return Err(ReplacementQualificationFailure::OutcomeUnknown);
                         }
-                        retry_delay = retry_delay
-                            .saturating_mul(2)
-                            .min(runtime.task_update_retry_policy.max_backoff());
-                        continue;
+                        return Err(ReplacementQualificationFailure::InvalidReservation);
                     }
-                    _ => {
-                        return Err(ReplacementQualificationFailure::Rejected);
+                };
+                let receipt = sent.original.receipt.as_ref();
+                if let Some((OperationOutcome::Accepted | OperationOutcome::Idempotent, receipt)) =
+                    receipt.and_then(|ack| ack.worker_outcome.zip(ack.ticket))
+                {
+                    admissions.push(QualifiedWorkerAdmission::try_new(
+                        qualification.identity().replacement(),
+                        request,
+                        receipt,
+                    )?);
+                    if let Some(stop) = sent.stopped {
+                        return Err(replacement_send_stopped(stop));
                     }
+                    break;
                 }
+                if let Some(stop) = sent.stopped {
+                    return Err(replacement_send_stopped(stop));
+                }
+                if receipt.is_some_and(|ack| ack.worker_outcome.is_some())
+                    || sent.original.rejected_attachment.is_some()
+                {
+                    return Err(ReplacementQualificationFailure::Rejected);
+                }
+                match sent.original.preparation_failure() {
+                    Some(PreparationFailure::Governance(error)) => {
+                        return Err(ReplacementQualificationFailure::DomainRefused(
+                            error.failure_fact(),
+                        ));
+                    }
+                    Some(PreparationFailure::Runtime(_) | PreparationFailure::Layout(_)) => {
+                        return Err(ReplacementQualificationFailure::InvalidReservation);
+                    }
+                    Some(_) => return Err(ReplacementQualificationFailure::Rejected),
+                    None => {}
+                }
+                if let Some(receipt) = receipt {
+                    tracing::debug!(
+                        dispatch = ?receipt.dispatch,
+                        governance = ?receipt.governance,
+                        "replacement dispatch completed without a Worker verdict"
+                    );
+                }
+                // Replay the immutable request with a fresh original WC input
+                // and a new send generation. Backpressure within one send never
+                // reissues a ticket or advances this logical replay counter.
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Err(ReplacementQualificationFailure::Rejected),
+                    _ = tokio::time::sleep_until(expiry) => return Err(ReplacementQualificationFailure::Expired),
+                    _ = tokio::time::sleep(retry_delay) => {},
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(runtime.task_update_retry_policy.max_backoff());
+                send_generation = send_generation
+                    .checked_add(1)
+                    .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
             }
         }
-        Ok(admissions.finish())
+        Ok(())
     };
-    tokio::time::timeout_at(
-        tokio::time::Instant::from_std(qualification.absolute_expiry()),
-        acquire,
-    )
-    .await
-    .map_err(|_| {
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(acquire)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(panic) => {
+            attempt_runtime.retain_replacement_failure(scope, panic);
+            return Err(ReplacementQualificationFailure::OutcomeUnknown);
+        }
+    };
+    if let Some(failure) = unresolved {
+        attempt_runtime.retain_replacement_failure(scope, failure);
+    } else if let Err(error) = attempt_runtime.finish_replacement_qualification(scope) {
+        tracing::warn!(?error, "replacement qualification scope exit is unresolved");
+        return Err(ReplacementQualificationFailure::OutcomeUnknown);
+    }
+    if result == Err(ReplacementQualificationFailure::Expired) {
         tracing::warn!(identity = ?qualification.identity(), "replacement admission acquisition expired");
-        ReplacementQualificationFailure::Expired
-    })?
+    }
+    result?;
+    Ok(admissions.finish())
 }
 
-/// Reuse the qualification's original registered waiter. A second waiter
-/// would allow notify_one to wake the older dormant registration while this
-/// consumer sleeps with its real acknowledgement already in the intake.
-async fn wait_for_replacement_acknowledgement<'a>(
-    acks: &TaskAckIntake,
-    notify: &'a tokio::sync::Notify,
-    mut notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'a>>,
-    cancellation: &mut watch::Receiver<bool>,
-    operation: TaskOperationId,
-) -> Result<crate::task_execution::intent::OperationAcknowledgement, ReplacementQualificationFailure>
-{
-    loop {
-        // Retire the same previous registration, then register before reading
-        // the level-triggered intake. Both early and racing ACKs are retained.
-        notified.as_mut().set(notify.notified());
-        notified.as_mut().enable();
-        if *cancellation.borrow() {
-            return Err(ReplacementQualificationFailure::Rejected);
-        }
-        if let Some(ack) = acks
-            .drain_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
-                TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
-            })
-            .find(|ack| ack.operation_id() == operation)
-        {
-            return Ok(ack);
-        }
-        tokio::select! {
-            _ = &mut notified => {},
-            _ = cancellation.changed() => {
-                return Err(ReplacementQualificationFailure::Rejected);
-            }
-        }
+fn replacement_send_stopped(stop: ReplacementSendStop) -> ReplacementQualificationFailure {
+    match stop {
+        ReplacementSendStop::Cancelled => ReplacementQualificationFailure::Rejected,
+        ReplacementSendStop::Expired => ReplacementQualificationFailure::Expired,
     }
 }
 
@@ -3298,76 +3309,6 @@ fn attempt_runtime_failure(
         SafeDetail::truncating(safe),
         ExecutionFailureSite::Coordinator,
     ))
-}
-
-#[cfg(test)]
-mod replacement_ack_tests {
-    use super::*;
-    use std::future::Future;
-    use std::sync::atomic::AtomicUsize;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct AckWake(AtomicUsize);
-    impl Wake for AckWake {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn replacement_ack_reuses_its_registered_waiter_for_early_and_late_real_intake_facts() {
-        for early in [false, true] {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-            let acks = TaskAckIntake::new(wake);
-            let operation = TaskOperationId::new_v7();
-            // This is the same still-live registration made before the real
-            // queue/submit stage. It must not steal the sole ACK notification.
-            let original_waiter = notify.notified();
-            tokio::pin!(original_waiter);
-            original_waiter.as_mut().enable();
-            let publish = || {
-                acks.handle().publish(crate::task_execution::intent::OperationAcknowledgement::new(
-                    operation,
-                    novarocks_execution_contract::OperationKind::AcquireParticipationAdmissionTicket,
-                    OperationOutcome::ResourceExhausted,
-                    AckPayload::None,
-                ));
-            };
-            if early {
-                publish();
-            }
-            let (_cancellation, mut cancellation) = watch::channel(false);
-            let wait = wait_for_replacement_acknowledgement(
-                &acks,
-                &notify,
-                original_waiter.as_mut(),
-                &mut cancellation,
-                operation,
-            );
-            tokio::pin!(wait);
-            let wake = Arc::new(AckWake(AtomicUsize::new(0)));
-            let waker = Waker::from(Arc::clone(&wake));
-            let mut cx = Context::from_waker(&waker);
-            if !early {
-                assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
-                publish();
-                assert!(
-                    wake.0.load(Ordering::SeqCst) > 0,
-                    "the real ACK must wake the actively awaited original registration"
-                );
-            }
-            let Poll::Ready(Ok(ack)) = wait.as_mut().poll(&mut cx) else {
-                panic!("a published ACK must not remain stranded behind a dormant waiter");
-            };
-            assert_eq!(ack.operation_id(), operation);
-            assert_eq!(
-                ack.worker_outcome(),
-                Some(OperationOutcome::ResourceExhausted)
-            );
-            assert_eq!(acks.queued(), 0);
-        }
-    }
 }
 
 #[cfg(test)]

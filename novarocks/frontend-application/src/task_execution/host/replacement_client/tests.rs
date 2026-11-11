@@ -17,21 +17,34 @@
 
 use super::*;
 use crate::{
-    native::transport_capacity::TOTAL_ITEMS,
-    task_execution::host::transport::GovernedQueuedInputFixture,
+    control_runtime::{
+        FrontendControlRuntime, FrontendControlRuntimeConfig, ReplacementQualificationScope,
+        ReplacementQualificationScopeError,
+    },
+    native::{
+        data_runtime::FrontendDataRuntime,
+        task_transport::{tests::Loopback, wire::AttemptWireFacts},
+        transport::Client,
+        transport_capacity::TOTAL_ITEMS,
+    },
+    task_execution::{clock::ProcessMonotonicClock, host::transport::GovernedQueuedInputFixture},
 };
 use novarocks_attempt_protocol::input::SendGeneration;
 use novarocks_control_runtime::{
-    completion::ReportSlot, exit_custody::ExitCustody, transaction::ScopeHandle,
+    completion::ReportSlot, exit_custody::ExitCustody, exit_work::GatedNotStarted,
+    reported_work::ReportedWork, transaction::ScopeHandle,
 };
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
     completion::ConsumerKind,
     identity::ConsumerId,
 };
-use novarocks_coordination_contract::AttemptActionId;
+use novarocks_coordination_contract::{AttemptActionId, MonotonicClock};
 use novarocks_execution_contract::{
-    AdmissionEpochCapability, LeaseValidFor, ParticipationRef, TaskOperationId,
+    AdmissionEpochCapability, AdmissionTicketId, LeaseValidFor, ParticipationRef, TaskOperationId,
+};
+use novarocks_query_application::api::{
+    BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::{
@@ -40,7 +53,7 @@ use novarocks_types::{
 };
 use std::{
     future::Future,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -48,6 +61,7 @@ use std::{
     task::{Context, Wake, Waker},
     time::Duration,
 };
+use tokio::runtime::Handle;
 
 const GENERATION: Generation = Generation::new(1).unwrap();
 
@@ -74,6 +88,10 @@ impl QualificationFixture {
             Duration::from_secs(1),
         )
         .unwrap();
+        Self::with_budget(budget)
+    }
+
+    fn with_budget(budget: TransportBudget) -> Self {
         let layout = NativeTransportCapacity::from_transport(budget).unwrap();
         let ledger =
             RuntimeLedger::with_keyed_families(layout.process_limits(), layout.keyed_families())
@@ -115,7 +133,7 @@ impl QualificationFixture {
         reserve_replacement_send(
             &self.ledger,
             &self.layout,
-            &self.original,
+            self.original.work(),
             GENERATION,
             request,
             send,
@@ -209,6 +227,22 @@ impl CountWake {
     }
 }
 
+struct Membership(watch::Sender<u64>);
+
+impl BackendProcessObservationPort for Membership {
+    fn subscribe_process_changes(&self) -> watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+
+    fn observe_process_at_endpoint(
+        &self,
+        _: BackendProcessId,
+        _: &novarocks_execution_contract::RuntimeEndpoint,
+    ) -> Result<BackendProcessObservation, BackendTopologyError> {
+        Ok(BackendProcessObservation::Current)
+    }
+}
+
 #[test]
 fn rejects_wrong_request_or_send_generation_and_keeps_the_exact_wc_input() {
     let mut governed = GovernedQueuedInputFixture::new();
@@ -291,4 +325,230 @@ fn target_release_wakes_the_current_waiter_and_cancel_unregisters_without_exitin
     let clean_wc = governed.finish();
     assert!(pending_before_cancel && registered_before_cancel && unregistered && no_cancelled_wake);
     assert!(pending && one_waiter && actual_wake && admitted && clean_queue && clean_wc);
+}
+
+#[tokio::test]
+async fn cancellation_after_queue_binding_retires_the_same_unstarted_send() {
+    use crate::task_execution::host::transport::BodyOutcome;
+
+    let mut peer = Loopback::start().await;
+    let mut governed = GovernedQueuedInputFixture::new();
+    let fixture = QualificationFixture::with_budget(TransportBudget::DEFAULT);
+    let request = request();
+    let executor = Handle::current();
+    let mut runtime = FrontendDataRuntime::new(executor.clone());
+    let authority = governed.authority();
+    let clock: Arc<dyn MonotonicClock> = Arc::new(ProcessMonotonicClock::default());
+    let client = Client::for_backend(
+        peer.descriptor(request.participation().backend_process_id()),
+        runtime.clone(),
+    );
+    let wire = AttemptWireFacts {
+        native_compatibility_id: request.native_compatibility_id(),
+    };
+    let (cancel, mut cancellation) = watch::channel(false);
+    let expiry = Instant::now() + Duration::from_secs(5);
+    let result = {
+        let context = SingleSendContext {
+            ledger: &fixture.ledger,
+            scope: &fixture.scope,
+            layout: &fixture.layout,
+            transport: fixture.layout.transport_budget(),
+            authority: &authority,
+            wire: &wire,
+            client: &client,
+            apply: runtime.apply_send_port(),
+            clock: &clock,
+            observer: ConsumerId::new(1).unwrap(),
+            executor: &executor,
+        };
+        let mut send = std::pin::pin!(send_replacement_admission(
+            context,
+            fixture.original.work(),
+            GENERATION,
+            request,
+            key(request, 1),
+            &mut cancellation,
+            expiry,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            if fixture.used() == 1 {
+                // The sole physical queue row now owns its exact WC grant.
+                // The single-thread executor has not polled the child yet.
+                break;
+            }
+            governed.progress();
+            assert!(Instant::now() < expiry, "original queue binding stalled");
+            tokio::task::yield_now().await;
+        }
+        cancel.send(true).unwrap();
+        loop {
+            if let Poll::Ready(result) = send.as_mut().poll(&mut cx) {
+                break result.unwrap();
+            }
+            governed.progress();
+            assert!(Instant::now() < expiry, "original send did not retire");
+            tokio::task::yield_now().await;
+        }
+    };
+    assert_eq!(result.stopped, Some(ReplacementSendStop::Cancelled));
+    assert!(matches!(
+        result.original.body,
+        Some(BodyOutcome::Unused(GatedNotStarted::Withdrawn))
+    ));
+    assert!(result.original.receipt.is_none());
+    assert_eq!(fixture.used(), 0);
+    assert_eq!(fixture.ledger.capacity_waiter_count(), 0);
+    assert!(peer.applied_requests().is_empty());
+    drop((client, authority));
+    fixture.finish();
+    assert!(governed.finish());
+    runtime
+        .drain_original_apply_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(runtime.original_apply_joined());
+    assert!(peer.settle().await);
+}
+
+#[tokio::test]
+async fn fresh_send_generations_share_the_same_frozen_acquire_and_retire_apply() {
+    let mut peer = Loopback::start().await;
+    let request = request();
+    let descriptor = peer.descriptor(request.participation().backend_process_id());
+    let mut governed = GovernedQueuedInputFixture::with_origin(Some(descriptor.endpoint()));
+    let executor = Handle::current();
+    let mut runtime = FrontendDataRuntime::new(executor.clone());
+    let authority = governed.authority();
+    let clock: Arc<dyn MonotonicClock> = Arc::new(ProcessMonotonicClock::default());
+    let mut control = FrontendControlRuntime::start(
+        FrontendControlRuntimeConfig {
+            pollers: NonZeroUsize::new(executor.metrics().num_workers()).unwrap(),
+            clock: clock.clone(),
+            transport: TransportBudget::DEFAULT,
+            workload_scope_limit: NonZeroUsize::new(8).unwrap(),
+            history: None,
+        },
+        &runtime,
+        Arc::new(Membership(watch::channel(0).0)),
+    )
+    .unwrap();
+    let attempts = control.attempts();
+    let qualification = attempts.open_replacement_qualification().unwrap();
+    let parent = qualification.parent();
+    let layout = attempts.transport_capacity();
+    let client = Client::for_backend(descriptor, runtime.clone());
+    let wire = AttemptWireFacts {
+        native_compatibility_id: request.native_compatibility_id(),
+    };
+    let ticket = ParticipationAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([0x73; 16]).unwrap(),
+        request.participation(),
+        request.valid_for(),
+    );
+    let (_cancel, mut cancellation) = watch::channel(false);
+    let (finish_progress, finished) = watch::channel(false);
+    let progress = executor.spawn(async move {
+        while !*finished.borrow() {
+            governed.progress();
+            tokio::task::yield_now().await;
+        }
+        governed
+    });
+    peer.expect_transport_unknown();
+    peer.expect_admission_ticket(OperationOutcome::Idempotent, ticket);
+    for (generation, verdict) in [(1, None), (2, Some(OperationOutcome::Idempotent))] {
+        let context = SingleSendContext {
+            ledger: attempts.ledger(),
+            scope: parent.scope(),
+            layout,
+            transport: layout.transport_budget(),
+            authority: &authority,
+            wire: &wire,
+            client: &client,
+            apply: runtime.apply_send_port(),
+            clock: &clock,
+            observer: ConsumerId::new(1).unwrap(),
+            executor: &executor,
+        };
+        let expiry = Instant::now() + Duration::from_secs(5);
+        // The independent WC driver only publishes WC progress. The send is
+        // polled by its actual WC, ledger and Join wakeups.
+        let result = tokio::time::timeout_at(
+            expiry + Duration::from_secs(1),
+            send_replacement_admission(
+                context,
+                parent,
+                ReplacementQualificationScope::GENERATION,
+                request,
+                key(request, generation),
+                &mut cancellation,
+                expiry,
+            ),
+        )
+        .await
+        .expect("original Acquire wakes on its actual exit")
+        .unwrap();
+        assert_eq!(result.stopped, None);
+        let receipt = result.original.receipt.expect("exact original reply");
+        assert_eq!(receipt.worker_outcome, verdict);
+        assert_eq!(receipt.ticket, verdict.map(|_| ticket));
+        assert!(receipt.governance.is_none());
+        if verdict.is_some() {
+            assert!(matches!(
+                receipt.dispatch,
+                OperationDispatchResult::WorkerReceipt(_)
+            ));
+        } else {
+            assert_eq!(receipt.dispatch, OperationDispatchResult::TransportUnknown);
+        }
+        assert_eq!(
+            attempts
+                .ledger()
+                .try_capacity_dimensions([TOTAL_ITEMS])
+                .unwrap()
+                .unwrap()
+                .used,
+            [0]
+        );
+    }
+    let applied = peer.applied_requests();
+    assert_eq!(applied.len(), 2);
+    assert_eq!(applied[0], applied[1]);
+    drop((client, authority));
+    finish_progress.send(true).unwrap();
+    assert!(progress.await.unwrap().finish());
+    let mut shutdown =
+        std::pin::pin!(control.shutdown_until(std::time::Instant::now() + Duration::from_secs(5)));
+    let wakes = Arc::new(CountWake::default());
+    let waker = Waker::from(wakes.clone());
+    assert!(
+        shutdown
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(matches!(
+        attempts.open_replacement_qualification(),
+        Err(ReplacementQualificationScopeError::Closed)
+    ));
+    assert!(!attempts.ledger().is_empty());
+    let before = wakes.count();
+    attempts
+        .finish_replacement_qualification(qualification)
+        .unwrap();
+    assert!(
+        wakes.count() > before,
+        "real Scope removal wakes the waiting shutdown"
+    );
+    shutdown.await.unwrap();
+    assert!(attempts.ledger().is_empty());
+    runtime
+        .drain_original_apply_until(std::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(runtime.original_apply_joined());
+    assert!(peer.settle().await);
 }

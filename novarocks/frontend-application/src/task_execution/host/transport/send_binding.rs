@@ -353,16 +353,16 @@ pub(crate) struct ResolvedBatch {
     pub(super) keys: Arc<[SendKey]>,
 }
 impl ResolvedBatch {
-    pub(super) fn cleanup_abort(
-        request: novarocks_execution_contract::AbortParticipation,
+    pub(super) fn single(
+        operation: OperationIntent,
         input: SendInputLoan,
         keys: Arc<[SendKey]>,
     ) -> Self {
         assert_eq!(&*keys, &[input.key()]);
-        assert_eq!(input.key().operation, request.envelope().operation_id());
+        assert_eq!(input.key().operation, operation.operation_id());
         Self {
             effect: None,
-            operations: vec![OperationIntent::AbortParticipation(request)],
+            operations: vec![operation],
             queued_inputs: vec![input],
             keys,
         }

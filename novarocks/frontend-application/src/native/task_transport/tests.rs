@@ -981,6 +981,30 @@ impl Loopback {
         self.peer.subscribed()
     }
 
+    pub(crate) fn applied_requests(&self) -> Vec<proto::ApplyTaskOperationsRequest> {
+        self.peer.applied()
+    }
+
+    pub(crate) fn expect_transport_unknown(&self) {
+        self.peer
+            .expect_apply(ApplyAnswer::Reject(tonic::Code::Unavailable));
+    }
+
+    pub(crate) fn expect_admission_ticket(
+        &self,
+        outcome: OperationOutcome,
+        receipt: novarocks_execution_contract::ParticipationAdmissionTicketReceipt,
+    ) {
+        self.peer.expect_apply(ApplyAnswer::WithAck(vec![(
+            outcome,
+            Some(
+                proto::task_operation_verdict::Ack::ParticipationAdmissionTicket(
+                    codec::encode_participation_admission_ticket_ack(receipt),
+                ),
+            ),
+        )]));
+    }
+
     pub(in crate::native) fn control_requests(&self) -> usize {
         self.peer.control_requests()
     }

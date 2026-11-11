@@ -73,14 +73,22 @@ use metrics::{FrontendHostObservations, FrontendRuntimeMetrics};
 use novarocks_control_runtime::{
     actor_turn::{ActorRuntime, Clock, PollerPool},
     history::HistoryCapture,
+    obligation::{ReservationObligation, WorkObligation},
     observation::RuntimeObservation,
     transaction::{RuntimeError, RuntimeLedger},
+};
+use novarocks_control_runtime_core::{
+    capacity::ReservationResources,
+    identity::{Generation, ScopeId},
+    scope::{WorkAdmission, WorkKind},
 };
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_query_application::api::BackendProcessObservationPort;
 use novarocks_task_codec::TransportBudget;
 use prometheus::Registry;
 use std::{
+    any::Any,
+    collections::BTreeMap,
     num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Instant,
@@ -137,8 +145,132 @@ pub(crate) struct FrontendAttemptRuntime {
     clock: Arc<dyn Clock>,
     observation: RuntimeObservation,
     host_observation: Arc<FrontendHostObservations>,
+    unresolved_replacements: Mutex<BTreeMap<ScopeId, UnresolvedReplacementQualification>>,
 }
+
+#[derive(Debug)]
+pub(crate) enum ReplacementQualificationScopeError {
+    Closed,
+    Runtime(RuntimeError),
+}
+
+/// The original admission parent for a single logical qualification. The
+/// logical qualification future drives all its physical sends to actual exit.
+#[must_use = "the FE ledger keeps the qualification until its original Scope is removed"]
+pub(crate) struct ReplacementQualificationScope {
+    parent: WorkObligation,
+    payer: ReservationObligation,
+}
+
+impl ReplacementQualificationScope {
+    pub(crate) const GENERATION: Generation = Generation::new(1).unwrap();
+
+    pub(crate) fn parent(&self) -> &WorkObligation {
+        &self.parent
+    }
+
+    fn retire(&mut self, ledger: &RuntimeLedger) -> Result<(), RuntimeError> {
+        self.parent.scope().close_external()?;
+        self.parent.body_exited()?;
+        self.parent.captures_exited()?;
+        self.payer.finish()?;
+        let scope = self.parent.scope();
+        if !scope.reap_observed_header(&self.parent.retirement_observer())? {
+            return Err(RuntimeError::ScopeNotRetired);
+        }
+        ledger.remove_scope(scope.id())
+    }
+}
+
+struct UnresolvedReplacementQualification {
+    _original: ReplacementQualificationScope,
+    _failure: Box<dyn Any + Send>,
+}
+
 impl FrontendAttemptRuntime {
+    pub(crate) fn open_replacement_qualification(
+        &self,
+    ) -> Result<ReplacementQualificationScope, ReplacementQualificationScopeError> {
+        use ReplacementQualificationScopeError::{Closed, Runtime};
+
+        let open = self
+            .registration_open
+            .lock()
+            .expect("frontend registration gate");
+        if !*open {
+            return Err(Closed);
+        }
+        let generation = ReplacementQualificationScope::GENERATION;
+        let scope = self
+            .ledger
+            .open_scope_next(None, generation)
+            .map_err(Runtime)?;
+        let root = match scope.reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                scope
+                    .close_external()
+                    .expect("unpublished qualification scope");
+                self.ledger
+                    .remove_scope(scope.id())
+                    .expect("empty unpublished qualification scope");
+                return Err(Runtime(error));
+            }
+        };
+        let (mut parent, payer) = root
+            .bind(WorkKind::Settlement)
+            .expect("original qualification parent");
+        parent
+            .start()
+            .expect("original qualification registration is open");
+        Ok(ReplacementQualificationScope { parent, payer })
+    }
+
+    pub(crate) fn finish_replacement_qualification(
+        &self,
+        mut original: ReplacementQualificationScope,
+    ) -> Result<(), RuntimeError> {
+        assert!(original.parent.scope().belongs_to_ledger(&self.ledger));
+        match original.retire(&self.ledger) {
+            Ok(()) => {
+                self.host.changed.notify_waiters();
+                Ok(())
+            }
+            Err(error) => {
+                self.retain_replacement_failure(original, error);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn retain_replacement_failure(
+        &self,
+        original: ReplacementQualificationScope,
+        failure: impl Any + Send,
+    ) {
+        let scope = original.parent.scope();
+        assert!(scope.belongs_to_ledger(&self.ledger));
+        let _ = scope.close_external();
+        original.parent.mark_unresolved();
+        let id = scope.id();
+        let retained = UnresolvedReplacementQualification {
+            _original: original,
+            _failure: Box::new(failure),
+        };
+        assert!(
+            self.unresolved_replacements
+                .lock()
+                .expect("replacement qualification custody")
+                .insert(id, retained)
+                .is_none()
+        );
+    }
+
     /// Install the real host route before that host can post Bootstrap.
     /// Refusal returns the Source and its still-unpublished original position.
     pub(crate) fn register_attempt(
@@ -278,6 +410,7 @@ impl FrontendControlRuntime {
             clock,
             observation,
             host_observation,
+            unresolved_replacements: Mutex::new(BTreeMap::new()),
         });
         Ok(Self {
             attempts,
