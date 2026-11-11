@@ -99,7 +99,7 @@ use std::{
 
 // The Core returns at most one primary effect, one Abort settlement and one
 // passive report. ActorStep charges their actual handoff separately.
-const OUTPUT_UNITS: usize = 3;
+pub(super) const OUTPUT_UNITS: usize = 3;
 
 pub(crate) struct AttemptActor {
     core: Core,
@@ -1619,7 +1619,11 @@ pub(crate) fn input_class(input: &AttemptInput) -> InputClass {
         AttemptInput::Timer => InputClass::Timer,
         AttemptInput::CapacityReleased
         | AttemptInput::Membership(_)
-        | AttemptInput::Executor(ExecutorFact::ReadProgress(_)) => InputClass::Ordinary,
+        | AttemptInput::Executor(
+            ExecutorFact::ReadProgress(_)
+            | ExecutorFact::PumpTaskUpdate { .. }
+            | ExecutorFact::SplitProfile { .. },
+        ) => InputClass::Ordinary,
         AttemptInput::Port(port)
             if matches!(
                 &port.body,

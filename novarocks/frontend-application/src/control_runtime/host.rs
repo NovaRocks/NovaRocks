@@ -52,7 +52,10 @@ use novarocks_control_runtime::{
     exit_custody::ExitObligation,
     transaction::{RuntimeLedger, ScopeHandle},
 };
-use novarocks_control_runtime_core::identity::{InputId, ScopeId, Tick};
+use novarocks_control_runtime_core::{
+    identity::{InputId, ScopeId, Tick},
+    mailbox::InputClass,
+};
 use std::{
     any::Any,
     collections::BTreeMap,
@@ -281,6 +284,8 @@ struct HostMachine {
     pending: Option<PendingHandoff>,
     failure_handed_off: bool,
     external_closed: bool,
+    attempt_timer: Option<InputId>,
+    timer_source_closed: bool,
 }
 struct HostEntry {
     scope: ScopeHandle,
@@ -571,6 +576,8 @@ impl HostRegistry {
                 pending: None,
                 failure_handed_off: false,
                 external_closed: false,
+                attempt_timer: None,
+                timer_source_closed: false,
             })),
         });
         let observed = HostExit {
@@ -884,6 +891,52 @@ impl HostRegistry {
         }
         let mut capacity_more = false;
         let source_closing = machine.source.result_admission_closed();
+        let attempt = entry.kind == FrontendActorKind::Attempt;
+        let mut timer_more = false;
+        if attempt {
+            let actor = entry.registration.actor();
+            if (failed || source_closing) && !machine.timer_source_closed {
+                if budget == 0 {
+                    timer_more = true;
+                } else {
+                    budget -= 1;
+                    self.runtime.close_actor_admission(actor)?;
+                    self.runtime.close_timer_source(actor)?;
+                    machine.timer_source_closed = true;
+                }
+            }
+            if failed {
+                // A failed Core can leave a filled Timer without committing
+                // a batch. Timer has a unique builtin Source and no captures.
+                machine.attempt_timer = self.runtime.pending_timer_input(actor)?;
+            }
+            if let Some(input) = machine.attempt_timer {
+                if budget == 0 {
+                    timer_more = true;
+                } else {
+                    budget -= 1;
+                    match self.runtime.retire_input(actor, input) {
+                        Ok(()) => machine.attempt_timer = None,
+                        Err(ActorTurnError::InputStillQueued) if failed => {
+                            if let Some((original, value)) =
+                                self.runtime.take_failed_input(actor, InputClass::Timer)?
+                            {
+                                assert_eq!(original.input, input);
+                                assert!(matches!(value, super::actor::FrontendInput::Timer));
+                                timer_more = true;
+                            }
+                        }
+                        Err(
+                            ActorTurnError::InputStillQueued
+                            | ActorTurnError::EffectsRemain
+                            | ActorTurnError::ReservationsRemain
+                            | ActorTurnError::MetadataStillPending,
+                        ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
         if let Some(capacity) = &mut machine.capacity
             && capacity.needs_progress(failed, source_closing)
         {
@@ -940,6 +993,7 @@ impl HostRegistry {
             capacity_more |= machine.capacity.is_some();
             membership_more |= machine.membership.is_some();
             controls_more |= machine.owner_controls.is_some();
+            timer_more |= attempt && !machine.timer_source_closed;
         }
         if let Some(transport) = transport {
             retired.progressed |= transport.progressed;
@@ -974,7 +1028,8 @@ impl HostRegistry {
             && machine.capacity.is_none()
             && machine.membership.is_none()
             && machine.owner_controls.is_none();
-        retired.more |= startup_more || capacity_more || membership_more || controls_more;
+        retired.more |=
+            startup_more || capacity_more || membership_more || controls_more || timer_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -1003,6 +1058,20 @@ impl HostRegistry {
                         retired: false,
                     });
                 }
+            }
+            if attempt
+                && (!machine.timer_source_closed
+                    || self
+                        .runtime
+                        .pending_timer_input(entry.registration.actor())?
+                        .is_some())
+            {
+                return Ok(HostProgress {
+                    units: entry.budget - budget,
+                    handoffs,
+                    more: retired.more || budget == 0,
+                    retired: false,
+                });
             }
             if let Some(funding) = &mut machine.funding {
                 let progress = if budget == 0 {
@@ -1048,6 +1117,16 @@ impl HostRegistry {
                 }
             ));
             budget -= indexed.units;
+            if attempt
+                && !indexed.inputs.is_empty()
+                && let Some(timer) = self
+                    .runtime
+                    .pending_timer_input(entry.registration.actor())?
+                && indexed.inputs.contains(&timer)
+            {
+                assert!(machine.attempt_timer.replace(timer).is_none());
+                timer_more = true;
+            }
             if !indexed.inputs.is_empty() && machine.scan_remaining.is_some() {
                 machine.rescan_requested = true;
             }
@@ -1286,6 +1365,7 @@ impl HostRegistry {
             || capacity_more
             || membership_more
             || controls_more
+            || timer_more
             || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
@@ -1534,6 +1614,97 @@ mod tests {
         fn handoff(&self, _: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
             unreachable!("no effect ticket exists")
         }
+    }
+
+    #[tokio::test]
+    async fn attempt_host_returns_its_builtin_timer_credit_after_each_committed_tick() {
+        struct TimerProbe(u64);
+        impl TestActor for TimerProbe {
+            fn handle(
+                &mut self,
+                now: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                self.0 += 1;
+                assert_eq!(now, Tick(self.0));
+                assert_eq!(envelope.class, InputClass::Timer);
+                assert!(matches!(input, FrontendInput::Timer));
+            }
+
+            fn next_deadline(&self) -> Option<Tick> {
+                Some(Tick(self.0 + 1))
+            }
+        }
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let actor = ActorId::new(1).unwrap();
+        let config = ActorConfig {
+            mailbox: [1; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(TimerProbe(0))),
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original timer actor: {error:?}"));
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(Arc::new(
+                novarocks_control_runtime::actor_turn::ProcessClock::default(),
+            ))),
+        );
+        let mut exit = host
+            .register(HostBinding {
+                scope: scope.clone(),
+                registration,
+                kind: FrontendActorKind::Attempt,
+                config,
+                policy: FrontendLanePolicy::attempt(1),
+                source: Box::new(MetadataSource {
+                    scope,
+                    closing: false,
+                    retire_batches: false,
+                }),
+                executor: Arc::new(NoExecutor),
+                transport: None,
+                ordered_observations: None,
+                startup: None,
+                capacity: None,
+                membership: None,
+                owner_controls: None,
+            })
+            .unwrap_or_else(|_| panic!("install original timer host"));
+        let drive = |now| {
+            while let Some(turn) = runtime.claim_host_actor() {
+                host.drive(now, turn);
+            }
+        };
+        for now in [Tick(1), Tick(2)] {
+            assert_eq!(runtime.advance_time(now, 1).unwrap(), 1);
+            assert!(runtime.poll_one(now).unwrap());
+            assert!(runtime.pending_timer_input(actor).unwrap().is_some());
+            drive(now);
+            assert!(runtime.pending_timer_input(actor).unwrap().is_none());
+        }
+        exit.request_close().unwrap();
+        drive(Tick(2));
+        exit.wait().await.unwrap();
+        assert_eq!(runtime.advance_time(Tick(3), 1).unwrap(), 0);
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
     }
 
     #[tokio::test]
