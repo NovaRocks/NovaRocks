@@ -44,6 +44,7 @@ use crate::{
     },
     task_execution::host::observations::host_turn::OrderedObservationHost,
     task_execution::host::publication::OriginalHostFailure,
+    task_execution::host::pumps::AttemptPumpSource,
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, OperationIntent},
@@ -98,6 +99,7 @@ enum Prepaid {
     Call(usize),
     OpenSubscription,
     Send(usize, Box<PreparedActorSend>),
+    Pump,
     Other,
 }
 
@@ -135,6 +137,7 @@ pub(crate) struct AttemptTransportSource {
     admission: AdmissionSource,
     calls: [Option<AttemptCallSource>; 6],
     subscriptions: Option<AttemptSubscriptions>,
+    pumps: Option<AttemptPumpSource>,
     requests: FrozenSendRequests,
     contexts: Arc<BTreeMap<BackendProcessId, SendContext>>,
     report_references: BTreeMap<(TaskOperationId, SendGeneration), NativeReportReferences>,
@@ -189,6 +192,7 @@ impl AttemptTransportSource {
             admission,
             calls,
             subscriptions,
+            pumps: None,
             requests: send.requests,
             contexts: send.contexts,
             report_references: send.report_references,
@@ -220,10 +224,21 @@ impl AttemptTransportSource {
         self
     }
 
+    pub(crate) fn with_pumps(mut self, pumps: AttemptPumpSource) -> Self {
+        assert!(self.releases.is_some());
+        assert!(pumps.matches(&self.registration));
+        assert!(self.pumps.replace(pumps).is_none());
+        self
+    }
+
     fn transport_drained(&self) -> bool {
         self.subscriptions
             .as_ref()
             .is_none_or(AttemptSubscriptions::is_drained)
+            && self
+                .pumps
+                .as_ref()
+                .is_none_or(AttemptPumpSource::is_drained)
             && self
                 .calls
                 .iter()
@@ -479,6 +494,15 @@ impl EffectSource for AttemptTransportSource {
     fn prepay_result(&mut self, effect: &FrontendEffect) -> Option<Position> {
         assert!(self.pending.is_none());
         if let FrontendEffect::Attempt(original) = effect {
+            if let Some(pumps) = self
+                .pumps
+                .as_mut()
+                .filter(|source| source.handles(original))
+            {
+                let result = pumps.prepay(original).expect("original pump prepayment")?;
+                self.pending = Some(Prepaid::Pump);
+                return Some(result);
+            }
             if let EffectBody::ReleaseCreationPayload { payload, .. } = original.protocol.body
                 && !self.admission.can_release_creation(payload)
             {
@@ -574,6 +598,7 @@ impl EffectSource for AttemptTransportSource {
                             .admission
                             .project_failure(reference)
                             .or_else(|| self.subscriptions.as_ref()?.project_failure(reference))
+                            .or_else(|| self.pumps.as_ref()?.project_failure(reference))
                             .or_else(|| {
                                 self.calls
                                     .iter()
@@ -646,6 +671,7 @@ impl EffectSource for AttemptTransportSource {
                 assert!(self.in_flight.insert(effect.protocol.id));
                 Ok(self.admission.bind(ticket, result))
             }
+            Prepaid::Pump => Ok(self.pumps.as_mut().unwrap().bind_job(ticket, result)),
             Prepaid::Other => self.other.try_bind_job(runtime, turn, ticket, result),
             Prepaid::Send(lane, prepared) => {
                 let FrontendEffect::Attempt(effect) = &ticket.effect else {
@@ -690,6 +716,7 @@ impl EffectSource for AttemptTransportSource {
         match self.pending.take().expect("same original prepayment") {
             Prepaid::Call(lane) => self.calls[lane].as_mut().unwrap().return_unclaimed(result),
             Prepaid::Admission => self.admission.return_unclaimed(result),
+            Prepaid::Pump => self.pumps.as_mut().unwrap().return_unclaimed(result),
             Prepaid::OpenSubscription => self
                 .subscriptions
                 .as_mut()
@@ -707,10 +734,19 @@ impl EffectSource for AttemptTransportSource {
         if let Some(subscriptions) = self.subscriptions.as_mut() {
             subscriptions.core_consumed(inputs);
         }
+        if let Some(pumps) = &mut self.pumps {
+            pumps.core_consumed(&self.runtime, inputs);
+        }
         self.other.core_consumed(inputs);
     }
 
     fn transport_event(&mut self, effect: AttemptActionId, event: TransportSourceEvent) {
+        if let Some(pumps) = self.pumps.as_mut().filter(|source| source.owns(effect)) {
+            if let Err(original) = pumps.transport_event(effect, event) {
+                self.other.retain_transport_failure(original);
+            }
+            return;
+        }
         if let Some(subscriptions) = self.subscriptions.as_mut()
             && subscriptions.owns(effect)
         {
@@ -743,6 +779,7 @@ impl EffectSource for AttemptTransportSource {
                             .take_failure(reference)
                             .map(OriginalHostFailure::Task)
                             .or_else(|| self.subscriptions.as_ref()?.take_failure(reference))
+                            .or_else(|| self.pumps.as_ref()?.take_failure(reference))
                             .or_else(|| {
                                 self.calls
                                     .iter_mut()
@@ -826,6 +863,19 @@ impl EffectSource for AttemptTransportSource {
     }
 
     fn owner_failed_pending(&mut self, pending: PendingHandoff) {
+        if let FrontendEffect::Attempt(effect) = &pending.ticket.effect
+            && let Some(pumps) = self
+                .pumps
+                .as_ref()
+                .filter(|source| source.owns(effect.protocol.id))
+        {
+            let releases = self
+                .releases
+                .as_ref()
+                .expect("original pump release executor");
+            pumps.owner_failed_pending(&self.runtime, releases.executor(), pending);
+            return;
+        }
         self.other.owner_failed_pending(pending);
     }
 
@@ -984,6 +1034,29 @@ impl EffectSource for AttemptTransportSource {
             units += progress.units;
             progressed |= progress.progressed;
         }
+        let pump_progress = self.pumps.as_mut().map(|pumps| {
+            let releases = self
+                .releases
+                .as_mut()
+                .expect("original pump release executor");
+            let failed = self
+                .runtime
+                .snapshot(self.registration.actor())
+                .expect("original pump host")
+                .failed;
+            pumps.progress(
+                failed,
+                closing,
+                retire_failures,
+                (budget - units).min(1),
+                releases.accepts_batch(),
+                |original| releases.retain(ReleaseCapture::Original(original)),
+            )
+        });
+        if let Some(progress) = &pump_progress {
+            units += progress.units;
+            progressed |= progress.progressed;
+        }
         let supervisor_advanced = if units < budget && self.supervisor.is_some() {
             units += 1;
             self.advance_supervisor(turn)
@@ -1095,6 +1168,7 @@ impl EffectSource for AttemptTransportSource {
         progress.more |= subscription_progress
             .as_ref()
             .is_some_and(|progress| release_accepting && progress.more)
+            || pump_progress.as_ref().is_some_and(|progress| progress.more)
             || supervisor_advanced
             || self.abort_scan != 0
             || self.admission_scan != 0
@@ -1132,7 +1206,10 @@ pub(crate) struct AttemptTransportExecutor {
 }
 impl EffectExecutor for AttemptTransportExecutor {
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
-        if matches!(&job.effect, FrontendEffect::Attempt(effect) if effect.uses_join_custody()) {
+        if matches!(&job.effect, FrontendEffect::Attempt(effect)
+            if effect.uses_join_custody()
+                && (!effect.is_pump_call() || job.captures.is::<super::BoundActorTransport>()))
+        {
             self.native.handoff(job)
         } else {
             self.other.handoff(job)

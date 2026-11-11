@@ -134,6 +134,16 @@ impl<A: Actor> CausalInputObligation<A> {
         let event = self.event.retire_ready_after_exit()?;
         Ok(predecessor && event)
     }
+    /// After a failure fence, the original owner may take only this causal
+    /// role's actual Source head. The returned payload must actually exit.
+    pub fn take_failed_payload(
+        &self,
+    ) -> Result<Option<crate::actor_turn::FailedSourcePayload<A>>, ActorTurnError> {
+        self.predecessor
+            .take_failed_source_payload_matching(|role| {
+                role == self.predecessor.id() || role == self.event.id()
+            })
+    }
     pub fn fill_with_receipt(
         &mut self,
         predecessor: Option<A::Input>,

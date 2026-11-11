@@ -86,6 +86,24 @@ impl AttemptEffectEnvelope {
             || self.is_read_confirmation()
             || self.is_subscription_open()
             || self.is_subscription_control()
+            || self.is_pump_call()
+    }
+
+    /// StopPump names a frozen payload, so the exact bound Source selects
+    /// its executor after the host's conservative Join-capacity check.
+    pub(crate) fn is_pump_call(&self) -> bool {
+        use novarocks_attempt_protocol::effect::PumpKind;
+        matches!(
+            self.protocol.body,
+            EffectBody::StartPump {
+                kind: PumpKind::DynamicFilters,
+                ..
+            } | EffectBody::StopPump { .. }
+                | EffectBody::ReadDynamicFilters { .. }
+                | EffectBody::AdmitDynamicFilterFeedback { .. }
+                | EffectBody::CollectDiagnostics { .. }
+                | EffectBody::DisposeDiagnosticInfo { .. }
+        )
     }
 
     pub(crate) fn is_subscription_open(&self) -> bool {

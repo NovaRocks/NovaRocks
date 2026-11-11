@@ -978,6 +978,10 @@ impl OriginalTransportJoinObligation {
         }
     }
 
+    pub(crate) fn exit_custody(&self) -> ExitCustody {
+        self.role.custody.clone()
+    }
+
     /// The encoding body is inline in the original transport Join. Move its
     /// one typed return only after that Join and the parent report were read.
     pub(crate) fn take_encoding_return(

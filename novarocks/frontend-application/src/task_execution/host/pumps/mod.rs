@@ -20,20 +20,22 @@
 
 mod diagnostics;
 mod dynamic_filters;
+mod job;
+mod source;
 pub(crate) mod split;
 
 pub(crate) use diagnostics::{DiagnosticRecords, DiagnosticRegistration};
-pub(crate) use dynamic_filters::{
-    DynamicFilterFailureSource, DynamicFilterRecords, DynamicReadRegistration,
-};
+pub(crate) use dynamic_filters::{DynamicFilterRecords, DynamicReadRegistration};
+pub(crate) use job::{BoundPumpWork, PumpOutcome};
+pub(crate) use source::AttemptPumpSource;
 
 use crate::task_execution::{error::TaskExecutionError, intent::attempt_receipt::failure_site};
 use novarocks_attempt_protocol::failure::{
     AttemptFailure, HostFailureKind, HostFailureRef, HostProjectedFailure,
 };
 use novarocks_control_runtime::exit_custody::{ExitCustody, ExitCustodyPhase};
+#[cfg(test)]
 use novarocks_control_runtime_core::identity::InputId;
-use std::collections::BTreeSet;
 
 #[derive(Debug)]
 pub(crate) enum PumpRecordError {
@@ -55,17 +57,20 @@ impl std::error::Error for PumpRecordError {}
 /// second join ledger: only ExitCustody performs report/header retirement.
 struct OriginalJobRecord {
     custody: ExitCustody,
+    #[cfg(test)]
     reply_input: Option<InputId>,
-    consumed: BTreeSet<InputId>,
+    result_resolved: bool,
 }
 impl OriginalJobRecord {
     fn new(custody: ExitCustody) -> Self {
         Self {
             custody,
+            #[cfg(test)]
             reply_input: None,
-            consumed: BTreeSet::new(),
+            result_resolved: false,
         }
     }
+    #[cfg(test)]
     fn bind_reply(&mut self, input: InputId) -> Result<(), PumpRecordError> {
         if self.reply_input.is_some() {
             return Err(PumpRecordError::ResultAlreadyBound);
@@ -73,18 +78,19 @@ impl OriginalJobRecord {
         self.reply_input = Some(input);
         Ok(())
     }
+    #[cfg(test)]
     fn core_consumed(&mut self, inputs: &[InputId]) {
         if let Some(input) = self.reply_input
             && inputs.contains(&input)
         {
-            self.consumed.insert(input);
+            self.result_resolved = true;
         }
     }
+    fn resolve_result(&mut self) {
+        self.result_resolved = true;
+    }
     fn retired(&self) -> bool {
-        self.custody.phase() == ExitCustodyPhase::Retired
-            && self
-                .reply_input
-                .is_some_and(|input| self.consumed.contains(&input))
+        self.custody.phase() == ExitCustodyPhase::Retired && self.result_resolved
     }
 }
 

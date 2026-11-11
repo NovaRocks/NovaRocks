@@ -1355,7 +1355,7 @@ impl<A: Actor> StandingInputObligation<A> {
     ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
         self.take_failed_source_payload_matching(|id| id == self.id())
     }
-    fn take_failed_source_payload_matching(
+    pub(crate) fn take_failed_source_payload_matching(
         &self,
         matches_role: impl FnOnce(StandingInputId) -> bool,
     ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {

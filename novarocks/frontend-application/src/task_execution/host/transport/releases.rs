@@ -98,6 +98,10 @@ impl TransportReleases {
         !self.failed && self.pending.is_empty()
     }
 
+    pub(super) fn executor(&self) -> &Handle {
+        &self.executor
+    }
+
     pub(super) fn retain(&mut self, original: ReleaseCapture) {
         assert!(self.pending.len() < 2);
         self.pending.push_back(ManuallyDrop::new(original));

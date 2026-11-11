@@ -135,11 +135,12 @@ impl ExitState {
             destroying: false,
         }
     }
-    fn start(&mut self) -> Result<(), ExitCustodyError> {
-        self.obligation
-            .as_mut()
-            .expect("work has not completed")
-            .start()?;
+    fn start(&mut self, generation: Option<Generation>) -> Result<(), ExitCustodyError> {
+        let original = self.obligation.as_mut().expect("work has not completed");
+        match generation {
+            Some(generation) => original.start_in_generation(generation)?,
+            None => original.start()?,
+        }
         self.started = true;
         Ok(())
     }
@@ -190,6 +191,7 @@ pub struct ObligatedFuture<F> {
     inner: Option<Pin<Box<F>>>,
     state: ExitState,
     panic: PanicSink,
+    generation: Option<Generation>,
 }
 pub fn run_future<F: Future>(
     obligation: ExitObligation,
@@ -200,7 +202,20 @@ pub fn run_future<F: Future>(
         inner: Some(Box::pin(future)),
         state: ExitState::new(obligation),
         panic,
+        generation: None,
     }
+}
+/// Like run_future, with start qualified against the exact admitted epoch
+/// before the future is first polled.
+pub fn run_future_in_generation<F: Future>(
+    obligation: ExitObligation,
+    future: F,
+    panic: PanicSink,
+    generation: Generation,
+) -> ObligatedFuture<F> {
+    let mut work = run_future(obligation, future, panic);
+    work.generation = Some(generation);
+    work
 }
 impl<F> ObligatedFuture<F> {
     fn destroy_inner(&mut self, body_panic: Option<PanicPayload>) {
@@ -220,7 +235,7 @@ impl<F: Future> Future for ObligatedFuture<F> {
             "obligated future polled after completion"
         );
         if !this.state.started
-            && let Err(error) = this.state.start()
+            && let Err(error) = this.state.start(this.generation)
         {
             this.destroy_inner(None);
             return Poll::Ready(match this.state.exit() {
@@ -267,6 +282,7 @@ pub struct ObligatedBlocking<F> {
     inner: Option<F>,
     state: ExitState,
     panic: PanicSink,
+    generation: Option<Generation>,
 }
 pub fn run_blocking<F>(
     obligation: ExitObligation,
@@ -277,7 +293,20 @@ pub fn run_blocking<F>(
         inner: Some(job),
         state: ExitState::new(obligation),
         panic,
+        generation: None,
     }
+}
+/// Like run_blocking, with start qualified against the exact admitted epoch
+/// before the blocking closure is invoked.
+pub fn run_blocking_in_generation<F>(
+    obligation: ExitObligation,
+    job: F,
+    panic: PanicSink,
+    generation: Generation,
+) -> ObligatedBlocking<F> {
+    let mut work = run_blocking(obligation, job, panic);
+    work.generation = Some(generation);
+    work
 }
 impl<F> ObligatedBlocking<F> {
     fn destroy_inner(&mut self) {
@@ -292,7 +321,7 @@ impl<F> ObligatedBlocking<F> {
     where
         F: FnOnce() -> R,
     {
-        if let Err(error) = self.state.start() {
+        if let Err(error) = self.state.start(self.generation) {
             self.destroy_inner();
             return match self.state.exit() {
                 Ok(()) => Err(ExitWorkError::NotStarted(error)),
@@ -552,6 +581,7 @@ impl<C> GatedWork<C> {
                     destroying: false,
                 },
                 panic: pending.panic.clone(),
+                generation: None,
             };
             running.await.map(GatedOutcome::Completed)
         }

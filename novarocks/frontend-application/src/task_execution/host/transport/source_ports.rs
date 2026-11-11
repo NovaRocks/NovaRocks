@@ -39,6 +39,7 @@ pub(crate) enum BodyOutcome {
     LocalFailure(WorkError),
     CreationFailed(TaskExecutionError),
     Call(super::call_source::AttemptCallReply),
+    Pump(crate::task_execution::host::pumps::PumpOutcome),
     RawFailure(Box<dyn Any + Send>),
 }
 

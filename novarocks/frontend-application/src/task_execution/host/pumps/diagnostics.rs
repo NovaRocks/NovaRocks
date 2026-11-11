@@ -25,6 +25,7 @@ use novarocks_attempt_protocol::{
     input::{DiagnosticRead, ExecutorFact, FinalTaskInfoProjection, FinalTaskInfoRef},
 };
 use novarocks_control_runtime::exit_custody::ExitCustody;
+#[cfg(test)]
 use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::AttemptRequestToken;
 use novarocks_execution_contract::{FinalTaskInfo, TaskIdentity};
@@ -38,12 +39,14 @@ pub(crate) struct DiagnosticRegistration {
     pub(crate) task: TaskIdentity,
     pub(crate) failure: HostFailureRef,
     pub(crate) custody: ExitCustody,
-    pub(crate) original_retention: Box<dyn std::any::Any + Send>,
+    #[cfg(test)]
+    pub(crate) original_retention: Option<Box<dyn std::any::Any + Send>>,
 }
 struct DiagnosticRecord {
     task: TaskIdentity,
     failure: HostFailureRef,
-    _original_retention: Box<dyn std::any::Any + Send>,
+    #[cfg(test)]
+    _original_retention: Option<Box<dyn std::any::Any + Send>>,
     job: OriginalJobRecord,
     started: bool,
     error: Option<String>,
@@ -106,6 +109,7 @@ impl DiagnosticRecords {
             DiagnosticRecord {
                 task: registration.task,
                 failure: registration.failure,
+                #[cfg(test)]
                 _original_retention: registration.original_retention,
                 job: OriginalJobRecord::new(registration.custody),
                 started: false,
@@ -198,6 +202,7 @@ impl DiagnosticRecords {
         }
         Ok(record.information.take())
     }
+    #[cfg(test)]
     pub(crate) fn bind_reply_input(
         &self,
         request: AttemptRequestToken,
@@ -212,6 +217,7 @@ impl DiagnosticRecords {
             .job
             .bind_reply(input)
     }
+    #[cfg(test)]
     pub(crate) fn core_consumed(&self, inputs: &[InputId]) {
         for record in self
             .records
@@ -222,6 +228,20 @@ impl DiagnosticRecords {
         {
             record.job.core_consumed(inputs);
         }
+    }
+    pub(super) fn resolve_result(
+        &self,
+        request: AttemptRequestToken,
+    ) -> Result<(), PumpRecordError> {
+        self.records
+            .lock()
+            .expect("diagnostic canonical records")
+            .reads
+            .get_mut(&request)
+            .ok_or(PumpRecordError::MissingRecord)?
+            .job
+            .resolve_result();
+        Ok(())
     }
     /// Diagnostics keep the actual transport text in the original record; it
     /// is logged as observation data and never classified as attempt failure.
@@ -241,26 +261,57 @@ impl DiagnosticRecords {
             .expect("diagnostic canonical records")
             .closing = true;
     }
-    pub(crate) fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+    pub(super) fn take_retired_one(&self) -> Option<Box<dyn std::any::Any + Send>> {
         let mut records = self.records.lock().expect("diagnostic canonical records");
-        let ids = records
+        let id = records
             .reads
             .iter()
-            .filter_map(|(id, r)| r.job.retired().then_some(*id))
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .map(|id| {
-                if records.active == Some(id) {
-                    records.active = None;
-                }
-                Box::new(
-                    records
-                        .reads
-                        .remove(&id)
-                        .expect("same retired diagnostic record"),
-                ) as Box<dyn std::any::Any + Send>
-            })
-            .collect()
+            .find_map(|(id, r)| r.job.retired().then_some(*id))?;
+        if records.active == Some(id) {
+            records.active = None;
+        }
+        Some(Box::new(
+            records
+                .reads
+                .remove(&id)
+                .expect("same retired diagnostic record"),
+        ))
+    }
+
+    #[cfg(test)]
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        std::iter::from_fn(|| self.take_retired_one()).collect()
+    }
+
+    pub(super) fn take_closing_information(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        self.records
+            .lock()
+            .expect("diagnostic canonical records")
+            .information
+            .pop_first()
+            .map(|(_, original)| Box::new(original) as _)
+    }
+
+    pub(super) fn read_count(&self) -> usize {
+        self.records
+            .lock()
+            .expect("diagnostic canonical records")
+            .reads
+            .len()
+    }
+
+    pub(super) fn backing_bytes(
+        tasks: usize,
+    ) -> Result<usize, super::super::observations::ObservationError> {
+        use super::super::observations::backing;
+        backing::sum([
+            backing::arc::<Self>()?.size(),
+            backing::tree::<AttemptRequestToken, DiagnosticRecord>(super::source::REPLY_ROLES)?,
+            backing::tree::<AttemptRequestToken, InformationRecord>(tasks)?,
+            backing::array::<FinalTaskInfo>(tasks)?,
+            backing::array::<DiagnosticRecord>(2)?,
+            backing::array::<InformationRecord>(2)?,
+        ])
     }
 }
 

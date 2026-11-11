@@ -30,6 +30,7 @@ use super::observations::{
     read_progress::ReadProgressInput,
     source::BoundObservationSource,
 };
+use super::pumps::{AttemptPumpSource, DiagnosticRecords, DynamicFilterRecords};
 use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
@@ -39,8 +40,12 @@ use crate::{
         host::{EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding},
         membership::{FrozenMember, MembershipRegistration, MembershipTarget, membership_input},
     },
-    native::transport_capacity::{
-        NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
+    native::{
+        data_runtime::FrontendDataRuntime,
+        task_transport::wire::AttemptWireFacts,
+        transport_capacity::{
+            NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
+        },
     },
     task_execution::{
         bridge::{control::AttemptOwnerControls, root_control::RootControlRequests},
@@ -51,13 +56,13 @@ use novarocks_attempt_protocol::{
     AttemptCore, Core, InputSelection,
     capacity::{QueueStage, ReservationToken, StepContext},
     config::DispatchLane,
-    effect::{AttemptEffect, EffectBody, EffectClass},
+    effect::{AttemptEffect, EffectBody, EffectClass, PumpKind},
     failure::AttemptFailure,
     input::{
         AttemptInput, AttemptInputClaim, AttemptInputId, AttemptSourceCut, AttemptSourceId,
         ExecutorFact,
     },
-    start::AttemptStart,
+    start::{AttemptStart, PayloadRef},
 };
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorStep, InputSourceCut},
@@ -68,21 +73,24 @@ use novarocks_control_runtime::{
     causal_input::CausalInputObligation,
     coalescing_input::{CoalescingInput, Merge},
     obligation::{ReservationObligation, StepRegistration, WorkObligation},
-    transaction::{RuntimeError, ScopeHandle},
+    transaction::{RuntimeError, RuntimeLedger, ScopeHandle},
 };
 use novarocks_control_runtime_core::{
     capacity::ReservationResources,
     effect::{EffectDescriptor, EffectKind},
-    identity::{ActionId, ActorId, Generation, InputId, ReservationId, ScopedWorkRef, Tick},
+    identity::{
+        ActionId, ActorId, ConsumerId, Generation, InputId, ReservationId, ScopedWorkRef, Tick,
+    },
     mailbox::{InputClass, InputEnvelope},
     owned_storage::OwnedSlotNeed,
     scope::WorkKind,
 };
 use novarocks_coordination_contract::{LogicalToAttemptBody, MonotonicClock, MonotonicInstant};
 use novarocks_execution_contract::{ParticipationRef, TaskOperationId};
-use novarocks_types::BackendProcessId;
+use novarocks_types::{BackendProcessId, NativeCompatibilityId};
+use novarocks_workload_control::joint_admission::NativeAsyncActionAuthority;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     num::NonZeroU64,
     sync::{Arc, OnceLock},
     task::Waker,
@@ -103,6 +111,8 @@ pub(crate) struct AttemptActor {
 pub(crate) struct AttemptActorRegistration {
     pub(crate) original: ActorRegistration,
     scope: ScopeHandle,
+    transport_capacity: NativeTransportCapacity,
+    compatibility: NativeCompatibilityId,
     native_source: ActorId,
     transport_source: ActorId,
     subscription_source: ActorId,
@@ -117,6 +127,8 @@ pub(crate) struct AttemptActorRegistration {
     failure_lifecycle: Option<FailureLifecycle>,
     failure_publications: Arc<FailurePublications>,
     failure_work: ScopedWorkRef,
+    dynamic_pump: Option<PayloadRef>,
+    retain_diagnostics: bool,
     root_control: RootControlBinding,
     ordered_host: Option<OrderedObservationHost>,
     ordered_bound: bool,
@@ -169,6 +181,7 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) subscription_control: super::transport::AttemptCallSource,
     pub(crate) subscriptions: super::transport::AttemptSubscriptions,
     pub(crate) send: super::transport::AttemptSendSource,
+    pub(crate) pumps: AttemptPumpSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
 }
@@ -177,7 +190,18 @@ pub(crate) struct PreparedNativeSubscriptions {
     pub(crate) original: super::transport::AttemptSubscriptions,
     pub(crate) control: super::transport::AttemptCallSource,
     pub(crate) endpoints: Arc<super::transport::SubscriptionEndpoints>,
+    data: FrontendDataRuntime,
 }
+
+pub(crate) struct AttemptSendInputs<'a> {
+    pub(crate) ledger: &'a RuntimeLedger,
+    pub(crate) authority: NativeAsyncActionAuthority,
+    pub(crate) clock: Arc<dyn MonotonicClock>,
+    pub(crate) observer: ConsumerId,
+    pub(crate) result_counts: [usize; 2],
+}
+
+type TransportResultPositions = [VecDeque<CausalInputObligation<FrontendActor>>; 2];
 
 struct CapacityReleased;
 impl Merge for CapacityReleased {
@@ -316,6 +340,35 @@ pub(crate) enum AttemptRegistrationError {
 }
 
 impl AttemptActorRegistration {
+    pub(crate) fn prepare_pump_source(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        payer: &ReservationObligation,
+        observer: ConsumerId,
+        dynamic: Option<Arc<DynamicFilterRecords>>,
+        diagnostics: Option<Arc<DiagnosticRecords>>,
+    ) -> Result<AttemptPumpSource, AttemptRegistrationError> {
+        if self.dynamic_pump.is_some() != dynamic.is_some()
+            || self.retain_diagnostics != diagnostics.is_some()
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "pump Sources differ from the original attempt plan",
+            ));
+        }
+        AttemptPumpSource::bind(
+            runtime,
+            &self.original,
+            self.native_source,
+            parent,
+            payer,
+            observer,
+            self.dynamic_pump.zip(dynamic),
+            diagnostics,
+        )
+        .map_err(AttemptRegistrationError::Runtime)
+    }
+
     /// The original QA reply position is separate from Native admission and
     /// observation credits. Only one original QA request can be in flight.
     pub(crate) fn prepare_qa_source(
@@ -442,6 +495,7 @@ impl AttemptActorRegistration {
             .ingress
             .root_binding()
             .same_original(&self.root_control)
+            || frozen.compatibility != self.compatibility
             || !self.scope.same_scope(parent.scope())
             || !payer.belongs_to_bound_work(&self.scope, parent.id())
         {
@@ -449,6 +503,7 @@ impl AttemptActorRegistration {
                 "subscription Source differs from the original activation or payer",
             ));
         }
+        let data = frozen.data.clone();
         let endpoints =
             super::transport::bind_subscription_endpoints(&self.failure_members, frozen)
                 .map_err(AttemptRegistrationError::Subscription)?;
@@ -480,6 +535,7 @@ impl AttemptActorRegistration {
                 original,
                 control,
                 endpoints,
+                data,
             }),
             Err(error) => {
                 assert!(
@@ -491,6 +547,56 @@ impl AttemptActorRegistration {
                 Err(AttemptRegistrationError::Runtime(error))
             }
         }
+    }
+
+    /// Use the exact clients already selected from this attempt's frozen roster.
+    /// The returned paid result inventory is independent of admission results.
+    pub(crate) fn prepare_send_routes(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        subscriptions: &PreparedNativeSubscriptions,
+        inputs: AttemptSendInputs<'_>,
+    ) -> Result<
+        (
+            Arc<BTreeMap<BackendProcessId, super::transport::SendContext>>,
+            TransportResultPositions,
+        ),
+        AttemptRegistrationError,
+    > {
+        if !self.scope.belongs_to_ledger(inputs.ledger)
+            || !subscriptions
+                .original
+                .matches(&self.original, self.subscription_source)
+        {
+            return Err(AttemptRegistrationError::InvalidConfig(
+                "send Source differs from the original attempt or frozen transport",
+            ));
+        }
+        let idle = self.reserve_transport_results(runtime, parent, inputs.result_counts)?;
+        let contexts = subscriptions
+            .endpoints
+            .iter()
+            .map(|(participation, endpoint)| {
+                let context = super::transport::SendContext {
+                    registration: self.original.clone(),
+                    ledger: inputs.ledger.clone(),
+                    scope: self.scope.clone(),
+                    layout: self.transport_capacity.clone(),
+                    transport: self.transport_capacity.transport_budget(),
+                    authority: inputs.authority.clone(),
+                    wire: AttemptWireFacts {
+                        native_compatibility_id: self.compatibility,
+                    },
+                    client: endpoint.client.clone(),
+                    apply: subscriptions.data.apply_send_port().clone(),
+                    clock: inputs.clock.clone(),
+                    observer: inputs.observer,
+                };
+                (participation.backend_process_id(), context)
+            })
+            .collect();
+        Ok((Arc::new(contexts), idle))
     }
 
     pub(crate) fn reserve_transport_result(
@@ -562,7 +668,6 @@ impl AttemptActorRegistration {
         authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
         counts: [usize; 2],
     ) -> Result<super::transport::AdmissionSource, AttemptRegistrationError> {
-        use std::collections::VecDeque;
         let binding = self
             .binding
             .get()
@@ -576,31 +681,7 @@ impl AttemptActorRegistration {
                 "admission Source payer belongs to another original Work",
             ));
         }
-        let mut positions = counts.map(VecDeque::with_capacity);
-        for (lane, count) in counts.into_iter().enumerate() {
-            for _ in 0..count {
-                match CausalInputObligation::reserve_admitted(
-                    runtime,
-                    &self.original,
-                    self.transport_source,
-                    InputClass::Lifecycle,
-                    parent,
-                ) {
-                    Ok(position) => positions[lane].push_back(position),
-                    Err(error) => {
-                        for mut original in positions
-                            .iter_mut()
-                            .flat_map(|positions| positions.drain(..))
-                        {
-                            original
-                                .close_after_exit()
-                                .expect("unpublished admission position");
-                        }
-                        return Err(AttemptRegistrationError::Runtime(error));
-                    }
-                }
-            }
-        }
+        let positions = self.reserve_transport_results(runtime, parent, counts)?;
         Ok(super::transport::AdmissionSource::new(
             parent,
             payer,
@@ -610,6 +691,34 @@ impl AttemptActorRegistration {
             positions,
         )
         .unwrap_or_else(|original| std::panic::resume_unwind(Box::new(original))))
+    }
+
+    fn reserve_transport_results(
+        &self,
+        runtime: &ActorRuntime<FrontendActor>,
+        parent: &WorkObligation,
+        counts: [usize; 2],
+    ) -> Result<TransportResultPositions, AttemptRegistrationError> {
+        let mut positions = counts.map(VecDeque::with_capacity);
+        for (lane, count) in counts.into_iter().enumerate() {
+            for _ in 0..count {
+                match self.reserve_transport_result(runtime, parent) {
+                    Ok(position) => positions[lane].push_back(position),
+                    Err(error) => {
+                        for mut original in positions
+                            .iter_mut()
+                            .flat_map(|positions| positions.drain(..))
+                        {
+                            original
+                                .close_after_exit()
+                                .expect("unpublished transport result position");
+                        }
+                        return Err(AttemptRegistrationError::Runtime(error));
+                    }
+                }
+            }
+        }
+        Ok(positions)
     }
 
     pub(crate) fn prepare_abort_ingress(
@@ -716,7 +825,8 @@ impl AttemptActorRegistration {
                     .sum(),
             )
             .and_then(|count| count.checked_add(transient_calls))
-            .and_then(|count| count.checked_add(transport.subscriptions.participants()));
+            .and_then(|count| count.checked_add(transport.subscriptions.participants()))
+            .and_then(|count| count.checked_add(transport.pumps.capacity()));
         if self.startup_reserved
             || !self.ordered_bound
             || self.read_progress_roles.is_none()
@@ -736,6 +846,7 @@ impl AttemptActorRegistration {
                 .subscriptions
                 .matches(&self.original, self.subscription_source)
             || required_joins.is_none_or(|count| count > transport.retirement.capacity())
+            || !transport.pumps.matches(&self.original)
             || !transport
                 .retirement
                 .matches_registration(runtime, &self.original)
@@ -799,6 +910,7 @@ impl AttemptActorRegistration {
             subscription_control,
             subscriptions,
             send,
+            pumps,
             executor: native,
             failure,
         } = transport;
@@ -876,7 +988,8 @@ impl AttemptActorRegistration {
                         ),
                         source,
                     )
-                    .with_releases(native.0.clone(), retirement.host_waker()),
+                    .with_releases(native.0.clone(), retirement.host_waker())
+                    .with_pumps(pumps),
                 ),
                 executor: Arc::new(super::transport::AttemptTransportExecutor {
                     native,
@@ -1310,11 +1423,18 @@ impl AttemptActor {
             ));
         }
         let binding = Arc::new(OnceLock::new());
+        let compatibility = start.plan.compatibility;
+        let dynamic_pump = start
+            .plan
+            .pumps
+            .iter()
+            .find_map(|(id, kind)| (*kind == PumpKind::DynamicFilters).then_some(*id));
+        let retain_diagnostics = start.activation.policy.retain_diagnostics;
         let core = Core::new(start).map_err(AttemptRegistrationError::Core)?;
         let adapter = Self {
             core,
             scope: scope.clone(),
-            capacity,
+            capacity: capacity.clone(),
             binding: binding.clone(),
         };
         let original = runtime
@@ -1338,6 +1458,8 @@ impl AttemptActor {
         Ok(AttemptActorRegistration {
             original,
             scope,
+            transport_capacity: capacity,
+            compatibility,
             native_source: native,
             transport_source,
             subscription_source,
@@ -1354,6 +1476,8 @@ impl AttemptActor {
             )),
             failure_publications,
             failure_work: failure_work.reference(),
+            dynamic_pump,
+            retain_diagnostics,
             root_control,
             ordered_host: None,
             ordered_bound: false,

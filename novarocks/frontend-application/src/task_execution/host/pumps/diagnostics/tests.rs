@@ -276,7 +276,7 @@ impl Fixture {
                 task,
                 failure: HostFailureRef(NonZeroU64::new(request.get()).unwrap()),
                 custody: custody.clone(),
-                original_retention: Box::new(ReadRetention(self.retired.clone())),
+                original_retention: Some(Box::new(ReadRetention(self.retired.clone()))),
             })
             .map_err(|(error, _)| error)
             .unwrap();
@@ -433,4 +433,183 @@ async fn foreign_status_keeps_requested_reference_and_exact_once_discard() {
     assert_eq!(projection.final_status.identity(), task(2));
     assert_eq!(actual_status, task(2));
     assert!(wrong_take && wrong_discard && unknown_take && unknown_discard && wrong_after_consumed);
+}
+
+#[tokio::test]
+async fn paid_diagnostic_source_reports_actual_exit_before_its_original_result() {
+    use crate::{
+        control_runtime::transport_withdrawal::AttemptEffectEnvelope,
+        task_execution::host::{
+            custody::{TransportRetirements, tests::WithdrawalInbox},
+            pumps::AttemptPumpSource,
+            transport::handoff_actor_transport,
+        },
+    };
+    use novarocks_attempt_protocol::effect::{AttemptEffect, EffectBody, EffectClass};
+    use novarocks_coordination_contract::{AttemptActionId, MonotonicInstant};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct GatedRead {
+        original: Mutex<Option<oneshot::Receiver<Box<FinalTaskInfo>>>>,
+        polled: Arc<tokio::sync::Notify>,
+    }
+    impl TaskResultTransport for GatedRead {
+        fn final_task_info(
+            &self,
+            _: TaskIdentity,
+        ) -> futures::future::BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
+            let original = self.original.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                self.polled.notify_one();
+                Ok(FinalTaskInfoRead::Available(original.await.unwrap()))
+            })
+        }
+        fn dynamic_filters(
+            &self,
+            _: TaskIdentity,
+            _: Option<DomainVersion>,
+        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+            unreachable!("only the original diagnostic read")
+        }
+    }
+
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let scope = ledger.open_scope_next(None, generation()).unwrap();
+    let (mut parent, mut payer) = scope
+        .reserve_next(
+            generation(),
+            ReservationResources::work_only(),
+            WorkKind::Cleanup,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Cleanup)
+        .unwrap();
+    parent.start().unwrap();
+    let task = task(1);
+    let request = request(1);
+    let effect_id = AttemptActionId::new(NonZeroU64::MIN);
+    let effect = AttemptEffectEnvelope::new(AttemptEffect {
+        id: effect_id,
+        class: EffectClass::Settlement,
+        body: EffectBody::CollectDiagnostics {
+            request,
+            task,
+            deadline: MonotonicInstant::from_origin(Duration::from_secs(1)),
+        },
+    });
+    let inbox = WithdrawalInbox::with_commands(&scope, [(effect.clone(), None)], [16; 4]);
+    let (send, receive) = oneshot::channel();
+    let polled = Arc::new(tokio::sync::Notify::new());
+    let records = DiagnosticRecords::new(Arc::new(GatedRead {
+        original: Mutex::new(Some(receive)),
+        polled: polled.clone(),
+    }));
+    let mut source = AttemptPumpSource::bind(
+        inbox.runtime(),
+        inbox.registration(),
+        inbox.source(),
+        &parent,
+        &payer,
+        ConsumerId::new(1).unwrap(),
+        None,
+        Some(records.clone()),
+    )
+    .unwrap();
+    let position = source.prepay(&effect).unwrap().unwrap();
+    let ticket = inbox.command(&parent, effect_id);
+    let command = ticket.input;
+    let handle = tokio::runtime::Handle::current();
+    let mut original = source.bind_job(&ticket, position);
+    let mut retirement = TransportRetirements::new(
+        inbox.runtime().clone(),
+        inbox.registration().clone(),
+        handle.clone(),
+        source.capacity(),
+    );
+    retirement
+        .track(effect, original.transport.take().unwrap())
+        .unwrap_or_else(|_| panic!("exact original diagnostic Join"));
+    handoff_actor_transport(&handle, original)
+        .unwrap_or_else(|_| panic!("original diagnostic handoff"));
+    inbox
+        .runtime()
+        .effect_completed(ticket)
+        .unwrap_or_else(|_| panic!("original diagnostic handoff completion"));
+    inbox
+        .runtime()
+        .retire_input(inbox.registration().actor(), command)
+        .unwrap();
+
+    fn drive(
+        inbox: &WithdrawalInbox,
+        source: &mut AttemptPumpSource,
+        retirement: &mut TransportRetirements,
+        closing: bool,
+    ) {
+        while let Some(turn) = inbox.runtime().claim_host_actor() {
+            let transport = retirement.progress(&turn, 1, |effect, event| {
+                source
+                    .transport_event(effect, event)
+                    .unwrap_or_else(|original| std::panic::resume_unwind(original))
+            });
+            let source = source.progress(false, closing, closing, 1, true, drop);
+            turn.release(transport.more || source.more).unwrap();
+        }
+    }
+
+    polled.notified().await;
+    drive(&inbox, &mut source, &mut retirement, false);
+    inbox.assert_no_result();
+    let original = info(task);
+    let pointer = std::ptr::from_ref(original.as_ref()) as usize;
+    send.send(original).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            drive(&inbox, &mut source, &mut retirement, false);
+            if let Some((exit, fact)) = inbox.try_commit_next() {
+                assert!(matches!(fact, ExecutorFact::ActualExit { effect } if effect == effect_id));
+                let (input, fact) = inbox.try_commit_next().unwrap();
+                assert!(matches!(fact, ExecutorFact::DiagnosticsFinished {
+                    request: actual, task: actual_task,
+                    result: DiagnosticRead::Available(FinalTaskInfoProjection { reference, .. }),
+                } if actual == request && actual_task == task && reference == FinalTaskInfoRef::new(request, task)));
+                inbox.runtime().retire_input(inbox.registration().actor(), exit).unwrap();
+                inbox.runtime().retire_input(inbox.registration().actor(), input).unwrap();
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let recovered = records
+        .take_information(FinalTaskInfoRef::new(request, task))
+        .unwrap();
+    assert_eq!(pointer, std::ptr::from_ref(recovered.as_ref()) as usize);
+    drop(recovered);
+
+    inbox
+        .runtime()
+        .notify_host_actor(inbox.registration())
+        .unwrap();
+    drive(&inbox, &mut source, &mut retirement, true);
+    assert!(retirement.is_empty() && source.is_drained());
+    parent.body_exited().unwrap();
+    parent.captures_exited().unwrap();
+    payer.finish().unwrap();
+    scope.close_external().unwrap();
+    ledger.reap_scope_ready(scope.id(), 32).unwrap();
+    assert!(scope.join_ready().unwrap());
+    inbox
+        .runtime()
+        .close_actor_admission(inbox.registration().actor())
+        .unwrap();
+    while let Some(turn) = inbox.runtime().claim_host_actor() {
+        turn.release(false).unwrap();
+    }
+    inbox
+        .runtime()
+        .seal_actor(inbox.registration().actor())
+        .unwrap();
+    inbox.finish();
 }

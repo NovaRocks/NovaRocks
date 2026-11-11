@@ -31,19 +31,26 @@ use crate::{
         host::{EffectExecutor, PreparedEffectJob},
         transport_withdrawal::AttemptEffectEnvelope,
     },
-    task_execution::host::custody::{
-        CustodyError, CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
-        TransportJoinRegistration, TransportRetirement,
+    task_execution::host::{
+        custody::{
+            CustodyError, CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
+            TransportJoinRegistration, TransportRetirement,
+        },
+        pumps::{BoundPumpWork, PumpOutcome},
     },
 };
 use novarocks_attempt_protocol::effect::EffectBody;
 use novarocks_control_runtime::{
     actor_turn::InputAuthor,
     causal_input::CausalInputObligation,
-    exit_work::{ExitWorkError, PanicSink, run_blocking, run_future},
+    exit_custody::ExitCustody,
+    exit_work::{
+        ExitWorkError, PanicSink, run_blocking, run_blocking_in_generation, run_future,
+        run_future_in_generation,
+    },
     reported_work::ReportedWork,
 };
-use novarocks_control_runtime_core::identity::ConsumerId;
+use novarocks_control_runtime_core::identity::{ConsumerId, Generation};
 use std::{alloc::Layout, collections::VecDeque, sync::Arc};
 use tokio::runtime::Handle;
 
@@ -81,6 +88,10 @@ pub(crate) enum ActorTransportWork {
     Admit(Box<BoundQueue>),
     Call(BoundAttemptCall),
     Subscription(Box<BoundSubscription>),
+    Pump {
+        work: Box<BoundPumpWork>,
+        generation: Generation,
+    },
 }
 impl ActorTransportWork {
     fn matches(&self, effect: &Arc<AttemptEffectEnvelope>) -> bool {
@@ -118,6 +129,7 @@ impl ActorTransportWork {
             }
             (Self::Call(call), _) => call.matches(effect),
             (Self::Subscription(bound), _) => bound.matches(effect),
+            (Self::Pump { work, .. }, _) => work.matches(effect),
             _ => false,
         }
     }
@@ -125,7 +137,7 @@ impl ActorTransportWork {
     fn send_reports(&self) -> Option<Arc<ActorSendReports>> {
         match self {
             Self::Send(send) => send.reports.actor().cloned(),
-            Self::Admit(_) | Self::Call(_) | Self::Subscription(_) => None,
+            Self::Admit(_) | Self::Call(_) | Self::Subscription(_) | Self::Pump { .. } => None,
         }
     }
 }
@@ -162,6 +174,40 @@ pub(crate) fn prepare_actor_transport(
     observer: ConsumerId,
     bind: impl FnOnce(TransportJoinRegistration) -> ActorTransportWork,
 ) -> Result<PreparedEffectJob, TransportPreparationRefusal> {
+    prepare_with_owner(effect, result, original, cleanup, observer, |owner| {
+        bind(owner.registration())
+    })
+}
+
+pub(crate) fn prepare_actor_pump(
+    effect: Arc<AttemptEffectEnvelope>,
+    result: CausalInputObligation<crate::control_runtime::actor::FrontendActor>,
+    original: ReportedWork,
+    observer: ConsumerId,
+    generation: Generation,
+    bind: impl FnOnce(ExitCustody) -> BoundPumpWork,
+) -> Result<PreparedEffectJob, TransportPreparationRefusal> {
+    prepare_with_owner(
+        effect,
+        result,
+        original,
+        VecDeque::new(),
+        observer,
+        |owner| ActorTransportWork::Pump {
+            work: Box::new(bind(owner.exit_custody())),
+            generation,
+        },
+    )
+}
+
+fn prepare_with_owner(
+    effect: Arc<AttemptEffectEnvelope>,
+    result: CausalInputObligation<crate::control_runtime::actor::FrontendActor>,
+    original: ReportedWork,
+    cleanup: VecDeque<ReportedWork>,
+    observer: ConsumerId,
+    bind: impl FnOnce(&OriginalTransportJoinObligation) -> ActorTransportWork,
+) -> Result<PreparedEffectJob, TransportPreparationRefusal> {
     let result_author = result.event_author().expect("original prepaid result");
     let panic = PanicSink::new();
     let (owner, exit, launch) =
@@ -175,7 +221,7 @@ pub(crate) fn prepare_actor_transport(
                 });
             }
         };
-    let work = bind(owner.registration());
+    let work = bind(&owner);
     Ok(PreparedEffectJob {
         effect: FrontendEffect::Attempt(effect.clone()),
         exit,
@@ -312,6 +358,22 @@ pub(crate) fn handoff_actor_transport(
                 stage_actor_outcome(&registration, outcome);
             })
         }
+        ActorTransportWork::Pump { work, generation } if work.runs_blocking() => launch
+            .spawn_blocking(runtime, exit, |exit, registration| {
+                let work = run_blocking_in_generation(
+                    exit,
+                    move || work.run_blocking(),
+                    panic,
+                    generation,
+                );
+                move || stage_actor_outcome(&registration, pump_outcome(work.run()))
+            }),
+        ActorTransportWork::Pump { work, generation } => {
+            launch.spawn(runtime, exit, |exit, registration| async move {
+                let outcome = run_future_in_generation(exit, work.run(), panic, generation).await;
+                stage_actor_outcome(&registration, pump_outcome(outcome));
+            })
+        }
         ActorTransportWork::Call(bound) if effect.is_transport_release() => {
             launch.spawn_blocking(runtime, exit, |exit, registration| {
                 let work = run_blocking(exit, move || bound.dispose(), panic);
@@ -345,4 +407,21 @@ pub(crate) fn handoff_actor_transport(
         Ok(()) => ActorTransportHandoff::Spawned,
         Err(error) => ActorTransportHandoff::Failed(error),
     })
+}
+
+fn pump_outcome(
+    result: Result<
+        Result<
+            Option<novarocks_attempt_protocol::input::ExecutorFact>,
+            crate::task_execution::host::pumps::PumpRecordError,
+        >,
+        ExitWorkError,
+    >,
+) -> BodyOutcome {
+    match result {
+        Ok(Ok(fact)) => BodyOutcome::Pump(PumpOutcome::Completed(fact)),
+        Err(ExitWorkError::NotStarted(_)) => BodyOutcome::Pump(PumpOutcome::Fenced),
+        Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
+        Err(error) => BodyOutcome::RawFailure(Box::new(error)),
+    }
 }

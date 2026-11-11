@@ -226,6 +226,8 @@ impl QueryTaskExecution {
         let action = self.dynamic_feedback.next_action(running)?;
         let operation = matches!(action, Action::Read { .. }).then(|| self.issue_operation_id());
         let feedback = &mut self.dynamic_feedback;
+        // Every emitted dynamic action has an original Source record to drain.
+        // Closing stops selecting new actions and waits for any emitted admission.
         let (body, class) = match action {
             Action::Start(pump) => {
                 feedback.lifecycle = Lifecycle::Open;
@@ -234,7 +236,7 @@ impl QueryTaskExecution {
                         pump,
                         kind: PumpKind::DynamicFilters,
                     },
-                    EffectClass::Business,
+                    EffectClass::Settlement,
                 )
             }
             Action::Stop(pump) => {
@@ -264,7 +266,7 @@ impl QueryTaskExecution {
                         acknowledged,
                         advertised,
                     },
-                    EffectClass::Business,
+                    EffectClass::Settlement,
                 )
             }
             Action::Admit {
@@ -280,7 +282,7 @@ impl QueryTaskExecution {
                         version,
                         feedback: payload,
                     },
-                    EffectClass::Business,
+                    EffectClass::Settlement,
                 )
             }
         };
@@ -513,8 +515,12 @@ mod tests {
             let source = PayloadRef(key(1));
             execution.bind_dynamic_feedback(Some(source));
             advertise(&mut execution, task, 2, 1);
-            advance(&mut execution, true, 1).unwrap();
-            advance(&mut execution, true, 2).unwrap();
+            for n in [1, 2] {
+                let effect = execution
+                    .advance_dynamic_feedback(true, AttemptActionId::new(key(n)), token(n))
+                    .unwrap();
+                assert_eq!(effect.class, EffectClass::Settlement);
+            }
             let available = DynamicFilterRead::Available {
                 version: version(1),
                 feedback: PayloadRef(key(3)),
@@ -522,8 +528,16 @@ mod tests {
             if emitted {
                 execution.observe_dynamic_read(token(2), task, available.clone());
                 assert!(matches!(
-                    advance(&mut execution, true, 3),
-                    Some(EffectBody::AdmitDynamicFilterFeedback { .. })
+                    execution.advance_dynamic_feedback(
+                        true,
+                        AttemptActionId::new(key(3)),
+                        token(3)
+                    ),
+                    Some(AttemptEffect {
+                        body: EffectBody::AdmitDynamicFilterFeedback { .. },
+                        class: EffectClass::Settlement,
+                        ..
+                    })
                 ));
                 assert!(advance(&mut execution, false, 4).is_none());
                 execution.observe_dynamic_admission(token(2), task, Ok(()));

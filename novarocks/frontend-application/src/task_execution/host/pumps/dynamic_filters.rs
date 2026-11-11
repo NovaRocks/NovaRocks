@@ -32,7 +32,6 @@ use novarocks_attempt_protocol::{
     start::PayloadRef,
 };
 use novarocks_control_runtime::exit_custody::ExitCustody;
-use novarocks_control_runtime_core::identity::InputId;
 use novarocks_coordination_contract::AttemptRequestToken;
 use novarocks_execution_contract::{DomainVersion, TaskIdentity, TaskOperationId};
 use std::{
@@ -46,28 +45,21 @@ pub(crate) struct DynamicReadRegistration {
     pub(crate) feedback: PayloadRef,
     pub(crate) failure: HostFailureRef,
     pub(crate) custody: ExitCustody,
-    pub(crate) original_retention: Box<dyn std::any::Any + Send>,
 }
 struct ReadRecord {
     task: TaskIdentity,
     feedback: PayloadRef,
     failure: HostFailureRef,
-    _original_retention: Box<dyn std::any::Any + Send>,
     read_job: OriginalJobRecord,
     admission_job: Option<OriginalJobRecord>,
     started: bool,
     admission_started: bool,
     read: Option<HostRead>,
-    read_error: Option<Arc<DynamicFilterReadError>>,
-    admission_error: Option<Arc<TaskExecutionError>>,
-    refusal_error: Option<Arc<TaskExecutionError>>,
-}
-pub(crate) enum DynamicFilterFailureSource {
-    Read(Arc<DynamicFilterReadError>),
-    Admission(Arc<TaskExecutionError>),
+    read_error: Option<DynamicFilterReadError>,
+    terminal_error: Option<TaskExecutionError>,
 }
 struct Records {
-    closing: bool,
+    feedback_closed: bool,
     reads: BTreeMap<AttemptRequestToken, ReadRecord>,
 }
 pub(crate) struct DynamicFilterRecords {
@@ -84,7 +76,7 @@ impl DynamicFilterRecords {
             transport,
             feedback,
             records: Mutex::new(Records {
-                closing: false,
+                feedback_closed: false,
                 reads: BTreeMap::new(),
             }),
         })
@@ -96,8 +88,9 @@ impl DynamicFilterRecords {
         registration: DynamicReadRegistration,
     ) -> Result<(), (PumpRecordError, DynamicReadRegistration)> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
-        if records.closing
-            || records.reads.contains_key(&registration.request)
+        // Core can stop the feedback consumer while the original read
+        // effect is still in the host queue. That read still owes its result.
+        if records.reads.contains_key(&registration.request)
             || records
                 .reads
                 .values()
@@ -111,15 +104,13 @@ impl DynamicFilterRecords {
                 task: registration.task,
                 feedback: registration.feedback,
                 failure: registration.failure,
-                _original_retention: registration.original_retention,
                 read_job: OriginalJobRecord::new(registration.custody),
                 admission_job: None,
                 started: false,
                 admission_started: false,
                 read: None,
                 read_error: None,
-                admission_error: None,
-                refusal_error: None,
+                terminal_error: None,
             },
         );
         Ok(())
@@ -133,8 +124,9 @@ impl DynamicFilterRecords {
         operation: TaskOperationId,
         acknowledged: Option<DomainVersion>,
     ) -> Result<ExecutorFact, PumpRecordError> {
-        {
+        let feedback_open = {
             let mut records = self.records.lock().expect("dynamic read canonical records");
+            let feedback_open = !records.feedback_closed;
             let record = records
                 .reads
                 .get_mut(&request)
@@ -146,11 +138,17 @@ impl DynamicFilterRecords {
                 return Err(PumpRecordError::AlreadyStarted);
             }
             record.started = true;
-        }
-        let result = self
-            .transport
-            .dynamic_filters_async(operation, task, acknowledged)
-            .await;
+            feedback_open
+        };
+        let result = if feedback_open {
+            self.transport
+                .dynamic_filters_async(operation, task, acknowledged)
+                .await
+        } else {
+            Err(DynamicFilterReadError::Unavailable(
+                "dynamic filter feedback stopped before the original read started".into(),
+            ))
+        };
         let mut records = self.records.lock().expect("dynamic read canonical records");
         let record = records
             .reads
@@ -174,15 +172,15 @@ impl DynamicFilterRecords {
                         DynamicFilterRead::Unavailable(record.failure)
                     }
                     DynamicFilterReadError::Refused(detail) => {
-                        let original = Arc::new(TaskExecutionError::Schedule(format!(
+                        let original = TaskExecutionError::Schedule(format!(
                             "dynamic filter read for task {task} was refused: {detail}"
-                        )));
+                        ));
                         let projected = project_task_error(record.failure, &original);
-                        record.refusal_error = Some(original);
+                        record.terminal_error = Some(original);
                         DynamicFilterRead::Refused(projected)
                     }
                 };
-                record.read_error = Some(Arc::new(error));
+                record.read_error = Some(error);
                 fact
             }
         };
@@ -271,95 +269,272 @@ impl DynamicFilterRecords {
             .get_mut(&request)
             .ok_or(PumpRecordError::MissingRecord)?;
         record.read = Some(read);
-        record.admission_error = error.map(Arc::new);
+        record.terminal_error = error;
         Ok(ExecutorFact::DynamicFilterFeedbackAdmitted {
             request,
             task,
             result,
         })
     }
-    pub(crate) fn bind_reply_input(
+    pub(super) fn resolve_result(
         &self,
         request: AttemptRequestToken,
         admission: bool,
-        input: InputId,
     ) -> Result<(), PumpRecordError> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
         let record = records
             .reads
             .get_mut(&request)
             .ok_or(PumpRecordError::MissingRecord)?;
-        if admission {
+        let job = if admission {
             record
                 .admission_job
                 .as_mut()
                 .ok_or(PumpRecordError::MissingRecord)?
-                .bind_reply(input)
         } else {
-            record.read_job.bind_reply(input)
-        }
-    }
-    pub(crate) fn core_consumed(&self, inputs: &[InputId]) {
-        let mut records = self.records.lock().expect("dynamic read canonical records");
-        for record in records.reads.values_mut() {
-            record.read_job.core_consumed(inputs);
-            if let Some(admission) = &mut record.admission_job {
-                admission.core_consumed(inputs);
-            }
-        }
+            &mut record.read_job
+        };
+        job.resolve_result();
+        Ok(())
     }
     /// Borrow the original typed cause for the bridge's existing error path.
-    pub(crate) fn failure_source(
+    pub(super) fn project_failure(
         &self,
         failure: HostFailureRef,
-    ) -> Option<DynamicFilterFailureSource> {
+    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
         let records = self.records.lock().expect("dynamic read canonical records");
         let record = records
             .reads
             .values()
             .find(|record| record.failure == failure)?;
-        if let Some(error) = record
-            .admission_error
-            .as_ref()
-            .or(record.refusal_error.as_ref())
-        {
-            return Some(DynamicFilterFailureSource::Admission(error.clone()));
-        }
         record
-            .read_error
+            .terminal_error
             .as_ref()
-            .map(|error| DynamicFilterFailureSource::Read(error.clone()))
+            .map(TaskExecutionError::preparation_input)
+    }
+
+    pub(super) fn take_failure(&self, failure: HostFailureRef) -> Option<TaskExecutionError> {
+        let mut records = self.records.lock().expect("dynamic read canonical records");
+        records
+            .reads
+            .values_mut()
+            .find(|record| record.failure == failure)?
+            .terminal_error
+            .take()
     }
     pub(crate) fn close_external(&self) {
         self.records
             .lock()
             .expect("dynamic read canonical records")
-            .closing = true;
+            .feedback_closed = true;
         self.feedback.close();
     }
     /// The Source moves returned records to its existing disposal executor.
     /// No rich payload or original error is dropped while holding this lock.
-    pub(crate) fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+    pub(super) fn take_retired(
+        &self,
+        closing: bool,
+        retire_failures: bool,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
-        let closing = records.closing;
-        let ids = records
+        let closing = records.feedback_closed || closing;
+        let id = records.reads.iter().find_map(|(id, r)| {
+            let available = r.read.as_ref().is_some_and(|read| read.version().is_some());
+            (r.read_job.retired()
+                && r.admission_job
+                    .as_ref()
+                    .is_none_or(OriginalJobRecord::retired)
+                && (retire_failures || r.terminal_error.is_none())
+                && (!available || r.admission_job.is_some() || closing))
+                .then_some(*id)
+        })?;
+        Some(Box::new(
+            records.reads.remove(&id).expect("same retired read"),
+        ))
+    }
+
+    pub(super) fn read_count(&self) -> usize {
+        self.records
+            .lock()
+            .expect("dynamic read canonical records")
             .reads
-            .iter()
-            .filter_map(|(id, r)| {
-                let available = r.read.as_ref().is_some_and(|read| read.version().is_some());
-                (r.read_job.retired()
-                    && r.admission_job
-                        .as_ref()
-                        .is_none_or(OriginalJobRecord::retired)
-                    && (!available || r.admission_job.is_some() || closing))
-                    .then_some(*id)
+            .len()
+    }
+
+    pub(super) fn backing_bytes() -> Result<usize, super::super::observations::ObservationError> {
+        use super::super::observations::backing;
+        backing::sum([
+            backing::arc::<Self>()?.size(),
+            backing::tree::<AttemptRequestToken, ReadRecord>(super::source::REPLY_ROLES)?,
+            backing::array::<ReadRecord>(2)?,
+        ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        native::{
+            data_runtime::FrontendDataRuntime, task_result_transport::TaskReadGrace,
+            task_transport::tests::Loopback,
+        },
+        runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration,
+    };
+    use novarocks_attempt_protocol::failure::AttemptFailure;
+    use novarocks_control_runtime::{
+        completion::ReportSlot,
+        exit_work::{PanicSink, run_future_in_generation},
+        reported_work::ReportedWork,
+        transaction::RuntimeLedger,
+    };
+    use novarocks_control_runtime_core::{
+        capacity::{ReservationResources, ResourceVector},
+        completion::ConsumerKind,
+        identity::{ConsumerId, Generation},
+        owned_storage::OwnedSlotNeed,
+        scope::{WorkAdmission, WorkKind},
+    };
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::{num::NonZeroU64, time::Duration};
+
+    #[tokio::test]
+    async fn original_dynamic_read_still_settles_after_feedback_stop() {
+        assert_read_during_stop(false).await;
+        assert_read_during_stop(true).await;
+    }
+
+    async fn assert_read_during_stop(feedback_closed: bool) {
+        let mut peer = Loopback::start().await;
+        let process = BackendProcessId::try_from_bytes([
+            1, 1, 1, 1, 1, 1, 0x71, 1, 0x81, 1, 1, 1, 1, 1, 1, 1,
+        ])
+        .unwrap();
+        let execution =
+            QueryExecutionId::new(QueryId::new(212, 9), AttemptId::new(1).unwrap()).unwrap();
+        let task = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            process,
+        );
+        let mut runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let transport = NativeTaskResultTransport::new(
+            Arc::from([peer.descriptor(process)]),
+            runtime.clone(),
+            TaskReadGrace::new(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let feedback = RuntimeFilterFeedbackState::new(
+            execution,
+            FrontendRuntimeFilterFeedbackDeclaration::default(),
+        )
+        .unwrap();
+        let records = DynamicFilterRecords::new(Arc::new(transport), Arc::new(feedback));
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (work, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::new(
+                    ResourceVector::default(),
+                    OwnedSlotNeed {
+                        work_headers: 1,
+                        completions: 1,
+                        captures: 1,
+                        ..Default::default()
+                    },
+                ),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        let observer = ConsumerId::new(1).unwrap();
+        let report = ReportSlot::reserve_next(
+            &mut payer,
+            generation,
+            1,
+            [(observer, ConsumerKind::Observer)],
+        )
+        .unwrap();
+        let (custody, exit) =
+            ExitCustody::from_admitted(ReportedWork::try_new(work, payer, report.clone()).unwrap());
+
+        let request = AttemptRequestToken::new(NonZeroU64::MIN);
+        let failure = HostFailureRef(NonZeroU64::MIN);
+        // Core already issued the effect when orderly stop fences new work.
+        // When the exact StopPump has also closed feedback, settle locally.
+        scope.request_stop().unwrap();
+        if feedback_closed {
+            records.close_external();
+        }
+        records
+            .register(DynamicReadRegistration {
+                request,
+                task,
+                feedback: PayloadRef(NonZeroU64::MIN),
+                failure,
+                custody: custody.clone(),
             })
-            .collect::<Vec<_>>();
-        ids.into_iter()
-            .map(|id| {
-                Box::new(records.reads.remove(&id).expect("same retired read"))
-                    as Box<dyn std::any::Any + Send>
-            })
-            .collect()
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        let fact = run_future_in_generation(
+            exit,
+            records.run_admitted_read(request, task, TaskOperationId::new_v7(), None),
+            PanicSink::new(),
+            generation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let ExecutorFact::DynamicFiltersRead {
+            request: actual_request,
+            task: actual_task,
+            result,
+        } = fact
+        else {
+            panic!("original dynamic read result");
+        };
+        assert_eq!((actual_request, actual_task), (request, task));
+        if feedback_closed {
+            assert!(
+                matches!(result, DynamicFilterRead::Unavailable(original) if original == failure)
+            );
+            assert!(records.take_failure(failure).is_none());
+            assert!(matches!(
+                records.records.lock().unwrap().reads[&request].read_error.as_ref(),
+                Some(DynamicFilterReadError::Unavailable(detail))
+                    if detail == "dynamic filter feedback stopped before the original read started"
+            ));
+        } else {
+            assert!(
+                matches!(result, DynamicFilterRead::Refused(AttemptFailure::Host(projected)) if projected.original == failure)
+            );
+            assert!(matches!(
+                records.take_failure(failure),
+                Some(TaskExecutionError::Schedule(detail)) if detail.contains("task wire test peer rejects FetchTaskDynamicFilters")
+            ));
+        }
+        report.consume(observer).unwrap();
+        assert!(custody.try_retire().unwrap());
+        records.resolve_result(request, false).unwrap();
+        assert!(records.take_retired(true, true).is_some());
+        ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        scope.close_external().unwrap();
+        assert!(scope.join_ready().unwrap());
+        drop(records);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        runtime.drain_original_apply_until(deadline).await.unwrap();
+        runtime
+            .drain_original_subscriptions_until(deadline)
+            .await
+            .unwrap();
+        assert!(runtime.original_apply_joined() && runtime.original_subscriptions_joined());
+        assert!(peer.settle().await);
     }
 }
