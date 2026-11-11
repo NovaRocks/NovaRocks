@@ -2097,6 +2097,10 @@ impl QueryTaskExecution {
         self.covered_gaps.is_empty()
     }
 
+    pub(crate) fn covered_gap_pending(&self, participation: ParticipationRef) -> bool {
+        self.covered_gaps.contains(&participation)
+    }
+
     pub(crate) fn covered_gap_participations(&self) -> impl Iterator<Item = ParticipationRef> + '_ {
         self.covered_observation
             .iter()

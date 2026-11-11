@@ -577,6 +577,10 @@ impl Core {
         participation: ParticipationRef,
         changed: bool,
     ) -> Result<(), TaskExecutionError> {
+        self.subscriptions.coverage_changed(
+            participation,
+            self.execution.covered_gap_pending(participation),
+        );
         if self.execution.needs_covered_subscription(participation) {
             if changed {
                 self.subscriptions.applied(participation);
@@ -859,7 +863,9 @@ impl Core {
                     settlement,
                 });
         }
-        let settlement = self.root.evaluate(self.execution.root_seal_facts(false))?;
+        let mut facts = self.execution.root_seal_facts(false);
+        facts.coverage_exhausted |= self.subscriptions.coverage_recovery_exhausted();
+        let settlement = self.root.evaluate(facts)?;
         let root_before_seal = if settlement.result.is_ok() {
             let projection = self.root_projection();
             self.execution.begin_normal_drain();
@@ -2431,6 +2437,294 @@ mod tests {
                     Some(Err(AttemptFailure::TaskProtocol(error)))
                     if matches!(*error, TaskExecutionError::Schedule(ref detail)
                         if detail.contains("did not arrive within its recovery budget"))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn seal_preserves_exact_root_on_leaf_exhaustion_and_refuses_expired_gap() {
+        use crate::{
+            AttemptCore,
+            effect::Publication,
+            input::{AttemptInput, AttemptInputClaim},
+        };
+        use novarocks_coordination_contract::AttemptToLogicalBody;
+        use novarocks_execution_contract::ExchangeDeliveryRequirement;
+        use std::cell::Cell;
+
+        for (retain_gap, exhaust_leaf) in [(false, true), (true, false), (true, true)] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            let now = start.initial_now;
+            let before_deadline = now.saturating_add(Duration::from_secs(29));
+            let deadline = now.saturating_add(Duration::from_secs(30));
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut core = Core::new(start).unwrap();
+            let root = core.execution.graph().root_identity();
+            let leaf = core
+                .execution
+                .graph()
+                .edges()
+                .find(|edge| edge.delivery() == ExchangeDeliveryRequirement::MustDrain)
+                .unwrap()
+                .producers()[0];
+            let mut open = |task: TaskIdentity, sequence, event| {
+                let participation = core
+                    .execution
+                    .graph()
+                    .task(task.task_id())
+                    .unwrap()
+                    .participation();
+                core.subscriptions.activate(now, participation).unwrap();
+                let SubscriptionStep::Effect(AttemptEffect {
+                    body: EffectBody::OpenSubscription(request),
+                    ..
+                }) = core
+                    .subscriptions
+                    .advance(
+                        &core.execution,
+                        now,
+                        AttemptActionId::new(id(sequence)),
+                        AttemptRequestToken::new(id(sequence)),
+                        &mut Units(16),
+                    )
+                    .unwrap()
+                else {
+                    panic!("expected the original subscription opening");
+                };
+                assert_eq!(request.participation, participation);
+                ReceivedObservation {
+                    participation,
+                    generation: request.generation,
+                    received_at: now,
+                    opening: ObservationOpening {
+                        started_at: now,
+                        opened_at: Some(now),
+                    },
+                    event,
+                }
+            };
+            let fact = |fact| ObservationEvent::Fact {
+                source_revision: None,
+                fact,
+            };
+            let finished = open(
+                root,
+                51,
+                fact(ObservationFact::Status(
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(1).unwrap(),
+                        TaskState::Finished,
+                        None,
+                        TaskOutputFacts::new(true),
+                    )
+                    .unwrap(),
+                )),
+            );
+            let gone = open(leaf, 52, fact(ObservationFact::Gone(leaf)));
+            let generation = gone.generation.get();
+            let next = Cell::new(1);
+            let step = |core: &mut Core, at, source, input| {
+                let input_id = AttemptInputId(id(next.get()));
+                next.set(next.get() + 1);
+                core.handle(
+                    at,
+                    AttemptInputClaim {
+                        source,
+                        input: input_id,
+                        native_cut: Some(AttemptSourceCut {
+                            source: sources.native,
+                            tail: None,
+                        }),
+                        selected_cut: Some(AttemptSourceCut {
+                            source: sources.observation,
+                            tail: (source == sources.observation).then_some(input_id),
+                        }),
+                    },
+                    input,
+                    &mut Units(128),
+                )
+                .unwrap()
+            };
+            let finish_round = |core: &mut Core, at, mut pending: AttemptStep| {
+                let mut effects = Vec::new();
+                for _ in 0..24 {
+                    let publication = pending.effect.take().and_then(|effect| {
+                        let applied = match &effect.body {
+                            EffectBody::Publish(Publication::RootStatus(_)) => {
+                                Some(PublicationApplied::RootStatus)
+                            }
+                            EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                                Some(PublicationApplied::ProtocolBatch { published: true })
+                            }
+                            EffectBody::Port(port)
+                                if matches!(port.body, AttemptToLogicalBody::SealResult { .. }) =>
+                            {
+                                Some(PublicationApplied::SealResult)
+                            }
+                            EffectBody::CloseSubscription { .. }
+                            | EffectBody::ConfirmReadState { .. }
+                            | EffectBody::ReleaseCreationPayload { .. } => None,
+                            other => {
+                                panic!("unexpected effect in the observation round: {other:?}")
+                            }
+                        };
+                        effects.push(effect.body);
+                        applied.map(|applied| (effect.id, applied))
+                    });
+                    let (source, input) = match (pending.selection, publication) {
+                        (InputSelection::Only(source), Some((effect, applied)))
+                            if source == sources.publication =>
+                        {
+                            (
+                                source,
+                                AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                    effect,
+                                    result: Ok(applied),
+                                }),
+                            )
+                        }
+                        (InputSelection::Only(source), None)
+                            if source == sources.actor || source == sources.observation =>
+                        {
+                            (sources.actor, AttemptInput::Timer)
+                        }
+                        (InputSelection::Prefer(source), None) if source == sources.native => {
+                            assert_eq!(pending.round_result, Some(Ok(())));
+                            return effects;
+                        }
+                        selection => {
+                            panic!("unexpected selection in the observation round: {selection:?}")
+                        }
+                    };
+                    pending = step(core, at, source, input);
+                }
+                panic!("the original observation round did not finish");
+            };
+            let observe = |core: &mut Core, at, items| {
+                let input = AttemptInput::Executor(ExecutorFact::Observations(
+                    ObservationBatch::new(items).unwrap(),
+                ));
+                let pending = step(core, at, sources.observation, input);
+                finish_round(core, at, pending)
+            };
+            step(&mut core, now, sources.actor, AttemptInput::Bootstrap);
+            let mut frames = vec![finished];
+            if retain_gap {
+                frames.extend([
+                    gone.clone(),
+                    ReceivedObservation {
+                        event: fact(ObservationFact::CatchUpComplete {
+                            generation,
+                            initial_cut: 1,
+                        }),
+                        ..gone.clone()
+                    },
+                ]);
+            }
+            let effects = observe(&mut core, now, frames);
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                EffectBody::Publish(Publication::RootStatus(projection))
+                    if projection.status.identity() == root
+                        && projection.status.state() == TaskState::Finished
+                        && projection.status.output().responsibility_complete()
+                        && projection.failure == AttemptRootFailure::None
+            )));
+            assert!(!core.root.sealed());
+            assert!(!core.execution.task(leaf.task_id()).unwrap().is_terminal());
+
+            let mut ending = Vec::new();
+            if retain_gap {
+                ending.push(ReceivedObservation {
+                    received_at: before_deadline,
+                    event: fact(ObservationFact::Bookmark {
+                        generation,
+                        sequence: 1,
+                        covered_prefix: 2,
+                        source_cut: 2,
+                    }),
+                    ..gone.clone()
+                });
+            }
+            if exhaust_leaf {
+                ending.push(ReceivedObservation {
+                    received_at: before_deadline,
+                    event: ObservationEvent::Closed,
+                    ..gone.clone()
+                });
+            }
+            let effects = observe(&mut core, before_deadline, ending);
+            let closed_leaf = effects.iter().filter(|effect| matches!(
+                effect,
+                EffectBody::CloseSubscription { participation, generation }
+                    if *participation == gone.participation && *generation == gone.generation
+            )).count();
+            assert_eq!(closed_leaf, usize::from(exhaust_leaf));
+            assert_eq!(
+                core.execution.covered_recovery_deadline(),
+                retain_gap.then_some(deadline)
+            );
+            assert_eq!(core.execution.selected_task_failure(), None);
+
+            let token = AttemptRequestToken::new(id(90));
+            let input = AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::SealRequest { token },
+            });
+            let accepted = step(&mut core, before_deadline, sources.observation, input);
+            assert!(accepted.root_control_processed.is_some());
+            let seal_effects = finish_round(&mut core, before_deadline, accepted);
+            let seal_replies = |effects: Vec<EffectBody>| {
+                effects
+                    .into_iter()
+                    .filter_map(|effect| {
+                        let EffectBody::Port(port) = effect else {
+                            return None;
+                        };
+                        match port.body {
+                            AttemptToLogicalBody::SealResult { token, result } => {
+                                Some((token, result))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let replies = seal_replies(seal_effects);
+            assert_eq!(core.root.sealed(), !retain_gap);
+            assert!(!core.execution.normal_drain_started());
+            let refusal = || {
+                [(
+                    token,
+                    Err(AttemptFailure::TaskProtocol(Box::new(schedule(
+                        RootSealRefusal::CoverageRecoveryExhausted.message(),
+                    )))),
+                )]
+            };
+            if retain_gap && exhaust_leaf {
+                // The same leaf still owes its terminal, so exhausting that
+                // stream at +29 s settles the next SealRequest immediately.
+                assert_eq!(replies, refusal());
+                assert!(!core.root.pending());
+            } else if retain_gap {
+                assert!(core.root.pending());
+                assert!(replies.is_empty());
+                let timer = step(&mut core, deadline, sources.actor, AttemptInput::Timer);
+                assert_eq!(
+                    seal_replies(finish_round(&mut core, deadline, timer)),
+                    refusal()
+                );
+                assert!(!core.root.pending());
+                assert!(!core.root.sealed());
+            } else {
+                assert!(!core.root.pending());
+                assert!(matches!(
+                    replies.as_slice(),
+                    [(reply, Ok(withdrawals))] if *reply == token && withdrawals.is_empty()
                 ));
             }
         }

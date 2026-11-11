@@ -38,6 +38,17 @@ struct Row {
     controller: CoveredSubscription,
     deadline: Option<MonotonicInstant>,
     opened: Option<(AttemptActionId, NonZeroU64)>,
+    missing_coverage: bool,
+}
+
+impl Row {
+    fn coverage_recovery_exhausted(&self) -> bool {
+        self.missing_coverage
+            && matches!(
+                self.controller.status(),
+                SubscriptionStatus::BudgetExhausted | SubscriptionStatus::ConnectionLossExhausted
+            )
+    }
 }
 
 #[derive(Debug)]
@@ -52,6 +63,7 @@ pub(super) struct Subscriptions {
     due: BTreeSet<(MonotonicInstant, ParticipationRef)>,
     adjust: BTreeSet<ParticipationRef>,
     request: Option<Request>,
+    exhausted_coverage: usize,
 }
 
 #[derive(Debug)]
@@ -75,6 +87,7 @@ impl Subscriptions {
                         controller: CoveredSubscription::new(participation, seed, error_budget)?,
                         deadline: None,
                         opened: None,
+                        missing_coverage: false,
                     },
                 ))
             })
@@ -84,6 +97,7 @@ impl Subscriptions {
             due: BTreeSet::new(),
             adjust: BTreeSet::new(),
             request: None,
+            exhausted_coverage: 0,
         })
     }
 
@@ -97,6 +111,7 @@ impl Subscriptions {
             .rows
             .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
+        let was_exhausted = row.coverage_recovery_exhausted();
         let result = apply(row);
         let deadline = row.controller.next_deadline(now);
         if row.deadline != deadline {
@@ -111,7 +126,34 @@ impl Subscriptions {
         if row.controller.status() != SubscriptionStatus::Live {
             self.adjust.remove(&participation);
         }
+        let exhausted = row.coverage_recovery_exhausted();
+        self.update_coverage_exhaustion(was_exhausted, exhausted);
         result
+    }
+
+    pub(super) fn coverage_changed(&mut self, participation: ParticipationRef, missing: bool) {
+        let row = self
+            .rows
+            .get_mut(&participation)
+            .expect("original coverage owner");
+        let was_exhausted = row.coverage_recovery_exhausted();
+        row.missing_coverage = missing;
+        let exhausted = row.coverage_recovery_exhausted();
+        self.update_coverage_exhaustion(was_exhausted, exhausted);
+    }
+
+    fn update_coverage_exhaustion(&mut self, before: bool, after: bool) {
+        match (before, after) {
+            (false, true) => self.exhausted_coverage += 1,
+            (true, false) => self.exhausted_coverage -= 1,
+            _ => {}
+        }
+    }
+
+    /// Count only exhausted streams with missing applied evidence for the
+    /// same participation. The Root can check this without scanning the roster.
+    pub(super) fn coverage_recovery_exhausted(&self) -> bool {
+        self.exhausted_coverage != 0
     }
 
     pub(super) fn activate(
