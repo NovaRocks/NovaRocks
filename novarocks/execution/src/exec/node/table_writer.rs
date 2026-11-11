@@ -24,13 +24,13 @@
 //! "last driver finishes" protocol: only an immutable logical recipe plus the
 //! attempt-local facts a driver needs to build its own physical context.
 
-use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[cfg(test)]
 use arrow::datatypes::DataType;
 
+use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 use novarocks_execution_contract::descriptor::ExchangeSource;
 use novarocks_spi::connector::write_stack::{
     ConnectorPositionShardSource, ConnectorWriteExecution, ConnectorWriterHandle,
@@ -215,10 +215,16 @@ impl TableWriterRuntimeBinding {
 
     pub fn with_position_shard_sources(
         mut self,
-        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
-        sources: BTreeMap<ExchangeSource, NonZeroU32>,
+        group: ConnectorMutationContributionGroupId,
+        receiver_node: i32,
+        mut sources: Vec<(ExchangeSource, NonZeroU32)>,
     ) -> Self {
-        self.position_shards = Some(Arc::new(PositionShardWriterSources { group, sources }));
+        sources.sort_unstable_by_key(|(source, _)| source.sender_ordinal());
+        self.position_shards = Some(Arc::new(PositionShardWriterSources {
+            group,
+            receiver_node,
+            sources,
+        }));
         self
     }
 
@@ -238,29 +244,125 @@ impl TableWriterRuntimeBinding {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct PositionShardWriterSources {
-    group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
-    sources: BTreeMap<ExchangeSource, NonZeroU32>,
+    group: ConnectorMutationContributionGroupId,
+    receiver_node: i32,
+    sources: Vec<(ExchangeSource, NonZeroU32)>,
+}
+
+/// The receiver mints this sideband after matching the exact authenticated
+/// source. Cloning a chunk retains the original roster without allocation.
+#[derive(Clone, Debug)]
+pub(crate) struct PositionShardChunkSource {
+    roster: Arc<PositionShardWriterSources>,
+    sender_ordinal: usize,
 }
 
 impl PositionShardWriterSources {
-    pub(crate) fn bind(
+    pub(crate) fn matches_receiver(
         &self,
-        source: Option<ExchangeSource>,
+        receiver_node: i32,
+        group: ConnectorMutationContributionGroupId,
+        expected_senders: usize,
+    ) -> bool {
+        self.receiver_node == receiver_node
+            && self.group == group
+            && self.sources.len() == expected_senders
+    }
+
+    pub(crate) fn authenticate(
+        self: &Arc<Self>,
+        source: ExchangeSource,
+    ) -> crate::runtime::task::ExecutionResult<PositionShardChunkSource> {
+        let sender_ordinal = source.sender_ordinal() as usize;
+        if !self
+            .sources
+            .get(sender_ordinal)
+            .is_some_and(|(expected, _)| *expected == source)
+        {
+            return Err(Self::invalid_source());
+        }
+        Ok(PositionShardChunkSource {
+            roster: Arc::clone(self),
+            sender_ordinal,
+        })
+    }
+
+    pub(crate) fn bind(
+        self: &Arc<Self>,
+        source: Option<&PositionShardChunkSource>,
     ) -> crate::runtime::task::ExecutionResult<ConnectorPositionShardSource> {
-        let (source, width) = source
-            .and_then(|source| self.sources.get(&source).map(|width| (source, *width)))
-            .ok_or_else(|| {
-                crate::exec::fragment::error::program_binding_failure(
-                    crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
-                    "Position shard author is absent from the admitted exchange roster",
-                )
-            })?;
+        let &(source, width) = source
+            .filter(|source| Arc::ptr_eq(&source.roster, self))
+            .and_then(|source| self.sources.get(source.sender_ordinal))
+            .ok_or_else(Self::invalid_source)?;
         let key = source.task_key();
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&key.high().to_be_bytes());
         bytes[8..].copy_from_slice(&key.low().to_be_bytes());
         Ok(ConnectorPositionShardSource::new(self.group, bytes, width))
+    }
+
+    fn invalid_source() -> crate::runtime::task::ExecutionFailure {
+        crate::exec::fragment::error::program_binding_failure(
+            crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+            "Position shard author is absent from the admitted exchange roster",
+        )
+    }
+}
+
+#[cfg(test)]
+mod position_shard_source_tests {
+    use super::*;
+    use crate::exec::chunk::Chunk;
+    use novarocks_execution_contract::identity::TaskIdentity;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
+    };
+
+    #[test]
+    fn compact_source_retains_exact_roster_through_chunk_slice() {
+        assert_eq!(
+            std::mem::size_of::<Option<PositionShardChunkSource>>(),
+            2 * std::mem::size_of::<usize>()
+        );
+        let task = |process| {
+            TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                process,
+            )
+        };
+        let key = UniqueId::new(3, 4);
+        let source = ExchangeSource::new(task(BackendProcessId::new_v7()), key, 0);
+        let other_process = ExchangeSource::new(task(BackendProcessId::new_v7()), key, 0);
+        let group = ConnectorMutationContributionGroupId::from_bytes([1; 32]);
+        let width = NonZeroU32::new(4).unwrap();
+        let roster = || {
+            Arc::new(PositionShardWriterSources {
+                group,
+                receiver_node: 7,
+                sources: vec![(source, width)],
+            })
+        };
+        let original = roster();
+        assert!(original.matches_receiver(7, group, 1));
+        assert!(!original.matches_receiver(8, group, 1));
+        assert!(original.authenticate(other_process).is_err());
+        assert!(original.bind(None).is_err());
+
+        let mut chunk = Chunk::default();
+        chunk.set_position_shard_source(original.authenticate(source).unwrap());
+        let slice = chunk.slice(0, 0);
+        drop(chunk);
+        assert!(roster().bind(slice.position_shard_source()).is_err());
+        let admitted = original.bind(slice.position_shard_source()).unwrap();
+        assert_eq!(admitted.group(), group);
+        assert_eq!(admitted.driver_count(), width);
+        assert_eq!(admitted.task_key()[..8], key.high().to_be_bytes());
+        assert_eq!(admitted.task_key()[8..], key.low().to_be_bytes());
     }
 }
 

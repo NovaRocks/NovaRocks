@@ -925,16 +925,43 @@ fn build_node(
                     format!("missing exchange binding for compiled receiver node {receiver}"),
                 )
             })?;
-            let mut source = ExchangeSourceFactory::new_compiled(node_id, binding);
-            if program.exchange_inputs().get(&id).is_some_and(|input| {
-                matches!(
-                    input.role,
-                    novarocks_local_program::ProgramOutputRole::PositionShards { .. }
-                )
-            }) {
-                source = source.with_position_shards();
-            }
-            let source: Box<dyn OperatorFactory> = Box::new(source);
+            let position_shards = match program.exchange_inputs().get(&id).map(|input| input.role) {
+                Some(novarocks_local_program::ProgramOutputRole::PositionShards {
+                    group, ..
+                }) => {
+                    let root = program.graph().root();
+                    if !matches!(
+                        program.graph().nodes()[root.index()].kind(),
+                        ProgramNodeKind::TableWriter { input, .. } if *input == id
+                    ) || binding.key.node_id != receiver
+                    {
+                        return Err(program_failure(
+                            FragmentBindingErrorKind::InvalidAssignment,
+                            "Position shard exchange requires its exact direct root writer",
+                        ));
+                    }
+                    Some(
+                        ctx.compiled_writers
+                            .writer(root)
+                            .and_then(|writer| writer.position_shards.as_ref())
+                            .filter(|sources| {
+                                sources.matches_receiver(receiver, group, binding.expected_senders)
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                program_failure(
+                                    FragmentBindingErrorKind::MissingAssignment,
+                                    "Position shard exchange has no matching writer source roster",
+                                )
+                            })?,
+                    )
+                }
+                _ => None,
+            };
+            let source: Box<dyn OperatorFactory> = Box::new(
+                ExchangeSourceFactory::new_compiled(node_id, binding)
+                    .with_position_shards(position_shards),
+            );
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {

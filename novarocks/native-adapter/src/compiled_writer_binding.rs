@@ -259,7 +259,7 @@ pub(crate) fn bind_compiled_writers(
                         .copied()
                         .map(|source| (source, dops[source.sender_ordinal() as usize]))
                         .collect();
-                    writer = writer.with_position_shard_sources(group, sources);
+                    writer = writer.with_position_shard_sources(group, node, sources);
                 }
                 bindings
                     .bind_writer(id, writer)
