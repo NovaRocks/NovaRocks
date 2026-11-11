@@ -582,6 +582,14 @@ async fn probe_storage(fixture: &Fixture) -> Result<()> {
                 "raw conditional writer accepted a real MinIO 412"
             );
         }
+        if !lost_ack {
+            ensure!(
+                events
+                    .iter()
+                    .all(|event| event.operation != S3Operation::Delete),
+                "a foreign conditional-create collision acquired object cleanup authority"
+            );
+        }
         upload_witness
             .check_exit()
             .context("production FS upload witness did not settle")?;
@@ -863,9 +871,8 @@ fn check_readback_exit(
             events
                 .iter()
                 .any(|event| event.operation == S3Operation::Get
-                    && event
-                        .status
-                        .is_some_and(|status| matches!(status, 200 | 206)))
+                    && event.upstream_response_complete
+                    && event.readback_sha256.is_some())
                 && cleanup
                     .iter()
                     .any(|event| event.status == Some(204) && event.upstream_response_complete)
@@ -925,11 +932,6 @@ fn native_writes(
         &sql.execute(format!("INSERT INTO {table} VALUES (2),(3),(4)"))?,
         3,
     )?;
-    ensure!(
-        sql::integer_column(&sql.execute(format!("SELECT id FROM {table} ORDER BY id"))?)?
-            == [1, 2, 3, 4],
-        "native lost-ACK INSERT changed the committed row bag"
-    );
     let events = fixture.proxy.events();
     let dropped = events[start..]
         .iter()
@@ -939,21 +941,65 @@ fn native_writes(
         anyhow::bail!("expected one actual lost native INSERT ACK")
     };
     let path = &dropped.object_path;
-    verify_single(
-        &events[start..]
-            .iter()
-            .filter(|event| &event.object_path == path)
-            .cloned()
-            .collect::<Vec<_>>(),
-        true,
-    )?;
-    let location = format!("s3://{}", path.trim_start_matches('/'));
+    let insert_events = events[start..]
+        .iter()
+        .filter(|event| &event.object_path == path)
+        .cloned()
+        .collect::<Vec<_>>();
+    verify_single(&insert_events, true)?;
+    let location = object_uri(path);
+    let marker = dropped
+        .create_marker
+        .as_ref()
+        .context("native PUT omitted its creation marker")?;
+    let digest = runtime.block_on(async {
+        let cfg = config(fixture, &endpoints.minio_endpoint);
+        let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())?;
+        let access = access(&cfg, &pool, &location)?;
+        let op = access.operator();
+        let relative = access.paths()[0].operator_relative_path();
+        let metadata = op.stat(relative).await?;
+        let observed = metadata
+            .user_metadata()
+            .context("native object marker absent")?;
+        ensure!(
+            observed.get(MARKER_ID) == Some(&marker.id)
+                && observed.get(MARKER_IDENTITY) == Some(&marker.identity),
+            "independent MinIO marker differs from the original native PUT"
+        );
+        let bytes = op.read(relative).await?.to_bytes();
+        ensure!(
+            bytes.len() as u64 == metadata.content_length(),
+            "independent native content length differs"
+        );
+        Ok::<_, anyhow::Error>(sha256(&bytes))
+    })?;
+    let head = insert_events
+        .iter()
+        .position(|event| {
+            event.operation == S3Operation::Head
+                && event.status == Some(200)
+                && event.upstream_response_complete
+        })
+        .context("native lost-ACK INSERT has no successful ownership HEAD")?;
+    ensure!(
+        insert_events[head + 1..].iter().any(|event| {
+            event.operation == S3Operation::Get
+                && event.upstream_response_complete
+                && event.readback_sha256.as_deref() == Some(digest.as_str())
+        }),
+        "native lost-ACK INSERT did not read back its independently verified content"
+    );
     ensure!(
         live_paths(&mut sql, &table)?.contains(&location)
             && fixture.rest.object_exists(&location)?,
         "lost-ACK native INSERT object is absent from publication or storage"
     );
-
+    ensure!(
+        sql::integer_column(&sql.execute(format!("SELECT id FROM {table} ORDER BY id"))?)?
+            == [1, 2, 3, 4],
+        "native lost-ACK INSERT changed the committed row bag"
+    );
     let landed = sql.execute(format!(
         "SELECT _file FROM {table} WHERE id BETWEEN 2 AND 4 GROUP BY _file"
     ))?;
@@ -1099,7 +1145,7 @@ fn native_writes(
     std::fs::write(
         fixture.root.join("managed-output-native.json"),
         serde_json::to_vec_pretty(
-            &json!({"insert_lost_ack":dropped,"ctas_sealed_objects":sealed,"canceled_ctas_cleaned_objects":canceled_staged,"dv_conditional_puts":dv_puts,"final_rows":[1,4,5]}),
+            &json!({"insert_lost_ack":{"sha256":digest,"http":insert_events},"ctas_sealed_objects":sealed,"canceled_ctas_cleaned_objects":canceled_staged,"dv_conditional_puts":dv_puts,"final_rows":[1,4,5]}),
         )?,
     )?;
     Ok(())

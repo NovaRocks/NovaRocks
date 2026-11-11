@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Body;
+use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -32,11 +33,14 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener};
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context as PollContext, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinSet;
+use tokio_stream::Stream;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,12 +114,20 @@ pub struct S3WriteEvent {
     pub upload_id_sha256: Option<String>,
     pub part_number: Option<u32>,
     pub condition_if_none_match_star: bool,
+    pub create_marker: Option<CreateMarker>,
+    pub readback_sha256: Option<String>,
     pub attempt: u64,
     pub status: Option<u16>,
     pub xml_code: Option<String>,
     pub upstream_response_complete: bool,
     pub downstream_response_dropped: bool,
     pub response_pause: Option<PauseAfter>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreateMarker {
+    pub id: String,
+    pub identity: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,20 +139,68 @@ pub struct S3WriteProxyExit {
 
 type AttemptKey = (S3Operation, String, Option<String>, Option<u32>);
 
-struct RecordedRequest<'a> {
-    observations: &'a Mutex<Observations>,
+struct RecordedRequest {
+    shared: Arc<Shared>,
     event: Option<S3WriteEvent>,
 }
 
-impl Drop for RecordedRequest<'_> {
+impl Drop for RecordedRequest {
     fn drop(&mut self) {
         if let Some(event) = self.event.take() {
-            self.observations
+            self.shared
+                .observations
                 .lock()
                 .expect("S3 write observation lock")
                 .events
                 .push(event);
         }
+    }
+}
+
+/// Observe the body while forwarding it. Hyper may stop polling after a
+/// successful fixed-length response, so count that framing boundary too.
+struct ObservedReadBody {
+    upstream: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,
+    recorded: RecordedRequest,
+    length: Option<u64>,
+    size: u64,
+    digest: Sha256,
+}
+
+impl ObservedReadBody {
+    fn record_complete(&mut self) {
+        if let Some(event) = self.recorded.event.as_mut() {
+            event.upstream_response_complete = true;
+            event.readback_sha256 = Some(format!("{:x}", self.digest.clone().finalize()));
+        }
+    }
+}
+
+impl Stream for ObservedReadBody {
+    type Item = std::result::Result<Bytes, reqwest::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut PollContext<'_>) -> Poll<Option<Self::Item>> {
+        let result = self.upstream.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.size += chunk.len() as u64;
+                self.digest.update(chunk);
+                if self.length == Some(self.size) {
+                    self.record_complete();
+                }
+            }
+            Poll::Ready(None) if self.length.is_none_or(|length| length == self.size) => {
+                self.record_complete();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                if let Some(event) = self.recorded.event.as_mut() {
+                    event.upstream_response_complete = false;
+                    event.readback_sha256 = None;
+                }
+            }
+            _ => {}
+        }
+        result
     }
 }
 
@@ -410,6 +470,30 @@ fn transport_error() -> io::Error {
     )
 }
 
+fn create_marker(headers: &HeaderMap) -> Option<CreateMarker> {
+    let id = headers
+        .get("x-amz-meta-novarocks-create-id")?
+        .to_str()
+        .ok()?;
+    let identity = headers
+        .get("x-amz-meta-novarocks-create-identity")?
+        .to_str()
+        .ok()?;
+    if id.len() != 36
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        || identity.len() != 64
+        || !identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(CreateMarker {
+        id: id.to_owned(),
+        identity: identity.to_owned(),
+    })
+}
+
 async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<Response<Body>> {
     let (mut parts, incoming) = request.into_parts();
     let path = parts.uri.path().to_owned();
@@ -443,14 +527,16 @@ async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<
         *attempt += 1;
         *attempt
     };
-    let mut recorded = RecordedRequest {
-        observations: &shared.observations,
+    let recorded = RecordedRequest {
+        shared: Arc::clone(&shared),
         event: Some(S3WriteEvent {
             object_path: path,
             operation,
             upload_id_sha256: upload,
             part_number: part,
             condition_if_none_match_star: conditional,
+            create_marker: conditional.then(|| create_marker(&parts.headers)).flatten(),
+            readback_sha256: None,
             attempt,
             status: None,
             xml_code: None,
@@ -475,24 +561,30 @@ async fn forward(shared: Arc<Shared>, request: Request<Incoming>) -> io::Result<
         ));
     }
     let sent = upstream.send().await;
-    let event = recorded.event.as_mut().expect("S3 request event is owned");
     match sent {
-        Ok(response) => finish_upstream(&shared, event, response).await,
+        Ok(response) => finish_upstream(recorded, response).await,
         Err(_) => Err(transport_error()),
     }
 }
 
 async fn finish_upstream(
-    shared: &Shared,
-    event: &mut S3WriteEvent,
+    mut recorded: RecordedRequest,
     upstream: reqwest::Response,
 ) -> io::Result<Response<Body>> {
+    let event = recorded.event.as_mut().expect("S3 request event is owned");
     let status = upstream.status();
     event.status = Some(status.as_u16());
     let mut headers = upstream.headers().clone();
     remove_hop_headers(&mut headers);
     let body = if status.is_success() && matches!(event.operation, S3Operation::Get) {
-        Body::from_stream(upstream.bytes_stream())
+        let length = upstream.content_length();
+        Body::from_stream(ObservedReadBody {
+            upstream: Box::pin(upstream.bytes_stream()),
+            recorded,
+            length,
+            size: 0,
+            digest: Sha256::new(),
+        })
     } else {
         let bytes = upstream.bytes().await.map_err(|_| transport_error())?;
         event.upstream_response_complete = true;
@@ -517,7 +609,8 @@ async fn finish_upstream(
                 _ => false,
             };
         let (drop_response, pause) = {
-            let mut observed = shared
+            let mut observed = recorded
+                .shared
                 .observations
                 .lock()
                 .expect("S3 write observation lock");
