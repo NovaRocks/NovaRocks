@@ -29,6 +29,7 @@ use super::observations::{
     read_progress::ReadProgressInput,
     source::{BoundObservationSource, ObservationMetadataAuthor},
 };
+use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
 use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use crate::{
@@ -161,51 +162,6 @@ pub(crate) struct AttemptTransportBinding {
     pub(crate) send: super::transport::AttemptSendSource,
     pub(crate) executor: super::transport::ActorTransportExecutor,
     pub(crate) failure: FailureSupervisor,
-}
-
-/// One paid original Lifecycle position, reused only after actual input
-/// retirement. The application opens external ingress after StartProtocol.
-#[must_use]
-pub(crate) struct AttemptStartup {
-    registration: ActorRegistration,
-    input: StandingInputObligation<FrontendActor>,
-    next: Option<AttemptInput>,
-}
-impl AttemptStartup {
-    /// `Ok(None)` proves that the StartProtocol input has actually retired.
-    pub(crate) fn advance(&mut self) -> Result<Option<InputId>, ActorTurnError> {
-        if self.input.in_flight()?.is_some() {
-            return Err(ActorTurnError::StandingInputBusy);
-        }
-        let Some(next) = self.next.take() else {
-            return Ok(None);
-        };
-        let after = matches!(next, AttemptInput::Bootstrap).then_some(AttemptInput::StartProtocol);
-        match self.input.fill(FrontendInput::Attempt(Box::new(next))) {
-            Ok(input) => {
-                self.next = after;
-                Ok(Some(input))
-            }
-            Err((error, FrontendInput::Attempt(input))) => {
-                self.next = Some(*input);
-                Err(error)
-            }
-            Err(_) => unreachable!("failed startup returns its original input"),
-        }
-    }
-
-    pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
-        self.input.close_after_exit()
-    }
-
-    pub(crate) fn ready_for(
-        &self,
-        registration: &ActorRegistration,
-    ) -> Result<bool, ActorTurnError> {
-        Ok(self.registration.same_registration(registration)
-            && self.next.is_none()
-            && self.input.in_flight()?.is_none())
-    }
 }
 
 struct CapacityReleased;
@@ -615,6 +571,7 @@ impl AttemptActorRegistration {
                     .take()
                     .expect("original progress roles"),
             );
+        let (startup_source, startup) = AttemptStartupSource::new(self.original.clone(), input);
         Ok(PreparedAttemptHost {
             binding: HostBinding {
                 scope: self.scope.clone(),
@@ -622,6 +579,7 @@ impl AttemptActorRegistration {
                 kind: FrontendActorKind::Attempt,
                 config: self.config,
                 policy: FrontendLanePolicy::attempt(self.config.max_effects_per_step),
+                startup: Some(startup_source),
                 ordered_observations: Some(ordered_host),
                 source: Box::new(super::transport::AttemptTransportSource::new(
                     runtime.clone(),
@@ -653,11 +611,7 @@ impl AttemptActorRegistration {
                 }),
                 transport: Some(retirement),
             },
-            startup: AttemptStartup {
-                registration: self.original.clone(),
-                input,
-                next: Some(AttemptInput::Bootstrap),
-            },
+            startup,
             controls,
             failure: failure_bridge,
             terminal,
@@ -1114,6 +1068,10 @@ impl AttemptActor {
         let class = input.class;
         let input = match value {
             FrontendInput::Timer => AttemptInput::Timer,
+            FrontendInput::AttemptStartup(StartupInput::Bootstrap) => AttemptInput::Bootstrap,
+            FrontendInput::AttemptStartup(StartupInput::StartProtocol) => {
+                AttemptInput::StartProtocol
+            }
             FrontendInput::CapacityReleased => AttemptInput::CapacityReleased,
             FrontendInput::Membership(view) => AttemptInput::Membership(view.0),
             FrontendInput::Attempt(input) => *input,

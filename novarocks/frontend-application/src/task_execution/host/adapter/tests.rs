@@ -403,21 +403,13 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     );
 
     let post = |input: AttemptInput| FrontendInput::Attempt(Box::new(input));
-    let mut startup = AttemptStartup {
-        registration: registration.clone(),
-        input: registered
-            .reserve_standing(&runtime, actor, InputClass::Lifecycle, &original_work)
-            .unwrap(),
-        next: Some(AttemptInput::Bootstrap),
-    };
-    let bootstrap = startup.advance().unwrap().unwrap();
-    assert_eq!(startup.input.in_flight().unwrap(), Some(bootstrap));
-    assert!(matches!(
-        startup.advance(),
-        Err(ActorTurnError::StandingInputBusy)
-    ));
-    assert!(matches!(startup.next, Some(AttemptInput::StartProtocol)));
-    assert!(!startup.ready_for(&registration).unwrap());
+    let mut startup = registered
+        .reserve_standing(&runtime, actor, InputClass::Lifecycle, &original_work)
+        .unwrap();
+    let bootstrap = startup
+        .fill(FrontendInput::AttemptStartup(StartupInput::Bootstrap))
+        .unwrap();
+    assert_eq!(startup.in_flight().unwrap(), Some(bootstrap));
     assert!(runtime.poll_one(Tick(1)).unwrap());
     for (_, input) in runtime.committed_batches(actor, None, 8).unwrap() {
         runtime.retire_input(actor, input).unwrap();

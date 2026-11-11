@@ -763,7 +763,7 @@ fn failed_source_moves_only_its_exact_fifo_head_and_pins_it_through_disposal() {
         });
     let runtime = &fixture.runtime;
     assert!(matches!(
-        second.take_failed_source_payload(&[second.id()].into()),
+        second.take_failed_role_payload(),
         Err(ActorTurnError::InputAuthorMismatch)
     ));
     assert_eq!(

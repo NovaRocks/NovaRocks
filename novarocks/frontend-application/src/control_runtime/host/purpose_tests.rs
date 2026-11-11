@@ -456,6 +456,7 @@ impl Fixture {
             source: Box::new(PurposeSource(bank.clone())),
             executor: executor.clone(),
             transport: None,
+            startup: None,
             ordered_observations: None,
         })
         .unwrap_or_else(|_| panic!("actual purpose Source registration"));
@@ -1461,6 +1462,7 @@ async fn run_failure_publication(bind_reply: bool, already_published: bool) {
             }),
             executor: executor.clone(),
             transport: None,
+            startup: None,
             ordered_observations: ordered,
         })
         .is_ok()

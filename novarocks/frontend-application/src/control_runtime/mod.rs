@@ -54,9 +54,10 @@ use crate::task_execution::bridge::{
     terminal::{RegisteredAttemptTerminal, TerminalOutbox},
 };
 use crate::task_execution::host::adapter::{
-    AttemptActorRegistration, AttemptRegistrationError, AttemptStartup, PreparedAttemptHost,
+    AttemptActorRegistration, AttemptRegistrationError, PreparedAttemptHost,
 };
 use crate::task_execution::host::failure_bridge::PendingFailureBridge;
+use crate::task_execution::host::startup::AttemptStartup;
 use crate::task_execution::host::transport::AttemptCallSource;
 use actor::{FrontendActor, FrontendClock};
 use host::{HostBinding, HostExit, HostRegistrationRefusal, HostRegistry};
@@ -131,7 +132,7 @@ pub(crate) struct FrontendAttemptRuntime {
     host_observation: Arc<FrontendHostObservations>,
 }
 impl FrontendAttemptRuntime {
-    /// Install the real host route before the application can post Bootstrap.
+    /// Install the real host route before that host can post Bootstrap.
     /// Refusal returns the Source and its still-unpublished original position.
     pub(crate) fn register_attempt(
         &self,
@@ -299,7 +300,7 @@ impl FrontendAttemptRuntime {
     ) -> Result<(), (ActorTurnError, Arc<MembershipTarget>)> {
         let admission = (|| {
             self.runtime.validate_registration(&target.registration)?;
-            if !startup.ready_for(&target.registration)? {
+            if !startup.ready_for(&target.registration) {
                 return Err(ActorTurnError::InputNotReserved);
             }
             let snapshot = self.runtime.snapshot(target.registration.actor())?;

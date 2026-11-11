@@ -258,6 +258,7 @@ struct HostMachine {
     executor: Arc<dyn EffectExecutor>,
     transport: Option<TransportRetirements>,
     ordered_observations: Option<OrderedObservationHost>,
+    startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
     // A finite pass over original ready markers survives host-budget yield.
     // Resetting this to ready.len() on every turn would busy-loop when all
     // purposes are Full and ready markers outnumber one host allowance.
@@ -332,6 +333,7 @@ pub(crate) struct HostBinding {
     pub(crate) executor: Arc<dyn EffectExecutor>,
     pub(crate) transport: Option<TransportRetirements>,
     pub(crate) ordered_observations: Option<OrderedObservationHost>,
+    pub(crate) startup: Option<crate::task_execution::host::startup::AttemptStartupSource>,
 }
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
@@ -412,6 +414,17 @@ impl HostRegistry {
                 binding,
             });
         }
+        if binding
+            .startup
+            .as_ref()
+            .is_some_and(|startup| !startup.matches(&binding.registration))
+        {
+            return Err(HostRegistrationRefusal {
+                reason: "startup position belongs to another actor registration",
+                runtime_error: None,
+                binding,
+            });
+        }
         let Some(inventory) = binding
             .config
             .max_batches
@@ -465,6 +478,7 @@ impl HostRegistry {
             binding.policy,
         );
         let (exit, exited) = watch::channel(false);
+        let start_after_registration = binding.startup.is_some();
         let original = Arc::new(HostEntry {
             scope: binding.scope,
             registration: binding.registration,
@@ -480,6 +494,7 @@ impl HostRegistry {
                 executor: binding.executor,
                 transport: binding.transport,
                 ordered_observations: binding.ordered_observations,
+                startup: binding.startup,
                 scan_remaining: None,
                 rescan_requested: false,
                 pending: None,
@@ -495,6 +510,11 @@ impl HostRegistry {
         };
         state.entries.insert(original.scope.id(), original);
         drop(state);
+        if start_after_registration {
+            self.runtime
+                .notify_host_actor(&observed.registration)
+                .expect("startup is scheduled on its installed original host");
+        }
         self.changed.notify_waiters();
         Ok(observed)
     }
@@ -737,6 +757,18 @@ impl HostRegistry {
                 }
             }
         }
+        let mut startup_more = false;
+        if let Some(startup) = &mut machine.startup {
+            if budget == 0 {
+                startup_more = true;
+            } else {
+                budget -= 1;
+                startup_more = startup.progress(failed, machine.external_closed)?;
+                if startup.is_closed() {
+                    machine.startup = None;
+                }
+            }
+        }
         let transport = machine.transport.as_mut().map(|transport| {
             // One original row visit per host turn leaves the original
             // indexing allowance available to make the Core and effects run.
@@ -788,6 +820,8 @@ impl HostRegistry {
             .ordered_observations
             .as_ref()
             .is_none_or(OrderedObservationHost::is_retired);
+        retired.retired &= machine.startup.is_none();
+        retired.more |= startup_more;
         if retired.retired
             && matches!(
                 self.runtime
@@ -851,6 +885,9 @@ impl HostRegistry {
             if let Some(observations) = &mut machine.ordered_observations {
                 observation_advanced =
                     observations.index_committed(&self.runtime, &indexed.inputs)?;
+            }
+            if let Some(startup) = &mut machine.startup {
+                startup_more |= startup.indexed(&indexed.inputs);
             }
             machine.source.core_consumed(&indexed.inputs);
             if !indexed.inputs.is_empty()
@@ -1067,6 +1104,7 @@ impl HostRegistry {
             rescan = std::mem::take(&mut machine.rescan_requested);
         }
         let more = retired.more
+            || startup_more
             || observation_advanced
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
@@ -1246,6 +1284,7 @@ mod tests {
     struct MetadataSource {
         scope: ScopeHandle,
         closing: bool,
+        retire_batches: bool,
     }
     impl EffectSource for MetadataSource {
         fn prepay_result(
@@ -1285,14 +1324,19 @@ mod tests {
             budget: usize,
         ) -> SourceProgress {
             let actor = turn.registration().actor();
-            let batches = runtime.committed_batches(actor, None, budget).unwrap();
+            let batches = if self.retire_batches {
+                runtime.committed_batches(actor, None, budget).unwrap()
+            } else {
+                Vec::new()
+            };
             for (_, input) in &batches {
                 runtime.retire_input(actor, *input).unwrap();
             }
-            let more = !runtime
-                .committed_batches(actor, None, 1)
-                .unwrap()
-                .is_empty();
+            let more = self.retire_batches
+                && !runtime
+                    .committed_batches(actor, None, 1)
+                    .unwrap()
+                    .is_empty();
             let retired = self.closing
                 && runtime.snapshot(actor).unwrap().inputs == 0
                 && self.scope.join_ready().unwrap();
@@ -1310,6 +1354,160 @@ mod tests {
             unreachable!("no effect ticket exists")
         }
     }
+
+    #[tokio::test]
+    async fn installed_host_drives_startup_through_original_input_retirement() {
+        drive_startup(false).await;
+    }
+
+    #[tokio::test]
+    async fn startup_close_notifies_the_caller_while_retaining_its_queued_input() {
+        drive_startup(true).await;
+    }
+
+    async fn drive_startup(close_before_bootstrap: bool) {
+        use crate::task_execution::host::startup::{AttemptStartupSource, StartupInput};
+
+        struct StartupProbe(Arc<Mutex<Vec<StartupInput>>>);
+        impl TestActor for StartupProbe {
+            fn handle(
+                &mut self,
+                _: Tick,
+                envelope: InputEnvelope,
+                input: FrontendInput,
+                _: &mut ActorStep<'_, FrontendEffect>,
+            ) {
+                let FrontendInput::AttemptStartup(input) = input else {
+                    panic!("the installed host supplies only its original startup inputs");
+                };
+                assert_eq!(envelope.class, InputClass::Lifecycle);
+                self.0.lock().unwrap().push(input);
+            }
+        }
+
+        let clock = Arc::new(FrontendClock(Arc::new(TestClock(Instant::now()))));
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let host = HostRegistry::new(
+            runtime.clone(),
+            ledger.clone(),
+            Arc::new(FrontendHostObservations::new(clock)),
+        );
+        let actor = ActorId::new(1).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let config = ActorConfig {
+            mailbox: [1; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let registration = runtime
+            .register_bound(
+                actor,
+                scope.clone(),
+                FrontendActor::Test(Box::new(StartupProbe(observed.clone()))),
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original runtime actor registration: {error:?}"));
+        let position = runtime
+            .reserve_input(actor, actor, InputClass::Lifecycle)
+            .unwrap()
+            .into_standing_input()
+            .unwrap();
+        let (source, mut startup) = AttemptStartupSource::new(registration.clone(), position);
+        assert!(runtime.claim_host_actor().is_none());
+        assert!(!startup.ready_for(&registration));
+
+        let mut exit = host
+            .register(HostBinding {
+                scope: scope.clone(),
+                registration: registration.clone(),
+                kind: FrontendActorKind::Test,
+                config,
+                policy: FrontendLanePolicy {
+                    lane: |_| None,
+                    per_step_inventory: 1,
+                },
+                source: Box::new(MetadataSource {
+                    scope,
+                    closing: false,
+                    retire_batches: false,
+                }),
+                executor: Arc::new(NoExecutor),
+                transport: None,
+                ordered_observations: None,
+                startup: Some(source),
+            })
+            .unwrap_or_else(|_| panic!("install original host startup"));
+        let drive_host = || {
+            host.drive(
+                Tick(1),
+                runtime.claim_host_actor().expect("original host wake"),
+            )
+        };
+        drive_host();
+        if close_before_bootstrap {
+            exit.request_close().unwrap();
+            drive_host();
+            assert_eq!(startup.wait_ready().await, Err(ActorTurnError::Closed));
+            assert_eq!(runtime.snapshot(actor).unwrap().inputs, 1);
+            assert!(!startup.ready_for(&registration));
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            drive_host(); // Index the already queued Bootstrap.
+            drive_host(); // Retire its actual occurrence.
+            drive_host(); // Close the role and retire the original host.
+            exit.wait().await.unwrap();
+            assert_eq!(*observed.lock().unwrap(), [StartupInput::Bootstrap]);
+            assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+            return;
+        }
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        assert_eq!(*observed.lock().unwrap(), [StartupInput::Bootstrap]);
+        assert!(!startup.ready_for(&registration));
+        assert!(!runtime.poll_one(Tick(1)).unwrap());
+
+        drive_host(); // Index Bootstrap.
+        drive_host(); // Retire Bootstrap.
+        drive_host(); // Fill StartProtocol in the same paid position.
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [StartupInput::Bootstrap, StartupInput::StartProtocol]
+        );
+        assert!(!startup.ready_for(&registration));
+        {
+            let wait = startup.wait_ready();
+            tokio::pin!(wait);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    wait.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+        }
+        drive_host(); // Index StartProtocol.
+        drive_host(); // Retire StartProtocol.
+        drive_host(); // Return the original standing position.
+        startup.wait_ready().await.unwrap();
+        assert!(startup.ready_for(&registration));
+        assert!(
+            runtime
+                .standing_input_inventory(actor, None, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        exit.request_close().unwrap();
+        drive_host();
+        exit.wait().await.unwrap();
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn three_actual_pollers_exclude_each_other_on_one_actor_and_drain_real_metadata() {
         const INPUTS: usize = 64;
@@ -1361,10 +1559,12 @@ mod tests {
                 },
                 source: Box::new(MetadataSource {
                     scope: source_scope,
-                    closing: false
+                    closing: false,
+                    retire_batches: true,
                 }),
                 executor: Arc::new(NoExecutor),
                 transport: None,
+                startup: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -1743,6 +1943,7 @@ mod tests {
                 }),
                 executor: executor.clone(),
                 transport: None,
+                startup: None,
                 ordered_observations: None,
             })
             .is_ok()
@@ -2034,6 +2235,7 @@ mod tests {
                     }),
                     executor: Arc::new(NoExecutor),
                     transport: None,
+                    startup: None,
                     ordered_observations: None,
                 })
                 .is_ok()

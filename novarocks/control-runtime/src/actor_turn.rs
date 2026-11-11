@@ -1216,7 +1216,7 @@ pub struct StandingInputObligation<A: Actor> {
 /// The failed Source's original queued payload. Only explicit disposal
 /// makes its input eligible for retirement. An unconsumed carrier retains
 /// unresolved custody and must never drop rich input on the host poller.
-#[must_use = "Dispose the original payload off the host poller"]
+#[must_use = "Dispose the original payload before retiring its input"]
 pub struct FailedSourcePayload<A: Actor> {
     runtime: ActorRuntime<A>,
     node: Arc<ActorCell<A>>,
@@ -1271,6 +1271,9 @@ impl<A: Actor> std::fmt::Debug for StandingInputObligation<A> {
     }
 }
 impl<A: Actor> StandingInputObligation<A> {
+    pub fn matches_registration(&self, registration: &ActorRegistration) -> bool {
+        self.actor == registration.actor && Arc::ptr_eq(&self.origin, &registration.origin)
+    }
     fn original_node(&self) -> Result<Arc<ActorCell<A>>, ActorTurnError> {
         let node = self.runtime.node(self.actor)?;
         if !Arc::ptr_eq(&self.origin, &node.origin) {
@@ -1344,6 +1347,18 @@ impl<A: Actor> StandingInputObligation<A> {
         &self,
         roles: &std::collections::BTreeSet<StandingInputId>,
     ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.take_failed_source_payload_matching(|id| roles.contains(&id))
+    }
+    /// Claim only this standing role, subject to the original Source FIFO.
+    pub fn take_failed_role_payload(
+        &self,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.take_failed_source_payload_matching(|id| id == self.id())
+    }
+    fn take_failed_source_payload_matching(
+        &self,
+        matches_role: impl FnOnce(StandingInputId) -> bool,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
         let node = self.original_node()?;
         let mut inbox = node.inbox.lock().expect("failed Source inbox lock");
         if !inbox.failed {
@@ -1363,7 +1378,7 @@ impl<A: Actor> StandingInputObligation<A> {
             .expect("original failed Source head");
         let standing = original
             .standing_input_id
-            .filter(|id| roles.contains(id))
+            .filter(|id| matches_role(*id))
             .ok_or(ActorTurnError::InputAuthorMismatch)?;
         assert_eq!(original.phase, InputPhase::Filled);
         assert_eq!(inbox.mailbox.pop_from(head.class, source), Some(head));

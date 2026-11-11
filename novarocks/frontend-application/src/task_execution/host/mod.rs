@@ -17,6 +17,7 @@
 
 pub(crate) mod adapter;
 pub(crate) mod observations;
+pub(crate) mod startup;
 pub(crate) mod subscriptions;
 
 pub(crate) mod publication;

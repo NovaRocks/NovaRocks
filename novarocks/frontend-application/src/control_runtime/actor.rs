@@ -20,6 +20,7 @@
 
 use super::transport_withdrawal::AttemptEffectEnvelope;
 use crate::task_execution::host::adapter::{AttemptActor, AttemptNotice, descriptor};
+use crate::task_execution::host::startup::StartupInput;
 use novarocks_attempt_protocol::{config::DispatchLane, input::AttemptInput};
 use novarocks_control_runtime::{
     actor::{Actor, ActorStep},
@@ -57,6 +58,7 @@ pub(crate) enum FrontendActor {
 #[derive(Clone, Debug)]
 pub(crate) enum FrontendInput {
     Timer,
+    AttemptStartup(StartupInput),
     CapacityReleased,
     Membership(super::membership::MembershipUpdate),
     Attempt(Box<AttemptInput>),
