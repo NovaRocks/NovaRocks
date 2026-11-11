@@ -899,6 +899,7 @@ fn schedule(detail: &str) -> TaskExecutionError {
 #[cfg(test)]
 mod tests {
     mod participation;
+    mod tasks;
 
     use super::*;
     use crate::{
