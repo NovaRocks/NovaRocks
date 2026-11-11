@@ -147,6 +147,8 @@ impl RootControlRef {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ObservationMetadataLayout {
     pub(crate) entry: Layout,
+    /// Upper bound for old and requested FIFO backing during a resize.
+    pub(crate) queue_peak_bytes: usize,
     pub(crate) root_reference: Layout,
     pub(crate) actor_input: Layout,
     pub(crate) ap_projection: Layout,
@@ -628,25 +630,26 @@ enum FailureTail {
 
 struct UnsubmittedTail<I> {
     queue: VecDeque<Entry>,
-    deferred: VecDeque<Entry>,
+    deferred: Option<Entry>,
     failed: Option<FailedFill<I>>,
     failed_control: Option<FailedControlProjection>,
 }
 
 impl<I> UnsubmittedTail<I> {
     fn retained_streams(&self) -> Vec<StreamKey> {
-        let mut streams = self
-            .queue
-            .iter()
-            .filter_map(|entry| match &entry.value {
-                EntryValue::Pending { key, .. } => Some(*key),
-                EntryValue::Observation(value) => Some(StreamKey {
-                    participation: value.participation,
-                    generation: value.generation,
-                }),
-                EntryValue::Control(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let failed = self
+            .failed
+            .as_ref()
+            .map_or(0, |failed| failed.streams.len());
+        let mut streams = Vec::with_capacity(self.queue.len() + failed);
+        streams.extend(self.queue.iter().filter_map(|entry| match &entry.value {
+            EntryValue::Pending { key, .. } => Some(*key),
+            EntryValue::Observation(value) => Some(StreamKey {
+                participation: value.participation,
+                generation: value.generation,
+            }),
+            EntryValue::Control(_) => None,
+        }));
         if let Some(failed) = &self.failed {
             streams.extend_from_slice(&failed.streams);
         }
@@ -667,7 +670,7 @@ impl<I> UnsubmittedTail<I> {
 struct State<I> {
     streams: BTreeMap<StreamKey, ReadState>,
     queue: VecDeque<Entry>,
-    deferred_controls: VecDeque<Entry>,
+    deferred_control: Option<Entry>,
     queued_frames: usize,
     writer_busy: bool,
     writer_poisoned: bool,
@@ -682,11 +685,27 @@ struct State<I> {
     closed: bool,
 }
 impl<I> State<I> {
+    fn push(&mut self, entry: Entry, positions: usize) {
+        let len = self.queue.len();
+        assert!(len < positions, "every entry holds one original position");
+        if self.queue.capacity() == len {
+            let capacity = len.saturating_mul(2).max(4).min(positions);
+            self.queue.reserve_exact(capacity - len);
+        }
+        self.queue.push_back(entry);
+    }
+
+    fn publish_deferred_control(&mut self, positions: usize) {
+        if let Some(control) = self.deferred_control.take() {
+            self.push(control, positions);
+        }
+    }
+
     fn take_unsubmitted_tail(&mut self) -> UnsubmittedTail<I> {
         self.queued_frames = 0;
         UnsubmittedTail {
             queue: std::mem::take(&mut self.queue),
-            deferred: std::mem::take(&mut self.deferred_controls),
+            deferred: self.deferred_control.take(),
             failed: self.failed.take(),
             failed_control: self.failed_control.take(),
         }
@@ -796,6 +815,10 @@ impl<A: Actor> OrderedObservationInput<A> {
             }
             source.retain_metadata(ObservationMetadataLayout {
                 entry: Layout::new::<Entry>(),
+                queue_peak_bytes: Layout::array::<Entry>(budget.total_positions)
+                    .ok()
+                    .and_then(|layout| layout.size().checked_mul(2))
+                    .ok_or(ObservationError::Budget)?,
                 root_reference: Layout::new::<RootControlRef>(),
                 actor_input: Layout::new::<A::Input>(),
                 ap_projection: Layout::new::<AttemptInput>(),
@@ -819,7 +842,7 @@ impl<A: Actor> OrderedObservationInput<A> {
             state: Mutex::new(State {
                 streams: BTreeMap::new(),
                 queue: VecDeque::new(),
-                deferred_controls: VecDeque::new(),
+                deferred_control: None,
                 queued_frames: 0,
                 writer_busy: false,
                 writer_poisoned: false,
@@ -1112,15 +1135,20 @@ impl<A: Actor> OrderedObservationInput<A> {
                         .expect("original opening generation")
                         .pending = pending;
                     let identity = Arc::new(());
-                    state.queue.push_back(Entry {
-                        value: EntryValue::Pending {
-                            key,
-                            received_at: observed_at,
-                            receipt: identity.clone(),
+                    state.push(
+                        Entry {
+                            value: EntryValue::Pending {
+                                key,
+                                received_at: observed_at,
+                                receipt: identity.clone(),
+                            },
+                            credit: Some(
+                                credit.take().expect("opening owns original preread credit"),
+                            ),
+                            pending,
                         },
-                        credit: Some(credit.take().expect("opening owns original preread credit")),
-                        pending,
-                    });
+                        self.0.budget.total_positions,
+                    );
                     if !pending {
                         state.queued_frames += 1;
                     }
@@ -1135,8 +1163,7 @@ impl<A: Actor> OrderedObservationInput<A> {
             stream.polling = false;
             let opened_at = stream.opened_at;
             if !state.streams.values().any(|stream| stream.polling) {
-                let controls = std::mem::take(&mut state.deferred_controls);
-                state.queue.extend(controls);
+                state.publish_deferred_control(self.0.budget.total_positions);
             }
             (result, opened_at)
         };
@@ -1222,19 +1249,22 @@ impl<A: Actor> OrderedObservationInput<A> {
                         .expect("original read generation")
                         .pending = pending;
                     let identity = Arc::new(());
-                    state.queue.push_back(Entry {
-                        value: EntryValue::Pending {
-                            key,
-                            received_at: observed_at,
-                            receipt: identity.clone(),
+                    state.push(
+                        Entry {
+                            value: EntryValue::Pending {
+                                key,
+                                received_at: observed_at,
+                                receipt: identity.clone(),
+                            },
+                            credit: Some(
+                                credit
+                                    .take()
+                                    .expect("network read owns its original credit"),
+                            ),
+                            pending,
                         },
-                        credit: Some(
-                            credit
-                                .take()
-                                .expect("network read owns its original credit"),
-                        ),
-                        pending,
-                    });
+                        self.0.budget.total_positions,
+                    );
                     if !pending {
                         state.queued_frames += 1;
                     }
@@ -1242,8 +1272,7 @@ impl<A: Actor> OrderedObservationInput<A> {
                 }
             };
             if !state.streams.values().any(|stream| stream.polling) {
-                let controls = std::mem::take(&mut state.deferred_controls);
-                state.queue.extend(controls);
+                state.publish_deferred_control(self.0.budget.total_positions);
             }
             result
         };
@@ -1399,17 +1428,20 @@ impl<A: Actor> OrderedObservationInput<A> {
             stream.receive(key, at, event)?;
             stream.pending = pending;
             stream.accepted_unretired += 1;
-            state.queue.push_back(Entry {
-                value: EntryValue::Observation(ReceivedObservation {
-                    participation: key.participation,
-                    generation: key.generation,
-                    received_at: at,
-                    opening,
-                    event: accepted.event.take().expect("accepted observation"),
-                }),
-                credit: accepted.credit.take(),
-                pending,
-            });
+            state.push(
+                Entry {
+                    value: EntryValue::Observation(ReceivedObservation {
+                        participation: key.participation,
+                        generation: key.generation,
+                        received_at: at,
+                        opening,
+                        event: accepted.event.take().expect("accepted observation"),
+                    }),
+                    credit: accepted.credit.take(),
+                    pending,
+                },
+                self.0.budget.total_positions,
+            );
             if !pending {
                 state.queued_frames += 1;
             }
@@ -1451,9 +1483,13 @@ impl<A: Actor> OrderedObservationInput<A> {
                 pending: false,
             };
             if state.streams.values().any(|stream| stream.polling) {
-                state.deferred_controls.push_back(entry);
+                assert!(
+                    state.deferred_control.is_none(),
+                    "the original control position is unique"
+                );
+                state.deferred_control = Some(entry);
             } else {
-                state.queue.push_back(entry);
+                state.push(entry, self.0.budget.total_positions);
             }
         }
         Ok(())

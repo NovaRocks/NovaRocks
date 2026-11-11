@@ -30,6 +30,7 @@ use novarocks_control_runtime_core::owned_storage::OwnedSlotKind;
 use novarocks_execution_contract::ParticipationRef;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Bound::{Excluded, Unbounded},
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
@@ -293,21 +294,16 @@ impl ObservationCredits {
         let claim_owner = self.clone();
         ObservationCredit::from_source(
             InputSlotLoan::from_source(position, move |position| {
-                let waiters = {
-                    let mut state = slot_owner.state.lock().expect("observation credit owner");
-                    match claim {
-                        Claim::Read(_) => {
-                            state.data.push(position);
-                            state.take_waiters()
-                        }
-                        Claim::Control => {
-                            assert!(state.control.replace(position).is_none());
-                            Vec::new()
-                        }
+                let mut state = slot_owner.state.lock().expect("observation credit owner");
+                match claim {
+                    Claim::Read(_) => {
+                        state.data.push(position);
+                        drop(state);
+                        slot_owner.wake_readers();
                     }
-                };
-                for waiter in waiters {
-                    waiter.wake();
+                    Claim::Control => {
+                        assert!(state.control.replace(position).is_none());
+                    }
                 }
             }),
             Box::new(Bytes {
@@ -317,6 +313,27 @@ impl ObservationCredits {
             }),
             move || claim_owner.return_claim(claim),
         )
+    }
+
+    /// Take one original waiter under the lock, then wake it outside. Bound a
+    /// release to one pass over distinct streams, even if a synchronous wake
+    /// re-registers its own waiter or new generations arrive during the pass.
+    fn wake_readers(&self) {
+        let mut after = Unbounded;
+        for _ in 0..self.budget.total_positions {
+            let next = self
+                .state
+                .lock()
+                .expect("observation credit owner")
+                .streams
+                .range_mut((after, Unbounded))
+                .find_map(|(key, row)| row.waiter.take().map(|waiter| (*key, waiter)));
+            let Some((key, waiter)) = next else {
+                break;
+            };
+            after = Excluded(key);
+            waiter.wake();
+        }
     }
 
     fn return_claim(&self, claim: Claim) {
@@ -379,13 +396,6 @@ impl Credits {
             .get_mut(&stream)
             .ok_or(ObservationError::UnknownStream)
     }
-
-    fn take_waiters(&mut self) -> Vec<Waker> {
-        self.streams
-            .values_mut()
-            .filter_map(|row| row.waiter.take())
-            .collect()
-    }
 }
 
 struct Bytes {
@@ -409,18 +419,12 @@ impl ObservationByteLoan for Bytes {
                 })?;
         self.reserved = charged_bytes;
         if returned != 0 && matches!(self.claim, Claim::Read(_)) {
-            let waiters = {
-                let mut state = self
-                    .original
-                    .state
-                    .lock()
-                    .expect("observation credit owner");
-                state.data_bytes -= returned;
-                state.take_waiters()
-            };
-            for waiter in waiters {
-                waiter.wake();
-            }
+            self.original
+                .state
+                .lock()
+                .expect("observation credit owner")
+                .data_bytes -= returned;
+            self.original.wake_readers();
         }
         Ok(())
     }

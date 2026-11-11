@@ -830,13 +830,18 @@ impl Fixture {
 
 #[test]
 fn real_runtime_batches_cut_at_256_and_root_control_waits_for_first_complete_processing() {
-    let f = Fixture::new(512, 512);
+    let f = Fixture::new(300, 512);
     f.frame(1);
     for n in 2..=300 {
         f.frame(n);
     }
     f.input.root_control(f.bank.seal()).unwrap();
     f.frame(301);
+    {
+        let state = f.input.0.state.lock().unwrap();
+        assert_eq!(state.queue.len(), 301);
+        assert!(state.queue.capacity() <= f.bank.budget.total_positions);
+    }
     f.consume(false);
     f.consume(false);
     f.consume(false);
@@ -1693,6 +1698,10 @@ fn compact_controls_project_only_at_fill_and_metadata_refusal_keeps_original() {
     );
     assert_eq!(layout.read_progress, Layout::new::<ReadProgressSnapshot>());
     assert_eq!(layout.total_positions, f.bank.budget.total_positions);
+    assert_eq!(
+        layout.queue_peak_bytes,
+        2 * layout.total_positions * Layout::new::<Entry>().size()
+    );
     assert_eq!(layout.max_batch_items, 256);
     assert!(layout.root_reference.size() < layout.logical_projection.size());
     f.frame(1);

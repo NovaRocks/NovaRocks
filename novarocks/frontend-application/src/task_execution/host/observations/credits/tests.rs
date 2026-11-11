@@ -143,6 +143,65 @@ fn data_bytes_and_positions_wake_reads_without_spending_the_control_share() {
 }
 
 #[test]
+fn slot_return_wakes_other_readers_when_a_wake_synchronously_reregisters() {
+    struct ReentrantReader {
+        credits: Arc<ObservationCredits>,
+        stream: StreamKey,
+        retry: Waker,
+        held: Mutex<Option<ObservationCredit>>,
+    }
+
+    impl Wake for ReentrantReader {
+        fn wake(self: Arc<Self>) {
+            let mut cx = Context::from_waker(&self.retry);
+            let credit = ready_credit(self.credits.poll_read(self.stream, &mut cx));
+            assert!(self.credits.poll_read(self.stream, &mut cx).is_pending());
+            assert!(self.held.lock().unwrap().replace(credit).is_none());
+        }
+    }
+
+    let original = stream();
+    let reentrant = StreamKey {
+        generation: NonZeroU64::new(2).unwrap(),
+        ..original
+    };
+    let later = StreamKey {
+        generation: NonZeroU64::new(3).unwrap(),
+        ..original
+    };
+    let (credits, _) = pool(&[original, reentrant, later], 100);
+    let credit = ready_credit(credits.poll_read(original, &mut Context::from_waker(Waker::noop())));
+    let retry = Arc::new(Wakes::default());
+    let reentry = Arc::new(ReentrantReader {
+        credits: credits.clone(),
+        stream: reentrant,
+        retry: Waker::from(retry.clone()),
+        held: Mutex::new(None),
+    });
+    let later_wakes = Arc::new(Wakes::default());
+    let reentry_waker = Waker::from(reentry.clone());
+    let later_waker = Waker::from(later_wakes.clone());
+    assert!(
+        credits
+            .poll_read(reentrant, &mut Context::from_waker(&reentry_waker))
+            .is_pending()
+    );
+    assert!(
+        credits
+            .poll_read(later, &mut Context::from_waker(&later_waker))
+            .is_pending()
+    );
+
+    drop(credit);
+    assert_eq!(later_wakes.0.load(Ordering::SeqCst), 1);
+    assert_eq!(retry.0.load(Ordering::SeqCst), 0);
+    let credit = reentry.held.lock().unwrap().take().unwrap();
+    drop(credit);
+    assert_eq!(retry.0.load(Ordering::SeqCst), 1);
+    credits.retire_after_exit().unwrap();
+}
+
+#[test]
 fn retirement_requires_exact_generation_and_wait_cancellation() {
     let first = stream();
     let second = stream();
