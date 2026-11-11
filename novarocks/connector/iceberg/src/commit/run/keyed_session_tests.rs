@@ -713,20 +713,35 @@ async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_ex
         .await
         .unwrap();
     assert!(before_live.is_empty());
-    let prepared = prepare_keyed_variant(
+    let mut prepared = prepare_keyed_variant(
         &fixture,
         ConnectorManagedPublicationTechnique::Incremental,
         false,
     )
     .await;
+    let expected_base = crate::commit::write_shared::position_mutation_base(
+        before.metadata(),
+        before.metadata_location(),
+        "main",
+        prepared.base_snapshot_id,
+    )
+    .unwrap();
+    let previous = &prepared.declaration;
+    let declaration = ConnectorDocumentPublicationDeclaration::try_new(
+        previous.publication_id(),
+        previous.admission().clone(),
+        previous.target_object_id().clone(),
+        expected_base,
+        previous.technique(),
+        previous.empty_input(),
+        None,
+        None,
+    )
+    .unwrap();
+    prepared.intent.declaration = declaration.clone();
+    prepared.declaration = declaration;
     let request = keyed_begin_shape(&prepared, ConnectorManagedPublicationShape::RowMutation);
     assert_eq!(request.intent, ConnectorWriteIntent::RowDelta);
-    assert!(
-        crate::commit::write_stack::control::session_freezes_old_deletes(
-            &request.flavor,
-            &crate::commit::write_stack::test_support::merge_on_read_input_shape(),
-        )
-    );
     fixture.catalog.clear();
     let control = write_control(&fixture);
     let plan = control.begin_write(request).unwrap();
@@ -746,7 +761,9 @@ async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_ex
         vec![IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
     );
     assert_eq!(plan.targets().len(), 2);
-    assert!(plan.targets().iter().all(|target| target.route().is_some()));
+    assert!(plan.targets()[0].route().is_some());
+    assert!(plan.targets()[1].position_materialization().is_some());
+    assert!(handle.mutation_read().is_some());
     // The exact bytes may be bound before finish; finish's same-value binding
     // must be idempotent and retain these bytes through checked dispatch.
     assert!(handle.document_records().unwrap().is_none());

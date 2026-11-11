@@ -38,6 +38,10 @@ pub enum ProgramOutputRole {
     ProviderRoute {
         target: novarocks_connector_contract::WriteTargetOrdinal,
     },
+    PositionShards {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+        target: novarocks_connector_contract::WriteTargetOrdinal,
+    },
     Summary(novarocks_result_contract::SummaryKind),
     WriterResults,
 }

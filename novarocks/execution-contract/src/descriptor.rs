@@ -372,6 +372,7 @@ pub struct ExchangeInbound {
     node_id: FragmentNodeId,
     sources: Vec<ExchangeSource>,
     delivery: crate::ExchangeDeliveryRequirement,
+    position_shard_source_dops: Option<Vec<NonZeroU32>>,
 }
 
 impl ExchangeInbound {
@@ -412,7 +413,29 @@ impl ExchangeInbound {
             node_id,
             sources,
             delivery,
+            position_shard_source_dops: None,
         })
+    }
+
+    pub fn try_with_position_shard_source_dops(
+        mut self,
+        dops: Vec<NonZeroU32>,
+    ) -> Result<Self, DescriptorError> {
+        if self.delivery != crate::ExchangeDeliveryRequirement::MustDrain
+            || dops.len() != self.sources.len()
+            || self.position_shard_source_dops.is_some()
+        {
+            return Err(DescriptorError::InvalidPositionShardSourceDops(
+                self.node_id,
+            ));
+        }
+        self.position_shard_source_dops = Some(dops);
+        Ok(self)
+    }
+
+    /// Actual producer widths indexed by the frozen sender ordinal.
+    pub fn position_shard_source_dops(&self) -> Option<&[NonZeroU32]> {
+        self.position_shard_source_dops.as_deref()
     }
 
     pub const fn node_id(&self) -> FragmentNodeId {
@@ -516,6 +539,7 @@ pub enum DescriptorError {
         expected: Vec<u32>,
         received: Vec<u32>,
     },
+    InvalidPositionShardSourceDops(FragmentNodeId),
     DuplicateEdgeId,
     DuplicateInboundNode,
     DuplicateSplitPlanNode(PlanNodeId),
@@ -553,6 +577,10 @@ impl fmt::Display for DescriptorError {
                 formatter,
                 "inbound exchange node {node:?} sender ordinals must be contiguous {expected:?}, received {received:?}"
             ),
+            Self::InvalidPositionShardSourceDops(node) => write!(
+                formatter,
+                "inbound exchange node {node:?} requires a single MustDrain position-shard DOP roster for its full sender set"
+            ),
             Self::DuplicateEdgeId => formatter.write_str("topology repeats an exchange edge id"),
             Self::DuplicateInboundNode => {
                 formatter.write_str("topology repeats an inbound exchange node")
@@ -580,6 +608,7 @@ impl crate::failure::FailureProjection for DescriptorError {
             Self::DuplicateEdgeId => 1027,
             Self::DuplicateInboundNode => 1028,
             Self::DuplicateSplitPlanNode(_) => 1029,
+            Self::InvalidPositionShardSourceDops(_) => 1030,
         };
         FailureFact::new(
             FailureClass::Invariant,

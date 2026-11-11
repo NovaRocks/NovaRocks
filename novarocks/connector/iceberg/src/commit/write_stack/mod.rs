@@ -24,14 +24,9 @@
 //! FE finish_write  -> exactly one Iceberg snapshot commit
 //! ```
 //!
-//! Two properties distinguish this from the write path it will replace:
-//!
-//! * a writer's result is a set of independent artifact descriptions rather
-//!   than one opaque report document, so the transport never splits a provider
-//!   document across frames; and
-//! * a delete branch's handle freezes *references* to the old delete artifacts
-//!   instead of an already-read bitmap, and the backend does the reading
-//!   through its own query-leased storage resolver (NCP-6 D10).
+//! Writers publish independent descriptions of staged artifacts and final
+//! delete effects. Position mutations resolve applicable deletes against the
+//! fixed read endpoint through the backend's query-leased storage resolver.
 //!
 //! The adapter that converts between these concrete values and the neutral
 //! `ConnectorWriteCommitSession` / `ConnectorWriterHandle` /
@@ -66,15 +61,11 @@ pub use domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
     IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergPositionDeleteFileArtifact,
-    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterHandle,
-    IcebergWriterOutput,
+    IcebergPositionRewriteTarget, IcebergSealedWriteTarget, IcebergWriteBranch,
+    IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
 };
 pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
-pub use old_delete::{
-    IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeOutcome, IcebergOldDeleteMergeTarget,
-    IcebergStorageRoute, read_and_merge_old_deletes,
-};
 pub use planning::{
     IcebergBranchSessionPlanInput, IcebergDataBranchPlan, IcebergDeleteBranchPlan,
     IcebergWriteBranchPlan, IcebergWriteSessionPlanInput, IcebergWriteTargetPlan,

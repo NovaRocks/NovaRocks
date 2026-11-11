@@ -21,8 +21,8 @@
 use super::*;
 
 const APPEND_HOLD: &str = "connector-write-append-hold";
-pub(super) const PARTITION_OBSERVATION_INDEX: usize = 4;
-pub(super) const SELECTED_UPDATE_OBSERVATION_INDEX: usize = 5;
+pub(super) const PARTITION_OBSERVATION_INDEX: usize = super::row_level_contract::OBSERVATION_COUNT;
+pub(super) const SELECTED_UPDATE_OBSERVATION_INDEX: usize = PARTITION_OBSERVATION_INDEX + 1;
 
 pub(super) fn selected_update_observation(cluster_size: usize) -> StatementSpec {
     let mut spec = partition_observation(cluster_size);
@@ -113,8 +113,8 @@ pub(super) fn require_effective_config(context: &mut ScenarioContext) -> Result<
 
 pub(super) fn add_append_holds(specs: &mut [StatementSpec], cluster_size: usize) -> Result<()> {
     anyhow::ensure!(
-        specs.len() == 4 && cluster_size > 0,
-        "small-slots writer requires the original two MERGE and two same-file observations"
+        specs.len() == PARTITION_OBSERVATION_INDEX && cluster_size > 0,
+        "small-slots writer requires the complete original row-level observation plan"
     );
     // The first two original nominations are the unmatched MERGEs at DOP 1/4.
     // All original writer/Task/reader observations remain independently live.

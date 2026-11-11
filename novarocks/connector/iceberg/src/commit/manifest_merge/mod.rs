@@ -76,6 +76,17 @@ pub(crate) async fn merge_manifests(
     context: PreparationContext,
     candidates: Vec<MergeCandidate<'_>>,
 ) -> Result<Vec<ManifestFile>> {
+    merge_manifests_scoped(artifacts, metadata, snapshot_id, context, candidates, None).await
+}
+
+pub(crate) async fn merge_manifests_scoped(
+    artifacts: &dyn ArtifactWriter,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+    context: PreparationContext,
+    candidates: Vec<MergeCandidate<'_>>,
+    scope: Option<&crate::manifest::target_query::ManifestReadScope>,
+) -> Result<Vec<ManifestFile>> {
     let layouts = packing::plan(candidates, context.merge_policy.map_err(invalid)?)?;
     let results = ordered_window(
         context.io_window_width,
@@ -88,7 +99,7 @@ pub(crate) async fn merge_manifests(
                     .map(|candidate| candidate.descriptor)
                     .collect::<Vec<_>>()),
                 packing::Layout::Merge(bin) => Ok(vec![
-                    merge_bin(artifacts, metadata, snapshot_id, bin).await?,
+                    merge_bin(artifacts, metadata, snapshot_id, bin, scope).await?,
                 ]),
             }
         },
@@ -102,6 +113,7 @@ async fn merge_bin(
     metadata: &TableMetadata,
     snapshot_id: i64,
     bin: Vec<MergeCandidate<'_>>,
+    scope: Option<&crate::manifest::target_query::ManifestReadScope>,
 ) -> Result<ManifestFile> {
     let spec_id = bin[0].descriptor.partition_spec_id;
     let content = bin[0].descriptor.content;
@@ -114,9 +126,36 @@ async fn merge_bin(
     for candidate in bin {
         artifacts.check_active()?;
         let source = candidate.source(snapshot_id);
-        let raw = source.load(artifacts.file_io()).await?;
+        let cached = scope.and_then(|scope| scope.cached_source(source));
+        let loaded;
+        let retained;
+        let raw = match cached {
+            Some(bound) => bound.raw(),
+            None => {
+                retained = match scope {
+                    Some(scope) => scope.cached_raw(source).await?,
+                    None => None,
+                };
+                match retained.as_deref() {
+                    Some(raw) => raw.manifest(),
+                    None => {
+                        loaded = source.load(artifacts.file_io()).await?;
+                        &loaded
+                    }
+                }
+            }
+        };
         let encoding_source = Arc::new(ManifestWriteSource::from_header(raw.metadata())?);
-        for bound in source.bind(&raw)? {
+        let fresh = if cached.is_none() {
+            Some(source.bind(raw)?)
+        } else {
+            None
+        };
+        let entries_for_source = cached
+            .into_iter()
+            .flat_map(|bound| bound.entries(source).map(Ok))
+            .chain(fresh.into_iter().flatten());
+        for bound in entries_for_source {
             artifacts.check_active()?;
             if let Some(entry) = merged_entry(bound?, raw.metadata().format_version, snapshot_id)? {
                 entries.push(SourcedManifestEntry {

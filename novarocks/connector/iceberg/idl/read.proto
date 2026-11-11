@@ -203,6 +203,7 @@ message IcebergTableHandle {
   map<int32, string> scalar_integer_domains = 16;
   optional IcebergCowSourceProof frozen_cow_source = 17;
   map<int32, string> nominal_declarations = 18;
+  optional string mutation_partition_type_json = 19;
 }
 
 message TableChangesFunctionHandle {

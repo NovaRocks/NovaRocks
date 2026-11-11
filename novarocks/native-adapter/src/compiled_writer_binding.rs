@@ -131,6 +131,7 @@ impl novarocks_execution_contract::failure::FailureProjection for CompiledWriter
 enum WriterBindingContractFailure {
     MissingRecipe,
     SummaryBinding(&'static str),
+    PositionShardBinding(&'static str),
     DisplayRange {
         index: usize,
         source: std::num::TryFromIntError,
@@ -143,6 +144,9 @@ impl fmt::Display for WriterBindingContractFailure {
         match self {
             Self::MissingRecipe => f.write_str("the writer carries no provider write recipe"),
             Self::SummaryBinding(detail) => write!(f, "compiled summary binding refused: {detail}"),
+            Self::PositionShardBinding(detail) => {
+                write!(f, "compiled position shard binding refused: {detail}")
+            }
             Self::DisplayRange { index, .. } => {
                 write!(f, "local node index {index} exceeds the display identity")
             }
@@ -166,7 +170,9 @@ impl novarocks_execution_contract::failure::FailureProjection for WriterBindingC
         use novarocks_execution_contract::failure::*;
         let (class, code) = match self {
             Self::MissingRecipe => (FailureClass::Invariant, 9720),
-            Self::SummaryBinding(_) => (FailureClass::Invariant, 9724),
+            Self::SummaryBinding(_) | Self::PositionShardBinding(_) => {
+                (FailureClass::Invariant, 9724)
+            }
             Self::DisplayRange { .. } => (FailureClass::Invariant, 9721),
             Self::WrongBinding => (FailureClass::Invariant, 9722),
             Self::Observation(_) => (FailureClass::Unexpected, 9723),
@@ -185,18 +191,76 @@ pub(crate) fn bind_compiled_writers(
     task: &CompiledWriteTaskFacts<'_>,
     topology: &novarocks_execution_contract::descriptor::ExchangeTopology,
 ) -> Result<CompiledWriterBindings, CompiledWriterBindingError> {
+    use novarocks_local_program::ProgramOutputRole;
+    for inbound in topology.inbound() {
+        if inbound.position_shard_source_dops().is_some()
+            && !program.exchange_inputs().values().any(|input| {
+                i32::try_from(input.receiver_node).ok() == Some(inbound.node_id().get())
+                    && matches!(input.role, ProgramOutputRole::PositionShards { .. })
+            })
+        {
+            return Err(CompiledWriterBindingError::at_domain(
+                program.graph().root(),
+                WriterBindingContractFailure::PositionShardBinding(
+                    "frozen driver widths were attached to another exchange role",
+                ),
+            ));
+        }
+    }
     let mut bindings = CompiledWriterBindings::default();
     for (index, node) in program.graph().nodes().iter().enumerate() {
         let id = ProgramNodeId::new(index);
         match node.kind() {
-            ProgramNodeKind::TableWriter { .. } => {
+            ProgramNodeKind::TableWriter { input, .. } => {
                 let recipe = program.write_recipes().get(&id).ok_or_else(|| {
                     CompiledWriterBindingError::at_domain(
                         id,
                         WriterBindingContractFailure::MissingRecipe,
                     )
                 })?;
-                let writer = bind_compiled_writer(id, recipe, task)?;
+                let mut writer = bind_compiled_writer(id, recipe, task)?;
+                if let Some(receiver) = program.exchange_inputs().get(input)
+                    && let novarocks_local_program::ProgramOutputRole::PositionShards {
+                        group, ..
+                    } = receiver.role
+                {
+                    let invalid = |detail| {
+                        CompiledWriterBindingError::at_domain(
+                            id,
+                            WriterBindingContractFailure::PositionShardBinding(detail),
+                        )
+                    };
+                    let node = i32::try_from(receiver.receiver_node).map_err(|_| {
+                        invalid("position shard receiver exceeds the native identity")
+                    })?;
+                    let inbound = topology
+                        .inbound_node(
+                            novarocks_execution_contract::descriptor::FragmentNodeId::new(node),
+                        )
+                        .ok_or_else(|| {
+                            invalid("position shard receiver has no admitted inbound capability")
+                        })?;
+                    if inbound.delivery()
+                        != novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                        || inbound.sources().iter().any(|source| {
+                            source.task().query_execution_id() != task.runtime.execution_id()
+                        })
+                    {
+                        return Err(invalid(
+                            "position shard source set has another attempt or delivery law",
+                        ));
+                    }
+                    let dops = inbound.position_shard_source_dops().ok_or_else(|| {
+                        invalid("position shard sources have no frozen driver widths")
+                    })?;
+                    let sources = inbound
+                        .sources()
+                        .iter()
+                        .copied()
+                        .map(|source| (source, dops[source.sender_ordinal() as usize]))
+                        .collect();
+                    writer = writer.with_position_shard_sources(group, sources);
+                }
                 bindings
                     .bind_writer(id, writer)
                     .map_err(|source| CompiledWriterBindingError::at_failure(id, source))?;
@@ -328,7 +392,7 @@ pub(crate) fn bind_compiled_writer(
     )
     .map(|context| context.with_storage_resolver(task.runtime.storage_resolver()))
     .map_err(|source| CompiledWriterBindingError::at_domain(id, source))?;
-    let execution = Arc::new(ObservedConnectorWriteExecution::new(
+    let execution = ObservedConnectorWriteExecution::new(
         binding.execution(),
         execution_id,
         node_id,
@@ -362,7 +426,21 @@ pub(crate) fn bind_compiled_writer(
                 )
             })?
             .flatten(),
-    ));
+    );
+    #[cfg(novarocks_dev_controls)]
+    let execution = {
+        use novarocks_connector_contract::ConnectorWriteInputShape;
+        let role = match draft.input() {
+            ConnectorWriteInputShape::PositionDelete { .. } => "v2_position_delete",
+            ConnectorWriteInputShape::DeletionVector { .. } if draft.input().field_count() == 9 => {
+                "v3_materialize"
+            }
+            ConnectorWriteInputShape::DeletionVector { .. } => "rewrite_position_deletes",
+            ConnectorWriteInputShape::EqualityDelete { .. } => "equality_delete",
+            _ => "data",
+        };
+        execution.with_writer_role(role)
+    };
     let fragment_encoder =
         RoleBoundCommitFragmentEncoder::new(binding.fragment_encoder(), execution_id, node_id);
     #[cfg(novarocks_dev_controls)]
@@ -374,7 +452,7 @@ pub(crate) fn bind_compiled_writer(
     let fragment_encoder = Arc::new(fragment_encoder);
     let writer = TableWriterRuntimeBinding::try_new(
         handle,
-        execution,
+        Arc::new(execution),
         physical_template,
         request_context,
         fragment_encoder,

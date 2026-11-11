@@ -178,6 +178,7 @@ pub(super) fn run(
         dop,
         FIRST_DELETE_ROWS as u64,
         Some(FIRST_DELETE_ROWS as u64),
+        super::dop_observation::Geometry::SameFileDelete,
         "large delete from the one old file",
     )?;
     assert_remaining(

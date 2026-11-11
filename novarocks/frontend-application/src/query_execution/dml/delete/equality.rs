@@ -126,15 +126,15 @@ pub(super) async fn prepare_equality_delete_statement_async(
     let (sql_write_input, table_bindings) =
         bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
+        match_read: None,
         state: state.clone(),
         target: target.clone(),
         delete_query,
-        sql_write_input,
+        write_plan: super::DeleteWritePlan::Direct(sql_write_input),
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
         write_session,
-        distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
     })
 }
 

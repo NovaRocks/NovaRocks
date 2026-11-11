@@ -2481,35 +2481,35 @@ impl Scenario for DistributedWriterRowLevel {
                 .with_context(|| format!("seed deletion-vector file {file}"))?;
         }
 
-        context.action("delete rows through the deletion-vector branch");
+        context.action("observe distributed position aggregation and the singleton materializer");
+        control.execute(format!(
+            "SET pipeline_dop={}",
+            row_level_contract::INITIAL_DELETE_DOP
+        ))?;
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-        let dv_snapshots_before = snapshot_count(&mut control, &dv)?;
-        let mutation_result = control
-            .execute(format!("DELETE FROM {dv} WHERE id IN (1, 5, 9)"))
-            .context("first deletion-vector DELETE")?;
-        row_level_contract::assert_affected(&mutation_result, 3, "first deletion-vector DELETE")?;
+        row_level_contract::dop_observation::mutate_observed(
+            context,
+            &mut control,
+            &self
+                .observations
+                .take(row_level_contract::MULTI_FILE_DV_OBSERVATION)?,
+            &dv,
+            &row_level_contract::initial_delete_sql(true),
+            &before,
+            row_level_contract::INITIAL_DELETE_DOP,
+            3,
+            None,
+            row_level_contract::dop_observation::Geometry::MultiFileDelete,
+            "first deletion-vector DELETE",
+        )?;
         let after = all_write_counters(context)?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
         let delta = write_delta(&before, &after);
-        if delta.writing_backends.len() < 2 {
-            bail!(
-                "deletion-vector DELETE opened writers on {} backend(s); a row-level branch must \
-                 distribute like any other write. before={before:?} after={after:?}",
-                delta.writing_backends.len()
-            );
-        }
         if delta.commit_fragments < 1.0 {
             bail!("deletion-vector DELETE produced no commit fragment: {delta:?}");
         }
         assert_committed_once(before_terminals, after_terminals, "deletion-vector DELETE")?;
-        let dv_snapshots_after = snapshot_count(&mut control, &dv)?;
-        if dv_snapshots_after != dv_snapshots_before + 1 {
-            bail!(
-                "deletion-vector DELETE moved {dv} from {dv_snapshots_before} to \
-                 {dv_snapshots_after} snapshots; expected exactly one"
-            );
-        }
         let remaining: Vec<i64> = sql::integer_column(
             &control
                 .execute(format!("SELECT id FROM {dv} ORDER BY id"))
@@ -2531,9 +2531,7 @@ impl Scenario for DistributedWriterRowLevel {
             after_terminals,
             "merged deletion-vector DELETE",
         )?;
-        // If the backend had merged anything other than the exact references
-        // the frontend froze, either the frontend would have refused this
-        // commit or ids 1, 5 and 9 would be back.
+        // The new vector must retain the previous three physical deletions.
         let remaining: Vec<i64> = sql::integer_column(
             &control
                 .execute(format!("SELECT id FROM {dv} ORDER BY id"))
@@ -2571,32 +2569,26 @@ impl Scenario for DistributedWriterRowLevel {
                 ))
                 .with_context(|| format!("seed position-delete file {file}"))?;
         }
-        context.action("delete rows through the position-delete branch");
+        context.action("observe the distributed v2 position-delete writer branch");
         let before = all_write_counters(context)?;
         let before_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-        let positional_snapshots_before = snapshot_count(&mut control, &positional)?;
-        let mutation_result = control
-            .execute(format!("DELETE FROM {positional} WHERE id IN (1, 5, 9)"))
-            .context("position-delete DELETE")?;
-        row_level_contract::assert_affected(&mutation_result, 3, "position-delete DELETE")?;
-        let after = all_write_counters(context)?;
+        row_level_contract::dop_observation::mutate_observed(
+            context,
+            &mut control,
+            &self
+                .observations
+                .take(row_level_contract::V2_POSITION_OBSERVATION)?,
+            &positional,
+            &row_level_contract::initial_delete_sql(false),
+            &before,
+            row_level_contract::INITIAL_DELETE_DOP,
+            3,
+            None,
+            row_level_contract::dop_observation::Geometry::V2Delete,
+            "position-delete DELETE",
+        )?;
         let after_terminals = publication_terminals(context, MUTATION_FAMILY)?;
-        let delta = write_delta(&before, &after);
-        if delta.writing_backends.len() < 2 {
-            bail!(
-                "position-delete DELETE opened writers on {} backend(s); before={before:?} \
-                 after={after:?}",
-                delta.writing_backends.len()
-            );
-        }
         assert_committed_once(before_terminals, after_terminals, "position-delete DELETE")?;
-        let positional_snapshots_after = snapshot_count(&mut control, &positional)?;
-        if positional_snapshots_after != positional_snapshots_before + 1 {
-            bail!(
-                "position-delete DELETE moved {positional} from {positional_snapshots_before} to \
-                 {positional_snapshots_after} snapshots; expected exactly one"
-            );
-        }
         let remaining: Vec<i64> = sql::integer_column(
             &control
                 .execute(format!("SELECT id FROM {positional} ORDER BY id"))
@@ -3100,6 +3092,14 @@ struct DistributedWriterFaults {
     intent: SqlIntentOwner,
 }
 
+const V3_FAULT_TABLE: &str =
+    "distributed_writer_faults.distributed_writer_fault_db.v3_materialization_fault";
+const V3_FAULT_KIND: &str = "connector-write-root-read-after-prefix-failure";
+
+fn v3_fault_sql() -> String {
+    format!("DELETE FROM {V3_FAULT_TABLE} WHERE v = 2 AND v > 0")
+}
+
 impl Scenario for DistributedWriterFaults {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
         crate::scenarios::declarations::for_module(
@@ -3130,8 +3130,25 @@ impl Scenario for DistributedWriterFaults {
             .iter()
             .position(|fault| matches!(fault, WriteFault::SeveredWriterStream))
             .context("writer fault matrix has no remote sender case")?;
+        let mut specs = writer_fault_specs(cluster_size);
+        specs.push(StatementSpec {
+            sql: v3_fault_sql(),
+            faults: (0..cluster_size)
+                .map(|index| (index, V3_FAULT_KIND))
+                .collect(),
+            observations: (0..cluster_size)
+                .map(|index| {
+                    (
+                        index,
+                        novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                            .as_str(),
+                        None,
+                    )
+                })
+                .collect(),
+        });
         Ok(Some(self.intent.freeze_remote_writer_sender(
-            writer_fault_specs(cluster_size),
+            specs,
             selected,
             cluster_size,
             binary,
@@ -3359,6 +3376,8 @@ impl Scenario for DistributedWriterFaults {
             }
         }
 
+        verify_materialization_fault(context, &mut control, self.intent.take(WRITE_FAULTS.len())?)?;
+
         // The cluster is still able to write after the whole matrix, which is
         // what makes "nothing was left behind" a statement about resources
         // rather than only about the catalog.
@@ -3384,6 +3403,66 @@ impl Scenario for DistributedWriterFaults {
         }
         Ok(())
     }
+}
+
+fn verify_materialization_fault(
+    context: &mut ScenarioContext,
+    control: &mut SqlSession,
+    selected: SelectedStatement,
+) -> Result<()> {
+    context.action("fault the v3 materialization result after the root reads its sealed prefix");
+    control.execute(format!(
+        "CREATE TABLE {V3_FAULT_TABLE} (v BIGINT) TBLPROPERTIES \
+         ('format-version'='3','write.row-lineage'='true','novarocks.update.mode'='merge-on-read')"
+    ))?;
+    let seed = control.execute(format!("INSERT INTO {V3_FAULT_TABLE} VALUES (1),(2),(3)"))?;
+    row_level_contract::assert_affected(&seed, 3, "seed v3 materialization fault")?;
+    let snapshots = snapshot_count(control, V3_FAULT_TABLE)?;
+    let terminals = publication_terminals(context, MUTATION_FAMILY)?;
+    let actor = WriterActor::start(context, &v3_fault_sql(), selected.clone(), None)?;
+    let terminal = context
+        .remaining("observe v3 materialization failure")
+        .and_then(|remaining| {
+            actor
+                .done
+                .recv_timeout(remaining)
+                .context("v3 materialization fault has no SQL terminal")
+        });
+    let failure = actor.settle(context, terminal)?;
+    anyhow::ensure!(
+        matches!(failure, Err(StatementFailure::Trino(_))),
+        "v3 materialization fault did not reach its public SQL terminal"
+    );
+    let hits = selected
+        .faults
+        .iter()
+        .try_fold(0usize, |count, &(index, kind)| {
+            context
+                .handle()
+                .selected_query_lifecycle_fault_hit(index, kind, &selected.token)
+                .map(|hit| count + usize::from(hit))
+        })?;
+    anyhow::ensure!(
+        hits > 0,
+        "v3 statement failed outside its selected root-prefix fault"
+    );
+    let after = publication_terminals(context, MUTATION_FAMILY)?;
+    assert_commit_never_invoked(terminals, after, "v3 sealed materialization fault")?;
+    let rows = |control: &mut SqlSession| -> Result<Vec<i64>> {
+        sql::integer_column(&control.execute(format!("SELECT v FROM {V3_FAULT_TABLE} ORDER BY v"))?)
+    };
+    anyhow::ensure!(
+        snapshot_count(control, V3_FAULT_TABLE)? == snapshots && rows(control)? == [1, 2, 3],
+        "failed v3 materialization changed the live snapshot or row bag"
+    );
+
+    let followup = control.execute(format!("DELETE FROM {V3_FAULT_TABLE} WHERE v = 2"))?;
+    row_level_contract::assert_affected(&followup, 1, "post-fault v3 DELETE")?;
+    anyhow::ensure!(
+        snapshot_count(control, V3_FAULT_TABLE)? == snapshots + 1 && rows(control)? == [1, 3],
+        "v3 materialization did not recover for the next independent DELETE"
+    );
+    Ok(())
 }
 
 /// Exact original test controls, owned after the writer so unwind releases

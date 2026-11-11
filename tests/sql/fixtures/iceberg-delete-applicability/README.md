@@ -87,3 +87,15 @@ Java 与 NovaRocks 采用相同统计策略时逐文件闭包完全相等；显�
 对象均位于本轮创建的表位置。实验默认保留它们以便重放和 native 验证，脚本不
 清理共享 namespace。验收 owner 完成消费后仅删除 receipt 指定的本轮表与对象；
 注册的异常表与源表共享内容，必须在全部读者退出后统一清理。
+
+`spark_rest_delete_materialization` 使用 `--mode mutation-seed` 生成三个 v2
+数据文件、含重复位置的独占 Parquet、共享 Parquet、被 DV 遮蔽的 Parquet，
+以及 equality 删除。升级到 v3 后，Java 在同一个 Puffin 写出两条历史分区
+DV，再演进当前 spec。NovaRocks 从两个旧文件各删一行。
+
+`--mode mutation-check --mutation-seed-receipt FILE` 重新用 Java 读取实际提交，
+核对两条新 DV 的独立基数 2 和 3、历史 spec 和 sequence、独占 Parquet 与
+旧逻辑 blob 的移除、共享来源及 equality 的保留。原数据文件、行身份、
+历史 list/manifest 和内容对象均与前置收据逐项比较。两个阶段使用同一
+私有 namespace，输出各自的 Spark 日志、真实 class 来源、运行身份与哈希
+验证过的对象。SQL 和 Java 的行袋均根据固定输入手算。

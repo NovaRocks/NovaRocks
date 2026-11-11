@@ -80,6 +80,9 @@ pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
     HierarchicalInputSlotIds(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
+    /// Equal typed file occurrences on distinct contribution receivers have
+    /// the same ordinal but different fragment-local slot identities.
+    HierarchicalFileInput(novarocks_type_contract::FunctionValueType),
     ConditionalKey {
         applies: SlotId,
         keys: Vec<(SlotId, novarocks_type_contract::FunctionValueType)>,
@@ -278,6 +281,7 @@ impl LocalExchanger {
         matches!(
             &self.partition_spec,
             LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+                | LocalExchangePartitionSpec::HierarchicalFileInput(_)
                 | LocalExchangePartitionSpec::ConditionalKey { .. }
         )
     }
@@ -587,6 +591,24 @@ impl LocalExchanger {
                     control,
                 );
             }
+            LocalExchangePartitionSpec::HierarchicalFileInput(ty) => {
+                let slot = chunk
+                    .chunk_schema()
+                    .slots()
+                    .first()
+                    .ok_or_else(|| {
+                        crate::runtime::task::ExecutionFailure::from_domain(LocalPartitionContract)
+                    })?
+                    .slot_id();
+                return self.partition_hierarchical(
+                    chunk,
+                    &[(slot, ty.clone())],
+                    None,
+                    bypass_cursor,
+                    factory,
+                    control,
+                );
+            }
             LocalExchangePartitionSpec::ConditionalKey { applies, keys } => {
                 return self.partition_hierarchical(
                     chunk,
@@ -767,6 +789,7 @@ impl LocalExchanger {
             }
             LocalExchangePartitionSpec::Single
             | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            | LocalExchangePartitionSpec::HierarchicalFileInput(_)
             | LocalExchangePartitionSpec::ConditionalKey { .. } => {
                 return Err(crate::runtime::task::ExecutionFailure::from_domain(
                     LocalPartitionContract,

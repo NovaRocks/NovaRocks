@@ -36,6 +36,8 @@ paths = [
     "tests/sql/fixtures/iceberg-delete-applicability/generate.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/avro.scala",
     "tests/sql/fixtures/iceberg-delete-applicability/row_lineage.scala",
+    "tests/sql/fixtures/iceberg-delete-applicability/mutation.scala",
+    "novarocks/execution/src/exec/operators/position_shard.rs",
     "tests/sql/fixtures/iceberg-delete-applicability/run.sh",
     "tests/sql/fixtures/iceberg-delete-applicability/validate_receipts.py",
     "docker/iceberg-rest/spark-shell.sh",

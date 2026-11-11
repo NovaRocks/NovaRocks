@@ -1,0 +1,23 @@
+-- query 2
+-- types	bigint	integer	varchar
+id	p	value
+2	1	v2
+3	1	v3
+4	1	v4
+6	1	v6
+9	1	v9
+10	1	v10
+12	1	v12
+13	1	v13
+14	1	v14
+
+-- query 5
+-- types	bigint	integer	varchar
+id	p	value
+3	1	v3
+4	1	v4
+6	1	v6
+10	1	v10
+12	1	v12
+13	1	v13
+14	1	v14

@@ -711,6 +711,11 @@ fn lower_with_creation<
             | NodeKind::Unpivot { .. }
             | NodeKind::ChangeEventExpand { .. }
             | NodeKind::Aggregate { .. } => node.inputs.len() == 1,
+            NodeKind::PositionShard(spec) => {
+                node.id == physical.root()
+                    && !spec.inputs.is_empty()
+                    && node.inputs.len() == spec.inputs.len()
+            }
             NodeKind::Filter { predicates } => !predicates.is_empty() && node.inputs.len() == 1,
             // Every row-count TopN phase; a grouped-state reduction has no
             // local owner.
@@ -1562,6 +1567,15 @@ fn lower_with_creation<
                     creation,
                 )?
             }
+            NodeKind::PositionShard(spec) => lower_position_shard(
+                physical,
+                node,
+                spec,
+                planned,
+                &channels_plan.nodes,
+                work,
+                creation,
+            )?,
             NodeKind::ChangeEventExpand { .. } => {
                 let child =
                     *local_ids
@@ -2618,6 +2632,86 @@ fn lower_with_creation<
         None => LocalProgram::try_new(lexical, operators, &allowed, facts, work.control())
             .map_err(Into::into),
     }
+}
+
+fn lower_position_shard<H>(
+    fragment: &novarocks_physical_plan::Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    spec: &novarocks_physical_plan::PositionShardAggregation,
+    planned: &crate::channels::NodeChannels,
+    channels: &BTreeMap<NodeId, crate::channels::NodeChannels>,
+    work: &mut CompileCheckpoints<'_>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
+    let invalid = |message| FragmentCompileError::Invalid(message);
+    let output_slots: [novarocks_types::SlotId; 9] = planned
+        .slots
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid("position shard output width differs"))?;
+    if node.output.columns.as_ref() != spec.output.columns()
+        || node.inputs.len() != spec.inputs.len()
+        || spec.inputs.is_empty()
+    {
+        return Err(invalid("position shard ports differ from its frozen layout").into());
+    }
+    let mut inputs = Vec::new();
+    crate::assert_rows::reserve_vec(&mut inputs, spec.inputs.len(), work)?;
+    for (&id, input) in node.inputs.iter().zip(&spec.inputs) {
+        work.step()?;
+        let child = fragment
+            .nodes()
+            .get(&id)
+            .ok_or_else(|| invalid("missing position contribution node"))?;
+        let child_channels = channels
+            .get(&id)
+            .ok_or_else(|| invalid("missing position contribution channels"))?;
+        let &[file, position, spec_id, partition] = child_channels.slots.as_ref() else {
+            return Err(invalid("position contribution channel width differs").into());
+        };
+        if !matches!(child.kind, NodeKind::ExchangeSource { .. })
+            || child.output.columns.as_ref() != input.columns()
+        {
+            return Err(
+                invalid("position contribution must be its exact received relation").into(),
+            );
+        }
+        inputs.push(ProgramPositionShardInput {
+            input: child_channels.local,
+            file,
+            position,
+            spec_id,
+            partition,
+        });
+    }
+    let mut layout = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+        output_slots.len(),
+        work,
+        creation,
+    )?;
+    for (ordinal, value) in spec.output.columns().into_iter().enumerate() {
+        let ty = &fragment
+            .values()
+            .get(&value)
+            .ok_or_else(|| invalid("missing position shard output value"))?
+            .ty;
+        let name = crate::typed_layout::local_name_with_creation(
+            "local",
+            planned.local.index(),
+            ordinal,
+            work,
+            creation,
+        )?;
+        layout.push_with_creation(ty, name, work, creation)?;
+    }
+    Ok((
+        ProgramNodeKind::PositionShard {
+            group: spec.group,
+            inputs: inputs.into_boxed_slice(),
+            output_slots,
+        },
+        layout.finish_with_creation(&output_slots, work, creation)?,
+    ))
 }
 
 /// Which node shape has no local owner, so a refusal names it.

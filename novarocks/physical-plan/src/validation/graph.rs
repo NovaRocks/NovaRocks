@@ -191,16 +191,22 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 ));
             }
             let mut route_ids = BTreeSet::new();
-            for (ordinal, route) in routes.iter().enumerate() {
+            let mut previous_target = None::<u32>;
+            for route in routes {
+                let target = route.write_target_ordinal.get();
+                let dense = previous_target.map_or(target == 0, |previous| {
+                    target == previous || previous.checked_add(1) == Some(target)
+                });
                 if route.route_id == crate::ConnectorWriteRouteId::from_bytes([0; 32])
                     || !route_ids.insert(route.route_id)
-                    || usize::try_from(route.write_target_ordinal.get()).ok() != Some(ordinal)
+                    || !dense
                 {
                     errors.push(ValidationError::new(
                         &path,
                         "router routes require unique identities and dense target ordinals in route order",
                     ));
                 }
+                previous_target = Some(target);
                 let mut effects = BTreeSet::new();
                 if route.accepted_effects.is_empty()
                     || route

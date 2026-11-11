@@ -498,6 +498,15 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// Bind this final shard writer to the Provider's exact raw contribution group.
+    pub fn with_position_materialization(
+        mut self,
+        group: novarocks_spi::connector::write_stack::ConnectorMutationContributionGroup,
+    ) -> Self {
+        self.0.position_materialization = Some(std::sync::Arc::new(group));
+        self
+    }
+
     /// Preserve the admitted application's logical affected-row owner.
     /// The physical writer's row and artifact checks still apply.
     pub fn with_external_count_owner(mut self) -> Self {
@@ -559,6 +568,7 @@ impl DmlWritePlanInput {
         Ok(Self(
             crate::planner::distributed::write::contract::SqlWritePlanInput {
                 contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
+                position_materialization: None,
                 input,
                 finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 root_output_exprs: None,
@@ -1146,10 +1156,15 @@ pub struct DmlChangeStreamStatisticsTarget {
 /// SQL-only specification of a generated row-mutation producer.
 #[derive(Clone, Debug)]
 pub enum DmlChangeStreamKind {
+    Delete {
+        position_input: [usize; 4],
+    },
     Update {
+        file_metadata: Option<[usize; 2]>,
         target_columns: Vec<novarocks_types::schema::ColumnDef>,
     },
     Merge {
+        file_metadata: Option<[usize; 2]>,
         target_columns: Vec<novarocks_types::schema::ColumnDef>,
         matched_update: bool,
         matched_delete: bool,
@@ -1421,10 +1436,23 @@ pub fn begin_final_dml_change_stream(
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let mut keyed_assert = request.pre_expand_keyed_assert;
     let producer = match request.kind {
-        DmlChangeStreamKind::Update { target_columns } => {
-            build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
+        DmlChangeStreamKind::Delete { position_input } => {
+            if keyed_assert.is_some() {
+                return Err("plain DELETE does not accept a matched-row assertion".into());
+            }
+            build_delete_change_event_expand(compiled.optimized_tree, position_input, &control)?
         }
+        DmlChangeStreamKind::Update {
+            file_metadata,
+            target_columns,
+        } => build_update_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            &control,
+            file_metadata,
+        )?,
         DmlChangeStreamKind::Merge {
+            file_metadata,
             target_columns,
             matched_update,
             matched_delete,
@@ -1437,6 +1465,7 @@ pub fn begin_final_dml_change_stream(
                 matched_delete,
                 not_matched_insert,
                 &control,
+                file_metadata,
             )?;
             if let Some(assertion) = &mut keyed_assert {
                 assertion.applicability_output_ordinal = Some(applicability_ordinal);
@@ -1477,10 +1506,23 @@ pub fn compile_final_dml_change_stream(
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let mut keyed_assert = request.pre_expand_keyed_assert;
     let producer = match request.kind {
-        DmlChangeStreamKind::Update { target_columns } => {
-            build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
+        DmlChangeStreamKind::Delete { position_input } => {
+            if keyed_assert.is_some() {
+                return Err("plain DELETE does not accept a matched-row assertion".into());
+            }
+            build_delete_change_event_expand(compiled.optimized_tree, position_input, &control)?
         }
+        DmlChangeStreamKind::Update {
+            file_metadata,
+            target_columns,
+        } => build_update_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            &control,
+            file_metadata,
+        )?,
         DmlChangeStreamKind::Merge {
+            file_metadata,
             target_columns,
             matched_update,
             matched_delete,
@@ -1493,6 +1535,7 @@ pub fn compile_final_dml_change_stream(
                 matched_delete,
                 not_matched_insert,
                 &control,
+                file_metadata,
             )?;
             if let Some(assertion) = &mut keyed_assert {
                 assertion.applicability_output_ordinal = Some(applicability_ordinal);
@@ -1657,11 +1700,13 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     })
 }
 
-fn completed_change_stream_writer_routes(
+pub(crate) fn completed_change_stream_writer_routes(
     plan: &novarocks_physical_plan::PhysicalPlan,
 ) -> Result<Vec<DmlFinalChangeStreamWriterRoute>, String> {
+    use novarocks_physical_plan::{FragmentSink, NodeKind, OutputRole};
+
     let mut routers = plan.fragments().values().filter_map(|fragment| {
-        let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() else {
+        let FragmentSink::Router { routes, .. } = fragment.sink() else {
             return None;
         };
         Some(routes)
@@ -1681,11 +1726,37 @@ fn completed_change_stream_writer_routes(
                     route.edge.get()
                 )
             })?;
+            let receiver = plan
+                .fragments()
+                .get(&edge.destination.fragment)
+                .ok_or_else(|| {
+                    "completed change-stream route has no destination fragment".to_string()
+                })?;
+            let writer_fragment_id = match &receiver.nodes()[&receiver.root()].kind {
+                NodeKind::PositionShard(spec) => {
+                    let FragmentSink::Stream { edge } = receiver.sink() else {
+                        return Err("position aggregation has no shard stream".into());
+                    };
+                    let edge = plan.edges().get(edge).ok_or_else(|| {
+                        "completed position aggregation has no shard edge".to_string()
+                    })?;
+                    if edge.role
+                        != (OutputRole::PositionShards {
+                            group: spec.group,
+                            target: route.write_target_ordinal,
+                        })
+                    {
+                        return Err("completed position shard edge differs from its route".into());
+                    }
+                    edge.destination.fragment
+                }
+                _ => receiver.id(),
+            };
             Ok(DmlFinalChangeStreamWriterRoute {
                 route_id: route.route_id,
                 write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects.to_vec(),
-                writer_fragment_id: edge.destination.fragment,
+                writer_fragment_id,
             })
         })
         .collect()
@@ -1704,13 +1775,19 @@ fn plan_change_stream_writer_statistics(
 > {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let route_targets = routes
-        .iter()
-        .map(|route| route.write_target_ordinal)
-        .collect::<BTreeSet<_>>();
-    if route_targets.len() != routes.len() {
-        return Err("change-stream statistics routes contain a duplicate target ordinal".into());
+    let mut writers = BTreeMap::<_, &DmlChangeStreamRoute>::new();
+    for route in routes {
+        if let Some(existing) = writers.insert(route.write_target_ordinal, route)
+            && (route.sink.0.position_materialization.is_none()
+                || existing.sink.0.position_materialization.is_none()
+                || route.sink.0.contract != existing.sink.0.contract)
+        {
+            return Err(
+                "change-stream statistics routes contain a duplicate target ordinal".into(),
+            );
+        }
     }
+    let route_targets = writers.keys().copied().collect::<BTreeSet<_>>();
 
     let mut requirements_by_target = BTreeMap::new();
     for target in statistics_targets {
@@ -1743,8 +1820,8 @@ fn plan_change_stream_writer_statistics(
         ).into());
     }
 
-    let target_schemas = routes
-        .iter()
+    let target_schemas = writers
+        .values()
         .map(|route| {
             crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
                 &route.sink.0,
@@ -1752,8 +1829,8 @@ fn plan_change_stream_writer_statistics(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let inputs = routes
-        .iter()
+    let inputs = writers
+        .values()
         .zip(target_schemas.iter())
         .map(|(route, schema)| {
             let requirements = requirements_by_target
@@ -1814,10 +1891,126 @@ fn bind_route_layout(
     })
 }
 
+fn build_delete_change_event_expand(
+    child: crate::optimizer::OptimizedOperatorNode,
+    ordinals: [usize; 4],
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    use arrow::datatypes::DataType;
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
+
+    let mut arena = clone_scalar_arena(&child, "DELETE")?;
+    let mut outputs = Vec::with_capacity(5);
+    let mut assignments = Vec::with_capacity(4);
+    let first = max_physical_column_id(&child) + 1;
+    for (index, (ordinal, name)) in ordinals
+        .into_iter()
+        .zip(["_file", "_pos", "_spec_id", "_partition"])
+        .enumerate()
+    {
+        let source = child
+            .output_columns
+            .get(ordinal)
+            .ok_or("DELETE raw position input is absent")?;
+        let ty = source.value_type.data_type();
+        let valid = match index {
+            0 => ty == &DataType::Utf8 && !source.value_type.nullable(),
+            1 => ty == &DataType::Int64 && !source.value_type.nullable(),
+            2 => ty == &DataType::Int32 && !source.value_type.nullable(),
+            _ => matches!(ty, DataType::Struct(_)) && source.value_type.nullable(),
+        };
+        if !valid {
+            return Err(format!(
+                "DELETE raw position input {ordinal} has the wrong type or nullability"
+            )
+            .into());
+        }
+        let output = crate::column_id::ColumnId(first + index as u32);
+        outputs.push(crate::analysis::OutputColumn {
+            column_id: output,
+            name: name.to_owned(),
+            value_type: source.value_type.clone(),
+            is_internal: true,
+        });
+        assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            output_column_id: output,
+            expr: Some(intern_column(&mut arena, source, control)?),
+        });
+    }
+    let effect = crate::column_id::ColumnId(first + 4);
+    outputs.push(crate::analysis::OutputColumn {
+        column_id: effect,
+        name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_owned(),
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+        is_internal: true,
+    });
+    build_change_expand(
+        child,
+        arena,
+        outputs,
+        effect,
+        vec![crate::optimizer::operator::ChangeEventSpec {
+            predicate: None,
+            effect: ConnectorRowMutationEffect::Delete,
+            assignments,
+        }],
+    )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
+}
+
+fn append_old_file_metadata(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    child: &[crate::analysis::OutputColumn],
+    outputs: &mut Vec<crate::analysis::OutputColumn>,
+    ordinals: Option<[usize; 2]>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<crate::optimizer::operator::ChangeEventOutputExpr>, crate::compiler::SqlCompileError>
+{
+    use arrow::datatypes::DataType;
+    let Some([spec, partition]) = ordinals else {
+        return Ok(Vec::new());
+    };
+    let effect = outputs
+        .pop()
+        .ok_or("change stream lost its effect occurrence")?;
+    let mut assignments = Vec::with_capacity(2);
+    for (index, (ordinal, name)) in [(spec, "_spec_id"), (partition, "_partition")]
+        .into_iter()
+        .enumerate()
+    {
+        let source = child
+            .get(ordinal)
+            .ok_or("change stream lost an old file metadata occurrence")?;
+        let ty = source.value_type.data_type();
+        if (index == 0 && ty != &DataType::Int32)
+            || (index == 1 && !matches!(ty, DataType::Struct(_)))
+        {
+            return Err("change stream old file metadata has an invalid type".into());
+        }
+        let output = crate::column_id::ColumnId(effect.column_id.0 + 1 + index as u32);
+        outputs.push(crate::analysis::OutputColumn {
+            column_id: output,
+            name: name.to_owned(),
+            value_type: source
+                .value_type
+                .with_nullable(true)
+                .map_err(|error| final_lowering_error(error.into()))?,
+            is_internal: true,
+        });
+        assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
+            output_column_id: output,
+            expr: Some(intern_column(arena, source, control)?),
+        });
+    }
+    outputs.push(effect);
+    Ok(assignments)
+}
+
 fn build_update_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
     control: &dyn novarocks_type_contract::PureCompileControl,
+    file_metadata: Option<[usize; 2]>,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
@@ -1870,10 +2063,19 @@ fn build_update_change_event_expand(
         control,
     )?);
     // Unassigned sequence outputs are NULL and inherit the actual commit sequence.
+    let mut outputs =
+        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect);
+    assignments.extend(append_old_file_metadata(
+        &mut arena,
+        &child_outputs,
+        &mut outputs,
+        file_metadata,
+        control,
+    )?);
     build_change_expand(
         distributed,
         arena,
-        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect),
+        outputs,
         effect.column_id,
         vec![crate::optimizer::operator::ChangeEventSpec {
             predicate: None,
@@ -1891,6 +2093,7 @@ fn build_merge_change_event_expand(
     matched_delete: bool,
     not_matched_insert: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    file_metadata: Option<[usize; 2]>,
 ) -> Result<(crate::optimizer::OptimizedOperatorNode, usize), crate::compiler::SqlCompileError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
@@ -1937,6 +2140,17 @@ fn build_merge_change_event_expand(
             control,
         )?,
     ];
+    let mut outputs =
+        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect);
+    let old_file = append_old_file_metadata(
+        &mut arena,
+        &child_outputs,
+        &mut outputs,
+        file_metadata,
+        control,
+    )?;
+    delete_assignments.extend(old_file.iter().cloned());
+    reuse_assignments.extend(old_file);
     let mut fresh_assignments = Vec::with_capacity(targets.len());
     for (name, output) in &targets {
         delete_assignments.push(output_expr(
@@ -2021,14 +2235,8 @@ fn build_merge_change_event_expand(
             .to_string()
             .into());
     }
-    let expanded = build_change_expand(
-        distributed,
-        arena,
-        change_output_columns(&file, &pos, &targets, &row_id, &last_sequence, &effect),
-        effect.column_id,
-        events,
-    )
-    .map_err(crate::compiler::SqlCompileError::Compilation)?;
+    let expanded = build_change_expand(distributed, arena, outputs, effect.column_id, events)
+        .map_err(crate::compiler::SqlCompileError::Compilation)?;
     Ok((expanded, applicability_ordinal))
 }
 
@@ -2970,6 +3178,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plain_delete_emits_exactly_one_event_per_selected_row() {
+        use crate::optimizer::operator::{Operator, ValuesOp};
+        use arrow::datatypes::{DataType, Fields};
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        let mut producer = mor_match_producer();
+        producer.output_columns = [
+            ("file_slot", DataType::Utf8, false),
+            ("position_slot", DataType::Int64, false),
+            ("historical_spec_slot", DataType::Int32, false),
+            (
+                "historical_partition_slot",
+                DataType::Struct(Fields::empty()),
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (name, ty, nullable))| crate::analysis::OutputColumn {
+                column_id: crate::column_id::ColumnId(index as u32 + 1),
+                name: name.to_owned(),
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, nullable),
+                is_internal: true,
+            },
+        )
+        .collect();
+        producer.op = Operator::PhysicalValues(ValuesOp {
+            rows: vec![],
+            columns: producer.output_columns.clone(),
+        });
+        let expanded = super::build_delete_change_event_expand(
+            producer.clone(),
+            [0, 1, 2, 3],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let Operator::PhysicalChangeEventExpand(expand) = expanded.op else {
+            panic!("expected change events")
+        };
+        assert_eq!(expand.events.len(), 1);
+        let event = &expand.events[0];
+        assert_eq!(event.effect, ConnectorRowMutationEffect::Delete);
+        assert!(event.predicate.is_none());
+        assert_eq!(event.assignments.len(), 4);
+        assert_eq!(expanded.output_columns[2].name, "_spec_id");
+        assert!(!expanded.output_columns[2].value_type.nullable());
+        assert_eq!(expanded.output_columns[3].name, "_partition");
+        assert!(expanded.output_columns[3].value_type.nullable());
+        assert!(
+            super::build_delete_change_event_expand(
+                producer,
+                [0, 2, 1, 3],
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mor_update_and_merge_carry_old_file_slots_only_on_deletion() {
+        use crate::optimizer::operator::Operator;
+        use arrow::datatypes::{DataType, Fields};
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        let mut producer = mor_match_producer();
+        let first = producer.output_columns.len();
+        for (index, ty) in [DataType::Int32, DataType::Struct(Fields::empty())]
+            .into_iter()
+            .enumerate()
+        {
+            let column = crate::analysis::OutputColumn {
+                column_id: crate::column_id::ColumnId((first + index + 1) as u32),
+                name: format!("old_file_slot_{index}"),
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
+                is_internal: true,
+            };
+            producer.output_columns.push(column.clone());
+            let Operator::PhysicalValues(values) = &mut producer.op else {
+                unreachable!()
+            };
+            values.columns.push(column);
+        }
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let targets = [column("id")];
+        let file_metadata = Some([first, first + 1]);
+        let update = super::build_update_change_event_expand(
+            producer.clone(),
+            &targets,
+            &control,
+            file_metadata,
+        )
+        .unwrap();
+        let (merge, _) = super::build_merge_change_event_expand(
+            producer,
+            &targets,
+            true,
+            true,
+            true,
+            &control,
+            file_metadata,
+        )
+        .unwrap();
+        for expanded in [update, merge] {
+            let Operator::PhysicalChangeEventExpand(expand) = expanded.op else {
+                panic!("expected change events")
+            };
+            let outputs = &expanded.output_columns;
+            let specs = &outputs[outputs.len() - 3];
+            let partition = &outputs[outputs.len() - 2];
+            assert_eq!(
+                (specs.name.as_str(), partition.name.as_str()),
+                ("_spec_id", "_partition")
+            );
+            for event in expand.events {
+                let retained = event
+                    .assignments
+                    .iter()
+                    .filter(|assignment| {
+                        [specs.column_id, partition.column_id]
+                            .contains(&assignment.output_column_id)
+                    })
+                    .count();
+                assert_eq!(
+                    retained,
+                    if event.effect == ConnectorRowMutationEffect::Insert {
+                        0
+                    } else {
+                        2
+                    }
+                );
+            }
+        }
+    }
+
     fn assert_replace_inherits_sequence_and_preserves_row_id(
         producer: &crate::optimizer::OptimizedOperatorNode,
     ) {
@@ -3051,6 +3393,7 @@ mod tests {
                     false,
                     false,
                     &crate::compiler::SqlCompileControl::unbounded(),
+                    None,
                 )
                 .unwrap()
                 .0
@@ -3059,6 +3402,7 @@ mod tests {
                     input,
                     &columns,
                     &crate::compiler::SqlCompileControl::unbounded(),
+                    None,
                 )
                 .unwrap()
             };
@@ -3123,6 +3467,7 @@ mod tests {
             mor_match_producer(),
             &columns,
             &crate::compiler::SqlCompileControl::unbounded(),
+            None,
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
@@ -3144,6 +3489,7 @@ mod tests {
             true,
             true,
             &crate::compiler::SqlCompileControl::unbounded(),
+            None,
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
@@ -3197,9 +3543,13 @@ mod tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let columns = [column("id")];
         for renamed_child_outputs in [false, true] {
-            let producer =
-                super::build_update_change_event_expand(mor_match_producer(), &columns, &control)
-                    .unwrap();
+            let producer = super::build_update_change_event_expand(
+                mor_match_producer(),
+                &columns,
+                &control,
+                None,
+            )
+            .unwrap();
             let mut physical =
                 crate::planner::optimizer_bridge::to_physical_plan(&producer).unwrap();
             if renamed_child_outputs {
@@ -3259,6 +3609,7 @@ mod tests {
                 matched_delete,
                 true,
                 &control,
+                None,
             )
             .unwrap();
             let Operator::PhysicalProject(project) = &producer.children[0].op else {
@@ -3390,6 +3741,7 @@ mod tests {
             false,
             false,
             &crate::compiler::SqlCompileControl::unbounded(),
+            None,
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&expanded);
@@ -4593,9 +4945,13 @@ mod tests {
                 &mut node,
                 std::sync::Arc::new(crate::optimizer::scalar::ScalarArena::new()),
             );
-            let expanded =
-                super::build_update_change_event_expand(node, &[column("k")], &RefuseUnusedWide)
-                    .expect("selected new value skips missing or refused old value");
+            let expanded = super::build_update_change_event_expand(
+                node,
+                &[column("k")],
+                &RefuseUnusedWide,
+                None,
+            )
+            .expect("selected new value skips missing or refused old value");
             let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) =
                 &expanded.op
             else {

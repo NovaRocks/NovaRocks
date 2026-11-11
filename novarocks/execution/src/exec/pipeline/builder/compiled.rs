@@ -910,8 +910,16 @@ fn build_node(
                     format!("missing exchange binding for compiled receiver node {receiver}"),
                 )
             })?;
-            let source: Box<dyn OperatorFactory> =
-                Box::new(ExchangeSourceFactory::new_compiled(node_id, binding));
+            let mut source = ExchangeSourceFactory::new_compiled(node_id, binding);
+            if program.exchange_inputs().get(&id).is_some_and(|input| {
+                matches!(
+                    input.role,
+                    novarocks_local_program::ProgramOutputRole::PositionShards { .. }
+                )
+            }) {
+                source = source.with_position_shards();
+            }
+            let source: Box<dyn OperatorFactory> = Box::new(source);
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -1183,10 +1191,19 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
-        ProgramNodeKind::PositionShard { .. } => Err(program_failure(
-            FragmentBindingErrorKind::InvalidAssignment,
-            "Position shard aggregation has no installed runtime",
-        )),
+        ProgramNodeKind::PositionShard {
+            inputs,
+            output_slots,
+            ..
+        } => build_position_shards(
+            program,
+            id,
+            node_id,
+            (inputs, output_slots),
+            ctx,
+            error,
+            ordered,
+        ),
         ProgramNodeKind::ChangeEventExpand { input, .. } => {
             let factory = CompiledChangeEventProcessorFactory::try_new(
                 Arc::clone(program),
@@ -1264,6 +1281,107 @@ fn build_node(
             .collect();
     }
     Ok(build)
+}
+
+/// All contribution receivers feed one file-hash exchange whose producer
+/// roster includes the actual drivers of every input pipeline.
+fn build_position_shards(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node_id: i32,
+    ports: (
+        &[novarocks_local_program::ProgramPositionShardInput],
+        &[novarocks_types::SlotId; 9],
+    ),
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
+    use crate::exec::operators::position_shard::PositionShardFactory;
+    use novarocks_type_contract::FunctionValueType;
+
+    let invalid = |detail| program_failure(FragmentBindingErrorKind::InvalidAssignment, detail);
+    let (inputs, output_slots) = ports;
+    let nodes = program.graph().nodes();
+    let output = nodes[id.index()].output_layout();
+    if inputs.is_empty() || output.slots() != output_slots {
+        return Err(invalid(
+            "Position shard output or contribution ports differ",
+        ));
+    }
+
+    let mut key = None;
+    let mut builds = Vec::with_capacity(inputs.len());
+    let mut producers = 0usize;
+    for input in inputs {
+        let child = nodes
+            .get(input.input.index())
+            .ok_or_else(|| invalid("Missing position contribution input"))?;
+        let layout = child.output_layout();
+        if !matches!(child.kind(), ProgramNodeKind::ExchangeSource { .. })
+            || layout.slots() != [input.file, input.position, input.spec_id, input.partition]
+        {
+            return Err(invalid(
+                "Position contribution differs from its exact receiver layout",
+            ));
+        }
+        let ty = layout
+            .value_binding(input.file)
+            .ok_or_else(|| invalid("Position contribution has no frozen file key type"))?;
+        let ty = FunctionValueType::try_from_typed_binding(ty.clone())
+            .map_err(ExecutionFailure::from_domain)?;
+        if key.as_ref().is_some_and(|expected| expected != &ty) {
+            return Err(invalid(
+                "Position contributions have different file key types",
+            ));
+        }
+        key.get_or_insert(ty);
+        let build = build_node(program, input.input, ctx, error, ordered)?;
+        let dop = usize::try_from(build.pipeline.dop)
+            .map_err(|_| invalid("Invalid position contribution producer width"))?;
+        producers = producers
+            .checked_add(dop)
+            .ok_or_else(|| invalid("Position contribution producer count overflow"))?;
+        builds.push(build);
+    }
+
+    let dop = ctx.pipeline_dop;
+    let partitions = usize::try_from(dop).map_err(|_| invalid("Invalid position shard DOP"))?;
+    let key = key.ok_or_else(|| invalid("Position shard has no file key"))?;
+    let exchanger = LocalExchanger::new_with_limits(
+        partitions,
+        producers,
+        LocalExchangePartitionSpec::HierarchicalFileInput(key),
+        ctx.local_exchange_buffer_mem_limit_per_driver,
+        ctx.local_exchange_max_buffered_rows,
+    );
+    let mut extra_pipelines = Vec::new();
+    for mut build in builds {
+        build
+            .pipeline
+            .factories
+            .push(Box::new(LocalExchangeSinkFactory::new(
+                node_id,
+                Arc::clone(&exchanger),
+            )));
+        build.pipeline.needs_sink = false;
+        extra_pipelines.push(build.pipeline);
+        extra_pipelines.append(&mut build.extra_pipelines);
+    }
+    let source = Box::new(LocalExchangeSourceFactory::new(
+        node_id, partitions, exchanger,
+    ));
+    let mut pipeline = new_source_pipeline_with_dop(ctx, source, dop);
+    pipeline.factories.push(Box::new(PositionShardFactory::new(
+        output.clone(),
+        Arc::clone(error),
+        dop,
+    )));
+    Ok(PipelineBuildResult {
+        pipeline,
+        extra_pipelines,
+        stream: StreamDesc::any(dop),
+    })
 }
 
 /// UnionAll as the compiler lowers it: every input is that branch's

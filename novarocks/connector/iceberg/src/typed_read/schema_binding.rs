@@ -37,6 +37,9 @@
 //! There is no name fallback, no ordinal fallback, and no implicit widening
 //! outside the promotions Iceberg actually defines.
 
+pub(crate) mod mutation_partition;
+pub(crate) use mutation_partition::MutationMetadataSchema;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -251,6 +254,8 @@ pub enum IcebergColumnSource {
     /// An identity partition value frozen on the split. `None` is a real null
     /// partition value, not a missing fact.
     IdentityPartitionConstant(Option<Literal>),
+    MutationSpecId(i32),
+    MutationPartition(Vec<Option<Literal>>),
     /// The frozen table schema's initial default for this field.
     InitialDefault,
     /// A typed null, legal only for a nullable field.
@@ -436,6 +441,17 @@ impl IcebergSchemaBinding {
                 IcebergColumnSource::IdentityPartitionConstant(value) => {
                     partition_constant(value.as_ref(), bound.target.as_ref(), row_count)?
                 }
+                IcebergColumnSource::MutationSpecId(spec_id) => {
+                    Arc::new(arrow::array::Int32Array::from(vec![*spec_id; row_count]))
+                }
+                IcebergColumnSource::MutationPartition(values) => {
+                    let DataType::Struct(fields) = bound.target.data_type() else {
+                        return Err(corrupt(
+                            "Iceberg mutation partition lost its Struct carrier",
+                        ));
+                    };
+                    mutation_partition::materialize(values, fields, row_count)?
+                }
                 IcebergColumnSource::InitialDefault => {
                     build_iceberg_default_array(bound.target.as_ref(), row_count)
                         .map_err(|error| corrupt(format!("iceberg initial default: {error}")))?
@@ -515,18 +531,36 @@ pub fn bind_scan_columns(
     let mut columns = Vec::with_capacity(request.columns.len());
     let mut physical_base_field_ids = Vec::new();
     for handle in request.columns {
-        let bound = bind_one_column(
-            handle,
-            &read_schema,
-            &physical,
-            mapped_physical.as_ref(),
-            &identity_partitions,
-            stored_row_lineage,
-        )?;
+        let bound = if mutation_partition::is_file_metadata(handle.base_field_id()) {
+            let spec = request
+                .partition_spec
+                .ok_or_else(|| corrupt("Iceberg mutation metadata has no bound file spec"))?;
+            let values = request
+                .partition_values
+                .ok_or_else(|| corrupt("Iceberg mutation metadata has no bound file partition"))?;
+            let (target, source) = mutation_partition::bind(handle, spec, values)?;
+            IcebergBoundColumn {
+                handle: handle.clone(),
+                base_target: Arc::clone(&target),
+                target,
+                source,
+            }
+        } else {
+            bind_one_column(
+                handle,
+                &read_schema,
+                &physical,
+                mapped_physical.as_ref(),
+                &identity_partitions,
+                stored_row_lineage,
+            )?
+        };
         let projected = match &bound.source {
             IcebergColumnSource::Physical { base_field_id, .. } => Some(*base_field_id),
             IcebergColumnSource::StoredRowLineage(column) => Some(column.field_id()),
             IcebergColumnSource::IdentityPartitionConstant(_)
+            | IcebergColumnSource::MutationSpecId(_)
+            | IcebergColumnSource::MutationPartition(_)
             | IcebergColumnSource::InitialDefault
             | IcebergColumnSource::TypedNull
             | IcebergColumnSource::Metadata(_) => None,

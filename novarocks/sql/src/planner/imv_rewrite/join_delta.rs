@@ -1242,6 +1242,7 @@ fn is_iceberg_row_identity_metadata_output(column: &OutputColumn) -> bool {
         || column
             .name
             .eq_ignore_ascii_case(crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)
+        || super::target_locator::is_target_file_metadata(&column.name)
 }
 
 pub(crate) fn mark_delta_scan(

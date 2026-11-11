@@ -27,6 +27,8 @@ use novarocks_connector_contract::{
 use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
 use std::{alloc::Layout, collections::HashMap};
 
+use crate::typed_read::schema_binding::mutation_partition;
+
 type CreationFailure = PureProviderCompileError<ConnectorError>;
 fn invalid_creation(message: &'static str) -> CreationFailure {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message).into()
@@ -110,9 +112,17 @@ pub(super) fn publish(
     let mut facts_count = 0usize;
     for column in columns {
         let field = resolve(schema.as_ref(), column, creation)?;
+        let mutation_type = if mutation_partition::is_file_metadata(column.base_field_id()) {
+            creation.work(column.type_json().len())?;
+            Some(parse_type(column.type_json(), "type_json")?)
+        } else {
+            None
+        };
         facts_count = facts_count
             .checked_add(count_fields(
-                field.map(|f| f.field_type.as_ref()),
+                field
+                    .map(|f| f.field_type.as_ref())
+                    .or(mutation_type.as_ref()),
                 1,
                 creation,
             )?)
@@ -146,10 +156,15 @@ pub(super) fn publish(
         };
         validate_column_declaration(source, column, schema.as_ref(), table, relation, creation)?;
         let empty = Default::default();
+        let column_nominals = if mutation_partition::is_file_metadata(source.id) {
+            &empty
+        } else {
+            nominal.unwrap_or(&empty)
+        };
         let declared = crate::schema_mapping::typed_value::from_field(
             source,
             column.nullable(),
-            nominal.unwrap_or(&empty),
+            column_nominals,
             column.scalar_integer_domain(),
             creation,
         )?;
@@ -212,6 +227,7 @@ fn resolve<'a>(
 ) -> Result<Option<&'a NestedField>, CreationFailure> {
     if IcebergMetadataColumn::from_field_id(column.base_field_id()).is_some()
         || column.base_field_id() == ICEBERG_CHANGE_OP_FIELD_ID
+        || mutation_partition::is_file_metadata(column.base_field_id())
         || schema.is_none()
     {
         creation.work(1)?;
@@ -323,6 +339,29 @@ fn validate_column_declaration(
                     "Iceberg metadata column differs from its original COW source",
                 ));
             }
+        }
+    } else if mutation_partition::is_file_metadata(source.id) {
+        let table = table
+            .ok_or_else(|| invalid_creation("Iceberg mutation metadata needs a table source"))?;
+        creation.work(table.mutation_partition_type_json().map_or(0, str::len))?;
+        let schema = table.mutation_metadata()?.ok_or_else(|| {
+            invalid_creation("Iceberg table did not declare mutation file metadata")
+        })?;
+        let expected = if source.id == mutation_partition::SPEC_ID {
+            schema.spec_field()
+        } else {
+            schema.partition_field()
+        };
+        if !matches!(relation, IcebergRuntimeRelation::Table(_))
+            || table.frozen_cow_source().is_some()
+            || !column.is_base_column()
+            || source.name != expected.name
+            || source.required != expected.required
+            || source.field_type != expected.field_type
+        {
+            return Err(invalid_creation(
+                "Iceberg mutation metadata differs from its pinned declaration",
+            ));
         }
     } else if source.id == ICEBERG_CHANGE_OP_FIELD_ID {
         if !matches!(relation, IcebergRuntimeRelation::ChangeWindow(_))

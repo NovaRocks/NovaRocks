@@ -279,6 +279,20 @@ fn build_target_locator_join(
         novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
     )?;
 
+    let file_metadata = target_file_metadata_columns(ctx)
+        .iter()
+        .map(|field| {
+            let value_type = field
+                .declared_value_type()
+                .map_err(|error| error.to_string())?;
+            Ok(output_column(
+                allocate_imv_column(ctx, &field.name, value_type.clone())?,
+                &field.name,
+                value_type,
+                true,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let right_scan = build_target_locator_scan(
         ext,
         &input,
@@ -288,6 +302,7 @@ fn build_target_locator_join(
         right_pos_id,
         right_row_id_id,
         right_last_updated_seq_id,
+        &file_metadata,
     )?;
     let join = LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
@@ -339,6 +354,14 @@ fn build_target_locator_join(
         crate::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
     ));
+    for field in file_metadata {
+        let mut item = project_item_for_output_column(&field);
+        item.expr.value_type = field
+            .value_type
+            .with_nullable(true)
+            .map_err(|error| error.to_string())?;
+        items.push(item);
+    }
     items.extend(
         input
             .output
@@ -388,6 +411,17 @@ fn build_new_output_locator_projection(
             output_column_id: allocate_imv_column(ctx, name, value_type)?,
         });
     }
+    for field in target_file_metadata_columns(ctx) {
+        let value_type = nullable_file_metadata_value(field)?;
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                value_type: value_type.clone(),
+            },
+            output_name: field.name.clone(),
+            output_column_id: allocate_imv_column(ctx, &field.name, value_type)?,
+        });
+    }
     items.extend(
         input
             .output
@@ -414,6 +448,7 @@ fn build_target_locator_scan(
     right_pos_id: ColumnId,
     right_row_id_id: ColumnId,
     right_last_updated_seq_id: ColumnId,
+    file_metadata: &[OutputColumn],
 ) -> Result<LogicalPlanNode, String> {
     let target = &ext.snapshot.target;
     let mut columns = vec![
@@ -434,7 +469,7 @@ fn build_target_locator_scan(
             .map_err(|error| format!("invalid IMV locator branch declaration: {error}"))?,
         );
     }
-    let metadata_columns = vec![
+    let mut metadata_columns = vec![
         ColumnDef {
             name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
             data_type: DataType::Utf8,
@@ -464,6 +499,9 @@ fn build_target_locator_scan(
             logical_type: None,
         },
     ];
+    if let Some(metadata) = &ext.snapshot.target_file_metadata {
+        metadata_columns.extend(metadata.iter().cloned());
+    }
     let mut scan_columns = vec![output_column(
         right_apply_key_id,
         &input.target_apply_key_column,
@@ -503,6 +541,7 @@ fn build_target_locator_scan(
         true,
     ));
 
+    scan_columns.extend_from_slice(file_metadata);
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::scan(PlanScanNode {
             database: target.namespace.clone(),
@@ -620,12 +659,35 @@ fn reserved_locator_output_name(columns: &[OutputColumn]) -> Option<&str> {
             || column
                 .name
                 .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_POS_COL)
+            || is_target_file_metadata(&column.name)
         {
             Some(column.name.as_str())
         } else {
             None
         }
     })
+}
+
+pub(super) fn target_file_metadata_columns<'ctx>(
+    ctx: &'ctx RewriteContext<'_>,
+) -> &'ctx [ColumnDef] {
+    ctx.extension::<ImvExtension>()
+        .and_then(|ext| ext.snapshot.target_file_metadata.as_deref())
+        .map_or(&[], |fields| fields.as_slice())
+}
+
+pub(super) fn is_target_file_metadata(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_spec_id") || name.eq_ignore_ascii_case("_partition")
+}
+
+pub(super) fn nullable_file_metadata_value(
+    field: &ColumnDef,
+) -> Result<novarocks_type_contract::FunctionValueType, String> {
+    field
+        .declared_value_type()
+        .map_err(|error| error.to_string())?
+        .with_nullable(true)
+        .map_err(|error| error.to_string())
 }
 
 fn subtree_has_target_locator_join(plan: &LogicalPlanNode) -> bool {
@@ -785,6 +847,56 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[test]
+    fn target_locator_projects_signed_historical_fields_before_action() {
+        let columns = vec![
+            target_column(HIDDEN_APPLY_KEY_COLUMN_NAME, DataType::Int64, false),
+            target_column(BRANCH_ID_COLUMN_NAME, DataType::Int32, false),
+        ];
+        let mut ctx = context(columns);
+        let mut extension = ctx.extension::<ImvExtension>().unwrap().clone();
+        let partition = DataType::Struct(
+            vec![Arc::new(arrow::datatypes::Field::new(
+                "old_region",
+                DataType::Utf8,
+                true,
+            ))]
+            .into(),
+        );
+        Arc::make_mut(&mut extension.snapshot).target_file_metadata = Some(Arc::new([
+            target_column("_spec_id", DataType::Int32, false),
+            target_column("_partition", partition.clone(), true),
+        ]));
+        ctx.set_extension(extension);
+        let source = source_plan(false, false);
+        let input = target_locator_join_input(&source, &ctx).unwrap().unwrap();
+        let plan = build_target_locator_join(source, input, &ctx).unwrap();
+        let LogicalPlanKind::Scan(scan) = &plan.unary_input().right().kind else {
+            panic!("expected target scan");
+        };
+        let [spec, row] = &scan.columns[scan.columns.len() - 2..] else {
+            panic!("expected exact mutation metadata suffix");
+        };
+        assert_eq!(
+            (spec.name.as_str(), row.name.as_str()),
+            ("_spec_id", "_partition")
+        );
+        assert!(!spec.value_type.nullable());
+        assert_eq!(row.value_type.data_type(), &partition);
+
+        let LogicalPlanKind::Project(project) = &plan.kind else {
+            panic!("expected locator projection")
+        };
+        let [old_spec, old_row, effect] = &project.items[project.items.len() - 3..] else {
+            panic!("expected locator metadata before the action");
+        };
+        assert_eq!(old_spec.output_column_id, spec.column_id);
+        assert_eq!(old_row.output_column_id, row.column_id);
+        assert!(old_spec.expr.value_type.nullable());
+        assert_eq!(old_row.expr.value_type.data_type(), &partition);
+        assert_eq!(effect.output_name, ImvActionColumn::NAME);
     }
 
     #[test]

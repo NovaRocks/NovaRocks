@@ -188,6 +188,16 @@ impl DeleteCandidateIndex {
     pub(crate) fn try_new_checked<E>(
         domain: Arc<ReadDomain>,
         observation: DeleteObservation,
+        active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
+        Self::from_observed_facts_checked(domain, observation.facts, active)
+    }
+
+    /// Combine facts from precisely the selected, independently closed sources.
+    /// Preserve multiplicity across sources so two live DVs for one target fail.
+    pub(crate) fn from_observed_facts_checked<E>(
+        domain: Arc<ReadDomain>,
+        facts: impl IntoIterator<Item = Arc<DeleteFact>>,
         mut active: impl FnMut() -> std::result::Result<(), E>,
     ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
         active().map_err(super::ConstructionFailure::Original)?;
@@ -196,7 +206,7 @@ impl DeleteCandidateIndex {
         let mut validated_groups = HashSet::new();
         let mut groups: HashMap<BucketKind, Vec<Arc<DeleteFact>>> = HashMap::new();
         let mut deletion_vectors = HashMap::new();
-        for fact in observation.facts {
+        for fact in facts {
             active().map_err(super::ConstructionFailure::Original)?;
             validate_partition_binding(&partition_bindings, fact.partition())?;
             let kind = match fact.kind() {

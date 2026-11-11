@@ -193,6 +193,7 @@ pub struct IcebergTableHandle {
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
     frozen_cow_source: Option<super::cow_source_proof::IcebergCowSourceProof>,
+    mutation_partition_type_json: Option<Arc<str>>,
 }
 
 impl IcebergTableHandle {
@@ -337,7 +338,88 @@ impl IcebergTableHandle {
             storage_properties,
             pinned_data_files,
             frozen_cow_source: None,
+            mutation_partition_type_json: None,
         })
+    }
+
+    pub(crate) fn with_mutation_partition_type(
+        mut self,
+        json: Option<String>,
+    ) -> Result<Self, ConnectorError> {
+        if json
+            .as_ref()
+            .is_some_and(|json| json.is_empty() || json.len() > MAX_JSON_BYTES)
+        {
+            return Err(invalid(
+                "Iceberg mutation partition JSON must be non-empty and bounded",
+            ));
+        }
+        self.mutation_partition_type_json = json.map(Arc::from);
+        if let Some(schema) = self.mutation_metadata()? {
+            use crate::iceberg::spec::FormatVersion;
+            let version = match self.format_version {
+                2 => FormatVersion::V2,
+                3 => FormatVersion::V3,
+                _ => {
+                    return Err(invalid(
+                        "Iceberg mutation metadata requires format v2 or v3",
+                    ));
+                }
+            };
+            let specs = self
+                .partition_spec_jsons
+                .keys()
+                .map(|id| self.parse_partition_spec(*id))
+                .collect::<Result<Vec<_>, _>>()?;
+            if let Some(domain) = &self.read_domain {
+                let expected = super::schema_binding::MutationMetadataSchema::from_endpoint(
+                    domain.endpoint(),
+                    version,
+                    specs,
+                )?;
+                if !schema.can_project_from(&expected, version) {
+                    return Err(invalid(
+                        "Iceberg mutation partition differs from the pinned read domain",
+                    ));
+                }
+            } else {
+                let field_ids = specs
+                    .iter()
+                    .flat_map(|spec| spec.fields().iter().map(|field| field.field_id))
+                    .collect::<BTreeSet<_>>();
+                if !field_ids.into_iter().eq(schema
+                    .partition_type()
+                    .fields()
+                    .iter()
+                    .map(|field| field.id))
+                {
+                    return Err(invalid(
+                        "Iceberg empty mutation partition differs from its frozen spec inventory",
+                    ));
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn mutation_partition_type_json(&self) -> Option<&str> {
+        self.mutation_partition_type_json.as_deref()
+    }
+
+    pub(crate) fn mutation_metadata(
+        &self,
+    ) -> Result<Option<super::schema_binding::MutationMetadataSchema>, ConnectorError> {
+        self.mutation_partition_type_json
+            .as_deref()
+            .map(|json| {
+                let partition = crate::metadata_json::from_str(json).map_err(|error| {
+                    invalid(format!(
+                        "Iceberg mutation partition JSON is invalid: {error}"
+                    ))
+                })?;
+                super::schema_binding::MutationMetadataSchema::from_type(partition)
+            })
+            .transpose()
     }
 
     pub fn frozen_cow_source(&self) -> Option<&super::cow_source_proof::IcebergCowSourceProof> {
@@ -697,6 +779,7 @@ impl IcebergTableHandle {
                 .as_deref()
                 .map(super::split::encode_read_domain),
             table_schema_json: self.table_schema_json.to_string(),
+            mutation_partition_type_json: self.mutation_partition_type_json().map(str::to_owned),
             spec_id: self.spec_id,
             partition_spec_jsons: self.partition_spec_jsons.clone(),
             format_version: self.format_version,
@@ -782,6 +865,7 @@ impl IcebergTableHandle {
                 .map(IcebergPinnedDataFileSet::from_proto)
                 .transpose()?,
         })?
+        .with_mutation_partition_type(raw.mutation_partition_type_json.clone())?
         .with_frozen_cow_source(
             raw.frozen_cow_source
                 .as_ref()
@@ -1318,6 +1402,40 @@ pub(super) mod tests {
         let encoded = handle.to_proto();
         let decoded = IcebergTableHandle::from_proto(&encoded).expect("decoded handle");
         assert_eq!(decoded, handle);
+    }
+
+    #[test]
+    fn empty_table_freezes_mutation_partition_without_a_snapshot() {
+        use crate::iceberg::spec::StructType;
+        let schema = partitioned_schema();
+        let spec = identity_partition_spec(&schema);
+        let partition = spec.partition_type(&schema).unwrap();
+        let mut parameters = table_handle_params(&schema, Some(&spec));
+        parameters.snapshot_id = None;
+        parameters.read_domain = None;
+        let handle = IcebergTableHandle::try_new(parameters).unwrap();
+        assert!(
+            handle
+                .clone()
+                .with_mutation_partition_type(Some(
+                    serde_json::to_string(&StructType::new(vec![])).unwrap()
+                ))
+                .is_err(),
+            "empty E does not erase the historical spec inventory"
+        );
+        let handle = handle
+            .with_mutation_partition_type(Some(serde_json::to_string(&partition).unwrap()))
+            .unwrap();
+        let decoded = IcebergTableHandle::from_proto(&handle.to_proto()).unwrap();
+        assert_eq!(decoded, handle);
+        assert_eq!(
+            decoded
+                .mutation_metadata()
+                .unwrap()
+                .unwrap()
+                .partition_type(),
+            &partition
+        );
     }
 
     #[test]

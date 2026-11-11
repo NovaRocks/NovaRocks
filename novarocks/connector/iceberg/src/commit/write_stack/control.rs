@@ -37,18 +37,19 @@
 
 mod logical_rows;
 mod publication;
+#[cfg(test)]
+pub(crate) use publication::observed_materialized_staging_fixture;
 mod recovery_codec;
 
 // Design: ADR-0177 (docs/adr/ADR-0177-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
-use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteFinishRequestRef,
-    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
-    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    ConnectorMutationContributionGroup, ConnectorWriteBeginRequest, ConnectorWriteFinishRequest,
+    ConnectorWriteFinishRequestRef, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor,
+    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteStatisticsContract,
@@ -70,18 +71,16 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::error::CatalogOutcome;
 use crate::commit::write_stack::domain::{
-    IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergContentRange,
+    IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCreationScope,
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEmptyWriteDecision,
-    IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
-    IcebergWriteTableFacts, IcebergWriterOutput, corrupt, invalid,
+    IcebergMutationReadRecipe, IcebergMutationSnapshot, IcebergWriteCommitSession,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
+    IcebergWriterOutput, corrupt, invalid,
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, IcebergSessionMaterial,
     plan_copy_on_write_branches, plan_distributed_rewrite_branches,
     plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
-};
-use crate::commit::write_stack::old_delete::{
-    IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
 };
 use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
@@ -315,25 +314,62 @@ pub(crate) fn validate_prepared_set<'a>(
     let sealed = handle
         .targets()
         .iter()
-        .map(|target| (target.ordinal(), target.branch()))
+        .map(|target| (target.ordinal(), target))
         .collect::<BTreeMap<_, _>>();
     let mut identities = BTreeSet::new();
     let mut delete_artifact_owner: BTreeMap<&str, WriteTargetOrdinal> = BTreeMap::new();
+    let mut physical_creations = BTreeMap::new();
+    let mut creation_ids = BTreeMap::new();
     let mut validated = Vec::with_capacity(prepared.fragments().len());
 
     for (ordinal, neutral) in prepared.fragments() {
         let fragment = adapter.commit_fragment(neutral)?;
-        if matches!(fragment.artifact(), IcebergCommitArtifact::FinalDelete(_)) {
+        if matches!(fragment.artifact(), IcebergCommitArtifact::FinalDelete(_))
+            && handle.mutation_read().is_none()
+        {
             return Err(invalid(
-                "Iceberg position materialization has no installed publication owner",
+                "Iceberg position materialization requires its pinned write endpoint",
             ));
         }
-        let branch = sealed.get(ordinal).copied().ok_or_else(|| {
+        if let Some(scope) = handle.creation_scope()
+            && let Some(path) = fragment.new_object_path()
+        {
+            let receipt = fragment.creation().ok_or_else(|| {
+                corrupt("Iceberg received managed output lacks its original creation receipt")
+            })?;
+            if let Some(previous) = physical_creations.insert(path, (*ordinal, receipt)) {
+                if previous != (*ordinal, receipt) {
+                    return Err(corrupt(
+                        "Iceberg received creation facts disagree about a physical object",
+                    ));
+                }
+            } else {
+                let format = if fragment.branch()
+                    == crate::commit::write_stack::domain::IcebergWriteBranch::DeletionVector
+                {
+                    crate::delete_file::IcebergFileFormat::Puffin
+                } else {
+                    crate::delete_file::IcebergFileFormat::Parquet
+                };
+                if !prepared.admits_creation(*ordinal, receipt.physical())?
+                    || scope.identity(*receipt.physical(), path, format)? != receipt.identity()
+                    || creation_ids
+                        .insert(receipt.create_id(), path)
+                        .is_some_and(|previous| previous != path)
+                {
+                    return Err(corrupt(
+                        "Iceberg received object creation differs from its completed writer cohort",
+                    ));
+                }
+            }
+        }
+        let target = sealed.get(ordinal).copied().ok_or_else(|| {
             invalid(format!(
                 "Iceberg commit fragment names write target {} which this session never sealed",
                 ordinal.get()
             ))
         })?;
+        let branch = target.branch();
         if fragment.branch() != branch {
             return Err(invalid(format!(
                 "Iceberg commit fragment describes a {} artifact but write target {} drives the {} branch",
@@ -352,22 +388,49 @@ pub(crate) fn validate_prepared_set<'a>(
             // Exactly one delete artifact per referenced data file: Iceberg
             // permits one deletion vector per data file, and two merged
             // position-delete files would each claim to be the whole truth.
-            if delete_artifact_owner.insert(referenced, *ordinal).is_some() {
+            let distributed_v2 = handle.mutation_read().is_some()
+                && matches!(
+                    fragment.artifact(),
+                    IcebergCommitArtifact::PositionDeleteFile(_)
+                );
+            if !distributed_v2 && delete_artifact_owner.insert(referenced, *ordinal).is_some() {
                 return Err(corrupt(format!(
                     "Iceberg prepared write set stages more than one delete artifact for data file {referenced}"
                 )));
             }
-            let owner = handle.delete_owner().get(referenced).ok_or_else(|| {
-                invalid(format!(
-                    "Iceberg delete artifact references data file {referenced}, which this session never routed"
-                ))
+            if handle.mutation_read().is_some() {
+                match fragment.artifact() {
+                    IcebergCommitArtifact::FinalDelete(_) => {}
+                    IcebergCommitArtifact::PositionDeleteFile(_)
+                        if fragment.merged_old_references().is_empty() => {}
+                    _ => {
+                        return Err(corrupt(
+                            "Iceberg fixed delete endpoint received an obsolete delete artifact",
+                        ));
+                    }
+                }
+                validated.push(ValidatedFragment {
+                    ordinal: *ordinal,
+                    fragment,
+                });
+                continue;
+            }
+            let rewrite = target.position_rewrite().ok_or_else(|| {
+                invalid("Iceberg received a position artifact without a fixed mutation or rewrite")
             })?;
-            if owner != ordinal {
-                return Err(invalid(format!(
-                    "Iceberg delete artifact for data file {referenced} was staged by write target {} but the session routed it to {}",
-                    ordinal.get(),
-                    owner.get()
-                )));
+            let IcebergCommitArtifact::DeletionVector(vector) = fragment.artifact() else {
+                return Err(invalid(
+                    "Iceberg position rewrite must produce deletion vectors",
+                ));
+            };
+            if rewrite.path() != referenced
+                || rewrite.partition() != vector.partition()
+                || vector.cardinality() > rewrite.record_count()
+                || !vector.merged_old_references().is_empty()
+            {
+                return Err(corrupt(
+                    "Iceberg position rewrite output differs from its selected data file",
+                ));
             }
         }
         if matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(file)
@@ -384,52 +447,6 @@ pub(crate) fn validate_prepared_set<'a>(
         });
     }
     Ok(validated)
-}
-
-/// Verify that every delete artifact superseded exactly the old references the
-/// session froze for its data file.
-///
-/// This is the commit-side half of the D10 contract: the backend proved it read
-/// the frozen references, and the frontend proves the artifact it is about to
-/// commit accounts for all of them.
-///
-/// The check runs over the *staged* artifacts, never over the frozen map. The
-/// frozen map is a superset by construction: `freeze_old_delete_references`
-/// walks every data file of the base snapshot, because at `begin_write` the
-/// frontend cannot know which of them the statement's predicate will match. A
-/// merge-on-read writer stages a delete artifact only for the data files it
-/// actually deleted a row from, and the commit action carries every other data
-/// file's delete manifest through verbatim, so a frozen data file with no
-/// staged artifact keeps its existing deletes rather than losing them.
-/// Demanding one artifact per frozen data file would therefore refuse every
-/// `DELETE` that does not happen to touch the whole table.
-pub(crate) fn validate_merged_old_references(
-    plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
-    validated: &[ValidatedFragment<'_>],
-) -> Result<(), ConnectorError> {
-    for entry in validated {
-        let Some(referenced) = entry.fragment.referenced_data_file() else {
-            continue;
-        };
-        let frozen = plans
-            .get(&entry.ordinal)
-            .and_then(|files| files.get(referenced))
-            .ok_or_else(|| {
-                invalid(format!(
-                    "Iceberg delete artifact references data file {referenced}, which write target {} never froze",
-                    entry.ordinal.get()
-                ))
-            })?;
-        let observed = entry.fragment.merged_old_references();
-        if observed != frozen.as_slice() {
-            return Err(corrupt(format!(
-                "Iceberg delete artifact for {referenced} merged {} old references but the session froze {}",
-                observed.len(),
-                frozen.len()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn validate_statistics_artifacts(
@@ -681,10 +698,25 @@ fn written_file_from_fragment(
     fragment: &IcebergCommitFragment,
     metadata: &TableMetadata,
 ) -> Result<WrittenFile, ConnectorError> {
+    written_file_with_historical_partition(fragment, metadata, None)
+}
+
+fn written_file_with_historical_partition(
+    fragment: &IcebergCommitFragment,
+    metadata: &TableMetadata,
+    historical_partition: Option<&crate::iceberg::spec::StructType>,
+) -> Result<WrittenFile, ConnectorError> {
     let partition = fragment
         .partition()
         .ok_or_else(|| corrupt("Iceberg result has no written partition"))?;
-    let partition_values = decode_partition_values(partition, metadata)?;
+    let partition_values = match historical_partition {
+        Some(ty) => crate::write_descriptor::decode_partition_descriptor_with_type(
+            partition.descriptor(),
+            ty,
+        )
+        .map_err(|error| corrupt(error.detail_message()))?,
+        None => decode_partition_values(partition, metadata)?,
+    };
     let metrics = fragment
         .metrics()
         .ok_or_else(|| corrupt("Iceberg result has no written metrics"))?;
@@ -744,10 +776,22 @@ fn written_file_from_fragment(
             None,
             Some(file.equality_field_ids().to_vec()),
         ),
-        IcebergCommitArtifact::FinalDelete(_) => {
-            return Err(invalid(
-                "Iceberg position materialization has no installed publication owner",
-            ));
+        IcebergCommitArtifact::FinalDelete(effect) => {
+            let crate::commit::write_stack::domain::IcebergFinalDeleteKind::ReplacePositions(file) =
+                effect.kind()
+            else {
+                return Err(invalid("Iceberg pure removal has no written artifact"));
+            };
+            (
+                DataFileFormat::Puffin,
+                DataContentType::PositionDeletes,
+                Some(file.referenced_data_file().to_owned()),
+                None,
+                Some(file.content_range().offset()),
+                Some(file.content_range().size_in_bytes()),
+                Some(file.cardinality()),
+                None,
+            )
         }
     };
     Ok(WrittenFile {
@@ -1021,7 +1065,6 @@ impl IcebergWriteSessionControl {
         handle: &IcebergWriteCommitSession,
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         document_publication: Option<&novarocks_spi::connector::KeyedPublicationIntent>,
         context: &ConnectorRequestContext,
         needed_ready: Option<
@@ -1046,7 +1089,6 @@ impl IcebergWriteSessionControl {
         );
         validate_context(context)?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
-        validate_merged_old_references(frozen_old_references, &validated)?;
 
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
@@ -1263,7 +1305,6 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergWriteCommitSession,
         prepared: &ConnectorPreparedWriteSet,
-        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         validate_context(context)?;
@@ -1271,7 +1312,6 @@ impl IcebergWriteSessionControl {
             internal("Iceberg staged write session lost its frozen target metadata")
         })?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
-        validate_merged_old_references(frozen_old_references, &validated)?;
 
         // Claim the single terminal attempt before producing anything, so a
         // second finish cannot mint a second receipt for the same session.
@@ -2077,6 +2117,7 @@ pub(crate) fn session_plan_from_targets(
                 routing_proof,
                 rewrite_source,
                 rewrite_group_digest,
+                position_materialization,
             ) = target.into_parts();
             let statistics = write_statistics_contract(
                 &writer,
@@ -2099,6 +2140,10 @@ pub(crate) fn session_plan_from_targets(
                     .with_statistics_contract(statistics)?;
             let plan = match route {
                 Some(route) => plan.with_route(route),
+                None => plan,
+            };
+            let plan = match position_materialization {
+                Some(group) => plan.with_position_materialization(group),
                 None => plan,
             };
             let plan = match routing_proof {
@@ -2124,6 +2169,82 @@ pub(crate) fn session_plan_from_targets(
         }
         None => ConnectorWriteSessionPlan::try_new(commit, plans),
     }
+}
+
+fn position_contribution_group(
+    session: IcebergWriteSessionId,
+    target: &super::planning::IcebergWriteTargetPlan,
+) -> Result<(ConnectorMutationContributionGroup, ConnectorWriteInputShape), ConnectorError> {
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_connector_contract::ConnectorMutationContributionGroupId;
+    use novarocks_type_contract::FunctionValueType;
+
+    let route = target
+        .route()
+        .ok_or_else(|| invalid("Iceberg materialization lost its position route"))?;
+    let fields = target.input().fields_iter().collect::<Vec<_>>();
+    let [file, pos, spec, partition] = fields.as_slice() else {
+        return Err(invalid(
+            "Iceberg materialization lost its raw position fields",
+        ));
+    };
+    let raw = ConnectorWriteInputShape::PositionDelete {
+        identity_fields: vec![(*file).clone(), (*pos).clone()],
+        partition_source_fields: vec![(*spec).clone(), (*partition).clone()],
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.position-contribution.v1\0");
+    hasher.update(session.to_bytes());
+    hasher.update(target.ordinal().get().to_be_bytes());
+    let id = ConnectorMutationContributionGroupId::from_bytes(hasher.finalize().into());
+    let routes = if route.accepted_effects().len() == 1 {
+        vec![route.clone()]
+    } else {
+        use novarocks_connector_contract::ConnectorWriteRouteId;
+        use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
+        route
+            .accepted_effects()
+            .iter()
+            .map(|&effect| {
+                let mut hasher = Sha256::new();
+                hasher.update(route.route_id().to_bytes());
+                hasher.update([effect as u8]);
+                ConnectorWriteRouteFacts::try_new(
+                    ConnectorWriteRouteId::from_bytes(hasher.finalize().into()),
+                    vec![effect],
+                    route.input_ordinals().to_vec(),
+                    route.requirements().clone(),
+                    Vec::new(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let group = ConnectorMutationContributionGroup::try_new(id, raw, file.token(), routes)?;
+    let shard_fields = [
+        ("driver", DataType::Int64),
+        ("high32", DataType::Int32),
+        ("container", DataType::Int32),
+        ("index", DataType::Int64),
+        ("count", DataType::Int64),
+        ("bitmap", DataType::Binary),
+    ]
+    .into_iter()
+    .map(|(name, data_type)| {
+        let mut hasher = Sha256::new();
+        hasher.update(id.to_bytes());
+        hasher.update(name.as_bytes());
+        ConnectorWriteFieldBinding::try_new_typed(
+            ConnectorWriteFieldToken::from_bytes(hasher.finalize().into()),
+            Field::new(name, data_type.clone(), false),
+            FunctionValueType::new(data_type, false),
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let writer_input = ConnectorWriteInputShape::DeletionVector {
+        identity_fields: vec![(*file).clone(), (*spec).clone(), (*partition).clone()],
+        partition_source_fields: shard_fields,
+    };
+    Ok((group, writer_input))
 }
 
 fn collect_on_write_enabled(metadata: &TableMetadata) -> bool {
@@ -2326,13 +2447,6 @@ mod cow_begin_own;
 mod rewrite_begin;
 
 impl IcebergWriteSessionControl {
-    fn frozen_references_of(
-        &self,
-        handle: &IcebergWriteCommitSession,
-    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>> {
-        handle.frozen_old_references()
-    }
-
     async fn admit_async_with_rewrite_io(
         &self,
         request: &ConnectorWriteBeginRequest,
@@ -2410,6 +2524,13 @@ impl IcebergWriteSessionControl {
             ),
             _ => None,
         };
+        let fixed_position_read = match &request.flavor {
+            ConnectorWriteSessionFlavor::RowMutation => true,
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
+                *shape == ConnectorManagedPublicationShape::RowMutation
+            }
+            _ => false,
+        };
         let (table, metadata, cow_read_access) = match &staged {
             Some(staged) => {
                 if staged.namespace != namespace || staged.table != table_name {
@@ -2427,6 +2548,21 @@ impl IcebergWriteSessionControl {
                 // Begin must observe the catalog after planning, even when FE shares one request cache.
                 let physical = if let Some(io) = rewrite_io {
                     io.observe(namespace, table_name, &request.context).await
+                } else if fixed_position_read
+                    || matches!(
+                        &request.flavor,
+                        ConnectorWriteSessionFlavor::DistributedRewrite { .. }
+                    )
+                {
+                    self.runtime
+                        .observe_table_classified_for_request_with_snapshots_async(
+                            namespace,
+                            table_name,
+                            &request.context,
+                            crate::catalog::SnapshotLoading::All,
+                        )
+                        .await
+                        .map_err(|(_, message)| message)
                 } else if matches!(
                     &request.flavor,
                     ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
@@ -2437,19 +2573,6 @@ impl IcebergWriteSessionControl {
                             table_name,
                             &request.context,
                             crate::catalog::SnapshotLoading::Refs,
-                        )
-                        .await
-                        .map_err(|(_, message)| message)
-                } else if matches!(
-                    &request.flavor,
-                    ConnectorWriteSessionFlavor::DistributedRewrite { .. }
-                ) {
-                    self.runtime
-                        .observe_table_classified_for_request_with_snapshots_async(
-                            namespace,
-                            table_name,
-                            &request.context,
-                            crate::catalog::SnapshotLoading::All,
                         )
                         .await
                         .map_err(|(_, message)| message)
@@ -2634,15 +2757,37 @@ impl IcebergWriteSessionControl {
             // row-mutation family belongs to `prepare_row_mutation`, which a
             // publication never calls: it admits a MERGE's match contract, and
             // a refresh's change stream is not matched against the target.
-            let snapshot = crate::commit::write_shared::snapshot_token(base_snapshot_id);
-            let expected = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-                "iceberg/write-base/v1/{}/{}/{snapshot}",
-                metadata.uuid(),
-                target_ref
-            )))?;
+            let expected = if fixed_position_read {
+                crate::commit::write_shared::position_mutation_base(
+                    &metadata,
+                    table.as_ref().and_then(|table| table.metadata_location()),
+                    target_ref,
+                    base_snapshot_id,
+                )?
+            } else {
+                let snapshot = crate::commit::write_shared::snapshot_token(base_snapshot_id);
+                ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
+                    "iceberg/write-base/v1/{}/{}/{snapshot}",
+                    metadata.uuid(),
+                    target_ref
+                )))?
+            };
             if declaration.expected_base() != &expected {
                 return Err(invalid(
                     "Iceberg document publication base does not match the current main head",
+                ));
+            }
+        }
+        if matches!(request.flavor, ConnectorWriteSessionFlavor::RowMutation) {
+            let expected = crate::commit::write_shared::position_mutation_base(
+                &metadata,
+                table.as_ref().and_then(|table| table.metadata_location()),
+                target_ref,
+                base_snapshot_id,
+            )?;
+            if request.base.as_ref() != Some(&expected) {
+                return Err(invalid(
+                    "Iceberg row mutation base differs from its admitted target",
                 ));
             }
         }
@@ -2766,6 +2911,14 @@ impl IcebergWriteSessionControl {
                 &request.input,
                 &request.context,
             )?
+        } else if fixed_position_read {
+            crate::commit::write_preparation::freeze_position_mutation_input(
+                writer_metadata,
+                target_ref,
+                base_snapshot_id,
+                &request.input,
+                &request.context,
+            )?
         } else {
             crate::commit::write_preparation::freeze_write_input_request(
                 writer_metadata,
@@ -2785,6 +2938,36 @@ impl IcebergWriteSessionControl {
             signed.into_shape()
         } else {
             sign_input_shape(&facts, &authored_input)?
+        };
+        let mutation_read = if fixed_position_read {
+            let table = table
+                .as_ref()
+                .ok_or_else(|| invalid("Iceberg row mutation requires a loaded target table"))?;
+            let location = table.metadata_location().ok_or_else(|| {
+                invalid("Iceberg row mutation target has no immutable metadata location")
+            })?;
+            let snapshot = base_snapshot_id
+                .map(|id| {
+                    let snapshot = metadata
+                        .snapshot_by_id(id)
+                        .ok_or_else(|| corrupt("Iceberg row mutation source snapshot is absent"))?;
+                    let schema = snapshot
+                        .schema(&metadata)
+                        .map_err(|err| corrupt(err.to_string()))?;
+                    IcebergMutationSnapshot::try_new(
+                        snapshot.manifest_list().to_owned(),
+                        schema.schema_id(),
+                    )
+                })
+                .transpose()?;
+            Some(IcebergMutationReadRecipe::try_new(
+                &facts,
+                location.to_owned(),
+                crate::read_snapshot::metadata_identity(&metadata).map_err(corrupt)?,
+                snapshot,
+            )?)
+        } else {
+            None
         };
         let material = IcebergSessionMaterial {
             data_output: IcebergWriterOutput::try_new(
@@ -2809,25 +2992,6 @@ impl IcebergWriteSessionControl {
                     writer_metadata,
                     matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
                 )?
-            },
-            // A delete branch's frozen old-delete references are the one piece
-            // of material that costs an external read, so it is taken only when
-            // the request's own shape says a delete branch exists.
-            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed)
-                && let Some(snapshot_id) = base_snapshot_id
-            {
-                let table = table.as_ref().ok_or_else(|| {
-                    invalid("Iceberg row-level write requires a loaded target table")
-                })?;
-                self.freeze_old_delete_references_async(
-                    table,
-                    &metadata,
-                    snapshot_id,
-                    &request.context,
-                )
-                .await?
-            } else {
-                Vec::new()
             },
             // The match key needs the frozen Iceberg schema to turn a column
             // name into a field id, so it is resolved here rather than in the
@@ -2927,8 +3091,16 @@ impl IcebergWriteSessionControl {
             copy_on_write,
             branches,
         } = plan;
+        let session_id = IcebergWriteSessionId::new();
+        let endpoint_digest =
+            crate::read_snapshot::metadata_identity_digest(&metadata).map_err(corrupt)?;
+        let creation = IcebergCreationScope::try_new(
+            session_id,
+            *uuid::Uuid::now_v7().as_bytes(),
+            endpoint_digest,
+        )?;
         let (handle, mut targets) = plan_branch_session(
-            IcebergWriteSessionId::new(),
+            session_id,
             IcebergBranchSessionPlanInput {
                 flavor,
                 purpose: request.purpose,
@@ -2943,14 +3115,29 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
-        let handle = if handle.document_publication().is_some() {
-            handle.with_frozen_delete_merge_targets(
-                targets
-                    .iter()
-                    .filter(|target| target.branch().writes_deletes())
-                    .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
-                    .collect(),
-            )?
+        let handle = handle.try_with_creation_scope(creation)?;
+        targets = targets
+            .into_iter()
+            .map(|target| target.with_creation_scope(creation))
+            .collect();
+        let handle = if let Some(recipe) = mutation_read {
+            targets = targets
+                .into_iter()
+                .map(|target| {
+                    use super::domain::IcebergWriteBranch;
+                    match target.branch() {
+                        IcebergWriteBranch::DeletionVector => {
+                            let group = position_contribution_group(session_id, &target)?;
+                            target.with_position_materialization(recipe.clone(), Some(group))
+                        }
+                        IcebergWriteBranch::PositionDelete => {
+                            target.with_position_materialization(recipe.clone(), None)
+                        }
+                        _ => Ok(target),
+                    }
+                })
+                .collect::<Result<_, ConnectorError>>()?;
+            handle.with_mutation_read(recipe)
         } else {
             handle
         };
@@ -3029,7 +3216,7 @@ impl IcebergWriteSessionControl {
                 .cloned()
                 .map(|group| IcebergFrozenRewriteBranch {
                     group,
-                    delete_targets: Vec::new(),
+                    position_rewrite: None,
                 })
                 .collect()),
             ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
@@ -3062,264 +3249,60 @@ impl IcebergWriteSessionControl {
                         .await
                         .map_err(unavailable)?
                 };
-                let by_path = files
-                    .into_iter()
-                    .map(|file| (file.path.clone(), file))
-                    .collect::<BTreeMap<_, _>>();
+                let selected = content
+                    .groups
+                    .iter()
+                    .map(|group| match group.data_files.as_slice() {
+                        [file] => Ok(file.path.as_str()),
+                        _ => Err(corrupt("Iceberg position-delete rewrite requires one selected data file per group")),
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                let mut by_path = BTreeMap::new();
+                for file in files {
+                    if selected.contains(file.path.as_str())
+                        && by_path.insert(file.path.clone(), file).is_some()
+                    {
+                        return Err(corrupt(
+                            "Iceberg rewrite selected a repeated starting-snapshot data file",
+                        ));
+                    }
+                }
                 content.groups.iter().map(|group| {
-                    let delete_targets = group.data_files.iter().map(|file| {
-                        let frozen = by_path.get(&file.path).ok_or_else(|| corrupt(format!("Iceberg frozen rewrite data file {} is missing from the starting snapshot", file.path)))?;
-                        frozen_delete_merge_target(frozen, metadata, snapshot_id, Vec::new())
-                    }).collect::<Result<Vec<_>, ConnectorError>>()?;
-                    Ok(IcebergFrozenRewriteBranch { group: group.clone(), delete_targets })
+                    let [file] = group.data_files.as_slice() else {
+                        return Err(corrupt("Iceberg position-delete rewrite requires one selected data file per group"));
+                    };
+                    let frozen = by_path.get(&file.path).ok_or_else(|| {
+                        corrupt(format!("Iceberg frozen rewrite data file {} is missing from the starting snapshot", file.path))
+                    })?;
+                    if frozen.record_count != file.row_count
+                        || frozen.partition_spec_id != file.partition_spec_id
+                    {
+                        return Err(corrupt("Iceberg rewrite data file differs from the frozen selection"));
+                    }
+                    let spec_id = frozen.partition_spec_id
+                        .ok_or_else(|| corrupt("Iceberg rewrite data file has no partition spec ID"))?;
+                    let spec = metadata.partition_spec_by_id(spec_id)
+                        .ok_or_else(|| corrupt("Iceberg rewrite data file has an unknown partition spec"))?;
+                    let values = frozen.partition_values.as_ref()
+                        .ok_or_else(|| corrupt("Iceberg rewrite data file has no partition values"))?;
+                    let (path, nulls) =
+                        crate::commit::report::partition_path_from_struct(values, spec).map_err(corrupt)?;
+                    let descriptor = crate::write_descriptor::encode_partition_descriptor(values, spec_id, metadata)
+                        .map_err(|error| corrupt(error.detail_message()))?;
+                    let partition = IcebergArtifactPartition::try_new(path, nulls, spec_id, descriptor)?;
+                    let count = frozen.record_count.and_then(|count| u64::try_from(count).ok())
+                        .ok_or_else(|| corrupt("Iceberg rewrite data file has an invalid row count"))?;
+                    let position_rewrite = super::domain::IcebergPositionRewriteTarget::try_new(
+                        frozen.path.clone(), count, partition,
+                    )?;
+                    Ok(IcebergFrozenRewriteBranch {
+                        group: group.clone(),
+                        position_rewrite: Some(position_rewrite),
+                    })
                 }).collect()
             }
         }
     }
-
-    /// Freeze exact references to every old delete artifact attached to the
-    /// base snapshot's data files.
-    ///
-    /// This is the frontend half of D10. It records what exists; it never opens
-    /// one of those artifacts.
-    async fn freeze_old_delete_references_async(
-        &self,
-        table: &crate::iceberg::table::Table,
-        metadata: &TableMetadata,
-        snapshot_id: i64,
-        context: &ConnectorRequestContext,
-    ) -> Result<Vec<IcebergOldDeleteMergeTarget>, ConnectorError> {
-        validate_context(context)?;
-        let owned = table.clone();
-        let control = context.clone();
-        let (files, facts) = (async move {
-            let check = || validate_context(&control).map_err(|error| error.to_string());
-            check()?;
-            let files = crate::manifest::extract_data_files_with_stats_at_with_control(
-                &owned,
-                snapshot_id,
-                Some(&control),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            let snapshot = owned
-                .metadata()
-                .snapshot_by_id(snapshot_id)
-                .ok_or_else(|| {
-                    format!(
-                        "Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"
-                    )
-                })?;
-            let manifests =
-                crate::manifest::load_manifest_list(snapshot, owned.file_io(), owned.metadata())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            check()?;
-            let mut facts = BTreeMap::new();
-            for descriptor in manifests.entries() {
-                check()?;
-                let manifest = crate::manifest::load_manifest(descriptor, owned.file_io())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                check()?;
-                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                    check()?;
-                    let identity = EntryIdentity::try_from(entry.data_file())
-                        .map_err(|error| error.to_string())?;
-                    // An absent entry snapshot inherits the manifest's actual added snapshot.
-                    let fact = (
-                        entry.data_file().record_count(),
-                        entry.snapshot_id().unwrap_or(descriptor.added_snapshot_id),
-                    );
-                    if facts.insert(identity, fact).is_some() {
-                        return Err("Iceberg pinned snapshot repeats a logical entry".to_string());
-                    }
-                }
-            }
-            check()?;
-            Ok::<_, String>((files, facts))
-        })
-        .await
-        .map_err(corrupt)?;
-        validate_context(context)?;
-        let mut targets = Vec::with_capacity(files.len());
-        for file in files {
-            let identity = EntryIdentity::DataFile {
-                path: file.path.clone(),
-            };
-            let (count, _) = facts
-                .get(&identity)
-                .ok_or_else(|| corrupt("Iceberg data projection has no pinned manifest entry"))?;
-            if file
-                .record_count
-                .and_then(|value| u64::try_from(value).ok())
-                != Some(*count)
-            {
-                return Err(corrupt(
-                    "Iceberg data projection disagrees with pinned manifest record count",
-                ));
-            }
-            let references = frozen_old_delete_references(&file, &facts)?;
-            targets.push(frozen_delete_merge_target(
-                &file,
-                metadata,
-                snapshot_id,
-                references,
-            )?);
-        }
-        Ok(targets)
-    }
-}
-
-/// Freeze one data file's delete-branch merge target.
-///
-/// The partition descriptor and row count come off the frozen manifest entry,
-/// because the backend's delete writer resolves both through this target: the
-/// partition names where the replacement artifact is written and how the commit
-/// decodes it, and the row count bounds every position it will accept.
-///
-/// `references` is stated by the caller rather than derived, because whether
-/// this target's old artifacts are merged or replaced is the caller's decision:
-/// a row mutation supersedes them and passes them all, a rewrite republishes
-/// them from its own scan and passes none.
-fn frozen_delete_merge_target(
-    file: &crate::manifest::DataFileWithStats,
-    metadata: &TableMetadata,
-    snapshot_id: i64,
-    references: Vec<IcebergOldDeleteArtifactRef>,
-) -> Result<IcebergOldDeleteMergeTarget, ConnectorError> {
-    let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
-        corrupt(format!(
-            "Iceberg data file {} has no frozen partition spec ID",
-            file.path
-        ))
-    })?;
-    let partition_values = file.partition_values.as_ref().ok_or_else(|| {
-        corrupt(format!(
-            "Iceberg data file {} has no frozen partition values",
-            file.path
-        ))
-    })?;
-    let partition_spec = metadata
-        .partition_spec_by_id(partition_spec_id)
-        .ok_or_else(|| {
-            corrupt(format!(
-                "Iceberg data file {} references unknown partition spec {partition_spec_id}",
-                file.path
-            ))
-        })?;
-    let (partition_path, null_fingerprint) =
-        crate::commit::report::partition_path_from_struct(partition_values, partition_spec)
-            .map_err(corrupt)?;
-    let descriptor = crate::write_descriptor::encode_partition_descriptor(
-        partition_values,
-        partition_spec_id,
-        metadata,
-    )
-    .map_err(|error| corrupt(error.detail_message()))?;
-    let partition = IcebergArtifactPartition::try_new(
-        partition_path,
-        null_fingerprint,
-        partition_spec_id,
-        descriptor,
-    )?;
-    let record_count = u64::try_from(
-        file.record_count
-            .ok_or_else(|| corrupt("Iceberg frozen data file has no record count"))?,
-    )
-    .map_err(|_| {
-        corrupt(format!(
-            "Iceberg data file {} has a negative record count",
-            file.path
-        ))
-    })?;
-    IcebergOldDeleteMergeTarget::try_new(
-        file.path.clone(),
-        record_count,
-        file.data_sequence_number,
-        partition,
-        snapshot_id,
-        references,
-    )
-}
-
-/// Freeze exact references to every position-delete artifact attached to one
-/// data file. It records what exists; it never opens one of those artifacts.
-fn frozen_old_delete_references(
-    file: &crate::manifest::DataFileWithStats,
-    facts: &BTreeMap<EntryIdentity, (u64, i64)>,
-) -> Result<Vec<IcebergOldDeleteArtifactRef>, ConnectorError> {
-    let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
-        corrupt(format!(
-            "Iceberg data file {} has no frozen partition spec ID",
-            file.path
-        ))
-    })?;
-    let mut references = Vec::new();
-    for delete in &file.delete_files {
-        if !matches!(
-            delete.file_content,
-            crate::scan_model::IcebergDeleteFileContent::Position
-        ) {
-            continue;
-        }
-        let file_format = match delete.file_format {
-            crate::scan_model::IcebergDeleteFileFormat::Parquet => {
-                crate::delete_file::IcebergFileFormat::Parquet
-            }
-            crate::scan_model::IcebergDeleteFileFormat::Puffin => {
-                crate::delete_file::IcebergFileFormat::Puffin
-            }
-        };
-        let length = delete
-            .length
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| {
-                corrupt(format!(
-                    "Iceberg delete artifact {} has no usable frozen file size",
-                    delete.path
-                ))
-            })?;
-        let content_range = match (delete.content_offset, delete.content_size_in_bytes) {
-            (Some(offset), Some(size)) => Some(IcebergContentRange::try_new(offset, size)?),
-            (None, None) => None,
-            _ => {
-                return Err(corrupt(format!(
-                    "Iceberg delete artifact {} carries a partial Puffin blob range",
-                    delete.path
-                )));
-            }
-        };
-        let route = IcebergStorageRoute::try_for_location(&delete.path)?;
-        references.push(IcebergOldDeleteArtifactRef::try_new(
-            delete.path.clone(),
-            crate::delete_file::IcebergFileContent::PositionDeletes,
-            file_format,
-            length,
-            Some(
-                facts
-                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
-                    .ok_or_else(|| {
-                        corrupt("Iceberg delete projection has no pinned manifest entry")
-                    })?
-                    .0,
-            ),
-            content_range,
-            delete.referenced_data_file.clone(),
-            delete.sequence_number,
-            Some(
-                facts
-                    .get(&crate::distributed_rewrite::delete_entry_identity(delete)?)
-                    .ok_or_else(|| {
-                        corrupt("Iceberg delete projection has no pinned manifest entry")
-                    })?
-                    .1,
-            ),
-            delete.partition_spec_id.unwrap_or(partition_spec_id),
-            route,
-        )?);
-    }
-    Ok(references)
 }
 
 fn iceberg_data_location(metadata: &TableMetadata) -> String {
@@ -3351,93 +3334,38 @@ fn format_version_number(metadata: &TableMetadata) -> u8 {
     }
 }
 
-/// Whether this session will seal a delete branch, and therefore has to freeze
-/// the old delete artifacts that branch must supersede.
-pub(crate) fn session_freezes_old_deletes(
-    flavor: &ConnectorWriteSessionFlavor,
-    signed: &ConnectorWriteInputShape,
-) -> bool {
-    match flavor {
-        ConnectorWriteSessionFlavor::Ordinary => {
-            crate::commit::write_stack::flavor::ordinary_delete_branch(signed).is_some()
-        }
-        // A merge-on-read mutation seals a deletion-vector branch from a
-        // row-lineage input, so the delete-shaped-input test is not enough here.
-        ConnectorWriteSessionFlavor::RowMutation => !matches!(
-            signed,
-            ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::EqualityDelete { .. }
-        ),
-        // A publication that applies a change stream seals the same delete
-        // branch a DML row mutation does, so it must supersede the same old
-        // artifacts. One that republishes rows wholesale seals no delete branch
-        // at all and has nothing to freeze.
-        ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
-            *shape == ConnectorManagedPublicationShape::RowMutation
-                && !matches!(
-                    signed,
-                    ConnectorWriteInputShape::Data { .. }
-                        | ConnectorWriteInputShape::EqualityDelete { .. }
-                )
-        }
-        // A staged target has no base snapshot and therefore no old delete
-        // artifact to supersede: it is a table nobody has ever written to. A
-        // copy-on-write mutation seals only data branches: it replaces whole
-        // files rather than staging a delete beside them, so there is no
-        // artifact for one to supersede either.
-        //
-        // A distributed rewrite seals no session-wide freeze even when its
-        // branch is a delete branch. Its branches own disjoint groups, so each
-        // one's merge target is frozen per branch by the frozen plan;
-        // and a rewrite supersedes nothing anyway -- it reads the old artifacts
-        // through its own scan and its commit retires exactly them.
-        ConnectorWriteSessionFlavor::StagedCreate(_)
-        | ConnectorWriteSessionFlavor::DistributedRewrite { .. }
-        | ConnectorWriteSessionFlavor::CopyOnWrite { .. } => false,
-    }
-}
-
 /// Pick the flavor an *ordinary* begin request describes.
 ///
 /// An unsupported combination fails here rather than being coerced into the
 /// nearest supported one.
 fn flavor_for(request: &ConnectorWriteBeginRequest) -> Result<IcebergWriteFlavor, ConnectorError> {
-    use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
-    // A staged create is decided by the flavor alone. Its intent is an append
-    // and its input is data, so reading intent and input would answer
-    // `Append` -- correct as far as it goes, and wrong about the one thing
-    // that matters: the target does not exist yet.
-    if matches!(request.flavor, ConnectorWriteSessionFlavor::StagedCreate(_)) {
-        return Ok(IcebergWriteFlavor::StagedCreate);
-    }
-    if request.purpose == ConnectorWriteAdmissionPurpose::MaterializedViewRefresh {
-        return Ok(IcebergWriteFlavor::ManagedPublication);
-    }
-    Ok(match (request.intent, &request.input) {
-        (ConnectorWriteIntent::Append, _) => IcebergWriteFlavor::Append,
-        (ConnectorWriteIntent::Overwrite, _) => IcebergWriteFlavor::Overwrite,
-        (ConnectorWriteIntent::PartitionOverwrite, _) => IcebergWriteFlavor::PartitionOverwrite,
-        (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::DeletionVector { .. }) => {
-            IcebergWriteFlavor::RowMutationDeletionVector
+    use novarocks_spi::connector::ConnectorWriteIntent;
+
+    let flavor = match (request.intent, &request.input) {
+        (ConnectorWriteIntent::Append, ConnectorWriteInputRequest::Data { .. }) => {
+            if matches!(request.flavor, ConnectorWriteSessionFlavor::StagedCreate(_)) {
+                IcebergWriteFlavor::StagedCreate
+            } else {
+                IcebergWriteFlavor::Append
+            }
         }
-        (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::PositionDelete { .. }) => {
-            IcebergWriteFlavor::RowMutationPositionDelete
+        (ConnectorWriteIntent::Overwrite, ConnectorWriteInputRequest::Data { .. }) => {
+            IcebergWriteFlavor::Overwrite
         }
-        (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::RowLineage { .. }) => {
-            IcebergWriteFlavor::RowMutationCopyOnWrite
+        (ConnectorWriteIntent::PartitionOverwrite, ConnectorWriteInputRequest::Data { .. }) => {
+            IcebergWriteFlavor::PartitionOverwrite
         }
-        // `ALTER TABLE ... ADD EQUALITY DELETE`. It appends delete files rather
-        // than superseding a data file's deletes, so it commits as an ordinary
-        // row delta, the same op a Parquet position-delete mutation uses.
         (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::EqualityDelete { .. }) => {
             IcebergWriteFlavor::EqualityDelete
         }
-        (ConnectorWriteIntent::RowDelta, _) => {
+        _ => {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                "Iceberg row-delta write requires a position-delete, deletion-vector, equality-delete, or row-lineage input",
+                "Iceberg ordinary write requires its data or equality-delete input; position changes require the fixed row-mutation session",
             ));
         }
-    })
+    };
+    Ok(flavor)
 }
 
 /// Sign the caller's requested fields into a provider-owned input shape.
@@ -3881,7 +3809,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         validate_context(context)?;
         let handle = self.adapter.commit_session(commit)?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
-        validate_merged_old_references(&handle.frozen_old_references(), &validated)?;
         let result = logical_rows::project(handle, &validated)?;
         validate_context(context)?;
         Ok(result)
@@ -5957,7 +5884,6 @@ impl IcebergWriteSessionControl {
             }
         };
         let statistics = validate_statistics_artifacts(handle, request.statistics)?;
-        let frozen = self.frozen_references_of(handle);
         // A staged create is the one flavor that finishes without committing:
         // its single external effect belongs to the publication that owns the
         // staged target, and performing one here would create a snapshot on a
@@ -5966,7 +5892,6 @@ impl IcebergWriteSessionControl {
             return self.seal_staged_prepared_set(
                 handle,
                 request.prepared,
-                &frozen,
                 request.context,
             ).map(novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion::from_outcome);
         }
@@ -5974,7 +5899,6 @@ impl IcebergWriteSessionControl {
             handle,
             request.prepared,
             statistics,
-            &frozen,
             document_publication,
             request.context,
             needed_ready,

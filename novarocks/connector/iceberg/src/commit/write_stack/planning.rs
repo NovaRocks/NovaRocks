@@ -21,22 +21,11 @@
 //! write targets. The neutral write stack sees only ordinals and input shapes;
 //! the cohort and route vocabulary the provider uses internally never crosses
 //! that boundary.
-//!
-//! The planner's other job is the NCP-6 unique-owner proof. Because a delete
-//! branch now re-reads and rewrites old delete artifacts on the backend, two
-//! branches that both claimed the same old data file would each write a merged
-//! artifact for it, and Iceberg permits only one deletion vector per data file.
-//! [`prove_unique_delete_owner`] therefore runs *before* any target is sealed
-//! and any writer can stage, so an unprovable routing fails with nothing
-//! written.
-
-use crate::commit::model::EntryIdentity;
-use std::collections::BTreeMap;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteCohortRoutingBody, ConnectorWriteCohortRoutingProof, ConnectorWriteRewriteSource,
-    ConnectorWriteRouteFacts,
+    ConnectorMutationContributionGroup, ConnectorWriteCohortRoutingBody,
+    ConnectorWriteCohortRoutingProof, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
@@ -45,43 +34,11 @@ use novarocks_spi::connector::{
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
-    IcebergFrozenRewriteBranchInput, IcebergSealedWriteTarget, IcebergSessionFacts,
-    IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor, IcebergWriteSessionId,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
+    IcebergFrozenRewriteBranchInput, IcebergPositionRewriteTarget, IcebergSealedWriteTarget,
+    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteCommitSession, IcebergWriteFlavor,
+    IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    invalid,
 };
-use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
-
-/// Prove that every old data file needing a delete merge is routed to exactly
-/// one logical write target.
-///
-/// The returned map is the proof: a data file appears once, and its value names
-/// the single target allowed to rewrite its deletes. A duplicate is a hard
-/// failure, never a "last writer wins".
-pub(crate) fn prove_unique_delete_owner(
-    targets: &[IcebergSealedWriteTarget],
-) -> Result<BTreeMap<String, WriteTargetOrdinal>, ConnectorError> {
-    let mut owner: BTreeMap<String, WriteTargetOrdinal> = BTreeMap::new();
-    for target in targets {
-        if !target.branch().writes_deletes() && !target.owned_data_files().is_empty() {
-            return Err(invalid(format!(
-                "Iceberg {} branch cannot own an old-delete merge",
-                target.branch().as_str()
-            )));
-        }
-        for data_file in target.data_files() {
-            if let Some(existing) = owner.get(data_file) {
-                return Err(invalid(format!(
-                    "Iceberg old data file {data_file} needing a delete merge is claimed by write targets {} and {}; a unique owner cannot be proven",
-                    existing.get(),
-                    target.ordinal().get()
-                )));
-            }
-            owner.insert(data_file.clone(), target.ordinal());
-        }
-    }
-    Ok(owner)
-}
-
 type IcebergWriteTargetPlanParts = (
     WriteTargetOrdinal,
     IcebergWriterHandle,
@@ -90,6 +47,7 @@ type IcebergWriteTargetPlanParts = (
     Option<ConnectorWriteCohortRoutingProof>,
     Option<ConnectorWriteRewriteSource>,
     Option<[u8; 32]>,
+    Option<ConnectorMutationContributionGroup>,
 );
 
 /// One logical target the sealed plan exposes.
@@ -103,6 +61,7 @@ pub struct IcebergWriteTargetPlan {
     routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
     rewrite_group_digest: Option<[u8; 32]>,
+    position_materialization: Option<ConnectorMutationContributionGroup>,
 }
 
 impl IcebergWriteTargetPlan {
@@ -131,6 +90,29 @@ impl IcebergWriteTargetPlan {
     pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
         self.routing_proof.as_ref()
     }
+    pub(crate) fn with_creation_scope(
+        mut self,
+        scope: super::domain::IcebergCreationScope,
+    ) -> Self {
+        self.handle = self.handle.with_creation_scope(scope);
+        self
+    }
+
+    pub(crate) fn with_position_materialization(
+        mut self,
+        recipe: super::domain::IcebergMutationReadRecipe,
+        materialization: Option<(ConnectorMutationContributionGroup, ConnectorWriteInputShape)>,
+    ) -> Result<Self, ConnectorError> {
+        let group_id = materialization.as_ref().map(|(group, _)| group.id());
+        self.handle = self.handle.try_with_mutation_read(recipe, group_id)?;
+        if let Some((group, input)) = materialization {
+            self.route = None;
+            self.input = input;
+            self.position_materialization = Some(group);
+        }
+        Ok(self)
+    }
+
     pub(crate) fn with_rewrite_group_digest(mut self, digest: [u8; 32]) -> Self {
         self.rewrite_group_digest = Some(digest);
         self
@@ -147,6 +129,7 @@ impl IcebergWriteTargetPlan {
             self.routing_proof,
             self.rewrite_source,
             self.rewrite_group_digest,
+            self.position_materialization,
         )
     }
 }
@@ -159,12 +142,12 @@ pub struct IcebergDataBranchPlan {
     pub input: ConnectorWriteInputShape,
 }
 
-/// A delete branch, with the old artifacts it claims exclusive ownership of.
+/// A position writer, optionally scoped to one maintenance selection.
 #[derive(Clone, Debug)]
 pub struct IcebergDeleteBranchPlan {
     pub branch: IcebergWriteBranch,
     pub output: IcebergWriterOutput,
-    pub merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    pub position_rewrite: Option<IcebergPositionRewriteTarget>,
     pub input: ConnectorWriteInputShape,
 }
 
@@ -242,26 +225,10 @@ impl IcebergWriteBranchPlan {
         }
     }
 
-    /// The old data files this branch claims exclusive ownership of, with the
-    /// exact old delete references it must supersede for each one.
-    fn owned_data_files(&self) -> BTreeMap<String, Vec<EntryIdentity>> {
+    fn position_rewrite(&self) -> Option<&IcebergPositionRewriteTarget> {
         match self {
-            // An equality delete names no data file at all, so it owns no
-            // old-delete merge for the same reason a data branch does not.
-            Self::Data { .. } | Self::EqualityDelete { .. } => BTreeMap::new(),
-            Self::Delete { plan, .. } => plan
-                .merge_targets
-                .iter()
-                .map(|target| {
-                    let mut references = target
-                        .references()
-                        .iter()
-                        .map(|reference| reference.entry_identity())
-                        .collect::<Vec<_>>();
-                    references.sort();
-                    (target.data_file_path().to_string(), references)
-                })
-                .collect(),
+            Self::Delete { plan, .. } => plan.position_rewrite.as_ref(),
+            _ => None,
         }
     }
 
@@ -275,12 +242,17 @@ impl IcebergWriteBranchPlan {
                 plan.output.clone(),
                 plan.recipe.clone(),
             ),
-            Self::Delete { plan, .. } => IcebergWriterHandle::try_new_delete(
-                plan.branch,
-                table.clone(),
-                plan.output.clone(),
-                plan.merge_targets.clone(),
-            ),
+            Self::Delete { plan, .. } => {
+                let handle = IcebergWriterHandle::try_new_delete(
+                    plan.branch,
+                    table.clone(),
+                    plan.output.clone(),
+                )?;
+                match &plan.position_rewrite {
+                    Some(target) => handle.try_with_position_rewrite(target.clone()),
+                    None => Ok(handle),
+                }
+            }
             Self::EqualityDelete { plan, .. } => IcebergWriterHandle::try_new_equality_delete(
                 table.clone(),
                 plan.output.clone(),
@@ -378,9 +350,6 @@ pub fn plan_branch_session(
         )));
     }
 
-    // Assemble the ordinal map first, then prove the routing, then build the
-    // handles. Proving before building is what makes the failure pre-staging:
-    // no writer recipe reaches a driver when the proof fails.
     let mut sealed = Vec::with_capacity(input.branches.len());
     for (index, plan) in input.branches.iter().enumerate() {
         let ordinal = u32::try_from(index)
@@ -388,10 +357,9 @@ pub fn plan_branch_session(
         sealed.push(IcebergSealedWriteTarget::new(
             WriteTargetOrdinal::try_new(ordinal)?,
             plan.branch(),
-            plan.owned_data_files(),
+            plan.position_rewrite().cloned(),
         ));
     }
-    prove_unique_delete_owner(&sealed)?;
 
     // A copy-on-write branch's read contract is per branch, so a session
     // holding a different number of recipes than it sealed branches could not
@@ -437,6 +405,7 @@ pub fn plan_branch_session(
             route: plan.route().cloned(),
             routing_proof,
             rewrite_group_digest: None,
+            position_materialization: None,
             rewrite_source: input
                 .copy_on_write
                 .get(index)
@@ -522,57 +491,8 @@ pub fn plan_write_session(
 mod tests {
     use super::*;
     use crate::commit::write_stack::test_support::{
-        data_branch_plan, delete_branch_plan, merge_target, table_facts,
+        data_branch_plan, delete_branch_plan, table_facts,
     };
-
-    fn sealed(
-        ordinal: u32,
-        branch: IcebergWriteBranch,
-        files: &[&str],
-    ) -> IcebergSealedWriteTarget {
-        IcebergSealedWriteTarget::new(
-            WriteTargetOrdinal::try_new(ordinal).expect("ordinal"),
-            branch,
-            files
-                .iter()
-                .map(|file| ((*file).to_string(), Vec::new()))
-                .collect::<BTreeMap<_, _>>(),
-        )
-    }
-
-    #[test]
-    fn a_unique_owner_is_proven_when_each_data_file_has_one_claimant() {
-        let owner = prove_unique_delete_owner(&[
-            sealed(0, IcebergWriteBranch::Data, &[]),
-            sealed(
-                1,
-                IcebergWriteBranch::DeletionVector,
-                &["a.parquet", "b.parquet"],
-            ),
-        ])
-        .expect("proof");
-        assert_eq!(owner.len(), 2);
-        assert_eq!(owner["a.parquet"].get(), 1);
-    }
-
-    #[test]
-    fn two_branches_claiming_one_old_data_file_are_rejected() {
-        let error = prove_unique_delete_owner(&[
-            sealed(0, IcebergWriteBranch::Data, &[]),
-            sealed(1, IcebergWriteBranch::PositionDelete, &["a.parquet"]),
-            sealed(2, IcebergWriteBranch::DeletionVector, &["a.parquet"]),
-        ])
-        .expect_err("non-unique owner");
-        assert!(error.message().contains("a unique owner cannot be proven"));
-    }
-
-    #[test]
-    fn a_data_branch_cannot_own_an_old_delete_merge() {
-        assert!(
-            prove_unique_delete_owner(&[sealed(0, IcebergWriteBranch::Data, &["a.parquet"])])
-                .is_err()
-        );
-    }
 
     #[test]
     fn a_flavor_seals_its_branches_as_dense_ordinals() {
@@ -585,10 +505,7 @@ mod tests {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(
-                    IcebergWriteBranch::DeletionVector,
-                    vec![merge_target("s3://b/a.parquet", 100, Vec::new())],
-                )],
+                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
             },
         )
         .expect("plan");
@@ -597,8 +514,7 @@ mod tests {
         assert_eq!(plans[0].branch(), IcebergWriteBranch::Data);
         assert_eq!(plans[1].ordinal().get(), 1);
         assert_eq!(plans[1].branch(), IcebergWriteBranch::DeletionVector);
-        assert_eq!(handle.delete_owner().len(), 1);
-        assert_eq!(handle.delete_owner()["s3://b/a.parquet"].get(), 1);
+        assert_eq!(handle.expected_targets().len(), 2);
     }
 
     #[test]
@@ -612,47 +528,10 @@ mod tests {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(
-                    IcebergWriteBranch::DeletionVector,
-                    vec![merge_target("s3://b/a.parquet", 100, Vec::new())],
-                )],
+                deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
             },
         )
         .expect_err("flavor does not own the branch");
         assert!(error.message().contains("does not own a"));
-    }
-
-    #[test]
-    fn a_non_unique_old_file_owner_fails_before_any_handle_is_built() {
-        // Both delete branches claim the same old data file, so the merge owner
-        // is ambiguous. This must be refused while planning — a writer that
-        // reached a driver could already have staged a Puffin blob.
-        let error = plan_write_session(
-            IcebergWriteSessionId::new(),
-            IcebergWriteSessionPlanInput {
-                flavor: IcebergWriteFlavor::RowMutationDeletionVector,
-                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                table: table_facts(),
-                base_version_digest: None,
-                staged_metadata: None,
-                data: data_branch_plan(),
-                deletes: vec![
-                    delete_branch_plan(
-                        IcebergWriteBranch::DeletionVector,
-                        vec![merge_target("s3://b/a.parquet", 100, Vec::new())],
-                    ),
-                    delete_branch_plan(
-                        IcebergWriteBranch::DeletionVector,
-                        vec![merge_target("s3://b/a.parquet", 100, Vec::new())],
-                    ),
-                ],
-            },
-        )
-        .expect_err("non-unique owner");
-        assert!(
-            error.message().contains("a unique owner cannot be proven"),
-            "unexpected message: {}",
-            error.message()
-        );
     }
 }

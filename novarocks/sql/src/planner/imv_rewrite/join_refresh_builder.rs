@@ -246,6 +246,7 @@ pub(crate) struct JoinRefreshTargetLocatorBinding {
     pub(crate) target_table_uuid: String,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) target_columns: std::sync::Arc<[ColumnDef]>,
+    target_file_metadata: Option<std::sync::Arc<[ColumnDef; 2]>>,
 }
 
 impl JoinRefreshTargetLocatorBinding {
@@ -257,6 +258,7 @@ impl JoinRefreshTargetLocatorBinding {
             target_table_uuid: snapshot.target_table_uuid.clone(),
             target_snapshot_id: snapshot.target_snapshot_id,
             target_columns: std::sync::Arc::clone(&snapshot.target_columns),
+            target_file_metadata: snapshot.target_file_metadata.clone(),
         }
     }
 }
@@ -398,6 +400,19 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         constant_policy,
         control,
     )?;
+    let mut file_metadata = Vec::new();
+    if let Some(fields) = &locator.target_file_metadata {
+        for field in fields.iter() {
+            file_metadata.push(output_column_from_factory(
+                column_ref_factory,
+                &field.name,
+                field
+                    .declared_value_type()
+                    .map_err(|error| error.to_string())?,
+                true,
+            ));
+        }
+    }
     let locator_join = build_locator_join_shell(
         key_shape_checked,
         desc,
@@ -409,6 +424,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_pos_column_id),
         ColumnId(locator_row_id_column_id),
         ColumnId(locator_last_updated_seq_column_id),
+        &file_metadata,
     )?;
     let locator_checked = build_locator_assert_filter(
         locator_join,
@@ -431,6 +447,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_pos_column_id),
         ColumnId(locator_row_id_column_id),
         ColumnId(locator_last_updated_seq_column_id),
+        &file_metadata,
     )
     .map_err(crate::compiler::SqlCompileError::from)
 }
@@ -740,6 +757,7 @@ fn build_locator_join_shell(
     locator_pos_column_id: ColumnId,
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
+    file_metadata: &[OutputColumn],
 ) -> Result<LogicalPlanNode, String> {
     let right_apply_key = target_apply_key_declaration(locator, left_apply_key)?;
     let right_scan = build_target_locator_scan(
@@ -751,6 +769,7 @@ fn build_locator_join_shell(
         locator_pos_column_id,
         locator_row_id_column_id,
         locator_last_updated_seq_column_id,
+        file_metadata,
     )?;
     let delete_only = binary(
         column_ref(net_column),
@@ -827,13 +846,14 @@ fn build_target_locator_scan(
     locator_pos_column_id: ColumnId,
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
+    file_metadata: &[OutputColumn],
 ) -> Result<LogicalPlanNode, String> {
     let target_apply_key = target_apply_key_declaration(locator, apply_key)?;
     let target_apply_key_type = target_apply_key
         .declared_value_type()
         .map_err(|error| error.to_string())?;
     let columns = vec![target_apply_key.clone()];
-    let metadata_columns = vec![
+    let mut metadata_columns = vec![
         ColumnDef {
             name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
             data_type: DataType::Utf8,
@@ -863,7 +883,10 @@ fn build_target_locator_scan(
             logical_type: None,
         },
     ];
-    let scan_columns = vec![
+    if let Some(fields) = &locator.target_file_metadata {
+        metadata_columns.extend(fields.iter().cloned());
+    }
+    let mut scan_columns = vec![
         output_column(
             right_apply_key_id,
             &target_apply_key.name,
@@ -895,6 +918,7 @@ fn build_target_locator_scan(
             true,
         ),
     ];
+    scan_columns.extend_from_slice(file_metadata);
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::scan(PlanScanNode {
             database: desc.mv_identity.database.clone(),
@@ -985,6 +1009,7 @@ fn build_final_coalesce_project(
     locator_pos_column_id: ColumnId,
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
+    file_metadata: &[OutputColumn],
 ) -> Result<LogicalPlanNode, String> {
     let action_output = mapped_output_column(
         desc,
@@ -1041,6 +1066,15 @@ fn build_final_coalesce_project(
         output_name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
         output_column_id: locator_pos_column_id,
     });
+    for field in file_metadata {
+        let mut item = project_item_from_source_to_output(field, field);
+        item.expr.value_type = field
+            .value_type
+            .clone()
+            .with_nullable(true)
+            .map_err(|error| error.to_string())?;
+        items.push(item);
+    }
     items.push(ProjectItem {
         expr: coalesced_action_expr(net_column),
         output_name: action_output.name,
@@ -1140,6 +1174,8 @@ fn is_reserved_coalesce_payload_output_name(name: &str) -> bool {
             | "__nr_join_delta_target_locator"
             | crate::common::ICEBERG_FILE_PATH_COL
             | crate::common::ICEBERG_ROW_POS_COL
+            | "_spec_id"
+            | "_partition"
             | crate::common::ICEBERG_ROW_ID_COL
             | crate::common::ICEBERG_LAST_UPDATED_SEQ_COL
     )
@@ -1925,6 +1961,7 @@ mod tests {
                 ColumnId(4),
                 ColumnId(5),
                 ColumnId(6),
+                &[],
             )
             .unwrap();
             let LogicalPlanKind::Scan(scan) = plan.kind else {
@@ -1984,6 +2021,7 @@ mod tests {
             ColumnId(4),
             ColumnId(5),
             ColumnId(6),
+            &[],
         )
         .unwrap();
         let LogicalPlanKind::Scan(scan) = plan.kind else {
@@ -2421,6 +2459,7 @@ mod tests {
             target_binding: crate::compiler::mv_rewrite::test_target_binding(),
             target_table_uuid: "target-uuid".to_string(),
             target_snapshot_id: Some(77),
+            target_file_metadata: None,
             target_columns: vec![ColumnDef {
                 name: crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
                 data_type: DataType::Utf8,

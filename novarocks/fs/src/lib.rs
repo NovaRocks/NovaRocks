@@ -64,8 +64,12 @@ mod range_service;
 mod read;
 mod resources;
 mod runtime;
+mod s3_upload_witness;
+pub use s3_upload_witness::S3UploadWitness;
 mod storage_authority;
 
+#[cfg(unix)]
+pub use access::ConditionalLocalFile;
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
     FsListEntry, FsListStream, FsListingBound, FsLocation, FsScheme, ObjectStoreAccessContext,

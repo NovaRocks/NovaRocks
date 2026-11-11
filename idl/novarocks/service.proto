@@ -861,6 +861,11 @@ enum ExchangeDeliveryRequirement {
   EXCHANGE_DELIVERY_REQUIREMENT_MUST_DRAIN = 2;
 }
 
+// The actual producer DOP for each ordinal in a position-shard input.
+message TaskPositionShardSourceDops {
+  repeated uint32 sender_dops = 1;  // one positive value per frozen sender ordinal
+}
+
 // One inbound exchange node. The frozen source set doubles as the expected
 // sender count, so the two can never disagree.
 message TaskExchangeInbound {
@@ -869,6 +874,8 @@ message TaskExchangeInbound {
                                             // duplicate fragment instance id
   // Required closed value: ordinary demand withdrawal cannot close MustDrain.
   ExchangeDeliveryRequirement delivery = 3;
+  // Present only for a PositionShards input, which must drain every sender.
+  TaskPositionShardSourceDops position_shard_source_dops = 4;
 }
 
 // The complete, frozen push exchange topology of one task. Exchange membership

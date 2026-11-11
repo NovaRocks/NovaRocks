@@ -125,8 +125,25 @@ fn delete_handle(branch: IcebergWriteBranch) -> dto::IcebergWriterHandle {
     } else {
         IcebergFileFormat::Parquet
     };
+    use crate::commit::write_stack::domain::{IcebergMutationReadRecipe, IcebergMutationSnapshot};
+    let table = table_facts();
+    let recipe = IcebergMutationReadRecipe::try_new(
+        &table,
+        "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
+        format!("sha256:{}", "a".repeat(64)),
+        Some(
+            IcebergMutationSnapshot::try_new("s3://b/wh/db/t/metadata/snap-77.avro".to_owned(), 1)
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let group = (branch == IcebergWriteBranch::DeletionVector).then(|| {
+        novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes([4; 32])
+    });
     encode(
-        &IcebergWriterHandle::try_new_delete(branch, table_facts(), output(format), vec![])
+        &IcebergWriterHandle::try_new_delete(branch, table, output(format))
+            .unwrap()
+            .try_with_mutation_read(recipe, group)
             .unwrap(),
     )
 }
@@ -278,7 +295,7 @@ fn data_private_recipe_keeps_all_actual_public_flavors_and_exact_fields() {
 }
 
 #[test]
-fn private_delete_roles_preserve_legacy_positional_columns_and_public_groups() {
+fn private_delete_recipes_preserve_public_positional_columns_and_groups() {
     for branch in [
         IcebergWriteBranch::PositionDelete,
         IcebergWriteBranch::DeletionVector,
@@ -304,9 +321,8 @@ fn private_delete_roles_preserve_legacy_positional_columns_and_public_groups() {
                 field("_PoS", DataType::Int64, true, 701, 8),
             ]),
         ));
-        // The legacy writer reads the first two flattened columns by type.
-        // Names, extra identity columns and role-group boundaries are not new
-        // semantic gates; all original public metadata/tokens remain sealed.
+        // The public declaration preserves field roles and tokens for native
+        // planning of the physical position input.
         assert_unchanged(&draft(
             &raw,
             make(vec![

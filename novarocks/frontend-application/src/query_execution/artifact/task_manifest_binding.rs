@@ -84,6 +84,7 @@ impl BoundManifestBackend {
 pub(crate) struct BoundWriterCohort {
     plan: novarocks_query_application::api::PlanSeal,
     task: TaskIdentity,
+    task_key: UniqueId,
     fragment: FragmentId,
     writer: crate::native::fragment_encoder::frozen::StaticTableWriter,
 }
@@ -93,6 +94,10 @@ impl BoundWriterCohort {
     }
     pub(crate) const fn task(self) -> TaskIdentity {
         self.task
+    }
+
+    pub(crate) const fn task_key(self) -> UniqueId {
+        self.task_key
     }
     pub(crate) const fn fragment(self) -> FragmentId {
         self.fragment
@@ -1015,6 +1020,7 @@ fn bound_writer_cohorts<'a>(
             .map(move |writer| BoundWriterCohort {
                 plan,
                 task: task.identity,
+                task_key: task.task_key(),
                 fragment: task.fragment_id,
                 writer,
             })

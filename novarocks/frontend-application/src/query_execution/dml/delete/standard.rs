@@ -141,12 +141,13 @@ pub(super) async fn prepare_delete_statement_async(
         state,
         target_binding.planning_pin(),
         &write_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             target,
             target_ref,
             novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
             delete_input_request(deletion_vectors)?,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            Some(mutation.base_version().clone()),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
             connector_context.clone(),
         )?,
@@ -155,7 +156,7 @@ pub(super) async fn prepare_delete_statement_async(
     .await?;
     // The original receiving already owns this session before any fallible
     // post-begin binding or query shaping can fail.
-    let (delete_query, sql_write_input, table_bindings) = bind_delete_write(
+    let (mut delete_query, write_plan, table_bindings) = bind_delete_write(
         target,
         target_ref,
         where_expr,
@@ -163,20 +164,25 @@ pub(super) async fn prepare_delete_statement_async(
         target_binding.planning_pin(),
         &write_session,
     )?;
+    let from = super::super::mutation_match_read::mutation_match_select(&mut delete_query)?;
+    let match_read = super::super::mutation_match_read::bind_mutation_match_read(
+        target,
+        &mut from.relation,
+        false,
+        &mutation,
+        target_binding.metadata(),
+        target_binding.planning_pin(),
+    )?;
     Ok(super::PreparedDeleteWrite {
         state: state.clone(),
         target: target.clone(),
         delete_query,
-        sql_write_input,
+        write_plan,
         table_bindings,
+        match_read: Some(match_read),
         execution,
         connector_context: connector_context.clone(),
         write_session,
-        distribution: if deletion_vectors {
-            crate::query_execution::compiler::iceberg_write_shuffle_by_output_index(0)
-        } else {
-            novarocks_sql::compiler::RootDistributionRequirement::Any
-        },
     })
 }
 
@@ -207,14 +213,7 @@ fn bind_delete_write(
     sink_mode: DmlWriteSinkMode,
     planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
     write_session: &crate::query_execution::write_session::ConnectorWriteSession,
-) -> Result<
-    (
-        Query,
-        novarocks_sql::planning::dml::DmlWritePlanInput,
-        Arc<QueryTableBindingStore>,
-    ),
-    String,
-> {
+) -> Result<(Query, super::DeleteWritePlan, Arc<QueryTableBindingStore>), String> {
     // A DELETE writes exactly one branch, so the session must have sealed
     // exactly one target and that target must carry the provider's row-mutation
     // routing facts. Both are proved here rather than assumed: a session that
@@ -229,37 +228,56 @@ fn bind_delete_write(
             ));
         }
     };
-    if write_target.route().is_none() {
-        return Err(format!(
-            "DELETE write target {} carries no provider routing facts",
-            write_target.ordinal().get()
-        ));
-    }
-
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = admit_session_connector_write_target(
-        table_bindings.as_ref(),
-        FrozenConnectorScanIdentity::new(
-            target.catalog.clone(),
-            target.namespace.clone(),
-            target.table.clone(),
-        ),
-        write_target,
-        planning_pin.clone(),
-    )?;
-    let sql_write_input = dml_write_plan_input_for_admitted_target(
-        table_bindings.as_ref(),
-        target_binding,
-        sink_mode,
-        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
-    )?;
+    let write_plan = match (
+        write_target.position_materialization(),
+        write_target.route(),
+    ) {
+        (Some(_), None) if sink_mode == DmlWriteSinkMode::DeletionVectors => {
+            super::DeleteWritePlan::Materialized(planning_pin.clone())
+        }
+        (None, Some(_)) if sink_mode == DmlWriteSinkMode::PositionDeletes => {
+            let target_binding = admit_session_connector_write_target(
+                table_bindings.as_ref(),
+                FrozenConnectorScanIdentity::new(
+                    target.catalog.clone(),
+                    target.namespace.clone(),
+                    target.table.clone(),
+                ),
+                write_target,
+                planning_pin.clone(),
+            )?;
+            super::DeleteWritePlan::Direct(dml_write_plan_input_for_admitted_target(
+                table_bindings.as_ref(),
+                target_binding,
+                sink_mode,
+                novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            )?)
+        }
+        _ => {
+            return Err(format!(
+                "DELETE write target {} differs from its signed position strategy",
+                write_target.ordinal().get()
+            ));
+        }
+    };
+    let raw_input = write_target
+        .position_materialization()
+        .map_or_else(|| write_target.input(), |group| group.raw_input());
     let delete_query = build_delete_position_sink_query(
         target,
         where_expr,
-        &write_input_columns(write_target.input()),
+        &write_input_columns(raw_input),
         target_ref,
     )?;
-    Ok((delete_query, sql_write_input, table_bindings))
+    Ok((delete_query, write_plan, table_bindings))
+}
+
+pub(super) const fn delete_change_stream_kind() -> novarocks_sql::planning::dml::DmlChangeStreamKind
+{
+    novarocks_sql::planning::dml::DmlChangeStreamKind::Delete {
+        position_input: [0, 1, 2, 3],
+    }
 }
 
 fn build_delete_position_sink_query(

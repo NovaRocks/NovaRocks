@@ -18,11 +18,13 @@
 //! Actual provider writers, real local files, and the local seal cut.
 
 use super::*;
-use crate::commit::write_stack::domain::{IcebergWriteTableFacts, IcebergWriterOutput};
-use crate::commit::write_stack::test_support::{
-    data_branch_plan, equality_delete_recipe, merge_target,
+use crate::commit::write_stack::domain::{
+    IcebergCreationScope, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterOutput,
 };
-use arrow::array::Int64Array;
+use crate::commit::write_stack::test_support::{
+    data_branch_plan, equality_delete_recipe, position_rewrite_target, writer_resources,
+};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
@@ -67,17 +69,6 @@ impl Fixture {
     async fn writer(
         &self,
         branch: IcebergWriteBranch,
-    ) -> (
-        Box<dyn ConnectorBatchWriter>,
-        RecordBatch,
-        ConnectorStopOwner,
-    ) {
-        self.writer_with_late_failure(branch, false).await
-    }
-    async fn writer_with_late_failure(
-        &self,
-        branch: IcebergWriteBranch,
-        unreadable_second: bool,
     ) -> (
         Box<dyn ConnectorBatchWriter>,
         RecordBatch,
@@ -130,46 +121,51 @@ impl Fixture {
                         .unwrap(),
                 )
             }
-            IcebergWriteBranch::PositionDelete | IcebergWriteBranch::DeletionVector => {
+            IcebergWriteBranch::DeletionVector => {
                 let source = format!("{root}/a-source.parquet");
-                let mut sources = vec![source.clone()];
-                let mut targets = vec![merge_target(&source, 2, Vec::new())];
-                if unreadable_second {
-                    let second = format!("{root}/z-source.parquet");
-                    let missing = crate::commit::write_stack::test_support::parquet_ref(
-                        &format!("{root}/missing-old-delete.parquet"),
-                        Some(&second),
-                        1,
-                        1,
-                    )
-                    .unwrap();
-                    targets.push(merge_target(&second, 2, vec![missing]));
-                    sources.push(second);
-                }
-                let positions = vec![0; sources.len()];
-                let handle =
-                    IcebergWriterHandle::try_new_delete(branch, table, output, targets).unwrap();
+                let handle = IcebergWriterHandle::try_new_delete(branch, table, output)
+                    .unwrap()
+                    .try_with_position_rewrite(position_rewrite_target(&source, 2))
+                    .unwrap()
+                    .with_creation_scope(
+                        IcebergCreationScope::try_new(
+                            IcebergWriteSessionId::new(),
+                            [1; 16],
+                            [2; 32],
+                        )
+                        .unwrap(),
+                    );
                 let schema = Arc::new(Schema::new(vec![
-                    Field::new("_file", DataType::Utf8, false),
-                    Field::new("_pos", DataType::Int64, false),
+                    Field::new(
+                        crate::position_delete::FILE_PATH_COLUMN,
+                        DataType::Utf8,
+                        false,
+                    ),
+                    Field::new(crate::position_delete::POS_COLUMN, DataType::Int64, false),
                 ]));
                 (
                     handle,
                     RecordBatch::try_new(
                         schema,
                         vec![
-                            Arc::new(StringArray::from(sources)),
-                            Arc::new(Int64Array::from(positions)),
+                            Arc::new(StringArray::from(vec![
+                                source.clone(),
+                                source.clone(),
+                                source,
+                            ])),
+                            Arc::new(Int64Array::from(vec![0, 0, 1])),
                         ],
                     )
                     .unwrap(),
                 )
             }
+            IcebergWriteBranch::PositionDelete => unreachable!("maintenance requires v3"),
         };
         let stop = ConnectorStopOwner::new();
         let writer = self
             .execution
             .open_writer(ConnectorOpenWriterRequest {
+                resources: (branch == IcebergWriteBranch::DeletionVector).then(writer_resources),
                 handle: self.adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: batch.schema(),
@@ -254,11 +250,7 @@ async fn sealed_equality_delete_survives_old_abort_drop_and_lost_receipt() {
     check_sealed(IcebergWriteBranch::EqualityDelete).await;
 }
 #[tokio::test]
-async fn sealed_position_delete_survives_old_abort_drop_and_lost_receipt() {
-    check_sealed(IcebergWriteBranch::PositionDelete).await;
-}
-#[tokio::test]
-async fn sealed_deletion_vector_survives_old_abort_drop_and_lost_receipt() {
+async fn sealed_maintenance_vector_survives_old_abort_drop_and_lost_receipt() {
     check_sealed(IcebergWriteBranch::DeletionVector).await;
 }
 #[tokio::test]
@@ -276,35 +268,56 @@ async fn unsealed_data_and_equality_delete_still_clean_their_own_objects() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_unsealed_finish_keeps_cleanup_of_its_already_written_prefix() {
-    for branch in [
-        IcebergWriteBranch::PositionDelete,
-        IcebergWriteBranch::DeletionVector,
-    ] {
-        let fixture = Fixture::new();
-        let (mut writer, batch, stop) = fixture.writer_with_late_failure(branch, true).await;
-        writer.append(batch).await.unwrap();
-        let failure = writer
-            .finish()
-            .await
-            .expect_err("the second target's actual missing old delete must fail");
+#[tokio::test]
+async fn maintenance_vector_rejects_foreign_and_out_of_domain_rows_before_staging() {
+    let fixture = Fixture::new();
+    for (foreign, position) in [(true, 0), (false, 2), (false, -1)] {
+        let (mut writer, original, _) = fixture.writer(IcebergWriteBranch::DeletionVector).await;
+        let names = original
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let path = if foreign {
+            "file:///foreign/data.parquet"
+        } else {
+            names.value(0)
+        };
+        let batch = RecordBatch::try_new(
+            original.schema(),
+            vec![
+                Arc::new(StringArray::from(vec![path])),
+                Arc::new(Int64Array::from(vec![position])),
+            ],
+        )
+        .unwrap();
         assert_eq!(
-            failure.kind(),
-            ConnectorErrorKind::NotFound,
-            "actual missing storage object"
-        );
-        assert_eq!(
-            fixture.files().len(),
-            1,
-            "the first target already staged a real output before failure"
-        );
-        stop.request_stop();
-        writer.abort().await.unwrap();
-        assert!(
-            fixture.files().is_empty(),
-            "failed finish never revokes the original cleanup authority"
+            writer.append(batch).await.unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
         );
         writer.abort().await.unwrap();
+        assert!(fixture.files().is_empty());
     }
+}
+
+#[tokio::test]
+async fn maintenance_vector_repacks_full_coverage_with_an_owned_puffin() {
+    let fixture = Fixture::new();
+    let (mut writer, batch, _) = fixture.writer(IcebergWriteBranch::DeletionVector).await;
+    writer.append(batch).await.unwrap();
+    let fragments = writer.finish().await.unwrap();
+    let [fragment] = fragments.as_slice() else {
+        panic!("one selected file must produce one vector");
+    };
+    let fragment = fixture.adapter.commit_fragment(fragment).unwrap();
+    let crate::commit::write_stack::IcebergCommitArtifact::DeletionVector(vector) =
+        fragment.artifact()
+    else {
+        panic!("maintenance must stage a replacement vector even at full coverage");
+    };
+    assert_eq!(vector.cardinality(), 2);
+    assert!(vector.merged_old_references().is_empty());
+    assert!(fragment.creation().is_some());
+    let [path]: [_; 1] = fixture.files().try_into().unwrap();
+    assert!(std::fs::read(path).unwrap().starts_with(b"PFA1"));
 }

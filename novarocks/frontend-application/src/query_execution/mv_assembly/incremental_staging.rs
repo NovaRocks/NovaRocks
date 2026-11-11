@@ -25,35 +25,6 @@ use crate::query_execution::planning::write_sink::{
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RewriteMergeRefreshEvidence {
-    None,
-    Aggregate,
-    JoinAggregate,
-    BranchUnionAggregate,
-}
-
-pub(crate) fn sql_imv_planning_input_from_rewrite(
-    rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
-    target_binding: novarocks_sql::binding::SqlTableBindingId,
-    evidence: RewriteMergeRefreshEvidence,
-) -> Result<novarocks_sql::compiler::SqlImvPlanningInput, String> {
-    use novarocks_sql::compiler::SqlImvRewriteValidation;
-
-    let validation = match evidence {
-        RewriteMergeRefreshEvidence::None => SqlImvRewriteValidation::None,
-        RewriteMergeRefreshEvidence::Aggregate => SqlImvRewriteValidation::Aggregate,
-        RewriteMergeRefreshEvidence::JoinAggregate => SqlImvRewriteValidation::JoinAggregate,
-        RewriteMergeRefreshEvidence::BranchUnionAggregate => {
-            SqlImvRewriteValidation::BranchUnionAggregate
-        }
-    };
-    Ok(novarocks_sql::compiler::SqlImvPlanningInput::new(
-        rewrite.to_sql_rewrite_snapshot(target_binding)?,
-        validation,
-    ))
-}
-
 /// The publication's branches, in the order their sealed write target ordinals
 /// put them.
 ///
@@ -74,22 +45,8 @@ fn change_stream_routed_targets(
     )>,
     String,
 > {
-    let mut routed = sealed_targets
-        .iter()
-        .map(|write_target| {
-            write_target
-                .route()
-                .map(|route| (write_target, route))
-                .ok_or_else(|| {
-                    format!(
-                        "MV incremental write target {} carries no provider routing facts",
-                        write_target.ordinal().get()
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    routed.sort_by_key(|(write_target, _)| write_target.ordinal());
-    Ok(routed)
+    crate::query_execution::dml::mutation_flow::routed_write_targets(sealed_targets)
+        .map_err(|error| format!("MV incremental: {error}"))
 }
 
 /// Project the session's sealed branches into the routes SQL compiles against.
@@ -103,7 +60,22 @@ pub(crate) fn incremental_change_stream_routes(
 
     let routed_targets = change_stream_routed_targets(write_session.targets())?;
     let mut routes = Vec::with_capacity(routed_targets.len());
+    use crate::query_execution::dml::mutation_flow::signed_change_stream_route;
+    let mut last_sink: Option<(
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+    )> = None;
     for (write_target, route) in routed_targets {
+        if let Some((ordinal, sink)) = &last_sink
+            && *ordinal == write_target.ordinal()
+        {
+            routes.push(signed_change_stream_route(
+                write_target,
+                route,
+                sink.clone(),
+            ));
+            continue;
+        }
         let target_binding = admit_session_connector_write_target(
             target_bindings,
             novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
@@ -138,16 +110,12 @@ pub(crate) fn incremental_change_stream_routes(
             novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
 
-        routes.push(novarocks_sql::planning::dml::DmlChangeStreamRoute {
-            route_id: route.route_id(),
-            // The branch's identity is its sealed ordinal, never its position
-            // in this loop.
-            write_target_ordinal: write_target.ordinal(),
-            accepted_effects: route.accepted_effects().to_vec(),
-            input_ordinals: route.input_ordinals().to_vec(),
-            requirements: route.requirements().clone(),
-            sink,
-        });
+        routes.push(signed_change_stream_route(
+            write_target,
+            route,
+            sink.clone(),
+        ));
+        last_sink = Some((write_target.ordinal(), sink));
     }
     Ok(routes)
 }

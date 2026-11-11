@@ -21,21 +21,16 @@
 //! artifacts and describes each one as an independent commit fragment; it has
 //! no catalog client and no commit capability at all.
 //!
-//! The deletion-vector and position-delete writers are where the NCP-6 D10
-//! inversion lands: they read the frozen old-delete references through this
-//! request's storage resolver, validate each artifact against the data file it
-//! claims, merge, and write. A read that fails for any reason fails the writer
-//! and therefore the query — it never degrades into an empty old delete set.
+//! Mutation writers materialize against their fixed read endpoint. A maintenance
+//! writer repacks positions from the already selected input scan.
 
 mod cleanup;
+mod materialization;
 use cleanup::UnsealedWriterCleanup;
 
-use crate::commit::model::EntryIdentity;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
@@ -47,24 +42,20 @@ use novarocks_spi::connector::{
 };
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::PositionDeleteGroup;
 use crate::commit::data_writer::{
     StagedDataFile, StagedPathJournal, StagedWriteContext, staged_data_file_to_writer_report,
     write_record_batches_journaled,
 };
-use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_from_frozen_facts};
-use crate::commit::position_delete_writer::write_position_delete_files_journaled;
+use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_with_file_io};
 use crate::commit::report::{IcebergPartitionReport, partition_path_from_struct};
-use crate::commit::write_io::build_staged_file_io;
+use crate::commit::write_io::{build_staged_file_io, build_staged_file_io_with_creation};
 use crate::commit::write_stack::domain::{
-    IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitFragment, IcebergContentRange,
-    IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergEqualityDeleteFileArtifact,
-    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriterHandle,
+    IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitFragment,
+    IcebergDataFileArtifact, IcebergEqualityDeleteFileArtifact, IcebergWriteBranch,
+    IcebergWriterHandle,
 };
 use crate::commit::write_stack::equality_schema::equality_delete_target_from_recipe;
-use crate::commit::write_stack::old_delete::read_and_merge_old_deletes;
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
-use crate::commit::{DeletionVector, write_single_deletion_vector_puffin};
 use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::encode_partition_descriptor;
 
@@ -117,9 +108,11 @@ impl ConnectorWriteExecution for IcebergWriteStackExecution {
             IcebergWriteBranch::Data => Ok(Box::new(IcebergDataStackWriter::open(
                 self, handle, request,
             )?)),
-            IcebergWriteBranch::PositionDelete | IcebergWriteBranch::DeletionVector => Ok(
-                Box::new(IcebergDeleteStackWriter::open(self, handle, request)?),
-            ),
+            IcebergWriteBranch::PositionDelete | IcebergWriteBranch::DeletionVector => {
+                Ok(Box::new(materialization::MaterializedDeleteWriter::open(
+                    self, handle, request,
+                )?))
+            }
             IcebergWriteBranch::EqualityDelete => Ok(Box::new(
                 IcebergEqualityDeleteStackWriter::open(self, handle, request)?,
             )),
@@ -247,6 +240,53 @@ fn ensure_live(
     Ok(())
 }
 
+fn managed_writer_io(
+    binding: &IcebergReadBinding,
+    handle: &IcebergWriterHandle,
+    physical: ConnectorWriterPhysicalContext,
+) -> Result<(crate::iceberg::io::FileIO, StagedPathJournal), ConnectorError> {
+    let location = handle.table().data_location();
+    if handle.creation_scope().is_some() {
+        let journal = StagedPathJournal::managed();
+        let file_io =
+            build_staged_file_io_with_creation(binding, location, handle, physical, &journal)?;
+        Ok((file_io, journal))
+    } else {
+        let file_io = build_staged_file_io(binding, location)
+            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        Ok((file_io, StagedPathJournal::default()))
+    }
+}
+
+fn with_creation_receipt(
+    fragment: IcebergCommitFragment,
+    journal: &StagedPathJournal,
+) -> Result<IcebergCommitFragment, ConnectorError> {
+    let Some(path) = fragment.new_object_path() else {
+        return Ok(fragment);
+    };
+    match journal
+        .receipt(path)
+        .map_err(|message| error(ConnectorErrorKind::CorruptData, message))?
+    {
+        Some(receipt) => fragment.try_with_creation(receipt),
+        None => Ok(fragment),
+    }
+}
+
+fn stage_position_error(cause: anyhow::Error) -> ConnectorError {
+    if let Some(original) = cause
+        .chain()
+        .find_map(|error| error.downcast_ref::<ConnectorError>())
+    {
+        return original.clone();
+    }
+    error(
+        ConnectorErrorKind::Internal,
+        format!("Stage Iceberg position artifact: {cause:#}"),
+    )
+}
+
 /// The per-driver data-file writer.
 struct IcebergDataStackWriter {
     adapter: IcebergWriteAdapter,
@@ -292,9 +332,9 @@ impl IcebergDataStackWriter {
             target_schema_json,
             parquet_row_group_size_bytes: handle.output().parquet_row_group_size_bytes(),
         };
-        let context =
-            staged_write_context_from_frozen_facts(&binding, &request.expected_schema, facts)
-                .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let (file_io, staged_paths) = managed_writer_io(&binding, &handle, request.physical)?;
+        let context = staged_write_context_with_file_io(&request.expected_schema, facts, file_io)
+            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         let cleanup = UnsealedWriterCleanup::new(
             binding,
             request.context.clone(),
@@ -305,7 +345,7 @@ impl IcebergDataStackWriter {
             context,
             request_context: request.context,
             fragments: Vec::new(),
-            staged_paths: StagedPathJournal::default(),
+            staged_paths,
             cleanup,
             lifecycle: WriterLifecycle::Live,
         })
@@ -380,10 +420,12 @@ impl IcebergDataStackWriter {
                 metrics,
                 report.file.first_row_id,
             )?;
-            self.fragments.push(
-                self.adapter
-                    .wrap_commit_fragment(IcebergCommitFragment::data_file(artifact)),
-            );
+            let fragment = with_creation_receipt(
+                IcebergCommitFragment::data_file(artifact),
+                &self.staged_paths,
+            )?;
+            self.fragments
+                .push(self.adapter.wrap_commit_fragment(fragment));
         }
         Ok(())
     }
@@ -419,337 +461,6 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         // phase once; Task stop still forbids append/finish work.
         self.cleanup.run(&self.staged_paths).await?;
         self.fragments.clear();
-        self.lifecycle = WriterLifecycle::Aborted;
-        Ok(())
-    }
-}
-
-/// The per-driver delete writer, shared by the position-delete and
-/// deletion-vector branches.
-///
-/// Both branches accept the same `(_file, _pos)` input, own the same frozen
-/// old-delete references, and differ only in the artifact they stage.
-struct IcebergDeleteStackWriter {
-    adapter: IcebergWriteAdapter,
-    binding: IcebergReadBinding,
-    handle: IcebergWriterHandle,
-    physical: ConnectorWriterPhysicalContext,
-    request_context: ConnectorRequestContext,
-    file_io: crate::iceberg::io::FileIO,
-    pending: BTreeMap<String, roaring::RoaringTreemap>,
-    staged_paths: StagedPathJournal,
-    cleanup: UnsealedWriterCleanup,
-    next_sequence: u64,
-    lifecycle: WriterLifecycle,
-}
-
-impl IcebergDeleteStackWriter {
-    fn open(
-        execution: &IcebergWriteStackExecution,
-        handle: IcebergWriterHandle,
-        request: ConnectorOpenWriterRequest,
-    ) -> Result<Self, ConnectorError> {
-        let binding = execution.binding.for_request(request.context.clone());
-        let file_io = build_staged_file_io(&binding, handle.table().data_location())
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
-        let cleanup = UnsealedWriterCleanup::new(
-            binding,
-            request.context.clone(),
-            handle.table().data_location(),
-        );
-        Ok(Self {
-            adapter: execution.adapter.clone(),
-            binding: execution.binding.clone(),
-            handle,
-            physical: request.physical,
-            request_context: request.context,
-            file_io,
-            pending: BTreeMap::new(),
-            staged_paths: StagedPathJournal::default(),
-            cleanup,
-            next_sequence: 0,
-            lifecycle: WriterLifecycle::Live,
-        })
-    }
-
-    fn branch_name(&self) -> &'static str {
-        self.handle.branch().as_str()
-    }
-
-    async fn stage_position_delete(
-        &mut self,
-        data_file: &str,
-        positions: &roaring::RoaringTreemap,
-        merged: Vec<EntryIdentity>,
-    ) -> Result<IcebergCommitFragment, ConnectorError> {
-        let target = self.handle.old_deletes().get(data_file).ok_or_else(|| {
-            error(
-                ConnectorErrorKind::CorruptData,
-                "frozen Iceberg delete merge target disappeared",
-            )
-        })?;
-        let partition = target.partition().clone();
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        let staging_dir = staged_path(
-            &self.handle,
-            &self.physical,
-            partition.partition_path(),
-            sequence,
-            "d",
-        );
-        let staging_dir = staging_dir
-            .rsplit_once('/')
-            .map_or(staging_dir.clone(), |(parent, _)| parent.to_string());
-        let ordered = positions
-            .iter()
-            .map(|position| {
-                i64::try_from(position).map_err(|_| {
-                    error(
-                        ConnectorErrorKind::CorruptData,
-                        "Iceberg position-delete position overflows i64",
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let written = write_position_delete_files_journaled(
-            &self.file_io,
-            &staging_dir,
-            vec![PositionDeleteGroup {
-                referenced_data_file: data_file.to_string(),
-                partition_spec_id: partition.partition_spec_id(),
-                // The backend never reconstructs partition values; the
-                // frontend decodes them from the frozen descriptor against
-                // the real table metadata at commit.
-                partition_values: crate::iceberg::spec::Struct::empty(),
-                positions: ordered,
-            }],
-            &self.staged_paths,
-        )
-        .await
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-        let [file] = written.as_slice() else {
-            return Err(error(
-                ConnectorErrorKind::Internal,
-                "Iceberg position-delete writer staged an unexpected file count",
-            ));
-        };
-        let metrics = IcebergArtifactMetrics::try_new(
-            file.record_count,
-            file.file_size_in_bytes,
-            Vec::new(),
-            None,
-        )?;
-        let artifact = IcebergPositionDeleteFileArtifact::try_new(
-            file.path.clone(),
-            partition,
-            metrics,
-            data_file.to_string(),
-            merged,
-        )?;
-        Ok(IcebergCommitFragment::position_delete_file(artifact))
-    }
-
-    async fn stage_deletion_vector(
-        &mut self,
-        data_file: &str,
-        positions: &roaring::RoaringTreemap,
-        merged: Vec<EntryIdentity>,
-    ) -> Result<IcebergCommitFragment, ConnectorError> {
-        let target = self.handle.old_deletes().get(data_file).ok_or_else(|| {
-            error(
-                ConnectorErrorKind::CorruptData,
-                "frozen Iceberg delete merge target disappeared",
-            )
-        })?;
-        let partition = target.partition().clone();
-        let mut vector = DeletionVector::new();
-        for position in positions.iter() {
-            vector.insert(position).map_err(|vector_error| {
-                error(
-                    ConnectorErrorKind::CorruptData,
-                    format!("encode Iceberg deletion vector failed: {vector_error}"),
-                )
-            })?;
-        }
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        let path = staged_path(
-            &self.handle,
-            &self.physical,
-            partition.partition_path(),
-            sequence,
-            "puffin",
-        );
-        self.staged_paths.record(&path);
-        let written = write_single_deletion_vector_puffin(&self.file_io, &path, data_file, &vector)
-            .await
-            .map_err(|write_error| {
-                error(
-                    ConnectorErrorKind::Internal,
-                    format!("stage Iceberg deletion vector failed: {write_error}"),
-                )
-            })?;
-        let metrics = IcebergArtifactMetrics::try_new(
-            written.cardinality,
-            written.file_size_in_bytes,
-            Vec::new(),
-            None,
-        )?;
-        let artifact = IcebergDeletionVectorArtifact::try_new(
-            written.path,
-            partition,
-            metrics,
-            written.referenced_data_file,
-            IcebergContentRange::try_new(written.content_offset, written.content_size_in_bytes)?,
-            written.cardinality,
-            merged,
-        )?;
-        Ok(IcebergCommitFragment::deletion_vector(artifact))
-    }
-
-    async fn cleanup(&mut self) -> Result<(), ConnectorError> {
-        self.cleanup.run(&self.staged_paths).await
-    }
-}
-
-#[async_trait::async_trait]
-impl ConnectorBatchWriter for IcebergDeleteStackWriter {
-    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        ensure_live(self.lifecycle, &self.request_context, self.branch_name())?;
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-        if batch.num_columns() < 2 {
-            return Err(error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg delete writer input requires _file and _pos columns",
-            ));
-        }
-        let file_paths = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                error(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg delete writer _file column must be Utf8",
-                )
-            })?;
-        let positions = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                error(
-                    ConnectorErrorKind::CorruptData,
-                    "Iceberg delete writer _pos column must be Int64",
-                )
-            })?;
-        if file_paths.null_count() != 0 || positions.null_count() != 0 {
-            return Err(error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg delete writer rows must not contain NULL _file or _pos",
-            ));
-        }
-        for row in 0..batch.num_rows() {
-            let referenced = file_paths.value(row);
-            // A row for a data file this logical target does not own would
-            // make two writers rewrite the same data file's deletes. The
-            // sealed route says which target owns it, so a foreign row is a
-            // routing error, not something to absorb.
-            let target = self.handle.old_deletes().get(referenced).ok_or_else(|| {
-                error(
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "Iceberg {} writer does not own data file `{referenced}` (owned files={})",
-                        self.handle.branch().as_str(),
-                        self.handle.old_deletes().len()
-                    ),
-                )
-            })?;
-            let position = u64::try_from(positions.value(row)).map_err(|_| {
-                error(
-                    ConnectorErrorKind::InvalidRequest,
-                    "Iceberg delete writer position must be non-negative",
-                )
-            })?;
-            if position >= target.data_file_record_count() {
-                return Err(error(
-                    ConnectorErrorKind::InvalidRequest,
-                    format!(
-                        "Iceberg delete writer position {position} is outside `{referenced}`, which has {} rows",
-                        target.data_file_record_count()
-                    ),
-                ));
-            }
-            self.pending
-                .entry(referenced.to_string())
-                .or_default()
-                .insert(position);
-        }
-        Ok(())
-    }
-
-    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        ensure_live(self.lifecycle, &self.request_context, self.branch_name())?;
-        self.lifecycle = WriterLifecycle::Finishing;
-        let pending = std::mem::take(&mut self.pending);
-        let mut fragments = Vec::with_capacity(pending.len());
-        for (data_file, new_positions) in pending {
-            let target = self
-                .handle
-                .old_deletes()
-                .get(&data_file)
-                .cloned()
-                .ok_or_else(|| {
-                    error(
-                        ConnectorErrorKind::CorruptData,
-                        "frozen Iceberg delete merge target disappeared",
-                    )
-                })?;
-            // D10: the old artifacts are read here, on the backend, through
-            // this request's storage lease. Any failure — missing, unreadable,
-            // corrupt, mismatched, or stale — propagates and fails the query.
-            let merged = read_and_merge_old_deletes(&target, &self.binding, &self.request_context)?;
-            let merged_references = merged.merged_references().to_vec();
-            let mut positions = merged.into_positions();
-            positions |= new_positions;
-            if positions.is_empty() {
-                continue;
-            }
-            let fragment = match self.handle.branch() {
-                IcebergWriteBranch::DeletionVector => {
-                    self.stage_deletion_vector(&data_file, &positions, merged_references)
-                        .await?
-                }
-                IcebergWriteBranch::PositionDelete => {
-                    self.stage_position_delete(&data_file, &positions, merged_references)
-                        .await?
-                }
-                IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
-                    return Err(error(
-                        ConnectorErrorKind::CorruptData,
-                        format!(
-                            "Iceberg position-delete writer opened on the {} branch",
-                            self.handle.branch().as_str()
-                        ),
-                    ));
-                }
-            };
-            fragments.push(self.adapter.wrap_commit_fragment(fragment));
-        }
-        self.lifecycle = WriterLifecycle::Sealed;
-        Ok(fragments)
-    }
-
-    async fn abort(&mut self) -> Result<(), ConnectorError> {
-        if !self.lifecycle.can_abort() {
-            return Ok(());
-        }
-        self.lifecycle = WriterLifecycle::Aborting;
-        self.pending.clear();
-        self.cleanup().await?;
         self.lifecycle = WriterLifecycle::Aborted;
         Ok(())
     }
@@ -793,8 +504,7 @@ impl IcebergEqualityDeleteStackWriter {
         let target = equality_delete_target_from_recipe(recipe, &request.expected_schema)?;
         let equality_field_ids = recipe.field_ids();
         let binding = execution.binding.for_request(request.context.clone());
-        let file_io = build_staged_file_io(&binding, handle.table().data_location())
-            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        let (file_io, staged_paths) = managed_writer_io(&binding, &handle, request.physical)?;
         // One directory per query attempt, the same shape every other writer
         // stages into, so an abort has one prefix to clean.
         let staging_dir = format!(
@@ -827,7 +537,7 @@ impl IcebergEqualityDeleteStackWriter {
             equality_field_ids,
             partition,
             fragments: Vec::new(),
-            staged_paths: StagedPathJournal::default(),
+            staged_paths,
             cleanup,
             lifecycle: WriterLifecycle::Live,
         })
@@ -870,10 +580,12 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
             metrics,
             self.equality_field_ids.clone(),
         )?;
-        self.fragments.push(
-            self.adapter
-                .wrap_commit_fragment(IcebergCommitFragment::equality_delete_file(artifact)),
-        );
+        let fragment = with_creation_receipt(
+            IcebergCommitFragment::equality_delete_file(artifact),
+            &self.staged_paths,
+        )?;
+        self.fragments
+            .push(self.adapter.wrap_commit_fragment(fragment));
         Ok(())
     }
 

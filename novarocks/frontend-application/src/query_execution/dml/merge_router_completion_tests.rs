@@ -162,6 +162,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         DmlChangeStreamCompileRequest {
             optimize_request: SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
             kind: DmlChangeStreamKind::Merge {
+                file_metadata: None,
                 target_columns: columns,
                 matched_update: true,
                 matched_delete: false,

@@ -18,6 +18,9 @@
 //! Freeze once from admission; every catalog conflict prepares fresh metadata.
 
 mod lineage;
+mod materialized;
+#[cfg(test)]
+pub(crate) use materialized::observed_materialized_staging_fixture;
 
 use super::*;
 #[cfg(test)]
@@ -30,6 +33,7 @@ use crate::commit::attempt::observation::PublicationJournal;
 use crate::commit::attempt::prepared::CatalogPublisher;
 use crate::commit::attempt::{self, RetryPolicy};
 use crate::commit::dependency::ValidationInputs;
+use crate::commit::model::EntryIdentity;
 use crate::commit::model::{
     AddedContent, ArtifactClass, BaseIdentity, CleanupScope, FileChanges, FrozenRequest,
     IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts, OperationToken,
@@ -53,11 +57,12 @@ fn format_error(error: ConnectorError) -> crate::iceberg::Error {
 }
 
 struct WriteRecipe {
-    source: TableMetadata,
+    source: Arc<TableMetadata>,
     files: Vec<WrittenFile>,
+    materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
+    fixed_mutation: bool,
     cow: Option<CowUpdateRewriteSet>,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
-    removed_dvs: BTreeSet<EntryIdentity>,
     start: Option<StartSnapshot>,
     target: TableTarget,
     target_ref: String,
@@ -77,25 +82,99 @@ impl WriteRecipe {
     ) -> Result<Self, ConnectorError> {
         use crate::commit::model::Dependency;
         let facts = handle.table();
-        let source = handle
-            .source_metadata()
-            .ok_or_else(|| internal("Iceberg write lost its admitted source metadata"))?
-            .clone();
+        let source = Arc::clone(
+            handle
+                .source_metadata_ref()
+                .ok_or_else(|| internal("Iceberg write lost its admitted source metadata"))?,
+        );
         let writer_metadata = handle
             .repartition()
-            .map_or(&source, |r| r.prospective_metadata());
-        let mut files = validated
-            .iter()
-            .map(|entry| written_file_from_fragment(entry.fragment, writer_metadata))
-            .collect::<Result<Vec<_>, _>>()?;
-        let cow = cow_update_rewrite_set(
-            handle,
-            &validated
-                .iter()
-                .map(|entry| entry.ordinal)
-                .zip(files.iter().cloned())
-                .collect::<Vec<_>>(),
-        )?;
+            .map_or(source.as_ref(), |r| r.prospective_metadata());
+        let fixed_mutation = handle.mutation_read().is_some();
+        let historical = handle
+            .mutation_read()
+            .map(|recipe| {
+                recipe.validate_loaded(facts, &source)?;
+                let snapshot = facts
+                    .base_snapshot_id()
+                    .map(|id| {
+                        source
+                            .snapshot_by_id(id)
+                            .ok_or_else(|| corrupt("Iceberg fixed write snapshot is absent"))
+                    })
+                    .transpose()?;
+                let schema = match snapshot {
+                    Some(snapshot) => snapshot
+                        .schema(&source)
+                        .map_err(|error| corrupt(error.to_string()))?,
+                    None => source.current_schema().clone(),
+                };
+                crate::read_snapshot::frozen_partition_types(&source, &schema).map_err(corrupt)
+            })
+            .transpose()?;
+        let mut targets = BTreeMap::new();
+        let mut files = Vec::new();
+        let mut located_files = Vec::new();
+        for entry in validated {
+            let fragment = entry.fragment;
+            let target = match fragment.artifact() {
+                IcebergCommitArtifact::FinalDelete(effect) => Some(materialized::Target {
+                    partition: effect.partition().clone(),
+                    final_effect: Some(effect.clone()),
+                }),
+                IcebergCommitArtifact::PositionDeleteFile(file) if fixed_mutation => {
+                    Some(materialized::Target {
+                        partition: file.partition().clone(),
+                        final_effect: None,
+                    })
+                }
+                _ => None,
+            };
+            let historical_type = target
+                .as_ref()
+                .map(|target| {
+                    historical
+                        .as_ref()
+                        .and_then(|types| types.get(&target.partition.partition_spec_id()))
+                        .ok_or_else(|| {
+                            corrupt("Iceberg materialized target has no historical partition type")
+                        })
+                })
+                .transpose()?;
+            if fragment.new_object_path().is_some() {
+                let file = written_file_with_historical_partition(
+                    fragment,
+                    writer_metadata,
+                    historical_type,
+                )?;
+                if handle.flavor() == IcebergWriteFlavor::RowMutationCopyOnWrite {
+                    located_files.push((entry.ordinal, file.clone()));
+                }
+                files.push(file);
+            }
+            if let Some(target) = target {
+                let path = fragment
+                    .referenced_data_file()
+                    .ok_or_else(|| corrupt("Iceberg materialized effect has no target"))?;
+                match targets.entry(path.to_owned()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(target);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get().final_effect.is_none()
+                            && target.final_effect.is_none()
+                            && entry.get().partition == target.partition => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(corrupt(
+                            "Iceberg materialized step has conflicting effects for one data file",
+                        ));
+                    }
+                }
+            }
+        }
+        let materialized = (!targets.is_empty())
+            .then(|| Arc::new(materialized::MaterializedDeleteStep::new(targets)));
+        let cow = cow_update_rewrite_set(handle, &located_files)?;
         if let Some(rewrite) = &cow {
             let markers = cow_output_row_ids(rewrite)?;
             for file in &mut files {
@@ -117,16 +196,6 @@ impl WriteRecipe {
         {
             lineage::freeze_preserved_row_ids(validated, &mut files)?;
         }
-        let removed_dvs = validated
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.fragment.artifact(),
-                    IcebergCommitArtifact::DeletionVector(_)
-                )
-            })
-            .flat_map(|entry| entry.fragment.merged_old_references().iter().cloned())
-            .collect();
         let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
         let mut summary = session_snapshot_properties_for_commit(handle)?;
         let keyed_documents = documents.map(|intent| intent.documents.clone());
@@ -177,9 +246,10 @@ impl WriteRecipe {
         Ok(Self {
             source,
             files,
+            materialized,
+            fixed_mutation,
             cow,
             selected,
-            removed_dvs,
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
                 sequence_number: facts.base_sequence_number(),
@@ -218,16 +288,34 @@ impl WriteRecipe {
             added.push(entry);
         }
         let mut removed = Vec::new();
-        if !matches!(
-            self.op_kind,
-            CommitOpKind::FastAppend | CommitOpKind::Overwrite | CommitOpKind::RowDelta
-        ) {
+        if let Some(step) = &self.materialized {
+            let snapshot_id = self
+                .start
+                .ok_or_else(|| format_error(invalid("materialized write has no source snapshot")))?
+                .snapshot_id;
+            let source_io = operation.begin_attempt()?;
+            removed = step
+                .observe(
+                    Arc::clone(&self.source),
+                    snapshot_id,
+                    &source_io,
+                    operation.request_context(),
+                )
+                .await?;
+        } else if !self.fixed_mutation
+            && !matches!(
+                self.op_kind,
+                CommitOpKind::FastAppend
+                    | CommitOpKind::Overwrite
+                    | CommitOpKind::RowDelta
+                    | CommitOpKind::MaterializedRowDelta
+            )
+        {
             let source_io = operation.begin_attempt()?;
             let inputs =
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
             let live = inputs.compact_live_entries().await?;
             let mut identities: BTreeSet<_> = match self.op_kind {
-                CommitOpKind::RowDeltaDvFromFiles => self.removed_dvs.clone(),
                 CommitOpKind::CowUpdate => self
                     .cow
                     .as_ref()
@@ -300,14 +388,6 @@ impl WriteRecipe {
                 removed.push(entry.frozen.clone());
             }
         }
-        if self.op_kind == CommitOpKind::RowDeltaDvFromFiles
-            && added.is_empty()
-            && !removed.is_empty()
-        {
-            return Err(format_error(invalid(
-                "DV removal requires a new replacement DV",
-            )));
-        }
         OperationIntent::new(OperationIntentParts {
             target: self.target.clone(),
             target_ref: self.target_ref.clone(),
@@ -333,12 +413,15 @@ impl WriteRecipe {
     }
 
     fn preparer(&self) -> Result<Box<dyn Preparer>, ConnectorError> {
+        if let Some(step) = &self.materialized {
+            return Ok(Box::new(Arc::clone(step)));
+        }
         // A managed publication admitted as CommitEmptyWrite still needs its
         // snapshot marker even when no row delta was materialized.
         if self.files.is_empty()
             && matches!(
                 self.op_kind,
-                CommitOpKind::RowDelta | CommitOpKind::RowDeltaDvFromFiles
+                CommitOpKind::RowDelta | CommitOpKind::MaterializedRowDelta
             )
             && !self.summary.is_empty()
         {
@@ -348,8 +431,13 @@ impl WriteRecipe {
             CommitOpKind::FastAppend => Box::new(crate::commit::fast_append::FastAppendPreparer),
             CommitOpKind::Overwrite => Box::new(crate::commit::overwrite::OverwritePreparer),
             CommitOpKind::RowDelta => Box::new(crate::commit::row_delta::RowDeltaPreparer),
-            CommitOpKind::RowDeltaDvFromFiles => {
-                Box::new(crate::commit::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer)
+            CommitOpKind::MaterializedRowDelta => {
+                if !self.fixed_mutation {
+                    return Err(corrupt(
+                        "Iceberg v3 row delta lacks its complete materialization",
+                    ));
+                }
+                Box::new(crate::commit::fast_append::FastAppendPreparer)
             }
             CommitOpKind::CowUpdate => Box::new(crate::commit::update_cow::CowUpdatePreparer {
                 rewrite: self

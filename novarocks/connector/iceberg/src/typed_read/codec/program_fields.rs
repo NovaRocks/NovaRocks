@@ -336,6 +336,37 @@ fn visit_table(
     let arrow = opaque_source(work, || annotated_read_schema(&schema))?;
     let index = source_index(&schema, &arrow, work)?;
     for (ordinal, column) in columns.iter().enumerate() {
+        use crate::typed_read::schema_binding::mutation_partition;
+        if mutation_partition::is_file_metadata(column.base_field_id()) {
+            let metadata = opaque_source(work, || table.mutation_metadata())?
+                .ok_or_else(|| invalid("Iceberg table did not declare mutation file metadata"))?;
+            if table.frozen_cow_source().is_some() {
+                return Err(invalid(
+                    "Iceberg COW source cannot supply mutation file metadata",
+                ));
+            }
+            let (declaration, carrier) = if column.base_field_id() == mutation_partition::SPEC_ID {
+                (metadata.spec_field(), DataType::Int32)
+            } else {
+                let carrier = opaque_source(work, || {
+                    mutation_partition::partition_carrier(metadata.partition_type())
+                })?;
+                (metadata.partition_field(), carrier)
+            };
+            let expected = opaque_source(work, || IcebergColumnHandle::base_column(declaration))?;
+            compare_handle(column, &expected, work)?;
+            let field = Field::new(&declaration.name, carrier, !declaration.required);
+            visit(
+                ordinal,
+                &field,
+                column.nullable(),
+                Some(declaration),
+                column.type_json().len(),
+                work,
+            )?;
+            work.step()?;
+            continue;
+        }
         let (field, nullable, declaration) =
             source_column_field(column, &index, Some(table), work)?;
         visit(
@@ -614,7 +645,13 @@ fn compare_public(
     }
     let value_declaration = opaque_source(work, || parse_type(column.type_json(), "type_json"))?;
     let empty_nominals = Default::default();
-    let nominals = typed_compare::nominal_declarations(relation).unwrap_or(&empty_nominals);
+    let nominals = if crate::typed_read::schema_binding::mutation_partition::is_file_metadata(
+        column.base_field_id(),
+    ) {
+        &empty_nominals
+    } else {
+        typed_compare::nominal_declarations(relation).unwrap_or(&empty_nominals)
+    };
     let value_id = column
         .field_id_path()
         .last()

@@ -74,6 +74,21 @@ impl<'a> ManifestSource<'a> {
         super::parse_manifest_checked(&bytes)
     }
 
+    /// Read under the scope's immutable physical object identity.
+    pub(crate) async fn load_sized(self, io: &FileIO) -> Result<Manifest> {
+        let bytes = io.new_input(&self.descriptor.manifest_path)?.read().await?;
+        if i64::try_from(bytes.len()).ok() != Some(self.descriptor.manifest_length) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Manifest {} length differs from its descriptor",
+                    self.descriptor.manifest_path
+                ),
+            ));
+        }
+        super::parse_manifest_checked(&bytes)
+    }
+
     pub(crate) fn bind(self, raw: &'a Manifest) -> Result<BoundEntries<'a>> {
         self.check_header(raw.metadata())?;
         BoundEntries::new(self, raw.entries())

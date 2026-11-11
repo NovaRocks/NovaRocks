@@ -137,10 +137,21 @@ pub(crate) fn prepare_write(
         )
     })?;
     let snapshot = snapshot_token(target_snapshot_id);
-    let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-        "iceberg/write-base/v1/{table_uuid}/{}/{snapshot}",
-        request.target_ref.as_str()
-    )))?;
+    let base_version = if request.purpose == ConnectorWriteAdmissionPurpose::MaterializedViewRefresh
+        && request.intent == ConnectorWriteIntent::RowDelta
+    {
+        super::write_shared::position_mutation_base(
+            &metadata,
+            payload.metadata_location.as_deref(),
+            request.target_ref.as_str(),
+            target_snapshot_id,
+        )?
+    } else {
+        ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
+            "iceberg/write-base/v1/{table_uuid}/{}/{snapshot}",
+            request.target_ref.as_str()
+        )))?
+    };
     let preparation_payload = Bytes::from(format!(
         "iceberg/write-preparation/v1/{}/{}/{}/{snapshot}",
         owner.instance_id.as_str(),
@@ -496,6 +507,68 @@ pub(crate) fn freeze_write_input_request(
                         creation,
                     )?,
                 }
+            }
+        })
+    })
+}
+
+pub(crate) fn freeze_position_mutation_input(
+    metadata: &TableMetadata,
+    target_ref: &str,
+    snapshot_id: Option<i64>,
+    input: &ConnectorWriteInputRequest,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<ConnectorWriteInputRequest, ConnectorError> {
+    let query_schema = crate::commit::write_shared::position_mutation_read_schema(
+        metadata,
+        target_ref,
+        snapshot_id,
+    )?;
+    let partition = crate::typed_read::schema_binding::MutationMetadataSchema::try_new(
+        metadata,
+        &query_schema,
+    )?;
+    crate::metadata::with_pure_schema_creation(context, |creation| {
+        let file = crate::typed_read::IcebergMetadataColumn::Path;
+        let position = crate::typed_read::IcebergMetadataColumn::RowPosition;
+        let mut identity = Vec::with_capacity(4);
+        for role in [file, position] {
+            let value = crate::schema_mapping::catalog_value::metadata_column(role, creation)
+                .map_err(crate::metadata::metadata_creation_error)?;
+            identity.push(ConnectorWriteFieldRequest::try_new_typed(
+                Field::new(role.column_name(), value.data_type().clone(), false),
+                crate::commit::write_shared::writer_value_with_nullable(&value, false, creation)?,
+            )?);
+        }
+        let partition_fields = partition.write_fields(creation)?;
+        Ok(match input {
+            ConnectorWriteInputRequest::PositionDelete { .. } => {
+                ConnectorWriteInputRequest::PositionDelete {
+                    identity_fields: identity,
+                    partition_source_fields: Vec::from(partition_fields),
+                }
+            }
+            ConnectorWriteInputRequest::DeletionVector { .. } => {
+                ConnectorWriteInputRequest::DeletionVector {
+                    identity_fields: identity,
+                    partition_source_fields: Vec::from(partition_fields),
+                }
+            }
+            ConnectorWriteInputRequest::RowLineage { data_fields, .. } => {
+                identity.extend(partition_fields);
+                ConnectorWriteInputRequest::RowLineage {
+                    data_fields: exact_row_lineage_data_write_fields(
+                        metadata,
+                        data_fields,
+                        creation,
+                    )?,
+                    row_identity_fields: identity,
+                }
+            }
+            _ => {
+                return Err(invalid_write_activation(
+                    "Iceberg position mutation has no row identity",
+                ));
             }
         })
     })

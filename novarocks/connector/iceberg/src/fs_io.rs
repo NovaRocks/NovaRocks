@@ -37,6 +37,9 @@ use novarocks_spi::connector::{
 
 use crate::access_binding::IcebergReadBinding;
 
+mod managed_create;
+use managed_create::{ManagedWriteObjects, supports_managed_create};
+
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static HADOOP_TEST_LIST_CALLS: std::cell::Cell<usize>;
@@ -321,6 +324,8 @@ pub struct IcebergFileSystemFactory {
     binding: Option<IcebergReadBinding>,
     #[serde(skip, default)]
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
+    #[serde(skip, default)]
+    creation: Option<ManagedWriteObjects>,
 }
 
 impl IcebergFileSystemFactory {
@@ -328,6 +333,7 @@ impl IcebergFileSystemFactory {
         Self {
             binding: Some(binding),
             admission: None,
+            creation: None,
         }
     }
 }
@@ -345,6 +351,7 @@ impl StorageFactory for IcebergFileSystemFactory {
             binding: Some(binding),
             listing: None,
             admission: self.admission.clone(),
+            creation: self.creation.clone(),
         }))
     }
 }
@@ -357,6 +364,8 @@ pub struct IcebergFsStorage {
     listing: Option<(ConnectorListingBound, usize)>,
     #[serde(skip, default)]
     admission: Option<Arc<dyn IcebergWriteAdmission>>,
+    #[serde(skip, default)]
+    creation: Option<ManagedWriteObjects>,
 }
 
 impl IcebergFsStorage {
@@ -365,6 +374,7 @@ impl IcebergFsStorage {
             binding: Some(binding),
             listing: None,
             admission: None,
+            creation: None,
         }
     }
 
@@ -574,6 +584,12 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        if self.creation.is_some() {
+            let mut writer = self.writer(path).await?;
+            writer.write(bs).await?;
+            writer.close().await?;
+            return Ok(());
+        }
         let permit = match &self.admission {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
@@ -604,6 +620,15 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        if let Some(creation) = &self.creation {
+            let binding = self.binding.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "managed Iceberg storage has no admitted binding",
+                )
+            })?;
+            return creation.open(binding, path).await;
+        }
         let permit = match &self.admission {
             Some(admission) => Some(admission.clone().admit(path)?.acquire().await?),
             None => None,
@@ -684,17 +709,40 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
+        if let Some(creation) = &self.creation {
+            creation
+                .journal
+                .receipt(path)
+                .map_err(|message| Error::new(ErrorKind::DataInvalid, message))?;
+        }
         let _phase = self.non_http_phase(path).await?;
         let (access, relative_path) = self.resolve_path("delete", path).await?;
-        access.operator().delete(&relative_path).await.map_err(|e| {
-            Error::new(
-                ErrorKind::Unexpected,
-                format!("fs delete({path}) through {relative_path}: {e}"),
-            )
-        })
+        access
+            .operator()
+            .delete(&relative_path)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("fs delete({path}) through {relative_path}: {e}"),
+                )
+            })?;
+        if let Some(creation) = &self.creation {
+            creation
+                .journal
+                .remove_owned(path)
+                .map_err(|message| Error::new(ErrorKind::DataInvalid, message))?;
+        }
+        Ok(())
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
+        if self.creation.is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "managed output cannot delete a prefix",
+            ));
+        }
         let _phase = self.non_http_phase(path).await?;
         let (access, relative_path) = self.resolve_path("delete_prefix", path).await?;
         access
@@ -1075,8 +1123,43 @@ pub(crate) fn build_admitted_file_io_for_location(
     FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
         binding: Some(binding),
         admission: Some(admission),
+        creation: None,
     }))
     .build()
+}
+
+pub(crate) fn build_managed_file_io(
+    location: &str,
+    binding: IcebergReadBinding,
+    scope: crate::commit::write_stack::domain::IcebergCreationScope,
+    physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
+    format: crate::delete_file::IcebergFileFormat,
+    journal: crate::commit::data_writer::StagedPathJournal,
+) -> std::result::Result<FileIO, ConnectorError> {
+    let access = binding.resolve_access(location)?;
+    if !supports_managed_create(&access) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "storage lacks conditional streaming creation and exact observation",
+        ));
+    }
+    if !journal.requires_creation() || binding.request_context().is_none() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "managed output requires its original request and staged path journal",
+        ));
+    }
+    Ok(FileIOBuilder::new(Arc::new(IcebergFileSystemFactory {
+        binding: Some(binding),
+        admission: None,
+        creation: Some(ManagedWriteObjects {
+            scope,
+            physical,
+            format,
+            journal,
+        }),
+    }))
+    .build())
 }
 
 pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
@@ -1141,6 +1224,7 @@ pub(crate) async fn list_directories(
         binding: Some(binding),
         listing: Some((bound, workspace_bytes)),
         admission: None,
+        creation: None,
     };
     storage.list_directories(location).await
 }
@@ -2015,6 +2099,7 @@ mod tests {
             binding: Some(binding.clone()),
             listing: Some((bound, 4096)),
             admission: None,
+            creation: None,
         };
         assert_eq!(
             complete
@@ -2033,6 +2118,7 @@ mod tests {
                 4096,
             )),
             admission: None,
+            creation: None,
         };
         assert_eq!(
             stopped_kind(

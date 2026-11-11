@@ -1457,6 +1457,11 @@ pub(crate) fn build_table_metadata(
         row_mutation_frozen_source: false,
         hidden_columns,
     };
+    let mutation_metadata = if payload.metadata_table_type.is_none() {
+        mutation_metadata_schema(metadata, &definition_schema)?
+    } else {
+        None
+    };
     let (schema, execution_schema) = if let Some(metadata_table_type) = payload.metadata_table_type
     {
         let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
@@ -1473,6 +1478,9 @@ pub(crate) fn build_table_metadata(
         // `_last_updated_sequence_number` unresolvable.
         let mut fields = base_schema.fields().to_vec();
         fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+        if let Some(mutation) = &mutation_metadata {
+            fields.extend(mutation.arrow_fields()?);
+        }
         let schema = Arc::new(Schema::new_with_metadata(
             fields,
             base_schema.metadata().clone(),
@@ -1481,6 +1489,7 @@ pub(crate) fn build_table_metadata(
             &nominal_document,
             definition_schema.as_ref(),
             &payload.metadata_columns,
+            mutation_metadata.as_ref(),
             creation,
         )?;
         (schema, execution)
@@ -1488,10 +1497,17 @@ pub(crate) fn build_table_metadata(
     let planning_facts = if payload.metadata_table_type.is_some() {
         ConnectorTablePlanningFacts::empty()
     } else {
+        let mut metadata_columns = payload.metadata_columns.clone();
+        if let Some(mutation) = &mutation_metadata {
+            metadata_columns.extend([
+                mutation.spec_field().name.clone(),
+                mutation.partition_field().name.clone(),
+            ]);
+        }
         let input = IcebergTablePlanningFactsInput {
             schema: &schema,
             iceberg_schema: Some(definition_schema.as_ref()),
-            metadata_columns: &payload.metadata_columns,
+            metadata_columns: &metadata_columns,
             hidden_columns: &payload.hidden_columns,
             nominal_declarations: &nominal_document.nominals,
             table_metadata: Some(metadata),
@@ -2176,6 +2192,11 @@ pub(crate) fn projected_schema_with_metadata(
     let mut fields = storage.fields().to_vec();
     let metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
     fields.extend(metadata_fields);
+    if !table.row_mutation_frozen_source
+        && let Some(mutation) = mutation_metadata_schema(metadata, &storage_schema)?
+    {
+        fields.extend(mutation.arrow_fields()?);
+    }
     let indexes = if projection.is_empty() {
         (0..fields.len()).collect::<Vec<_>>()
     } else {
@@ -2464,7 +2485,7 @@ fn select_snapshot(
 fn is_metadata_column(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number"
+        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number" | "_spec_id" | "_partition"
     )
 }
 
@@ -2683,6 +2704,17 @@ fn annotate_hidden_fields(schema: SchemaRef, hidden: &[String]) -> SchemaRef {
         })
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+pub(crate) fn mutation_metadata_schema(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
+) -> Result<Option<crate::typed_read::schema_binding::MutationMetadataSchema>, ConnectorError> {
+    (metadata.format_version() >= crate::iceberg::spec::FormatVersion::V2)
+        .then(|| {
+            crate::typed_read::schema_binding::MutationMetadataSchema::try_new(metadata, schema)
+        })
+        .transpose()
 }
 
 pub(crate) fn metadata_column_names(metadata: &crate::iceberg::spec::TableMetadata) -> Vec<String> {
@@ -4569,8 +4601,24 @@ mod plan_splits_pruning_tests {
                     .unwrap();
                 drop(owner.take());
                 assert!(weak.upgrade().is_none());
-                assert_eq!(result.to_metadata().schema().field(0).name(), "id");
-                assert_eq!(result.to_metadata().schema().fields().len(), 3);
+                let schema = result.to_metadata().schema();
+                assert_eq!(
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>(),
+                    ["id", "_file", "_pos", "_spec_id", "_partition"],
+                );
+                assert!(!schema.field(3).is_nullable());
+                assert_eq!(
+                    schema.field(3).data_type(),
+                    &arrow::datatypes::DataType::Int32
+                );
+                assert_eq!(
+                    schema.field(4).data_type(),
+                    &arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::empty()),
+                );
             });
         }
     }

@@ -29,9 +29,9 @@ pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
 #[cfg(test)]
 pub use history::{HistoryGap, HistoryWindow, history_window};
-pub use inputs::ValidationInputs;
 #[cfg(test)]
-pub use inputs::{LiveEntry, LiveSet};
+pub use inputs::LiveSet;
+pub use inputs::ValidationInputs;
 
 use super::model::{Dependency, EntryIdentity};
 

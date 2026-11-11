@@ -103,6 +103,7 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
     planning_pin: novarocks_spi::connector::ConnectorControlPlanningPin,
     metadata: novarocks_spi::connector::ConnectorTableMetadata,
     affected_partitions: Option<&AffectedTargetPartitions>,
+    retain_original_source: bool,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     let target = &rewrite.target;
     let target_table_uuid = rewrite.target_table_uuid.clone();
@@ -185,6 +186,14 @@ pub(crate) fn bind_imv_target_query_table_from_metadata(
             .target_object_id
             .clone(),
         frozen_snapshot_id,
+        original_source: retain_original_source
+            .then(|| {
+                metadata
+                    .source_read_facts()
+                    .cloned()
+                    .ok_or("MV RowDelta target lost its original provider access provenance")
+            })
+            .transpose()?,
     };
     let key = QueryTableBindingKey::mv_target(
         &target.catalog,
@@ -270,6 +279,7 @@ pub(crate) async fn bind_imv_target_query_table_in_store_from_rewrite_original(
         planning_pin.clone(),
         metadata,
         affected_partitions,
+        false,
     )
     .map_err(Into::into)
 }

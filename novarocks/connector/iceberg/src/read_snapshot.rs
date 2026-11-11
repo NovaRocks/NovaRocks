@@ -82,9 +82,26 @@ pub(crate) fn mint_read_domain(
 
 /// Resolve storage partition types once from the pinned field-ID history.
 /// A missing projected source does not erase its historical storage facts.
-fn frozen_partition_types(
+pub(crate) fn frozen_partition_types(
     metadata: &TableMetadata,
     query: &Schema,
+) -> Result<BTreeMap<i32, StructType>, String> {
+    resolve_partition_types(metadata, query, false)
+}
+
+/// A mutation's signed file metadata is independent of the source query's
+/// schema projection, including a historical branch's narrower field type.
+pub(crate) fn historical_mutation_partition_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+) -> Result<BTreeMap<i32, StructType>, String> {
+    resolve_partition_types(metadata, query, true)
+}
+
+fn resolve_partition_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+    prefer_historical: bool,
 ) -> Result<BTreeMap<i32, StructType>, String> {
     let mut sources = BTreeMap::<i32, (PrimitiveType, PrimitiveType)>::new();
     for spec in metadata.partition_specs_iter() {
@@ -104,13 +121,18 @@ fn frozen_partition_types(
                 .iter()
                 .map(|field| {
                     let (query_source, storage_proof) = &sources[&field.source_id];
+                    let preferred = if prefer_historical {
+                        storage_proof
+                    } else {
+                        query_source
+                    };
                     // The query may predate a transform introduced by a later
                     // spec (for example hour after Date -> Timestamp). Prove
                     // that spec's storage type from the retained legal chain;
                     // do not force its unrelated query projection to change.
                     let ty = match field
                         .transform
-                        .result_type(&Type::Primitive(query_source.clone()))
+                        .result_type(&Type::Primitive(preferred.clone()))
                     {
                         Ok(ty) => ty,
                         Err(_) => field
@@ -133,9 +155,17 @@ fn frozen_partition_types(
 pub(crate) fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
     // This is a canonical fact identity, not the raw metadata object's digest.
     // SDK map/set iteration cannot change a pinned relation's identity.
+    let digest = metadata_identity_digest(metadata)?;
+    Ok(format!(
+        "sha256:{:x}",
+        sha2::digest::Output::<Sha256>::from(digest)
+    ))
+}
+
+pub(crate) fn metadata_identity_digest(metadata: &TableMetadata) -> Result<[u8; 32], String> {
     let bytes =
         crate::delete_semantics::canonical_metadata_json(metadata).map_err(|e| e.to_string())?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    Ok(Sha256::digest(bytes).into())
 }
 
 pub async fn build_read_snapshot_at(

@@ -322,6 +322,47 @@ fn prepare_metadata_only_document_write_request(
 /// The write intent, signed input, and branch shape one incremental refresh mode
 /// declares.
 ///
+pub(crate) fn target_file_metadata(
+    target: &novarocks_spi::connector::ConnectorTableMetadata,
+) -> Result<[novarocks_types::schema::ColumnDef; 2], String> {
+    let execution = target.execution_schema();
+    let fields = execution.schema().fields();
+    let start = fields
+        .len()
+        .checked_sub(2)
+        .ok_or("MV target lost its file metadata declaration")?;
+    let field = |ordinal: usize| {
+        use novarocks_spi::connector::{ConnectorTableColumnRole, ConnectorTableColumnVisibility};
+
+        let role = target
+            .planning_facts
+            .column_facts()
+            .get(ordinal)
+            .ok_or("MV target lost a file metadata role")?;
+        if usize::try_from(role.field_ordinal()).ok() != Some(ordinal)
+            || role.role() != ConnectorTableColumnRole::RowLineageSystem
+            || role.visibility() != ConnectorTableColumnVisibility::Hidden
+        {
+            return Err("MV target file metadata is not a signed hidden field".to_string());
+        }
+        let field: &arrow::datatypes::Field = fields
+            .get(ordinal)
+            .map(std::sync::Arc::as_ref)
+            .ok_or("MV target lost a file metadata field")?;
+        let declared = execution
+            .bindings()
+            .get(ordinal)
+            .ok_or("MV target lost a file metadata type")?;
+        novarocks_types::schema::ColumnDef::from_value_type(
+            field.name().clone(),
+            declared.clone(),
+            None,
+        )
+        .map_err(|error| error.to_string())
+    };
+    Ok([field(start)?, field(start + 1)?])
+}
+
 /// The shape is the whole decision this function exists to make, and it cannot
 /// be inferred from the input: a row-lineage input with a `_file`/`_pos`
 /// identity is exactly what ordinary DML row mutation sends, so the provider

@@ -104,6 +104,19 @@ impl CompiledWriterBindings {
         Ok(())
     }
 
+    pub fn has_writers(&self) -> bool {
+        !self.writers.is_empty()
+    }
+
+    pub fn install_resources(
+        &mut self,
+        resources: novarocks_spi::connector::ConnectorExecutionResources,
+    ) {
+        for writer in self.writers.values_mut() {
+            writer.resources = Some(resources.clone());
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.writers.is_empty() && self.finishers.is_empty()
     }
@@ -484,6 +497,20 @@ fn prepare_compiled_task_in(
             Arc::get_mut(&mut state)
                 .expect("newly constructed runtime state has no aliases")
                 .install_query_tracker_witness(context.query_tracker_witness.clone());
+            if let Some((task, observer)) = context
+                .result_identity
+                .zip(context.position_shard_test_observer.clone())
+            {
+                Arc::get_mut(&mut state)
+                    .expect("newly constructed runtime state has no aliases")
+                    .position_shard_observation = Some(
+                    crate::runtime::runtime_state::PositionShardTestObservation {
+                        execution: task.query_execution_id(),
+                        task_key: instance_task_key,
+                        observer,
+                    },
+                );
+            }
             state
         };
         // Both receiver lifetimes use the same tracker, model and creation

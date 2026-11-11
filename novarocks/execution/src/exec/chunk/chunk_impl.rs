@@ -71,6 +71,7 @@ impl std::fmt::Debug for ChunkAccountingCharge {
 /// Phase 2: Wrapper around Arrow RecordBatch.
 #[derive(Debug, Clone)]
 pub struct Chunk {
+    position_shard_source: Option<novarocks_execution_contract::descriptor::ExchangeSource>,
     batch: Arc<RecordBatch>,
     chunk_schema: ChunkSchemaRef,
     accounting: Option<ChunkAccountingCharge>,
@@ -157,6 +158,7 @@ impl ChunkBatchProjection {
     }
     pub fn into_chunk(self) -> Chunk {
         Chunk {
+            position_shard_source: None,
             batch: self.batch,
             chunk_schema: self.chunk_schema,
             accounting: self.accounting,
@@ -169,6 +171,19 @@ impl ChunkBatchProjection {
 }
 
 impl Chunk {
+    pub(crate) fn set_position_shard_source(
+        &mut self,
+        source: novarocks_execution_contract::descriptor::ExchangeSource,
+    ) {
+        self.position_shard_source = Some(source);
+    }
+
+    pub(crate) fn position_shard_source(
+        &self,
+    ) -> Option<novarocks_execution_contract::descriptor::ExchangeSource> {
+        self.position_shard_source
+    }
+
     pub(crate) fn source_authority(&self) -> super::ChunkSourceAuthorityRef<'_> {
         match self.accounting.as_ref() {
             Some(ChunkAccountingCharge::AdditionalBuffers(ledger)) => ledger.source_authority(),
@@ -397,6 +412,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: source.storage.clone(),
             construction_storage: source.storage,
+            position_shard_source: None,
             output_column_metadata: None,
         })
     }
@@ -508,6 +524,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            position_shard_source: None,
             output_column_metadata: None,
         })
     }
@@ -563,6 +580,7 @@ impl Chunk {
                 connector_output_memory: None,
                 array_type_storage: ValueTypeStorageLifetime::pure(),
                 construction_storage: ValueTypeStorageLifetime::pure(),
+                position_shard_source: None,
                 output_column_metadata: None,
             });
         }
@@ -577,6 +595,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            position_shard_source: None,
             output_column_metadata: None,
         })
     }
@@ -717,6 +736,7 @@ impl Chunk {
             connector_output_memory: self.connector_output_memory.clone(),
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            position_shard_source: self.position_shard_source,
             output_column_metadata: self.output_column_metadata.clone(),
         };
         if let Some(ChunkAccountingCharge::WholeBatch(accounting)) = self.accounting.as_ref() {
@@ -806,6 +826,7 @@ impl Chunk {
             connector_output_memory: None,
             array_type_storage: self.array_type_storage.clone(),
             construction_storage: storage,
+            position_shard_source: self.position_shard_source,
             output_column_metadata: self.output_column_metadata.clone(),
         };
         result.retain_source_buffer_funding(self);
@@ -1009,6 +1030,7 @@ impl Default for Chunk {
             connector_output_memory: None,
             array_type_storage: ValueTypeStorageLifetime::pure(),
             construction_storage: ValueTypeStorageLifetime::pure(),
+            position_shard_source: None,
             output_column_metadata: None,
         }
     }

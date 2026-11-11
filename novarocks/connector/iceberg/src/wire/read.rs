@@ -1635,6 +1635,7 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
             .frozen_cow_source()
             .map(crate::typed_read::cow_source_proof::IcebergCowSourceProof::to_proto),
         table_schema_json: value.table_schema_json().to_string(),
+        mutation_partition_type_json: value.mutation_partition_type_json().map(str::to_owned),
         spec_id: value.spec_id(),
         partition_spec_jsons: value
             .partition_spec_jsons()
@@ -1791,6 +1792,15 @@ fn decode_table(
         };
         let table = observe_opaque(context, || IcebergTableHandle::try_new(parameters))?
             .map_err(|error| domain_error("iceberg_table", error))?;
+        let partition_type = raw
+            .mutation_partition_type_json
+            .as_deref()
+            .map(|json| copy_string(json, context))
+            .transpose()?;
+        let table = observe_opaque(context, || {
+            table.with_mutation_partition_type(partition_type)
+        })?
+        .map_err(|error| domain_error("iceberg_table.mutation_partition_type_json", error))?;
         let mut scalar_integer_domains = BTreeMap::new();
         for (id, value) in &raw.scalar_integer_domains {
             let domain = observe_opaque(context, || {

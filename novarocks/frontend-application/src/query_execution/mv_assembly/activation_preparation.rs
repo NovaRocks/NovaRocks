@@ -24,8 +24,7 @@ use super::{
         finish_frozen_mv_rewrite_context_original, validate_frozen_mv_rewrite_identity,
     },
     incremental_staging::{
-        RewriteMergeRefreshEvidence, incremental_change_stream_routes,
-        incremental_change_stream_statistics_targets, sql_imv_planning_input_from_rewrite,
+        incremental_change_stream_routes, incremental_change_stream_statistics_targets,
     },
     refresh_artifact::{MvFirstRefreshExecutionArtifact, MvIncrementalExecutionArtifact},
     refresh_handoff::{PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact},
@@ -148,6 +147,7 @@ pub(crate) async fn prepare_analysis(
                             input.planning.clone(),
                             input.target.metadata().clone(),
                             Some(&facts.affected_partitions),
+                            false,
                         )
                         .map_err(contract_error)?;
                     let overlay = facts.frozen_base_overlays.ok_or_else(|| {
@@ -275,6 +275,7 @@ pub(crate) async fn prepare_analysis(
                     input.planning.clone(),
                     input.target.metadata().clone(),
                     Some(&facts.affected_partitions),
+                    mode == novarocks_mv_application::product::MvIncrementalWriteMode::RowDelta,
                 )
                 .map_err(contract_error)?;
             seal_analysis_write_targets(&input.session)?;
@@ -333,25 +334,27 @@ pub(crate) async fn prepare_analysis(
                 novarocks_mv_application::product::MvIncrementalWriteMode::RowDelta =>
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta,
             };
+            let rewrite_snapshot = match mode {
+                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::FastAppend =>
+                    rewrite.to_sql_rewrite_snapshot(target_binding),
+                novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta =>
+                    rewrite.to_sql_rewrite_snapshot_with_target_file_metadata(target_binding, input.target.metadata()),
+            }.map_err(contract_error)?;
             let analysis = match artifact {
                 MvIncrementalExecutionArtifact::CanonicalQuery => {
                     use novarocks_mv_application::product::MvIncrementalRewriteEvidence as E;
-                    let evidence = match evidence {
-                        E::None => RewriteMergeRefreshEvidence::None,
-                        E::Aggregate => RewriteMergeRefreshEvidence::Aggregate,
-                        E::JoinAggregate => RewriteMergeRefreshEvidence::JoinAggregate,
-                        E::BranchUnionAggregate => {
-                            RewriteMergeRefreshEvidence::BranchUnionAggregate
-                        }
+                    use novarocks_sql::compiler::{
+                        SqlImvPlanningInput, SqlImvRewriteValidation as V,
+                    };
+                    let validation = match evidence {
+                        E::None => V::None,
+                        E::Aggregate => V::Aggregate,
+                        E::JoinAggregate => V::JoinAggregate,
+                        E::BranchUnionAggregate => V::BranchUnionAggregate,
                     };
                     MvWriteAnalysisInput::IncrementalCanonical {
                         query,
-                        rewrite: sql_imv_planning_input_from_rewrite(
-                            &rewrite,
-                            target_binding,
-                            evidence,
-                        )
-                        .map_err(contract_error)?,
+                        rewrite: SqlImvPlanningInput::new(rewrite_snapshot, validation),
                         mode,
                         context,
                         routes,
@@ -367,9 +370,7 @@ pub(crate) async fn prepare_analysis(
                     };
                     MvWriteAnalysisInput::IncrementalJoin {
                         query,
-                        rewrite: rewrite
-                            .to_sql_rewrite_snapshot(target_binding)
-                            .map_err(contract_error)?,
+                        rewrite: rewrite_snapshot,
                         join_mode,
                         mode,
                         context,

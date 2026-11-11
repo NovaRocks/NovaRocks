@@ -58,12 +58,12 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
+use crate::commit::write_stack::domain::IcebergPositionRewriteTarget;
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
     IcebergFrozenRewriteBranchInput, IcebergWriteBranch, IcebergWriteFlavor,
     IcebergWriteTableFacts, IcebergWriterOutput, invalid,
 };
-use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::commit::write_stack::planning::{
     IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergEqualityDeleteBranchPlan,
     IcebergWriteBranchPlan,
@@ -96,9 +96,6 @@ pub(crate) struct IcebergSessionMaterial {
     pub data_output: IcebergWriterOutput,
     /// The partitioning and schema recipe every data branch writes through.
     pub data_recipe: IcebergDataBranchRecipe,
-    /// The exact old delete artifacts a delete branch must supersede. Frozen by
-    /// reference only: `begin_write` never opens one.
-    pub merge_targets: Vec<IcebergOldDeleteMergeTarget>,
     /// The match key an equality-delete branch writes its file on. Present
     /// exactly when the signed input is an equality delete, because only then
     /// is there a branch to attach it to.
@@ -130,21 +127,14 @@ impl IcebergSessionMaterial {
         branch: IcebergWriteBranch,
         input: ConnectorWriteInputShape,
     ) -> Result<IcebergDeleteBranchPlan, ConnectorError> {
-        self.rewrite_delete_plan(branch, input, self.merge_targets.clone())
+        self.rewrite_delete_plan(branch, input, None)
     }
 
-    /// A delete branch whose owned data files are stated rather than taken from
-    /// the session-wide freeze.
-    ///
-    /// A distributed rewrite seals several delete branches, and each owns only
-    /// its own group's data files; giving every branch the session-wide set
-    /// would make each one claim every file, which the unique-owner proof
-    /// refuses.
     fn rewrite_delete_plan(
         &self,
         branch: IcebergWriteBranch,
         input: ConnectorWriteInputShape,
-        merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+        position_rewrite: Option<IcebergPositionRewriteTarget>,
     ) -> Result<IcebergDeleteBranchPlan, ConnectorError> {
         Ok(IcebergDeleteBranchPlan {
             branch,
@@ -153,7 +143,7 @@ impl IcebergSessionMaterial {
                 parquet::basic::Compression::SNAPPY,
                 None,
             )?,
-            merge_targets,
+            position_rewrite,
             input,
         })
     }
@@ -190,11 +180,7 @@ pub(crate) struct IcebergSessionFlavorPlan {
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
 
-/// Plan the canonical data-plus-delete shape.
-///
-/// This is today's behaviour, unchanged: one data branch, plus one delete
-/// branch when the signed input is row-level. Neither branch is routed, because
-/// an ordinary write has exactly one thing to do with every row it is given.
+/// Plan one unrouted data or equality-delete target.
 pub(crate) fn plan_ordinary_branches(
     flavor: IcebergWriteFlavor,
     material: &IcebergSessionMaterial,
@@ -208,16 +194,15 @@ pub(crate) fn plan_ordinary_branches(
     ) {
         return plan_equality_delete_branches(flavor, material);
     }
-    let mut branches = vec![IcebergWriteBranchPlan::Data {
+    if !matches!(material.input, ConnectorWriteInputShape::Data { .. }) {
+        return Err(unsupported(
+            "Iceberg ordinary data branch requires its signed data fields",
+        ));
+    }
+    let branches = vec![IcebergWriteBranchPlan::Data {
         plan: material.data_plan(material.input.clone())?,
         route: None,
     }];
-    if let Some(branch) = ordinary_delete_branch(&material.input) {
-        branches.push(IcebergWriteBranchPlan::Delete {
-            plan: material.delete_plan(branch, material.input.clone())?,
-            route: None,
-        });
-    }
     Ok(IcebergSessionFlavorPlan {
         flavor,
         document_publication: None,
@@ -260,7 +245,7 @@ fn plan_equality_delete_branches(
 }
 
 /// The delete branch an ordinary session's signed input calls for, if any.
-pub(crate) const fn ordinary_delete_branch(
+pub(crate) const fn position_delete_branch(
     input: &ConnectorWriteInputShape,
 ) -> Option<IcebergWriteBranch> {
     match input {
@@ -292,7 +277,7 @@ fn plan_publication_branch_list(
 ) -> Result<Vec<IcebergWriteBranchPlan>, ConnectorError> {
     let branches = match shape {
         ConnectorManagedPublicationShape::Data => {
-            if ordinary_delete_branch(&material.input).is_some() {
+            if position_delete_branch(&material.input).is_some() {
                 return Err(unsupported(
                     "Iceberg managed publication publishes data files, not a row-level delete input",
                 ));
@@ -315,7 +300,7 @@ fn plan_publication_branch_list(
             // needs beyond that is the route: its rows arrive as change events,
             // and SQL's change-stream compile requires every branch to declare
             // which effects it accepts.
-            if ordinary_delete_branch(&material.input).is_some() {
+            if position_delete_branch(&material.input).is_some() {
                 return Err(unsupported(
                     "Iceberg insert-only publication publishes data files, not a row-level delete input",
                 ));
@@ -381,23 +366,15 @@ fn plan_publication_branch_list(
 ///
 /// The group alone decides a data rewrite's branch. A position-delete rewrite
 /// needs one thing more: its branch writes a deletion vector, and the writer
-/// resolves a data file's partition and row count through the merge target the
-/// session froze for it. Those come from the table metadata, so `begin_write`
-/// freezes them and the pure branch planner only attaches them.
+/// receives the selected data file's partition and row count from the
+/// starting snapshot.
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergFrozenRewriteBranch {
     /// The group this branch rewrites, and therefore exactly what its commit
     /// replaces.
     pub group: IcebergFrozenRewriteGroupV1,
-    /// The data files this branch's delete writer owns, each frozen with *no*
-    /// old reference to merge. Empty on a data rewrite, which seals no delete
-    /// branch at all.
-    ///
-    /// A rewrite reads the old artifacts through its own scan and republishes
-    /// their positions, so there is nothing left for the writer to merge —
-    /// handing it the references would make it read the same Puffin blobs a
-    /// second time, and its commit retires them either way.
-    pub delete_targets: Vec<IcebergOldDeleteMergeTarget>,
+    /// The exact data file whose positions this branch republishes.
+    pub position_rewrite: Option<IcebergPositionRewriteTarget>,
 }
 
 /// Plan a distributed rewrite's branches: one branch per frozen group.
@@ -421,7 +398,7 @@ pub(crate) fn plan_distributed_rewrite_branches(
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
     let flavor = match shape {
         ConnectorDistributedRewriteShape::DataFiles { .. } => {
-            if ordinary_delete_branch(&material.input).is_some() {
+            if position_delete_branch(&material.input).is_some() {
                 return Err(unsupported(
                     "Iceberg distributed rewrite republishes data files, not a row-level delete input",
                 ));
@@ -468,11 +445,24 @@ pub(crate) fn plan_distributed_rewrite_branches(
                 })
             }
             ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                let target = branch.position_rewrite.as_ref().ok_or_else(|| {
+                    invalid("Iceberg position-delete rewrite branch has no selected data file")
+                })?;
+                let [file] = branch.group.data_files.as_slice() else {
+                    return Err(invalid(
+                        "Iceberg position-delete rewrite requires one data file per branch",
+                    ));
+                };
+                if file.path != target.path() {
+                    return Err(invalid(
+                        "Iceberg position-delete rewrite has a mismatched data file",
+                    ));
+                }
                 Ok(IcebergWriteBranchPlan::Delete {
                     plan: material.rewrite_delete_plan(
                         IcebergWriteBranch::DeletionVector,
                         material.input.clone(),
-                        branch.delete_targets.clone(),
+                        Some(target.clone()),
                     )?,
                     route: None,
                 })
@@ -552,7 +542,7 @@ pub(crate) fn plan_row_mutation_branches(
             identity_fields,
             partition_source_fields,
         } => {
-            let branch = ordinary_delete_branch(&material.input)
+            let branch = position_delete_branch(&material.input)
                 .ok_or_else(|| invalid("Iceberg row-level input has no delete branch"))?;
             let flavor = match branch {
                 IcebergWriteBranch::DeletionVector => IcebergWriteFlavor::RowMutationDeletionVector,
@@ -564,7 +554,14 @@ pub(crate) fn plan_row_mutation_branches(
                 vec![ConnectorRowMutationEffect::Delete],
                 &ordinals,
                 identity_fields.iter().chain(partition_source_fields),
-                partition_source_fields,
+                if partition_source_fields.first().is_some_and(|field| {
+                    field.field().name()
+                        == crate::typed_read::schema_binding::mutation_partition::SPEC_NAME
+                }) {
+                    &[]
+                } else {
+                    partition_source_fields
+                },
                 Vec::new(),
             )?;
             Ok(IcebergSessionFlavorPlan {
@@ -632,9 +629,13 @@ fn plan_merge_on_read_branches(
         fields: data_fields.to_vec(),
     };
     data_input.validate()?;
+    let (identity_fields, partition_fields) = match row_identity_fields {
+        [_, _, _, _] => (&row_identity_fields[..2], &row_identity_fields[2..]),
+        fields => (fields, &[][..]),
+    };
     let delete_input = ConnectorWriteInputShape::DeletionVector {
-        identity_fields: row_identity_fields.to_vec(),
-        partition_source_fields: Vec::new(),
+        identity_fields: identity_fields.to_vec(),
+        partition_source_fields: partition_fields.to_vec(),
     };
     delete_input.validate()?;
     let data_route = route_facts(

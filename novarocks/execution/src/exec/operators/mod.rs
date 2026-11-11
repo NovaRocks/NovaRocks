@@ -64,6 +64,7 @@ pub(crate) mod logical_change_summary;
 mod noop_sink;
 #[cfg(test)]
 mod opaque_memory_host_tests;
+pub(crate) mod position_shard;
 mod project_processor;
 mod repeat_processor;
 mod result_buffer_sink;

@@ -38,6 +38,21 @@ pub(crate) struct ManifestWriteSource {
 }
 
 impl ManifestWriteSource {
+    /// New position files have an independently signed historical tuple and
+    /// no table-column bounds. The ordinary encoding chooser selects a real
+    /// header whose partition type can represent that tuple.
+    pub(crate) fn for_position_output(
+        schema: SchemaRef,
+        spec: PartitionSpec,
+        partition_type: StructType,
+    ) -> Self {
+        Self {
+            schema,
+            spec,
+            partition_type,
+        }
+    }
+
     pub(crate) fn from_header(header: &ManifestMetadata) -> Result<Self> {
         // The embedded schema carries its real ID. Java does not write the
         // redundant schema-id Avro metadata key.

@@ -48,7 +48,6 @@ use parquet::basic::Compression;
 use crate::commit::CommitOpKind;
 use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
-use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
 
@@ -62,9 +61,8 @@ pub(crate) fn corrupt(message: impl Into<String>) -> ConnectorError {
 
 /// Reject a value that is empty, carries a NUL byte, or embeds a credential.
 ///
-/// A handle, a fragment, and an old-delete reference are all values the
-/// frontend hands to a backend, so a location that smuggles a secret through a
-/// URL userinfo or query parameter must never be constructible.
+/// Wire-visible paths must never embed secrets in URL userinfo or query
+/// parameters.
 pub(crate) fn validate_location(subject: &str, value: &str) -> Result<(), ConnectorError> {
     if value.is_empty() {
         return Err(invalid(format!("Iceberg {subject} must not be empty")));
@@ -114,12 +112,7 @@ pub enum IcebergWriteBranch {
 }
 
 impl IcebergWriteBranch {
-    /// Whether this branch supersedes the pre-existing delete artifacts of the
-    /// data files it writes for, and therefore owns their old-delete merge.
-    ///
-    /// An equality delete does not: it appends a delete file that names no data
-    /// file, retires nothing, and merges nothing. Reporting it here would give
-    /// it an old-delete merge it has no data file to perform.
+    /// Whether this branch writes deletes addressed by data file and position.
     pub const fn writes_deletes(self) -> bool {
         matches!(self, Self::PositionDelete | Self::DeletionVector)
     }
@@ -200,7 +193,7 @@ impl IcebergWriteFlavor {
     /// The single external commit op this flavor performs.
     ///
     /// The mapping is the one the provider already commits today: a
-    /// deletion-vector mutation lands on `RowDeltaDvFromFiles` because a Puffin
+    /// deletion-vector mutation lands on `MaterializedRowDelta` because a Puffin
     /// artifact makes the delta file-based, and a distributed rewrite lands on
     /// `SelectedRewrite` because its input file set is frozen at planning.
     pub const fn commit_op_kind(self) -> CommitOpKind {
@@ -211,7 +204,7 @@ impl IcebergWriteFlavor {
             Self::Overwrite => CommitOpKind::Overwrite,
             Self::PartitionOverwrite => CommitOpKind::OverwritePartitions,
             Self::RowMutationPositionDelete => CommitOpKind::RowDelta,
-            Self::RowMutationDeletionVector => CommitOpKind::RowDeltaDvFromFiles,
+            Self::RowMutationDeletionVector => CommitOpKind::MaterializedRowDelta,
             // The same op a Parquet position-delete row mutation commits: the
             // delta is file-based only when the artifacts are Puffin, and an
             // equality delete's are not.
@@ -311,11 +304,8 @@ impl IcebergWriteFlavor {
     /// Only the two distributed rewrites and a copy-on-write mutation may.
     /// Their logical targets are all one branch kind — one per frozen rewrite
     /// group, one per rewritten data file — and the ordinal, not the branch, is
-    /// what tells them apart. Every other flavor keeps the stricter rule,
-    /// because a repeated delete branch would make the old-delete merge owner
-    /// ambiguous. A position-delete rewrite repeats one and stays unambiguous
-    /// for a different reason: `prove_unique_delete_owner` still runs, and its
-    /// groups own disjoint data files, so no two branches claim one file.
+    /// what tells them apart. Position-delete rewrite groups each select a
+    /// distinct data file.
     pub const fn seals_one_target_per_branch(self) -> bool {
         !matches!(
             self,
@@ -972,16 +962,13 @@ impl IcebergDataBranchRecipe {
 
 /// One logical write recipe, copied to every physical writer placement.
 ///
-/// A delete branch carries `old_deletes`: exact, bounded *references* to the
-/// artifacts a writer must re-read through its own query-leased storage. The
-/// FE deliberately does not read them.
 #[derive(Clone, Debug)]
 pub struct IcebergWriterHandle {
     branch: IcebergWriteBranch,
     table: IcebergWriteTableFacts,
     output: IcebergWriterOutput,
     data: Option<IcebergDataBranchRecipe>,
-    old_deletes: BTreeMap<String, IcebergOldDeleteMergeTarget>,
+    position_rewrite: Option<IcebergPositionRewriteTarget>,
     mutation_read: Option<IcebergMutationReadRecipe>,
     position_group: Option<ConnectorMutationContributionGroupId>,
     creation_scope: Option<IcebergCreationScope>,
@@ -1003,7 +990,7 @@ impl IcebergWriterHandle {
             table,
             output,
             data: Some(data),
-            old_deletes: BTreeMap::new(),
+            position_rewrite: None,
             mutation_read: None,
             position_group: None,
             creation_scope: None,
@@ -1031,7 +1018,7 @@ impl IcebergWriterHandle {
             table,
             output,
             data: None,
-            old_deletes: BTreeMap::new(),
+            position_rewrite: None,
             mutation_read: None,
             position_group: None,
             creation_scope: None,
@@ -1039,17 +1026,11 @@ impl IcebergWriterHandle {
         })
     }
 
-    /// Build a delete branch's recipe from its frozen old-delete references.
-    ///
-    /// Every merge target must name the data file it keys, and a deletion
-    /// vector branch must write Puffin while a position-delete branch must
-    /// write Parquet. Both rules are structural, so neither can be bypassed by
-    /// a caller assembling the parts by hand.
+    /// Build the format-specific position writer recipe.
     pub fn try_new_delete(
         branch: IcebergWriteBranch,
         table: IcebergWriteTableFacts,
         output: IcebergWriterOutput,
-        old_deletes: Vec<IcebergOldDeleteMergeTarget>,
     ) -> Result<Self, ConnectorError> {
         let expected_format = match branch {
             IcebergWriteBranch::PositionDelete => IcebergFileFormat::Parquet,
@@ -1067,29 +1048,12 @@ impl IcebergWriterHandle {
                 branch.as_str()
             )));
         }
-        let base_snapshot_id = table.base_snapshot_id();
-        let mut frozen = BTreeMap::new();
-        for target in old_deletes {
-            if Some(target.base_snapshot_id()) != base_snapshot_id {
-                return Err(invalid(
-                    "Iceberg old-delete merge target does not name the session's frozen base snapshot",
-                ));
-            }
-            if frozen
-                .insert(target.data_file_path().to_string(), target)
-                .is_some()
-            {
-                return Err(invalid(
-                    "Iceberg delete writer handle repeats a referenced data file",
-                ));
-            }
-        }
         Ok(Self {
             branch,
             table,
             output,
             data: None,
-            old_deletes: frozen,
+            position_rewrite: None,
             mutation_read: None,
             position_group: None,
             creation_scope: None,
@@ -1127,7 +1091,7 @@ impl IcebergWriterHandle {
             _ => false,
         };
         if !valid_branch
-            || !self.old_deletes.is_empty()
+            || self.position_rewrite.is_some()
             || self.mutation_read.is_some()
             || recipe.snapshot().is_some() != self.table.base_snapshot_id().is_some()
         {
@@ -1157,15 +1121,66 @@ impl IcebergWriterHandle {
         self.mutation_read.as_ref()
     }
 
-    /// The exact old-delete artifacts a writer must re-read, keyed by the data
-    /// file each one belongs to.
-    pub const fn old_deletes(&self) -> &BTreeMap<String, IcebergOldDeleteMergeTarget> {
-        &self.old_deletes
+    pub fn try_with_position_rewrite(
+        mut self,
+        target: IcebergPositionRewriteTarget,
+    ) -> Result<Self, ConnectorError> {
+        if self.branch != IcebergWriteBranch::DeletionVector
+            || self.table.format_version() != 3
+            || self.table.base_snapshot_id().is_none()
+            || self.position_rewrite.is_some()
+            || self.mutation_read.is_some()
+        {
+            return Err(invalid(
+                "Iceberg position-delete rewrite conflicts with the writer recipe",
+            ));
+        }
+        self.position_rewrite = Some(target);
+        Ok(self)
     }
 
-    /// The data files this handle owns exclusively for the old-delete merge.
-    pub fn owned_data_files(&self) -> impl Iterator<Item = &str> {
-        self.old_deletes.keys().map(String::as_str)
+    pub const fn position_rewrite(&self) -> Option<&IcebergPositionRewriteTarget> {
+        self.position_rewrite.as_ref()
+    }
+}
+
+/// One existing data file selected by the position-delete maintenance operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergPositionRewriteTarget {
+    data_file_path: String,
+    record_count: u64,
+    partition: IcebergArtifactPartition,
+}
+
+impl IcebergPositionRewriteTarget {
+    pub fn try_new(
+        data_file_path: String,
+        record_count: u64,
+        partition: IcebergArtifactPartition,
+    ) -> Result<Self, ConnectorError> {
+        validate_location("position rewrite data file", &data_file_path)?;
+        if record_count == 0 {
+            return Err(invalid(
+                "Iceberg position rewrite selected an empty data file",
+            ));
+        }
+        Ok(Self {
+            data_file_path,
+            record_count,
+            partition,
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.data_file_path
+    }
+
+    pub const fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    pub const fn partition(&self) -> &IcebergArtifactPartition {
+        &self.partition
     }
 }
 
@@ -1770,6 +1785,7 @@ pub struct IcebergFinalDeleteEffect {
 #[derive(Clone, Debug)]
 pub enum IcebergFinalDeleteKind {
     RemoveDataFile {
+        partition: IcebergArtifactPartition,
         old_exclusive_deletes: Box<[EntryIdentity]>,
     },
     ReplacePositions(IcebergDeletionVectorArtifact),
@@ -1789,6 +1805,7 @@ impl IcebergFinalDeleteEffect {
         match &kind {
             IcebergFinalDeleteKind::RemoveDataFile {
                 old_exclusive_deletes,
+                ..
             } => {
                 validate_merged_references(old_exclusive_deletes)?;
             }
@@ -1820,6 +1837,13 @@ impl IcebergFinalDeleteEffect {
 
     pub const fn kind(&self) -> &IcebergFinalDeleteKind {
         &self.kind
+    }
+
+    pub const fn partition(&self) -> &IcebergArtifactPartition {
+        match &self.kind {
+            IcebergFinalDeleteKind::RemoveDataFile { partition, .. } => partition,
+            IcebergFinalDeleteKind::ReplacePositions(file) => file.partition(),
+        }
     }
 }
 
@@ -1901,6 +1925,7 @@ impl IcebergCreationScope {
 /// Content evidence for one newly and conditionally created physical object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IcebergCreationReceipt {
+    physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
     create_id: [u8; 16],
     identity: [u8; 32],
     size: u64,
@@ -1909,6 +1934,7 @@ pub struct IcebergCreationReceipt {
 
 impl IcebergCreationReceipt {
     pub fn try_new(
+        physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
         create_id: [u8; 16],
         identity: [u8; 32],
         size: u64,
@@ -1920,11 +1946,18 @@ impl IcebergCreationReceipt {
             ));
         }
         Ok(Self {
+            physical,
             create_id,
             identity,
             size,
             content_sha256,
         })
+    }
+
+    pub const fn physical(
+        &self,
+    ) -> &novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext {
+        &self.physical
     }
 
     pub const fn create_id(&self) -> [u8; 16] {
@@ -2120,6 +2153,7 @@ impl IcebergCommitFragment {
             IcebergCommitArtifact::FinalDelete(effect) => match effect.kind() {
                 IcebergFinalDeleteKind::RemoveDataFile {
                     old_exclusive_deletes,
+                    ..
                 } => old_exclusive_deletes,
                 IcebergFinalDeleteKind::ReplacePositions(file) => file.merged_old_references(),
             },
@@ -2141,41 +2175,36 @@ impl IcebergCommitFragment {
 
 /// One sealed logical target inside a begin session.
 ///
-/// A delete branch's map keys are every old data file routed to it, and each
-/// value is the sorted set of old delete artifacts the session froze for that
-/// file. An empty value means "this data file has no old deletes" — a decision,
-/// not a read result.
 #[derive(Clone, Debug)]
 pub struct IcebergSealedWriteTarget {
     ordinal: WriteTargetOrdinal,
     branch: IcebergWriteBranch,
-    owned_data_files: BTreeMap<String, Vec<EntryIdentity>>,
+    position_rewrite: Option<IcebergPositionRewriteTarget>,
 }
 
 impl IcebergSealedWriteTarget {
     pub const fn new(
         ordinal: WriteTargetOrdinal,
         branch: IcebergWriteBranch,
-        owned_data_files: BTreeMap<String, Vec<EntryIdentity>>,
+        position_rewrite: Option<IcebergPositionRewriteTarget>,
     ) -> Self {
         Self {
             ordinal,
             branch,
-            owned_data_files,
+            position_rewrite,
         }
     }
 
     pub const fn ordinal(&self) -> WriteTargetOrdinal {
         self.ordinal
     }
+
     pub const fn branch(&self) -> IcebergWriteBranch {
         self.branch
     }
-    pub const fn owned_data_files(&self) -> &BTreeMap<String, Vec<EntryIdentity>> {
-        &self.owned_data_files
-    }
-    pub fn data_files(&self) -> impl Iterator<Item = &String> {
-        self.owned_data_files.keys()
+
+    pub const fn position_rewrite(&self) -> Option<&IcebergPositionRewriteTarget> {
+        self.position_rewrite.as_ref()
     }
 }
 
@@ -2217,18 +2246,14 @@ impl std::fmt::Display for IcebergWriteSessionId {
 #[derive(Debug)]
 pub struct IcebergWriteCommitSession {
     session_id: IcebergWriteSessionId,
+    creation_scope: Option<IcebergCreationScope>,
+    mutation_read: Option<IcebergMutationReadRecipe>,
     table: IcebergWriteTableFacts,
     flavor: IcebergWriteFlavor,
     purpose: ConnectorWriteAdmissionPurpose,
     base_version_digest: Option<[u8; 32]>,
     document_publication: Option<IcebergDocumentPublicationFacts>,
     targets: Vec<IcebergSealedWriteTarget>,
-    delete_owner: BTreeMap<String, WriteTargetOrdinal>,
-    /// Managed publications retain the same exact merge facts already frozen
-    /// for their BE writers. This is session-local evidence for logical row
-    /// changes, never a serialized second source of delete identities.
-    frozen_delete_merge_targets:
-        Option<BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>>,
     /// The frozen metadata of a staged target, present exactly on a
     /// staged-create session. It stands in for the catalog load every other
     /// flavor performs, and the seal reads its schema and partition spec to
@@ -2372,6 +2397,32 @@ pub enum IcebergWriteSessionState {
 }
 
 impl IcebergWriteCommitSession {
+    pub(crate) fn with_mutation_read(mut self, recipe: IcebergMutationReadRecipe) -> Self {
+        self.mutation_read = Some(recipe);
+        self
+    }
+
+    pub const fn mutation_read(&self) -> Option<&IcebergMutationReadRecipe> {
+        self.mutation_read.as_ref()
+    }
+
+    pub(crate) fn try_with_creation_scope(
+        mut self,
+        scope: IcebergCreationScope,
+    ) -> Result<Self, ConnectorError> {
+        if scope.session() != self.session_id || self.creation_scope.is_some() {
+            return Err(invalid(
+                "Iceberg creation scope must belong to this write session",
+            ));
+        }
+        self.creation_scope = Some(scope);
+        Ok(self)
+    }
+
+    pub const fn creation_scope(&self) -> Option<IcebergCreationScope> {
+        self.creation_scope
+    }
+
     pub(crate) const fn fixed_backing_bytes() -> usize {
         std::mem::size_of::<Self>()
     }
@@ -2491,7 +2542,30 @@ impl IcebergWriteCommitSession {
             .collect::<Vec<_>>();
         novarocks_spi::connector::write_stack::validate_dense_target_ordinals(&ordinals)?;
         let mut branches = BTreeSet::new();
+        let position_rewrite = flavor == IcebergWriteFlavor::DistributedRewritePositionDeletes;
+        let mut selected = BTreeSet::new();
         for target in &targets {
+            if let Some(selection) = target.position_rewrite() {
+                let files = rewrite_inputs
+                    .get(target.ordinal().get() as usize)
+                    .map(IcebergFrozenRewriteBranchInput::data_paths);
+                if !position_rewrite
+                    || target.branch() != IcebergWriteBranch::DeletionVector
+                    || files.is_none_or(|files| {
+                        files.len() != 1
+                            || !files.iter().any(|file| file.path() == selection.path())
+                    })
+                    || !selected.insert(selection.path())
+                {
+                    return Err(invalid(
+                        "Iceberg position rewrite target differs from the selected group",
+                    ));
+                }
+            } else if position_rewrite {
+                return Err(invalid(
+                    "Iceberg position rewrite target has no selected data file",
+                ));
+            }
             if !branches.insert(target.branch()) && flavor.seals_one_target_per_branch() {
                 return Err(invalid(
                     "Iceberg write session repeats a physical write branch",
@@ -2511,17 +2585,16 @@ impl IcebergWriteCommitSession {
                 flavor.as_str()
             )));
         }
-        let delete_owner = super::planning::prove_unique_delete_owner(&targets)?;
         Ok(Self {
             session_id,
+            creation_scope: None,
+            mutation_read: None,
             table,
             flavor,
             purpose,
             base_version_digest,
             document_publication,
             targets,
-            delete_owner,
-            frozen_delete_merge_targets: None,
             staged_metadata,
             source_metadata: None,
             rewrite_inputs,
@@ -2540,52 +2613,6 @@ impl IcebergWriteCommitSession {
             empty_cleanup_disposed: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
-    }
-
-    pub(crate) fn with_frozen_delete_merge_targets(
-        mut self,
-        targets: BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>,
-    ) -> Result<Self, ConnectorError> {
-        if self.document_publication.is_none() || self.frozen_delete_merge_targets.is_some() {
-            return Err(invalid(
-                "Iceberg logical row facts require one managed publication owner",
-            ));
-        }
-        let mut identities = BTreeMap::new();
-        for (ordinal, files) in &targets {
-            let mut entries = BTreeMap::new();
-            for (path, target) in files {
-                if path != target.data_file_path()
-                    || Some(target.base_snapshot_id()) != self.table.base_snapshot_id()
-                {
-                    return Err(invalid(
-                        "Iceberg logical row facts differ from their frozen data-file target",
-                    ));
-                }
-                entries.insert(
-                    path.clone(),
-                    target
-                        .references()
-                        .iter()
-                        .map(|reference| reference.entry_identity())
-                        .collect::<Vec<_>>(),
-                );
-            }
-            identities.insert(*ordinal, entries);
-        }
-        if identities != self.frozen_old_references() {
-            return Err(invalid(
-                "Iceberg logical row facts differ from the sealed old-delete identities",
-            ));
-        }
-        self.frozen_delete_merge_targets = Some(targets);
-        Ok(self)
-    }
-
-    pub(crate) fn frozen_delete_merge_targets(
-        &self,
-    ) -> Option<&BTreeMap<WriteTargetOrdinal, BTreeMap<String, IcebergOldDeleteMergeTarget>>> {
-        self.frozen_delete_merge_targets.as_ref()
     }
 
     pub(crate) fn with_source_metadata(
@@ -2610,8 +2637,8 @@ impl IcebergWriteCommitSession {
         Ok(self)
     }
 
-    pub(crate) fn source_metadata(&self) -> Option<&crate::iceberg::spec::TableMetadata> {
-        self.source_metadata.as_deref()
+    pub(crate) fn source_metadata_ref(&self) -> Option<&Arc<crate::iceberg::spec::TableMetadata>> {
+        self.source_metadata.as_ref()
     }
 
     pub(crate) fn with_statistics_expectations(
@@ -2819,28 +2846,6 @@ impl IcebergWriteCommitSession {
             }
             _ => IcebergEmptyWriteDecision::Commit,
         }
-    }
-
-    /// The proven route from an old data file routed to a delete branch to its
-    /// single owning logical target. It is a superset of the files that
-    /// actually need a merge, because a file with no old deletes still needs a
-    /// unique writer.
-    pub const fn delete_owner(&self) -> &BTreeMap<String, WriteTargetOrdinal> {
-        &self.delete_owner
-    }
-
-    /// The frozen old-delete references, keyed by target and data file.
-    ///
-    /// `finish_write` uses this to prove each staged artifact superseded
-    /// exactly the references the session froze.
-    pub fn frozen_old_references(
-        &self,
-    ) -> BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<EntryIdentity>>> {
-        self.targets
-            .iter()
-            .filter(|target| target.branch().writes_deletes())
-            .map(|target| (target.ordinal(), target.owned_data_files().clone()))
-            .collect()
     }
 
     pub fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
@@ -3463,7 +3468,7 @@ mod tests {
             IcebergSealedWriteTarget::new(
                 WriteTargetOrdinal::try_new(ordinal).expect("ordinal"),
                 branch,
-                BTreeMap::new(),
+                None,
             )
         };
         assert!(
@@ -3535,7 +3540,7 @@ mod tests {
             vec![IcebergSealedWriteTarget::new(
                 WriteTargetOrdinal::try_new(0).expect("ordinal"),
                 IcebergWriteBranch::Data,
-                BTreeMap::new(),
+                None,
             )],
         )
         .expect("session");

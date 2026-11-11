@@ -2072,6 +2072,14 @@ pub(crate) fn validate_node_semantics(
                 ));
             }
             let mut routes = BTreeSet::new();
+            // The producer may emit a nullable envelope for other effects.
+            // PositionShard checks the required values on selected rows.
+            let raw_type = |id, expected| {
+                fragment
+                    .values()
+                    .get(&id)
+                    .is_some_and(|value| value.ty.data_type() == &expected)
+            };
             for (input, &child) in spec.inputs.iter().zip(node.inputs.iter()) {
                 let columns = input.columns();
                 let exact_input = fragment
@@ -2082,9 +2090,9 @@ pub(crate) fn validate_node_semantics(
                     || !routes.insert(input.route)
                     || !exact_input
                     || columns.into_iter().collect::<BTreeSet<_>>().len() != columns.len()
-                    || !required(input.file, DataType::Utf8)
-                    || !required(input.position, DataType::Int64)
-                    || !required(input.spec_id, DataType::Int32)
+                    || !raw_type(input.file, DataType::Utf8)
+                    || !raw_type(input.position, DataType::Int64)
+                    || !raw_type(input.spec_id, DataType::Int32)
                     || fragment
                         .values()
                         .get(&input.partition)

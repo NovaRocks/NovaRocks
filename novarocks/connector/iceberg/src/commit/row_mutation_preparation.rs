@@ -28,8 +28,8 @@ use novarocks_spi::connector::{
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
     ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken,
+    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteBaseVersion,
+    ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
 
@@ -120,7 +120,8 @@ pub(crate) fn prepare_row_mutation(
     // Insert rows.  The signed match layout therefore declares precisely those
     // fields nullable; Delete/Replace validation still rejects null keys.
     let insert_eligible = request.intent.accepts(ConnectorRowMutationEffect::Insert);
-    let identity_source_fields = metadata_arrow_fields(&payload.metadata_columns)?;
+    let mut identity_source_fields = metadata_arrow_fields(&payload.metadata_columns)?;
+    let uniqueness_width = identity_source_fields.len();
     if identity_source_fields.is_empty() {
         return Ok(ConnectorRowMutationPreparationOutcome::Denied(
             ConnectorError::new(
@@ -136,12 +137,38 @@ pub(crate) fn prepare_row_mutation(
         )
     })?;
     let target_snapshot_id = write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
-    let target_iceberg_schema = write_target_schema(&metadata, target_snapshot_id)?;
+    let target_iceberg_schema = if strategy == ConnectorRowMutationStrategy::CopyOnWrite {
+        write_target_schema(&metadata, target_snapshot_id)?
+    } else {
+        super::write_shared::position_mutation_read_schema(
+            &metadata,
+            request.target_ref.as_str(),
+            target_snapshot_id,
+        )?
+    };
+    let mutation_metadata = if strategy == ConnectorRowMutationStrategy::MergeOnRead {
+        crate::metadata::mutation_metadata_schema(&metadata, &target_iceberg_schema)?
+    } else {
+        None
+    };
+    if let Some(mutation) = &mutation_metadata {
+        identity_source_fields.extend(mutation.arrow_fields()?);
+    }
+
     let snapshot = snapshot_token(target_snapshot_id);
-    let base_version = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-        "iceberg/row-mutation-base/v1/{table_uuid}/{}/{snapshot}",
-        request.target_ref.as_str()
-    )))?;
+    let base_version = if strategy == ConnectorRowMutationStrategy::CopyOnWrite {
+        ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
+            "iceberg/row-mutation-base/v1/{table_uuid}/{}/{snapshot}",
+            request.target_ref.as_str()
+        )))?
+    } else {
+        super::write_shared::position_mutation_base(
+            &metadata,
+            payload.metadata_location.as_deref(),
+            request.target_ref.as_str(),
+            target_snapshot_id,
+        )?
+    };
     // The match layout is provider-signed rather than name-derived by SQL:
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
@@ -171,6 +198,7 @@ pub(crate) fn prepare_row_mutation(
                 &document,
                 &target_iceberg_schema,
                 &payload.metadata_columns,
+                mutation_metadata.as_ref(),
                 creation,
             )
             .map_err(crate::metadata::metadata_creation_error)?;
@@ -301,9 +329,11 @@ pub(crate) fn prepare_row_mutation(
     // part of row uniqueness.  COW rewrites bind the same token separately as
     // the writer's forward-looking version field. Keeping it in the match
     // tuple would make one token claim both roles and the SPI correctly
-    // rejects that ambiguous recipe.
+    // rejects that ambiguous recipe. The file metadata suffix belongs only to
+    // delete materialization and does not change the original match tuple.
     let uniqueness_tokens = identity_fields
         .iter()
+        .take(uniqueness_width)
         .filter(|field| {
             !field
                 .field()

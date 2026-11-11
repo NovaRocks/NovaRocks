@@ -31,6 +31,7 @@ use crate::manifest::source::ManifestSource;
 pub(crate) struct SnapshotSources<'a> {
     snapshot: &'a Snapshot,
     descriptors: Vec<ManifestFile>,
+    list_ordinals: Vec<usize>,
 }
 
 impl<'a> SnapshotSources<'a> {
@@ -71,13 +72,37 @@ impl<'a> SnapshotSources<'a> {
             }
         }
         let descriptors = indices
-            .into_iter()
-            .map(|index| list.entries()[index].clone())
+            .iter()
+            .map(|index| list.entries()[*index].clone())
             .collect();
         Ok(Self {
             snapshot,
             descriptors,
+            list_ordinals: indices,
         })
+    }
+
+    pub(crate) fn from_indexed_descriptors(
+        snapshot: &'a Snapshot,
+        descriptors: impl IntoIterator<Item = (usize, ManifestFile)>,
+    ) -> Self {
+        let (list_ordinals, descriptors) = descriptors.into_iter().unzip();
+        Self {
+            snapshot,
+            descriptors,
+            list_ordinals,
+        }
+    }
+
+    pub(crate) fn source_index_for_list_ordinal(&self, ordinal: usize) -> Option<usize> {
+        self.list_ordinals.binary_search(&ordinal).ok()
+    }
+
+    pub(crate) fn into_indexed_descriptors(self) -> BTreeMap<usize, ManifestFile> {
+        self.list_ordinals
+            .into_iter()
+            .zip(self.descriptors)
+            .collect()
     }
 
     pub(crate) fn sources(&self) -> impl Iterator<Item = ManifestSource<'_>> {

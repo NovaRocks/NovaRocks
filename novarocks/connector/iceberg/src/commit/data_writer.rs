@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 #[path = "data_writer/staged_paths.rs"]
 mod staged_paths;
-pub(crate) use staged_paths::StagedPathJournal;
+pub(crate) use staged_paths::{CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal};
 
 use super::write_adaptation::adapt_batch;
 use crate as novarocks_connector_iceberg;

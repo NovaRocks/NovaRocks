@@ -975,12 +975,6 @@ pub(crate) fn iceberg_write_shuffle_by_output_name(
     novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
 }
 
-pub(crate) fn iceberg_write_shuffle_by_output_index(
-    output_index: usize,
-) -> novarocks_sql::compiler::RootDistributionRequirement {
-    novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
-}
-
 /// Compile the original INSERT source after asynchronously observing its
 /// catalog, statistics and provider facts. The statement action must retain
 /// `provider_source` until its close proves the original creator actually exited.
@@ -1001,6 +995,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding_async(
@@ -1017,7 +1012,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         connector_context,
         write_session,
         None,
-        &[],
+        overlays,
         provider_source,
     )
     .await

@@ -21,9 +21,12 @@
 //! It neither names nor infers a table-format strategy, row identity layout,
 //! or a physical data/delete branch.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
-use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::write_stack::{
+    ConnectorMutationContributionGroup, WriteTargetOrdinal,
+};
 use novarocks_spi::connector::{
     ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteRouteId,
 };
@@ -105,27 +108,86 @@ pub(crate) fn validate_route_set(routes: &[ChangeStreamWriteRouteSpec]) -> Resul
         return Err("row-mutation router requires at least one route".to_string());
     }
     let mut route_ids = BTreeSet::new();
-    for (index, route) in routes.iter().enumerate() {
+    for route in routes {
         if !route_ids.insert(route.route_id) {
             return Err("row-mutation router contains a duplicate opaque route id".to_string());
-        }
-        // The router's branch order *is* the write target order: branch `i`
-        // streams into the writer this DAG will give ordinal `i`, and the finish
-        // node expects exactly `0..routes.len()`. A permuted or gapped set would
-        // still build a legal-looking plan whose rows reach the wrong writer, so
-        // the disagreement is refused here rather than discovered as data.
-        if !usize::try_from(route.write_target_ordinal.get()).is_ok_and(|value| value == index) {
-            return Err(format!(
-                "row-mutation route {index} carries write target ordinal {} but the router's \
-                 write targets are dense from zero in route order",
-                route.write_target_ordinal.get()
-            ));
         }
         validate_effects(&route.accepted_effects)?;
         validate_route_inputs(&route.input_ordinals)?;
         validate_requirement_tokens(&route.requirements, &route.input_ordinals)?;
     }
+    let mut group_ids = BTreeSet::new();
+    for (index, target_routes) in routes
+        .chunk_by(|left, right| left.write_target_ordinal == right.write_target_ordinal)
+        .enumerate()
+    {
+        let first = &target_routes[0];
+        if !usize::try_from(first.write_target_ordinal.get()).is_ok_and(|value| value == index) {
+            return Err(format!(
+                "row-mutation route {index} carries write target ordinal {} but the router's \
+                 write targets are dense from zero in route order",
+                first.write_target_ordinal.get()
+            ));
+        }
+        let Some(group) = &first.sink.position_materialization else {
+            if target_routes.len() != 1 {
+                return Err("direct row-mutation target has multiple routes".to_string());
+            }
+            continue;
+        };
+        if !group_ids.insert(group.id())
+            || first.sink.contract.mode != super::contract::SqlWriteSinkMode::DeletionVectors
+            || target_routes.len() != group.routes().len()
+        {
+            return Err("invalid position contribution group target or route count".to_string());
+        }
+        let members = group
+            .routes()
+            .iter()
+            .map(|route| (route.route_id(), route))
+            .collect::<BTreeMap<_, _>>();
+        for route in target_routes {
+            let Some(actual) = &route.sink.position_materialization else {
+                return Err("position contribution target mixes direct and grouped routes".into());
+            };
+            if !(Arc::ptr_eq(group, actual) || same_position_group(group, actual))
+                || route.sink.contract != first.sink.contract
+                || route.sink.input != first.sink.input
+                || route.sink.finish_count_mode != first.sink.finish_count_mode
+                || route.sink.root_output_exprs.is_some()
+                || !members.get(&route.route_id).is_some_and(|member| {
+                    member.accepted_effects() == route.accepted_effects
+                        && member.input_ordinals() == route.input_ordinals
+                        && member.requirements() == &route.requirements
+                })
+            {
+                return Err(
+                    "row-mutation route differs from its position contribution group".into(),
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+fn same_position_group(
+    left: &ConnectorMutationContributionGroup,
+    right: &ConnectorMutationContributionGroup,
+) -> bool {
+    left.id() == right.id()
+        && left.file_key() == right.file_key()
+        && left.raw_input() == right.raw_input()
+        && left.routes().len() == right.routes().len()
+        && left
+            .routes()
+            .iter()
+            .zip(right.routes())
+            .all(|(left, right)| {
+                left.route_id() == right.route_id()
+                    && left.accepted_effects() == right.accepted_effects()
+                    && left.input_ordinals() == right.input_ordinals()
+                    && left.requirements() == right.requirements()
+            })
 }
 
 /// Bind provider-signed route inputs to the immutable SQL producer layout.
@@ -156,10 +218,24 @@ pub(crate) fn bind_change_stream_write_layout(
                 .collect::<Vec<_>>(),
             "route input",
         )?;
+        let declared_names = match &route.sink.position_materialization {
+            Some(group) => group
+                .raw_input()
+                .fields_iter()
+                .map(|field| field.field().name().as_str())
+                .collect(),
+            None => route
+                .sink
+                .contract
+                .input_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect(),
+        };
         validate_metadata_column_positions(
             request.producer_output_columns,
             &route.input_ordinals,
-            &route.sink.contract.input_columns,
+            declared_names,
         )?;
 
         route
@@ -216,33 +292,29 @@ fn validate_effects(effects: &[ConnectorRowMutationEffect]) -> Result<(), String
 fn validate_metadata_column_positions(
     producer_output_columns: &[crate::analysis::OutputColumn],
     input_ordinals: &[ConnectorMutationRouteInput],
-    input_columns: &[novarocks_types::schema::ColumnDef],
+    input_names: Vec<&str>,
 ) -> Result<(), String> {
     for (position, binding) in input_ordinals.iter().enumerate() {
         // A route whose declared schema is shorter than its input is an arity
         // disagreement, which the writer-schema binding owns and reports; this
         // check has nothing to say about a position with no declared column.
-        let Some(declared) = input_columns.get(position) else {
+        let Some(&declared) = input_names.get(position) else {
             continue;
         };
-        if !is_connector_row_metadata_column(&declared.name) {
+        if !is_connector_row_metadata_column(declared) {
             continue;
         }
         let ordinal = binding.input_ordinal() as usize;
         let produced = producer_output_columns.get(ordinal).ok_or_else(|| {
             "row-mutation route input ordinal is outside the producer output".to_string()
         })?;
-        if !produced.name.eq_ignore_ascii_case(&declared.name) {
+        if !produced.name.eq_ignore_ascii_case(declared) {
             return Err(format!(
                 "row-mutation route expects `{}` at producer output ordinal {ordinal}, which \
                  produces `{}`; the route reads [{}] and the producer is [{}]",
-                declared.name,
+                declared,
                 produced.name,
-                input_columns
-                    .iter()
-                    .map(|column| column.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                input_names.join(", "),
                 producer_output_columns
                     .iter()
                     .map(|column| column.name.as_str())
@@ -260,6 +332,8 @@ fn is_connector_row_metadata_column(name: &str) -> bool {
         crate::common::ICEBERG_ROW_POS_COL,
         crate::common::ICEBERG_ROW_ID_COL,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+        "_spec_id",
+        "_partition",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))

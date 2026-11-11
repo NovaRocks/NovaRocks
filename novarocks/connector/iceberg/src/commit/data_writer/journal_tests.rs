@@ -154,7 +154,7 @@ fn file_io(
     (io, probe)
 }
 async fn cleanup(io: &FileIO, journal: &StagedPathJournal) {
-    while let Some(path) = journal.last() {
+    while let Some(path) = journal.last_owned() {
         assert!(
             io.exists(&path).await.unwrap(),
             "closed object must still exist before exact cleanup"

@@ -77,6 +77,7 @@ pub(crate) fn exact_requested_write_fields_at_schema(
         &document,
         iceberg_schema,
         &[],
+        None,
         creation,
     )
     .map_err(crate::metadata::metadata_creation_error)?;
@@ -238,6 +239,39 @@ pub(crate) fn write_target_schema(
                 )
             }),
         None => Ok(metadata.current_schema().clone()),
+    }
+}
+
+pub(crate) fn position_mutation_base(
+    metadata: &TableMetadata,
+    location: Option<&str>,
+    target_ref: &str,
+    snapshot_id: Option<i64>,
+) -> Result<novarocks_spi::connector::ConnectorWriteBaseVersion, ConnectorError> {
+    use sha2::{Digest, Sha256};
+    let metadata_identity = crate::read_snapshot::metadata_identity(metadata)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?;
+    let metadata_object = location.map_or_else(
+        || "none".to_owned(),
+        |path| format!("{:x}", Sha256::digest(path.as_bytes())),
+    );
+    let snapshot = snapshot_token(snapshot_id);
+    novarocks_spi::connector::ConnectorWriteBaseVersion::try_new(bytes::Bytes::from(format!(
+        "iceberg/position-mutation-base/v2/{}/{target_ref}/{snapshot}/{metadata_object}/{metadata_identity}",
+        metadata.uuid(),
+    )))
+}
+
+pub(crate) fn position_mutation_read_schema(
+    metadata: &TableMetadata,
+    target_ref: &str,
+    snapshot_id: Option<i64>,
+) -> Result<std::sync::Arc<Schema>, ConnectorError> {
+    match snapshot_id {
+        Some(snapshot) if target_ref != "main" => {
+            crate::typed_boundary::projection_schema_for_pinned_snapshot(metadata, snapshot)
+        }
+        _ => Ok(metadata.current_schema().clone()),
     }
 }
 

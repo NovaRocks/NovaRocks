@@ -37,6 +37,7 @@ pub enum ArtifactKind {
     Manifest,
     ManifestList,
     Statistics,
+    #[cfg(test)]
     DeletionVector,
     #[cfg(test)]
     Metadata,
@@ -46,7 +47,9 @@ impl ArtifactKind {
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Manifest | Self::ManifestList => "avro",
-            Self::Statistics | Self::DeletionVector => "puffin",
+            Self::Statistics => "puffin",
+            #[cfg(test)]
+            Self::DeletionVector => "puffin",
             #[cfg(test)]
             Self::Metadata => "json",
         }

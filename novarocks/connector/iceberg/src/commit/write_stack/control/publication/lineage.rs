@@ -232,6 +232,7 @@ mod tests {
         let execution = IcebergWriteStackExecution::new(catalog, adapter.clone(), binding);
         let mut writer = execution
             .open_writer(ConnectorOpenWriterRequest {
+                resources: None,
                 handle: adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: schema,

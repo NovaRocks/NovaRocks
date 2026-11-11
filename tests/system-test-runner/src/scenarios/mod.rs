@@ -22,6 +22,7 @@ mod independent_root_target;
 mod json_membership;
 mod listing;
 mod listing_real_rest;
+mod managed_output_storage;
 mod memory_attribution;
 mod mv_recovery;
 mod mv_uea7;
@@ -99,6 +100,9 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(iceberg_delete_warm::scenarios());
     scenarios.push(Box::new(
         iceberg_delete_applicability::IcebergDeleteApplicability::default(),
+    ));
+    scenarios.push(Box::new(
+        managed_output_storage::ManagedOutputStorage::default(),
     ));
     scenarios.extend(distributed_writer::scenarios());
     scenarios.extend(frontend_lifecycle::scenarios());

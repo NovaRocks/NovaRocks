@@ -758,12 +758,23 @@ fn scan_topology(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
                     MAX_TOPOLOGY_ENTRIES,
                     "task topology exceeds 256 inbound nodes",
                 )?;
-                scan_repeated_message_field(
-                    node,
-                    2,
-                    MAX_INBOUND_SOURCES,
-                    "exchange inbound exceeds 4096 sources",
-                )?;
+                let mut sources = 0;
+                let mut source_dops = 0;
+                for_fields(node, |field, value| match (field, value) {
+                    (2, Value::Bytes(_)) => checked_increment(
+                        &mut sources,
+                        MAX_INBOUND_SOURCES,
+                        "exchange inbound exceeds 4096 sources",
+                    ),
+                    (4, Value::Bytes(roster)) => count_repeated_varints(
+                        roster,
+                        1,
+                        &mut source_dops,
+                        MAX_INBOUND_SOURCES,
+                        "position-shard roster exceeds 4096 sender DOPs",
+                    ),
+                    _ => Ok(()),
+                })?;
             }
             _ => {}
         }
@@ -986,6 +997,33 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "task descriptor exceeds 1024 split nodes"
+        );
+    }
+
+    #[test]
+    fn position_shard_roster_preflight_counts_packed_and_merged_occurrences() {
+        let mut roster = Vec::new();
+        write_bytes_field(&mut roster, 1, &vec![1; MAX_INBOUND_SOURCES]);
+        let mut inbound = Vec::new();
+        write_bytes_field(&mut inbound, 4, &roster);
+        let wrap = |inbound: &[u8]| {
+            let mut topology = Vec::new();
+            write_bytes_field(&mut topology, 2, inbound);
+            let mut descriptor = Vec::new();
+            write_bytes_field(&mut descriptor, 5, &topology);
+            let mut metadata = Vec::new();
+            write_bytes_field(&mut metadata, 2, &descriptor);
+            metadata
+        };
+        assert!(check_creation_metadata(&wrap(&inbound), 0).is_ok());
+        // Prost would merge this second singular wrapper and append one
+        // unpacked sender DOP. The bound must apply before Prost allocates.
+        write_bytes_field(&mut inbound, 4, &[0x08, 0x01]);
+        assert_eq!(
+            check_creation_metadata(&wrap(&inbound), 0)
+                .unwrap_err()
+                .to_string(),
+            "position-shard roster exceeds 4096 sender DOPs",
         );
     }
 

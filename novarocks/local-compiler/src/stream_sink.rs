@@ -54,11 +54,8 @@ pub(crate) fn cut_role(
         }
         novarocks_physical_plan::OutputRole::Summary(kind) => ProgramOutputRole::Summary(kind),
         novarocks_physical_plan::OutputRole::WriterResults => ProgramOutputRole::WriterResults,
-        novarocks_physical_plan::OutputRole::PositionShards { .. } => {
-            return Err(FragmentCompileError::Unsupported {
-                node: None,
-                feature: "position shard writer edge",
-            });
+        novarocks_physical_plan::OutputRole::PositionShards { group, target } => {
+            ProgramOutputRole::PositionShards { group, target }
         }
     })
 }

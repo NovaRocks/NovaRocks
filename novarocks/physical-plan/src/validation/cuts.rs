@@ -798,6 +798,7 @@ pub(crate) fn validate_fragment_cuts_into(
         }
     }
     if let FragmentSink::Router { routes, .. } = fragment.sink() {
+        let mut target_contributions = BTreeMap::new();
         for route in routes {
             let cut = outbound_by_edge.get(&route.edge).copied();
             if cut.is_none_or(|cut| {
@@ -813,6 +814,22 @@ pub(crate) fn validate_fragment_cuts_into(
             }
             if let Some(cut) = cut {
                 validate_router_partitioning(route, &cut.partitioning.source, &path, errors);
+                let contribution = match (&cut.payload, &cut.partitioning.source) {
+                    (
+                        crate::ExchangePayloadContract::PositionContribution { group, .. },
+                        crate::Distribution::Hash { scheme, .. },
+                    ) => Some((*group, cut.destination_fragment, scheme)),
+                    _ => None,
+                };
+                if let Some(previous) =
+                    target_contributions.insert(route.write_target_ordinal, contribution)
+                    && (contribution.is_none() || previous != contribution)
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "repeated router target requires one position contribution group and instance hash scheme",
+                    ));
+                }
                 let proof_matches = cut.change_stream_writer().is_some_and(|proof| {
                     proof.route_id == route.route_id
                         && proof.write_target_ordinal == route.write_target_ordinal

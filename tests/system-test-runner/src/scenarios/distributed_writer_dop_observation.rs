@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual writer geometry for two predeclared row-level MERGE statements.
+//! Actual stage and driver geometry for predeclared row-level statements.
 //! Authenticated bindings select the execution/process; original typed markers
 //! select each Task and each driver-local writer. Neither grants capacity or
 //! substitutes for SQL, publication, resource convergence or process exit.
 use super::*;
+use anyhow::ensure;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_failpoint::target_binding::StatementExecutionBinding;
 use novarocks_types::{StageId, TaskId, UniqueId};
@@ -30,7 +31,31 @@ const PREPARED: &str = novarocks_failpoint::observation_marker::TASK_PREPARED_DO
 const OPENED: &str = novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED;
 const READER_CLOSE: &str = novarocks_failpoint::observation_marker::CONNECTOR_UNIT_READER_CLOSE;
 
-pub(super) fn mutate_observed(
+const SHARD_OPENED: &str = novarocks_failpoint::observation_marker::POSITION_SHARD_DRIVER_OPENED;
+const SHARD_FINISHED: &str =
+    novarocks_failpoint::observation_marker::POSITION_SHARD_DRIVER_FINISHED;
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::scenarios::distributed_writer) enum Geometry {
+    DataAndEmptyDelete,
+    SameFileDelete,
+    MixedSameFile,
+    MultiFileDelete,
+    V2Delete,
+}
+impl Geometry {
+    fn report_suffix(self) -> &'static str {
+        match self {
+            Self::DataAndEmptyDelete => "",
+            Self::SameFileDelete => "-same-file-delete",
+            Self::MixedSameFile => "-mixed-same-file",
+            Self::MultiFileDelete => "-multi-file-delete",
+            Self::V2Delete => "-v2-delete",
+        }
+    }
+}
+
+pub(in crate::scenarios::distributed_writer) fn mutate_observed(
     context: &mut ScenarioContext,
     control: &mut SqlSession,
     selected: &SelectedStatement,
@@ -40,6 +65,7 @@ pub(super) fn mutate_observed(
     dop: i32,
     affected: u64,
     reader_rows: Option<u64>,
+    geometry: Geometry,
     subject: &str,
 ) -> Result<()> {
     let before = snapshot_count(control, table)?;
@@ -144,23 +170,14 @@ pub(super) fn mutate_observed(
             backend["original_writer_open_delta"] = serde_json::json!(actual_opens);
             backends.push(backend);
         }
-        anyhow::ensure!(
-            backends.iter().any(|backend| backend["writer_groups"]
-                .as_array()
-                .is_some_and(|groups| !groups.is_empty())),
-            "selected MERGE produced no actual writer observations"
-        );
+        validate_geometry(&backends, geometry)?;
         if let Some(expected_rows) = reader_rows {
             anyhow::ensure!(
                 total_reader_batches > 1 && total_reader_rows >= expected_rows,
                 "one old file DELETE observed batches={total_reader_batches} rows_decoded={total_reader_rows}, expected multiple actual batches covering at least {expected_rows} rows"
             );
         }
-        let suffix = if reader_rows.is_some() {
-            "-same-file-delete"
-        } else {
-            ""
-        };
+        let suffix = geometry.report_suffix();
         std::fs::write(
             context
                 .scenario_root()
@@ -251,7 +268,139 @@ struct Prepared {
 struct Writers {
     task: TaskIdentity,
     plan_node: i32,
+    role: WriterRole,
     drivers: BTreeSet<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterRole {
+    Data,
+    V2PositionDelete,
+    V3Materialize,
+}
+impl WriterRole {
+    fn read(value: &str) -> Result<Self> {
+        match value {
+            "data" => Ok(Self::Data),
+            "v2_position_delete" => Ok(Self::V2PositionDelete),
+            "v3_materialize" => Ok(Self::V3Materialize),
+            _ => bail!("unexpected observed writer role {value}"),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::V2PositionDelete => "v2_position_delete",
+            Self::V3Materialize => "v3_materialize",
+        }
+    }
+    fn dop(self, input_dop: i32) -> i32 {
+        match self {
+            Self::V3Materialize => 1,
+            _ => input_dop,
+        }
+    }
+}
+
+fn validate_geometry(backends: &[serde_json::Value], geometry: Geometry) -> Result<()> {
+    let groups = |field: &str| -> Vec<&serde_json::Value> {
+        backends
+            .iter()
+            .flat_map(|be| be[field].as_array().unwrap())
+            .collect()
+    };
+    let writers = groups("writer_groups");
+    let shards = groups("position_shard_groups");
+    let by_role = |role: WriterRole| -> Vec<&serde_json::Value> {
+        writers
+            .iter()
+            .copied()
+            .filter(|group| group["role"] == role.name())
+            .collect()
+    };
+    let data = by_role(WriterRole::Data);
+    let v2 = by_role(WriterRole::V2PositionDelete);
+    let v3 = by_role(WriterRole::V3Materialize);
+    let writer_backends = |role: WriterRole| {
+        backends
+            .iter()
+            .filter(|be| {
+                be["writer_groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group["role"] == role.name())
+            })
+            .count()
+    };
+    let shard_backends = backends
+        .iter()
+        .filter(|be| !be["position_shard_groups"].as_array().unwrap().is_empty())
+        .count();
+    let nonempty = shards
+        .iter()
+        .map(|group| group["nonempty_authors"].as_u64().unwrap())
+        .sum::<u64>();
+    let shard_stages = shards
+        .iter()
+        .map(|group| group["stage"].as_u64().unwrap())
+        .collect::<BTreeSet<_>>();
+    let distinct_singleton = v3.len() == 1
+        && shard_stages.len() == 1
+        && v3[0]["stage"]
+            .as_u64()
+            .is_some_and(|stage| !shard_stages.contains(&stage));
+
+    ensure!(
+        data.iter()
+            .all(|group| group["stage"].as_u64().is_some_and(|stage| {
+                !shard_stages.contains(&stage)
+                    && v3
+                        .iter()
+                        .all(|writer| writer["stage"].as_u64() != Some(stage))
+            })),
+        "data writers cannot share the position aggregation or materialization stage"
+    );
+
+    match geometry {
+        Geometry::DataAndEmptyDelete => {
+            ensure!(
+                writer_backends(WriterRole::Data) >= 2
+                    && v2.is_empty()
+                    && distinct_singleton
+                    && nonempty == 0,
+                "unmatched MERGE requires distributed data writers and empty shard output with one materializer: {backends:?}"
+            );
+        }
+        Geometry::SameFileDelete | Geometry::MultiFileDelete | Geometry::MixedSameFile => {
+            let expects_data = matches!(geometry, Geometry::MixedSameFile);
+            ensure!(
+                (!data.is_empty()) == expects_data && v2.is_empty() && distinct_singleton,
+                "v3 mutation requires one distinct materialization writer stage and its declared data branch: {backends:?}"
+            );
+            if matches!(geometry, Geometry::MultiFileDelete) {
+                ensure!(
+                    shard_backends >= 2 && nonempty > 0,
+                    "multi-file v3 DELETE requires multiple authenticated aggregation backends and real shard output: {backends:?}"
+                );
+            } else {
+                ensure!(
+                    nonempty == 1,
+                    "one source file needs exactly one nonempty shard author: {backends:?}"
+                );
+            }
+        }
+        Geometry::V2Delete => {
+            ensure!(
+                data.is_empty()
+                    && v3.is_empty()
+                    && shards.is_empty()
+                    && writer_backends(WriterRole::V2PositionDelete) >= 2,
+                "v2 DELETE must retain multiple distributed position writers: {backends:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn inventory(
@@ -318,9 +467,11 @@ fn inventory(
         let task = prepared
             .get(&task_key)
             .context("opened writer has no exact prepared Task")?;
-        anyhow::ensure!(
-            task.dop == dop,
-            "opened writer Task has actual descriptor DOP {}, requested {dop}",
+        let role = WriterRole::read(field(&fields, "role")?)?;
+        let expected_dop = role.dop(dop);
+        ensure!(
+            task.dop == expected_dop,
+            "opened {role:?} writer Task has actual descriptor DOP {}, expected {expected_dop}",
             task.dop
         );
         let target = number::<u32>(&fields, "write_target")?;
@@ -332,10 +483,11 @@ fn inventory(
             .or_insert_with(|| Writers {
                 task: task.identity,
                 plan_node,
+                role,
                 drivers: BTreeSet::new(),
             });
         anyhow::ensure!(
-            group.plan_node == plan_node && group.task == task.identity,
+            group.plan_node == plan_node && group.task == task.identity && group.role == role,
             "physical writer group combines different node/Task owners"
         );
         anyhow::ensure!(
@@ -344,10 +496,11 @@ fn inventory(
         );
         raw.push(line.to_owned());
     }
-    let expected = (0..u32::try_from(dop)?).collect::<BTreeSet<_>>();
     let mut writers = Vec::new();
     let mut observed_opens = 0_usize;
     for ((target, task_key, ordinal), group) in groups {
+        let descriptor_dop = group.role.dop(dop);
+        let expected = (0..u32::try_from(descriptor_dop)?).collect::<BTreeSet<_>>();
         anyhow::ensure!(
             group.drivers == expected,
             "Task {} target {target} writer ordinal {ordinal} actual driver set {:?}, expected {:?}",
@@ -356,7 +509,78 @@ fn inventory(
             expected
         );
         observed_opens += group.drivers.len();
-        writers.push(serde_json::json!({"task":group.task.to_string(),"task_key":task_key,"target":target,"writer_ordinal":ordinal,"plan_node":group.plan_node,"driver_ids":group.drivers,"descriptor_dop":dop}));
+        writers.push(
+            serde_json::json!({"task":group.task.to_string(),"task_key":task_key,
+            "stage":group.task.stage_id().get(),"target":target,"writer_ordinal":ordinal,
+            "plan_node":group.plan_node,"driver_ids":group.drivers,"descriptor_dop":descriptor_dop,
+            "role":group.role.name()}),
+        );
+    }
+    let mut shard_groups = BTreeMap::<String, BTreeMap<u32, Option<u64>>>::new();
+    for line in stdout.lines() {
+        let (fields, finished) = if let Some(fields) = fields(line, SHARD_OPENED)? {
+            (fields, false)
+        } else if let Some(fields) = fields(line, SHARD_FINISHED)? {
+            (fields, true)
+        } else {
+            continue;
+        };
+        if field(&fields, "execution_id")? != execution_text {
+            continue;
+        }
+        let key = task_key(&fields)?;
+        let task = prepared
+            .get(&key)
+            .context("shard driver has no exact prepared Task")?;
+        ensure!(
+            task.dop == dop,
+            "shard Task {} has actual DOP {}, expected {dop}",
+            task.identity,
+            task.dop
+        );
+        let driver = number::<u32>(&fields, "driver_id")?;
+        if finished {
+            let emitted = shard_groups
+                .get_mut(&key)
+                .and_then(|drivers| drivers.get_mut(&driver))
+                .context("finished shard driver never opened")?;
+            ensure!(emitted.is_none(), "shard driver finished twice");
+            *emitted = Some(number(&fields, "emitted_rows")?);
+        } else {
+            ensure!(
+                shard_groups
+                    .entry(key)
+                    .or_default()
+                    .insert(driver, None)
+                    .is_none(),
+                "shard driver opened twice"
+            );
+        }
+        raw.push(line.to_owned());
+    }
+    let expected = (0..u32::try_from(dop)?).collect::<BTreeSet<_>>();
+    let mut shards = Vec::new();
+    for (key, drivers) in shard_groups {
+        let task = &prepared[&key];
+        let ordinals = drivers.keys().copied().collect::<BTreeSet<_>>();
+        ensure!(
+            ordinals == expected,
+            "shard Task {} opened drivers {ordinals:?}, expected {expected:?}",
+            task.identity
+        );
+        let emitted = drivers.values().try_fold(0_u64, |sum, rows| {
+            sum.checked_add(rows.context("shard driver did not reach genuine EOS")?)
+                .context("shard emitted rows overflow")
+        })?;
+        let authors = drivers
+            .values()
+            .filter(|rows| rows.is_some_and(|rows| rows > 0))
+            .count();
+        shards.push(
+            serde_json::json!({"task":task.identity.to_string(),"task_key":key,
+            "stage":task.identity.stage_id().get(),"driver_rows":drivers,"descriptor_dop":task.dop,
+            "nonempty_authors":authors,"emitted_rows":emitted}),
+        );
     }
     // The original private binding retains its run token. The derived report
     // needs process/execution attribution, never another copy of that token.
@@ -371,7 +595,7 @@ fn inventory(
         })
     });
     Ok(
-        serde_json::json!({"validated_binding_attribution":attribution,"writer_groups":writers,"observed_writer_opens":observed_opens,"original_markers":raw}),
+        serde_json::json!({"validated_binding_attribution":attribution,"writer_groups":writers,"position_shard_groups":shards,"observed_writer_opens":observed_opens,"original_markers":raw}),
     )
 }
 
@@ -448,7 +672,7 @@ mod tests {
     }
     fn writer(task_key: &str, driver: u32) -> String {
         format!(
-            "{OPENED} execution_id=1:2:1 task_key={task_key} plan_node=1 write_target=0 driver_id={driver} writer_ordinal=0\n"
+            "{OPENED} execution_id=1:2:1 task_key={task_key} plan_node=1 write_target=0 driver_id={driver} writer_ordinal=0 role=data\n"
         )
     }
     #[test]
@@ -497,6 +721,38 @@ mod tests {
             &BackendProcessId::new_v7().to_string(),
         );
         assert!(inventory(&wrong, Some(&binding), "1:2:1", 4).is_err());
+    }
+    #[test]
+    fn shard_roster_requires_genuine_eos_and_distinct_singleton_writer() {
+        let binding = binding();
+        let mut log = prepared(&binding, "a:b", 4)
+            + &prepared(&binding, "c:d", 1).replace("stage=1 task=2", "stage=2 task=3");
+        log.push_str(&writer("c:d", 0).replace("role=data", "role=v3_materialize"));
+        let mut final_driver_eos = String::new();
+        for driver in 0..4 {
+            log.push_str(&format!(
+                "{SHARD_OPENED} execution_id=1:2:1 task_key=a:b driver_id={driver}\n"
+            ));
+            let finish = format!(
+                "{SHARD_FINISHED} execution_id=1:2:1 task_key=a:b driver_id={driver} emitted_rows={}\n",
+                u64::from(driver == 1)
+            );
+            if driver == 3 {
+                final_driver_eos = finish;
+            } else {
+                log.push_str(&finish);
+            }
+        }
+        assert!(inventory(&log, Some(&binding), "1:2:1", 4).is_err());
+        log.push_str(&final_driver_eos);
+        let backend = inventory(&log, Some(&binding), "1:2:1", 4).unwrap();
+        assert_eq!(backend["writer_groups"][0]["descriptor_dop"], 1);
+        assert_eq!(backend["position_shard_groups"][0]["descriptor_dop"], 4);
+        validate_geometry(std::slice::from_ref(&backend), Geometry::SameFileDelete).unwrap();
+        assert!(validate_geometry(&[backend], Geometry::MultiFileDelete).is_err());
+        let wrong_stage = log.replace("stage=2 task=3", "stage=1 task=3");
+        let backend = inventory(&wrong_stage, Some(&binding), "1:2:1", 4).unwrap();
+        assert!(validate_geometry(&[backend], Geometry::SameFileDelete).is_err());
     }
     fn reader(sequence: u64, rows: u64, batches: u64) -> String {
         format!(

@@ -70,14 +70,11 @@ use crate::commit::write_stack::domain::{
     IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteFileArtifact,
     IcebergEqualityDeleteRecipe, IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
     IcebergMutationReadRecipe, IcebergMutationSnapshot, IcebergPositionDeleteFileArtifact,
-    IcebergWriteBranch, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle,
-    IcebergWriterOutput,
-};
-use crate::commit::write_stack::old_delete::{
-    IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
+    IcebergPositionRewriteTarget, IcebergWriteBranch, IcebergWriteSessionId,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
 };
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
-use crate::delete_file::{IcebergFileContent, IcebergFileFormat};
+use crate::delete_file::IcebergFileFormat;
 use crate::wire::dto;
 use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
@@ -240,35 +237,6 @@ impl IcebergWriteValueCodec {
                 Err(spi_codec_error(self.invalid(
                     path,
                     "an Iceberg write carrier requires a named file format",
-                )))
-            }
-        };
-        finish_value_decode(result, context)
-    }
-
-    fn encode_file_content(&self, content: IcebergFileContent) -> i32 {
-        match content {
-            IcebergFileContent::Data => dto::IcebergFileContent::Data as i32,
-            IcebergFileContent::PositionDeletes => dto::IcebergFileContent::PositionDeletes as i32,
-            IcebergFileContent::EqualityDeletes => dto::IcebergFileContent::EqualityDeletes as i32,
-        }
-    }
-
-    fn decode_file_content(
-        &self,
-        value: i32,
-        path: FieldPath,
-        context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergFileContent, ConnectorCodecError> {
-        context.flush_compile_control()?;
-        let result = match dto::IcebergFileContent::try_from(value) {
-            Ok(dto::IcebergFileContent::Data) => Ok(IcebergFileContent::Data),
-            Ok(dto::IcebergFileContent::PositionDeletes) => Ok(IcebergFileContent::PositionDeletes),
-            Ok(dto::IcebergFileContent::EqualityDeletes) => Ok(IcebergFileContent::EqualityDeletes),
-            Ok(dto::IcebergFileContent::Unspecified) | Err(_) => {
-                Err(spi_codec_error(self.invalid(
-                    path,
-                    "an Iceberg write carrier requires a named file content kind",
                 )))
             }
         };
@@ -533,50 +501,6 @@ impl IcebergWriteValueCodec {
     /// scheme or authority does not follow from its own prefix has no faithful
     /// carrier, and is refused here rather than quietly rewritten on the far
     /// side into a route naming storage the artifact does not live in.
-    fn encode_storage_route(
-        &self,
-        route: &IcebergStorageRoute,
-        path: FieldPath,
-    ) -> Result<dto::IcebergStorageRoute, ConnectorWriteCodecError> {
-        let access_binding = route.prefix().to_string();
-        let derived = IcebergStorageRoute::try_for_location(&access_binding)
-            .map_err(|error| self.rejected(path.clone(), &error))?;
-        if &derived != route {
-            return Err(self.invalid(
-                path,
-                "Iceberg storage route scheme or authority does not follow from its own prefix",
-            ));
-        }
-        Ok(dto::IcebergStorageRoute { access_binding })
-    }
-
-    fn decode_storage_route(
-        &self,
-        route: Option<&dto::IcebergStorageRoute>,
-        path: FieldPath,
-        context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergStorageRoute, ConnectorCodecError> {
-        context.flush_compile_control()?;
-        let result = (|| {
-            let route = route.ok_or_else(|| {
-                spi_codec_error(self.missing(
-                    path.clone(),
-                    "an Iceberg old delete reference requires its storage route",
-                ))
-            })?;
-            {
-                let arguments = (&route.access_binding,);
-                observe_value_opaque(context, || {
-                    IcebergStorageRoute::try_for_location(arguments.0)
-                })?
-            }
-            .map_err(|error| spi_codec_error(self.rejected(path.field("access_binding"), &error)))
-        })();
-        finish_value_decode(result, context)
-    }
-
-    // -- writer handle -----------------------------------------------------
-
     fn encode_table(&self, table: &IcebergWriteTableFacts) -> dto::IcebergWriteTableFacts {
         dto::IcebergWriteTableFacts {
             table_uuid: table.table_uuid().to_string(),
@@ -758,163 +682,6 @@ impl IcebergWriteValueCodec {
         finish_value_decode(result, context)
     }
 
-    fn encode_reference(
-        &self,
-        reference: &IcebergOldDeleteArtifactRef,
-        path: FieldPath,
-    ) -> Result<dto::IcebergOldDeleteArtifactRef, ConnectorWriteCodecError> {
-        Ok(dto::IcebergOldDeleteArtifactRef {
-            path: reference.path().to_string(),
-            content: self.encode_file_content(reference.content()),
-            file_format: self
-                .encode_file_format(reference.file_format(), path.field("file_format"))?,
-            file_size_in_bytes: reference.file_size_in_bytes(),
-            // Presence is semantic. A missing manifest count stays unknown;
-            // zero, when a future source can prove it, remains a known zero.
-            record_count: reference.record_count(),
-            content_range: reference
-                .content_range()
-                .map(|range| self.encode_content_range(range)),
-            referenced_data_file: reference.referenced_data_file().map(str::to_string),
-            data_sequence_number: reference.data_sequence_number(),
-            added_snapshot_id: reference.added_snapshot_id(),
-            partition_spec_id: reference.partition_spec_id(),
-            storage_route: Some(
-                self.encode_storage_route(reference.storage_route(), path.field("storage_route"))?,
-            ),
-        })
-    }
-
-    fn decode_reference(
-        &self,
-        reference: &dto::IcebergOldDeleteArtifactRef,
-        path: FieldPath,
-        context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergOldDeleteArtifactRef, ConnectorCodecError> {
-        context.flush_compile_control()?;
-        let result = (|| {
-            let content_range = reference
-                .content_range
-                .as_ref()
-                .map(|range| self.decode_content_range(range, path.field("content_range"), context))
-                .transpose()?;
-            {
-                let arguments = (
-                    copy_value_string(&reference.path, context)?,
-                    self.decode_file_content(reference.content, path.field("content"), context)?,
-                    self.decode_file_format(
-                        reference.file_format,
-                        path.field("file_format"),
-                        context,
-                    )?,
-                    reference.file_size_in_bytes,
-                    reference.record_count,
-                    content_range,
-                    reference
-                        .referenced_data_file
-                        .as_deref()
-                        .map(|value| copy_value_string(value, context))
-                        .transpose()?,
-                    reference.data_sequence_number,
-                    reference.added_snapshot_id,
-                    reference.partition_spec_id,
-                    self.decode_storage_route(
-                        reference.storage_route.as_ref(),
-                        path.field("storage_route"),
-                        context,
-                    )?,
-                );
-                observe_value_opaque(context, || {
-                    IcebergOldDeleteArtifactRef::try_new(
-                        arguments.0,
-                        arguments.1,
-                        arguments.2,
-                        arguments.3,
-                        arguments.4,
-                        arguments.5,
-                        arguments.6,
-                        arguments.7,
-                        arguments.8,
-                        arguments.9,
-                        arguments.10,
-                    )
-                })?
-            }
-            .map_err(|error| spi_codec_error(self.rejected(path, &error)))
-        })();
-        finish_value_decode(result, context)
-    }
-
-    fn encode_merge_target(
-        &self,
-        target: &IcebergOldDeleteMergeTarget,
-        path: FieldPath,
-    ) -> Result<dto::IcebergOldDeleteMergeTarget, ConnectorWriteCodecError> {
-        let mut references = Vec::with_capacity(target.references().len());
-        for (index, reference) in target.references().iter().enumerate() {
-            references
-                .push(self.encode_reference(reference, path.field("references").index(index))?);
-        }
-        Ok(dto::IcebergOldDeleteMergeTarget {
-            data_file_path: target.data_file_path().to_string(),
-            data_file_record_count: target.data_file_record_count(),
-            data_file_sequence_number: target.data_file_sequence_number(),
-            partition: Some(self.encode_partition(target.partition())),
-            base_snapshot_id: target.base_snapshot_id(),
-            references,
-        })
-    }
-
-    fn decode_merge_target(
-        &self,
-        target: &dto::IcebergOldDeleteMergeTarget,
-        path: FieldPath,
-        context: &mut ConnectorDecodeContext<'_>,
-    ) -> Result<IcebergOldDeleteMergeTarget, ConnectorCodecError> {
-        context.flush_compile_control()?;
-        let result = (|| {
-            let mut references = Vec::with_capacity(target.references.len());
-            for (index, reference) in target.references.iter().enumerate() {
-                references.push(self.decode_reference(
-                    reference,
-                    path.field("references").index(index),
-                    context,
-                )?);
-                context.observe_compile_step()?;
-            }
-            // `try_new` owns the target-wide rules — a reference that belongs to
-            // another data file, a repeated artifact, a partition spec that
-            // disagrees with the data file's — none of which the carrier's shape
-            // can express.
-            {
-                let arguments = (
-                    copy_value_string(&target.data_file_path, context)?,
-                    target.data_file_record_count,
-                    target.data_file_sequence_number,
-                    self.decode_partition(
-                        target.partition.as_ref(),
-                        path.field("partition"),
-                        context,
-                    )?,
-                    target.base_snapshot_id,
-                    references,
-                );
-                observe_value_opaque(context, || {
-                    IcebergOldDeleteMergeTarget::try_new(
-                        arguments.0,
-                        arguments.1,
-                        arguments.2,
-                        arguments.3,
-                        arguments.4,
-                        arguments.5,
-                    )
-                })?
-            }
-            .map_err(|error| spi_codec_error(self.rejected(path, &error)))
-        })();
-        finish_value_decode(result, context)
-    }
-
     fn encode_equality_recipe(
         &self,
         recipe: &IcebergEqualityDeleteRecipe,
@@ -983,13 +750,6 @@ impl IcebergWriteValueCodec {
         handle: &IcebergWriterHandle,
     ) -> Result<dto::IcebergWriterHandle, ConnectorWriteCodecError> {
         let path = FieldPath::root("writer_handle").field("iceberg");
-        let mut old_deletes = std::collections::BTreeMap::new();
-        for (key, target) in handle.old_deletes() {
-            old_deletes.insert(
-                key.clone(),
-                self.encode_merge_target(target, path.field("old_deletes").map_key(key.clone()))?,
-            );
-        }
         let data = handle
             .data()
             .map(|recipe| self.encode_recipe(recipe, path.field("data")))
@@ -999,7 +759,13 @@ impl IcebergWriteValueCodec {
             table: Some(self.encode_table(handle.table())),
             output: Some(self.encode_output(handle.output(), path.field("output"))?),
             data,
-            old_deletes,
+            position_rewrite: handle.position_rewrite().map(|target| {
+                dto::IcebergPositionRewriteTarget {
+                    data_file_path: target.path().to_owned(),
+                    record_count: target.record_count(),
+                    partition: Some(self.encode_partition(target.partition())),
+                }
+            }),
             position_group_id: handle.position_group().map(|id| id.to_bytes().to_vec()),
             creation_scope: handle
                 .creation_scope()
@@ -1094,32 +860,36 @@ impl IcebergWriteValueCodec {
                         crate::wire::write::require_exact_bytes(bytes, field)
                             .map(novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes)
                     }).transpose()?;
-                    let mut targets = Vec::with_capacity(iceberg.old_deletes.len());
-                    for (key, target) in &iceberg.old_deletes {
-                        targets.push(
-                            self.decode_merge_target(
-                                target,
-                                path.field("old_deletes")
-                                    .map_key(copy_value_string(key, context)?),
+                    let rewrite = iceberg
+                        .position_rewrite
+                        .as_ref()
+                        .map(|target| {
+                            let field = path.field("position_rewrite");
+                            let data_file_path =
+                                copy_value_string(&target.data_file_path, context)?;
+                            let partition = self.decode_partition(
+                                target.partition.as_ref(),
+                                field.field("partition"),
                                 context,
-                            )?,
-                        );
-                        context.observe_compile_step()?;
-                    }
-                    // `try_new_delete` owns the branch/format pairing, the frozen
-                    // base snapshot every target must agree with, and the exclusive
-                    // ownership of each referenced data file.
-                    {
-                        observe_value_opaque(context, || {
-                            let handle = IcebergWriterHandle::try_new_delete(
-                                branch, table, output, targets,
                             )?;
-                            match mutation {
-                                Some(recipe) => handle.try_with_mutation_read(recipe, group),
-                                None => Ok(handle),
-                            }
-                        })?
-                    }
+                            IcebergPositionRewriteTarget::try_new(
+                                data_file_path,
+                                target.record_count,
+                                partition,
+                            )
+                            .map_err(|error| spi_codec_error(self.rejected(field, &error)))
+                        })
+                        .transpose()?;
+                    observe_value_opaque(context, || {
+                        let handle = IcebergWriterHandle::try_new_delete(branch, table, output)?;
+                        match (mutation, rewrite) {
+                            (Some(recipe), None) => handle.try_with_mutation_read(recipe, group),
+                            (None, Some(target)) => handle.try_with_position_rewrite(target),
+                            _ => Err(super::domain::invalid(
+                                "Iceberg position writer requires exactly one input recipe",
+                            )),
+                        }
+                    })?
                     .map_err(|error| spi_codec_error(self.rejected(path.clone(), &error)))
                 }
                 IcebergWriteBranch::EqualityDelete => {
@@ -1226,8 +996,10 @@ impl IcebergWriteValueCodec {
                 use dto::iceberg_final_delete_effect::Effect;
                 let kind = match effect.kind() {
                     IcebergFinalDeleteKind::RemoveDataFile {
+                        partition,
                         old_exclusive_deletes,
                     } => Effect::RemoveDataFile(dto::IcebergRemoveDataFile {
+                        partition: Some(self.encode_partition(partition)),
                         old_exclusive_deletes: old_exclusive_deletes
                             .iter()
                             .map(encode_merged_reference)
@@ -1268,6 +1040,13 @@ impl IcebergWriteValueCodec {
                     identity: receipt.identity().to_vec(),
                     size: receipt.size(),
                     content_sha256: receipt.content_sha256().to_vec(),
+                    physical: Some(dto::IcebergCreationWriter {
+                        execution_query_id: receipt.physical().execution_query_id().to_vec(),
+                        execution_attempt_id: receipt.physical().execution_attempt_id(),
+                        task_key: receipt.physical().task_key().to_vec(),
+                        driver_id: receipt.physical().driver_id(),
+                        writer_ordinal: receipt.physical().writer_ordinal(),
+                    }),
                 }),
         })
     }
@@ -1489,7 +1268,27 @@ impl IcebergWriteValueCodec {
                 &receipt.content_sha256,
                 wire_path.field("content_sha256"),
             )?;
-            IcebergCreationReceipt::try_new(id, identity, receipt.size, content)
+            let writer = receipt.physical.as_ref().ok_or_else(|| {
+                spi_codec_error(self.missing(
+                    path.field("physical"),
+                    "creation receipt requires its physical writer",
+                ))
+            })?;
+            let physical =
+                novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext::new(
+                    crate::wire::write::require_exact_bytes(
+                        &writer.execution_query_id,
+                        wire_path.field("physical").field("execution_query_id"),
+                    )?,
+                    writer.execution_attempt_id,
+                    crate::wire::write::require_exact_bytes(
+                        &writer.task_key,
+                        wire_path.field("physical").field("task_key"),
+                    )?,
+                    writer.driver_id,
+                    writer.writer_ordinal,
+                );
+            IcebergCreationReceipt::try_new(physical, id, identity, receipt.size, content)
                 .and_then(|receipt| value.try_with_creation(receipt))
                 .map_err(|error| spi_codec_error(self.rejected(path, &error)))
         })();
@@ -1569,6 +1368,11 @@ impl IcebergWriteValueCodec {
         .map_err(|error| spi_codec_error(self.rejected(field, &error)))?;
         let kind = match value.effect.as_ref() {
             Some(Effect::RemoveDataFile(remove)) => IcebergFinalDeleteKind::RemoveDataFile {
+                partition: self.decode_partition(
+                    remove.partition.as_ref(),
+                    path.field("remove_data_file").field("partition"),
+                    context,
+                )?,
                 old_exclusive_deletes: self
                     .decode_merged_references(
                         &remove.old_exclusive_deletes,
@@ -2048,8 +1852,8 @@ mod tests {
 
     use crate::commit::write_stack::runtime::build_write_adapter;
     use crate::commit::write_stack::test_support::{
-        equality_delete_recipe, merge_target, parquet_ref, puffin_ref, sample_metrics,
-        sample_partition, table_facts,
+        equality_delete_recipe, position_rewrite_target, sample_metrics, sample_partition,
+        table_facts,
     };
 
     fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
@@ -2205,54 +2009,34 @@ mod tests {
         .expect("data handle")
     }
 
-    /// Two merge targets, each carrying two frozen references, so the map and
-    /// the per-target reference vectors both have to survive the round trip.
     fn delete_handle(branch: IcebergWriteBranch) -> IcebergWriterHandle {
-        let format = match branch {
-            IcebergWriteBranch::DeletionVector => IcebergFileFormat::Puffin,
-            _ => IcebergFileFormat::Parquet,
+        let table = table_facts();
+        let format = if branch == IcebergWriteBranch::DeletionVector {
+            IcebergFileFormat::Puffin
+        } else {
+            IcebergFileFormat::Parquet
         };
-        let first = merge_target(
-            "s3://b/wh/db/t/data/a.parquet",
-            100,
-            vec![
-                puffin_ref(
-                    "s3://b/wh/db/t/data/a-dv-1.puffin",
-                    Some("s3://b/wh/db/t/data/a.parquet"),
-                    4096,
-                    3,
-                    0,
-                    64,
-                )
-                .expect("reference"),
-                parquet_ref("s3://b/wh/db/t/data/shared-1.parquet", None, 4096, 9)
-                    .expect("reference"),
-            ],
-        );
-        let second = merge_target(
-            "s3://b/wh/db/t/data/b.parquet",
-            200,
-            vec![
-                puffin_ref(
-                    "s3://b/wh/db/t/data/b-dv-1.puffin",
-                    Some("s3://b/wh/db/t/data/b.parquet"),
-                    8192,
-                    5,
-                    16,
-                    128,
-                )
-                .expect("reference"),
-                parquet_ref("s3://b/wh/db/t/data/shared-2.parquet", None, 4096, 0)
-                    .expect("reference"),
-            ],
-        );
-        IcebergWriterHandle::try_new_delete(
-            branch,
-            table_facts(),
-            output(format),
-            vec![first, second],
+        let handle =
+            IcebergWriterHandle::try_new_delete(branch, table.clone(), output(format)).unwrap();
+        if branch == IcebergWriteBranch::DeletionVector {
+            return handle
+                .try_with_position_rewrite(position_rewrite_target(
+                    "s3://b/wh/db/t/data/a.parquet",
+                    100,
+                ))
+                .unwrap();
+        }
+        let recipe = IcebergMutationReadRecipe::try_new(
+            &table,
+            "s3://b/wh/db/t/metadata/v3.json".into(),
+            format!("sha256:{}", "a".repeat(64)),
+            Some(
+                IcebergMutationSnapshot::try_new("s3://b/wh/db/t/metadata/snap-77.avro".into(), 3)
+                    .unwrap(),
+            ),
         )
-        .expect("delete handle")
+        .unwrap();
+        handle.try_with_mutation_read(recipe, None).unwrap()
     }
 
     fn data_file_fragment() -> IcebergCommitFragment {
@@ -2381,7 +2165,7 @@ mod tests {
             }
             _ => panic!("one handle has a data recipe and the other does not"),
         }
-        assert_eq!(left.old_deletes(), right.old_deletes());
+        assert_eq!(left.position_rewrite(), right.position_rewrite());
     }
 
     fn assert_same_fragment(left: &IcebergCommitFragment, right: &IcebergCommitFragment) {
@@ -2425,7 +2209,6 @@ mod tests {
             original.branch(),
             table.clone(),
             original.output().clone(),
-            Vec::new(),
         )
         .unwrap();
         let recipe = IcebergMutationReadRecipe::try_new(
@@ -2471,6 +2254,7 @@ mod tests {
             target.clone(),
             4,
             IcebergFinalDeleteKind::RemoveDataFile {
+                partition: unpartitioned(),
                 old_exclusive_deletes: Box::default(),
             },
         )
@@ -2503,6 +2287,13 @@ mod tests {
                 identity: vec![2; 32],
                 size: 1,
                 content_sha256: vec![3; 32],
+                physical: Some(dto::IcebergCreationWriter {
+                    execution_query_id: vec![4; 16],
+                    execution_attempt_id: 1,
+                    task_key: vec![5; 16],
+                    driver_id: 0,
+                    writer_ordinal: 0,
+                }),
             });
         });
         assert!(
@@ -2641,22 +2432,6 @@ mod tests {
         assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg.output");
         assert!(error.detail().contains("Iceberg Parquet row group size"));
-
-        let mut private = codec
-            .encode_writer_handle_value(&delete_handle(IcebergWriteBranch::PositionDelete))
-            .unwrap();
-        private
-            .old_deletes
-            .values_mut()
-            .next()
-            .unwrap()
-            .base_snapshot_id += 1;
-        let error = codec
-            .decode_writer_handle_value(&private, &mut context)
-            .expect_err("merge target must retain the session's base snapshot");
-        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
-        assert_eq!(error.path().to_string(), "writer_handle.iceberg");
-        assert!(error.detail().contains("frozen base snapshot"));
     }
 
     struct ProjectionControl {
@@ -2993,11 +2768,10 @@ mod tests {
             .expect("private handle");
 
         let mut unknown_root = valid.to_vec();
-        push_varint(&mut unknown_root, 7 << 3);
-        push_varint(&mut unknown_root, 0);
+        push_length_delimited(&mut unknown_root, 5, &[]);
         assert_eq!(
             decode_private_handle(&facets, &unknown_root, private_limits())
-                .expect_err("unknown root field")
+                .expect_err("retired old-delete writer field")
                 .kind(),
             &ConnectorCodecErrorKind::UnknownField
         );
@@ -3048,6 +2822,35 @@ mod tests {
     }
 
     #[test]
+    fn position_writer_without_fixed_or_selected_input_is_rejected() {
+        let facets = generation();
+        let codec = IcebergWriteValueCodec::new("catalog.iceberg");
+        for branch in [
+            IcebergWriteBranch::PositionDelete,
+            IcebergWriteBranch::DeletionVector,
+        ] {
+            let handle = delete_handle(branch);
+            let legacy = IcebergWriterHandle::try_new_delete(
+                branch,
+                handle.table().clone(),
+                handle.output().clone(),
+            )
+            .unwrap();
+            let raw = codec
+                .encode_writer_handle_value(&legacy)
+                .unwrap()
+                .encode_to_vec();
+            let failure = decode_private_handle(&facets, &raw, private_limits()).unwrap_err();
+            assert_eq!(failure.kind(), &ConnectorCodecErrorKind::InconsistentFields);
+            assert!(
+                failure
+                    .detail()
+                    .contains("exactly one position input recipe")
+            );
+        }
+    }
+
+    #[test]
     fn private_decode_budgets_are_independent() {
         let facets = generation();
         let bytes = facets
@@ -3074,57 +2877,6 @@ mod tests {
                 &ConnectorCodecErrorKind::Capacity
             );
         }
-    }
-
-    #[test]
-    fn optional_old_delete_record_count_preserves_presence_before_domain_validation() {
-        let facets = generation();
-        let codec = IcebergWriteValueCodec::new("catalog.iceberg");
-        let mut private = codec
-            .encode_writer_handle_value(&delete_handle(IcebergWriteBranch::PositionDelete))
-            .expect("private handle");
-        private
-            .old_deletes
-            .values_mut()
-            .next()
-            .expect("target")
-            .references
-            .first_mut()
-            .expect("reference")
-            .record_count = None;
-        let none_bytes = private.encode_to_vec();
-        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
-        let mut ledger = ConnectorDecodeLedger::new(private_limits());
-        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
-        let parsed = crate::wire::write::decode_writer_handle(&none_bytes, &mut context)
-            .expect("unknown count remains legal");
-        assert_eq!(
-            parsed.old_deletes.values().next().unwrap().references[0].record_count,
-            None
-        );
-
-        private
-            .old_deletes
-            .values_mut()
-            .next()
-            .expect("target")
-            .references
-            .first_mut()
-            .expect("reference")
-            .record_count = Some(0);
-        let zero_bytes = private.encode_to_vec();
-        let mut ledger = ConnectorDecodeLedger::new(private_limits());
-        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
-        let parsed = crate::wire::write::decode_writer_handle(&zero_bytes, &mut context)
-            .expect("protobuf presence preserves a claimed zero");
-        assert_eq!(
-            parsed.old_deletes.values().next().unwrap().references[0].record_count,
-            Some(0)
-        );
-        let error = decode_private_handle(&facets, &zero_bytes, private_limits())
-            .expect_err("the existing domain invariant rejects a claimed zero");
-        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
-        assert!(error.detail().contains("must be positive"));
     }
 
     #[test]
@@ -3162,81 +2914,15 @@ mod tests {
     }
 
     #[test]
-    fn both_delete_branches_round_trip_with_every_frozen_reference() {
+    fn position_rewrite_round_trips_exact_selected_file() {
         let facets = generation();
-        for branch in [
-            IcebergWriteBranch::PositionDelete,
-            IcebergWriteBranch::DeletionVector,
-        ] {
-            let handle = delete_handle(branch);
-            let recovered = round_trip_handle(&facets, &handle);
-            assert_eq!(recovered.old_deletes().len(), 2);
-            for target in recovered.old_deletes().values() {
-                assert_eq!(target.references().len(), 2);
-            }
-            // A reference whose frozen manifest projection carried no record
-            // count must come back as unknown, not as a claimed count of zero.
-            let unknown = recovered
-                .old_deletes()
-                .get("s3://b/wh/db/t/data/b.parquet")
-                .expect("second target")
-                .references()
-                .iter()
-                .find(|reference| reference.path().ends_with("shared-2.parquet"))
-                .expect("shared reference");
-            assert_eq!(unknown.record_count(), None);
-        }
-    }
-
-    #[test]
-    fn old_delete_recipe_round_trips_two_vectors_in_one_puffin() {
-        let facets = generation();
-        let data = "s3://b/wh/db/t/data/a.parquet";
-        let refs = [80, 4]
-            .map(|offset| {
-                puffin_ref(
-                    "s3://b/wh/db/t/data/shared.puffin",
-                    Some(data),
-                    4096,
-                    3,
-                    offset,
-                    64,
-                )
-                .unwrap()
-            })
-            .to_vec();
-        let target = merge_target(data, 100, refs);
-        let expected = target
-            .references()
-            .iter()
-            .map(|entry| entry.entry_identity())
-            .collect::<Vec<_>>();
-        let handle = IcebergWriterHandle::try_new_delete(
-            IcebergWriteBranch::DeletionVector,
-            table_facts(),
-            output(IcebergFileFormat::Puffin),
-            vec![target],
-        )
-        .unwrap();
+        let handle = delete_handle(IcebergWriteBranch::DeletionVector);
         let recovered = round_trip_handle(&facets, &handle);
-        assert_eq!(
-            recovered.old_deletes()[data]
-                .references()
-                .iter()
-                .map(|entry| entry.entry_identity())
-                .collect::<Vec<_>>(),
-            expected
-        );
-        let raw = facets.handle_encoder.encode_private(&handle).unwrap();
-        let mut private = dto::IcebergWriterHandle::decode(raw.as_ref()).unwrap();
-        let references = &mut private.old_deletes.get_mut(data).unwrap().references;
-        references.swap(0, 1);
-        assert_eq!(
-            decode_private_handle(&facets, &private.encode_to_vec(), private_limits())
-                .unwrap_err()
-                .kind(),
-            &ConnectorCodecErrorKind::InconsistentFields
-        );
+        let target = recovered.position_rewrite().unwrap();
+        assert_eq!(target.path(), "s3://b/wh/db/t/data/a.parquet");
+        assert_eq!(target.record_count(), 100);
+        assert_eq!(target.partition(), &sample_partition());
+        assert!(recovered.mutation_read().is_none());
     }
 
     #[test]
@@ -3588,34 +3274,6 @@ mod tests {
                 .contains("Iceberg Parquet row group size")
         );
 
-        // A merge target frozen against a snapshot the session is not based on.
-        let raw = facets
-            .handle_encoder
-            .encode_writer_handle(
-                &facets
-                    .adapter
-                    .wrap_writer_handle(delete_handle(IcebergWriteBranch::PositionDelete)),
-            )
-            .expect("encode");
-        let raw = mutate_private_handle(raw, |iceberg| {
-            iceberg
-                .old_deletes
-                .get_mut("s3://b/wh/db/t/data/a.parquet")
-                .expect("target")
-                .base_snapshot_id = 78;
-        });
-        let error = facets
-            .handle_decoder
-            .decode_writer_handle(&parse_handle(raw))
-            .expect_err("a target frozen against another snapshot");
-        assert_public_provider_error_path(&error, "writer_handle.iceberg");
-        assert!(
-            error
-                .protocol()
-                .detail()
-                .contains("does not name the session's frozen base snapshot")
-        );
-
         // A deletion vector whose cardinality disagrees with its record count.
         let raw = facets
             .fragment_encoder
@@ -3719,12 +3377,13 @@ mod tests {
         // fixture cheap: it is a location the domain accepts and nothing else.
         let huge = format!("/wh/db/t/data/{}.parquet", "x".repeat(17 * 1024 * 1024));
         let handle = IcebergWriterHandle::try_new_delete(
-            IcebergWriteBranch::PositionDelete,
+            IcebergWriteBranch::DeletionVector,
             table_facts(),
-            output(IcebergFileFormat::Parquet),
-            vec![merge_target(&huge, 10, Vec::new())],
+            output(IcebergFileFormat::Puffin),
         )
-        .expect("handle");
+        .expect("handle")
+        .try_with_position_rewrite(position_rewrite_target(&huge, 10))
+        .expect("maintenance selection");
         let neutral = facets.adapter.wrap_writer_handle(handle);
         let error = facets
             .handle_encoder
@@ -3805,7 +3464,7 @@ mod tests {
         assert_eq!(recovered.equality(), handle.equality());
         // It carries no old-delete merge and no data recipe: an equality delete
         // supersedes nothing and writes no data file.
-        assert!(recovered.old_deletes().is_empty());
+        assert!(recovered.position_rewrite().is_none());
         assert!(recovered.data().is_none());
     }
 

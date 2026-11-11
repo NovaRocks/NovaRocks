@@ -24,15 +24,19 @@
 //! "last driver finishes" protocol: only an immutable logical recipe plus the
 //! attempt-local facts a driver needs to build its own physical context.
 
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[cfg(test)]
 use arrow::datatypes::DataType;
 
-use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_execution_contract::descriptor::ExchangeSource;
 use novarocks_spi::connector::write_stack::{
-    ConnectorWriteExecution, ConnectorWriterHandle, ConnectorWriterPhysicalContext,
+    ConnectorPositionShardSource, ConnectorWriteExecution, ConnectorWriterHandle,
+    ConnectorWriterPhysicalContext,
 };
+use novarocks_spi::connector::{ConnectorExecutionResources, ConnectorRequestContext};
 
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
@@ -167,6 +171,8 @@ mod required_value_source_properties {
 /// Provider and attempt capabilities moved out of the transient decoder node.
 /// A pure local program never owns any of these values.
 pub struct TableWriterRuntimeBinding {
+    pub(crate) resources: Option<ConnectorExecutionResources>,
+    pub(crate) position_shards: Option<Arc<PositionShardWriterSources>>,
     pub(crate) handle: ConnectorWriterHandle,
     pub(crate) execution: Arc<dyn ConnectorWriteExecution>,
     pub(crate) physical_template: TableWriterPhysicalContextTemplate,
@@ -195,6 +201,8 @@ impl TableWriterRuntimeBinding {
             ));
         }
         Ok(Self {
+            resources: None,
+            position_shards: None,
             handle,
             execution,
             physical_template,
@@ -203,6 +211,15 @@ impl TableWriterRuntimeBinding {
             #[cfg(novarocks_dev_controls)]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
+    }
+
+    pub fn with_position_shard_sources(
+        mut self,
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+        sources: BTreeMap<ExchangeSource, NonZeroU32>,
+    ) -> Self {
+        self.position_shards = Some(Arc::new(PositionShardWriterSources { group, sources }));
+        self
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
@@ -218,6 +235,32 @@ impl TableWriterRuntimeBinding {
 
     pub const fn physical_template(&self) -> TableWriterPhysicalContextTemplate {
         self.physical_template
+    }
+}
+
+pub(crate) struct PositionShardWriterSources {
+    group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+    sources: BTreeMap<ExchangeSource, NonZeroU32>,
+}
+
+impl PositionShardWriterSources {
+    pub(crate) fn bind(
+        &self,
+        source: Option<ExchangeSource>,
+    ) -> crate::runtime::task::ExecutionResult<ConnectorPositionShardSource> {
+        let (source, width) = source
+            .and_then(|source| self.sources.get(&source).map(|width| (source, *width)))
+            .ok_or_else(|| {
+                crate::exec::fragment::error::program_binding_failure(
+                    crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                    "Position shard author is absent from the admitted exchange roster",
+                )
+            })?;
+        let key = source.task_key();
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&key.high().to_be_bytes());
+        bytes[8..].copy_from_slice(&key.low().to_be_bytes());
+        Ok(ConnectorPositionShardSource::new(self.group, bytes, width))
     }
 }
 

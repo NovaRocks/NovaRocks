@@ -161,6 +161,8 @@ struct LocalPreparedWriterPartial {
 }
 /// The immutable per-node facts every driver copies when it opens its writer.
 struct TableWriterPlan {
+    resources: Option<novarocks_spi::connector::ConnectorExecutionResources>,
+    position_shards: Option<Arc<crate::exec::node::table_writer::PositionShardWriterSources>>,
     handle: ConnectorWriterHandle,
     target: WriteTargetOrdinal,
     execution: Arc<dyn ConnectorWriteExecution>,
@@ -235,6 +237,8 @@ impl TableWriterOperatorFactory {
         Ok(Self {
             name,
             plan: Arc::new(TableWriterPlan {
+                resources: binding.resources.clone(),
+                position_shards: binding.position_shards.clone(),
                 handle: binding.handle.clone(),
                 target,
                 execution: Arc::clone(&binding.execution),
@@ -313,6 +317,7 @@ impl TableWriterOperatorFactory {
             .physical_template
             .for_driver(u32::try_from(driver_id.max(0)).unwrap_or(u32::MAX));
         let request = ConnectorOpenWriterRequest {
+            resources: plan.resources.clone(),
             handle: plan.handle.clone(),
             target: plan.target,
             expected_schema: Arc::clone(&plan.expected_schema),
@@ -349,6 +354,7 @@ impl TableWriterOperatorFactory {
         let partial_aggregate =
             partial_aggregate.map(|partial| ChildStep::new(partial, readiness_observable.clone()));
         Transform::hydrating(TableWriterOperator {
+            position_shards: plan.position_shards.clone(),
             name: self.name.clone(),
             projection: plan.projection.create(),
             writer,
@@ -445,6 +451,7 @@ struct PendingAppend {
 }
 
 struct TableWriterOperator {
+    position_shards: Option<Arc<crate::exec::node::table_writer::PositionShardWriterSources>>,
     name: String,
     projection: Box<dyn WriterPageProjection>,
     writer: AsyncWriterOwner<WriterCompletion>,
@@ -943,6 +950,11 @@ impl TableWriterOperator {
                     },
                 )
             })?;
+            let source = self
+                .position_shards
+                .as_ref()
+                .map(|roster| roster.bind(chunk.position_shard_source()))
+                .transpose()?;
             let projected = self.projection.project(&chunk)?;
             let batch = projected.record_batch();
             let reservation = self.writer.try_reserve_input(
@@ -977,6 +989,7 @@ impl TableWriterOperator {
                     .into(),
                 );
             };
+            let append = append.with_position_shard_source(source);
             drop(chunk);
             if let Some(child) = self.partial_aggregate.as_mut() {
                 #[cfg(novarocks_dev_controls)]

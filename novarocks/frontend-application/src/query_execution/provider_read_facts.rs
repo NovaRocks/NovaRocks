@@ -545,10 +545,16 @@ impl FrontendProviderReadFacts {
 /// thing a name and a version would select is a different read.
 enum AdmittedRead {
     Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
+    RowMutationMatch {
+        materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
+        original: novarocks_spi::connector::ConnectorTableMetadata,
+        snapshot_id: Option<i64>,
+    },
     PreparedSource(Arc<crate::catalog_application::query_bindings::QueryPreparedSourceRead>),
     MvTarget {
         materialization: crate::catalog_application::query_bindings::QueryScanMaterialization,
         object_id: novarocks_spi::connector::ConnectorTableObjectId,
+        original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
     },
     Cohort(crate::catalog_application::query_bindings::QueryFrozenCohortRead),
 }
@@ -559,6 +565,9 @@ impl AdmittedRead {
     fn planning_pin(&self) -> &ConnectorControlPlanningPin {
         match self {
             Self::Relation(materialization)
+            | Self::RowMutationMatch {
+                materialization, ..
+            }
             | Self::MvTarget {
                 materialization, ..
             } => &materialization.planning_pin,
@@ -582,6 +591,10 @@ impl AdmittedRead {
 
         let (namespace, table) = match self {
             Self::PreparedSource(source) => return Ok(source.receipt.request().name().clone()),
+            Self::RowMutationMatch { original, .. } => (
+                original.identity.namespace.to_string(),
+                original.identity.table.to_string(),
+            ),
             Self::Relation(_) | Self::MvTarget { .. } => {
                 let identity = relation_identity(relation);
                 (
@@ -655,10 +668,29 @@ fn prepare_read_opening(
                 target.full.clone()
             },
             object_id: target.target_object_id.clone(),
+            original_source: target.original_source.clone(),
         }
     } else {
         let input = frozen_input(relation)?;
         let binding = bindings.binding(need.binding())?;
+        if let crate::catalog_application::query_bindings::QueryTableBindingAdmission::RowMutationMatch(
+            _, snapshot_id,
+        ) = &binding.admission
+        {
+            if !matches!(relation, ProviderReadRelationNeed::Data { .. })
+                || input != QueryFrozenReadInput::Current
+            {
+                return Err("mutation target scan differs from its signed selector".to_string().into());
+            }
+            let original = binding.source_metadata.clone().ok_or_else(|| {
+                "mutation target scan lost its original table observation".to_string()
+            })?;
+            AdmittedRead::RowMutationMatch {
+                materialization: bindings.frozen_read_input(need.binding(), input)?,
+                original,
+                snapshot_id: *snapshot_id,
+            }
+        } else {
         let prepared = match relation {
             ProviderReadRelationNeed::Data { .. }
             | ProviderReadRelationNeed::FrozenInputSet { .. } => {
@@ -696,6 +728,7 @@ fn prepare_read_opening(
                     )
                 }
             }
+        }
         }
     };
     let planning_pin = admitted.planning_pin().clone();
@@ -780,7 +813,20 @@ async fn prepare_observation(
         *observation = Some(ReadObservation::OriginalPreparedSource);
         return Ok(());
     }
-    let kind = if let AdmittedRead::Cohort(cohort) = &opening.admitted {
+    let kind = if let AdmittedRead::RowMutationMatch {
+        materialization,
+        original,
+        snapshot_id,
+    } = &opening.admitted
+    {
+        K::RowMutationMatch {
+            table: materialization.table.clone(),
+            original_source: original.source_read_facts().cloned().ok_or_else(|| {
+                "mutation target scan has no original provider access provenance".to_string()
+            })?,
+            snapshot_id: *snapshot_id,
+        }
+    } else if let AdmittedRead::Cohort(cohort) = &opening.admitted {
         match (need.relation(),cohort) {
             (ProviderReadRelationNeed::PinnedFileSet { .. },QueryFrozenCohortRead::PinnedFileSet(read)) => {
                 if read.frozen_source.is_some() {
@@ -829,6 +875,7 @@ async fn prepare_observation(
                 let AdmittedRead::MvTarget {
                     materialization,
                     object_id,
+                    original_source,
                 } = &opening.admitted
                 else {
                     return Err(format!(
@@ -837,23 +884,33 @@ async fn prepare_observation(
                     )
                     .into());
                 };
-                match &materialization.mv_partition_selection {
-                    Some(selection) => {
-                        if selection.object_id() != object_id {
-                            return Err(format!(
+                if let Some(original_source) = original_source {
+                    K::FrozenMvTarget {
+                        table: materialization.table.clone(),
+                        original_source: original_source.clone(),
+                        object_id: object_id.clone(),
+                        snapshot_id: *target_snapshot_id,
+                        selection: materialization.mv_partition_selection.clone(),
+                    }
+                } else {
+                    match &materialization.mv_partition_selection {
+                        Some(selection) => {
+                            if selection.object_id() != object_id {
+                                return Err(format!(
                                 "provider read of {} has a different MV target selection object",
                                 opening.name
                             )
                             .into());
+                            }
+                            K::MvTargetPartition {
+                                selection: selection.clone(),
+                            }
                         }
-                        K::MvTargetPartition {
-                            selection: selection.clone(),
-                        }
+                        None => K::MvTarget {
+                            object_id: object_id.clone(),
+                            snapshot_id: *target_snapshot_id,
+                        },
                     }
-                    None => K::MvTarget {
-                        object_id: object_id.clone(),
-                        snapshot_id: *target_snapshot_id,
-                    },
                 }
             }
             relation => return Err(unsupported_family(relation).into()),
@@ -1506,6 +1563,7 @@ fn open_relation(
             let AdmittedRead::MvTarget {
                 materialization,
                 object_id,
+                ..
             } = admitted
             else {
                 return Err(

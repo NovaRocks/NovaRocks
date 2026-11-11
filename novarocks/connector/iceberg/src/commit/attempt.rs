@@ -1081,6 +1081,13 @@ mod tests {
             token: fixture.operation.token(),
         })
         .unwrap();
+        let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
+            std::sync::Arc::new(source.clone()),
+            &intent,
+            &writer,
+        )
+        .await
+        .unwrap();
         // This branch commits only after the statement's source facts and
         // outputs are frozen, but before the publication's authoritative load.
         let branched = source
@@ -1123,7 +1130,7 @@ mod tests {
             &fixture.operation,
             &intent,
             &PreparedChange::default(),
-            &[&super::super::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer],
+            &[&preparer],
             &publisher,
             policy(),
         )

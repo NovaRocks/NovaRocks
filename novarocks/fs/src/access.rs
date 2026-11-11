@@ -458,6 +458,19 @@ impl FsAccessHandle {
         self
     }
 
+    /// Observe the SDK multipart lifecycle of one conditional writer.
+    pub fn conditional_object_writer_operator(
+        &self,
+    ) -> FileResult<(Operator, crate::S3UploadWitness)> {
+        if self.scheme != FsScheme::ObjectStore || self.paths.len() != 1 {
+            return Err(FileError::invalid(
+                "conditional object writer requires one authorized S3 path",
+            ));
+        }
+        let witness = crate::S3UploadWitness::default();
+        Ok((witness.install(&self.operator), witness))
+    }
+
     pub fn new(
         access_domain: StorageAccessDomainId,
         scheme: FsScheme,
@@ -839,6 +852,31 @@ impl FsAccessHandle {
         )))
     }
 
+    /// Open a private local stream for a target already bound to this handle.
+    #[cfg(unix)]
+    pub async fn open_conditional_local_file(
+        &self,
+        path_index: usize,
+        cancellation: &FileCancellation,
+    ) -> FileResult<ConditionalLocalFile> {
+        if self.scheme != FsScheme::Local {
+            return Err(FileError::invalid(
+                "conditional local file requires local access",
+            ));
+        }
+        let path = self.paths.get(path_index).ok_or_else(|| {
+            FileError::invalid(format!("file path index out of bounds: {path_index}"))
+        })?;
+        let root = self.root.as_deref().ok_or_else(|| {
+            FileError::new(FileErrorKind::Internal, "local access handle has no root")
+        })?;
+        let relative = normalize_bound_relative_path(
+            Path::new(path.operator_relative_path()),
+            path.location().original(),
+        )?;
+        ConditionalLocalFile::open(Path::new(root).join(relative), cancellation).await
+    }
+
     /// Atomically create one authorized path without replacing an existing file.
     ///
     /// Design: ADR-0077 makes native conditional storage creation the publication
@@ -896,6 +934,137 @@ impl FsAccessHandle {
                 }
             }
         }
+    }
+}
+
+/// A private streamed output held through installation and ownership observation.
+#[cfg(unix)]
+pub struct ConditionalLocalFile {
+    target: PathBuf,
+    temporary: tempfile::TempPath,
+    file: Option<tokio::fs::File>,
+    install_dispatched: bool,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl ConditionalLocalFile {
+    async fn open(target: PathBuf, cancellation: &FileCancellation) -> FileResult<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        cancellation.check()?;
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| map_local_install_error("create conditional file parent", error))?;
+        cancellation.check()?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".novarocks-create-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(|error| map_local_install_error("create conditional temporary file", error))?;
+        let metadata = temporary.as_file().metadata().map_err(|error| {
+            map_local_install_error("read conditional temporary file identity", error)
+        })?;
+        let (file, temporary) = temporary.into_parts();
+        Ok(Self {
+            target,
+            temporary,
+            file: Some(tokio::fs::File::from_std(file)),
+            install_dispatched: false,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub async fn write(&mut self, bytes: &[u8], cancellation: &FileCancellation) -> FileResult<()> {
+        use tokio::io::AsyncWriteExt;
+
+        cancellation.check()?;
+        self.file
+            .as_mut()
+            .ok_or_else(|| FileError::invalid("conditional local file is already closed"))?
+            .write_all(bytes)
+            .await
+            .map_err(|error| map_local_install_error("write conditional temporary file", error))
+    }
+
+    /// Drain the private file before installing its name without replacement.
+    /// Keep the private inode until the caller records ownership.
+    pub async fn close_and_install(
+        &mut self,
+        cancellation: &FileCancellation,
+    ) -> FileResult<ConditionalCreateOutcome> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| FileError::invalid("conditional local file is already closed"))?;
+        let flushed = file.flush().await;
+        drop(file.into_std().await);
+        flushed
+            .map_err(|error| map_local_install_error("flush conditional temporary file", error))?;
+        cancellation.check()?;
+        self.install_dispatched = true;
+        match tokio::fs::hard_link(&self.temporary, &self.target).await {
+            Ok(()) => Ok(ConditionalCreateOutcome::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(ConditionalCreateOutcome::AlreadyExists)
+            }
+            Err(error) => Err(map_local_install_error("install conditional file", error)),
+        }
+    }
+
+    pub const fn install_dispatched(&self) -> bool {
+        self.install_dispatched
+    }
+
+    pub async fn read_private_file(&self) -> FileResult<tokio::fs::File> {
+        use std::os::unix::fs::MetadataExt;
+
+        let file = tokio::fs::File::open(&self.temporary)
+            .await
+            .map_err(|error| map_local_install_error("read conditional temporary file", error))?;
+        let metadata = file.metadata().await.map_err(|error| {
+            map_local_install_error("verify conditional temporary file identity", error)
+        })?;
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(FileError::invalid(
+                "conditional temporary file lost its original inode",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// An absent target leaves installation unproven. A different inode
+    /// never belongs to the attempted creation even if its bytes are equal.
+    pub async fn observe_target(&self) -> FileResult<Option<bool>> {
+        use std::os::unix::fs::MetadataExt;
+
+        match tokio::fs::symlink_metadata(&self.target).await {
+            Ok(metadata) => Ok(Some(
+                metadata.is_file() && metadata.dev() == self.device && metadata.ino() == self.inode,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(map_local_install_error(
+                "observe conditional local target",
+                error,
+            )),
+        }
+    }
+
+    pub async fn abort(mut self) -> FileResult<()> {
+        if let Some(file) = self.file.take() {
+            drop(file.into_std().await);
+        }
+        self.temporary
+            .close()
+            .map_err(|error| map_local_install_error("remove conditional temporary file", error))
     }
 }
 
@@ -3397,6 +3566,81 @@ mod tests {
     // FS owns complete installation visibility; these tests use isolated local
     // directories and join every writer. They supplement conformance's public
     // API checks with pauses/failures inside the private whole-file writer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_local_streams_choose_one_inode_even_for_identical_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("new.parquet");
+        let cancellation = FileCancellation::new();
+        let mut left = ConditionalLocalFile::open(target.clone(), &cancellation)
+            .await
+            .unwrap();
+        let mut right = ConditionalLocalFile::open(target.clone(), &cancellation)
+            .await
+            .unwrap();
+        left.write(b"same", &cancellation).await.unwrap();
+        right.write(b"same", &cancellation).await.unwrap();
+        assert!(!target.exists());
+
+        let (left_result, right_result) = tokio::join!(
+            left.close_and_install(&cancellation),
+            right.close_and_install(&cancellation),
+        );
+        let (winner, loser) = match (left_result.unwrap(), right_result.unwrap()) {
+            (ConditionalCreateOutcome::Created, ConditionalCreateOutcome::AlreadyExists) => {
+                (left, right)
+            }
+            (ConditionalCreateOutcome::AlreadyExists, ConditionalCreateOutcome::Created) => {
+                (right, left)
+            }
+            other => panic!("one atomic install must win: {other:?}"),
+        };
+        assert_eq!(winner.observe_target().await.unwrap(), Some(true));
+        assert_eq!(loser.observe_target().await.unwrap(), Some(false));
+        let mut observed = Vec::new();
+        winner
+            .read_private_file()
+            .await
+            .unwrap()
+            .read_to_end(&mut observed)
+            .await
+            .unwrap();
+        assert_eq!(observed, b"same");
+        winner.abort().await.unwrap();
+        loser.abort().await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"same");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn conditional_local_stream_rejects_replaced_private_name_after_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("new.parquet");
+        let cancellation = FileCancellation::new();
+        let mut writer = ConditionalLocalFile::open(target.clone(), &cancellation)
+            .await
+            .unwrap();
+        writer.write(b"same", &cancellation).await.unwrap();
+        assert_eq!(
+            writer.close_and_install(&cancellation).await.unwrap(),
+            ConditionalCreateOutcome::Created
+        );
+        assert_eq!(writer.observe_target().await.unwrap(), Some(true));
+
+        std::fs::remove_file(&writer.temporary).unwrap();
+        std::fs::write(&writer.temporary, b"same").unwrap();
+        assert_eq!(writer.observe_target().await.unwrap(), Some(true));
+        assert_eq!(
+            writer.read_private_file().await.unwrap_err().kind(),
+            FileErrorKind::Invalid
+        );
+        writer.abort().await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"same");
+    }
+
     #[test]
     fn conditional_local_install_exposes_only_complete_payload_and_excludes_temporary_name() {
         let directory = tempfile::tempdir().unwrap();

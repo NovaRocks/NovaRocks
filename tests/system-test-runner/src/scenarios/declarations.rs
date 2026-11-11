@@ -128,7 +128,7 @@ pub(super) fn for_module(
             "novarocks/local-program/**",
             "novarocks/native-adapter/**",
         ],
-        "distributed_writer" | "table_maintenance" => &[
+        "distributed_writer" | "table_maintenance" | "managed_output_storage" => &[
             "novarocks/trino-adapter/**",
             "tests/system-test-runner/src/actors/sql.rs",
             "novarocks/connector/iceberg/**",
@@ -178,6 +178,7 @@ pub(super) fn for_module(
             "novarocks/coordination-contract/**",
             "novarocks/query-application/**",
             "novarocks/catalog-application/**",
+            "novarocks/mv-application/**",
             "novarocks/connector/iceberg/**",
             "novarocks/sql/**",
             "novarocks/execution/**",
@@ -353,6 +354,20 @@ pub(super) fn for_module(
                 "tests/system-test-runner/src/scenarios/mv_uea7_documents/wire.rs",
             ]
             .into_iter()
+            .map(str::to_owned),
+        );
+    }
+    if module == "managed_output_storage" {
+        paths.extend(
+            [
+                "tests/system-test-runner/src/scenarios/connector.rs",
+                "tests/system-test-runner/src/scenarios/iceberg_delete_applicability.rs",
+                "tests/system-test-runner/src/scenarios/native_sql_controls.rs",
+                "tests/system-test-runner/src/scenarios/writer_statement_actor.rs",
+                "docker/iceberg-rest/**",
+                "docker/fixture-inputs/**",
+                "tests/fixtures/iceberg-rest-publication/**",
+            ]
             .map(str::to_owned),
         );
     }
@@ -758,6 +773,7 @@ pub(super) fn for_module(
                 | "uea4_range_reads"
                 | "iceberg_delete_applicability"
                 | "iceberg_delete_warm"
+                | "managed_output_storage"
         )
         || name.contains("vended-")
     {

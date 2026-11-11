@@ -236,6 +236,15 @@ pub fn staged_write_context_from_frozen_facts(
     input_schema: &ArrowSchemaRef,
     facts: FrozenDataWriteFacts,
 ) -> Result<StagedWriteContext, String> {
+    let file_io = build_staged_file_io(binding, &facts.data_location)?;
+    staged_write_context_with_file_io(input_schema, facts, file_io)
+}
+
+pub(crate) fn staged_write_context_with_file_io(
+    input_schema: &ArrowSchemaRef,
+    facts: FrozenDataWriteFacts,
+    file_io: crate::iceberg::io::FileIO,
+) -> Result<StagedWriteContext, String> {
     let prepared =
         prepare_schema_core(input_schema, &facts, &mut SchemaWork(None)).map_err(|error| {
             match error {
@@ -245,7 +254,6 @@ pub fn staged_write_context_from_frozen_facts(
                 }
             }
         })?;
-    let file_io = build_staged_file_io(binding, &facts.data_location)?;
     StagedWriteContext::from_parts_with_partition_spec_id(
         prepared.metadata,
         file_io,
