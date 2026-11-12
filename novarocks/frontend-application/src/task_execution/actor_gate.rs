@@ -748,6 +748,9 @@ fn actor_establish_error(error: EstablishIssueError) -> TaskExecutionError {
 }
 
 #[cfg(test)]
+mod bridge_replay_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::future::Future;
     use std::num::NonZeroUsize;
@@ -851,6 +854,20 @@ pub(crate) mod tests {
         NativeAttemptDrive,
         super::super::abort_effect::NativeAbortEffectIntake,
     ) {
+        let (abort_adapter, abort_intake) =
+            super::super::abort_effect::NativeAbortEffectAdapter::bounded(
+                NonZeroUsize::new(2).unwrap(),
+                Arc::new(CountingWake::default()),
+            );
+        let (logical, drive) =
+            logical_execution_with_abort_port(participation, abort_adapter).await;
+        (logical, drive, abort_intake)
+    }
+
+    pub(super) async fn logical_execution_with_abort_port(
+        participation: ParticipationRef,
+        abort_port: Arc<dyn AbortParticipationEffectPort>,
+    ) -> (LogicalExecutionTestHarness, NativeAttemptDrive) {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -869,11 +886,6 @@ pub(crate) mod tests {
             .scope()
             .try_acquire(Stage::Execution)
             .expect("execution stage admitted");
-        let (abort_adapter, abort_intake) =
-            super::super::abort_effect::NativeAbortEffectAdapter::bounded(
-                NonZeroUsize::new(2).unwrap(),
-                Arc::new(CountingWake::default()),
-            );
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             participation.query_execution_id(),
             ExecutionEffect::None,
@@ -885,10 +897,7 @@ pub(crate) mod tests {
             execution_stage,
         )
         .expect("valid actor config")
-        .with_abort_participation_effect_port(
-            abort_adapter as Arc<dyn AbortParticipationEffectPort>,
-            NonZeroUsize::new(2).unwrap(),
-        );
+        .with_abort_participation_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
@@ -898,7 +907,7 @@ pub(crate) mod tests {
         .expect("logical execution installed");
         logical.activate_initial().await.expect("attempt activated");
         let drive = logical.native_attempt_drive();
-        (logical, drive, abort_intake)
+        (logical, drive)
     }
 
     #[tokio::test]
