@@ -353,6 +353,7 @@ impl CreationLengths {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreationSizing {
     pub(crate) lengths: CreationLengths,
+    #[cfg(test)]
     pub(crate) descriptor_encoded_bytes: usize,
     /// All newly requested descriptor/projection buffers plus the final
     /// encoded metadata buffer; original borrowed source backing is excluded.
@@ -673,6 +674,7 @@ impl TaskCreationSeed {
                 metadata,
                 assignment,
             },
+            #[cfg(test)]
             descriptor_encoded_bytes: descriptor,
             new_backing_bytes: requested,
         })
