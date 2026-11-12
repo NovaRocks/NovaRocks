@@ -1368,6 +1368,34 @@ impl DrainTrace {
     }
 }
 
+#[test]
+fn an_accepted_create_without_its_receipt_is_refused() {
+    use novarocks_execution_contract::OperationKind;
+
+    let mut trace = DrainTrace::with_dispatched_creates();
+    let task = trace.producer;
+    let (request, generation) = &trace.creates[&task];
+    let execution = &mut trace.core.execution;
+    let credit_before_reply = execution.dispatcher().in_flight_operations();
+    let reply = worker_accepted(request, *generation, None);
+
+    let (effect, outcome) = execution.apply_dispatched_reply(&reply);
+    assert_eq!(
+        outcome,
+        Err(TaskExecutionError::MissingReceipt(
+            OperationKind::CreateTask
+        ))
+    );
+    assert!(effect.is_none());
+    assert_eq!(
+        execution.dispatcher().in_flight_operations(),
+        credit_before_reply - 1
+    );
+    let task = execution.task(task.task_id()).unwrap();
+    assert!(!task.create_ownership_proven());
+    assert!(task.status().is_none());
+}
+
 fn permutations<T: Copy>(events: &mut [T], position: usize, traces: &mut Vec<Vec<T>>) {
     if position == events.len() {
         traces.push(events.to_vec());

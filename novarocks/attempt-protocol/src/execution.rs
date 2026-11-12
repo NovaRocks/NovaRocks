@@ -3453,6 +3453,65 @@ mod bounded_drain_tests {
         }
     }
     #[test]
+    fn a_split_for_a_plan_node_the_descriptor_does_not_own_is_refused() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        use novarocks_execution_contract::{DomainConflict, SplitOffer, SplitSequence};
+
+        let node = PlanNodeId::new(7).unwrap();
+        let (mut frozen, _) = crate::test_support::frozen_graph_with_strict_input(false);
+        let middle = frozen.tasks[&TaskId::new(2).unwrap()].identity;
+        frozen
+            .tasks
+            .get_mut(&TaskId::new(3).unwrap())
+            .unwrap()
+            .split_plan_nodes = Box::from([node]);
+        let mut execution =
+            crate::test_support::execution_with_graph(TaskGraph::from_frozen(frozen).unwrap());
+        let payload = PayloadRef(NonZeroU64::new(102).unwrap());
+        let sequence = SplitSequence::new(1).unwrap();
+        let (admission, intent) = execution
+            .prepare_task_update(
+                middle,
+                TaskDomainUpdate::SplitAssignment {
+                    node,
+                    offer: SplitOffer::batch(sequence, sequence, false).unwrap(),
+                    payload,
+                    queued_bytes: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(admission, UpdateAdmission::Preparing);
+        let intent = intent.unwrap();
+        let operation = intent.operation_id();
+        let original = grant(1);
+        execution
+            .begin_initial_update_admission(
+                intent,
+                original.generation().admission_effect(),
+                QueuedInputPayload::NewTaskUpdate(payload),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, original),
+            Err(TaskExecutionError::DomainRegression {
+                domain: "split_assignment",
+                conflict: DomainConflict::UnknownMember,
+                ..
+            })
+        ));
+        let remote = execution.task_by_identity_ref(middle).unwrap();
+        assert!(!remote.input_preparation_pending());
+        assert_eq!(remote.pending_updates(), 0);
+        assert!(execution.dispatcher.take_batch().is_none());
+        assert!(matches!(
+            execution.advance_task_input_cleanup(),
+            Some(EffectBody::ReleaseQueuedInput { grant }) if grant == original
+        ));
+        assert!(execution.advance_task_input_cleanup().is_none());
+    }
+
+    #[test]
     fn split_delivery_keeps_one_original_operation_across_fresh_admission_and_a_late_receipt() {
         use crate::{
             effect::{AttemptEffect, EffectBody, PumpKind, QueuedInputPayload},
