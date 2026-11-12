@@ -1130,6 +1130,43 @@ failing statement can leave the shared server in a state where later cases fail
 for reasons of their own, so the count overstates the problem. Re-run a
 suspected case against a clean server before attributing it to the change.
 
+### 8.6 Rust Test Organization
+
+Where a Rust test lives, what it may depend on and who supplies its input are
+decided by the [Rust test organization guide](docs/guides/development/rust-test-organization.md).
+Existing neighbours predate it and are not examples. Before writing a test,
+answer its [placement procedure](docs/guides/development/rust-test-organization.md#放置判定程序):
+
+1. Whose property does the assertion protect? The crate that must change when
+   it fails owns the test.
+2. Are all needed crates inside the owner's production dependency closure, a
+   testkit of that closure, or mechanical test support? A composition across two
+   crates with no production edge goes to a seam test package.
+3. Does it need private items? Yes: a white-box test file under `src/`. No:
+   `<crate>/tests/it`. A test that needs the crate's own testkit must be in
+   `tests/it`.
+4. Does it need a target-level property (custom harness, global allocator,
+   `required-features`, Loom, Miri, a binary-scoped nextest group)? Only then a
+   standalone integration target; a test that also needs private items stays
+   under `src/`.
+5. Does an existing subject file, in any layout, already cover this behaviour
+   axis? Add the case there; create a new file only when none fits.
+6. Where does the input come from? Take the nearest sufficient rung of the
+   fixture ladder.
+
+The guide is in a trial period. Its
+[trial rules](docs/guides/development/rust-test-organization.md#试行期规则) constrain new tests:
+
+- Do not add flat `foo_tests.rs` siblings or new `#[cfg(test)] mod xxx_tests;`
+  lines in a production `mod.rs`.
+- Do not add one-binary-per-file integration targets; new public-contract tests
+  go to `tests/it`.
+- Do not add dev-dependencies outside the owner's production dependency closure.
+
+Adding cases to an existing flat test file is allowed, and existing tests are
+not migrated opportunistically. The guide wins where this summary and the guide
+differ.
+
 ## 9. Suggested Starting Points for Typical Changes
 
 - **工作签发、退出与启动入口**：先读 ADR-0218，再看
@@ -1362,6 +1399,10 @@ repository. The final development checkpoint is the target commit's composition,
 with selection gaps, deferrals and heavy obligations visible. Expand known
 contracts to their affected domains; unbounded impact requires broad coverage.
 Explicit required runs in the approved plan remain required.
+
+A plan task that adds Rust tests also states their placement: which existing
+subject file it extends, or why a new file is needed, following
+[test placement in plans](docs/guides/development/rust-test-organization.md#plan-中的测试落点).
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by
