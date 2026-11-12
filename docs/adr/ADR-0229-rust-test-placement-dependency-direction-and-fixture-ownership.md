@@ -7,6 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-11-12
 provenance:
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1304"
   - "discussion: 2026-11-12 Rust test organization methodology: placement, dependency direction, fixtures and growth"
 code-anchors:
   - "docs/guides/development/rust-test-organization.md (operating rules and placement procedure)"
