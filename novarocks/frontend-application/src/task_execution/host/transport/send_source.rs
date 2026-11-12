@@ -101,6 +101,10 @@ pub(crate) struct SendContext {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Send preflight preserves the exact original batch or quotation failure."
+)]
 pub(crate) enum SendPreflightError {
     Batch(SendBindingError),
     WrongClient,
@@ -111,6 +115,10 @@ pub(crate) enum SendPreflightError {
 }
 
 #[must_use = "an unclaimed send still owns the original result and reports"]
+#[allow(
+    dead_code,
+    reason = "The unclaimed guard returns the original prepared send and its paid position to the Source."
+)]
 pub(crate) struct SendClaimRefusal {
     pub(crate) error: ActorTurnError,
     pub(crate) prepared: PreparedActorSend,
@@ -199,17 +207,6 @@ impl PreparedActorSend {
     pub(super) fn with_lifecycle(mut self, original: LifecycleStarts) -> Self {
         self.lifecycle = Some(original);
         self
-    }
-
-    pub(crate) fn bind(
-        self,
-        runtime: &ActorRuntime<FrontendActor>,
-        ticket: &EffectTicket<FrontendEffect>,
-        result: CausalInputObligation<FrontendActor>,
-        admission: &mut AdmissionSource,
-    ) -> Result<PreparedEffectJob, SendClaimRefusal> {
-        self.bind_tracked(runtime, ticket, result, admission)
-            .map(|(job, _)| job)
     }
 
     pub(super) fn bind_tracked(

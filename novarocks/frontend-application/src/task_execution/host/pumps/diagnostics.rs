@@ -252,18 +252,7 @@ impl DiagnosticRecords {
             .resolve_result();
         Ok(())
     }
-    /// Diagnostics keep the actual transport text in the original record; it
-    /// is logged as observation data and never classified as attempt failure.
-    pub(crate) fn original_error(&self, failure: HostFailureRef) -> Option<String> {
-        self.records
-            .lock()
-            .expect("diagnostic canonical records")
-            .reads
-            .values()
-            .find(|record| record.failure == failure)?
-            .error
-            .clone()
-    }
+    #[cfg(test)]
     pub(crate) fn close_external(&self) {
         self.records
             .lock()
@@ -307,20 +296,6 @@ impl DiagnosticRecords {
             .expect("diagnostic canonical records")
             .reads
             .len()
-    }
-
-    pub(super) fn backing_bytes(
-        tasks: usize,
-    ) -> Result<usize, super::super::observations::ObservationError> {
-        use super::super::observations::backing;
-        backing::sum([
-            backing::arc::<Self>()?.size(),
-            backing::tree::<AttemptRequestToken, DiagnosticRecord>(super::source::REPLY_ROLES)?,
-            backing::tree::<AttemptRequestToken, InformationRecord>(tasks)?,
-            backing::array::<FinalTaskInfo>(tasks)?,
-            backing::array::<DiagnosticRecord>(2)?,
-            backing::array::<InformationRecord>(2)?,
-        ])
     }
 }
 

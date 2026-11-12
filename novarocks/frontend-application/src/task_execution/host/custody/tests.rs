@@ -674,8 +674,7 @@ async fn assert_withdrawn_admission_result(fail_scope: bool) {
             .unwrap_or_else(|e| panic!("{}", e.error));
     let mut foreign_result = handoff
         .bind_actor_result(effect.clone(), &author, foreign_result, None)
-        .err()
-        .expect("another position of the same Work cannot substitute");
+        .expect_err("another position of the same Work cannot substitute");
     assert!(
         foreign_result
             .event_author()

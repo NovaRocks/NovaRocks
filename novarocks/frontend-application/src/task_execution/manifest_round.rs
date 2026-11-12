@@ -20,13 +20,11 @@
 use std::sync::Arc;
 
 use novarocks_query_application::api::{
-    NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
 };
-use novarocks_query_application::coordination::{AcceptedRootStatusSource, NativeAttemptDrive};
+use novarocks_query_application::coordination::NativeAttemptDrive;
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
-use super::abort_effect::NativeAbortEffectIntake;
 use super::actor_gate::ActorGateOwner;
 use super::attempt_convergence::{
     NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, advance_task_round,
@@ -48,7 +46,6 @@ pub(crate) struct ManifestAssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
     pub(crate) actor_gate: ActorGateOwner,
-    protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
     convergence: NativeAttemptConvergenceOwner,
     notify: Arc<tokio::sync::Notify>,
     terminal: Option<NativeAttemptTerminal>,
@@ -91,16 +88,6 @@ pub(crate) enum ManifestAttemptCompletion {
 }
 
 impl ManifestAssembledRound {
-    /// Read only the terminal selected by this original attempt owner.
-    pub(crate) fn observed_failure(
-        &self,
-    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
-        match self.terminal.as_ref() {
-            Some(NativeAttemptTerminal::Failed(failure)) => Some(failure.input().clone()),
-            _ => None,
-        }
-    }
-
     pub(crate) fn install_split_assignment(
         &mut self,
         execution: novarocks_types::QueryExecutionId,
@@ -128,49 +115,6 @@ impl ManifestAssembledRound {
             );
         }
         guard
-    }
-
-    pub(crate) fn install_profile_diagnostics(
-        &mut self,
-        transport: Arc<dyn crate::native::task_result_transport::TaskResultTransport>,
-    ) -> Result<super::profile_diagnostics::ProfileDiagnosticObserver, TaskExecutionError> {
-        if self.profile_diagnostics.is_some() {
-            return Err(TaskExecutionError::Schedule(
-                "profile diagnostics are already installed".to_owned(),
-            ));
-        }
-        let mut collector = super::profile_diagnostics::TaskFinalInfoCollector::new(
-            transport,
-            true,
-            &self.round,
-            Arc::new(NotifyWake::new(Arc::clone(&self.notify))),
-        );
-        let observer = collector.enable_profile_observation()?;
-        self.profile_diagnostics = Some(collector);
-        Ok(observer)
-    }
-
-    pub(crate) fn abort_wake(&self) -> Arc<dyn StatusIntakeWake> {
-        Arc::new(NotifyWake::new(Arc::clone(&self.notify)))
-    }
-
-    /// Installs the actor's one bounded Abort-effect intake before the attempt
-    /// starts. The intake is part of C3's manifest-validated runtime resource
-    /// projection; this owner never constructs a second actor port.
-    pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
-        self.round.install_abort_effect_intake(intake);
-    }
-
-    /// Transfer only this attempt's original receiver to its fixed FA consumer.
-    /// A replacement owns a distinct pair, not a shared "latest" projection.
-    pub(crate) fn take_protocol_facts(
-        &mut self,
-    ) -> Option<super::protocol_facts::AttemptProtocolFactsReceiver> {
-        self.protocol_facts.take()
-    }
-
-    pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
-        self.round.take_root_status_source()
     }
 
     /// Drives one fair Task-protocol turn and then releases at most one batch
@@ -574,63 +518,6 @@ impl ManifestAssembledRound {
         }
     }
 
-    /// Keeps the original local pumps until their real close/join exits. The
-    /// original remote deadline only ends remote tracking; it never supplies a
-    /// Worker stop fact or substitutes for a local pump exit.
-    pub(crate) async fn converge(
-        &mut self,
-        request: NativeActiveConvergenceRequest,
-    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
-        if let Some(ready) = request.computation_ready() {
-            self.round
-                .verify_computation_ready(ready)
-                .map_err(|error| {
-                    StatementNativeHealthFailure::actual_exit_unproven(
-                        "Native convergence rejected a foreign computation cut",
-                        Arc::new(error),
-                    )
-                })?;
-            if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
-                diagnostics
-                    .begin_profile_observation(ready)
-                    .map_err(|error| {
-                        StatementNativeHealthFailure::actual_exit_unproven(
-                            "Native convergence could not bind its original diagnostic observation",
-                            Arc::new(error),
-                        )
-                    })?;
-                if let Some(deadline) = diagnostics.observation_deadline() {
-                    self.round
-                        .execution_mut()
-                        .retain_profile_diagnostics_until(deadline);
-                }
-            }
-        } else if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
-            // Initialization or execution failed before computation readiness.
-            // There is no diagnostic window to invent or extend.
-            diagnostics.stop_starting();
-        }
-        let mode = if matches!(self.terminal, Some(NativeAttemptTerminal::Failed(_))) {
-            NativeAttemptConvergenceMode::Cleanup
-        } else if request.computation_ready().is_some()
-            || matches!(self.terminal, Some(NativeAttemptTerminal::Completed))
-        {
-            NativeAttemptConvergenceMode::Normal
-        } else {
-            NativeAttemptConvergenceMode::Cleanup
-        };
-        self.convergence
-            .drive(
-                &mut self.round,
-                &self.split_delivery,
-                mode,
-                request,
-                &self.notify,
-                self.profile_diagnostics.as_mut(),
-            )
-            .await
-    }
-
     /// Only the stable pre-run owner may use this local close author. It
     /// closes normal dispatch before touching the same original round sources.
     pub(crate) async fn converge_unstarted(&mut self) -> Result<(), StatementNativeHealthFailure> {
@@ -820,7 +707,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -1244,7 +1130,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -1342,7 +1227,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: Some(NativeAttemptTerminal::Completed),
@@ -1655,7 +1539,6 @@ mod tests {
                 round,
                 split_delivery,
                 actor_gate,
-                protocol_facts: None,
                 convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
@@ -1903,7 +1786,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -3532,7 +3414,6 @@ mod tests {
                 round,
                 split_delivery,
                 actor_gate,
-                protocol_facts: None,
                 convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,

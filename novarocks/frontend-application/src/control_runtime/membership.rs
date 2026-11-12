@@ -66,11 +66,19 @@ pub(crate) type ObservationErrors = Vec<(ParticipationRef, BackendTopologyError)
 
 /// The logical receiver retains the rich original errors. The observer
 /// replaces them off the poller; the host only owns bounded membership facts.
-pub(crate) struct MembershipErrors(Arc<Mutex<ObservationErrors>>);
+pub(crate) struct MembershipErrors {
+    _original: Arc<Mutex<ObservationErrors>>,
+}
 
+#[cfg(test)]
 impl MembershipErrors {
     pub(crate) fn take(&self) -> ObservationErrors {
-        std::mem::take(&mut *self.0.lock().expect("frontend membership errors lock"))
+        std::mem::take(
+            &mut *self
+                ._original
+                .lock()
+                .expect("frontend membership errors lock"),
+        )
     }
 }
 
@@ -100,7 +108,7 @@ impl MembershipTarget {
                 input,
                 errors: Arc::downgrade(&errors),
             }),
-            errors: MembershipErrors(errors),
+            errors: MembershipErrors { _original: errors },
         }
     }
 

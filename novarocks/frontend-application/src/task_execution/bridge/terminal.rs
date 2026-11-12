@@ -18,7 +18,7 @@
 //! Terminal delivery to the original logical attempt.
 
 use super::control::AttemptOwnerControls;
-use crate::control_runtime::membership::{MembershipErrors, ObservationErrors};
+use crate::control_runtime::membership::MembershipErrors;
 use crate::task_execution::{
     error::TaskExecutionError,
     host::{
@@ -256,7 +256,7 @@ impl TerminalOutbox {
 pub(crate) struct RegisteredAttemptTerminal {
     normal: Arc<TerminalOutbox>,
     failure: FailureBridge,
-    membership_errors: Option<MembershipErrors>,
+    _membership_errors: Option<MembershipErrors>,
     selected: Option<Result<NativeAttemptTerminal, TerminalProjectionError>>,
     lifecycle_runtime_filters: Option<Arc<RuntimeFilterDiagnostic>>,
 }
@@ -270,17 +270,10 @@ impl RegisteredAttemptTerminal {
         Self {
             normal,
             failure,
-            membership_errors,
+            _membership_errors: membership_errors,
             selected: None,
             lifecycle_runtime_filters: None,
         }
-    }
-
-    pub(crate) fn take_membership_errors(&self) -> ObservationErrors {
-        self.membership_errors
-            .as_ref()
-            .map(MembershipErrors::take)
-            .unwrap_or_default()
     }
 
     pub(crate) fn lifecycle_runtime_filter_diagnostic(&self) -> Option<&RuntimeFilterDiagnostic> {
@@ -315,6 +308,7 @@ impl RegisteredAttemptTerminal {
     /// Complete a submitted convergence through its original registered host.
     /// A late Core loss transfers the same remote responsibility to the failure
     /// bridge even if the normal protocol reports arrived first.
+    #[cfg(test)]
     pub(crate) async fn finish_convergence(
         &mut self,
         request: NativeActiveConvergenceRequest,
@@ -367,6 +361,7 @@ impl RegisteredAttemptTerminal {
         Ok(Some(project_convergence(remote)))
     }
 
+    #[cfg(test)]
     pub(crate) fn failure_bridge_mut(&mut self) -> &mut FailureBridge {
         &mut self.failure
     }
@@ -406,10 +401,6 @@ impl RegisteredActiveAttempt {
             run_outcome: None,
             normal_at_close: None,
         }
-    }
-
-    pub(crate) fn take_membership_errors(&self) -> ObservationErrors {
-        self.terminal.take_membership_errors()
     }
 
     pub(crate) fn lifecycle_runtime_filter_diagnostic(&self) -> Option<&RuntimeFilterDiagnostic> {
@@ -753,7 +744,7 @@ fn project_task_failure(
         } => TaskExecutionError::DomainRegression {
             domain,
             token: token.clone(),
-            conflict: conflict.clone(),
+            conflict: *conflict,
         }
         .preparation_input(),
         E::Capacity(bound) => ExecutionFailureInput::new(

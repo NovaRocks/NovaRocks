@@ -25,6 +25,10 @@ use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use novarocks_attempt_protocol::{effect::EffectBody, input::ExecutorFact};
 use std::sync::Arc;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The completed executor fact moves through the existing result custody."
+)]
 pub(crate) enum PumpOutcome {
     Completed(Option<ExecutorFact>),
     Fenced,

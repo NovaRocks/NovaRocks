@@ -129,6 +129,10 @@ impl std::error::Error for OriginalSubscriptionFailure {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The subscription work already prepays this exact one-shot failure slot."
+)]
 enum Slot {
     Unreported,
     Retained(OriginalSubscriptionFailure),
@@ -201,6 +205,7 @@ impl SubscriptionFailureRecord {
                 AttemptFailureClass::ContractViolation
             }
             ParticipantObservationFailure::Transport(_) => AttemptFailureClass::ExecutionFailure,
+            #[cfg(test)]
             ParticipantObservationFailure::ConnectionLost => unreachable!("Core owns exhaustion"),
         };
         let mut slot = self.slot.lock().unwrap();

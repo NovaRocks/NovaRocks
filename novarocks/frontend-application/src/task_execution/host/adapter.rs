@@ -32,7 +32,8 @@ use super::observations::{
 };
 use super::pumps::{AttemptPumpSource, DiagnosticRecords, DynamicFilterRecords, split::SplitPump};
 use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
-use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
+#[cfg(test)]
+use super::transport::{NativeReceiptInput, SendKey};
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},
@@ -170,6 +171,14 @@ pub(crate) struct PreparedAttemptHost {
     pub(crate) failure: PendingFailureBridge,
     pub(crate) terminal: Arc<crate::task_execution::bridge::terminal::TerminalOutbox>,
 }
+type AttemptHostPreparationRefusal = (
+    AttemptRegistrationError,
+    AttemptCapacitySource,
+    MembershipRegistration,
+    Box<dyn EffectSource>,
+    AttemptTransportBinding,
+);
+
 pub(crate) struct AttemptTransportBinding {
     pub(crate) retirement: TransportRetirements,
     pub(crate) admission: super::transport::AdmissionSource,
@@ -341,6 +350,10 @@ impl AttemptNotice {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Installation reports the original preparation or registration error through Debug."
+)]
 pub(crate) enum AttemptRegistrationError {
     InvalidConfig(&'static str),
     Core(AttemptFailure),
@@ -823,16 +836,7 @@ impl AttemptActorRegistration {
         source: Box<dyn EffectSource>,
         executor: &Arc<dyn EffectExecutor>,
         transport: AttemptTransportBinding,
-    ) -> Result<
-        PreparedAttemptHost,
-        (
-            AttemptRegistrationError,
-            AttemptCapacitySource,
-            MembershipRegistration,
-            Box<dyn EffectSource>,
-            AttemptTransportBinding,
-        ),
-    > {
+    ) -> Result<PreparedAttemptHost, AttemptHostPreparationRefusal> {
         let transient_calls = [
             &transport.qa,
             &transport.process,
@@ -1307,6 +1311,7 @@ impl AttemptActorRegistration {
         Ok(ingress)
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_native_receipt(
         &self,
         runtime: &ActorRuntime<FrontendActor>,
@@ -1320,18 +1325,6 @@ impl AttemptActorRegistration {
         let position =
             self.reserve_standing(runtime, self.native_source, InputClass::Lifecycle, work)?;
         Ok(NativeReceiptInput::new(key, kind, position))
-    }
-
-    pub(crate) fn reserve_native_progress(
-        &self,
-        runtime: &ActorRuntime<FrontendActor>,
-        work: &WorkObligation,
-    ) -> Result<NativeProgressInput, ActorTurnError> {
-        if !self.scope.same_scope(work.scope()) {
-            return Err(ActorTurnError::InputAuthorMismatch);
-        }
-        self.reserve_standing(runtime, self.native_source, InputClass::Lifecycle, work)
-            .map(NativeProgressInput::new)
     }
 
     fn reserve_standing(

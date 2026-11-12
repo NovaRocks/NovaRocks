@@ -39,12 +39,17 @@ use novarocks_control_runtime::exit_custody::{ExitCustody, ExitCustodyPhase};
 use novarocks_control_runtime_core::identity::InputId;
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The pump record invariant reports the original typed failure through Debug."
+)]
 pub(crate) enum PumpRecordError {
     DuplicateRecord,
     MissingRecord,
     WrongIdentity,
     AlreadyStarted,
     MissingFeedback,
+    #[cfg(test)]
     ResultAlreadyBound,
     Split(split::SplitRecordError),
     SplitCloseUnresolved(crate::task_execution::pump_health::PumpCloseUnresolved),

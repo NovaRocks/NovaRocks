@@ -52,6 +52,10 @@ pub(crate) struct ReturnedActorTransportResult {
     /// available to the Source's failure/retirement path.
     pub(crate) withdrawal: Option<Result<InputId, CausalFillFailure<FrontendInput>>>,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The original returned custody occupies the already allocated join handoff cell."
+)]
 pub(super) enum ActorResultState {
     Unbound,
     Held(ReturnedActorTransportResult),

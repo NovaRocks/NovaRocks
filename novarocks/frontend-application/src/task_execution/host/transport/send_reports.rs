@@ -503,6 +503,10 @@ impl ActorSendReports {
 /// Original values for the Source's domain or failure consumer. The
 /// canonical Native reply remains live through that consumer's actual exit.
 #[must_use = "transfer the original report to its final consumer"]
+#[allow(
+    dead_code,
+    reason = "Returned reports retain their exact keys, original acknowledgements and rejected payloads through disposal."
+)]
 pub(crate) enum SendReportReturn {
     Receipt {
         key: SendKey,
@@ -536,6 +540,10 @@ impl SendReportReturn {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Each bounded step can return the original send report directly to the existing owner."
+)]
 pub(crate) enum SendReportRetirementStep {
     Advanced(Option<SendReportReturn>),
     Pending,

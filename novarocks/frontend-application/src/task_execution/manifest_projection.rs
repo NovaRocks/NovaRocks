@@ -39,9 +39,8 @@ use novarocks_coordination_contract::{
     AttemptActivation, AttemptCompletionPolicy, AttemptInheritedAdmission, AttemptLifecyclePolicy,
     MonotonicInstant,
 };
-use novarocks_execution_contract::{
-    AdmissionEpochCapability, BackendProcessDescriptor, ParticipationRef, TaskIdentity,
-};
+use novarocks_execution_contract::BackendProcessDescriptor;
+use novarocks_execution_contract::{AdmissionEpochCapability, ParticipationRef, TaskIdentity};
 use novarocks_query_application::api::PlanSeal;
 use novarocks_query_application::coordination::{
     AcceptedRootStatusSender, AcceptedRootStatusSource, NativeAttemptDrive,
@@ -208,6 +207,7 @@ pub(crate) struct AttemptActivationInputs<'a> {
 pub(crate) struct AttemptManifestProjection {
     pub(crate) start: AttemptStart,
     pub(crate) members: Arc<[FrozenMember]>,
+    #[cfg(test)]
     pub(crate) backends: Arc<[BackendProcessDescriptor]>,
     pub(crate) publications: ManifestPublications,
     pub(crate) creations: BTreeMap<PayloadRef, PricedTaskCreation>,
@@ -236,6 +236,7 @@ impl AttemptManifestProjection {
             admission_epochs,
             preparing_positions,
             members,
+            #[cfg(test)]
             backends,
             ..
         } = prepared.inputs;
@@ -331,6 +332,7 @@ impl AttemptManifestProjection {
         Ok(Self {
             start,
             members,
+            #[cfg(test)]
             backends,
             publications: prepared.publications,
             creations,

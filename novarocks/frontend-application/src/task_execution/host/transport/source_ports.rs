@@ -24,6 +24,10 @@ use novarocks_control_runtime::exit_custody::ExitObligation;
 use novarocks_workload_control::WorkError;
 use std::{any::Any, sync::Arc};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The work body returns original grants and replies in the existing paid join handoff."
+)]
 pub(crate) enum BodyOutcome {
     /// The same real WC grant moves to its original Join owner.
     InputAdmitted {
@@ -33,6 +37,10 @@ pub(crate) enum BodyOutcome {
     /// Individual original ACK cells contain every exact operation result.
     ReceiptsRecorded,
     /// GatedWork destroyed pre-handoff, captures and unused original authority.
+    #[allow(
+        dead_code,
+        reason = "Unused work retains the original start-fence or withdrawal reason."
+    )]
     Unused(novarocks_control_runtime::exit_work::GatedNotStarted),
     /// Original first-party cause; the Source pins this same cause through its
     /// final logical/error consumer, independently of Core input consumption.

@@ -256,20 +256,20 @@ pub(crate) struct SharedApplyRetirement {
     physical_retirement: Option<TransportPhysicalRetirement>,
 }
 
+type PrepareSharedApplyRefusal = (
+    RegistrationFailure,
+    ApplySlot,
+    Vec<NativeQueuedInputGrant>,
+    StepRegistration,
+);
+
 impl ApplySlot {
     pub(crate) fn prepare_shared(
         mut self,
         inputs: Vec<NativeQueuedInputGrant>,
         encoding: StepRegistration,
-    ) -> Result<
-        (SharedApplyPreparation, SharedApplyJoinObligation),
-        (
-            RegistrationFailure,
-            Self,
-            Vec<NativeQueuedInputGrant>,
-            StepRegistration,
-        ),
-    > {
+    ) -> Result<(SharedApplyPreparation, SharedApplyJoinObligation), PrepareSharedApplyRefusal>
+    {
         let mut state = self
             .core
             .state
@@ -614,12 +614,11 @@ impl SharedApplyRetirement {
                     .unwrap_or_else(|error| error.into_inner())
                     .take()
                     .expect("same original physical packet");
-                let physical = match physical {
-                    ApplyReservations::Shared(original) => original,
-                    #[cfg(test)]
-                    ApplyReservations::Legacy { .. } => {
-                        panic!("Shared cleanup cannot consume Legacy physical custody");
-                    }
+                #[cfg(not(test))]
+                let ApplyReservations::Shared(physical) = physical;
+                #[cfg(test)]
+                let ApplyReservations::Shared(physical) = physical else {
+                    panic!("Shared cleanup cannot consume Legacy physical custody");
                 };
                 assert!(
                     physical.financial.is_some(),

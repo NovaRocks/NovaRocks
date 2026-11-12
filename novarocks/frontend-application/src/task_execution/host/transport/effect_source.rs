@@ -118,8 +118,11 @@ enum Supervisor {
 }
 
 #[must_use = "the failure custodian owns the original send result and header"]
+#[expect(
+    dead_code,
+    reason = "An unresolved result and its actual header stay in original failure custody."
+)]
 pub(crate) struct FailedSendResult {
-    pub(crate) effect: AttemptActionId,
     pub(crate) original: ReturnedActorTransportResult,
     pub(crate) header: WorkRetirementObserver,
 }
@@ -941,7 +944,6 @@ impl EffectSource for AttemptTransportSource {
                         assert!(self.failed_sends.insert(effect, row.abort_keys).is_none());
                         self.other
                             .retain_transport_failure(Box::new(FailedSendResult {
-                                effect,
                                 original: result,
                                 header: row.header,
                             }));

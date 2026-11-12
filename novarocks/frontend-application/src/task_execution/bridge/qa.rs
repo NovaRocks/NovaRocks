@@ -67,6 +67,11 @@ pub(crate) struct AttemptQaReply {
     pub(in crate::task_execution) failure: Option<(HostFailureRef, TaskExecutionError)>,
 }
 
+type AttemptAuthorizationReply = (
+    Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<AttemptFailure>>,
+    Option<(HostFailureRef, TaskExecutionError)>,
+);
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum AttemptQaPortError {
     WrongRequest,
@@ -447,10 +452,7 @@ impl AttemptQaBridge {
         &self,
         action: AttemptActionId,
         error: LogicalExecutionActorError,
-    ) -> (
-        Result<AttemptAuthorizationDecision, AttemptAuthorizationFailure<AttemptFailure>>,
-        Option<(HostFailureRef, TaskExecutionError)>,
-    ) {
+    ) -> AttemptAuthorizationReply {
         let (failure, original) = Self::project_failure(
             action,
             HostFailureKind::EstablishAuthorization,

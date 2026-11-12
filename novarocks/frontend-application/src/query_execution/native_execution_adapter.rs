@@ -2680,18 +2680,18 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                 original.register_cut(ready).await?;
             }
             let convergence = original.bridge.converge(request, retain, || Ok(())).await?;
-            if self.lifecycle_diagnostics.is_enabled() {
-                if let Some(runtime_filter) = original.take_lifecycle_rollup() {
-                    self.lifecycle_diagnostics.publish(
-                        crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
-                            execution_id,
-                            primary_error: None,
-                            failure: self.observed_failure.clone(),
-                            worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
-                            runtime_filter,
-                        },
-                    );
-                }
+            if self.lifecycle_diagnostics.is_enabled()
+                && let Some(runtime_filter) = original.take_lifecycle_rollup()
+            {
+                self.lifecycle_diagnostics.publish(
+                    crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+                        execution_id,
+                        primary_error: None,
+                        failure: self.observed_failure.clone(),
+                        worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
+                        runtime_filter,
+                    },
+                );
             }
             Ok(convergence)
         })

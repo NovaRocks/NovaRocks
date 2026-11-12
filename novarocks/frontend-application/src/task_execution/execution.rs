@@ -44,7 +44,6 @@ use novarocks_execution::task_execution::{
     ParticipationConvergenceCursor, ParticipationConvergenceReceipt, QuiesceParticipationReceipt,
     TaskConvergenceCursor, TaskConvergenceReceipt,
 };
-use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
@@ -605,27 +604,6 @@ impl QueryTaskExecution {
             released_outputs: BTreeSet::new(),
             released_children_of: BTreeSet::new(),
         })
-    }
-
-    /// Installs the complete admission set acquired by a qualified
-    /// replacement. Missing, duplicate, or foreign evidence is rejected
-    /// before the first Task-protocol turn.
-    pub(crate) fn adopt_replacement_admissions(
-        &mut self,
-        admissions: &[ReplacementWorkerAdmissionEvidence],
-    ) -> Result<(), TaskExecutionError> {
-        super::manifest_projection::validate_replacement_admissions(
-            self.owners.keys().copied(),
-            admissions,
-        )?;
-        let now = self.clock.now();
-        for admission in admissions.iter() {
-            self.owners
-                .get_mut(&admission.participation())
-                .expect("the complete replacement admission set was validated")
-                .adopt_replacement_admission(admission.receipt(), now)?;
-        }
-        Ok(())
     }
 
     pub const fn graph(&self) -> &TaskGraph {

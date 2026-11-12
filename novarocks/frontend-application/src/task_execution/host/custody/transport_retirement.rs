@@ -43,6 +43,10 @@ use std::{
 use tokio::{runtime::Handle, sync::futures::OwnedNotified};
 
 #[must_use = "retain each original refused proof and its actual failure"]
+#[allow(
+    dead_code,
+    reason = "Failed retirement transfers unresolved receipts and typed causes to their original failure owner."
+)]
 pub(crate) enum TransportRetirementError {
     Custody(CustodyError),
     JoinFunding(CustodyError, SharedApplyJoinCompletion),
@@ -55,6 +59,10 @@ pub(crate) enum TransportRetirementError {
 }
 
 #[must_use]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "A bounded retirement turn moves the original send report back to its source by value."
+)]
 pub(crate) enum TransportRetirementStep {
     Advanced,
     Scanned,
@@ -120,10 +128,6 @@ impl TransportRetirement {
 
     pub(super) fn retain_unresolved(&mut self) {
         self.failed = true;
-    }
-
-    pub(crate) fn active_disposal(&self) -> Option<&OriginalDisposalObligation> {
-        self.disposal.as_ref()
     }
 
     pub(crate) fn take_rejected_attachment(&mut self) -> Option<RegistrationFailure> {

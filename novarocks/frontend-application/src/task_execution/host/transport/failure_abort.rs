@@ -85,6 +85,10 @@ use tokio::{
 
 /// A one-operation projection of its actual reply. It keeps the Worker header
 /// and participation state without retaining a second canonical reply owner.
+#[allow(
+    dead_code,
+    reason = "Failure convergence retains the original typed abort verdict with the attempt."
+)]
 pub(crate) struct AbortReceipt {
     pub(crate) operation: TaskOperationId,
     pub(crate) dispatch: OperationDispatchResult,
@@ -127,6 +131,10 @@ impl<R> SingleSendResult<R> {
 }
 
 #[must_use = "retain the original refusal or unresolved transport ownership"]
+#[allow(
+    dead_code,
+    reason = "Unproven sends retain original results, cleanup work and panic custody."
+)]
 pub(crate) enum SingleSendError<R> {
     WrongOwner,
     Governance(WorkError),
@@ -272,10 +280,10 @@ impl FailureCleanupPort for NativeFailureCleanup {
         original: FailureCleanupRequest,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            if let Some((owner, handoff)) = self.abort_drain {
-                if let Err(drained) = handoff.send(owner.drain_failed()) {
-                    std::panic::resume_unwind(Box::new(drained));
-                }
+            if let Some((owner, handoff)) = self.abort_drain
+                && let Err(drained) = handoff.send(owner.drain_failed())
+            {
+                std::panic::resume_unwind(Box::new(drained));
             }
             self.residual.finish(original, self.attempts).await;
         })

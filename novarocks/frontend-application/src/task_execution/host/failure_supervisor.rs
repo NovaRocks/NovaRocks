@@ -50,6 +50,10 @@ use tokio::{
 };
 
 pub(crate) struct FailureCleanupRequest {
+    #[allow(
+        dead_code,
+        reason = "The original panic allocation remains in the failed attempt custody."
+    )]
     pub(crate) core_panic: PanicPayload,
     pub(crate) publication: Result<(), ActorTurnError>,
     pub(crate) root_reply: Result<(), Arc<super::publication::PublicationError>>,
@@ -241,6 +245,10 @@ impl FailureSupervisor {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The failure bridge retains the exact original Join or exit failure."
+)]
 pub(crate) enum FailureSupervisorError {
     Join(JoinError),
     Exit(ExitWorkError),

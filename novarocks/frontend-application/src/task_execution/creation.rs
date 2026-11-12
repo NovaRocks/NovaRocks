@@ -390,15 +390,18 @@ impl TaskCreationSeed {
         self.identity
     }
 
+    #[cfg(test)]
     pub(crate) const fn participation(&self) -> ParticipationRef {
         self.participation
     }
 
+    #[cfg(test)]
     pub(crate) fn split_plan_nodes(&self) -> &[PlanNodeId] {
         &self.split_plan_nodes
     }
 
     /// The edges this task produces on, which all start closed.
+    #[cfg(test)]
     pub(crate) fn outbound_edges(&self) -> &[ExchangeEdgeId] {
         self.view.outbound()
     }
@@ -435,6 +438,7 @@ impl TaskCreationSeed {
     /// The metadata message is built once to be measured and dropped at once;
     /// only the lengths survive. The caller keeps them, so a creation that
     /// waits behind backpressure is never measured twice.
+    #[cfg(test)]
     pub(crate) fn lengths(&self) -> Result<CreationLengths, TaskExecutionError> {
         #[cfg(test)]
         tests::record_pricing();
@@ -820,6 +824,7 @@ impl CreateTaskIntent {
             self.original.parts.lengths(),
         )
     }
+    #[cfg(test)]
     pub(crate) fn plan_carrier_bytes(&self) -> usize {
         plan_carrier_bytes(&self.original.parts.fragment, self.original.parts.lengths())
     }

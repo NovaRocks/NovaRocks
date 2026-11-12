@@ -231,6 +231,10 @@ enum OriginalState {
         reason = "pre-spawn original input custody, not an exit observation"
     )]
     Prepared(Arc<OriginalInput>),
+    #[allow(
+        dead_code,
+        reason = "The legacy test owner starts this state and the original drain still recognizes it."
+    )]
     Running {
         join: JoinHandle<()>,
         input: Arc<OriginalInput>,

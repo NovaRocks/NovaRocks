@@ -101,12 +101,20 @@ pub(crate) struct FrontendControlRuntimeConfig {
     pub(crate) history: Option<HistoryCapture>,
 }
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The application reports the original typed startup failure through Debug."
+)]
 pub(crate) enum FrontendControlStartError {
     Ledger(RuntimeError),
     Observation(ObservationError),
     Pollers(std::io::Error),
 }
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    dead_code,
+    reason = "The shutdown diagnostic reports each original owner and join state through Debug."
+)]
 pub(crate) struct FrontendShutdownSnapshot {
     pub(crate) actors_drained: bool,
     pub(crate) ledger_drained: bool,
@@ -295,6 +303,16 @@ impl FrontendAttemptRuntime {
     }
 }
 
+type AttemptRegistrationRefusal = (
+    HostRegistrationRefusal,
+    AttemptStartup,
+    AttemptOwnerControls,
+    PendingFailureBridge,
+    Arc<TerminalOutbox>,
+    MembershipErrors,
+    AttemptHostFunding,
+);
+
 impl AttemptRegistrationGuard<'_> {
     pub(crate) fn register_binding(
         &self,
@@ -316,15 +334,7 @@ impl AttemptRegistrationGuard<'_> {
             AttemptOwnerControls,
             RegisteredAttemptTerminal,
         ),
-        (
-            HostRegistrationRefusal,
-            AttemptStartup,
-            AttemptOwnerControls,
-            PendingFailureBridge,
-            Arc<TerminalOutbox>,
-            MembershipErrors,
-            AttemptHostFunding,
-        ),
+        AttemptRegistrationRefusal,
     > {
         let PreparedAttemptHost {
             mut binding,

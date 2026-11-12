@@ -46,7 +46,9 @@ use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
     QuiesceObservationCursor,
 };
-use novarocks_workload_control::{WorkError, WorkOwner, WorkScope};
+#[cfg(test)]
+use novarocks_workload_control::WorkScope;
+use novarocks_workload_control::{WorkError, WorkOwner};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -194,12 +196,14 @@ impl<A: Actor> SubscriptionPhasePublisher<A> {
     }
     /// The Source routes only this original standing role's actual retire
     /// receipts here, using the pre-retirement runtime custody metadata.
+    #[cfg(test)]
     pub(crate) fn current_input(&self) -> Result<Option<InputId>, ObservationError> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
         self.input.in_flight().map_err(ObservationError::Runtime)
     }
+    #[cfg(test)]
     pub(crate) fn input_retired(&self, input: InputId) -> Result<(), ObservationError> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
@@ -306,6 +310,10 @@ pub(crate) struct SubscriptionSource<A: Actor> {
     state: Mutex<SourceState>,
 }
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Source refusal retains the original work or request reason with the exact stream."
+)]
 pub(crate) enum SubscriptionSourceError {
     Work(WorkError),
     Ingress(ObservationError),
@@ -349,6 +357,7 @@ impl<A: Actor> SubscriptionSource<A> {
             }),
         })
     }
+    #[cfg(test)]
     pub(crate) fn scope(&self) -> Result<WorkScope, SubscriptionSourceError> {
         self.state
             .lock()
@@ -474,6 +483,7 @@ impl<A: Actor> SubscriptionSource<A> {
         Ok(())
     }
     /// Source-qualified observed applied facts, never a received-frame cursor.
+    #[cfg(test)]
     pub(crate) fn applied_request(
         &self,
         generation: NonZeroU64,
@@ -540,6 +550,7 @@ impl<A: Actor> SubscriptionSource<A> {
         self.state.lock().expect("covered original Source").open = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn close_new_jobs(&self) {
         let stops = {
             let mut state = self.state.lock().expect("covered original Source");

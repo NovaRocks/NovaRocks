@@ -160,7 +160,7 @@ impl OperationAcknowledgement {
 fn passive_payload(payload: &AckPayload, retained_filter: Option<PayloadRef>) -> PassiveAck {
     match payload {
         AckPayload::None => PassiveAck::None,
-        AckPayload::AdmissionTicket(receipt) => PassiveAck::AdmissionTicket(receipt.clone()),
+        AckPayload::AdmissionTicket(receipt) => PassiveAck::AdmissionTicket(*receipt),
         AckPayload::Create(receipt) => PassiveAck::Create(receipt.clone()),
         AckPayload::Update(receipt) => PassiveAck::Update(receipt.clone()),
         AckPayload::Participation(receipt) => PassiveAck::Participation(receipt.clone()),

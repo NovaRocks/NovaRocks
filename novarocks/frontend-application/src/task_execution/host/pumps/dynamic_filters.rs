@@ -62,6 +62,11 @@ struct Records {
     feedback_closed: bool,
     reads: BTreeMap<AttemptRequestToken, ReadRecord>,
 }
+type RetiredDynamicFilterRead = (
+    Option<(HostFailureRef, TaskExecutionError)>,
+    Box<dyn std::any::Any + Send>,
+);
+
 pub(crate) struct DynamicFilterRecords {
     transport: Arc<NativeTaskResultTransport>,
     feedback: Arc<RuntimeFilterFeedbackState>,
@@ -331,13 +336,7 @@ impl DynamicFilterRecords {
     }
     /// The Source moves returned records to its existing disposal executor.
     /// No rich payload or original error is dropped while holding this lock.
-    pub(super) fn take_retired(
-        &self,
-        closing: bool,
-    ) -> Option<(
-        Option<(HostFailureRef, TaskExecutionError)>,
-        Box<dyn std::any::Any + Send>,
-    )> {
+    pub(super) fn take_retired(&self, closing: bool) -> Option<RetiredDynamicFilterRead> {
         let mut records = self.records.lock().expect("dynamic read canonical records");
         let closing = records.feedback_closed || closing;
         let id = records.reads.iter().find_map(|(id, r)| {
@@ -364,15 +363,6 @@ impl DynamicFilterRecords {
             .expect("dynamic read canonical records")
             .reads
             .len()
-    }
-
-    pub(super) fn backing_bytes() -> Result<usize, super::super::observations::ObservationError> {
-        use super::super::observations::backing;
-        backing::sum([
-            backing::arc::<Self>()?.size(),
-            backing::tree::<AttemptRequestToken, ReadRecord>(super::source::REPLY_ROLES)?,
-            backing::array::<ReadRecord>(2)?,
-        ])
     }
 }
 

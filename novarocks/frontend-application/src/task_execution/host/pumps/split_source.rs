@@ -79,6 +79,10 @@ pub(crate) trait SplitPayloadStore {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The split owner retains the original payload, runtime or driver failure."
+)]
 pub(crate) enum SplitSourceError {
     Input(ActorTurnError),
     Record(SplitRecordError),
@@ -442,6 +446,10 @@ impl BoundSplitCleanup {
 type CleanupResult = Result<(), TaskExecutionError>;
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Split failure transfers the original Join and panic or exit refusal together."
+)]
 pub(crate) enum SplitCleanupFailure {
     Join(JoinError, Option<PanicPayload>),
     Work(ExitWorkError),

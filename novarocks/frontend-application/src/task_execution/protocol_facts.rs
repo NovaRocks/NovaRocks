@@ -311,18 +311,6 @@ impl AttemptProtocolFactsPublisher {
         self.bind_identity(drive.identity())
     }
 
-    #[cfg(test)]
-    pub(super) fn verify_computation_ready(
-        &self,
-        ready: novarocks_query_application::api::ComputationReadyToken,
-    ) -> Result<(), TaskExecutionError> {
-        if self.activation != Some(ready.activation()) || self.shared.frozen.root != ready.root() {
-            return Err(protocol_error(
-                "computation cut differs from the original Native drive and root",
-            ));
-        }
-        Ok(())
-    }
     fn bind_identity(
         &mut self,
         activation: AttemptActivationIdentity,

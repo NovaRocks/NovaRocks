@@ -58,11 +58,19 @@ impl ReleaseCapture {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Release refusal retains the original admission or report error with disposal custody."
+)]
 pub(super) enum ReleaseError {
     Admission(RuntimeError),
     Retirement(CustodyError),
 }
 
+#[allow(
+    dead_code,
+    reason = "A failed release retains the typed cause and original launch, Join and panic evidence."
+)]
 pub(super) struct ReleaseFailure {
     pub(super) error: ReleaseError,
     pub(super) handoff: Option<Original>,

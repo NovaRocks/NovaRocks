@@ -129,26 +129,10 @@ impl ReturnedQueuedInput {
     pub(crate) fn key(&self) -> SendKey {
         self.key
     }
-    pub(crate) fn borrow(&self) -> &NativeQueuedInputGrant {
-        &self.input
-    }
     /// Move the same grant to the Source's original Native row. This transfers
     /// custody only, never signals queue exit or financial return.
     pub(crate) fn into_original(self) -> NativeQueuedInputGrant {
         ManuallyDrop::into_inner(self.input)
-    }
-    /// Caller is the original Source after actual Join, Native return (or its
-    /// real never-attached boundary), and successful queue+encoding finishes.
-    /// Failure returns the same unexited object; no destructor refunds it.
-    pub(crate) fn finish_after_physical_exit(self) -> Result<(), (WorkError, Self)> {
-        match self.input.queue_exited_in() {
-            Ok(notification) => {
-                drop(ManuallyDrop::into_inner(self.input));
-                notification.notify();
-                Ok(())
-            }
-            Err(error) => Err((error, self)),
-        }
     }
 }
 /// Move-only loan of that same Source's grant, not a parallel queue record.
@@ -162,9 +146,6 @@ pub(crate) struct SendInputLoan {
 impl SendInputLoan {
     pub(crate) fn key(&self) -> SendKey {
         self.input.as_ref().expect("original input loan").key()
-    }
-    pub(crate) fn borrow(&self) -> &NativeQueuedInputGrant {
-        self.input.as_ref().expect("original input loan").borrow()
     }
     pub(crate) fn matches_send(
         &self,

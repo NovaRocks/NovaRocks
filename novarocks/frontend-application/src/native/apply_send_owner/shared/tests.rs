@@ -397,6 +397,10 @@ fn transport_factory(
         }
     }
 }
+#[expect(
+    clippy::manual_async_fn,
+    reason = "The fixture quotes this disjoint-capture future and releases its unused queue capture at construction."
+)]
 fn fixture_body(captures: Captures, (): ()) -> impl Future<Output = ()> {
     async move {
         if let Some((source, binding)) = captures.inline {
@@ -567,7 +571,7 @@ fn pending_row(
         layouts.push(Layout::new::<custody::TransportRetirement>());
     }
     let (quote, plan) = transport::original_run_for_factory(
-        &[operation.clone()],
+        std::slice::from_ref(&operation),
         TransportBudget::DEFAULT,
         actual_future_layout(transport_factory),
         SourceLayouts { original: &layouts },
@@ -690,8 +694,7 @@ fn pending_row(
         let OperationIntent::CancelTask(original) = &operation else {
             unreachable!()
         };
-        let protocol =
-            novarocks_attempt_protocol::effect::OperationIntent::CancelTask(original.clone());
+        let protocol = novarocks_attempt_protocol::effect::OperationIntent::CancelTask(*original);
         let id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
         let effect = AttemptEffectEnvelope::new(AttemptEffect {
             id,
@@ -1057,7 +1060,6 @@ async fn finish_row(
     oracles.push(
         armed && wake.wakes.load(Ordering::SeqCst) > 0 && !wake.premature.load(Ordering::SeqCst),
     );
-    drop(wait);
     oracles.push(row.source.try_retire().unwrap());
     drop(row.source);
     drop(row.completed);
@@ -1377,7 +1379,7 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         let OperationIntent::CancelTask(cancel) = operation else {
             unreachable!()
         };
-        ProtocolIntent::CancelTask(cancel.clone())
+        ProtocolIntent::CancelTask(*cancel)
     });
     let effect_id = AttemptActionId::new(NonZeroU64::new(3).unwrap());
     let effect = AttemptEffectEnvelope::new(AttemptEffect {
@@ -2657,7 +2659,7 @@ async fn run_actor_send(
         let lost = terminal_owner.failure_bridge_mut().original_loss();
         assert!(
             matches!(&lost.body, AttemptToLogicalBody::AttemptLost { unknown_participations, unresolved_actions, .. }
-            if &**unknown_participations == &[participation] && &**unresolved_actions == &[send_id])
+            if **unknown_participations == [participation] && **unresolved_actions == [send_id])
         );
         actor_runtime.retire_input(actor, failed).unwrap();
     }
@@ -2761,7 +2763,7 @@ async fn run_actor_send(
         .unwrap();
         if failure_verdict == Some(OperationOutcome::Accepted) {
             assert!(
-                matches!(closure, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if &*exact_participations == &[participation])
+                matches!(closure, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if *exact_participations == [participation])
             );
             processes.changed.send_replace(1);
             let original = terminal_owner
@@ -2773,11 +2775,11 @@ async fn run_actor_send(
                 .await
                 .unwrap();
             assert!(
-                matches!(original, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if &*exact_participations == &[participation])
+                matches!(original, NativeActiveConvergenceClosure::RemoteTrackingEnded { exact_participations } if *exact_participations == [participation])
             );
         } else {
             assert!(
-                matches!(closure, NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(facts)) if &*facts == &[NativeParticipationConvergence::worker_process_replaced(participation)])
+                matches!(closure, NativeActiveConvergenceClosure::Evidence(NativeAttemptConvergence::Participations(facts)) if *facts == [NativeParticipationConvergence::worker_process_replaced(participation)])
             );
         }
     } else {

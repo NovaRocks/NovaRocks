@@ -54,6 +54,10 @@ use std::{
     task::{Context, Poll},
 };
 
+#[allow(
+    dead_code,
+    reason = "Preparation returns the original governance, runtime or channel cause to the send owner."
+)]
 pub(crate) enum PreparationFailure {
     Governance(WorkError),
     Runtime(RuntimeError),
@@ -209,14 +213,14 @@ impl Future for PrepareSend {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.released.refresh(cx.waker());
-        if this.warm.is_some() {
+        if let Some(warm) = &this.warm {
             loop {
                 if this.generation_wait.is_none() {
                     let mut wait = Box::pin(this.client.original_ready_notified());
                     wait.as_mut().enable();
                     this.generation_wait = Some(wait);
                 }
-                if this.warm.as_ref().unwrap().acquired.is_retired() {
+                if warm.acquired.is_retired() {
                     return Poll::Ready(Err(PreparationFailure::GenerationRetired));
                 }
                 if this

@@ -653,6 +653,10 @@ impl ReadState {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Observation rows occupy prepaid FIFO storage before decoding fills the original slot."
+)]
 enum EntryValue {
     Pending {
         key: StreamKey,
@@ -1518,6 +1522,7 @@ impl<A: Actor> OrderedObservationInput<A> {
     }
     /// Acceptance, receive time and liveness update commit under one lock.
     /// No caller assigns an ordinal then races another caller's runtime fill.
+    #[cfg(test)]
     pub(crate) fn accept(
         &self,
         key: StreamKey,
@@ -1592,6 +1597,7 @@ impl<A: Actor> OrderedObservationInput<A> {
         &self.0.root_binding
     }
 
+    #[cfg(test)]
     pub(crate) fn root_control(&self, reference: RootControlRef) -> Result<(), ObservationError> {
         self.queue_root_control(reference)?;
         self.drive()
@@ -1997,15 +2003,6 @@ impl<A: Actor> OrderedObservationInput<A> {
             }
         }
     }
-    /// Stops new ingress; this is not a producer/body/report exit proof.
-    pub(crate) fn close(&self) {
-        self.0
-            .state
-            .lock()
-            .expect("ordered observation state")
-            .closed = true;
-        self.0.changed.notify_waiters();
-    }
     fn is_retired(&self) -> bool {
         self.0
             .state
@@ -2335,6 +2332,10 @@ impl<A: Actor> Future for ReadStateConfirmation<'_, A> {
 
 #[cfg(test)]
 enum ConfirmationFailure<I> {
+    #[allow(
+        dead_code,
+        reason = "The read confirmation failure retains the original snapshot refusal."
+    )]
     Snapshot(ObservationError),
     Fill(CausalFillFailure<I>),
 }

@@ -30,7 +30,6 @@ use crate::{
 use novarocks_control_runtime::actor_turn::{ActorHostTurn, ActorRegistration, ActorRuntime};
 use novarocks_coordination_contract::AttemptActionId;
 use std::{
-    alloc::Layout,
     collections::VecDeque,
     sync::{
         Arc,
@@ -62,8 +61,20 @@ impl Wake for HostWake {
 pub(crate) enum TransportSourceEvent {
     Result(ReturnedActorTransportResult),
     Report(SendReportReturn),
+    #[allow(
+        dead_code,
+        reason = "The original failure owner retains the typed attachment refusal."
+    )]
     RejectedAttachment(RegistrationFailure),
+    #[allow(
+        dead_code,
+        reason = "The original failure owner retains the unresolved result and its exit custody."
+    )]
     RefusedResult(ReturnedActorTransportResult),
+    #[allow(
+        dead_code,
+        reason = "The original failure owner retains the retirement error and any returned originals."
+    )]
     Failed(TransportRetirementError),
     Retired,
 }
@@ -78,6 +89,10 @@ struct Row {
     retirement: Box<TransportRetirement>,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The source turn transfers the retired row event without allocating a new handoff."
+)]
 enum RowStep {
     Pending,
     Scanning,
@@ -97,17 +112,6 @@ pub(crate) struct TransportRetirements {
 }
 
 impl TransportRetirements {
-    pub(crate) fn layouts(
-        rows: usize,
-    ) -> Result<[Layout; 2], novarocks_type_contract::owned_resources::layout::LayoutResourceError>
-    {
-        use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
-        Ok([
-            Layout::array::<Row>(rows).map_err(|_| LayoutResourceError::Arithmetic)?,
-            arc_layout(Layout::new::<HostWake>())?,
-        ])
-    }
-
     pub(crate) fn new(
         runtime: ActorRuntime<FrontendActor>,
         registration: ActorRegistration,

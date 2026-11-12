@@ -167,7 +167,7 @@ impl Drop for Release {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Seen {
-    Failure(AttemptFailure),
+    Failure(Box<AttemptFailure>),
     Profile(SplitDiagnosticObservation),
     Finished,
 }
@@ -188,7 +188,7 @@ impl Actor for Recorder {
     ) {
         let value = match value {
             AttemptInput::Executor(ExecutorFact::PumpFailed { failure, .. }) => {
-                Seen::Failure(failure)
+                Seen::Failure(Box::new(failure))
             }
             AttemptInput::Executor(ExecutorFact::SplitProfile { observation, .. }) => {
                 Seen::Profile(observation)
@@ -509,7 +509,7 @@ async fn run_case(refuse_failure: bool, check_idle_timer: bool) {
     } else {
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            &[Seen::Failure(project(&original))]
+            &[Seen::Failure(Box::new(project(&original)))]
         );
     }
     // Extra real progress notifications while the physical close is parked

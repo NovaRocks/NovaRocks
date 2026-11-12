@@ -515,6 +515,10 @@ impl DiagnosticSourceSnapshot {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Publication refusal returns the original typed protocol error inline."
+)]
 pub(crate) enum PublicationError {
     MissingRootPublisher,
     MissingRootControlReply,

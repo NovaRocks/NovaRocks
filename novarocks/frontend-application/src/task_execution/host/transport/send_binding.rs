@@ -128,20 +128,6 @@ impl FrozenSendRequests {
         }
     }
 
-    pub(crate) fn install(&mut self, original: OperationIntent) -> Result<(), OperationIntent> {
-        let std::collections::btree_map::Entry::Vacant(record) =
-            self.originals.entry(original.operation_id())
-        else {
-            return Err(original);
-        };
-        record.insert(original);
-        Ok(())
-    }
-
-    pub(crate) fn into_originals(self) -> BTreeMap<TaskOperationId, OperationIntent> {
-        self.originals
-    }
-
     #[cfg(test)]
     pub(crate) fn creation_for_test(&self, operation: TaskOperationId) -> Option<CreateTaskIntent> {
         match self.originals.get(&operation)? {
@@ -554,6 +540,10 @@ impl PreparedSendBatch {
 }
 
 #[must_use = "retain the original prepared batch and queue window on refusal"]
+#[allow(
+    dead_code,
+    reason = "A refused binding returns the original batch and queue window with the cause."
+)]
 pub(crate) struct SendBindingRefusal {
     pub(crate) error: SendBindingError,
     pub(crate) batch: PreparedSendBatch,

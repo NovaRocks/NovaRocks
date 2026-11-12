@@ -51,6 +51,10 @@ use tokio::{
 };
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Custody errors carry the original typed report or exit refusal to the failure owner."
+)]
 pub(crate) enum CustodyError {
     Report(RuntimeError),
     Exit(ExitCustodyError),
@@ -81,6 +85,10 @@ impl std::fmt::Display for CustodyError {
 impl std::error::Error for CustodyError {}
 pub(crate) struct CustodyRefusal {
     pub(crate) error: CustodyError,
+    #[allow(
+        dead_code,
+        reason = "Refusal returns the original funded Work before a transport owner is installed."
+    )]
     pub(crate) original: ReportedWork,
 }
 struct Joined<T> {
@@ -338,20 +346,23 @@ fn disposal_work(
     move || work.run()
 }
 
+type HostDisposalCapture<T> = Arc<Mutex<Option<ManuallyDrop<T>>>>;
+type HostDisposalFactory<T, F> = fn(ExitObligation, HostDisposalCapture<T>, fn(T), PanicSink) -> F;
+
 /// Owns an original host capture until its credentialed blocking disposal
 /// returns. A rejected handoff or a work that never starts keeps the capture
 /// here, including when Tokio drops its unstarted closure.
 #[must_use = "observe the original blocking disposal and retire its Work"]
 pub(crate) struct HostDisposal<T> {
     role: Arc<OriginalRole<Result<(), ExitWorkError>>>,
-    _capture: Arc<Mutex<Option<ManuallyDrop<T>>>>,
+    _capture: HostDisposalCapture<T>,
 }
 
 type HostPanic = Box<dyn std::any::Any + Send>;
 
 fn host_disposal_work<T>(
     exit: ExitObligation,
-    body: Arc<Mutex<Option<ManuallyDrop<T>>>>,
+    body: HostDisposalCapture<T>,
     dispose: fn(T),
     panic: PanicSink,
 ) -> impl FnOnce() -> Result<(), ExitWorkError> {
@@ -411,9 +422,7 @@ impl<T: Send + 'static> HostDisposal<T> {
     > {
         use novarocks_type_contract::owned_resources::layout::arc_layout;
         use std::alloc::Layout;
-        fn carrier<T, F>(
-            _: fn(ExitObligation, Arc<Mutex<Option<ManuallyDrop<T>>>>, fn(T), PanicSink) -> F,
-        ) -> Layout {
+        fn carrier<T, F>(_: HostDisposalFactory<T, F>) -> Layout {
             Layout::new::<F>()
         }
         Ok([
@@ -482,18 +491,6 @@ impl OriginalDisposalObligation {
         }
         Ok(owner)
     }
-    pub(crate) fn take_handoff_failure(&self) -> Option<Box<dyn std::any::Any + Send>> {
-        self.role.take_handoff_failure()
-    }
-    /// Move originals only to the Source's credentialed failure consumer.
-    /// Taking a cause never clears its recorded failure or signs completion.
-    pub(crate) fn take_join_failure(&self) -> Option<JoinError> {
-        self.role.take_join_failure()
-    }
-    pub(crate) fn take_work_panic(&self) -> Option<Box<dyn std::any::Any + Send>> {
-        self.role.take_work_panic()
-    }
-
     /// Pending relies on the original Join and ledger progress wakes. The
     /// Source must register those real wakes, not schedule a polling timer.
     pub(crate) fn poll_complete(
@@ -929,6 +926,7 @@ impl OriginalTransportJoinObligation {
     /// The factory receives the original role's unique exit and weak row port.
     /// It constructs its credentialed future before Tokio handoff. No method
     /// accepts a caller-supplied JoinHandle or a numeric completion claim.
+    #[cfg(test)]
     pub(crate) fn spawn<F, Make>(
         runtime: &Handle,
         original: ReportedWork,
@@ -1186,6 +1184,7 @@ impl OriginalTransportJoinObligation {
     /// Retire only the original unused local role after factory/spawn failed
     /// without returning a Join. This emits no Native completion and releases
     /// no staged financial/input packet. Native rows, if any, remain UNKNOWN.
+    #[cfg(test)]
     pub(crate) fn retire_unused_without_join(&self) -> Result<bool, CustodyError> {
         {
             let state = self.role.joined.lock().unwrap_or_else(|e| e.into_inner());

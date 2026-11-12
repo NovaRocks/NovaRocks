@@ -158,6 +158,10 @@ impl Drop for StagedSubscriptionEndpoints {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Installation refusal keeps the exact participant and returned Source."
+)]
 pub(crate) enum SubscriptionEndpointError {
     Roster,
     Source {
@@ -242,6 +246,10 @@ pub(crate) fn retire_unpublished_endpoints(endpoints: &SubscriptionEndpoints) {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Covered control refusal transfers the original Source error."
+)]
 pub(super) enum SubscriptionControlError {
     WrongEffect,
     WrongParticipation,

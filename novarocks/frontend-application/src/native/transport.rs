@@ -253,6 +253,7 @@ impl Client {
         self.data_runtime.native_ready_notified()
     }
 
+    #[cfg(test)]
     pub(crate) fn for_backend(
         descriptor: FrozenBackendDescriptor,
         data_runtime: FrontendDataRuntime,

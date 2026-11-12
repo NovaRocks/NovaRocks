@@ -33,6 +33,10 @@ use novarocks_types::BackendProcessId;
 use std::sync::Arc;
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Capacity refusal retains the original ledger or layout error."
+)]
 pub(crate) enum CapacityFailure {
     Runtime(RuntimeError),
     Layout(TransportCapacityError),
@@ -269,10 +273,10 @@ impl EncodingCustody {
 }
 impl Drop for EncodingCustody {
     fn drop(&mut self) {
-        if let Some((window, returned)) = self.original.take() {
-            if let Err(refused) = returned.publish(window.into_original()) {
-                std::panic::resume_unwind(Box::new(refused));
-            }
+        if let Some((window, returned)) = self.original.take()
+            && let Err(refused) = returned.publish(window.into_original())
+        {
+            std::panic::resume_unwind(Box::new(refused));
         }
     }
 }

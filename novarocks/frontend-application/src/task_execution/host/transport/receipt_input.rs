@@ -41,6 +41,10 @@ pub(crate) enum NativeReceiptError {
     WrongSend,
     AlreadyRecorded,
     WrongDiagnosticRelease,
+    #[allow(
+        dead_code,
+        reason = "Receipt projection retains the typed reason with the original rejected reply."
+    )]
     Projection(AttemptReceiptError),
 }
 
@@ -72,6 +76,10 @@ impl Receipt {
 /// Carry the same raw acknowledgement and any rejected passive backing to
 /// their actual final owner. Closing the mailbox position drops neither here.
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "The original ACK and refused projection retain their aliases through physical disposal."
+)]
 pub(crate) struct RetiredNativeReceipt {
     pub(crate) original: OperationAcknowledgement,
     pub(crate) unpublished: Option<FrontendInput>,

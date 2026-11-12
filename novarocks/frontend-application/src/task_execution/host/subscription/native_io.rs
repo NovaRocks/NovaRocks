@@ -44,6 +44,10 @@ use std::{alloc::Layout, future::Future, sync::Arc};
 /// The original failure object and the phase that observed it.
 #[derive(Debug)]
 pub(crate) enum NativeSubscriptionFailure {
+    #[allow(
+        dead_code,
+        reason = "The original Native subscription failure retains both process identities."
+    )]
     WrongClient {
         expected: BackendProcessId,
         actual: BackendProcessId,

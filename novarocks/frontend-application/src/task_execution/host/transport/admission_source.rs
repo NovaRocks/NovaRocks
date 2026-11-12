@@ -95,11 +95,19 @@ struct Pending {
 }
 
 #[must_use = "the original result and any refused input remain in custody"]
+#[allow(
+    dead_code,
+    reason = "Admission refusal transfers the original result position and typed cause to the failure owner."
+)]
 pub(crate) struct AdmissionResultRefusal {
     pub(crate) result: ReturnedActorTransportResult,
     pub(crate) cause: AdmissionResultError,
 }
 
+#[allow(
+    dead_code,
+    reason = "Admission failure keeps the original refused input and payload custody."
+)]
 pub(crate) enum AdmissionResultError {
     WrongEffect,
     MissingOutcome,

@@ -32,13 +32,9 @@ use crate::{
     },
     task_execution::host::{
         RetirementScan,
-        custody::{
-            ReturnedActorTransportResult, TransportRetirement, TransportSourceEvent,
-            storage_layouts,
-        },
-        observations::{ObservationError, backing},
+        custody::{ReturnedActorTransportResult, TransportSourceEvent},
         publication::OriginalHostFailure,
-        transport::{BodyOutcome, BoundActorTransport, prepare_actor_pump},
+        transport::{BodyOutcome, prepare_actor_pump},
     },
 };
 use novarocks_attempt_protocol::{
@@ -67,7 +63,6 @@ use novarocks_control_runtime_core::{
 use novarocks_coordination_contract::AttemptActionId;
 use novarocks_query_application::execution_error::ExecutionFailureInput;
 use std::{
-    alloc::Layout,
     any::Any,
     collections::BTreeMap,
     num::NonZeroU64,
@@ -150,45 +145,6 @@ pub(crate) struct AttemptPumpSource {
 impl AttemptPumpSource {
     pub(crate) const fn role_count(dynamic: bool, diagnostics: bool) -> usize {
         (dynamic as usize + diagnostics as usize) * ROLES_PER_PUMP
-    }
-
-    pub(crate) fn backing_bytes(
-        diagnostic_tasks: usize,
-        dynamic: bool,
-        diagnostics: bool,
-    ) -> Result<usize, ObservationError> {
-        let dynamic_bytes = if dynamic {
-            DynamicFilterRecords::backing_bytes()?
-        } else {
-            0
-        };
-        let diagnostic_bytes = if diagnostics {
-            DiagnosticRecords::backing_bytes(diagnostic_tasks)?
-        } else {
-            0
-        };
-        let roles = Self::role_count(dynamic, diagnostics);
-        let join = storage_layouts().map_err(|_| ObservationError::Budget)?;
-        let per_job = backing::sum([
-            backing::arc::<AttemptEffectEnvelope>()?.size(),
-            Layout::new::<BoundActorTransport>().size(),
-            Layout::new::<BoundPumpWork>().size(),
-            Layout::new::<TransportRetirement>().size(),
-            backing::array::<AttemptInput>(
-                novarocks_control_runtime::causal_input::CAUSAL_INPUT_POSITIONS,
-            )?,
-            join.transport_record.size(),
-            join.transport_registration.size(),
-            join.exit_custody.size(),
-            join.panic_sink.size(),
-        ])?;
-        backing::sum([
-            Layout::new::<Self>().size(),
-            backing::array::<Lane>(roles)?,
-            per_job.checked_mul(roles).ok_or(ObservationError::Budget)?,
-            dynamic_bytes,
-            diagnostic_bytes,
-        ])
     }
 
     #[allow(clippy::too_many_arguments)]

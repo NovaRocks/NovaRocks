@@ -73,6 +73,10 @@ pub(crate) enum FrontendEffect {
     Attempt(Arc<AttemptEffectEnvelope>),
     AttemptNotice(Arc<AttemptNotice>),
     AttemptRootControlProcessed(InputId),
+    #[allow(
+        dead_code,
+        reason = "The owner failure action retains the exact failed input and its original scope identity."
+    )]
     AttemptOwnerFailed {
         scope: ScopeId,
         generation: Generation,
@@ -99,6 +103,7 @@ pub(crate) enum FrontendLaneKey {
     #[cfg(test)]
     Test(u64),
 }
+#[cfg(test)]
 impl FrontendActor {
     pub(crate) fn kind(&self) -> FrontendActorKind {
         match self {

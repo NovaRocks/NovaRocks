@@ -100,6 +100,10 @@ impl AttemptCallOwner {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The reply moves the original input and its paired failure into the reserved result custody."
+)]
 pub(crate) enum AttemptCallReply {
     Input {
         input: AttemptInput,
@@ -288,10 +292,20 @@ struct Live {
 }
 
 #[must_use = "retain the original call result, input credit, and refused publication"]
+#[allow(
+    dead_code,
+    reason = "Call refusal retains the original paid input and publication through failure custody."
+)]
 pub(crate) struct AttemptCallResultRefusal {
     pub(crate) original: ReturnedActorTransportResult,
     pub(crate) publication: Option<CausalFillFailure<FrontendInput>>,
 }
+
+type DrainedCallOwner = (
+    AttemptCallOwner,
+    Option<Arc<AbortSettlementOwner>>,
+    Option<Arc<TerminalOutbox>>,
+);
 
 pub(crate) struct AttemptCallSource {
     scope: ScopeHandle,
@@ -476,6 +490,7 @@ impl AttemptCallSource {
         Ok(ReportedWork::try_new(work, payer, report).expect("same original call work"))
     }
 
+    #[cfg(test)]
     pub(crate) fn bind(
         &mut self,
         ticket: &EffectTicket<FrontendEffect>,
@@ -792,13 +807,7 @@ impl AttemptCallSource {
         Ok(true)
     }
 
-    pub(crate) fn take_drained_owner(
-        &mut self,
-    ) -> Option<(
-        AttemptCallOwner,
-        Option<Arc<AbortSettlementOwner>>,
-        Option<Arc<TerminalOutbox>>,
-    )> {
+    pub(crate) fn take_drained_owner(&mut self) -> Option<DrainedCallOwner> {
         if self.idle.is_none()
             && self.pending.is_none()
             && self.live.is_none()

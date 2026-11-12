@@ -25,6 +25,10 @@ use novarocks_workload_control::{WorkError, joint_admission::NativeQueuedInputGr
 use std::mem::ManuallyDrop;
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The retirement failure retains the typed cause while the Source owns the original resources."
+)]
 pub(crate) enum PhysicalReturnError {
     Financial(RuntimeError),
     Queue(WorkError),

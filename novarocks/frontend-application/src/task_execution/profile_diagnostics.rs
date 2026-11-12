@@ -127,6 +127,10 @@ impl ReleasedRuntimeFilterContributions {
 pub(crate) struct ProfileDiagnosticSnapshot {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) closure: ProfileDiagnosticClosure,
+    #[allow(
+        dead_code,
+        reason = "The frozen profile records the original observation cutoff with its evidence."
+    )]
     pub(crate) selected_at: MonotonicInstant,
     pub(crate) runtime_filters: ReleasedRuntimeFilterContributions,
     pub(crate) split: ProfileSplitDiagnostic,

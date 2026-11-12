@@ -84,8 +84,16 @@ pub(crate) struct ReplacementAdmissionSend {
 
 #[derive(Debug)]
 #[must_use = "retain any unresolved original Native retirement proof"]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "A refused replacement send returns the original send error and its unresolved retirement proof."
+)]
 pub(crate) enum ReplacementSendError {
     StoppedBeforeHandoff(ReplacementSendStop),
+    #[allow(
+        dead_code,
+        reason = "The qualification diagnostic reports the original typed queue error through Debug."
+    )]
     Queue(ReplacementQueueError),
     Send(SingleSendError<ReplacementAdmissionReceipt>),
 }
@@ -171,6 +179,10 @@ pub(crate) async fn wait_for_stop(
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Queue qualification retains the governance or original funding error for diagnostics."
+)]
 pub(crate) enum ReplacementQueueError {
     WrongOriginalInput,
     Layout(TransportCapacityError),

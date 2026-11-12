@@ -180,6 +180,8 @@ struct BankState {
     next_claim: u64,
     claims: BTreeMap<u64, Option<StreamKey>>,
 }
+type ResumeCallback = Box<dyn FnOnce(ReadProgressSnapshot) + Send>;
+
 /// Test author uses the SAME existing Source byte window plus real bound CR
 /// positions. It adds NO ledger byte dimension or transport capacity claim.
 pub(in crate::task_execution::host) struct Bank {
@@ -192,7 +194,7 @@ pub(in crate::task_execution::host) struct Bank {
     projections: Mutex<usize>,
     metadata: Mutex<TestMetadataRecord>,
     progress: Mutex<Option<CoalescingInput<Recorder, TestReadProgress>>>,
-    on_resume: Mutex<Option<Box<dyn FnOnce(ReadProgressSnapshot) + Send>>>,
+    on_resume: Mutex<Option<ResumeCallback>>,
     progress_debts: Mutex<std::collections::BTreeSet<StreamKey>>,
     progress_failed: std::sync::atomic::AtomicBool,
 }

@@ -33,7 +33,7 @@ use crate::{
     },
     task_execution::host::{
         custody::{
-            CustodyError, CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
+            CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
             TransportJoinRegistration, TransportRetirement, storage_layouts,
         },
         observations::{ObservationError, backing},
@@ -88,6 +88,10 @@ pub(crate) struct BoundActorTransport {
     /// a purpose author admitted before the send's step guard is bound.
     pub(crate) result_author: InputAuthor,
 }
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The bound call is inline in the transport work envelope whose full size is reserved."
+)]
 pub(crate) enum ActorTransportWork {
     Send(Box<BoundSend>),
     Admit(Box<BoundQueue>),
@@ -288,15 +292,14 @@ fn prepare_with_owner(
 }
 
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "Preparation refusal returns original Work, result and cleanup custody together."
+)]
 pub(crate) struct TransportPreparationRefusal {
     pub(crate) refused: CustodyRefusal,
     pub(crate) result: CausalInputObligation<crate::control_runtime::actor::FrontendActor>,
     pub(crate) cleanup: VecDeque<ReportedWork>,
-}
-
-pub(crate) enum ActorTransportHandoff {
-    Spawned,
-    Failed(CustodyError),
 }
 
 pub(crate) struct ActorTransportExecutor(pub(crate) Handle);
@@ -304,7 +307,7 @@ impl EffectExecutor for ActorTransportExecutor {
     fn handoff(&self, job: PreparedEffectJob) -> Result<(), PreparedEffectJob> {
         // A failed launch has transferred the original result position. The
         // Source receives that same raw failure through the original owner.
-        handoff_actor_transport(&self.0, job).map(|_| ())
+        handoff_actor_transport(&self.0, job)
     }
 }
 
@@ -314,7 +317,7 @@ impl EffectExecutor for ActorTransportExecutor {
 pub(crate) fn handoff_actor_transport(
     runtime: &Handle,
     job: PreparedEffectJob,
-) -> Result<ActorTransportHandoff, PreparedEffectJob> {
+) -> Result<(), PreparedEffectJob> {
     if job.transport.is_some() {
         return Err(job);
     }
@@ -372,7 +375,8 @@ pub(crate) fn handoff_actor_transport(
         panic,
         result: Box::new(ActorResultObligation(registration)),
     };
-    let spawned = match work {
+    // The original Source owns the launch error after this handoff.
+    let _ = match work {
         ActorTransportWork::Send(bound) => launch.spawn(runtime, exit, |exit, registration| {
             run_send(SendJob {
                 leg: leg(exit, registration.clone(), panic),
@@ -436,10 +440,7 @@ pub(crate) fn handoff_actor_transport(
             })
         }
     };
-    Ok(match spawned {
-        Ok(()) => ActorTransportHandoff::Spawned,
-        Err(error) => ActorTransportHandoff::Failed(error),
-    })
+    Ok(())
 }
 
 fn pump_outcome(

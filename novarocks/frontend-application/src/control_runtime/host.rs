@@ -215,6 +215,10 @@ pub(crate) trait EffectSource: Send + 'static {
     ) -> SourceProgress;
 }
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "The original Source retains the binding error and its unconsumed captures together."
+)]
 pub(crate) struct EffectBindRefusal {
     pub(crate) error: ActorTurnError,
     pub(crate) original: Box<dyn Any + Send>,
@@ -394,6 +398,10 @@ pub(crate) struct HostBinding {
     pub(crate) membership: Option<AttemptMembershipSource>,
     pub(crate) owner_controls: Option<AttemptOwnerControlSource>,
 }
+#[allow(
+    dead_code,
+    reason = "The refusal returns the original binding and typed cause before publication."
+)]
 pub(crate) struct HostRegistrationRefusal {
     pub(crate) reason: &'static str,
     pub(crate) runtime_error: Option<ActorTurnError>,
@@ -427,6 +435,7 @@ impl HostRegistry {
             changed: Notify::new(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn register(
         &self,
         binding: HostBinding,
@@ -634,14 +643,6 @@ impl HostRegistry {
         }
         self.changed.notify_waiters();
         Ok(observed)
-    }
-    pub(crate) fn kind(&self, scope: ScopeId) -> Option<FrontendActorKind> {
-        self.state
-            .lock()
-            .expect("frontend host registry lock")
-            .entries
-            .get(&scope)
-            .map(|entry| entry.kind)
     }
     pub(super) fn observation_owners(&self) -> (&RuntimeLedger, &ActorRuntime<FrontendActor>) {
         (&self.ledger, &self.runtime)
@@ -1538,6 +1539,10 @@ struct HostProgress {
     retired: bool,
 }
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "The host reports the original runtime, dispatch or observation failure through Debug."
+)]
 enum HostError {
     Runtime(ActorTurnError),
     Dispatch(DispatchError),
