@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "observation_tests/liveness.rs"]
+mod liveness;
+
 use super::*;
 use novarocks_control_runtime::{
     actor::{ActorConfig, ActorStep},
@@ -91,6 +94,7 @@ enum Seen {
 struct Recorder(
     Arc<Mutex<Vec<(InputId, Seen)>>>,
     Arc<Mutex<Vec<ObservationOpening>>>,
+    Option<liveness::Capture>,
 );
 impl Actor for Recorder {
     type Input = AttemptInput;
@@ -105,6 +109,10 @@ impl Actor for Recorder {
         value: AttemptInput,
         _: &mut ActorStep<'_, ()>,
     ) {
+        if let Some(capture) = &self.2 {
+            assert!(capture.lock().unwrap().replace((input, value)).is_none());
+            return;
+        }
         let summary = match value {
             AttemptInput::Executor(ExecutorFact::Observations(batch)) => Seen::Observations(
                 batch
@@ -548,6 +556,15 @@ impl Fixture {
         Self::make(queue, byte_frames, false)
     }
     fn make(queue: usize, byte_frames: usize, opened: bool) -> Self {
+        Self::make_with_trace(queue, byte_frames, opened, None)
+    }
+
+    fn make_with_trace(
+        queue: usize,
+        byte_frames: usize,
+        opened: bool,
+        trace: Option<liveness::Trace>,
+    ) -> Self {
         let ledger = RuntimeLedger::new(ResourceVector::default());
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
@@ -585,12 +602,21 @@ impl Fixture {
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
         let openings = Arc::new(Mutex::new(Vec::new()));
-        let runtime = ActorRuntime::new();
+        let (runtime, key, capture, progress_source) = if let Some(trace) = trace {
+            (
+                ActorRuntime::with_history(trace.history),
+                trace.key,
+                Some(trace.capture),
+                ActorId::new(3).unwrap(),
+            )
+        } else {
+            (ActorRuntime::new(), key(), None, ActorId::new(5).unwrap())
+        };
         let registration = runtime
             .register_bound(
                 actor(),
                 scope.clone(),
-                Recorder(seen.clone(), openings.clone()),
+                Recorder(seen.clone(), openings.clone(), capture),
                 ActorConfig {
                     mailbox: [8; 4],
                     max_batches: 8,
@@ -601,7 +627,6 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let key = key();
         let binding = RootControlBinding::for_registered_source(
             registration.clone(),
             AttemptActivationIdentity::from_parts(1, key.participation.query_execution_id(), 1),
@@ -623,12 +648,7 @@ impl Fixture {
                 .unwrap()
         };
         let progress = runtime
-            .reserve_admitted_input(
-                actor(),
-                ActorId::new(5).unwrap(),
-                InputClass::Ordinary,
-                &work,
-            )
+            .reserve_admitted_input(actor(), progress_source, InputClass::Ordinary, &work)
             .unwrap()
             .into_standing_input()
             .unwrap();
@@ -2308,6 +2328,326 @@ fn closed_confirmation_waits_for_ordered_marker_and_eof_before_retry_settlement(
 
 #[test]
 fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
+    run_frontend_ordered_control(None);
+}
+
+#[test]
+fn ordered_host_runs_pending_seal_cut_through_the_attempt_core() {
+    for finished_first in [true, false] {
+        run_frontend_ordered_control(Some(finished_first));
+    }
+}
+
+struct ProtocolUnits(usize);
+
+impl novarocks_attempt_protocol::capacity::StepContext for ProtocolUnits {
+    fn charge(&mut self, units: usize) -> bool {
+        let Some(remaining) = self.0.checked_sub(units) else {
+            return false;
+        };
+        self.0 = remaining;
+        true
+    }
+
+    fn reserve_queue_stage(
+        &mut self,
+        _: novarocks_attempt_protocol::config::DispatchLane,
+        _: bool,
+        _: BackendProcessId,
+        _: usize,
+        _: usize,
+    ) -> novarocks_attempt_protocol::capacity::QueueStage {
+        panic!("the ordered-only fixture has no Native dispatch")
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProtocolObservation {
+    Batch(InputId, Vec<(ParticipationRef, u64)>),
+    FirstSealProcessing(InputId),
+    SealResult(bool),
+}
+
+struct ProtocolOrder {
+    core: novarocks_attempt_protocol::Core,
+    sources: novarocks_attempt_protocol::start::AttemptSources,
+    continuation: u64,
+    observed: Arc<Mutex<Vec<ProtocolObservation>>>,
+}
+
+impl ProtocolOrder {
+    fn apply(
+        &mut self,
+        now: MonotonicInstant,
+        source: novarocks_attempt_protocol::input::AttemptSourceId,
+        input: novarocks_attempt_protocol::input::AttemptInputId,
+        value: AttemptInput,
+        observed_tail: Option<novarocks_attempt_protocol::input::AttemptInputId>,
+    ) -> novarocks_attempt_protocol::AttemptStep {
+        use novarocks_attempt_protocol::{
+            AttemptCore,
+            input::{AttemptInputClaim, AttemptSourceCut},
+        };
+        self.core
+            .handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input,
+                    native_cut: Some(AttemptSourceCut {
+                        source: self.sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: self.sources.observation,
+                        tail: observed_tail,
+                    }),
+                },
+                value,
+                &mut ProtocolUnits(64),
+            )
+            .unwrap()
+    }
+
+    fn next_continuation(&mut self) -> novarocks_attempt_protocol::input::AttemptInputId {
+        self.continuation += 1;
+        novarocks_attempt_protocol::input::AttemptInputId(
+            NonZeroU64::new(self.continuation).unwrap(),
+        )
+    }
+}
+
+impl crate::control_runtime::actor::TestActor for ProtocolOrder {
+    fn handle(
+        &mut self,
+        at: Tick,
+        claim: InputEnvelope,
+        input: crate::control_runtime::actor::FrontendInput,
+        step: &mut ActorStep<'_, crate::control_runtime::actor::FrontendEffect>,
+    ) {
+        use crate::control_runtime::actor::{FrontendEffect, FrontendInput};
+        use novarocks_attempt_protocol::{
+            InputSelection,
+            effect::{EffectBody, Publication},
+            input::{AttemptInputId, PublicationApplied},
+        };
+        use novarocks_control_runtime_core::effect::EffectKind;
+        use novarocks_coordination_contract::AttemptToLogicalBody;
+
+        let FrontendInput::Attempt(input) = input else {
+            panic!("the fixture consumes the original ordered input");
+        };
+        let input_id = AttemptInputId(NonZeroU64::new(claim.input.get()).unwrap());
+        if let AttemptInput::Executor(ExecutorFact::Observations(batch)) = input.as_ref() {
+            let keys = batch
+                .items()
+                .iter()
+                .map(|frame| {
+                    let sequence = match &frame.event {
+                        ObservationEvent::Fact {
+                            fact: ObservationFact::Bookmark { sequence, .. },
+                            ..
+                        } => *sequence,
+                        ObservationEvent::Fact {
+                            fact: ObservationFact::Status(_),
+                            ..
+                        } => 0,
+                        _ => panic!("unexpected ordered fixture observation"),
+                    };
+                    (frame.participation, sequence)
+                })
+                .collect();
+            self.observed
+                .lock()
+                .unwrap()
+                .push(ProtocolObservation::Batch(claim.input, keys));
+        }
+        let now = MonotonicInstant::from_origin(Duration::from_nanos(at.0));
+        let mut result = self.apply(
+            now,
+            self.sources.observation,
+            input_id,
+            *input,
+            Some(input_id),
+        );
+        if let Some(processed) = result.root_control_processed {
+            assert_eq!(processed, input_id);
+            self.observed
+                .lock()
+                .unwrap()
+                .push(ProtocolObservation::FirstSealProcessing(claim.input));
+            let author = step.input_author().unwrap().clone();
+            step.effect_from_author(
+                &author,
+                crate::task_execution::host::adapter::descriptor(
+                    result.notice_action.expect("original Core notice").get(),
+                    author.work(),
+                    EffectKind::Settlement,
+                ),
+                FrontendEffect::AttemptRootControlProcessed(claim.input),
+            )
+            .unwrap();
+        }
+        // Model external publication delivery and the Core timer only. The
+        // production ordered writer and Host must still retire the control.
+        for _ in 0..64 {
+            let applied = result.effect.take().and_then(|effect| {
+                let applied = match effect.body {
+                    EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                        PublicationApplied::ProtocolBatch { published: true }
+                    }
+                    EffectBody::Publish(Publication::RootStatus(_)) => {
+                        PublicationApplied::RootStatus
+                    }
+                    EffectBody::Port(port) => {
+                        if let AttemptToLogicalBody::SealResult {
+                            token: reply,
+                            result,
+                        } = port.body
+                        {
+                            assert_eq!(reply, token(1));
+                            self.observed
+                                .lock()
+                                .unwrap()
+                                .push(ProtocolObservation::SealResult(result.is_ok()));
+                            return Some((effect.id, PublicationApplied::SealResult));
+                        }
+                        assert!(matches!(
+                            port.body,
+                            AttemptToLogicalBody::AttemptTerminal(_)
+                        ));
+                        return None;
+                    }
+                    EffectBody::AdjustReadWindow(_) | EffectBody::ReleaseCreationPayload { .. } => {
+                        return None;
+                    }
+                    other => panic!("unexpected ordered fixture effect: {other:?}"),
+                };
+                Some((effect.id, applied))
+            });
+            let (source, value) = match (result.selection, applied) {
+                (InputSelection::Only(source), Some((effect, applied)))
+                    if source == self.sources.publication =>
+                {
+                    (
+                        source,
+                        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                            effect,
+                            result: Ok(applied),
+                        }),
+                    )
+                }
+                (InputSelection::Only(source), None) if source == self.sources.actor => {
+                    (source, AttemptInput::Timer)
+                }
+                (InputSelection::Only(source), None) if source == self.sources.observation => {
+                    return;
+                }
+                (InputSelection::Prefer(source), None) if source == self.sources.native => return,
+                other => panic!("unexpected continuation after ordered fixture input: {other:?}"),
+            };
+            let id = self.next_continuation();
+            result = self.apply(now, source, id, value, None);
+        }
+        panic!("the original ordered fixture input did not finish");
+    }
+}
+
+fn ordered_protocol_fixture(
+    observed: Arc<Mutex<Vec<ProtocolObservation>>>,
+) -> (
+    ProtocolOrder,
+    AttemptActivationIdentity,
+    TaskIdentity,
+    TaskIdentity,
+    [StreamKey; 2],
+) {
+    use crate::task_execution::host::adapter::tests::start;
+    use novarocks_attempt_protocol::{
+        AttemptCore, Core, input::AttemptSourceId, start::PayloadRef,
+    };
+    use novarocks_coordination_contract::AttemptActionId;
+    let mut start = start();
+    let root = start.plan.graph.root;
+    let root_task = start.plan.graph.tasks[&root.task_id()].clone();
+    let backend = BackendProcessId::new_v7();
+    let sibling = TaskIdentity::new(
+        root.query_execution_id(),
+        StageId::new(root.stage_id().get() + 1).unwrap(),
+        TaskId::new(root.task_id().get() + 1).unwrap(),
+        backend,
+    );
+    let sibling_participation = ParticipationRef::new(
+        root.query_execution_id(),
+        root_task.participation.frontend_process_id(),
+        backend,
+    );
+    let root_backend = root.backend_process_id();
+    let mut sibling_task = root_task.clone();
+    sibling_task.identity = sibling;
+    sibling_task.participation = sibling_participation;
+    sibling_task.creation.resource = PayloadRef(NonZeroU64::new(3).unwrap());
+    start
+        .plan
+        .graph
+        .tasks
+        .insert(sibling.task_id(), sibling_task);
+    start
+        .plan
+        .graph
+        .stages
+        .insert(sibling.stage_id(), Box::new([sibling]));
+    let mut material = start.plan.establish_material[&root_task.participation];
+    material.material = PayloadRef(NonZeroU64::new(4).unwrap());
+    start
+        .plan
+        .establish_material
+        .insert(sibling_participation, material);
+    start
+        .plan
+        .admission_epochs
+        .insert(backend, start.plan.admission_epochs[&root_backend]);
+    start
+        .plan
+        .preparation_positions
+        .insert(backend, start.plan.preparation_positions[&root_backend]);
+    start.sources.observation = AttemptSourceId(NonZeroU64::new(11).unwrap());
+
+    let activation = start.activation.identity;
+    let sources = start.sources;
+    let mut core = <Core as AttemptCore>::new(start).unwrap();
+    let streams = [root_task.participation, sibling_participation].map(|participation| {
+        let generation = core
+            .open_subscription_for_test(
+                participation,
+                AttemptActionId::new(NonZeroU64::new(99).unwrap()),
+                token(99),
+                &mut ProtocolUnits(64),
+            )
+            .unwrap();
+        StreamKey {
+            participation,
+            generation,
+        }
+    });
+    let mut protocol = ProtocolOrder {
+        core,
+        sources,
+        observed,
+        continuation: 1 << 32,
+    };
+    let id = protocol.next_continuation();
+    protocol.apply(
+        MonotonicInstant::ORIGIN,
+        sources.actor,
+        id,
+        AttemptInput::Bootstrap,
+        None,
+    );
+    (protocol, activation, root, sibling, streams)
+}
+
+fn run_frontend_ordered_control(finished_first: Option<bool>) {
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput, TestActor},
         host::{
@@ -2437,11 +2777,13 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
         }
     }
 
-    let ledger = RuntimeLedger::new(ResourceVector::default());
+    use novarocks_control_runtime::history::HistoryCapture;
+    use novarocks_control_runtime_core::history::{EffectHistoryPhase, HistoryFact};
+    let runtime_history = HistoryCapture::new(4096);
+    let ledger = RuntimeLedger::with_history(ResourceVector::default(), runtime_history.clone());
     let generation = Generation::new(1).unwrap();
     let scope = ledger.open_scope_next(None, generation).unwrap();
-    let runtime = ActorRuntime::new();
-    let source = ActorId::new(2).unwrap();
+    let runtime = ActorRuntime::with_history(runtime_history.clone());
     let config = ActorConfig {
         mailbox: [4; 4],
         max_batches: 4,
@@ -2451,20 +2793,55 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
         max_step_work: 1,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let registration = runtime
-        .register_bound(
-            actor(),
-            scope.clone(),
-            FrontendActor::Test(Box::new(Core(seen.clone()))),
-            config,
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let (test_actor, activation, root, key, sibling) = if finished_first.is_some() {
+        let (protocol, activation, root, sibling, [first, second]) =
+            ordered_protocol_fixture(observed.clone());
+        (
+            FrontendActor::Test(Box::new(protocol)),
+            activation,
+            root,
+            first,
+            Some((sibling, second)),
         )
+    } else {
+        let key = key();
+        let query = key.participation.query_execution_id();
+        let activation = AttemptActivationIdentity::from_parts(1, query, 1);
+        let root = TaskIdentity::new(
+            query,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            key.participation.backend_process_id(),
+        );
+        (
+            FrontendActor::Test(Box::new(Core(seen.clone()))),
+            activation,
+            root,
+            key,
+            None,
+        )
+    };
+    let source = ActorId::new(if sibling.is_some() { 11 } else { 2 }).unwrap();
+    let registration = runtime
+        .register_bound(actor(), scope.clone(), test_actor, config)
         .unwrap_or_else(|_| panic!("original ordered actor"));
-    let budget = ObservationBudget {
-        queued_frames: 3,
-        total_positions: 5,
-        max_frame_bytes: 1024,
-        total_bytes: 4608,
-        control_bytes: 512,
+    let budget = if sibling.is_some() {
+        ObservationBudget {
+            queued_frames: 260,
+            total_positions: 262,
+            max_frame_bytes: 2048,
+            total_bytes: 2048 * 262 + 512,
+            control_bytes: 512,
+        }
+    } else {
+        ObservationBudget {
+            queued_frames: 3,
+            total_positions: 5,
+            max_frame_bytes: 1024,
+            total_bytes: 4608,
+            control_bytes: 512,
+        }
     };
     let (mut work, mut reservation) = scope
         .reserve_next(
@@ -2491,19 +2868,8 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
             original
         })
         .collect();
-    let key = key();
-    let query = key.participation.query_execution_id();
-    let binding = RootControlBinding::for_registered_source(
-        registration.clone(),
-        AttemptActivationIdentity::from_parts(1, query, 1),
-        TaskIdentity::new(
-            query,
-            StageId::new(1).unwrap(),
-            TaskId::new(1).unwrap(),
-            key.participation.backend_process_id(),
-        ),
-    )
-    .unwrap();
+    let binding =
+        RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
     let bank = Bank::make(budget, positions, binding.clone());
     let standing = |class| {
         runtime
@@ -2562,22 +2928,229 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
             host.drive(Tick(1), turn);
         }
     };
-    ingress.register_stream(key).unwrap();
-    let mut credit = Some(bank.credit(false, Some(key)).unwrap());
-    let mut opened = ready(Ok::<(), ObservationFailure>(()));
-    assert!(matches!(
-        ingress
-            .poll_open(
+    let open = |key| {
+        ingress.register_stream(key).unwrap();
+        let mut credit = Some(bank.credit(false, Some(key)).unwrap());
+        let mut opened = ready(Ok::<(), ObservationFailure>(()));
+        assert!(matches!(
+            ingress
+                .poll_open(
+                    key,
+                    &mut credit,
+                    Pin::new(&mut opened),
+                    &mut Context::from_waker(Waker::noop()),
+                )
+                .unwrap()
+                .result,
+            Poll::Ready(Ok(()))
+        ));
+    };
+    open(key);
+
+    let mut finish = || {
+        read_progress.close_after_exit().unwrap();
+
+        ingress.job_closed(key).unwrap();
+        ingress.retire_stream(key).unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        reservation.finish().unwrap();
+        scope.close_external().unwrap();
+        bank.metadata.lock().unwrap().refuse_once = true;
+        assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
+        scope.reap_ready(budget.total_positions + 8).unwrap();
+        assert!(scope.join_ready().unwrap());
+        exit.request_close().unwrap();
+        drive();
+        assert!(!host.is_empty());
+        ingress.close_after_exit().unwrap();
+        bank.retire_positions();
+        scope.reap_ready(budget.total_positions + 8).unwrap();
+        runtime.notify_host_actor(&registration).unwrap();
+        drive();
+        assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    };
+
+    if let (Some(finished_first), Some((sibling, other))) = (finished_first, sibling) {
+        use novarocks_execution_contract::{
+            AbortCause, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
+            TerminationDetail,
+        };
+        open(other);
+        let accept = |key, event| {
+            ingress
+                .accept(key, event, 32, bank.credit(false, Some(key)).unwrap())
+                .unwrap();
+        };
+        // The status suffix is still part of the initial covered transfer.
+        // These markers advance liveness without claiming a covered prefix.
+        let marker = |key: StreamKey, sequence| ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Bookmark {
+                generation: key.generation.get(),
+                sequence,
+                covered_prefix: 0,
+                source_cut: 0,
+            },
+        };
+        accept(key, marker(key, 1));
+        let read = |key| {
+            let mut frame = ready(());
+            let mut credit = Some(bank.credit(false, Some(key)).unwrap());
+            match ingress.poll_receive(
                 key,
                 &mut credit,
-                Pin::new(&mut opened),
+                Pin::new(&mut frame),
                 &mut Context::from_waker(Waker::noop()),
-            )
-            .unwrap()
-            .result,
-        Poll::Ready(Ok(()))
-    ));
-    drop(credit);
+            ) {
+                Poll::Ready(Ok((receipt, ()))) => receipt,
+                _ => panic!("the original receipt did not enter the ordered writer"),
+            }
+        };
+        let earlier = read(key);
+        let later = read(other);
+        ingress
+            .complete_receive(&later, marker(other, 3), 32)
+            .unwrap();
+        ingress
+            .complete_receive(&earlier, marker(key, 2), 32)
+            .unwrap();
+        for sequence in 4..=258 {
+            let key = if sequence % 2 == 0 { key } else { other };
+            accept(key, marker(key, sequence));
+        }
+        ingress.root_control(bank.seal()).unwrap();
+        let status = |task, state, termination| ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Status(
+                TaskStatus::try_new_with_installed(
+                    task,
+                    TaskStatusVersion::FIRST,
+                    state,
+                    termination,
+                    TaskOutputFacts::new(state == TaskState::Finished),
+                    true,
+                )
+                .unwrap(),
+            ),
+        };
+        let finished = (key, status(root, TaskState::Finished, None));
+        let failed = (
+            other,
+            status(
+                sibling,
+                TaskState::Aborted,
+                Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+            ),
+        );
+        for (key, event) in if finished_first {
+            [finished, failed]
+        } else {
+            [failed, finished]
+        } {
+            accept(key, event);
+        }
+
+        for _ in 0..3 {
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            drive();
+        }
+        assert!(runtime.poll_one(Tick(1)).unwrap());
+        let prefix = observed.lock().unwrap();
+        let [
+            ProtocolObservation::Batch(first_id, first),
+            ProtocolObservation::Batch(batch_id, batch),
+            ProtocolObservation::Batch(last_id, last),
+            ProtocolObservation::FirstSealProcessing(control),
+        ] = prefix.as_slice()
+        else {
+            panic!("the Core did not first process the pending seal after the 256-frame cut");
+        };
+        assert_eq!(first.as_slice(), [(key.participation, 1)]);
+        assert_eq!(batch.len(), 256);
+        assert_eq!(
+            batch[..2],
+            [(key.participation, 2), (other.participation, 3)]
+        );
+        assert_eq!(last.as_slice(), [(key.participation, 258)]);
+        let mut expected_inputs = vec![*first_id, *batch_id, *last_id, *control];
+        let control = *control;
+        drop(prefix);
+        assert!(runtime.input_custody(actor(), control).unwrap().is_some());
+        assert!(
+            !runtime.poll_one(Tick(1)).unwrap(),
+            "the suffix requires actual Host retirement"
+        );
+        drive();
+        assert!(runtime.input_custody(actor(), control).unwrap().is_none());
+        assert!(
+            runtime.poll_one(Tick(1)).unwrap(),
+            "pending Seal cannot block its evidence"
+        );
+        drive();
+        let history = observed.lock().unwrap();
+        let [
+            ProtocolObservation::Batch(suffix_id, suffix),
+            ProtocolObservation::SealResult(success),
+        ] = &history[4..]
+        else {
+            panic!("expected one suffix batch and one decision from the actual Core: {history:?}");
+        };
+        assert_eq!(suffix.len(), 2);
+        assert_eq!(*success, finished_first);
+        expected_inputs.push(*suffix_id);
+        drop(history);
+        let history = runtime_history.drain(4096);
+        assert!(
+            history.complete && history.remaining == 0,
+            "{:?}",
+            history.error
+        );
+        let consumed = history
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.fact {
+                HistoryFact::InputConsumed { input, .. } if expected_inputs.contains(input) => {
+                    Some(*input)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(consumed, expected_inputs);
+        let control_completion = history
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.fact {
+                HistoryFact::Effect {
+                    input,
+                    phase: EffectHistoryPhase::Completed,
+                    ..
+                } if *input == control => Some(entry.ordinal),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let suffix_consumption = history
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.fact {
+                HistoryFact::InputConsumed { input, .. }
+                    if Some(input) == expected_inputs.last() =>
+                {
+                    Some(entry.ordinal)
+                }
+                _ => None,
+            })
+            .expect("the original suffix was consumed");
+        let [completed] = control_completion.as_slice() else {
+            panic!("the Host must consume the first-processing notice once");
+        };
+        assert!(*completed < suffix_consumption);
+        ingress.job_closed(other).unwrap();
+        ingress.retire_stream(other).unwrap();
+        finish();
+        return;
+    }
+
     let accept = |sequence| {
         ingress
             .accept(
@@ -2644,27 +3217,7 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
     drive();
     assert!(coalesced.retired());
     drop((first, coalesced));
-    read_progress.close_after_exit().unwrap();
-
-    ingress.job_closed(key).unwrap();
-    ingress.retire_stream(key).unwrap();
-    work.body_exited().unwrap();
-    work.captures_exited().unwrap();
-    reservation.finish().unwrap();
-    scope.close_external().unwrap();
-    bank.metadata.lock().unwrap().refuse_once = true;
-    assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
-    scope.reap_ready(8).unwrap();
-    assert!(scope.join_ready().unwrap());
-    exit.request_close().unwrap();
-    drive();
-    assert!(!host.is_empty());
-    ingress.close_after_exit().unwrap();
-    bank.retire_positions();
-    scope.reap_ready(8).unwrap();
-    runtime.notify_host_actor(&registration).unwrap();
-    drive();
-    assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+    finish();
 }
 
 #[test]

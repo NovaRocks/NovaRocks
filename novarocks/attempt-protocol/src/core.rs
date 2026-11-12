@@ -694,6 +694,32 @@ impl Core {
             .advance(&self.execution, now, effect, token, context)
     }
 
+    /// Issue a real subscription generation without a Native startup fixture.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn open_subscription_for_test(
+        &mut self,
+        participation: ParticipationRef,
+        effect: AttemptActionId,
+        token: AttemptRequestToken,
+        context: &mut dyn StepContext,
+    ) -> Result<std::num::NonZeroU64, TaskExecutionError> {
+        let now = self.execution.monotonic_now();
+        self.subscriptions.activate(now, participation)?;
+        match self
+            .subscriptions
+            .advance(&self.execution, now, effect, token, context)?
+        {
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::OpenSubscription(request),
+                ..
+            }) if request.participation == participation => Ok(request.generation),
+            _ => Err(schedule(
+                "fixture could not issue its original observation generation",
+            )),
+        }
+    }
+
     /// A host may acknowledge the original root-control claim only after
     /// this first decision, including when the same seal remains pending.
     pub(crate) fn apply_root_control(

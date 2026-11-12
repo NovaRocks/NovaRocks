@@ -10,6 +10,9 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 novarocks-coordination-contract.workspace = true
 novarocks-result-contract.workspace = true
