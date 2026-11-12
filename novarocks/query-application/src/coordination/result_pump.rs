@@ -1098,7 +1098,7 @@ pub(super) async fn run_streamed_root_relay(
 /// follows the local End consumption proof and the root's terminal facts; it
 /// never waits for the Backend to acknowledge the final item.
 #[doc(hidden)]
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) async fn run_root_relay(
     permit: RunningAttemptPermit,
     root: TaskIdentity,

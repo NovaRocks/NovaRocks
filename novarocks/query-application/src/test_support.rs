@@ -902,6 +902,52 @@ impl LogicalExecutionTestHarness {
         )
     }
 
+    /// Drives the production root relay with the original running permit and
+    /// reports its logical decision. The caller can still observe the same
+    /// registered actor while the relay is pending.
+    pub fn run_original_root_relay(
+        &mut self,
+        scope: novarocks_workload_control::WorkScope,
+        binding: crate::coordination::RootRelayBinding,
+        statuses: crate::coordination::AcceptedRootStatusSource,
+        terminal: impl std::future::Future<Output = crate::api::NativeAttemptTerminal> + Send + 'static,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::coordination::LogicalConclusion> + Send>,
+    > {
+        use crate::coordination::{
+            ResultPumpFailure, native_attempt_terminal_channel, root_ack_test_fixture,
+            run_root_relay,
+        };
+        let actor = self.actor().clone();
+        let running = self.running.take().expect("the fixture attempt is active");
+        let root = binding.frontier.root();
+        let (tail_owner, tail) = root_ack_test_fixture(running.identity(), root);
+        let (sender, receiver) = native_attempt_terminal_channel();
+        Box::pin(async move {
+            let relay = run_root_relay(running, root, scope, binding, statuses, receiver, tail);
+            let terminal = async move { sender.publish(terminal.await) };
+            tokio::pin!(relay, terminal);
+            let result = tokio::select! {
+                biased;
+                () = &mut terminal => relay.await,
+                result = &mut relay => result,
+            };
+            tail_owner.close_native();
+            tail_owner.drain().await;
+            match result {
+                Ok(conclusion) => conclusion,
+                Err(ResultPumpFailure::Concluded(original)) => original.conclusion(),
+                Err(ResultPumpFailure::DecisionPending(original)) => original
+                    .fail_logical(&actor)
+                    .await
+                    .expect("same actor decision"),
+                Err(ResultPumpFailure::ActorOutcomeUnknown(original)) => {
+                    panic!("the original QA actor outcome is unknown: {original:?}")
+                }
+            }
+        })
+    }
+
     /// Abandons the active attempt so tests can drive its real stand-down and
     /// registry-shutdown path after exercising a borrowed Native drive.
     pub fn abandon_running_attempt(&mut self) {

@@ -806,7 +806,7 @@ impl NativeActiveCustodyRegistry {
         }
         changed.await;
     }
-    #[cfg(test)]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) async fn root_ack_tail_progress(&self) {
         let changed = self.root_ack_ready.changed.notified();
         tokio::pin!(changed);
@@ -1469,19 +1469,21 @@ fn convergence_panic(payload: Box<dyn std::any::Any + Send>) -> StatementNativeH
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) struct RootAckTestOwner {
     registry: NativeActiveCustodyRegistry,
     key: NativeActiveCustodyKey,
     slot: Arc<ActiveSlot>,
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 impl RootAckTestOwner {
+    #[cfg(test)]
     pub(super) fn start_consumer_in(&self, input: &mut Option<OriginalConsumerStart>) {
         self.registry
             .start_consumer_in(self.key, &self.slot, input)
             .unwrap();
     }
+    #[cfg(test)]
     pub(crate) async fn join_consumer(&self) {
         loop {
             let pending = self.slot.consumer.lock().unwrap().pending();
@@ -1491,12 +1493,15 @@ impl RootAckTestOwner {
             self.registry.root_ack_tail_progress().await;
         }
     }
+    #[cfg(test)]
     pub(crate) fn consumer_pending(&self) -> bool {
         self.slot.consumer.lock().unwrap().pending()
     }
+    #[cfg(test)]
     pub(crate) fn consumer_failed(&self) -> bool {
         self.slot.consumer.lock().unwrap().failed()
     }
+    #[cfg(test)]
     pub(crate) fn consumer_join_panicked(&self) -> bool {
         self.slot
             .consumer
@@ -1506,10 +1511,12 @@ impl RootAckTestOwner {
             .as_ref()
             .is_some_and(|e| e.is_panic())
     }
+    #[cfg(test)]
     pub(crate) fn live_registration(&self) -> bool {
         self.registry
             .blocks_registration(self.key.initial, self.key.generation)
     }
+    #[cfg(test)]
     pub(crate) fn dispose_for_process_exit(self) {
         self.registry.abandon_for_process_exit();
     }
@@ -1521,12 +1528,13 @@ impl RootAckTestOwner {
             self.registry.root_ack_tail_progress().await;
         }
     }
+    #[cfg(test)]
     pub(crate) fn retained(&self) -> bool {
         self.registry
             .contains_registration(self.key.initial, self.key.generation)
     }
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn root_ack_test_fixture(
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
@@ -1537,7 +1545,7 @@ pub(crate) fn root_ack_test_fixture(
     );
     root_ack_test_fixture_in(registry, activation, root)
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 fn root_ack_test_fixture_in(
     registry: NativeActiveCustodyRegistry,
     activation: AttemptActivationIdentity,
@@ -1571,7 +1579,7 @@ pub(crate) fn root_ack_successor_fixture(
         root,
     )
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 fn root_ack_test_fixture_for_key(
     registry: NativeActiveCustodyRegistry,
     key: NativeActiveCustodyKey,

@@ -20,3 +20,6 @@ pub(crate) mod control;
 pub(super) mod qa;
 pub(crate) mod root_control;
 pub(crate) mod terminal;
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod tests;
