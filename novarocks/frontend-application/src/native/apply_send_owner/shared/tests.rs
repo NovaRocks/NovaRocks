@@ -90,10 +90,10 @@ struct Governed {
 }
 impl Governed {
     fn new() -> Self {
-        Self::for_control_origin(None)
+        Self::for_native_origin(None)
     }
 
-    fn for_control_origin(
+    fn for_native_origin(
         peer_endpoint: Option<&novarocks_execution_contract::RuntimeEndpoint>,
     ) -> Self {
         // Use the existing Native author's actual proposal-observer geometry;
@@ -1720,10 +1720,16 @@ async fn actor_withdraws_a_fresh_replay_after_host_handoff_and_before_send_start
     run_actor_send(ActorSendMode::WithdrawReplay, None).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn actor_replays_same_create_without_charging_payload_bytes_twice() {
+    run_actor_send(ActorSendMode::CreateReplay, None).await;
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
     Replay,
+    CreateReplay,
     WithdrawReplay,
     Withdraw,
     Release,
@@ -1743,7 +1749,6 @@ async fn run_actor_send(
         metrics::FrontendHostObservations,
         transport_withdrawal::AttemptEffectEnvelope,
     };
-    use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::host::failure_lifecycle::FailureLifecycle;
     use crate::task_execution::host::failure_publication::{FailureContext, FailurePublications};
     use crate::task_execution::host::failure_supervisor::{
@@ -1753,6 +1758,12 @@ async fn run_actor_send(
         bridge::terminal::{RegisteredAttemptTerminal, TerminalOutbox},
         host::failure_bridge::PendingFailureBridge,
     };
+    use crate::task_execution::{
+        clock::ProcessMonotonicClock,
+        creation::{
+            PricedTaskCreation, creation_owner_header_bytes, tests::original_creation_seed,
+        },
+    };
     use novarocks_attempt_protocol::{
         capacity::ReservationToken,
         effect::{
@@ -1760,6 +1771,7 @@ async fn run_actor_send(
             OperationIntent as ProtocolIntent, QueuedInputPayload,
         },
         input::{ExecutorFact, QueuedInputGrantRef, SendGeneration, WithdrawalOutcome},
+        start::PayloadRef,
     };
     use novarocks_control_runtime::{
         actor::ActorConfig,
@@ -1773,7 +1785,8 @@ async fn run_actor_send(
         AttemptActionId, AttemptActivationIdentity, AttemptToLogicalBody, MonotonicInstant,
     };
     use novarocks_execution_contract::{
-        AbortCause, AbortParticipation, OperationOutcome, ParticipationRef, RuntimeEndpoint,
+        AbortCause, AbortParticipation, OperationEnvelope, OperationKind, OperationOutcome,
+        ParticipationRef, RuntimeEndpoint,
     };
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
@@ -1783,7 +1796,8 @@ async fn run_actor_send(
     use novarocks_types::FrontendProcessId;
 
     let withdraw_replay = mode == ActorSendMode::WithdrawReplay;
-    let replay = mode == ActorSendMode::Replay || withdraw_replay;
+    let create_replay = mode == ActorSendMode::CreateReplay;
+    let replay = mode == ActorSendMode::Replay || withdraw_replay || create_replay;
     let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
     let roles = Roles::with_history(history.clone());
     let fail_core = failure_verdict.is_some();
@@ -1795,7 +1809,20 @@ async fn run_actor_send(
     } else {
         None
     };
-    let mut wc = Governed::for_control_origin(peer.as_ref().map(|peer| &peer.control_endpoint));
+    let creation_seed = create_replay.then(original_creation_seed);
+    let backend = creation_seed
+        .as_ref()
+        .map_or_else(BackendProcessId::new_v7, |seed| {
+            seed.identity().backend_process_id()
+        });
+    let peer_endpoint = peer.as_ref().map(|peer| {
+        if create_replay {
+            peer.descriptor(backend).endpoint().clone()
+        } else {
+            peer.control_endpoint.clone()
+        }
+    });
+    let mut wc = Governed::for_native_origin(peer_endpoint.as_ref());
     let handle = Handle::current();
     let mut runtime = FrontendDataRuntime::new(handle.clone());
     let (parent, payer) = roles
@@ -1809,17 +1836,26 @@ async fn run_actor_send(
         .unwrap()
         .bind(WorkKind::Cleanup)
         .unwrap();
-    let backend = BackendProcessId::new_v7();
-    let execution =
-        QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap();
-    let participation = ParticipationRef::new(execution, FrontendProcessId::new_v7(), backend);
+    let participation = creation_seed.as_ref().map_or_else(
+        || {
+            ParticipationRef::new(
+                QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
+                FrontendProcessId::new_v7(),
+                backend,
+            )
+        },
+        |seed| seed.participation(),
+    );
+    let execution = participation.query_execution_id();
     let lifecycle = FailureLifecycle::freeze([participation].into_iter());
     let starts = lifecycle.starts();
     if let Some(peer) = &peer {
         if replay {
             peer.expect_transport_unknown();
         }
-        if !withdraw_replay {
+        if let Some(seed) = creation_seed.as_ref() {
+            peer.accept_create(seed.identity());
+        } else if !withdraw_replay {
             peer.accept_abort(participation);
         }
         match failure_verdict {
@@ -1829,24 +1865,58 @@ async fn run_actor_send(
             Some(other) => panic!("unsupported fixture failure verdict {other:?}"),
         }
     }
-    let abort = AbortParticipation::new(
-        TaskOperationId::new_v7(),
-        participation,
-        AbortCause::QueryFailed,
-    );
-    let operation = OperationIntent::AbortParticipation(abort);
-    let key = send_key(&operation);
+    let payload = PayloadRef(NonZeroU64::MIN);
+    let operation = TaskOperationId::new_v7();
+    let creation = creation_seed.map(|seed| PricedTaskCreation::quote(seed, payload).unwrap());
+    let creation_task = creation
+        .as_ref()
+        .map(|(_, original)| original.seed.identity());
+    let protocol = if let Some((quote, original)) = &creation {
+        ProtocolIntent::CreateTask {
+            envelope: OperationEnvelope::with_default_wait(operation, OperationKind::CreateTask),
+            identity: original.seed.identity(),
+            creation: payload,
+            queued_bytes: quote.queued_bytes,
+        }
+    } else {
+        ProtocolIntent::AbortParticipation(AbortParticipation::new(
+            operation,
+            participation,
+            AbortCause::QueryFailed,
+        ))
+    };
+    let key = transport::SendKey {
+        operation,
+        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+    };
     let reference = QueuedInputGrantRef::new(NonZeroU64::MIN, key.generation);
-    let protocol = ProtocolIntent::AbortParticipation(abort);
+    let control = protocol.requires_control_progress();
+    let (lane, kind, class) = if control {
+        (
+            TransportCapacityLane::Control,
+            WorkKind::Settlement,
+            EffectClass::Settlement,
+        )
+    } else {
+        (
+            TransportCapacityLane::Ordinary,
+            WorkKind::Business,
+            EffectClass::Business,
+        )
+    };
     let make_admit = |reference: QueuedInputGrantRef| {
         AttemptEffectEnvelope::new(AttemptEffect {
             id: reference.generation().admission_effect(),
-            class: EffectClass::Settlement,
+            class,
             body: EffectBody::AdmitQueuedInput {
                 lane: protocol.lane(),
                 operation: protocol.clone(),
                 generation: reference.generation(),
-                payload: QueuedInputPayload::AlreadyRetained,
+                payload: if create_replay && reference.generation() == key.generation {
+                    QueuedInputPayload::NewCreation(payload)
+                } else {
+                    QueuedInputPayload::AlreadyRetained
+                },
             },
         })
     };
@@ -1869,25 +1939,25 @@ async fn run_actor_send(
                 transport::send_queue_resources(
                     &roles.layout,
                     backend,
-                    TransportCapacityLane::Control,
+                    lane,
                     1,
-                    operation.queued_bytes(),
+                    protocol.queued_bytes(),
                 )
                 .unwrap(),
-                WorkKind::Settlement,
+                kind,
             )
             .unwrap();
         let reservation = queue.reservation_id();
         let send = AttemptEffectEnvelope::new(AttemptEffect {
             id,
-            class: EffectClass::Settlement,
+            class,
             body: EffectBody::SendBatch {
                 batch: DispatchBatch {
                     backend,
                     lane: protocol.lane(),
-                    control_progress: true,
+                    control_progress: control,
                     operations: Box::new([protocol.clone()]),
-                    queued_bytes: operation.queued_bytes(),
+                    queued_bytes: protocol.queued_bytes(),
                     queued_at: MonotonicInstant::ORIGIN,
                     queued_inputs: Box::new([reference]),
                 },
@@ -1921,6 +1991,16 @@ async fn run_actor_send(
                 body: EffectBody::Withdraw {
                     effect: replay_send_id,
                 },
+            }),
+            None,
+        )
+    });
+    let release_creation_effect = creation_task.map(|task| {
+        (
+            AttemptEffectEnvelope::new(AttemptEffect {
+                id: AttemptActionId::new(NonZeroU64::new(6).unwrap()),
+                class: EffectClass::Cleanup,
+                body: EffectBody::ReleaseCreationPayload { task, payload },
             }),
             None,
         )
@@ -2119,6 +2199,10 @@ async fn run_actor_send(
     if replay {
         mailbox[InputClass::Lifecycle.index()] += 2 + usize::from(withdraw_replay);
     }
+    if create_replay {
+        // The original payload release has both its own command and result.
+        mailbox[InputClass::Lifecycle.index()] += 2;
+    }
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
         [(admit, None), (send.clone(), queue)]
@@ -2128,7 +2212,8 @@ async fn run_actor_send(
                     .into_iter()
                     .flat_map(|(commands, _)| commands),
             )
-            .chain(withdraw_effect),
+            .chain(withdraw_effect)
+            .chain(release_creation_effect),
         mailbox,
         Some(failure_work.work()),
     );
@@ -2141,23 +2226,43 @@ async fn run_actor_send(
         ]
     });
     let withdraw_command = withdraw_replay.then(|| inbox.reserve_command(&parent));
-    let admission = transport::AdmissionSource::new(
+    let release_creation = create_replay.then(|| inbox.reserve_command(&parent));
+    let mut admission_idle = [VecDeque::new(), VecDeque::new()];
+    admission_idle[usize::from(control)].push_back(inbox.reserve_result(&parent));
+    let mut admission = transport::AdmissionSource::new(
         &parent,
         &payer,
         generation(),
         observer(),
         wc.authority(),
-        [
-            VecDeque::new(),
-            VecDeque::from([inbox.reserve_result(&parent)]),
-        ],
+        admission_idle,
     )
     .unwrap_or_else(|_| panic!("original source payer"));
-    let send_idle = [
-        VecDeque::new(),
-        VecDeque::from([inbox.reserve_result(&parent)]),
-    ];
-    let release_source = release.then(|| {
+    let create_grants = Arc::new(Mutex::new(Vec::new()));
+    let mut expected_payload = None;
+    if let Some((_, original)) = creation {
+        expected_payload = Some(
+            u64::try_from(
+                creation_owner_header_bytes().unwrap() + original.sizing.new_backing_bytes,
+            )
+            .unwrap(),
+        );
+        admission
+            .install_creation(payload, original)
+            .unwrap_or_else(|_| panic!("original Create seed"));
+        let observed = create_grants.clone();
+        admission.observe_create_grants_for_test(move |key, bytes, original| {
+            observed.lock().unwrap().push((
+                key,
+                bytes,
+                original.retained_payload_bytes_for_test(),
+                original.weak_original_lifetimes(),
+            ));
+        });
+    }
+    let mut send_idle = [VecDeque::new(), VecDeque::new()];
+    send_idle[usize::from(control)].push_back(inbox.reserve_result(&parent));
+    let release_source = (release || create_replay).then(|| {
         transport::AttemptCallSource::new(
             &parent,
             &payer,
@@ -2169,10 +2274,14 @@ async fn run_actor_send(
     });
     let report_author = roles.cleanup(parent.id());
     let requests = transport::FrozenSendRequests::default();
-    let endpoint = peer.as_ref().map_or_else(
-        || novarocks_types::NativeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()),
-        |peer| peer.control_endpoint.native_endpoint().clone(),
-    );
+    let original_endpoint = peer_endpoint
+        .unwrap_or_else(|| RuntimeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()));
+    let endpoint = original_endpoint.native_endpoint().clone();
+    let domain = if create_replay {
+        NativeEndpointDomain::BackendData
+    } else {
+        NativeEndpointDomain::BackendControl
+    };
     let context = transport::SendContext {
         registration: inbox.registration().clone(),
         ledger: roles.ledger.clone(),
@@ -2183,12 +2292,7 @@ async fn run_actor_send(
         wire: crate::native::task_transport::wire::AttemptWireFacts {
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([1; 32]),
         },
-        client: Client::for_endpoint(
-            endpoint,
-            NativeEndpointDomain::BackendControl,
-            backend,
-            runtime.clone(),
-        ),
+        client: Client::for_endpoint(endpoint, domain, backend, runtime.clone()),
         apply: runtime.apply_send_port().clone(),
         clock: Arc::new(ProcessMonotonicClock::default()),
         observer: observer(),
@@ -2210,10 +2314,6 @@ async fn run_actor_send(
         activation,
         &roles.scope,
     ));
-    let original_endpoint = peer.as_ref().map_or_else(
-        || RuntimeEndpoint::from_socket_addr(wc.listener.local_addr().unwrap()),
-        |peer| peer.control_endpoint.clone(),
-    );
     let (failure_bridge, residual_port) = PendingFailureBridge::new(
         inbox.registration().clone(),
         activation,
@@ -2345,9 +2445,29 @@ async fn run_actor_send(
         failure_bridge.bind(exit, processes.clone()),
         None,
     );
+    let input_exits = Arc::new(Mutex::new(Vec::new()));
     let advance_host = || {
-        while let Some(turn) = actor_runtime.claim_host_actor() {
-            host.drive(Tick(1), turn);
+        let run = || {
+            while let Some(turn) = actor_runtime.claim_host_actor() {
+                host.drive(Tick(1), turn);
+            }
+        };
+        if create_replay {
+            let ledger = roles.ledger.clone();
+            let input_exits = input_exits.clone();
+            custody::with_input_exit_observer_for_test(
+                move || {
+                    let quota = ledger
+                        .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+                        .unwrap()
+                        .unwrap()
+                        .used;
+                    input_exits.lock().unwrap().push(quota);
+                },
+                run,
+            );
+        } else {
+            run();
         }
     };
 
@@ -2383,11 +2503,12 @@ async fn run_actor_send(
     };
     let observe_send = async |wc: &mut Governed,
                               effect_id,
+                              send_input,
                               send_generation,
                               expect_unknown,
                               expect_withdrawn| {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut started = false;
+        let mut started = false;
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 drive(&mut wc.driver);
                 advance_host();
@@ -2419,7 +2540,15 @@ async fn run_actor_send(
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        }).await;
+        assert!(
+            observed.is_ok(),
+            "original send stalled: effect={effect_id:?}, started={started}, wire requests={}, actor={:?}, effects={:?}",
+            peer.as_ref()
+                .map_or(0, |peer| peer.applied_requests().len()),
+            actor_runtime.snapshot(actor),
+            actor_runtime.effect_inventory(actor, send_input, None, 8),
+        );
         if !expect_withdrawn {
             tokio::time::timeout(Duration::from_secs(3), async {
                 while receipt.lock().unwrap().is_none() {
@@ -2454,12 +2583,23 @@ async fn run_actor_send(
                 .0,
             reservation.unwrap()
         );
-        observe_send(&mut wc, send_id, key.generation, replay, withdraw).await;
+        observe_send(
+            &mut wc,
+            send_id,
+            send_input,
+            key.generation,
+            replay,
+            withdraw,
+        )
+        .await;
     }
-    assert_eq!(starts.was_started(participation), sends);
+    // Create reports its exact Task send through the Native receipt path.
+    assert_eq!(starts.was_started(participation), sends && !create_replay);
     drop(starts);
     if sends {
-        assert_eq!(peer.as_ref().unwrap().control_requests(), 1);
+        let peer = peer.as_ref().unwrap();
+        assert_eq!(peer.applied_requests().len(), 1);
+        assert_eq!(peer.control_requests(), usize::from(control));
     }
     let assert_transport_usage = |expected| {
         assert_eq!(
@@ -2494,7 +2634,7 @@ async fn run_actor_send(
         );
         // The script holds the second unbound guard until its command. Only
         // that future send's capacity may remain when the first queue retires.
-        assert_transport_usage([1, u64::try_from(operation.queued_bytes()).unwrap()]);
+        assert_transport_usage([1, u64::try_from(protocol.queued_bytes()).unwrap()]);
         let observed = history.drain(4096);
         assert!(
             observed.complete && observed.remaining == 0,
@@ -2522,6 +2662,35 @@ async fn run_actor_send(
         let actual = admit_original(&mut wc, admit_command, replay_reference).await;
         assert_ne!(actual.record(), first_grant.record());
         assert_ne!(actual.generation(), first_grant.generation());
+        if let Some(bytes) = expected_payload {
+            assert!(bytes > 0);
+            let observed = create_grants.lock().unwrap();
+            let [
+                (first, first_bytes, first_retained, first_original),
+                (replay, replay_bytes, replay_retained, replay_original),
+            ] = observed.as_slice()
+            else {
+                panic!("the real WC installed both Create generations");
+            };
+            assert_eq!(*first, key);
+            assert_eq!(
+                *replay,
+                transport::SendKey {
+                    operation: key.operation,
+                    generation: replay_generation
+                }
+            );
+            assert_eq!((*first_bytes, *replay_bytes), (bytes, 0));
+            assert_eq!((*first_retained, *replay_retained), (bytes, bytes));
+            assert!(std::sync::Weak::ptr_eq(
+                &first_original.0,
+                &replay_original.0
+            ));
+            assert!(std::sync::Weak::ptr_eq(
+                &first_original.1,
+                &replay_original.1
+            ));
+        }
         let send = submit(send_command);
         let (replay_work, replay_reservation) = replay_custody.unwrap();
         if let Some(withdraw_command) = withdraw_command {
@@ -2551,6 +2720,7 @@ async fn run_actor_send(
         observe_send(
             &mut wc,
             replay_send_id,
+            send,
             replay_generation,
             false,
             withdraw_replay,
@@ -2636,6 +2806,39 @@ async fn run_actor_send(
         }
     }
     assert_transport_usage([0, 0]);
+    if let Some(command) = release_creation {
+        assert_eq!(
+            input_exits.lock().unwrap().as_slice(),
+            &[[1, u64::try_from(protocol.queued_bytes()).unwrap()], [0, 0]],
+            "each WC queue exit follows both original physical quota returns"
+        );
+        let original = receipt
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the replay's exact Create reply");
+        assert_eq!(original.operation_id(), key.operation);
+        assert_eq!(original.worker_outcome(), Some(OperationOutcome::Accepted));
+        assert!(matches!(
+            original.payload(),
+            crate::task_execution::intent::AckPayload::Create(reply)
+                if Some(reply.identity()) == creation_task
+        ));
+        drop(original);
+        let (body, parts) = create_grants.lock().unwrap()[0].3.clone();
+        assert!(body.strong_count() > 0 && parts.strong_count() > 0);
+        let command = submit(command);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while body.strong_count() != 0 || parts.strong_count() != 0 {
+                drive(&mut wc.driver);
+                advance_host();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        actor_runtime.retire_input(actor, command).unwrap();
+    }
     if fail_core {
         {
             let mut waiting = Box::pin(terminal_owner.terminal());
@@ -2667,7 +2870,7 @@ async fn run_actor_send(
     actor_runtime.close_timer_source(actor).unwrap();
     host.close_registration();
     advance_host();
-    if sends && !withdraw_replay {
+    if sends && !withdraw_replay && !create_replay {
         assert!(
             !host.is_empty(),
             "the original Native row still has a reply alias"
@@ -2786,7 +2989,7 @@ async fn run_actor_send(
         assert!(!cleanup.lock().unwrap().transferred);
     }
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
-    if withdraw_replay {
+    if withdraw_replay || create_replay {
         let waits = roles
             .ledger
             .try_capacity_waiter_snapshot()

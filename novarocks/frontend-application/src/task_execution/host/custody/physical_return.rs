@@ -24,6 +24,30 @@ use novarocks_control_runtime::{obligation::ReservationObligation, transaction::
 use novarocks_workload_control::{WorkError, joint_admission::NativeQueuedInputGrant};
 use std::mem::ManuallyDrop;
 
+#[cfg(test)]
+std::thread_local! {
+    static INPUT_EXIT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Observes the exact successful queue exit during the fixture's synchronous Host turn.
+#[cfg(test)]
+pub(crate) fn with_input_exit_observer_for_test<T>(
+    observer: impl FnMut() + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            INPUT_EXIT_OBSERVER.with_borrow_mut(|row| drop(row.take()));
+        }
+    }
+    INPUT_EXIT_OBSERVER.with_borrow_mut(|row| assert!(row.replace(Box::new(observer)).is_none()));
+    let _clear = Clear;
+    run()
+}
+
 #[derive(Debug)]
 #[allow(
     dead_code,
@@ -117,6 +141,12 @@ impl PhysicalInputRetirementObligation {
         let notification = if let Some(input) = self.inputs.pop() {
             match input.queue_exited_in() {
                 Ok(notification) => {
+                    #[cfg(test)]
+                    INPUT_EXIT_OBSERVER.with_borrow_mut(|row| {
+                        if let Some(observer) = row {
+                            observer();
+                        }
+                    });
                     drop(input);
                     Some(notification)
                 }

@@ -829,6 +829,14 @@ impl CreateTaskIntent {
         plan_carrier_bytes(&self.original.parts.fragment, self.original.parts.lengths())
     }
     #[cfg(test)]
+    pub(crate) fn retained_payload_bytes_for_test(&self) -> u64 {
+        self.retention
+            .as_ref()
+            .expect("original Create has its actual WC payload pin")
+            .capacity_bytes()
+            .unwrap()
+    }
+    #[cfg(test)]
     pub(crate) fn same_original(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.original, &other.original)
     }

@@ -1013,6 +1013,20 @@ impl Loopback {
         self.peer.control_requests()
     }
 
+    pub(in crate::native) fn accept_create(&self, task: TaskIdentity) {
+        self.peer.expect_apply(ApplyAnswer::WithAck(vec![(
+            OperationOutcome::Accepted,
+            Some(proto::task_operation_verdict::Ack::CreateTask(
+                codec::encode_create_task_ack(&CreateTaskReceipt::new(
+                    task,
+                    Vec::new(),
+                    TaskStatus::created(task),
+                ))
+                .expect("the exact Create acknowledgement encodes"),
+            )),
+        )]));
+    }
+
     pub(in crate::native) fn accept_abort(&self, participation: ParticipationRef) {
         self.peer.expect_apply(ApplyAnswer::WithAck(vec![(
             OperationOutcome::Accepted,

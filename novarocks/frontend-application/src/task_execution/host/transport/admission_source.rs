@@ -118,6 +118,10 @@ pub(crate) enum AdmissionResultError {
     Fill(CausalFillFailure<FrontendInput>),
 }
 
+#[cfg(test)]
+type CreateGrantObserver =
+    Box<dyn FnMut(SendKey, u64, &crate::task_execution::creation::CreateTaskIntent) + Send>;
+
 /// Uses pre-paid result positions per purpose. Each physical generation
 /// derives its own Work from the original attempt payer and submits to WC
 /// once. Only a completed occurrence returns a result position to the pool.
@@ -134,6 +138,8 @@ pub(crate) struct AdmissionSource {
     payloads: BTreeMap<PayloadRef, PayloadCharge>,
     grants: GrantedInputs,
     failures: FailureRecords,
+    #[cfg(test)]
+    create_grant_observer: Option<CreateGrantObserver>,
 }
 
 impl AdmissionSource {
@@ -163,7 +169,23 @@ impl AdmissionSource {
             payloads: BTreeMap::new(),
             grants: GrantedInputs::default(),
             failures: FailureRecords::default(),
+            #[cfg(test)]
+            create_grant_observer: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_create_grants_for_test(
+        &mut self,
+        observer: impl FnMut(SendKey, u64, &crate::task_execution::creation::CreateTaskIntent)
+        + Send
+        + 'static,
+    ) {
+        assert!(
+            self.create_grant_observer
+                .replace(Box::new(observer))
+                .is_none()
+        );
     }
 
     /// Supplied by the same owner that retains the frozen request. The
@@ -712,6 +734,16 @@ impl AdmissionSource {
                 );
             }
             QueuedInputPayload::AlreadyRetained => {}
+        }
+        #[cfg(test)]
+        if matches!(operation, OperationIntent::CreateTask { .. })
+            && let Some(observer) = self.create_grant_observer.as_mut()
+        {
+            let original = requests
+                .creation_for_test(key.operation)
+                .expect("the paid original is installed before publication");
+            let bytes = input.retain_payload().unwrap().capacity_bytes().unwrap();
+            observer(key, bytes, &original);
         }
         let Some(BodyOutcome::InputAdmitted {
             input,

@@ -1295,6 +1295,8 @@ pub(crate) fn storage_layouts()
 }
 
 mod physical_return;
+#[cfg(test)]
+pub(crate) use physical_return::with_input_exit_observer_for_test;
 pub(crate) use physical_return::{PhysicalInputRetirementObligation, PhysicalReturnError};
 mod encoding;
 pub(crate) use encoding::{EncodingBinding, EncodingJob, owned_layouts as encoding_owned_layouts};
