@@ -592,6 +592,169 @@ mod tests {
     }
 
     #[test]
+    fn establish_prefix_keeps_the_valid_peer_receipt_after_the_first_error() {
+        use crate::dispatch::DispatchOperationState;
+        use novarocks_execution_contract::{
+            LeaseReceipt, ParticipationReceipt, ParticipationState,
+        };
+        use std::time::Duration;
+
+        for invalid_start in [false, true] {
+            let mut execution = crate::test_support::execution_with_strict_input();
+            let participants: Vec<_> = execution.graph().participations().copied().collect();
+            let [first, peer] = [participants[0], participants[1]];
+            let mut emit = |participation, sequence| {
+                let receipt = emit_admission(
+                    &mut execution,
+                    participation,
+                    sequence,
+                    OperationOutcome::Accepted,
+                );
+                execution.apply_dispatched_reply(&receipt).1.unwrap();
+                let effect = AttemptActionId::new(id(sequence + 20));
+                let generation = SendGeneration::new(AttemptActionId::new(id(sequence + 10)));
+                let intent = queue_establish(
+                    &mut execution,
+                    participation,
+                    QueuedInputGrantRef::new(id(sequence + 10), generation),
+                );
+                let batch = execution.dispatcher.take_batch().unwrap();
+                execution.dispatcher.accept_emitted(&batch, effect).unwrap();
+                (intent, effect, generation)
+            };
+            let (first_intent, first_send, first_generation) = emit(first, 1);
+            let (peer_intent, peer_send, peer_generation) = emit(peer, 2);
+            let first_operation = first_intent.operation_id();
+            let peer_operation = peer_intent.operation_id();
+            let OperationIntent::EstablishParticipation {
+                initial_lease_sequence,
+                initial_lease_valid_for,
+                ..
+            } = peer_intent
+            else {
+                panic!("expected the peer's frozen Establish");
+            };
+            let source = AttemptSourceId(id(7));
+            let tail = AttemptInputId(id(4));
+            let now = execution.now;
+            let mut phase = NativeAckPhase::new(source, [1, 1, 3, 1]).unwrap();
+            phase
+                .begin(AttemptSourceCut {
+                    source,
+                    tail: Some(tail),
+                })
+                .unwrap();
+            let started = |effect, operation, participation| ExecutorFact::EstablishRpcStarted {
+                effect,
+                operation,
+                participation,
+                started_at: now,
+            };
+            let verdict = |operation_id, generation, outcome, acknowledgement| {
+                ExecutorFact::Operation(OperationObservation {
+                    generation,
+                    reply: OperationReply {
+                        operation_id,
+                        kind: OperationKind::UpdateParticipation,
+                        result: OperationReplyResult::Worker(OperationResult::Verdict {
+                            outcome,
+                            detail: None,
+                            acknowledgement,
+                        }),
+                    },
+                })
+            };
+            let mut apply = |input, fact| {
+                phase
+                    .apply(source, input, &fact, &mut execution, unexpected_abort)
+                    .unwrap();
+            };
+            // The malformed start names the wrong participant while the send
+            // and operation still identify the current original row.
+            let first_reported = if invalid_start { peer } else { first };
+            apply(
+                AttemptInputId(id(1)),
+                started(first_send, first_operation, first_reported),
+            );
+            if !invalid_start {
+                apply(
+                    AttemptInputId(id(2)),
+                    verdict(
+                        first_operation,
+                        first_generation,
+                        OperationOutcome::InvalidStateOrRequest,
+                        None,
+                    ),
+                );
+            }
+            apply(
+                AttemptInputId(id(3)),
+                started(peer_send, peer_operation, peer),
+            );
+            let active = ParticipationReceipt::new(peer, ParticipationState::Active).with_lease(
+                LeaseReceipt::new(
+                    initial_lease_sequence,
+                    initial_lease_valid_for,
+                    Duration::from_secs(9),
+                ),
+            );
+            apply(
+                tail,
+                verdict(
+                    peer_operation,
+                    peer_generation,
+                    OperationOutcome::Accepted,
+                    Some(AckPayload::Participation(active)),
+                ),
+            );
+
+            assert_eq!(execution.owners[&peer].state(), ParticipationState::Active);
+            assert!(execution.needs_covered_subscription(peer));
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .operation_state(peer_operation)
+                    .unwrap(),
+                DispatchOperationState::Absent
+            );
+            assert_eq!(phase.run_round_tail(), Ok(false));
+            phase.begin_settlement(Ok(())).unwrap();
+            if !invalid_start {
+                assert!(execution.owners[&first].is_released());
+                let Some(ObserverDebt::Establish(debt)) = phase.current().unwrap() else {
+                    panic!("expected the original rejected Establish debt");
+                };
+                assert_eq!(debt.operation_id, first_operation);
+                assert_eq!(
+                    debt.result,
+                    ObservedDispatch::Worker(OperationOutcome::InvalidStateOrRequest)
+                );
+                phase.settled_current(Ok(())).unwrap();
+            }
+            let Some(ObserverDebt::Establish(debt)) = phase.current().unwrap() else {
+                panic!("expected the peer's accepted Establish debt");
+            };
+            assert_eq!(debt.operation_id, peer_operation);
+            assert_eq!(
+                debt.result,
+                ObservedDispatch::Worker(OperationOutcome::Accepted)
+            );
+            phase.settled_current(Ok(())).unwrap();
+            assert_eq!(phase.current(), Ok(None));
+            let error = phase.finish().unwrap().unwrap_err();
+            if invalid_start {
+                assert_eq!(error, TaskExecutionError::UnknownOperation);
+            } else {
+                assert!(matches!(
+                    error,
+                    TaskExecutionError::PreReadyEstablishRejected { participation, operation_id, .. }
+                        if participation == first && operation_id == first_operation
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn only_current_establish_rpc_first_poll_can_open_create_pipeline() {
         let mut execution = crate::test_support::execution_with_strict_input();
         let participation = *execution.graph().participations().next().unwrap();
