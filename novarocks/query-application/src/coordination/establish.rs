@@ -281,6 +281,8 @@ pub struct EstablishIssueSnapshot {
     conservative_expiry: MonotonicInstant,
     identity: Option<EstablishIssueIdentity>,
     state: EstablishIssueState,
+    #[cfg(novarocks_dev_controls)]
+    latest_authorization: (u64, EstablishIssueState),
 }
 
 /// Borrowed, non-cloneable projection used by the transport encoder after it
@@ -367,6 +369,12 @@ impl EstablishIssueSnapshot {
 
     pub const fn state(self) -> EstablishIssueState {
         self.state
+    }
+
+    /// Observe the latest authorization generation's own settlement.
+    #[cfg(novarocks_dev_controls)]
+    pub const fn latest_authorization(self) -> (u64, EstablishIssueState) {
+        self.latest_authorization
     }
 }
 
@@ -581,6 +589,8 @@ impl EstablishIssueRecord {
             conservative_expiry: self.conservative_expiry,
             identity: self.identity,
             state: self.operation_state(),
+            #[cfg(novarocks_dev_controls)]
+            latest_authorization: (self.authorization_generation, self.state),
         }
     }
 }

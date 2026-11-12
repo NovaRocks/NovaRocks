@@ -3466,6 +3466,7 @@ mod tests {
         use novarocks_execution_contract::{
             OperationKind, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
         };
+        use novarocks_query_application::coordination::EstablishIssueState;
         for (mode, cancel_before_startup, late_after_handoff) in [
             (0, false, false),
             (1, false, false),
@@ -3601,6 +3602,31 @@ mod tests {
                         .retained_late_establish_for_test(held.operation_id())
                 );
             }
+            let replay_issue = if late_after_handoff {
+                Some(
+                    tokio::time::timeout_at(deadline, async {
+                        loop {
+                            if let Some(snapshot) =
+                                logical.establish_snapshot(target).await.unwrap()
+                                && let (generation, EstablishIssueState::TransportOwned) =
+                                    snapshot.latest_authorization()
+                                && generation > 1
+                            {
+                                assert_eq!(generation, 2, "the original guard and one replay");
+                                let identity = snapshot.identity().unwrap();
+                                assert_eq!(identity.operation_id(), held.operation_id());
+                                assert_eq!(identity.participation(), target);
+                                break (identity, generation);
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the original gate owns the newer submission before sealing"),
+                )
+            } else {
+                None
+            };
             if mode == 2 && !late_after_handoff {
                 // Before handoff the original round and actor-gate owner still
                 // own this late receipt. Feed only its actual intake: advance
@@ -3687,31 +3713,35 @@ mod tests {
                 .owner(target)
                 .unwrap()
                 .is_released();
-            if late_after_handoff {
-                // The snapshot names the latest replay, captured by the gate
-                // but never sent by its inner transport. Convergence marks
-                // that replay DefinitelyUnsent; the older unknown send still
-                // requires the original ticket/participation Abort responsibility.
-                tokio::time::timeout_at(deadline, async {
+            if let Some((identity, generation)) = replay_issue {
+                let unsent = (generation, EstablishIssueState::DefinitelyUnsent);
+                let snapshot = tokio::time::timeout_at(deadline, async {
                     loop {
-                        if logical.establish_snapshot(target).await.unwrap().is_some_and(|snapshot| {
-                            snapshot.state() == novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent
-                        }) { break; }
+                        let snapshot = logical.establish_snapshot(target).await.unwrap().unwrap();
+                        assert_eq!(snapshot.identity(), Some(identity));
+                        assert_eq!(snapshot.latest_authorization().0, generation);
+                        if snapshot.latest_authorization() == unsent {
+                            break snapshot;
+                        }
                         tokio::task::yield_now().await;
                     }
-                }).await.unwrap();
-            }
-            // Do not make the result seal or run wait for a later receipt.
-            // Its publisher is released only after the original local handoff.
-            if late_after_handoff {
+                })
+                .await
+                .expect("the original latest submission settles as definitely unsent");
+                assert_eq!(snapshot.state(), EstablishIssueState::TransportUnknown);
+
+                // Release the late publisher only after the original local
+                // handoff and the actor's exact latest-generation settlement.
                 publish_late.send(()).unwrap();
                 tokio::time::timeout_at(deadline, late_worker.unwrap())
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(logical.establish_snapshot(target).await.unwrap().unwrap().state(),
-                    novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent,
-                    "publishing into the original intake is not an applied actor settlement");
+                let after = logical.establish_snapshot(target).await.unwrap().unwrap();
+                assert_eq!(
+                    after, snapshot,
+                    "publishing into the original intake does not settle the actor's original issue"
+                );
             } else {
                 assert!(late_worker.is_none());
             }
