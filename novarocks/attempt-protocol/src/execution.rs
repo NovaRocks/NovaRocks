@@ -4044,14 +4044,15 @@ mod bounded_drain_tests {
     }
 
     #[test]
-    fn release_waits_for_both_actual_stops_and_retries_only_at_the_original_deadline() {
+    fn release_retries_at_50_and_100_ms_while_renewal_remains_live() {
         use crate::{
-            effect::EffectBody,
-            input::{AckPayload, OperationReplyResult},
+            diagnostics::sources::DiagnosticSourceAssembly,
+            input::{AckPayload, OperationObservation, OperationReplyResult},
         };
         use novarocks_execution_contract::{
-            OperationOutcome, ParticipationState, QuiesceParticipationReceipt,
-            TaskConvergenceVersion, operation::OperationResult,
+            OperationOutcome, ParticipationReceipt, ParticipationState,
+            QuiesceParticipationReceipt, ReleaseOutcome, TaskConvergenceVersion,
+            operation::OperationResult,
         };
         let mut execution = crate::test_support::execution_with_strict_input();
         let root = execution.graph.root_identity();
@@ -4064,8 +4065,16 @@ mod bounded_drain_tests {
             .task_by_identity_ref(producer)
             .unwrap()
             .participation();
-        begin_test_establish(&mut execution, receiver);
-        let created = enqueue_create(&mut execution, root, grant(1));
+        let establish = prepare_test_establish(&mut execution, receiver);
+        let establish_input = grant(1);
+        start_test_lifecycle_send(&mut execution, &establish, establish_input, 2);
+        settle_test_lease(
+            &mut execution,
+            &establish,
+            establish_input,
+            Duration::from_secs(9),
+        );
+        let created = enqueue_create(&mut execution, root, grant(3));
         finish(&mut execution, root);
         execution.activate_covered_observation();
         execution.normal_drain_started = true;
@@ -4137,6 +4146,8 @@ mod bounded_drain_tests {
             .actual_stopped
             .insert(root, stopped(root));
 
+        let release_at = MonotonicInstant::from_origin(Duration::from_millis(2_975));
+        execution.set_now(release_at).unwrap();
         let mut proof = ReleaseCheck::default();
         let ReleaseProgress::Done(Some(intent)) = execution
             .advance_release_candidate(receiver, &mut proof, &mut Turn(16))
@@ -4144,59 +4155,156 @@ mod bounded_drain_tests {
         else {
             panic!("exact inbound and own exit must admit Release");
         };
+        let OperationIntent::ReleaseParticipation(original) = intent else {
+            panic!("expected the original Release request");
+        };
+        assert_eq!(original.participation(), receiver);
         let operation = intent.operation_id();
-        let first = grant(2);
-        execution
-            .begin_lifecycle_admission(intent, first.generation().admission_effect())
-            .unwrap();
+        let backend = receiver.backend_process_id();
+        let apply =
+            |execution: &mut QueryTaskExecution, input: QueuedInputGrantRef, outcome, payload| {
+                assert!(matches!(
+                    execution.apply_dispatched_reply(&OperationObservation {
+                        generation: input.generation(),
+                        reply: worker(
+                            operation,
+                            OperationKind::ReleaseParticipation,
+                            outcome,
+                            Some(payload),
+                        ),
+                    }),
+                    (None, Ok(()))
+                ));
+            };
+        let not_ready = |execution: &mut QueryTaskExecution, input| {
+            apply(
+                execution,
+                input,
+                OperationOutcome::ReleaseNotReady,
+                AckPayload::Release {
+                    receipt: ParticipationReceipt::new(receiver, ParticipationState::Quiescing),
+                    outcome: ReleaseOutcome::NotReady,
+                    runtime_filter: None,
+                },
+            );
+        };
+        let candidate = |execution: &mut QueryTaskExecution| {
+            let ReleaseProgress::Done(intent) = execution
+                .advance_release_candidate(receiver, &mut ReleaseCheck::default(), &mut Turn(16))
+                .unwrap()
+            else {
+                panic!("the exact inbound and own proof fits this turn");
+            };
+            intent
+        };
+        let retry = |execution: &mut QueryTaskExecution, input, send| {
+            let replay = candidate(execution).expect("the original Release retry is due");
+            let OperationIntent::ReleaseParticipation(request) = replay else {
+                panic!("expected the original Release request");
+            };
+            assert_eq!(request.envelope(), original.envelope());
+            assert_eq!(request.participation(), original.participation());
+            start_test_lifecycle_send(execution, &replay, input, send);
+            assert!(execution.dispatcher.tracks_input(operation, input));
+        };
+
         assert_eq!(
             execution.dispatcher.operation_state(created).unwrap(),
             DispatchOperationState::Absent
         );
-        assert!(matches!(
-            execution.observe_lifecycle_grant(operation, first).unwrap(),
-            CreateGrantProgress::Queued
-        ));
-        let batch = execution.dispatcher.take_batch().unwrap();
-        assert_eq!(batch.queued_inputs.as_ref(), [first]);
-        execution
-            .dispatcher
-            .accept_emitted(&batch, grant(20).generation().admission_effect())
-            .unwrap();
-        let reply = worker(
-            operation,
-            OperationKind::ReleaseParticipation,
-            OperationOutcome::ReleaseNotReady,
-            None,
-        );
+        let first = grant(4);
+        start_test_lifecycle_send(&mut execution, &intent, first, 5);
+        not_ready(&mut execution, first);
+        assert!(!execution.dispatcher.tracks_input(operation, first));
+        assert!(execution.owners[&receiver].must_keep_renewing());
+        assert!(!execution.owners[&receiver].is_released());
         assert!(
             execution
-                .acknowledge_current_send(first.generation(), &reply)
-                .unwrap()
+                .released_runtime_filter_contributions()
+                .contributions()
+                .is_empty()
+        );
+        assert!(candidate(&mut execution).is_none());
+
+        let first_retry = release_at.saturating_add(Duration::from_millis(50));
+        let renewal_due = MonotonicInstant::from_origin(Duration::from_secs(3));
+        assert_eq!(execution.next_lifecycle_deadline(), Some(renewal_due));
+        execution.set_now(renewal_due).unwrap();
+        let renewal = execution.next_renewal_intent(receiver).unwrap().unwrap();
+        let renewal_input = grant(6);
+        start_test_lifecycle_send(&mut execution, &renewal, renewal_input, 7);
+        assert_eq!(
+            execution
+                .dispatcher
+                .lane_in_flight(backend, DispatchLane::Lifecycle),
+            1
+        );
+        settle_test_lease(
+            &mut execution,
+            &renewal,
+            renewal_input,
+            Duration::from_secs(3),
+        );
+        assert_eq!(execution.next_lifecycle_deadline(), Some(first_retry));
+        execution
+            .set_now(release_at.saturating_add(Duration::from_millis(49)))
+            .unwrap();
+        assert!(candidate(&mut execution).is_none());
+
+        execution.set_now(first_retry).unwrap();
+        let second = grant(8);
+        retry(&mut execution, second, 9);
+        not_ready(&mut execution, first);
+        assert!(execution.dispatcher.tracks_input(operation, second));
+        not_ready(&mut execution, second);
+        assert!(!execution.dispatcher.tracks_input(operation, second));
+        let second_retry = first_retry.saturating_add(Duration::from_millis(100));
+        assert_eq!(execution.next_lifecycle_deadline(), Some(second_retry));
+        execution
+            .set_now(first_retry.saturating_add(Duration::from_millis(99)))
+            .unwrap();
+        finish(&mut execution, root);
+        assert!(
+            candidate(&mut execution).is_none(),
+            "a repeated output fact cannot accelerate Release"
         );
 
-        let deadline = execution.now.saturating_add(Duration::from_millis(50));
-        assert_eq!(execution.next_lifecycle_deadline(), Some(deadline));
-        assert!(matches!(
+        execution.set_now(second_retry).unwrap();
+        let third = grant(10);
+        retry(&mut execution, third, 11);
+        let contribution = PayloadRef(NonZeroU64::new(19).unwrap());
+        apply(
+            &mut execution,
+            third,
+            OperationOutcome::Accepted,
+            AckPayload::Release {
+                receipt: ParticipationReceipt::new(receiver, ParticipationState::TerminalRetained),
+                outcome: ReleaseOutcome::Released,
+                runtime_filter: Some(contribution),
+            },
+        );
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        assert!(execution.owners[&receiver].is_released());
+        assert!(!execution.owners[&receiver].must_keep_renewing());
+        let diagnostics = execution.diagnostic_sources();
+        let mut assembly = DiagnosticSourceAssembly::new(diagnostics.freeze(execution.now));
+        while !assembly.complete() {
+            assert!(assembly.advance(diagnostics, &mut Turn(1)));
+        }
+        let released = assembly.finish().unwrap().runtime_filters;
+        assert_eq!(released.contributions, [(backend, contribution.0)]);
+        assert!(!released.complete, "the inbound sender has not released");
+        assert!(
             execution
-                .advance_release_candidate(receiver, &mut ReleaseCheck::default(), &mut Turn(16))
-                .unwrap(),
-            ReleaseProgress::Done(None)
-        ));
-        execution.set_now(deadline).unwrap();
-        let ReleaseProgress::Done(Some(replay)) = execution
-            .advance_release_candidate(receiver, &mut ReleaseCheck::default(), &mut Turn(16))
-            .unwrap()
-        else {
-            panic!("exact Release retry is due");
-        };
-        assert_eq!(replay.operation_id(), operation);
-        let second = grant(3);
-        assert!(matches!(
-            execution.begin_lifecycle_admission(replay, second.generation().admission_effect()).unwrap().body,
-            EffectBody::AdmitQueuedInput { generation, .. } if generation == second.generation()
-        ));
+                .participation_convergence_receipt(receiver)
+                .is_none()
+        );
         assert_eq!(execution.next_lifecycle_deadline(), None);
+        execution
+            .set_now(renewal_due.saturating_add(Duration::from_secs(1)))
+            .unwrap();
+        assert!(execution.next_renewal_intent(receiver).unwrap().is_none());
+        assert!(candidate(&mut execution).is_none());
     }
 
     fn start_test_dispatch(
@@ -4214,7 +4322,7 @@ mod bounded_drain_tests {
         batch.operations[0].clone()
     }
 
-    fn start_test_lease_send(
+    fn start_test_lifecycle_send(
         execution: &mut QueryTaskExecution,
         intent: &OperationIntent,
         input: QueuedInputGrantRef,
@@ -4267,7 +4375,12 @@ mod bounded_drain_tests {
             _ => panic!("expected an original lease request"),
         };
         assert!(effective < requested.get());
-        let receipt = ParticipationReceipt::new(participation, ParticipationState::Active)
+        let state = if matches!(intent, OperationIntent::EstablishParticipation { .. }) {
+            ParticipationState::Active
+        } else {
+            execution.owners[&participation].state()
+        };
+        let receipt = ParticipationReceipt::new(participation, state)
             .with_lease(LeaseReceipt::new(sequence, requested, effective));
         assert!(matches!(
             execution.apply_dispatched_reply(&OperationObservation {
@@ -4296,7 +4409,7 @@ mod bounded_drain_tests {
         execution.set_now(sent).unwrap();
         let establish = prepare_test_establish(&mut execution, participation);
         let input = grant(1);
-        start_test_lease_send(&mut execution, &establish, input, 2);
+        start_test_lifecycle_send(&mut execution, &establish, input, 2);
         let ack_at = sent.saturating_add(Duration::from_secs(1));
         execution.set_now(ack_at).unwrap();
         settle_test_lease(&mut execution, &establish, input, Duration::from_secs(9));
@@ -4362,7 +4475,7 @@ mod bounded_drain_tests {
             .participation();
         let establish = prepare_test_establish(&mut execution, participation);
         let establish_input = grant(1);
-        start_test_lease_send(&mut execution, &establish, establish_input, 2);
+        start_test_lifecycle_send(&mut execution, &establish, establish_input, 2);
         let sent = execution.now;
         execution
             .set_now(sent.saturating_add(Duration::from_secs(1)))
@@ -4496,7 +4609,7 @@ mod bounded_drain_tests {
             OperationIntent::RenewParticipationLease(request) if request.participation() == participation
         ));
         let renewal_input = grant(7);
-        start_test_lease_send(&mut execution, &renewal, renewal_input, 8);
+        start_test_lifecycle_send(&mut execution, &renewal, renewal_input, 8);
         let backend = participation.backend_process_id();
         assert!(execution.dispatcher.tracks_input(update, second));
         assert!(
