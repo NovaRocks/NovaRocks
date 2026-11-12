@@ -778,6 +778,12 @@ mod tests {
 
     #[test]
     fn definitive_older_abort_withdraws_pending_replay_without_reusing_grant() {
+        for replay_admitted in [false, true] {
+            definitive_older_abort_at_replay_cut(replay_admitted);
+        }
+    }
+
+    fn definitive_older_abort_at_replay_cut(replay_admitted: bool) {
         let mut execution = crate::test_support::execution_with_strict_input();
         let participation = *execution.graph().participations().next().unwrap();
         let operation = execution.issue_operation_id();
@@ -832,7 +838,9 @@ mod tests {
         aborts
             .begin(&execution, action(20), request, generation(2))
             .unwrap();
-        assert_eq!(aborts.admit_next().unwrap().id, action(2));
+        if replay_admitted {
+            assert_eq!(aborts.admit_next().unwrap().id, action(2));
+        }
         let ignored = aborts.observe::<AttemptFailure>(&mut execution, &unknown);
         assert!(ignored.settlement.is_none() && ignored.cleanup.is_none());
 
@@ -853,9 +861,15 @@ mod tests {
         };
         let resolved = aborts.observe::<AttemptFailure>(&mut execution, &closing);
         resolved.domain.unwrap();
-        assert!(
-            matches!(resolved.cleanup, Some(EffectBody::Withdraw { effect }) if effect == action(2))
-        );
+        if replay_admitted {
+            assert!(
+                matches!(resolved.cleanup, Some(EffectBody::Withdraw { effect }) if effect == action(2))
+            );
+        } else {
+            assert!(resolved.cleanup.is_none());
+        }
+        assert!(!aborts.has_pending());
+        assert!(aborts.admit_next().is_none());
         assert!(
             matches!(resolved.settlement, Some(AttemptToLogicalBody::AbortSettlement {
             abort_action, receipt_generation: Some(original), settlement: AbortIssueSettlement::Worker(OperationOutcome::Accepted), ..
