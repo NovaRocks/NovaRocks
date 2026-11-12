@@ -1147,9 +1147,10 @@ answer its [placement procedure](docs/guides/development/rust-test-organization.
    `tests/it`.
 4. Does it need a target-level property (custom harness, global allocator,
    `required-features`, Loom, Miri, a binary-scoped nextest group)? Only then a
-   standalone integration target.
-5. Does an existing subject file already cover this behaviour axis? Add the
-   case there; create a new file only when none fits.
+   standalone integration target; a test that also needs private items stays
+   under `src/`.
+5. Does an existing subject file, in any layout, already cover this behaviour
+   axis? Add the case there; create a new file only when none fits.
 6. Where does the input come from? Take the nearest sufficient rung of the
    fixture ladder.
 
