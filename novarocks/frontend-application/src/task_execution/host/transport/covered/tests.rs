@@ -294,6 +294,52 @@ async fn subscription_staging_retires_only_its_unpublished_children() {
 
 #[tokio::test]
 async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_exit() {
+    run_installed_subscription(false).await;
+}
+
+#[tokio::test]
+async fn installed_subscription_progress_and_actual_exit_survive_full_ordinary() {
+    run_installed_subscription(true).await;
+}
+
+async fn run_installed_subscription(saturate_ordinary: bool) {
+    use crate::{
+        control_runtime::membership::{
+            AttemptMembershipSource, MembershipRegistry, MembershipTarget, membership_input,
+        },
+        native::transport_capacity::{
+            NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
+        },
+        task_execution::host::{
+            adapter::AttemptCapacitySource, geometry::AttemptHostGeometry,
+            startup::AttemptStartupSource,
+        },
+    };
+    use novarocks_attempt_protocol::{config::CoordinationBudgets, input::ObservationEvent};
+    use novarocks_control_runtime::{
+        actor_turn::InputPhase, coalescing_input::CoalescingInput, history::HistoryCapture,
+        obligation::WorkObligation, transaction::RuntimeError,
+    };
+    use novarocks_control_runtime_core::history::HistoryFact;
+    use novarocks_execution_contract::RuntimeEndpoint;
+    use novarocks_query_application::api::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    };
+    use std::{cell::Cell, num::NonZeroUsize, task::Waker};
+
+    struct CurrentProcess(FrozenMember);
+    impl BackendProcessObservationPort for CurrentProcess {
+        fn observe_process_at_endpoint(
+            &self,
+            process: BackendProcessId,
+            endpoint: &RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, BackendTopologyError> {
+            assert_eq!(process, self.0.participation.backend_process_id());
+            assert_eq!(endpoint, &self.0.endpoint);
+            Ok(BackendProcessObservation::Current)
+        }
+    }
+
     let generation = Generation::new(1).unwrap();
     let budget = ObservationBudget {
         queued_frames: 2,
@@ -309,7 +355,21 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         .unwrap()
         .checked_add(quote.quota())
         .unwrap();
-    let ledger = RuntimeLedger::new(resources.clone());
+    let transport_budget = novarocks_task_codec::TransportBudget::DEFAULT;
+    let layout = NativeTransportCapacity::from_transport(transport_budget).unwrap();
+    let history = saturate_ordinary.then(|| HistoryCapture::new(4096));
+    let ledger = if let Some(history) = &history {
+        RuntimeLedger::with_keyed_families_and_observation(
+            layout.process_limits().checked_add(&resources).unwrap(),
+            layout.keyed_families(),
+            [],
+            Some(history.clone()),
+            Default::default(),
+        )
+        .unwrap()
+    } else {
+        RuntimeLedger::new(resources.clone())
+    };
     let outer = ledger.open_scope_next(None, generation).unwrap();
     let (mut launcher, mut launcher_payer) = outer
         .reserve_next(
@@ -402,29 +462,61 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
     });
     let adjusted = Arc::new((*request).clone());
     let id = |n| AttemptActionId::new(NonZeroU64::new(n).unwrap());
-    let effects = [
-        EffectBody::OpenSubscription(request.clone()),
-        EffectBody::AdjustReadWindow(adjusted.clone()),
-        EffectBody::CloseSubscription {
-            participation,
-            generation: request.generation,
-        },
-    ];
-    let mailbox = [8; 4];
-    let inbox = WithdrawalInbox::with_commands(
-        &scope,
-        effects.into_iter().enumerate().map(|(n, body)| {
-            (
-                AttemptEffectEnvelope::new(AttemptEffect {
-                    id: id(n as u64 + 1),
-                    class: EffectClass::Settlement,
-                    body,
-                }),
-                None,
-            )
-        }),
+    let mut effects = vec![EffectBody::OpenSubscription(request.clone())];
+    if !saturate_ordinary {
+        effects.extend([
+            EffectBody::AdjustReadWindow(adjusted.clone()),
+            EffectBody::CloseSubscription {
+                participation,
+                generation: request.generation,
+            },
+        ]);
+    }
+    let sources = saturate_ordinary.then(|| {
+        AttemptHostGeometry::derive(
+            scope.id(),
+            NonZeroUsize::MIN,
+            CoordinationBudgets::DEFAULT.dispatch,
+            &layout,
+            &[],
+            false,
+        )
+        .unwrap()
+        .sources
+    });
+    let mailbox = sources.map_or([8; 4], |sources| sources.mailbox);
+    let config = ActorConfig {
         mailbox,
-    );
+        max_batches: if saturate_ordinary {
+            mailbox.iter().sum()
+        } else {
+            4
+        },
+        max_effects_per_step: 1,
+        max_dependencies_per_effect: 0,
+        turn_budget: if saturate_ordinary { 16 } else { 8 },
+        max_step_work: 1,
+    };
+    let commands = effects.into_iter().enumerate().map(|(n, body)| {
+        (
+            AttemptEffectEnvelope::new(AttemptEffect {
+                id: id(n as u64 + 1),
+                class: EffectClass::Settlement,
+                body,
+            }),
+            None,
+        )
+    });
+    let inbox = match (sources, &history) {
+        (Some(sources), Some(history)) => WithdrawalInbox::with_attempt_geometry_and_history(
+            &scope,
+            commands,
+            config,
+            sources,
+            history.clone(),
+        ),
+        _ => WithdrawalInbox::with_commands(&scope, commands, mailbox),
+    };
     let runtime = inbox.runtime();
     let registration = inbox.registration();
     let transport =
@@ -458,19 +550,17 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         Some(metadata.pin()),
     )
     .unwrap();
-    let standing = |source, class, work| {
+    let standing = |source, class, work: &WorkObligation| {
         runtime
             .reserve_admitted_input_for(registration, source, class, work)
             .unwrap()
             .into_standing_input()
             .unwrap()
     };
-    let progress = ReadProgressInput::new(
-        registration,
-        participation,
-        standing(inbox.source(), InputClass::Ordinary, observation),
-    )
-    .with_backing(Some(metadata.pin()));
+    let progress_position = standing(inbox.source(), InputClass::Ordinary, observation);
+    let progress_id = progress_position.id();
+    let progress = ReadProgressInput::new(registration, participation, progress_position)
+        .with_backing(Some(metadata.pin()));
     let requests = RootControlRequests::new(
         root.clone(),
         Arc::new(FailurePublications::new(
@@ -486,7 +576,11 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         BTreeMap::from([(participation, progress.clone())]),
         metadata,
     );
-    let observation_source = ActorId::new(4).unwrap();
+    let source_id = |source: novarocks_attempt_protocol::input::AttemptSourceId| {
+        ActorId::new(source.0.get()).unwrap()
+    };
+    let observation_source =
+        sources.map_or_else(|| ActorId::new(4).unwrap(), |s| source_id(s.observation));
     let control_position = standing(observation_source, InputClass::Control, root_control);
     let reply_author = control_position.author().unwrap();
     let ingress = OrderedObservationInput::new(
@@ -539,6 +633,47 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         AttemptCallOwner::SubscriptionControl(endpoints),
         inbox.reserve_result(parent),
     );
+    let membership_registry = Arc::new(MembershipRegistry::new());
+    let queue_parent = payer.id();
+    let ordinary = sources.map(|sources| {
+        let (startup, witness) = AttemptStartupSource::new(
+            registration.clone(),
+            standing(registration.actor(), InputClass::Lifecycle, parent),
+        );
+        let membership_position =
+            standing(source_id(sources.membership), InputClass::Ordinary, parent);
+        let membership_id = membership_position.id();
+        let member = MembershipTarget::register(
+            registration.clone(),
+            Arc::from(roster.clone()),
+            CoalescingInput::new(membership_position, membership_input),
+        );
+        let membership =
+            AttemptMembershipSource::new(membership_registry.clone(), member.target.clone());
+        let capacity_position = standing(source_id(sources.capacity), InputClass::Ordinary, parent);
+        let capacity_id = capacity_position.id();
+        let registrant = Arc::new(scope.capacity_registrant(Waker::noop().clone()).unwrap());
+        let capacity =
+            AttemptCapacitySource::new(registration.clone(), capacity_position, registrant.clone());
+        let roles = [
+            (progress_id, inbox.source()),
+            (membership_id, source_id(sources.membership)),
+            (capacity_id, source_id(sources.capacity)),
+        ];
+        (
+            (startup, capacity, membership),
+            (witness, member, registrant, roles),
+        )
+    });
+    let (startup, capacity_source, membership, ordinary) = match ordinary {
+        Some(((startup, capacity, membership), ordinary)) => (
+            Some(startup),
+            Some(capacity),
+            Some(membership),
+            Some(ordinary),
+        ),
+        None => (None, None, None, None),
+    };
     let host = HostRegistry::new(
         runtime.clone(),
         ledger.clone(),
@@ -554,14 +689,7 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
                 scope: scope.clone(),
                 registration: registration.clone(),
                 kind: FrontendActorKind::Test,
-                config: ActorConfig {
-                    mailbox,
-                    max_batches: 4,
-                    max_effects_per_step: 1,
-                    max_dependencies_per_effect: 0,
-                    turn_budget: 8,
-                    max_step_work: 1,
-                },
+                config,
                 policy: FrontendLanePolicy::attempt(1),
                 source: Box::new(HostSource {
                     subscriptions,
@@ -574,9 +702,9 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
                 }),
                 executor: Arc::new(ActorTransportExecutor(handle.clone())),
                 transport: Some(transport),
-                startup: None,
-                capacity: None,
-                membership: None,
+                startup,
+                capacity: capacity_source,
+                membership,
                 owner_controls: None,
                 ordered_observations: Some(
                     OrderedObservationHost::new(ingress.clone()).with_read_progress([progress]),
@@ -592,13 +720,52 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
             host.drive(Tick(1), turn);
         }
     };
+    if let Some((witness, _, _, _)) = &ordinary {
+        drive();
+        for _ in 0..2 {
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            drive();
+        }
+        assert!(witness.ready_for(registration));
+        assert!(!membership_registry.is_empty());
+    }
     let post = || inbox.submit_command(&command);
+    let lifecycle_filled = || {
+        runtime
+            .input_inventory(registration.actor(), None, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                row.source == inbox.source()
+                    && row.class == InputClass::Lifecycle
+                    && row.phase == InputPhase::Filled
+            })
+            .map(|row| row.input)
+            .collect::<Vec<_>>()
+    };
+    let eof_observed = Cell::new(false);
     let next_fact = || {
         while let Some((envelope, input)) = inbox.try_commit_envelope() {
-            assert_eq!(envelope.source, inbox.source());
             let AttemptInput::Executor(fact) = input else {
                 panic!("expected an original subscription fact");
             };
+            if saturate_ordinary && envelope.source == observation_source {
+                assert_eq!(envelope.class, InputClass::Lifecycle);
+                let ExecutorFact::Observations(batch) = fact else {
+                    panic!("expected the ordered EOF from the original stream");
+                };
+                let [frame] = batch.items() else {
+                    panic!("the loopback sent only EOF");
+                };
+                assert_eq!(
+                    (frame.participation, frame.generation),
+                    (participation, request.generation)
+                );
+                assert!(matches!(&frame.event, ObservationEvent::Closed));
+                assert!(!eof_observed.replace(true));
+                continue;
+            }
+            assert_eq!(envelope.source, inbox.source());
             if let ExecutorFact::ReadProgress(read) = fact {
                 assert_eq!(envelope.class, InputClass::Ordinary);
                 assert_eq!(
@@ -608,13 +775,18 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
                 continue;
             }
             assert_eq!(envelope.class, InputClass::Lifecycle);
-            return Some(fact);
+            return Some((envelope.input, fact));
         }
         None
     };
     let wait_handoff = |input| async move {
+        if saturate_ordinary {
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+        }
         loop {
-            let _ = runtime.poll_one(Tick(1)).unwrap();
+            if !saturate_ordinary {
+                let _ = runtime.poll_one(Tick(1)).unwrap();
+            }
             drive();
             match runtime.retire_input(registration.actor(), input) {
                 Ok(()) => return,
@@ -634,69 +806,269 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         &request
     ));
 
-    tokio::time::timeout(wait, async {
+    let ordinary_inventory = || {
+        runtime
+            .standing_input_inventory(registration.actor(), None, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.class == InputClass::Ordinary)
+            .collect::<Vec<_>>()
+    };
+    let filled_ordinary = || {
+        let (_, _, _, roles) = ordinary.as_ref().unwrap();
+        let rows = ordinary_inventory();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), mailbox[InputClass::Ordinary.index()]);
+        for &(id, source) in roles {
+            let row = rows.iter().find(|row| row.standing_input_id == id).unwrap();
+            assert_eq!(row.source, source);
+            let input = row
+                .in_flight
+                .expect("the original Ordinary occurrence is filled");
+            let custody = runtime
+                .input_custody(registration.actor(), input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    custody.class,
+                    custody.phase,
+                    custody.source,
+                    custody.standing_input_id
+                ),
+                (InputClass::Ordinary, InputPhase::Filled, source, Some(id)),
+            );
+            assert!(!custody.runtime_metadata);
+        }
+        rows
+    };
+    let mut wait_target = None;
+    let ordinary_cut = if let Some((_, _, registrant, _)) = &ordinary {
+        membership_registry.publish_for_test(1, &CurrentProcess(roster[0].clone()));
+        let resources = |items| {
+            layout
+                .queue_resources(backend, TransportCapacityLane::Ordinary, items, 1)
+                .unwrap()
+        };
+        let blocker = scope
+            .reserve_next(
+                generation,
+                resources(layout.capacity_sources().target_items),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let denial = match scope.reserve_child_next_or_wait(
+            generation,
+            queue_parent,
+            resources(1),
+            WorkKind::Business,
+            registrant,
+        ) {
+            Err(RuntimeError::CapacityDenied(denial)) => denial,
+            _ => panic!("the original Ordinary queue wait must be denied"),
+        };
+        assert!(
+            matches!(NativeTransportCapacity::classify_denial(denial).unwrap(),
+            TransportCapacityRefusal::TargetFull(target) if target == backend)
+        );
+        wait_target = Some((registrant.id(), denial.wait_target()));
+        drop(blocker);
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+        // The actual stream takes its first original credit before the native
+        // opening poll. Leave its genuine resume hint in the paid role.
+        tokio::time::timeout(wait, async {
+            while !ordinary_inventory()
+                .iter()
+                .any(|row| row.standing_input_id == progress_id && row.in_flight.is_some())
+            {
+                drive();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        Some(filled_ordinary())
+    } else {
+        None
+    };
+    let mut phases = Vec::new();
+    let phase_work = if let Some(rows) = &ordinary_cut {
+        // Subscription progress and exit share the same original Source as
+        // the earlier Ordinary read hint. Observe filled custody before
+        // driving that FIFO rather than allowing later Lifecycle to overtake.
+        let input = tokio::time::timeout(wait, async {
+            loop {
+                drive();
+                assert_eq!(filled_ordinary(), *rows);
+                let filled = lifecycle_filled();
+                if let [phase] = filled.as_slice()
+                    && peer.subscription_requests().len() == 1
+                {
+                    return *phase;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let authors = runtime
+            .input_header_authors(registration.actor(), input, 4)
+            .unwrap();
+        let [original] = authors.as_slice() else {
+            panic!("the phase input identifies its original subscription Work");
+        };
+        assert_eq!(original.scope, scope.id());
+        Some((input, *original))
+    } else {
+        tokio::time::timeout(wait, async {
+            loop {
+                drive();
+                if let Some((_, fact)) = next_fact() {
+                    let ExecutorFact::SubscriptionProgress(phase) = fact else {
+                        panic!("original phase: {fact:?}");
+                    };
+                    assert_eq!(
+                        (phase.participation, phase.generation),
+                        (participation, request.generation)
+                    );
+                    if phase.opened_at.is_some() {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        None
+    };
+    assert_eq!(peer.subscription_requests().len(), 1);
+
+    if let Some(rows) = &ordinary_cut {
+        assert_eq!(filled_ordinary(), *rows);
+        assert_eq!(lifecycle_filled(), [phase_work.unwrap().0]);
+        // EOF lets the real stream exit while the actor leaves every paid
+        // input queued. Posting a command would poll their original FIFO.
+        peer.close_held_subscriptions();
+    } else {
+        tokio::time::timeout(wait, wait_handoff(post()))
+            .await
+            .unwrap();
+        tokio::time::timeout(wait, async {
+            while !Arc::ptr_eq(
+                &original.applied_request(request.generation).unwrap(),
+                &adjusted,
+            ) {
+                drive();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peer.subscription_requests().len(), 1);
+        assert!(next_fact().is_none());
+        tokio::time::timeout(wait, wait_handoff(post()))
+            .await
+            .unwrap();
+    }
+    let queued_exit = if let Some(rows) = &ordinary_cut {
+        let (phase, work) = phase_work.unwrap();
+        Some(
+            tokio::time::timeout(wait, async {
+                loop {
+                    drive();
+                    assert_eq!(filled_ordinary(), *rows);
+                    let filled = lifecycle_filled();
+                    if let [first, exit] = filled.as_slice() {
+                        assert_eq!(*first, phase);
+                        assert!(matches!(
+                            scope.work_lifecycle(work.work).unwrap(),
+                            Some((_, true, true, _)),
+                        ));
+                        return *exit;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let mut exit_input = None;
+    let drained = tokio::time::timeout(wait, async {
         loop {
             drive();
-            if let Some(fact) = next_fact() {
-                let ExecutorFact::SubscriptionProgress(phase) = fact else {
-                    panic!("original phase: {fact:?}")
-                };
-                assert_eq!(
-                    (phase.participation, phase.generation),
-                    (participation, request.generation)
-                );
-                if phase.opened_at.is_some() {
-                    break;
+            if let Some((input, fact)) = next_fact() {
+                match fact {
+                    ExecutorFact::SubscriptionExited {
+                        effect,
+                        participation: actual,
+                        generation,
+                    } => {
+                        assert_eq!(
+                            (effect, actual, generation),
+                            (id(1), participation, request.generation)
+                        );
+                        assert!(exit_input.replace(input).is_none());
+                        if let Some(queued) = queued_exit {
+                            assert_eq!(input, queued);
+                        } else {
+                            return;
+                        }
+                    }
+                    ExecutorFact::SubscriptionProgress(phase) if saturate_ordinary => {
+                        assert_eq!(
+                            (phase.participation, phase.generation),
+                            (participation, request.generation)
+                        );
+                        phases.push(input);
+                    }
+                    other => panic!("expected an original subscription phase or exit: {other:?}"),
                 }
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(peer.subscription_requests().len(), 1);
-
-    tokio::time::timeout(wait, wait_handoff(post()))
-        .await
-        .unwrap();
-    tokio::time::timeout(wait, async {
-        while !Arc::ptr_eq(
-            &original.applied_request(request.generation).unwrap(),
-            &adjusted,
-        ) {
-            drive();
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(peer.subscription_requests().len(), 1);
-    assert!(next_fact().is_none());
-
-    tokio::time::timeout(wait, wait_handoff(post()))
-        .await
-        .unwrap();
-    tokio::time::timeout(wait, async {
-        loop {
-            drive();
-            if let Some(ExecutorFact::SubscriptionExited {
-                effect,
-                participation: actual,
-                generation,
-            }) = next_fact()
+            if let Some(input) = exit_input
+                && runtime
+                    .input_custody(registration.actor(), input)
+                    .unwrap()
+                    .is_none()
+                && ordinary_inventory()
+                    .iter()
+                    .all(|row| row.in_flight.is_none())
+                && original.applied_request(request.generation).is_err()
+                && eof_observed.get()
             {
-                assert_eq!(
-                    (effect, actual, generation),
-                    (id(1), participation, request.generation)
-                );
-                break;
+                return;
             }
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
-
+    .await;
+    assert!(
+        drained.is_ok(),
+        "original subscription drain stalled: exit={exit_input:?}, exit phase={:?}, ordinary={:?}, retained request={}, observed EOF={}",
+        exit_input.and_then(|input| runtime
+            .input_custody(registration.actor(), input)
+            .unwrap()
+            .map(|custody| custody.phase)),
+        ordinary_inventory(),
+        original.applied_request(request.generation).is_ok(),
+        eof_observed.get(),
+    );
+    if let Some(rows) = &ordinary_cut {
+        assert_eq!(phases.first(), Some(&phase_work.unwrap().0));
+        let idle = rows
+            .iter()
+            .copied()
+            .map(|mut row| {
+                row.in_flight = None;
+                row
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary_inventory(), idle);
+    }
     command.body_exited().unwrap();
     command.captures_exited().unwrap();
     command_payer.finish().unwrap();
@@ -735,6 +1107,73 @@ async fn installed_subscription_uses_one_native_stream_and_reports_exact_actual_
         .unwrap();
     assert!(host.is_empty() && runtime.is_empty());
     assert!(scope.snapshot().is_err() && control_scope.snapshot().is_err());
+    assert!(membership_registry.is_empty());
+    if let Some(history) = history {
+        let history = history.drain(4096);
+        assert!(
+            history.complete && history.remaining == 0,
+            "{:?}",
+            history.error
+        );
+        let once = |predicate: &dyn Fn(&HistoryFact) -> bool| {
+            let ordinals = history
+                .entries
+                .iter()
+                .filter(|entry| predicate(&entry.fact))
+                .map(|entry| entry.ordinal)
+                .collect::<Vec<_>>();
+            let [only] = ordinals.as_slice() else {
+                panic!("expected one matching original event, got {ordinals:?}");
+            };
+            *only
+        };
+        let (queued_phase, original) = phase_work.unwrap();
+        let started = once(
+            &|fact| matches!(fact, HistoryFact::Started { scope, work } if (*scope, *work) == (original.scope, original.work)),
+        );
+        let body = once(
+            &|fact| matches!(fact, HistoryFact::BodyExited { scope, work } if (*scope, *work) == (original.scope, original.work)),
+        );
+        let captures = once(
+            &|fact| matches!(fact, HistoryFact::CapturesExited { scope, work } if (*scope, *work) == (original.scope, original.work)),
+        );
+        let retired = once(
+            &|fact| matches!(fact, HistoryFact::WorkRetired { scope, work } if (*scope, *work) == (original.scope, original.work)),
+        );
+        let consumed = |input| {
+            once(
+                &|fact| matches!(fact, HistoryFact::InputConsumed { target, input: exact } if *exact == input && target.actor == registration.actor() && target.scope_origin == scope.id()),
+            )
+        };
+        let exit = consumed(exit_input.unwrap());
+        let phase = consumed(queued_phase);
+        assert!(started < body && body < captures && captures < phase && phase < exit);
+        assert!(captures < retired);
+        let mut preceding = captures;
+        for input in phases {
+            let next = consumed(input);
+            assert!(preceding < next);
+            preceding = next;
+        }
+        for role in ordinary_cut.unwrap() {
+            let ordinary = consumed(role.in_flight.unwrap());
+            assert!(captures < ordinary);
+            if role.standing_input_id == progress_id {
+                assert!(
+                    ordinary < phase,
+                    "the original Source keeps its predecessor first"
+                );
+            }
+        }
+        let (registrant, wait) = wait_target.unwrap();
+        let registered = once(
+            &|fact| matches!(fact, HistoryFact::CapacityWaitRegistered { registrant: id, target } if (*id, *target) == (registrant, wait)),
+        );
+        let notified = once(
+            &|fact| matches!(fact, HistoryFact::CapacityWaitNotified { registrant: id, target } if (*id, *target) == (registrant, wait)),
+        );
+        assert!(registered < notified && notified < exit);
+    }
     launcher.body_exited().unwrap();
     launcher.captures_exited().unwrap();
     launcher_payer.finish().unwrap();

@@ -304,7 +304,11 @@ type TransportCommand = (
     Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
     Option<novarocks_control_runtime::obligation::StepRegistration>,
 );
-struct WithdrawalTarget(ObservedWithdrawals, VecDeque<TransportCommand>);
+struct WithdrawalTarget {
+    observed: ObservedWithdrawals,
+    commands: VecDeque<TransportCommand>,
+    handle_attempt_hints: bool,
+}
 impl TestActor for WithdrawalTarget {
     fn handle(
         &mut self,
@@ -313,9 +317,34 @@ impl TestActor for WithdrawalTarget {
         value: FrontendInput,
         step: &mut ActorStep<'_, FrontendEffect>,
     ) {
+        if self.handle_attempt_hints {
+            match &value {
+                FrontendInput::AttemptStartup(_) => {
+                    assert_eq!(envelope.class, InputClass::Lifecycle);
+                    return;
+                }
+                FrontendInput::CapacityReleased | FrontendInput::Membership(_) => {
+                    assert_eq!(envelope.class, InputClass::Ordinary);
+                    return;
+                }
+                FrontendInput::Attempt(value)
+                    if matches!(
+                        value.as_ref(),
+                        AttemptInput::Executor(ExecutorFact::ReadProgress(_))
+                    ) =>
+                {
+                    assert_eq!(envelope.class, InputClass::Ordinary);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let FrontendInput::Test(value) = value {
             assert_ne!(value, u64::MAX, "transport fixture Core failure");
-            let (effect, guard) = self.1.pop_front().expect("one original transport command");
+            let (effect, guard) = self
+                .commands
+                .pop_front()
+                .expect("one original transport command");
             let work = match guard {
                 Some(guard) => {
                     let work = novarocks_control_runtime_core::identity::ScopedWorkRef {
@@ -358,7 +387,7 @@ impl TestActor for WithdrawalTarget {
         let FrontendInput::Attempt(value) = value else {
             panic!("expected an original attempt input");
         };
-        self.0.lock().unwrap().push((envelope, *value));
+        self.observed.lock().unwrap().push((envelope, *value));
     }
 }
 
@@ -408,18 +437,58 @@ impl WithdrawalInbox {
         mailbox: [usize; 4],
         failure: Option<&novarocks_control_runtime::obligation::WorkObligation>,
     ) -> Self {
-        let runtime = ActorRuntime::new();
-        let actor = ActorId::new(1).unwrap();
-        let source = ActorId::new(2).unwrap();
-        let observed: ObservedWithdrawals = Arc::default();
-        let target = FrontendActor::Test(Box::new(WithdrawalTarget(
-            observed.clone(),
-            commands.into_iter().collect(),
-        )));
-        let config = ActorConfig {
-            mailbox,
-            ..Self::CONFIG
+        Self::register(
+            scope,
+            commands,
+            ActorConfig {
+                mailbox,
+                ..Self::CONFIG
+            },
+            failure,
+            None,
+        )
+    }
+
+    pub(crate) fn with_attempt_geometry_and_history(
+        scope: &ScopeHandle,
+        commands: impl IntoIterator<Item = TransportCommand>,
+        config: ActorConfig,
+        sources: novarocks_attempt_protocol::start::AttemptSources,
+        history: novarocks_control_runtime::history::HistoryCapture,
+    ) -> Self {
+        assert_eq!(config.mailbox, sources.mailbox);
+        Self::register(scope, commands, config, None, Some((sources, history)))
+    }
+
+    fn register(
+        scope: &ScopeHandle,
+        commands: impl IntoIterator<Item = TransportCommand>,
+        config: ActorConfig,
+        failure: Option<&novarocks_control_runtime::obligation::WorkObligation>,
+        geometry: Option<(
+            novarocks_attempt_protocol::start::AttemptSources,
+            novarocks_control_runtime::history::HistoryCapture,
+        )>,
+    ) -> Self {
+        let handle_attempt_hints = geometry.is_some();
+        let (runtime, actor, source) = match geometry {
+            Some((sources, history)) => (
+                ActorRuntime::with_history(history),
+                ActorId::new(sources.actor.0.get()).unwrap(),
+                ActorId::new(sources.subscription.0.get()).unwrap(),
+            ),
+            None => (
+                ActorRuntime::new(),
+                ActorId::new(1).unwrap(),
+                ActorId::new(2).unwrap(),
+            ),
         };
+        let observed: ObservedWithdrawals = Arc::default();
+        let target = FrontendActor::Test(Box::new(WithdrawalTarget {
+            observed: observed.clone(),
+            commands: commands.into_iter().collect(),
+            handle_attempt_hints,
+        }));
         let registration = match failure {
             Some(work) => runtime.register_supervised_bound_with_source_cut(
                 actor,

@@ -981,6 +981,10 @@ impl Loopback {
         self.peer.subscribed()
     }
 
+    pub(crate) fn close_held_subscriptions(&self) {
+        self.peer.close_held_subscriptions();
+    }
+
     pub(crate) fn applied_requests(&self) -> Vec<proto::ApplyTaskOperationsRequest> {
         self.peer.applied()
     }
