@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{adapter::tests::start, publication::PublicationRecord};
+use super::{
+    adapter::tests::start, custody::tests::WithdrawalInbox, publication::PublicationRecord,
+};
 use crate::task_execution::{
-    bridge::terminal::{TerminalOutbox, TerminalPublication},
+    bridge::{
+        control::AttemptOwnerControls,
+        terminal::{TerminalOutbox, TerminalPublication},
+    },
     completion::WriteVerdict,
     protocol_facts::{AttemptProtocolFactsPublisher, WriteProtocolTracker},
     tests::delivery_chain_graph,
@@ -34,13 +39,22 @@ use novarocks_attempt_protocol::{
     },
     start::{AttemptSources, FrozenEstablish, PayloadRef},
 };
+use novarocks_control_runtime::transaction::RuntimeLedger;
+use novarocks_control_runtime_core::{
+    capacity::{ReservationResources, ResourceVector},
+    identity::Generation,
+    mailbox::InputClass,
+    scope::{WorkAdmission, WorkKind},
+};
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptRequestToken, AttemptTerminal, AttemptToLogicalBody, ExecutionEffect,
-    LogicalToAttempt, LogicalToAttemptBody, MonotonicInstant, ResultParticipationWithdrawal,
+    AttemptActionId, AttemptActivationIdentity, AttemptRequestToken, AttemptStopReason,
+    AttemptTerminal, AttemptToLogicalBody, ExecutionEffect, LogicalToAttempt, LogicalToAttemptBody,
+    MonotonicInstant, ResultParticipationWithdrawal, SelectedTaskTermination,
 };
 use novarocks_execution_contract::{
-    AdmissionEpochCapability, ExchangeDeliveryRequirement, TaskIdentity, TaskOutputFacts,
-    TaskState, TaskStatus, TaskStatusVersion,
+    AdmissionEpochCapability, ExchangeDeliveryRequirement, SafeDetail, TaskFailure,
+    TaskFailurePhase, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
+    TerminationDetail, failure::FailureProjection,
 };
 use novarocks_physical_plan::PlanVersionId;
 use novarocks_query_application::{
@@ -49,17 +63,21 @@ use novarocks_query_application::{
         AcceptedRootControlPort, AcceptedRootControlRequest, LogicalExecutionActorConfig,
         accepted_root_status_projection_with_control_port,
     },
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
+    session_outcome::governed_cancellation_failure_input,
     test_support::LogicalExecutionTestHarness,
 };
 use novarocks_result_contract::{PerKind, SummaryKind};
 use novarocks_types::BackendProcessId;
 use novarocks_workload_control::{
-    ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    CancellationReason, ResourceConfig, Stage, WorkCancellationRequestOutcome, WorkClass,
+    WorkRequest, WorkloadConfig, WorkloadControl,
 };
 use std::{
     collections::BTreeSet,
     num::{NonZeroU64, NonZeroUsize},
     sync::{Arc, Mutex},
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -194,7 +212,9 @@ impl StrictTail {
                         }
                         assert!(matches!(
                             port.body,
-                            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Completed)
+                            AttemptToLogicalBody::AttemptTerminal(
+                                AttemptTerminal::Completed | AttemptTerminal::Failed(_)
+                            )
                         ));
                         assert!(
                             self.terminal
@@ -219,6 +239,72 @@ impl StrictTail {
     }
 }
 
+fn apply_governed_stop(
+    tail: &mut StrictTail,
+    activation: AttemptActivationIdentity,
+    reason: CancellationReason,
+) -> AttemptStep {
+    let generation = Generation::new(1).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let (mut work, mut payer) = scope
+        .reserve_next(
+            generation,
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    work.start().unwrap();
+    let inbox = WithdrawalInbox::new(&scope);
+    let standing = || {
+        inbox
+            .runtime()
+            .reserve_admitted_input_for(
+                inbox.registration(),
+                inbox.registration().actor(),
+                InputClass::Control,
+                &work,
+            )
+            .unwrap()
+            .into_standing_input()
+            .unwrap()
+    };
+    let mut controls = AttemptOwnerControls::new(activation, standing(), standing());
+    let input = controls
+        .stop_for_cancellation(reason.clone())
+        .unwrap()
+        .unwrap();
+    let (committed, stop) = inbox.try_commit_owner_control().unwrap();
+    assert_eq!(committed, input);
+    assert!(matches!(
+        &stop,
+        AttemptInput::Port(LogicalToAttempt {
+            activation: actual,
+            body: LogicalToAttemptBody::Stop {
+                reason: AttemptStopReason::Client,
+                ..
+            },
+        }) if *actual == activation
+    ));
+    let step = tail.input(tail.sources.actor, stop);
+    assert!(step.stop_producing);
+    assert_eq!(controls.stop_for_cancellation(reason).unwrap(), None);
+    assert!(inbox.try_commit_owner_control().is_none());
+    controls.close_after_exit().unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    payer.finish().unwrap();
+    scope.reap_ready(8).unwrap();
+    scope.close_external().unwrap();
+    inbox.finish();
+    ledger.remove_scope(scope.id()).unwrap();
+    assert!(ledger.is_empty());
+    step
+}
+
 fn finished(task: TaskIdentity) -> TaskStatus {
     TaskStatus::try_new(
         task,
@@ -230,10 +316,38 @@ fn finished(task: TaskIdentity) -> TaskStatus {
     .unwrap()
 }
 
+#[derive(Clone, Copy)]
+enum TailCase {
+    StrictCompletion { writer_first: bool },
+    StrictSourceFailure,
+    StrictCancellation,
+    OrdinaryCompletion,
+}
+
 #[tokio::test]
 async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals() {
-    for writer_first in [true, false] {
-        let graph = delivery_chain_graph(ExchangeDeliveryRequirement::MustDrain);
+    run_tail_cases([true, false].map(|writer_first| TailCase::StrictCompletion { writer_first }))
+        .await;
+}
+
+#[tokio::test]
+async fn strict_tail_preserves_original_source_failure_and_governed_cancellation() {
+    run_tail_cases([TailCase::StrictSourceFailure, TailCase::StrictCancellation]).await;
+}
+
+#[tokio::test]
+async fn demand_driven_tail_completes_at_original_seal_with_live_siblings() {
+    run_tail_cases([TailCase::OrdinaryCompletion]).await;
+}
+
+async fn run_tail_cases(cases: impl IntoIterator<Item = TailCase>) {
+    for case in cases {
+        let strict = !matches!(case, TailCase::OrdinaryCompletion);
+        let graph = delivery_chain_graph(if strict {
+            ExchangeDeliveryRequirement::MustDrain
+        } else {
+            ExchangeDeliveryRequirement::DemandDriven
+        });
         let root = graph.root_identity();
         let execution = root.query_execution_id();
         let writer = graph
@@ -248,9 +362,9 @@ async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals
             .identity();
         assert_ne!(writer, summary);
         let plan = PlanSeal::Version(PlanVersionId::try_new([197; 16]).unwrap());
-        let writers = BTreeSet::from([writer]);
+        let writers = strict.then_some(writer).into_iter().collect();
         let summaries = PerKind {
-            write_counts: Some(BTreeSet::from([summary])),
+            write_counts: strict.then(|| BTreeSet::from([summary])),
             delete_verification: None,
         };
         let (publisher, mut facts) =
@@ -270,6 +384,8 @@ async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = work.owner.scope();
+        let requester = work.owner.cancellation_requester();
+        let cancellation = scope.cancellation().unwrap();
         let stage = scope.try_acquire(Stage::Execution).unwrap();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution,
@@ -400,8 +516,12 @@ async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals
         assert!(tail.drive(initial).is_none());
         let initial = facts.take_changes(activation, root, plan).unwrap().unwrap();
         assert!(!initial.root_success_sealed());
-        let mut tracker = WriteProtocolTracker::from_initial(&initial).unwrap();
-        assert!(tracker.execution_verdict().is_pending());
+        for sibling in [writer, summary] {
+            assert!(initial.tasks().iter().any(|change| {
+                change.identity() == sibling
+                    && change.status().is_some_and(|status| !status.is_terminal())
+            }));
+        }
 
         let mut seal = statuses.begin_success_seal_request().unwrap();
         let token = AttemptRequestToken::new(id(1000));
@@ -417,7 +537,23 @@ async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals
             .drive(step)
             .expect("the Root seal is independent of strict Task terminal facts");
         assert_eq!(reply.token, token);
-        assert!(reply.withdrawals.is_empty());
+        if strict {
+            assert!(reply.withdrawals.is_empty());
+        } else {
+            let participant = participations
+                .iter()
+                .copied()
+                .find(|part| part.backend_process_id() == writer.backend_process_id())
+                .unwrap();
+            assert_eq!(
+                reply.withdrawals.as_ref(),
+                &[ResultParticipationWithdrawal::new(
+                    activation,
+                    root,
+                    participant
+                )]
+            );
+        }
         let mut terminal_wait = Box::pin(terminal.terminal());
         let paused = tail.input(sources.actor, AttemptInput::Timer);
         assert!(paused.effect.is_none() && paused.round_result.is_none());
@@ -451,41 +587,137 @@ async fn strict_tail_keeps_native_completion_behind_both_original_task_terminals
         seal.await.unwrap().unwrap();
         let sealed = facts.take_changes(activation, root, plan).unwrap().unwrap();
         assert!(sealed.root_success_sealed());
-        tracker.observe(&sealed).unwrap();
-        assert!(tracker.execution_verdict().is_pending());
-        assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+        assert!(sealed.selected_failure().is_none());
+        if strict {
+            assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+        }
 
-        let (first, last, remaining_kind) = if writer_first {
-            (writer, summary, Some(SummaryKind::WriteCounts))
-        } else {
-            (summary, writer, None)
-        };
-        let first = tail.observe(vec![observation(finished(first))]);
-        assert!(tail.drive(first).is_none());
-        let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
-        tracker.observe(&delta).unwrap();
-        assert_eq!(
-            tracker.execution_verdict(),
-            WriteVerdict::TaskNotFinished {
-                task: last,
-                state: TaskState::Planned,
-                summary_kind: remaining_kind,
+        match case {
+            TailCase::StrictCompletion { writer_first } => {
+                let mut tracker = WriteProtocolTracker::from_initial(&initial).unwrap();
+                assert!(tracker.execution_verdict().is_pending());
+                tracker.observe(&sealed).unwrap();
+                assert!(tracker.execution_verdict().is_pending());
+                let (first, last, remaining_kind) = if writer_first {
+                    (writer, summary, Some(SummaryKind::WriteCounts))
+                } else {
+                    (summary, writer, None)
+                };
+                let first = tail.observe(vec![observation(finished(first))]);
+                assert!(tail.drive(first).is_none());
+                let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
+                tracker.observe(&delta).unwrap();
+                assert_eq!(
+                    tracker.execution_verdict(),
+                    WriteVerdict::TaskNotFinished {
+                        task: last,
+                        state: TaskState::Planned,
+                        summary_kind: remaining_kind,
+                    }
+                );
+                assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
+
+                let last = tail.observe(vec![observation(finished(last))]);
+                assert!(tail.drive(last).is_none());
+                let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
+                tracker.observe(&delta).unwrap();
+                assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), terminal_wait)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    NativeAttemptTerminal::Completed
+                ));
             }
-        );
-        assert!(futures::poll!(terminal_wait.as_mut()).is_pending());
-
-        let last = tail.observe(vec![observation(finished(last))]);
-        assert!(tail.drive(last).is_none());
-        let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
-        tracker.observe(&delta).unwrap();
-        assert_eq!(tracker.execution_verdict(), WriteVerdict::Complete);
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), terminal_wait)
-                .await
-                .unwrap()
-                .unwrap(),
-            NativeAttemptTerminal::Completed
-        ));
+            TailCase::StrictSourceFailure => {
+                let termination = TerminationDetail::Failed(TaskFailure::new_in_phase(
+                    QueryFailureReason::SplitAssignmentFailed.failure_fact(),
+                    SafeDetail::truncating("original strict source failed after root seal"),
+                    TaskFailurePhase::Execution,
+                ));
+                let selected = SelectedTaskTermination::new(summary, termination.clone());
+                let step = tail.observe(vec![observation(
+                    TaskStatus::try_new(
+                        summary,
+                        TaskStatusVersion::new(2).unwrap(),
+                        TaskState::Failing,
+                        Some(termination),
+                        TaskOutputFacts::default(),
+                    )
+                    .unwrap()
+                    .with_installed(),
+                )]);
+                assert!(tail.drive(step).is_none());
+                let delta = facts.take_changes(activation, root, plan).unwrap().unwrap();
+                assert!(delta.root_success_sealed());
+                assert_eq!(delta.selected_failure(), Some(&selected));
+                assert!(delta.tasks().iter().any(|change| {
+                    change.identity() == summary
+                        && change.status().is_some_and(|status| {
+                            status.state() == TaskState::Failing
+                                && status.version() == TaskStatusVersion::new(2).unwrap()
+                                && status.installed()
+                        })
+                }));
+                let Poll::Ready(Ok(NativeAttemptTerminal::Failed(failure))) =
+                    futures::poll!(terminal_wait.as_mut())
+                else {
+                    panic!("strict source failure must settle before either sibling finishes");
+                };
+                assert_eq!(
+                    failure.input(),
+                    &ExecutionFailureInput::from_selected_task(&selected).unwrap()
+                );
+                assert_eq!(
+                    failure.input().site(),
+                    ExecutionFailureSite::Task {
+                        identity: summary,
+                        phase: TaskFailurePhase::Execution,
+                    }
+                );
+            }
+            TailCase::StrictCancellation => {
+                assert_eq!(
+                    requester
+                        .request_with_outcome(CancellationReason::Requested)
+                        .unwrap(),
+                    WorkCancellationRequestOutcome::Requested
+                );
+                let reason = tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
+                    .await
+                    .unwrap();
+                assert_eq!(reason, CancellationReason::Requested);
+                let expected = governed_cancellation_failure_input(reason.clone());
+                let stop = apply_governed_stop(&mut tail, activation, reason);
+                assert!(tail.drive(stop).is_none());
+                let Poll::Ready(Ok(NativeAttemptTerminal::Failed(failure))) =
+                    futures::poll!(terminal_wait.as_mut())
+                else {
+                    panic!("governed cancellation must settle before either sibling finishes");
+                };
+                assert_eq!(failure.input(), &expected);
+                assert_eq!(failure.input().site(), ExecutionFailureSite::Coordinator);
+                assert_eq!(
+                    failure.input().fact(),
+                    QueryFailureReason::Cancelled.failure_fact()
+                );
+                if let Some(delta) = facts.take_changes(activation, root, plan).unwrap() {
+                    assert!(delta.root_success_sealed());
+                    assert!(delta.selected_failure().is_none());
+                }
+            }
+            TailCase::OrdinaryCompletion => {
+                assert!(matches!(
+                    futures::poll!(terminal_wait.as_mut()),
+                    Poll::Ready(Ok(NativeAttemptTerminal::Completed))
+                ));
+                assert!(sealed.tasks().iter().all(|change| {
+                    ![writer, summary].contains(&change.identity())
+                        || change.status().is_some_and(|status| !status.is_terminal())
+                }));
+            }
+        }
 
         drop(drive);
         work.business.release();
