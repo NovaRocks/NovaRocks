@@ -2222,6 +2222,9 @@ mod tests {
             let idle = controls.wait_convergence_idle();
             tokio::pin!(idle);
             assert!(futures::poll!(idle.as_mut()).is_pending());
+            // The Source has exited while the last owner control still has
+            // an indexed occurrence. Its retirement must open another visit.
+            local_exited.store(true, Ordering::Release);
             drive(); // Retire the original occurrence and wake the idle waiter.
             tokio::time::timeout(Duration::from_secs(1), idle)
                 .await
@@ -2231,9 +2234,16 @@ mod tests {
 
         assert_eq!(*seen.lock().unwrap(), [first]);
         assert!(!runtime.poll_one(Tick(1)).unwrap());
-        local_exited.store(true, Ordering::Release);
-        runtime.notify_host_actor(&registration).unwrap();
-        drive(); // Only the original Source exit makes the prepaid fact eligible.
+        let retirement_wake = runtime.claim_host_actor();
+        let local_exit_reachable = retirement_wake.is_some();
+        if let Some(turn) = retirement_wake {
+            host.drive(Tick(1), turn);
+        } else {
+            // Still release the fixture's original positions if the wake
+            // regression occurs, so their Drop checks preserve the assertion.
+            runtime.notify_host_actor(&registration).unwrap();
+            drive();
+        }
         assert!(runtime.poll_one(Tick(1)).unwrap());
         let local = seen.lock().unwrap()[1];
         drive(); // Index the local-exit occurrence.
@@ -2277,6 +2287,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
+        assert!(
+            local_exit_reachable,
+            "last owner control retirement lost the local exit wake"
+        );
     }
 
     #[tokio::test]

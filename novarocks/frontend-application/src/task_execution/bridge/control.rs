@@ -340,6 +340,7 @@ impl AttemptOwnerControlSource {
             self.inputs.fence();
         }
         let mut idle = true;
+        let mut retired_owner_control = false;
         for (role, indexed) in self.indexed.iter_mut().enumerate() {
             let position = self.inputs.position(role);
             if failed {
@@ -360,9 +361,12 @@ impl AttemptOwnerControlSource {
             } else {
                 position.in_flight()?.is_none()
             };
-            if retired && indexed.take().is_some() && role == CONVERGENCE {
-                drop(position);
-                self.inputs.changed.notify_waiters();
+            if retired && indexed.take().is_some() {
+                retired_owner_control = true;
+                if role == CONVERGENCE {
+                    drop(position);
+                    self.inputs.changed.notify_waiters();
+                }
             }
             idle &= retired;
         }
@@ -396,7 +400,9 @@ impl AttemptOwnerControlSource {
             self.inputs.close_positions()?;
             self.closed = true;
         }
-        Ok(false)
+        // The Host tested local exit before retiring these inputs. Revisit
+        // once after returning a control occurrence that could have blocked it.
+        Ok(retired_owner_control && self.waiting_for_local_exit())
     }
 
     pub(crate) fn is_closed(&self) -> bool {
