@@ -217,6 +217,16 @@ impl TerminalTrace {
         source: AttemptSourceId,
         input: AttemptInput,
     ) -> AttemptStep {
+        self.handle_with_context(now, source, input, &mut Units(128))
+    }
+
+    fn handle_with_context(
+        &mut self,
+        now: MonotonicInstant,
+        source: AttemptSourceId,
+        input: AttemptInput,
+        context: &mut dyn StepContext,
+    ) -> AttemptStep {
         let id = AttemptInputId(self.next_id());
         let sources = self.core.sources;
         self.core
@@ -235,7 +245,7 @@ impl TerminalTrace {
                     }),
                 },
                 input,
-                &mut Units(128),
+                context,
             )
             .unwrap()
     }
@@ -1830,6 +1840,231 @@ fn accepted_failing_task_takes_precedence_over_its_covered_exhaustion() {
             )));
             assert!(!trace.core.root.sealed());
         }
+    }
+}
+
+#[test]
+fn successful_seal_releases_queued_startup_without_native_dispatch() {
+    use novarocks_coordination_contract::{
+        AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptIssueSettlement,
+        AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    for establish in [false, true] {
+        let mut frozen = start();
+        for edge in frozen.plan.graph.edges.values_mut() {
+            edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+        }
+        let now = frozen.initial_now;
+        let sources = frozen.sources;
+        let activation = frozen.activation.identity;
+        let mut trace = TerminalTrace {
+            core: Core::new(frozen).unwrap(),
+            next: 100,
+        };
+        let root = trace.core.execution.graph().root_identity();
+        let target = trace
+            .core
+            .execution
+            .graph()
+            .participations()
+            .copied()
+            .find(|part| part.backend_process_id() != root.backend_process_id())
+            .unwrap();
+        trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+        let finished = TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap();
+        let frame = status_frame(&mut trace, finished);
+        let observed = trace.handle_input(
+            now,
+            sources.observation,
+            AttemptInput::Executor(ExecutorFact::Observations(
+                ObservationBatch::new(vec![frame]).unwrap(),
+            )),
+        );
+        assert_eq!(trace.finish_observation_round(now, observed).0, Ok(()));
+
+        let action = AttemptActionId::new(trace.next_id());
+        let grant = QueuedInputGrantRef::new(trace.next_id(), SendGeneration::new(action));
+        let request = admission_intent(&mut trace.core.execution, target);
+        let guard = AttemptAuthorizationRef::new(trace.next_id());
+        let (intent, decision) = if establish {
+            let admission = dispatch_admission(
+                &mut trace.core.execution,
+                request,
+                11,
+                OperationOutcome::Accepted,
+            );
+            trace
+                .core
+                .execution
+                .apply_dispatched_reply(&admission)
+                .1
+                .unwrap();
+            let intent = queue_establish(&mut trace.core.execution, target, grant);
+            (
+                intent,
+                AttemptAuthorizationDecision::EstablishAuthorized(guard),
+            )
+        } else {
+            let intent = OperationIntent::AcquireParticipationAdmissionTicket(request);
+            trace
+                .core
+                .execution
+                .begin_lifecycle_admission(intent.clone(), action)
+                .unwrap();
+            assert!(matches!(
+                trace
+                    .core
+                    .execution
+                    .observe_lifecycle_grant(intent.operation_id(), grant)
+                    .unwrap(),
+                CreateGrantProgress::Queued
+            ));
+            (
+                intent,
+                AttemptAuthorizationDecision::AdmissionStarted(guard),
+            )
+        };
+        let request_token = AttemptRequestToken::new(trace.next_id());
+        let request_action = AttemptActionId::new(trace.next_id());
+        assert!(matches!(
+            trace
+                .core
+                .authorize_candidate(&intent, request_token, request_action)
+                .unwrap(),
+            AuthorizationStep::Request(_)
+        ));
+        trace
+            .core
+            .apply_qa_reply(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token: request_token,
+                    decision: Ok(decision),
+                },
+            })
+            .unwrap();
+        assert_eq!(trace.core.execution.dispatcher().queued_items(), 1);
+
+        let token = AttemptRequestToken::new(trace.next_id());
+        let mut next = trace.handle_input(
+            now,
+            sources.observation,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::SealRequest { token },
+            }),
+        );
+        assert!(next.root_control_processed.is_some());
+        let mut seal = false;
+        let mut releases = 0;
+        let mut round_finished = false;
+        for _ in 0..24 {
+            let mut source = sources.actor;
+            let mut input = AttemptInput::Timer;
+            if let Some(effect) = next.effect {
+                match &effect.body {
+                    EffectBody::Port(port)
+                        if matches!(&port.body, AttemptToLogicalBody::SealResult {
+                        token: original, result: Ok(_),
+                    } if *original == token) =>
+                    {
+                        seal = true
+                    }
+                    EffectBody::ReleaseQueuedInput { grant: original } => {
+                        assert_eq!(*original, grant);
+                        releases += 1;
+                    }
+                    EffectBody::SendBatch { batch, .. } => {
+                        panic!(
+                            "sealed attempt emitted queued startup: {:?}",
+                            batch.operations
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some(applied) = TerminalTrace::applied_observation_publication(&effect.body)
+                {
+                    source = sources.publication;
+                    input = AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                        effect: effect.id,
+                        result: Ok(applied),
+                    });
+                }
+            }
+            if let Some(round) = next.round_result {
+                assert_eq!(round, Ok(()));
+                round_finished = true;
+                assert!(seal);
+                assert_eq!(releases, 1);
+                assert_eq!(trace.core.execution.dispatcher().queued_items(), 0);
+                assert_eq!(trace.core.execution.dispatcher().in_flight_operations(), 0);
+                break;
+            }
+            next = trace.handle_with_context(
+                now,
+                source,
+                input,
+                &mut OriginalSend(target.backend_process_id(), DispatchLane::Lifecycle),
+            );
+        }
+        assert!(round_finished && seal);
+        assert_eq!(releases, 1);
+
+        let mut unused_establish = establish.then_some(guard);
+        let mut terminal = false;
+        for _ in 0..24 {
+            let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+            let Some(AttemptEffect {
+                body: EffectBody::Port(port),
+                ..
+            }) = step.effect
+            else {
+                assert!(step.effect.is_none(), "{step:?}");
+                continue;
+            };
+            match port.body {
+                AttemptToLogicalBody::EstablishSettlement {
+                    token,
+                    authorization,
+                    participation,
+                    operation_id,
+                    settlement,
+                } => {
+                    assert_eq!(unused_establish.take(), Some(authorization));
+                    assert_eq!(participation, target);
+                    assert_eq!(operation_id, intent.operation_id());
+                    assert_eq!(settlement, AttemptIssueSettlement::DefinitelyUnsent);
+                    let applied = trace.handle_input(
+                        now,
+                        sources.qa,
+                        AttemptInput::Port(LogicalToAttempt {
+                            activation,
+                            body: LogicalToAttemptBody::EstablishSettlementReply {
+                                token,
+                                authorization,
+                                result: Ok(()),
+                            },
+                        }),
+                    );
+                    assert!(applied.effect.is_none());
+                }
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Completed) => {
+                    terminal = true;
+                    break;
+                }
+                other => panic!("unexpected original authorization close: {other:?}"),
+            }
+        }
+        assert!(terminal);
+        assert!(unused_establish.is_none());
     }
 }
 

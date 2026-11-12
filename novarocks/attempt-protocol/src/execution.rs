@@ -1110,9 +1110,10 @@ impl QueryTaskExecution {
         let next = self
             .graph
             .task_after(cursor.after)
-            .map(|task| task.identity());
+            .map(|task| (task.identity(), task.participation()));
         match next {
-            Some(identity) => {
+            Some((identity, participation)) => {
+                self.cancel_queued_participation_startup(participation)?;
                 self.stand_down_task_normally(identity)?;
                 self.normal_drain_cursor
                     .as_mut()
@@ -1123,6 +1124,33 @@ impl QueryTaskExecution {
         }
         Ok(true)
     }
+    // Normal drain closes participation startup. An already emitted
+    // generation stays with its transport owner.
+    fn cancel_queued_participation_startup(
+        &mut self,
+        participation: ParticipationRef,
+    ) -> Result<(), TaskExecutionError> {
+        let target = OperationTarget::Participation(participation);
+        for operation in self.owners[&participation]
+            .startup_operations()
+            .into_iter()
+            .flatten()
+        {
+            if self.dispatcher.operation_state(operation)? != DispatchOperationState::Queued {
+                continue;
+            }
+            if self.operation_targets.get(&operation) != Some(&target) {
+                return Err(TaskExecutionError::Schedule(
+                    "queued startup differs from its original participation".into(),
+                ));
+            }
+            self.dispatcher.cancel_queued(operation)?;
+            self.operation_targets.remove(&operation);
+            self.rollback_unsent(target, operation);
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_pending_normal_drain(&self) -> bool {
         self.normal_drain_cursor.is_some()
     }

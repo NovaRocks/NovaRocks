@@ -754,6 +754,17 @@ impl ParticipationOwner {
         self.admission_reissue_at = None;
     }
 
+    pub(crate) fn startup_operations(&self) -> [Option<TaskOperationId>; 2] {
+        [
+            self.admission
+                .as_ref()
+                .map(|admission| admission.request.envelope().operation_id()),
+            self.establish
+                .as_ref()
+                .map(|establish| establish.request.operation_id()),
+        ]
+    }
+
     /// Find the original request even when its last generation already
     /// returned TransportUnknown and no replay has been placed yet.
     pub(crate) fn tracks_lifecycle_request(
