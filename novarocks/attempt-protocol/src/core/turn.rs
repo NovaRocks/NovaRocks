@@ -2040,7 +2040,7 @@ impl Core {
                         .unwrap_or(TerminalWake::Round),
                 );
             }
-            QaReply::AuthorizationFailed { failure, .. } => {
+            QaReply::AuthorizationFailed(failure) => {
                 self.record_terminal_failure(failure)?;
                 if matches!(self.turn.phase, Phase::Idle | Phase::Candidates) {
                     self.candidates.authorization = None;

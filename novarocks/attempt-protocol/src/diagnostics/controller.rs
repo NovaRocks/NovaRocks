@@ -451,6 +451,7 @@ impl DiagnosticCollector {
     pub(crate) fn actual_reads_exited(&self) -> bool {
         self.pending.is_none()
     }
+    #[cfg(test)]
     pub(crate) fn selected(&self) -> bool {
         self.selected
     }

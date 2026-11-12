@@ -27,7 +27,9 @@ pub(crate) mod observations;
 #[cfg(test)]
 mod tests;
 
-use crate::{error::TaskExecutionError, failure::AttemptFailure, input::OperationReply};
+#[cfg(test)]
+use crate::input::OperationReply;
+use crate::{error::TaskExecutionError, failure::AttemptFailure};
 use novarocks_coordination_contract::{
     AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationFailure,
     AttemptAuthorizationRef, AttemptRequestToken,
@@ -93,6 +95,7 @@ impl AdmissionAuthorization {
             closing: false,
         }
     }
+    #[cfg(test)]
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.flight.is_none()
     }
@@ -117,6 +120,7 @@ impl AdmissionAuthorization {
     /// Only an ACK belonging to this original operation enters this row. The
     /// Core must first filter an old Unknown behind a queued exact replay,
     /// matching the old observer-before-domain-settlement order.
+    #[cfg(test)]
     pub(crate) fn settle(
         &mut self,
         token: AttemptRequestToken,

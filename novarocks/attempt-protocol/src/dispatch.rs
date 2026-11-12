@@ -77,10 +77,6 @@ struct QueuedOperation {
     queued_bytes: usize,
 }
 
-pub(crate) fn queued_operation_layout() -> std::alloc::Layout {
-    std::alloc::Layout::new::<QueuedOperation>()
-}
-
 /// One operation that waited past the frontend queue-residence bound.
 ///
 /// It is reported rather than sent late: the backend would time it out on its
@@ -507,41 +503,6 @@ impl OperationDispatcher {
         Ok(())
     }
 
-    /// Whether one exact urgent operation can enter and immediately use its
-    /// lane on this serial turn.
-    ///
-    /// This is checked before an external owner hands its payload to the task
-    /// substrate. The caller separately obtains the process transport's queue
-    /// permit; this predicate is only the attempt-local dispatcher authority.
-    /// Because one TaskRound is the dispatcher's sole mutator, the capacity
-    /// cannot change between this check and the matching enqueue.
-    pub(super) fn priority_capacity_available(
-        &self,
-        intent: &OperationIntent,
-    ) -> Result<bool, TaskExecutionError> {
-        self.validate_operation_carrier(intent)?;
-        let queued_bytes = intent.queued_bytes();
-        if self.queued_items + 1 > self.transport.max_backend_queued_operations()
-            || self.queued_bytes + queued_bytes > self.transport.max_backend_queued_bytes()
-        {
-            return Ok(false);
-        }
-        let backend = intent.backend_process_id();
-        let lane = lane_index(intent.lane());
-        let Some(queues) = self.backends.get(&backend) else {
-            return Ok(false);
-        };
-        if queues.queued_items + 1 > self.transport.max_query_backend_queued_operations()
-            || queues.queued_bytes + queued_bytes > self.transport.max_query_backend_queued_bytes()
-        {
-            return Ok(false);
-        }
-        if queues.in_flight[lane] >= self.budget.permits_for(intent.lane()) {
-            return Ok(false);
-        }
-        Ok(queued_bytes <= self.transport.max_batch_encoded_bytes())
-    }
-
     /// Reports whether an exact operation is still locally queued or has
     /// crossed the process-transport acceptance boundary.
     pub(super) fn operation_state(
@@ -696,45 +657,14 @@ impl OperationDispatcher {
         self.take_backend_lane_batch(backend, lane_index(DispatchLane::Control))
     }
 
-    /// Takes only one already-queued exact head operation. Pending process
-    /// observation uses this for actor-owned Abort, so ordinary lifecycle
-    /// work cannot hitch a ride even though it shares the same lane.
-    pub(super) fn take_priority_operation_batch(
-        &mut self,
-        operation_id: TaskOperationId,
-    ) -> Option<DispatchBatch> {
-        let &(backend, lane, _) = self.queued_routes.get(&operation_id)?;
-        if self.backends.get(&backend)?.lanes[lane]
-            .front()?
-            .intent
-            .operation_id()
-            != operation_id
-        {
-            return None;
-        }
-        let queues = self.backends.get_mut(&backend)?;
-        if queues.credits[lane] == 0 {
-            queues.credits[lane] = self.budget.permits_for(LANES[lane]);
-        }
-        self.take_backend_lane_batch_limited(backend, lane, 1)
-    }
-
     fn take_backend_lane_batch(
         &mut self,
         backend: BackendProcessId,
         lane: usize,
     ) -> Option<DispatchBatch> {
-        self.take_backend_lane_batch_limited(backend, lane, self.transport.max_batch_items())
-    }
-
-    fn take_backend_lane_batch_limited(
-        &mut self,
-        backend: BackendProcessId,
-        lane: usize,
-        max_items: usize,
-    ) -> Option<DispatchBatch> {
         let queues = self.backends.get(&backend)?;
-        let allowance = batch_allowance(queues, lane, self.budget, max_items);
+        let allowance =
+            batch_allowance(queues, lane, self.budget, self.transport.max_batch_items());
         let prefix =
             queues.lanes[lane].batch_prefix(allowance, self.transport.max_batch_encoded_bytes())?;
         Some(self.take_batch_prefix(backend, lane, prefix))
@@ -835,6 +765,7 @@ impl OperationDispatcher {
     /// No dispatch permit was consumed, so this is a pure ownership return.
     /// The oldest residence timestamp is retained for every restored item to
     /// prevent repeated process-level backpressure from extending deadlines.
+    #[cfg(test)]
     pub(super) fn restore_backpressured(&mut self, batch: DispatchBatch) {
         let backend = batch.backend();
         let lane = lane_index(batch.lane());

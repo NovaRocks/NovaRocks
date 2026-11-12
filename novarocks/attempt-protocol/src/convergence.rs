@@ -157,6 +157,7 @@ impl RemoteConvergence {
     pub(crate) fn closure(&self) -> Option<&Arc<AttemptConvergenceClosure>> {
         self.closure.as_ref()
     }
+    #[cfg(test)]
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.pass.is_none()
     }

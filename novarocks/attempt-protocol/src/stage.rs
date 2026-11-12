@@ -254,6 +254,7 @@ impl StageExecution {
             observations,
         ))
     }
+    #[cfg(test)]
     pub(crate) fn tasks_mut_observed<'a>(
         &'a mut self,
         observations: &'a demand::StageDemandObservations,
@@ -274,15 +275,6 @@ impl StageExecution {
 
     pub fn tasks(&self) -> impl ExactSizeIterator<Item = (&TaskId, &RemoteTask)> + '_ {
         self.tasks.iter()
-    }
-
-    pub(crate) fn tasks_mut(
-        &mut self,
-    ) -> impl ExactSizeIterator<Item = (&TaskId, TaskMutation<'_>)> + '_ {
-        let counts = &self.counts;
-        self.tasks
-            .iter_mut()
-            .map(move |(id, task)| (id, TaskMutation::new(task, counts)))
     }
 
     /// Whether every task of this frozen set has been created.
@@ -583,29 +575,6 @@ impl EdgeOpenTracker {
             }
         }
         resolution
-    }
-
-    /// Reduce each frozen edge's exact destination withdrawals once. A
-    /// producer is present only when it owns a real output edge; all of its
-    /// edges must be withdrawn before it can release a result prerequisite.
-    pub(crate) fn normal_output_withdrawals(
-        &self,
-        graph: &TaskGraph,
-    ) -> BTreeMap<TaskIdentity, bool> {
-        let mut producers = BTreeMap::<TaskIdentity, bool>::new();
-        for edge in graph.edges() {
-            let closed = self.normally_closed.get(&edge.edge_id());
-            let all_closed = edge.destinations().iter().all(|destination| {
-                closed.is_some_and(|destinations| destinations.contains(destination))
-            });
-            for &producer in edge.producers() {
-                producers
-                    .entry(producer)
-                    .and_modify(|all| *all &= all_closed)
-                    .or_insert(all_closed);
-            }
-        }
-        producers
     }
 
     pub(crate) fn requires_drain(&self, task: TaskIdentity) -> bool {

@@ -77,16 +77,11 @@ pub(crate) enum ObserverStep {
 pub(crate) enum QaReply {
     Stale,
     Authorized(TaskOperationId),
-    AuthorizationFailed {
-        operation: TaskOperationId,
-        failure: AttemptFailure,
-    },
+    AuthorizationFailed(AttemptFailure),
     ObserverProgress,
     ClosingProgress,
     ClosingFailed(AttemptFailure),
-    ObserverComplete {
-        retire: Option<TaskOperationId>,
-    },
+    ObserverComplete { retire: Option<TaskOperationId> },
 }
 
 #[derive(Debug)]
@@ -209,7 +204,7 @@ impl AuthorizationGate {
                 let request = match establish.authorize(token) {
                     Directive::Request(request) => request,
                     Directive::Waiting => return Ok(AuthorizationStep::Waiting),
-                    Directive::IssueRecorded(_) => return Ok(AuthorizationStep::Ready),
+                    Directive::IssueRecorded => return Ok(AuthorizationStep::Ready),
                     Directive::Retired => return Ok(AuthorizationStep::Retired),
                 };
                 (Row::Establish(operation), request)
@@ -356,7 +351,7 @@ impl AuthorizationGate {
                         }
                     }
                     AdmissionGateReply::Failed { failure, .. } => {
-                        QaReply::AuthorizationFailed { operation, failure }
+                        QaReply::AuthorizationFailed(failure)
                     }
                     AdmissionGateReply::Stale => return Ok(QaReply::Stale),
                     _ => return Err(schedule("admission QA reply crossed the selected phase")),
@@ -374,9 +369,7 @@ impl AuthorizationGate {
                 match establish.authorized(token, decision)? {
                     AuthorizationReply::Stale => return Ok(QaReply::Stale),
                     AuthorizationReply::IssueRecorded(_) => QaReply::Authorized(operation),
-                    AuthorizationReply::Failed(failure) => {
-                        QaReply::AuthorizationFailed { operation, failure }
-                    }
+                    AuthorizationReply::Failed(failure) => QaReply::AuthorizationFailed(failure),
                 }
             }
             (

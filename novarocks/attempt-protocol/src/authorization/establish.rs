@@ -21,10 +21,9 @@
 
 #[cfg(test)]
 mod tests;
-use crate::{
-    error::TaskExecutionError, failure::AttemptFailure, input::SendGeneration,
-    operation::OperationDispatchResult,
-};
+#[cfg(test)]
+use crate::operation::OperationDispatchResult;
+use crate::{error::TaskExecutionError, failure::AttemptFailure, input::SendGeneration};
 use novarocks_coordination_contract::{
     AttemptActivationIdentity, AttemptAuthorization, AttemptAuthorizationDecision,
     AttemptAuthorizationFailure, AttemptAuthorizationLimits, AttemptAuthorizationRef,
@@ -37,7 +36,7 @@ use std::collections::VecDeque;
 pub(crate) enum Directive {
     Request(AttemptAuthorization),
     /// Correlation only: emission must recheck this row and the global gate.
-    IssueRecorded(AttemptAuthorizationRef),
+    IssueRecorded,
     Waiting,
     Retired,
 }
@@ -178,8 +177,8 @@ impl EstablishAuthorization {
         if self.closing || self.retired {
             return Directive::Retired;
         }
-        if let Some(current) = self.current {
-            return Directive::IssueRecorded(current.authorization);
+        if self.current.is_some() {
+            return Directive::IssueRecorded;
         }
         let replay = self.attempted || !self.late.is_empty();
         // Before awaiting, including a subsequently cancelled original call.
@@ -289,6 +288,7 @@ impl EstablishAuthorization {
     }
     /// Caller has already validated this exact op and filtered queued-replay
     /// old Unknown. Observer settlement follows the original round phases.
+    #[cfg(test)]
     pub(crate) fn begin_settlement(
         &mut self,
         result: OperationDispatchResult,

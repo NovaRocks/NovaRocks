@@ -217,6 +217,7 @@ impl TerminalController {
         self.sample.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn permits_protocol_turn(&self) -> bool {
         self.decision_turn.is_none() && self.preparing_terminal.is_none() && self.selected.is_none()
     }
@@ -228,6 +229,7 @@ impl TerminalController {
     pub(crate) fn terminal(&self) -> Option<&AttemptTerminal<AttemptFailure>> {
         self.selected.as_ref()
     }
+    #[cfg(test)]
     pub(crate) fn residual(&self) -> Option<&AttemptFailure> {
         self.residual.as_ref()
     }

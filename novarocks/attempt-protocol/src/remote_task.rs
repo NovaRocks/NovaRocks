@@ -187,18 +187,11 @@ impl CreateCandidate {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct UpdateCandidate {
     request: TaskOperationQueueRequest,
-    holds_queue_permit: bool,
 }
 
 impl UpdateCandidate {
     pub(crate) const fn request(self) -> TaskOperationQueueRequest {
         self.request
-    }
-
-    /// Whether the update already carries the process reservation it was
-    /// admitted with, so taking it must not reserve a second one.
-    pub(crate) const fn holds_queue_permit(self) -> bool {
-        self.holds_queue_permit
     }
 }
 
@@ -665,6 +658,7 @@ impl RemoteTask {
     }
 
     /// Whether this task still owes a create send.
+    #[cfg(test)]
     pub(crate) fn create_pending(&self) -> bool {
         !self.create_ownership_proven
             && !matches!(self.state, RemoteTaskState::Terminal)
@@ -779,19 +773,6 @@ impl RemoteTask {
             return self.pending_input.take().and_then(|input| input.discarded);
         }
         None
-    }
-
-    /// A definitely-unused withdrawal consumes only its original preparation.
-    pub(crate) fn finish_unused_preparation(
-        &mut self,
-        operation: TaskOperationId,
-    ) -> Option<UpdateAdmission> {
-        if self.pending_input.as_ref().is_none_or(|input| {
-            input.request.envelope().operation_id() != operation || input.discarded.is_none()
-        }) {
-            return None;
-        }
-        self.pending_input.take().and_then(|input| input.discarded)
     }
 
     /// Passive Create preview. Only a matching Source grant can confirm that
@@ -1107,13 +1088,11 @@ impl RemoteTask {
             }
             return Some(UpdateCandidate {
                 request: released.request.queue_request(),
-                holds_queue_permit: false,
             });
         }
         let pending = self.pending_front()?;
         Some(UpdateCandidate {
             request: pending.request.queue_request(),
-            holds_queue_permit: true,
         })
     }
 

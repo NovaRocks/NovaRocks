@@ -193,95 +193,6 @@ enum OperationTarget {
     ActorAbort,
 }
 
-/// One owner transition waiting to become a dispatcher entry.
-///
-/// A task-domain update may already carry the process reservation acquired
-/// before it entered `RemoteTask::pending`; every other candidate obtains its
-/// reservation in the same transaction that releases its owner marker.
-#[derive(Debug)]
-/// One candidate of an admission pass.
-///
-/// A minted candidate is an intent its owner already handed out; a pass that
-/// does not admit it gives it back through `rollback_unsent`, exactly as a
-/// refused reservation always has. A create or update candidate is only a
-/// position: the task is asked what the send would cost, and nothing is taken
-/// from it -- no create frozen, no pending update or its reservation removed --
-/// until admission holds the capacity for it.
-enum AdmissionCandidate {
-    /// Boxed so that the many create and update positions of one pass stay
-    /// small; only lifecycle operations are minted ahead of admission.
-    Minted {
-        target: OperationTarget,
-        intent: Box<OperationIntent>,
-    },
-    Create {
-        stage: StageId,
-        task: TaskId,
-    },
-    Update {
-        stage: StageId,
-        task: TaskId,
-    },
-}
-
-impl AdmissionCandidate {
-    fn minted(target: OperationTarget, intent: OperationIntent) -> Self {
-        Self::Minted {
-            target,
-            intent: Box::new(intent),
-        }
-    }
-}
-
-/// Why an admission pass stopped before its last candidate.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionPassEnd {
-    /// A process-wide transport window was full.
-    ProcessTransport,
-    /// This attempt's own total queue bound was full.
-    AttemptQueue,
-}
-
-/// How one admission pass went.
-///
-/// A full target skipped only its own later candidates; a pass end skipped
-/// everything after it. Both leave every skipped candidate exactly where it
-/// was, so the next pass resumes in the same order.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AdmissionPass {
-    pub admitted: usize,
-    pub full_targets: BTreeSet<BackendProcessId>,
-    pub ended: Option<AdmissionPassEnd>,
-    /// Whether a skipped candidate was left unadmitted. A caller that must
-    /// know every candidate went out -- a stage release -- reads this.
-    pub skipped: bool,
-}
-
-impl AdmissionPass {
-    const fn complete(&self) -> bool {
-        !self.skipped
-    }
-}
-
-/// What one candidate's admission did.
-enum CandidateAdmission {
-    Admitted,
-    /// The candidate had nothing to send after all.
-    Nothing,
-    TargetFull,
-    DeploymentWindowFull,
-    Ended(AdmissionPassEnd),
-}
-
-/// What one pump released.
-#[derive(Debug, Default)]
-pub struct PumpReport {
-    pub batches: usize,
-    pub operations: usize,
-    /// How this pump's admission pass went.
-    pub admission: AdmissionPass,
-}
-
 /// What applying intake changed.
 #[derive(Debug, Default)]
 pub struct StatusReport {
@@ -413,7 +324,6 @@ pub struct QueryTaskExecution {
     lifecycle_admissions: BTreeMap<TaskOperationId, lifecycle_admission::LifecycleAdmission>,
     lifecycle_granted: BTreeSet<TaskOperationId>,
     create_receipts: BTreeMap<TaskOperationId, create_admission::CreateReceiptRoute>,
-    pending_candidates: VecDeque<AdmissionCandidate>,
     queue_expiry: Option<QueueExpiryPass>,
     status_reconciliations: BTreeSet<ParticipationRef>,
     terminal_retired_reconciliations: BTreeSet<ParticipationRef>,
@@ -440,15 +350,7 @@ pub struct QueryTaskExecution {
     released_children_of: BTreeSet<StageId>,
 }
 
-/// Real dispatcher and process-transport capacity reserved for one exact
-/// actor-owned Abort preview.
-#[derive(Debug)]
-pub(crate) struct ActorAbortReservation {
-    operation_id: TaskOperationId,
-    participation: ParticipationRef,
-    queue_permit: QueuedInputGrantRef,
-}
-
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ActorAbortDispatchState {
     Queued,
@@ -684,7 +586,6 @@ impl QueryTaskExecution {
             lifecycle_admissions: BTreeMap::new(),
             lifecycle_granted: BTreeSet::new(),
             create_receipts,
-            pending_candidates: VecDeque::new(),
             queue_expiry: None,
             status_reconciliations: BTreeSet::new(),
             terminal_retired_reconciliations: BTreeSet::new(),
@@ -823,10 +724,6 @@ impl QueryTaskExecution {
         std::mem::take(&mut self.status_reconciliations)
     }
 
-    pub(crate) fn take_covered_reconciliations(&mut self) -> BTreeSet<ParticipationRef> {
-        std::mem::take(&mut self.covered_reconciliations)
-    }
-
     pub(crate) fn has_subscription_reconciliation(&self) -> bool {
         !self.status_reconciliations.is_empty() || !self.covered_reconciliations.is_empty()
     }
@@ -881,10 +778,6 @@ impl QueryTaskExecution {
 
     pub(crate) fn accepted_protocol_task_changes(&self) -> &BTreeSet<TaskId> {
         &self.accepted_protocol_dirty_tasks
-    }
-
-    pub(crate) fn clear_accepted_protocol_task_changes(&mut self) {
-        self.accepted_protocol_dirty_tasks.clear();
     }
 
     /// Transfer this original dirty root at the publication point. The Core
@@ -1097,6 +990,7 @@ impl QueryTaskExecution {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn actor_abort_dispatch_state(
         &self,
         operation_id: TaskOperationId,
@@ -1109,25 +1003,6 @@ impl QueryTaskExecution {
             DispatchOperationState::InFlight => Ok(ActorAbortDispatchState::InFlight),
             DispatchOperationState::Absent => Err(TaskExecutionError::UnknownOperation),
         }
-    }
-
-    /// Cancels a definitely-unsent actor Abort after another generation's
-    /// definitive receipt closed the exact operation.
-    pub(crate) fn cancel_queued_actor_abort(
-        &mut self,
-        operation_id: TaskOperationId,
-    ) -> Result<(), TaskExecutionError> {
-        if self.actor_abort_dispatch_state(operation_id)? != ActorAbortDispatchState::Queued {
-            return Err(TaskExecutionError::UnknownOperation);
-        }
-        let intent = self.dispatcher.cancel_queued(operation_id)?;
-        if intent.kind() != OperationKind::AbortParticipation {
-            return Err(TaskExecutionError::Schedule(
-                "actor Abort dispatcher target retained a non-Abort carrier".to_owned(),
-            ));
-        }
-        self.operation_targets.remove(&operation_id);
-        Ok(())
     }
 
     /// Applies the positive closure fact from a definitive actor-owned Abort
@@ -2101,12 +1976,6 @@ impl QueryTaskExecution {
         self.covered_gaps.contains(&participation)
     }
 
-    pub(crate) fn covered_gap_participations(&self) -> impl Iterator<Item = ParticipationRef> + '_ {
-        self.covered_observation
-            .iter()
-            .filter_map(|(&participation, state)| state.gap_pending().then_some(participation))
-    }
-
     pub(crate) fn covered_recovery_deadline(&self) -> Option<MonotonicInstant> {
         self.covered_gap_deadlines
             .first()
@@ -2121,10 +1990,6 @@ impl QueryTaskExecution {
     pub(crate) fn activate_covered_observation(&mut self) {
         assert!(!self.covered_observation_active);
         self.covered_observation_active = true;
-    }
-
-    pub(crate) fn covered_observation_active(&self) -> bool {
-        self.covered_observation_active
     }
 
     pub(crate) fn task_actual_stopped(&self, identity: TaskIdentity) -> bool {
@@ -2959,39 +2824,6 @@ impl QueryTaskExecution {
         &self,
     ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
         self.failure.selected()
-    }
-
-    /// Retain the same pure owner decisions until the core's bounded driver
-    /// can request the original native input grant. No host callback runs here.
-    fn enqueue_candidates(
-        &mut self,
-        candidates: VecDeque<AdmissionCandidate>,
-        _now: MonotonicInstant,
-    ) -> Result<AdmissionPass, TaskExecutionError> {
-        for candidate in &candidates {
-            if let AdmissionCandidate::Minted { intent, .. } = candidate {
-                self.dispatcher.validate_operation_carrier(intent)?;
-            }
-        }
-        let admitted = candidates.len();
-        self.pending_candidates.extend(candidates);
-        Ok(AdmissionPass {
-            admitted,
-            ..AdmissionPass::default()
-        })
-    }
-
-    fn refresh_deployment_window(&mut self) {
-        let stages = &self.stages;
-        self.deployment_window.retain(|_, identities| {
-            identities.retain(|identity| {
-                stages
-                    .get(&identity.stage_id())
-                    .and_then(|stage| stage.task(identity.task_id()))
-                    .is_some_and(RemoteTask::needs_deployment_window)
-            });
-            !identities.is_empty()
-        });
     }
 
     fn rollback_unsent(&mut self, target: OperationTarget, operation_id: TaskOperationId) {

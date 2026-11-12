@@ -87,8 +87,6 @@ pub struct Core {
     aborts: abort::Aborts,
     candidates: candidates::Candidates,
     establish_material: BTreeMap<ParticipationRef, crate::start::FrozenEstablish>,
-    retry: crate::config::TaskUpdateRetryPolicy,
-    pumps: Box<[(crate::start::PayloadRef, crate::effect::PumpKind)]>,
 }
 
 #[derive(Debug)]
@@ -149,7 +147,7 @@ impl Core {
             establish_material,
             coordination,
             transport,
-            retry,
+            retry: _,
             pumps,
             initial_lease,
             steady_lease,
@@ -282,8 +280,6 @@ impl Core {
             aborts: abort::Aborts::new(authorization_limits.abort_per_participation),
             candidates: candidates::Candidates::default(),
             establish_material,
-            retry,
-            pumps,
         })
     }
 
