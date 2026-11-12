@@ -3759,6 +3759,285 @@ mod bounded_drain_tests {
     }
 
     #[test]
+    fn empty_quiesce_fence_preserves_original_release_across_lost_replies() {
+        use crate::{
+            capacity::ReservationToken,
+            dispatch::{BatchDispatch, BatchDispatchPass},
+            effect::EffectBody,
+            input::{
+                AckPayload, LocalDispatchResult, ObservationOpening, OperationObservation,
+                OperationReplyResult, ReceivedObservation,
+            },
+            observation::controller::{
+                CoveredSubscription, ObservationDisposition, SubscriptionDirective,
+            },
+        };
+        use novarocks_execution_contract::{
+            OperationOutcome, ParticipationReceipt, ParticipationState, ReleaseOutcome,
+            operation::OperationResult,
+        };
+
+        struct SendTurn(Turn);
+        impl StepContext for SendTurn {
+            fn charge(&mut self, units: usize) -> bool {
+                self.0.charge(units)
+            }
+
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                control: bool,
+                _: BackendProcessId,
+                records: usize,
+                _: usize,
+            ) -> QueueStage {
+                assert!(control);
+                assert_eq!(records, 1);
+                QueueStage::Granted(ReservationToken(NonZeroU64::new(1).unwrap()))
+            }
+        }
+
+        let emit = |execution: &mut QueryTaskExecution, intent: &OperationIntent, sequence| {
+            let input = grant(sequence);
+            execution
+                .begin_lifecycle_admission(intent.clone(), input.generation().admission_effect())
+                .unwrap();
+            assert!(matches!(
+                execution
+                    .observe_lifecycle_grant(intent.operation_id(), input)
+                    .unwrap(),
+                CreateGrantProgress::Queued
+            ));
+            let send = grant(sequence + 10).generation().admission_effect();
+            let BatchDispatch::Ready(effect) = execution
+                .advance_send_batch(
+                    &mut BatchDispatchPass::new(),
+                    send,
+                    &mut SendTurn(Turn(32)),
+                    |_| Ok(()),
+                )
+                .unwrap()
+            else {
+                panic!("expected the original lifecycle send");
+            };
+            let EffectBody::SendBatch { batch, .. } = effect.body else {
+                panic!("expected a Native batch");
+            };
+            assert_eq!(effect.id, send);
+            assert_eq!(batch.queued_inputs.as_ref(), [input]);
+            assert_eq!(batch.operations[0].envelope(), intent.envelope());
+            execution.observe_send_started(send);
+            input
+        };
+        let reply = |execution: &mut QueryTaskExecution,
+                     intent: &OperationIntent,
+                     input: QueuedInputGrantRef,
+                     result| {
+            assert!(matches!(
+                execution.apply_dispatched_reply(&OperationObservation {
+                    generation: input.generation(),
+                    reply: OperationAcknowledgement {
+                        operation_id: intent.operation_id(),
+                        kind: intent.kind(),
+                        result,
+                    },
+                }),
+                (None, Ok(()))
+            ));
+        };
+        let accepted = |acknowledgement| {
+            OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: Some(acknowledgement),
+            })
+        };
+        let unknown = || OperationReplyResult::Local {
+            result: LocalDispatchResult::TransportUnknown,
+            failure: None,
+            protocol_failure: None,
+            detail: None,
+        };
+        let release_candidate = |execution: &mut QueryTaskExecution, participation| {
+            let ReleaseProgress::Done(intent) = execution
+                .advance_release_candidate(
+                    participation,
+                    &mut ReleaseCheck::default(),
+                    &mut Turn(16),
+                )
+                .unwrap()
+            else {
+                panic!("the two-Task release check must finish in one turn");
+            };
+            intent
+        };
+
+        let assert_fenced = |execution: &QueryTaskExecution, tasks: [TaskIdentity; 2]| {
+            for task in tasks {
+                let remote = execution.task_by_identity_ref(task).unwrap();
+                assert!(remote.fenced_out());
+                assert!(remote.status().is_none());
+                assert!(!execution.task_actual_stopped(task));
+            }
+        };
+
+        for covered_first in [false, true] {
+            let mut execution = many_tasks(2);
+            let participation = execution.participation_after(None).unwrap();
+            assert_eq!(execution.participation_after(Some(participation)), None);
+            let tasks = [identity(&execution, 1), identity(&execution, 2)];
+            execution.activate_covered_observation();
+            execution.begin_normal_drain();
+            assert!(execution.normal_drain_started());
+            while execution.has_pending_normal_drain() {
+                assert!(execution.advance_normal_drain(&mut Turn(1)).unwrap());
+            }
+            for task in tasks {
+                let remote = execution.task_by_identity_ref(task).unwrap();
+                assert_eq!(remote.participation(), participation);
+                assert!(!remote.fenced_out());
+                assert!(!remote.create_ownership_proven());
+                assert!(remote.status().is_none());
+            }
+
+            let quiesce = execution.next_quiesce_intent(participation).unwrap();
+            let OperationIntent::QuiesceParticipation(original) = quiesce else {
+                panic!("expected the original Quiesce request");
+            };
+            assert_eq!(original.participation(), participation);
+            let first = emit(&mut execution, &quiesce, 1);
+            assert!(release_candidate(&mut execution, participation).is_none());
+            let fence = Arc::new(QuiesceParticipationReceipt::new(
+                participation,
+                1,
+                Vec::new(),
+                ParticipationState::Quiescing,
+            ));
+
+            if covered_first {
+                let now = execution.now;
+                let mut subscription =
+                    CoveredSubscription::new(participation, crate::ids::IdSeed::new(99, 1), 8)
+                        .unwrap();
+                subscription.activate();
+                let Some(SubscriptionDirective::Open { generation }) = subscription
+                    .drive(now, NonZeroU64::new(1).unwrap(), None)
+                    .unwrap()
+                else {
+                    panic!("expected the original covered opening");
+                };
+                let ObservationDisposition::ApplyEntity(observation) = subscription
+                    .observe(ReceivedObservation {
+                        participation,
+                        generation,
+                        received_at: now,
+                        opening: ObservationOpening {
+                            started_at: now,
+                            opened_at: Some(now),
+                        },
+                        event: ObservationEvent::Fact {
+                            source_revision: None,
+                            fact: CoveredStatusStreamFact::Quiesce(Arc::clone(&fence)),
+                        },
+                    })
+                    .unwrap()
+                else {
+                    panic!("expected a covered catch-up fence");
+                };
+                execution.apply_covered_observation(observation).unwrap();
+                assert!(
+                    execution
+                        .dispatcher
+                        .tracks_input(quiesce.operation_id(), first)
+                );
+            } else {
+                reply(&mut execution, &quiesce, first, unknown());
+                assert!(
+                    !execution
+                        .dispatcher
+                        .tracks_input(quiesce.operation_id(), first)
+                );
+                assert!(!execution.has_pending_quiesce());
+                assert!(release_candidate(&mut execution, participation).is_none());
+                let replay = execution.next_quiesce_intent(participation).unwrap();
+                let OperationIntent::QuiesceParticipation(request) = replay else {
+                    panic!("expected a replay of the original Quiesce");
+                };
+                assert_eq!(request.envelope(), original.envelope());
+                assert_eq!(request.participation(), original.participation());
+                let second = emit(&mut execution, &replay, 2);
+                assert_ne!(second.generation(), first.generation());
+                reply(
+                    &mut execution,
+                    &replay,
+                    second,
+                    accepted(AckPayload::Quiesce(Arc::clone(&fence))),
+                );
+            }
+            execution.advance_quiesce(&mut Turn(32)).unwrap().unwrap();
+            assert_eq!(
+                execution.owners[&participation]
+                    .quiesce_receipt()
+                    .map(Arc::as_ref),
+                Some(fence.as_ref())
+            );
+            assert!(execution.next_quiesce_intent(participation).is_none());
+
+            assert_fenced(&execution, tasks);
+            let release = release_candidate(&mut execution, participation).unwrap();
+            let OperationIntent::ReleaseParticipation(request) = release else {
+                panic!("expected the original Release after the complete fence");
+            };
+            assert_eq!(request.participation(), participation);
+            let release_input = emit(&mut execution, &release, 3);
+            if covered_first {
+                reply(&mut execution, &quiesce, first, unknown());
+                execution.advance_quiesce(&mut Turn(32)).unwrap().unwrap();
+                assert!(
+                    !execution
+                        .dispatcher
+                        .tracks_input(quiesce.operation_id(), first)
+                );
+                assert!(
+                    execution
+                        .dispatcher
+                        .tracks_input(release.operation_id(), release_input)
+                );
+                assert_eq!(
+                    execution.owners[&participation]
+                        .quiesce_receipt()
+                        .map(Arc::as_ref),
+                    Some(fence.as_ref())
+                );
+                assert!(execution.next_quiesce_intent(participation).is_none());
+                assert!(release_candidate(&mut execution, participation).is_none());
+            }
+
+            reply(
+                &mut execution,
+                &release,
+                release_input,
+                accepted(AckPayload::Release {
+                    receipt: ParticipationReceipt::new(
+                        participation,
+                        ParticipationState::TerminalRetained,
+                    ),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: None,
+                }),
+            );
+            assert!(execution.owners[&participation].is_released());
+            assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+            assert!(
+                execution
+                    .participation_convergence_receipt(participation)
+                    .is_none()
+            );
+            assert_fenced(&execution, tasks);
+        }
+    }
+
+    #[test]
     fn release_waits_for_both_actual_stops_and_retries_only_at_the_original_deadline() {
         use crate::{
             effect::EffectBody,
