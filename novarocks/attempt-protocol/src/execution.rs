@@ -3241,6 +3241,16 @@ mod bounded_drain_tests {
         execution: &mut QueryTaskExecution,
         participation: ParticipationRef,
     ) -> OperationIntent {
+        let intent = prepare_test_establish(execution, participation);
+        execution
+            .establish_send_started(participation, intent.operation_id())
+            .unwrap();
+        intent
+    }
+    fn prepare_test_establish(
+        execution: &mut QueryTaskExecution,
+        participation: ParticipationRef,
+    ) -> OperationIntent {
         use crate::input::{AckPayload, OperationReplyResult};
         use novarocks_execution_contract::{
             AdmissionTicketId, OperationOutcome, ParticipationAdmissionTicketReceipt,
@@ -3276,7 +3286,7 @@ mod bounded_drain_tests {
                 now,
             )
             .unwrap();
-        let intent = owner
+        owner
             .establish_intent(
                 ParticipationEstablishFacts {
                     material: PayloadRef(NonZeroU64::new(900).unwrap()),
@@ -3286,11 +3296,7 @@ mod bounded_drain_tests {
                 &mut execution.ids,
             )
             .unwrap()
-            .unwrap();
-        execution
-            .establish_send_started(participation, intent.operation_id())
-            .unwrap();
-        intent
+            .unwrap()
     }
     fn refusal_reply(
         operation_id: TaskOperationId,
@@ -4193,51 +4199,119 @@ mod bounded_drain_tests {
         assert_eq!(execution.next_lifecycle_deadline(), None);
     }
 
-    #[test]
-    fn lease_deadline_is_armed_from_the_effective_worker_lease_until_renewal_is_pending() {
-        use crate::{
-            effect::EffectBody,
-            input::{AckPayload, OperationReplyResult},
-        };
+    fn start_test_dispatch(
+        execution: &mut QueryTaskExecution,
+        operation: TaskOperationId,
+        input: QueuedInputGrantRef,
+        send_sequence: u64,
+    ) -> OperationIntent {
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [input]);
+        assert_eq!(batch.operations[0].operation_id(), operation);
+        let send = grant(send_sequence).generation().admission_effect();
+        execution.dispatcher.accept_emitted(&batch, send).unwrap();
+        execution.observe_send_started(send);
+        batch.operations[0].clone()
+    }
+
+    fn start_test_lease_send(
+        execution: &mut QueryTaskExecution,
+        intent: &OperationIntent,
+        input: QueuedInputGrantRef,
+        send_sequence: u64,
+    ) {
+        let operation = intent.operation_id();
+        execution
+            .begin_lifecycle_admission(intent.clone(), input.generation().admission_effect())
+            .unwrap();
+        assert!(matches!(
+            execution.observe_lifecycle_grant(operation, input).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        let emitted = start_test_dispatch(execution, operation, input, send_sequence);
+        assert_eq!(emitted.envelope(), intent.envelope());
+        if let OperationIntent::EstablishParticipation { participation, .. } = intent {
+            execution
+                .establish_send_started(*participation, operation)
+                .unwrap();
+        }
+    }
+
+    fn settle_test_lease(
+        execution: &mut QueryTaskExecution,
+        intent: &OperationIntent,
+        input: QueuedInputGrantRef,
+        effective: Duration,
+    ) {
+        use crate::input::{AckPayload, OperationObservation, OperationReplyResult};
         use novarocks_execution_contract::{
             LeaseReceipt, OperationOutcome, ParticipationReceipt, ParticipationState,
             operation::OperationResult,
         };
-        let mut execution = many_tasks(1);
-        let participation = *execution.graph.participations().next().unwrap();
-        let establish = begin_test_establish(&mut execution, participation);
-        let OperationIntent::EstablishParticipation {
-            initial_lease_sequence,
-            initial_lease_valid_for,
-            ..
-        } = establish
-        else {
-            panic!("original Establish request");
-        };
-        let effective = Duration::from_secs(9);
-        execution
-            .acknowledge_participation(
+        let (participation, sequence, requested) = match intent {
+            OperationIntent::EstablishParticipation {
                 participation,
-                &OperationAcknowledgement {
-                    operation_id: establish.operation_id(),
-                    kind: OperationKind::UpdateParticipation,
+                initial_lease_sequence,
+                initial_lease_valid_for,
+                ..
+            } => (
+                *participation,
+                *initial_lease_sequence,
+                *initial_lease_valid_for,
+            ),
+            OperationIntent::RenewParticipationLease(request) => (
+                request.participation(),
+                request.sequence(),
+                request.valid_for(),
+            ),
+            _ => panic!("expected an original lease request"),
+        };
+        assert!(effective < requested.get());
+        let receipt = ParticipationReceipt::new(participation, ParticipationState::Active)
+            .with_lease(LeaseReceipt::new(sequence, requested, effective));
+        assert!(matches!(
+            execution.apply_dispatched_reply(&OperationObservation {
+                generation: input.generation(),
+                reply: OperationAcknowledgement {
+                    operation_id: intent.operation_id(),
+                    kind: intent.kind(),
                     result: OperationReplyResult::Worker(OperationResult::Verdict {
                         outcome: OperationOutcome::Accepted,
                         detail: None,
-                        acknowledgement: Some(AckPayload::Participation(
-                            ParticipationReceipt::new(participation, ParticipationState::Active)
-                                .with_lease(LeaseReceipt::new(
-                                    initial_lease_sequence,
-                                    initial_lease_valid_for,
-                                    effective,
-                                )),
-                        )),
+                        acknowledgement: Some(AckPayload::Participation(receipt)),
                     }),
                 },
-            )
-            .unwrap();
-        let deadline = execution.now.saturating_add(Duration::from_secs(3));
+            }),
+            (None, Ok(()))
+        ));
+    }
+
+    #[test]
+    fn lease_deadline_is_armed_from_the_effective_worker_lease_until_renewal_is_pending() {
+        use crate::effect::EffectBody;
+
+        let mut execution = many_tasks(1);
+        let participation = *execution.graph.participations().next().unwrap();
+        let sent = MonotonicInstant::from_origin(Duration::from_secs(10));
+        execution.set_now(sent).unwrap();
+        let establish = prepare_test_establish(&mut execution, participation);
+        let input = grant(1);
+        start_test_lease_send(&mut execution, &establish, input, 2);
+        let ack_at = sent.saturating_add(Duration::from_secs(1));
+        execution.set_now(ack_at).unwrap();
+        settle_test_lease(&mut execution, &establish, input, Duration::from_secs(9));
+        let deadline = sent.saturating_add(Duration::from_secs(3));
         assert_eq!(execution.next_lifecycle_deadline(), Some(deadline));
+        assert_eq!(
+            execution.owners[&participation]
+                .renew_schedule()
+                .unwrap()
+                .conservative_expiry(),
+            sent.saturating_add(Duration::from_secs(9))
+        );
+        execution
+            .set_now(sent.saturating_add(Duration::from_millis(2_999)))
+            .unwrap();
         assert!(
             execution
                 .next_renewal_intent(participation)
@@ -4250,7 +4324,7 @@ mod bounded_drain_tests {
             .unwrap()
             .unwrap();
         assert_eq!(execution.next_lifecycle_deadline(), None);
-        let first = grant(1);
+        let first = grant(3);
         let operation = original.operation_id();
         execution
             .begin_lifecycle_admission(original, first.generation().admission_effect())
@@ -4261,11 +4335,258 @@ mod bounded_drain_tests {
             .unwrap()
             .unwrap();
         assert_eq!(replay.operation_id(), operation);
-        let second = grant(2);
+        let second = grant(4);
         assert!(matches!(
             execution.begin_lifecycle_admission(replay, second.generation().admission_effect()).unwrap().body,
             EffectBody::AdmitQueuedInput { generation, .. } if generation == second.generation()
         ));
+    }
+
+    #[test]
+    fn due_renewal_sends_and_settles_while_the_exact_split_update_is_unsettled() {
+        use crate::{
+            effect::{AttemptEffect, EffectBody, QueuedInputPayload},
+            input::{AckPayload, LocalDispatchResult, OperationObservation, OperationReplyResult},
+        };
+        use novarocks_execution_contract::{
+            DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitSequence,
+            SplitWatermark, TaskDomainReceipt, UpdateTaskReceipt, operation::OperationResult,
+        };
+
+        let node = PlanNodeId::new(7).unwrap();
+        let mut execution = many_tasks_with_split_node(1, Some(node));
+        let task = identity(&execution, 1);
+        let participation = execution
+            .task_by_identity_ref(task)
+            .unwrap()
+            .participation();
+        let establish = prepare_test_establish(&mut execution, participation);
+        let establish_input = grant(1);
+        start_test_lease_send(&mut execution, &establish, establish_input, 2);
+        let sent = execution.now;
+        execution
+            .set_now(sent.saturating_add(Duration::from_secs(1)))
+            .unwrap();
+        settle_test_lease(
+            &mut execution,
+            &establish,
+            establish_input,
+            Duration::from_secs(9),
+        );
+
+        let status = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        execution
+            .apply_published(&status, &mut StatusReport::default())
+            .unwrap();
+        let payload = PayloadRef(NonZeroU64::new(101).unwrap());
+        let sequence = SplitSequence::new(1).unwrap();
+        let (preparation, original) = execution
+            .prepare_task_update(
+                task,
+                TaskDomainUpdate::SplitAssignment {
+                    node,
+                    offer: SplitOffer::batch(sequence, sequence, false).unwrap(),
+                    payload,
+                    queued_bytes: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(preparation, UpdateAdmission::Preparing);
+        let original = original.unwrap();
+        let OperationIntent::UpdateTask {
+            envelope,
+            domains: frozen,
+            ..
+        } = &original
+        else {
+            panic!("expected the original split Update");
+        };
+        let update = envelope.operation_id();
+        let first = grant(3);
+        execution
+            .begin_initial_update_admission(
+                original.clone(),
+                first.generation().admission_effect(),
+                QueuedInputPayload::NewTaskUpdate(payload),
+            )
+            .unwrap();
+        assert!(matches!(
+            execution.observe_lifecycle_grant(update, first).unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        assert!(matches!(
+            execution
+                .advance_update_send(task, grant(4).generation().admission_effect())
+                .unwrap(),
+            (true, None)
+        ));
+        start_test_dispatch(&mut execution, update, first, 4);
+        let update_reply = |input: QueuedInputGrantRef, result| OperationObservation {
+            generation: input.generation(),
+            reply: OperationAcknowledgement {
+                operation_id: update,
+                kind: OperationKind::UpdateTask,
+                result,
+            },
+        };
+        let unknown = update_reply(
+            first,
+            OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            },
+        );
+        assert!(matches!(
+            execution.apply_dispatched_reply(&unknown),
+            (None, Ok(()))
+        ));
+        assert!(!execution.dispatcher.tracks_input(update, first));
+        assert_eq!(
+            execution
+                .task_by_identity_ref(task)
+                .unwrap()
+                .released_update_operation(),
+            Some(update)
+        );
+
+        let due = sent.saturating_add(Duration::from_secs(3));
+        assert_eq!(execution.next_lifecycle_deadline(), Some(due));
+        execution.set_now(due).unwrap();
+        let second = grant(5);
+        let (queued, effect) = execution
+            .advance_update_send(task, second.generation().admission_effect())
+            .unwrap();
+        assert!(!queued);
+        assert!(matches!(
+            effect,
+            Some(AttemptEffect {
+                body: EffectBody::AdmitQueuedInput {
+                    operation: OperationIntent::UpdateTask { envelope: replay, domains, .. },
+                    generation,
+                    payload: QueuedInputPayload::AlreadyRetained,
+                    ..
+                },
+                ..
+            }) if *envelope == replay && Arc::ptr_eq(frozen, &domains) && generation == second.generation()
+        ));
+        assert!(matches!(
+            execution.observe_lifecycle_grant(update, second).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        let replay = start_test_dispatch(&mut execution, update, second, 6);
+        assert!(
+            matches!(replay, OperationIntent::UpdateTask { domains, .. } if Arc::ptr_eq(frozen, &domains))
+        );
+
+        let renewal = execution
+            .next_renewal_intent(participation)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &renewal,
+            OperationIntent::RenewParticipationLease(request) if request.participation() == participation
+        ));
+        let renewal_input = grant(7);
+        start_test_lease_send(&mut execution, &renewal, renewal_input, 8);
+        let backend = participation.backend_process_id();
+        assert!(execution.dispatcher.tracks_input(update, second));
+        assert!(
+            execution
+                .dispatcher
+                .tracks_input(renewal.operation_id(), renewal_input)
+        );
+        assert_eq!(
+            execution
+                .dispatcher
+                .lane_in_flight(backend, DispatchLane::Update),
+            1
+        );
+        assert_eq!(
+            execution
+                .dispatcher
+                .lane_in_flight(backend, DispatchLane::Lifecycle),
+            1
+        );
+        assert!(
+            execution
+                .next_renewal_intent(participation)
+                .unwrap()
+                .is_none()
+        );
+
+        execution
+            .set_now(due.saturating_add(Duration::from_millis(250)))
+            .unwrap();
+        settle_test_lease(
+            &mut execution,
+            &renewal,
+            renewal_input,
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            execution.next_lifecycle_deadline(),
+            Some(due.saturating_add(Duration::from_secs(1)))
+        );
+        assert_eq!(
+            execution
+                .dispatcher
+                .lane_in_flight(backend, DispatchLane::Lifecycle),
+            0
+        );
+        assert_eq!(
+            execution
+                .dispatcher
+                .lane_in_flight(backend, DispatchLane::Update),
+            1
+        );
+        assert!(execution.dispatcher.tracks_input(update, second));
+        assert_eq!(
+            execution
+                .task_by_identity_ref(task)
+                .unwrap()
+                .released_update_operation(),
+            Some(update)
+        );
+
+        let receipt = UpdateTaskReceipt::new(
+            task,
+            vec![TaskDomainReceipt::SplitAssignment {
+                nodes: vec![PlanNodeSplitReceipt::new(
+                    node,
+                    SplitWatermark::empty().apply_batch(sequence, false),
+                )],
+                progression: DomainProgression::Apply,
+            }],
+        );
+        let accepted = update_reply(
+            second,
+            OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: Some(AckPayload::Update(receipt)),
+            }),
+        );
+        assert!(matches!(
+            execution.apply_dispatched_reply(&accepted),
+            (None, Ok(()))
+        ));
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        assert_eq!(
+            execution
+                .task_by_identity_ref(task)
+                .unwrap()
+                .released_update_operation(),
+            None
+        );
     }
 
     #[test]
