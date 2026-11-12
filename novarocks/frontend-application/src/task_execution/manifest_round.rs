@@ -19,59 +19,29 @@
 
 use std::sync::Arc;
 
-use novarocks_attempt_protocol::config::DispatchBudget;
 use novarocks_query_application::api::{
     NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
 };
-use novarocks_query_application::coordination::{
-    AcceptedRootStatusSource, NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
-};
+use novarocks_query_application::coordination::{AcceptedRootStatusSource, NativeAttemptDrive};
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
 use super::abort_effect::NativeAbortEffectIntake;
-use super::actor_gate::{ActorGateOwner, ActorGatedTaskOperationSink};
+use super::actor_gate::ActorGateOwner;
 use super::attempt_convergence::{
-    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
-    advance_task_round,
+    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, advance_task_round,
 };
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
-use super::execution::QueryTaskExecution;
-use super::intent::TaskOperationSink;
-use super::manifest_projection::ManifestAttemptInputs;
-use super::round::{AcknowledgementObserver, TaskRound};
-use super::sources::AttemptEstablishFacts;
+use super::round::TaskRound;
 use super::split_transport::SplitDeliveryBridge;
-use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
+use super::status_intake::{NotifyWake, StatusIntakeWake};
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::native::task_transport::{
-    AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
-};
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentFailureSource, SplitAssignmentRoundGuard,
 };
-use novarocks_coordination_contract::MonotonicClock;
-use novarocks_query_application::api::BackendProcessObservationService;
 
-const STATUS_INTAKE_CAPACITY: usize = 4096;
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
-
-/// Process-owned runtime policy used to instantiate one exact manifest.
-pub(crate) struct ManifestAttemptTransport {
-    pub(crate) clock: Arc<dyn MonotonicClock>,
-    pub(crate) dispatch_budget: DispatchBudget,
-    pub(crate) status_subscription_error_budget: u32,
-    pub(crate) data_runtime: FrontendDataRuntime,
-    pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
-    pub(crate) source_cohort:
-        crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
-    pub(crate) native_actions:
-        novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
-    /// Exact process evidence bounds active pre-ready observation and residual
-    /// convergence. It cannot change the frozen manifest or schedule a successor.
-    pub(crate) convergence_source: BackendProcessObservationService,
-}
 
 /// One active Task protocol owner assembled without a scheduling capability.
 pub(crate) struct ManifestAssembledRound {
@@ -118,119 +88,6 @@ pub(crate) enum ManifestAttemptCompletion {
     /// A row result pump owns output and asks TaskRound to seal the exact root
     /// success after it has consumed Worker EOS.
     AcceptedRootSuccessSeal,
-}
-
-pub(crate) fn assemble_manifest_round(
-    inputs: ManifestAttemptInputs,
-    establish: AttemptEstablishFacts,
-    replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
-    transport: ManifestAttemptTransport,
-) -> Result<ManifestAssembledRound, TaskExecutionError> {
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    let ManifestAttemptInputs {
-        plan,
-        graph,
-        compatibility,
-        transport: transport_budget,
-        writers,
-        summary_sources,
-        admission_epochs,
-        preparing_positions,
-        members,
-        backends,
-    } = inputs;
-    let split_delivery = SplitDeliveryBridge::for_graph(&graph);
-    let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
-    let convergence_source = Arc::clone(&transport.convergence_source);
-
-    let convergence_targets = members
-        .iter()
-        .map(|member| {
-            NativeAttemptConvergenceTarget::new(member.participation, member.endpoint.clone())
-        })
-        .collect::<Vec<_>>();
-
-    let acks = TaskAckIntake::new(Arc::clone(&wake));
-    let native = Arc::new(
-        NativeTaskOperationSink::new(
-            &backends,
-            transport_budget,
-            AttemptWireFacts {
-                native_compatibility_id: compatibility,
-            },
-            acks.handle(),
-            transport.data_runtime.clone(),
-            transport.native_actions,
-        )
-        .map_err(TaskExecutionError::NativeTransport)?,
-    ) as Arc<dyn TaskOperationSink>;
-    let (actor_sink, actor_gate, actor_observer) =
-        ActorGatedTaskOperationSink::pair(native, Arc::clone(&wake), compatibility);
-    let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
-
-    let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let clock = Arc::clone(&transport.clock);
-    let observation = Arc::new(
-        ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
-            |error| {
-                TaskExecutionError::Schedule(format!(
-                    "covered observation capacity is invalid: {error:?}"
-                ))
-            },
-        )?,
-    );
-    let covered_subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new_with_source_cohort(
-            &backends,
-            Arc::clone(&observation),
-            transport.status_subscription_error_budget,
-            transport.data_runtime,
-            transport.subscription_scope,
-            transport.source_cohort,
-        )
-        .map_err(TaskExecutionError::NativeTransport)?,
-    );
-    let mut execution = QueryTaskExecution::new(
-        graph,
-        transport.dispatch_budget,
-        transport_budget,
-        compatibility,
-        &admission_epochs,
-        &preparing_positions,
-        clock,
-        sink,
-        intake,
-    )?;
-    if let Some(admissions) = replacement_admissions {
-        execution.adopt_replacement_admissions(&admissions)?;
-    }
-    let mut round = TaskRound::new_covered(
-        execution,
-        acks,
-        Box::new(establish),
-        covered_subscriber,
-        observation,
-    )
-    .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
-    .observing(actor_observer)
-    .with_connector_blocking_io(connector_blocking_io);
-    let protocol_facts = round.install_protocol_facts(plan, &writers, &summary_sources)?;
-    let convergence =
-        NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
-    Ok(ManifestAssembledRound {
-        round,
-        split_delivery,
-        actor_gate,
-        protocol_facts: Some(protocol_facts),
-        convergence,
-        notify,
-        terminal: None,
-        pending_terminal: None,
-        pending_pre_ready: None,
-        split_failure: None,
-        profile_diagnostics: None,
-    })
 }
 
 impl ManifestAssembledRound {
@@ -843,6 +700,10 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_execution::{
+        actor_gate::ActorGatedTaskOperationSink,
+        attempt_convergence::NativeAttemptConvergenceTarget, intent::TaskOperationSink,
+    };
     use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_query_application::api::{BackendProcessObservation, QueryExecutionErrorKind};
 

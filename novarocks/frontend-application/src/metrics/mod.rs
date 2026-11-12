@@ -353,7 +353,6 @@ impl FrontendMetricsRegistry {
         dml_publication::register_collectors(&registry)?;
         task_creation::register_collectors(&registry)?;
         native_transport::register_collectors(&registry)?;
-        crate::native::task_transport::register_metric_collectors(&registry)?;
         let process_memory = observation
             .map(|observation| {
                 process_memory::ProcessMemoryGauges::register(&registry, observation)

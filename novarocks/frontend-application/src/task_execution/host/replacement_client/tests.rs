@@ -427,7 +427,6 @@ async fn fresh_send_generations_share_the_same_frozen_acquire_and_retire_apply()
         FrontendControlRuntimeConfig {
             pollers: NonZeroUsize::new(executor.metrics().num_workers()).unwrap(),
             clock: clock.clone(),
-            transport: TransportBudget::DEFAULT,
             workload_scope_limit: NonZeroUsize::new(8).unwrap(),
             history: None,
         },

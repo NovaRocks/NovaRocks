@@ -57,7 +57,7 @@ impl FrontendWorkloadCapacityProfile {
         if let Some(budget) = self.transport_budget {
             let source = self.inputs.native.as_ref().ok_or(WorkError::NotReady)?;
             if !native
-                .task_transport_supervisor()
+                .transport_capacity()
                 .accepts_transport_budget(budget.into_codec())
                 || source.apply_records != budget.max_backend_queued_operations()
                 || source.transport.process_items != budget.max_backend_queued_operations()
@@ -123,6 +123,8 @@ impl FrontendWorkloadCapacityProfile {
         let pair = workload.configure_responsibility(ResponsibilityConfig {
             work_per_turn: self.policy().turn_budget(),
         })?;
+        // Covered subscriptions consume paid Source children from these
+        // fixed slots. The original Workload owner validates the exact count.
         workload.configure_control_storage(ControlStorageConfig::new(slots, &roles))?;
         Ok(pair)
     }

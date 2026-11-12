@@ -3261,7 +3261,6 @@ mod original_failure_tests {
             Arc::new(trust),
             novarocks_native_adapter::FrontendNativeTransport::plaintext(),
             novarocks_task_codec::TransportBudget::DEFAULT,
-            8,
         )
         .unwrap()
     }

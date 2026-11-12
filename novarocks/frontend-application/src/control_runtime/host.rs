@@ -3223,7 +3223,6 @@ mod tests {
             FrontendControlRuntimeConfig {
                 pollers: std::num::NonZeroUsize::new(handle.metrics().num_workers()).unwrap(),
                 clock: Arc::new(TestClock(Instant::now())),
-                transport: novarocks_task_codec::TransportBudget::DEFAULT,
                 workload_scope_limit: std::num::NonZeroUsize::new(
                     novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
                 )
@@ -3273,7 +3272,6 @@ mod tests {
             FrontendControlRuntimeConfig {
                 pollers: std::num::NonZeroUsize::new(handle.metrics().num_workers()).unwrap(),
                 clock,
-                transport: novarocks_task_codec::TransportBudget::DEFAULT,
                 workload_scope_limit: std::num::NonZeroUsize::new(
                     novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
                 )

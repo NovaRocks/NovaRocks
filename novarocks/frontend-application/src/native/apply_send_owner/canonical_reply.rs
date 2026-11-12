@@ -411,6 +411,7 @@ impl ApplySlot {
             &mut row.original.as_mut().unwrap().native.accepted,
         )
     }
+    #[cfg(test)]
     pub(crate) fn shrink_native_encoding(
         &self,
         bytes: usize,

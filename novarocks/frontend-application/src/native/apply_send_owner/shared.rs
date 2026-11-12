@@ -614,8 +614,12 @@ impl SharedApplyRetirement {
                     .unwrap_or_else(|error| error.into_inner())
                     .take()
                     .expect("same original physical packet");
-                let ApplyReservations::Shared(physical) = physical else {
-                    panic!("Shared cleanup cannot consume Legacy physical custody");
+                let physical = match physical {
+                    ApplyReservations::Shared(original) => original,
+                    #[cfg(test)]
+                    ApplyReservations::Legacy { .. } => {
+                        panic!("Shared cleanup cannot consume Legacy physical custody");
+                    }
                 };
                 assert!(
                     physical.financial.is_some(),

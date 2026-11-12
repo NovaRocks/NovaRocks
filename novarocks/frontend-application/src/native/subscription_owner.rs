@@ -404,8 +404,8 @@ impl NativeSubscriptionOwner {
             .ok_or(WorkError::ArithmeticOverflow)
     }
 
-    /// `scope_records_limit` is copied from the SAME configured FE Workload;
-    /// production composition must not substitute a default or another owner.
+    /// The legacy fixture allocates records from its original WC scope limit.
+    #[cfg(test)]
     pub(crate) fn new(
         handle: Handle,
         scope_records_limit: usize,
@@ -439,7 +439,8 @@ impl NativeSubscriptionOwner {
             port,
         ))
     }
-    /// Host installs this owner BEFORE opening the port. No early task is minted.
+    /// The fixture installs this owner before opening the port.
+    #[cfg(test)]
     pub(crate) fn start_reaper(&mut self) -> Result<(), RegistrationError> {
         {
             let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -630,16 +631,6 @@ impl Drop for NativeSubscriptionOwner {
 }
 
 impl NativeSubscriptionPort {
-    /// Observe this original process owner's installed records. Readiness is
-    /// opened only after the composition starts its original reaper.
-    pub(crate) fn installed_records(&self) -> Result<usize, novarocks_workload_control::WorkError> {
-        let state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.closed {
-            return Err(novarocks_workload_control::WorkError::Closed);
-        }
-        Ok(state.records.len())
-    }
-
     /// Reserve only this original finite header and parent facts. The one
     /// original service queues/polls the child outside Core and caller locks.
     /// No SDK request, watch, state or future is constructed by this operation.
@@ -973,9 +964,11 @@ impl Drop for SubscriptionReservation {
     }
 }
 
+#[cfg(test)]
 struct ReaperExitGuard {
     core: Arc<Core>,
 }
+#[cfg(test)]
 impl Drop for ReaperExitGuard {
     fn drop(&mut self) {
         let failed = {

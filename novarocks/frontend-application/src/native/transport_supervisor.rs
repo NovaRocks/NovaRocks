@@ -107,7 +107,8 @@ pub(crate) struct NativeTransportSupervisorBudget {
     max_waiters: usize,
 }
 
-/// Limits read from the actual original supervisor, not a second wallet.
+/// Limits read from the original legacy fixture supervisor.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeTaskOperationCapacityFacts {
     pub(crate) process_items: usize,
@@ -245,6 +246,7 @@ impl TargetRetained {
 #[derive(Debug)]
 struct SupervisorInner {
     budget: NativeTransportSupervisorBudget,
+    #[cfg(test)]
     source_transport: Option<TransportBudget>,
     state: Mutex<SupervisorState>,
 }
@@ -263,6 +265,7 @@ impl NativeTransportSupervisor {
         Ok(NativeTransportSupervisorBudget::from_transport(transport)?.max_waiters)
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity_sources(&self) -> NativeTaskOperationCapacityFacts {
         let budget = self.inner.budget;
         NativeTaskOperationCapacityFacts {
@@ -277,6 +280,7 @@ impl NativeTransportSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_transport(transport: TransportBudget) -> Result<Self, String> {
         Ok(Self {
             inner: Arc::new(SupervisorInner {
@@ -298,6 +302,7 @@ impl NativeTransportSupervisor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn accepts_transport_budget(&self, transport: TransportBudget) -> bool {
         self.inner
             .source_transport
@@ -466,6 +471,7 @@ impl NativeTransportSupervisor {
     /// Reserve the original run's exact protobuf bytes before its first DTO
     /// clone/encoding. Invalid input is permanent; physical saturation alone
     /// registers the same waiter and returns typed backpressure.
+    #[cfg(test)]
     pub(crate) fn try_reserve_original_encoding(
         &self,
         waiter: &NativeTransportWaiter,
@@ -580,6 +586,7 @@ impl NativeTransportSupervisor {
 }
 
 /// The original encoder never turns a malformed invoice into a capacity wait.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NativeEncodingReservationFailure {
     InvalidBytes,
@@ -739,6 +746,7 @@ impl Drop for NativeTransportQueuePermit {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct NativeTransportEncodingPermit {
     inner: Arc<SupervisorInner>,
@@ -747,6 +755,7 @@ pub(crate) struct NativeTransportEncodingPermit {
     retained_bytes: usize,
 }
 
+#[cfg(test)]
 impl NativeTransportEncodingPermit {
     pub(crate) fn shrink_to(&mut self, actual: usize) {
         assert!(
@@ -794,6 +803,7 @@ impl NativeTransportEncodingPermit {
     }
 }
 
+#[cfg(test)]
 impl Drop for NativeTransportEncodingPermit {
     fn drop(&mut self) {
         let wakes = {

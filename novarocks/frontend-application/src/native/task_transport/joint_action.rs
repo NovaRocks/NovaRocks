@@ -16,23 +16,20 @@
 // under the License.
 
 //! Same-ticket original Native action, selected local offer and paid reply plan.
-use super::super::{
-    data_runtime::CachedNativeChannel,
-    transport::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff},
-};
+#[cfg(test)]
+use super::super::transport::{NativeChannelSource, NativeDialAttempt};
+use super::super::{data_runtime::CachedNativeChannel, transport::NativeDialHandoff};
 use super::*;
 use novarocks_native_adapter::native_lane::ReservedNativeCall;
 use novarocks_proto_models::resource_layout::{CloneBackingVisitor, GeneratedCloneBacking};
-use novarocks_workload_control::{
-    WorkError,
-    joint_admission::{
-        JointLane, JointResources, NativeAsyncActionAdmission, NativeAsyncActionQuote,
-    },
+#[cfg(test)]
+use novarocks_workload_control::joint_admission::{
+    JointLane, JointResources, NativeAsyncActionQuote,
 };
-use std::{
-    alloc::Layout,
-    task::{Context, Poll, Waker},
-};
+use novarocks_workload_control::{WorkError, joint_admission::NativeAsyncActionAdmission};
+use std::alloc::Layout;
+#[cfg(test)]
+use std::task::{Context, Poll, Waker};
 
 pub(crate) struct NativeBatchAdmission {
     pub(crate) remaining: usize,
@@ -46,6 +43,7 @@ impl std::fmt::Debug for NativeBatchAdmission {
     }
 }
 pub(crate) struct NativePhysicalOffer {
+    #[cfg(test)]
     pub(crate) encoding: Option<super::super::transport_supervisor::NativeTransportEncodingPermit>,
     pub(crate) call: Option<NativeCallSource>,
 }
@@ -186,10 +184,12 @@ pub(crate) fn clone_input_backing(operations: &[OperationIntent]) -> Result<usiz
     }
     Ok(invoice.owned)
 }
+#[cfg(test)]
 fn nonzero(value: usize) -> Result<std::num::NonZeroU64, WorkError> {
     std::num::NonZeroU64::new(u64::try_from(value).map_err(|_| WorkError::ArithmeticOverflow)?)
         .ok_or(WorkError::Conflict)
 }
+#[cfg(test)]
 fn make_quote(
     items: usize,
     input_bytes: usize,
@@ -307,10 +307,12 @@ pub(crate) fn original_run_encoding(
 
 /// Complete requested backing of one actual original RPC method run. This is
 /// not a budget-only promise for every possible input or a capacity grant.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeMethodRunProgress {
     original: NativeAsyncActionQuote,
 }
+#[cfg(test)]
 impl NativeMethodRunProgress {
     pub(crate) fn foreground(self) -> Result<JointResources, WorkError> {
         self.original.action(JointLane::Foreground)
@@ -325,6 +327,7 @@ impl NativeMethodRunProgress {
     }
 }
 
+#[cfg(test)]
 impl NativeTaskOperationSink {
     /// Allocation-free invoice for the actual next run, before DTO clones or
     /// encoding. Keep the whole method run: no sampled message or truncated D.
@@ -372,20 +375,24 @@ impl NativeTaskOperationSink {
     }
 }
 
+#[cfg(test)]
 pub(super) enum NativeAdmissionFailure {
     Governance(WorkError),
     Unsent(String),
 }
+#[cfg(test)]
 impl From<WorkError> for NativeAdmissionFailure {
     fn from(error: WorkError) -> Self {
         Self::Governance(error)
     }
 }
+#[cfg(test)]
 pub(super) struct AcceptedNativeAction {
     pub(super) slot: super::super::apply_send_owner::ApplySlot,
     pub(super) publisher: super::super::apply_send_owner::OriginalReplyPublisher,
     pub(super) notifications: [novarocks_workload_control::WorkloadProgressNotification; 3],
 }
+#[cfg(test)]
 impl NativeTaskOperationSink {
     pub(super) fn admit_original_batch(
         &self,
@@ -513,15 +520,12 @@ impl NativeTaskOperationSink {
         encoding_plan: novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan,
         cx: &mut Context<'_>,
     ) -> Poll<Result<NativePhysicalOffer, NativeAdmissionFailure>> {
-        let encoding = match self
-            .data_runtime
-            .task_transport_supervisor()
-            .try_reserve_original_encoding(
-                &self.transport_waiter,
-                backend,
-                lane,
-                encoding_plan.protobuf_bytes(),
-            ) {
+        let encoding = match self.supervisor.try_reserve_original_encoding(
+            &self.transport_waiter,
+            backend,
+            lane,
+            encoding_plan.protobuf_bytes(),
+        ) {
             Ok(value) => value,
             Err(
                 super::super::transport_supervisor::NativeEncodingReservationFailure::Backpressured(

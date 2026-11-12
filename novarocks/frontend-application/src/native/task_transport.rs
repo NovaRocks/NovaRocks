@@ -15,31 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The native carrier of the frontend task protocol.
+//! Native Task wire projection for the frontend attempt host.
 //!
-//! Two independent channels live here. [`NativeTaskOperationSink`] is the
-//! mutation path: it encodes one released [`DispatchBatch`], sends exactly one
-//! `ApplyTaskOperations` to the batch's own backend, and hands every receipt
-//! back through [`TaskAckIntake`] in request order.
-//! [`TaskStatusSubscriber`] is the observation path: one `SubscribeTaskStatus`
-//! stream per participation, resubscribed by cursor inside a bounded error
-//! budget.
-//!
-//! The two are deliberately unable to reach each other. The observation path
-//! holds a [`StatusIntakeHandle`] and nothing else, so it can enqueue a
-//! snapshot and wake the runner but cannot create a task, complete a stage,
-//! settle an operation, or renew a lease. Nothing here renews a lease at all:
-//! a renewal is minted by the participation owner from its own clock and
-//! reaches the wire as an ordinary operation, so a healthy transport can never
-//! keep an unhealthy query alive and a broken observation channel can never
-//! stop a renewal.
-//!
-//! Both paths reuse the role's one native client stack — the cached channel,
-//! the deployment JWT interceptor, and the typed channel-acquisition boundary
-//! of [`super::transport`]. There is no second client here.
+//! The legacy TaskRound receipt intake and observation adapters remain during
+//! fixture migration. Both carriers use the role-owned Native client stack.
 #![allow(
     dead_code,
-    reason = "The native task protocol is not routed into production yet; the coordinator cutover constructs this carrier."
+    reason = "The old TaskRound carrier remains compiled during fixture migration."
 )]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -51,9 +33,9 @@ use std::task::Poll;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
-use prometheus::{
-    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
-};
+#[cfg(test)]
+use prometheus::Registry;
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts};
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
 use novarocks_attempt_protocol::config::DispatchLane;
@@ -88,9 +70,10 @@ use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::ParticipationReceipt;
 
+use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+#[cfg(test)]
 use crate::task_execution::intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
-    TaskOperationQueueAdmission, TaskOperationSink, TaskOperationSubmit,
+    DispatchBatch, TaskOperationQueueAdmission, TaskOperationSink, TaskOperationSubmit,
 };
 use crate::task_execution::participation_convergence::{
     ParticipationConvergenceIntakeHandle, ParticipationConvergencePublishError,
@@ -100,12 +83,14 @@ use crate::task_execution::status_intake::{
     StatusIntakeHandle, StatusIntakeWake,
 };
 
+#[cfg(test)]
 use super::apply_send_owner::{ApplyReservations, OriginalDisposition};
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
+use super::transport_supervisor::NativeTransportReadyWake;
+#[cfg(test)]
 use super::transport_supervisor::{
-    NativeTransportBackpressure, NativeTransportLane, NativeTransportReadyWake,
-    NativeTransportWaiter,
+    NativeTransportBackpressure, NativeTransportLane, NativeTransportWaiter,
 };
 
 mod joint_action;
@@ -119,6 +104,7 @@ pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_
 mod covered;
 mod legacy;
 mod metrics;
+#[cfg(test)]
 mod send;
 mod sink;
 pub(crate) mod wire;
@@ -126,6 +112,7 @@ use covered::*;
 #[cfg(test)]
 use legacy::*;
 use metrics::*;
+#[cfg(test)]
 use send::*;
 use sink::*;
 use wire::*;
@@ -134,17 +121,25 @@ use wire::*;
 pub(crate) use covered::covered_subscription_future_layout;
 pub(crate) use covered::{CoveredTaskStatusSubscriber, SubscriptionState};
 pub(crate) use legacy::TaskStatusSubscriber;
-pub(crate) use metrics::{observe_attempt_pump_installed, register_metric_collectors};
+pub(crate) use metrics::observe_attempt_pump_installed;
+#[cfg(test)]
+pub(crate) use sink::NativeTaskOperationSink;
 pub(crate) use sink::{
-    NativeTaskOperationSink, NativeTaskTransportCreationError, TaskAckIntake, TaskAckIntakeHandle,
-    TaskOperationIntakeEvent,
+    NativeTaskTransportCreationError, TaskAckIntake, TaskAckIntakeHandle, TaskOperationIntakeEvent,
 };
 pub(crate) use wire::AttemptWireFacts;
+
+fn is_small_control(intent: &OperationIntent) -> bool {
+    intent.native_method() == NativeRpcMethod::ApplyTaskControlOperations
+}
 
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(test)]
 #[path = "task_transport/action_input.rs"]
 mod action_input;
+#[cfg(test)]
 pub(crate) use action_input::{NativeApplyKnownInputLayouts, known_input_layouts_for_composition};
+#[cfg(test)]
 mod proposal_wait;

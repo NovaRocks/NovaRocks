@@ -344,7 +344,6 @@ struct FrontendQueryRuntimeConfig {
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    transport_budget: FrontendTaskTransportBudget,
     abort_capacity: NonZeroUsize,
 }
 
@@ -1499,7 +1498,6 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             execution.transport_budget.into_codec(),
-            execution.workload.scope_records_limit,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
@@ -1553,7 +1551,6 @@ impl FrontendApplicationHost {
                 task_update_retry_policy: execution.task_update_retry_policy,
                 split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
                 coordination_budgets: execution.coordination_budgets,
-                transport_budget: execution.transport_budget,
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
             execution_runtime_owner,
@@ -1640,13 +1637,9 @@ impl FrontendApplicationHost {
                 .await);
         }
 
-        // Unique original Apply owner is now in Host. No Native caller has
-        // received a projection yet; early try_new failure had no reaper.
-        if let Err(error) = host
-            .data_runtime
-            .start_original_apply_reaper()
-            .and_then(|()| host.data_runtime.start_original_subscription_reaper())
-        {
+        // Open the original Shared Apply bank after Host takes its owner and
+        // before Native callers receive projections.
+        if let Err(error) = host.data_runtime.open_shared_apply_bank() {
             return Err(host
                 .cleanup_open_error(FrontendApplicationError::new(
                     FrontendApplicationErrorKind::CoordinatorOpen,
@@ -1883,7 +1876,6 @@ impl FrontendApplicationHost {
             FrontendControlRuntimeConfig {
                 pollers,
                 clock: Arc::clone(&host.execution_runtime_owner.clock),
-                transport: host.query_runtime.transport_budget.into_codec(),
                 workload_scope_limit: NonZeroUsize::new(
                     host.execution_runtime_owner
                         .native_capacity_profile
@@ -2633,12 +2625,14 @@ impl FrontendApplicationHost {
             trace_shutdown_stage("catalog_controller_joined");
         }
         trace_shutdown_stage("workload_join_started");
-        let execution_result = {
-            let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
+        let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
+        #[cfg(not(test))]
+        let execution_result = shutdown.await;
+        #[cfg(test)]
+        let execution_result = if self.data_runtime.has_original_subscription_owner() {
+            // Legacy fixtures explicitly install the original reaper. Recover
+            // that same failed owner so its children cannot strand WC drain.
             tokio::pin!(shutdown);
-            // The healthy continuous reaper stays active throughout logical
-            // teardown. If it fails, borrow the SAME owner here so its original
-            // children cannot strand the Workload drain that precedes the tail.
             tokio::select! {
                 result = &mut shutdown => result,
                 recovery = self.data_runtime.recover_failed_subscription_reaper_until(deadline) => {
@@ -2646,6 +2640,8 @@ impl FrontendApplicationHost {
                     shutdown.await
                 }
             }
+        } else {
+            shutdown.await
         };
         trace_shutdown_stage("workload_join_returned");
         if let Err(error) = execution_result {
@@ -2744,25 +2740,28 @@ impl FrontendApplicationHost {
             }
         }
         trace_shutdown_stage("native_apply_join_returned");
-        trace_shutdown_stage("native_subscriptions_join_started");
-        if let Err(error) = self
-            .data_runtime
-            .drain_original_subscriptions_until(deadline)
-            .await
-        {
-            if !self.data_runtime.original_subscriptions_joined() {
-                return Err(match primary_error {
-                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
-                    None => error,
-                });
+        #[cfg(test)]
+        if self.data_runtime.has_original_subscription_owner() {
+            trace_shutdown_stage("native_subscriptions_join_started");
+            if let Err(error) = self
+                .data_runtime
+                .drain_original_subscriptions_until(deadline)
+                .await
+            {
+                if !self.data_runtime.original_subscriptions_joined() {
+                    return Err(match primary_error {
+                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                        None => error,
+                    });
+                }
+                if let Some(primary) = primary_error.as_mut() {
+                    primary.push_str(&format!("; cleanup failed: {error}"));
+                } else {
+                    primary_error = Some(error);
+                }
             }
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {error}"));
-            } else {
-                primary_error = Some(error);
-            }
+            trace_shutdown_stage("native_subscriptions_join_returned");
         }
-        trace_shutdown_stage("native_subscriptions_join_returned");
         // Role-owned callers have reached the Native tail. Close future calls,
         // retire cache aliases and wait for the original public IO/body exits
         // before StateStore, using the same absolute Host deadline.

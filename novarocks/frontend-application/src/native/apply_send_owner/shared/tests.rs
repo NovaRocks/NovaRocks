@@ -605,7 +605,7 @@ fn pending_row(
         WorkKind::Cleanup
     };
     let encoding = roles.encoding(principal, backend, plan.protobuf_bytes(), encoding_kind);
-    let slot = runtime.apply_send_port().reserve_original_slot(1).unwrap();
+    let slot = runtime.apply_send_port().reserve_shared_slot(1).unwrap();
     let panic = PanicSink::new();
     let inner = panic.clone();
     let (mut source, exit, launch) =
@@ -1229,7 +1229,7 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
     let mut wc = Governed::new();
     let (mut apply, port) =
         ApplySendOwner::new(Handle::current(), TransportBudget::DEFAULT).unwrap();
-    apply.start_reaper().unwrap();
+    apply.open_shared_bank().unwrap();
     let backend = BackendProcessId::new_v7();
     let operation = cancel(backend);
     let (parent, queue, principal) = roles.parent(backend, operation.queued_bytes());
@@ -1238,7 +1238,7 @@ async fn refused_attachment_survives_withdrawal_and_releases_only_after_join() {
         NonZeroU64::new(Layout::new::<NativeQueuedInputGrant>().size() as u64).unwrap(),
         0,
     ));
-    let slot = port.reserve_original_slot(1).unwrap();
+    let slot = port.reserve_shared_slot(1).unwrap();
     apply.close();
     let panic = PanicSink::new();
     let inner = panic.clone();
@@ -1911,14 +1911,17 @@ async fn run_actor_send(
             }
             std::panic::resume_unwind(original);
         }
-        fn transport_event(&mut self, _: AttemptActionId, original: custody::TransportSourceEvent) {
-            match original {
-                custody::TransportSourceEvent::Report(transport::SendReportReturn::Receipt {
+        fn retain_transport_release(&mut self, original: Box<dyn std::any::Any + Send>) {
+            let report = original
+                .downcast::<transport::SendReportReturn>()
+                .unwrap_or_else(|original| std::panic::resume_unwind(original));
+            match *report {
+                transport::SendReportReturn::Receipt {
                     key,
                     delivery_error: None,
                     receipt,
                     ..
-                }) => {
+                } => {
                     assert_eq!(key.operation, receipt.original.operation_id());
                     assert!(receipt.unpublished.is_none());
                     assert!(

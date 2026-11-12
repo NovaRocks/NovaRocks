@@ -3604,6 +3604,7 @@ async fn actual_covered_rpc_abort_keeps_original_publisher_until_future_destruct
     let reservation = role
         .runtime
         .subscription_port()
+        .unwrap()
         .reserve(
             &role.scope(),
             Some(Arc::clone(&publisher)),

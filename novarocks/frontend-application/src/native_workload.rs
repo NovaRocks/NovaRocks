@@ -20,7 +20,7 @@
 //! Source identity and lifecycle readiness do not grant resource capacity.
 
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::native::transport_supervisor::NativeTaskOperationCapacityFacts;
+use crate::native::transport_capacity::TransportCapacityFacts;
 use crate::query_execution::internal_result_cpu::{
     FrontendResultCapacityProfile, InternalResultCpu,
 };
@@ -91,13 +91,7 @@ impl FrontendNativeCapacityInputs {
         mut self,
         native: &FrontendDataRuntime,
     ) -> Result<Self, WorkError> {
-        let source = native.installed_runtime_sources()?;
-        if source.subscription_records != self.policy.scope_limit() {
-            return Err(WorkError::InvalidConfig(
-                "frontend actual subscription inventory",
-            ));
-        }
-        self.native = Some(source);
+        self.native = Some(native.installed_runtime_sources()?);
         Ok(self)
     }
     pub(crate) fn validate_pool_declarations(
@@ -141,8 +135,7 @@ pub(crate) struct FrontendNativeCapacitySources {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeProcessCapacitySources {
     pub(crate) apply_records: usize,
-    pub(crate) subscription_records: usize,
-    pub(crate) transport: NativeTaskOperationCapacityFacts,
+    pub(crate) transport: TransportCapacityFacts,
     #[cfg(test)]
     pub(crate) physical: novarocks_native_adapter::native_transport_admission::AdmissionDimensions,
 }

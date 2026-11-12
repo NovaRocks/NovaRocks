@@ -84,7 +84,6 @@ use novarocks_control_runtime_core::{
 };
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_query_application::api::BackendProcessObservationPort;
-use novarocks_task_codec::TransportBudget;
 use prometheus::Registry;
 use std::{
     any::Any,
@@ -98,13 +97,11 @@ pub(crate) struct FrontendControlRuntimeConfig {
     /// The actual worker count of the role's data runtime.
     pub(crate) pollers: NonZeroUsize,
     pub(crate) clock: Arc<dyn MonotonicClock>,
-    pub(crate) transport: TransportBudget,
     pub(crate) workload_scope_limit: NonZeroUsize,
     pub(crate) history: Option<HistoryCapture>,
 }
 #[derive(Debug)]
 pub(crate) enum FrontendControlStartError {
-    Transport(String),
     Ledger(RuntimeError),
     Observation(ObservationError),
     Pollers(std::io::Error),
@@ -372,8 +369,7 @@ impl FrontendControlRuntime {
         data: &FrontendDataRuntime,
         backend_processes: Arc<dyn BackendProcessObservationPort>,
     ) -> Result<Self, FrontendControlStartError> {
-        let layout = NativeTransportCapacity::from_transport(config.transport)
-            .map_err(FrontendControlStartError::Transport)?;
+        let layout = data.transport_capacity().clone();
         let clock: Arc<dyn Clock> = Arc::new(FrontendClock(config.clock));
         let observation = RuntimeObservation::new(Some(clock.clone()));
         let budget = ObservationBudget::for_task_attempt();

@@ -334,6 +334,14 @@ async fn original_process_health_blocks_ready_and_triggers_running_host_observat
 async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
     use novarocks_workload_control::{WorkClass, WorkRequest};
     let mut host = open_host(Some(state_store_input())).await.unwrap();
+    let scope_limit = host
+        .execution_runtime_owner
+        .native_capacity_profile
+        .policy()
+        .scope_limit();
+    host.data_runtime
+        .install_original_subscription_reaper(scope_limit)
+        .unwrap();
     host.install_statement_control_for_test();
     host.mark_ready().unwrap();
     let root = host
@@ -346,6 +354,7 @@ async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_dra
     let lease = host
         .data_runtime
         .subscription_port()
+        .unwrap()
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
         .start(std::future::pending())
@@ -444,7 +453,7 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     let attempts = control.attempts();
     assert_eq!(
         attempts.transport_capacity().transport_budget(),
-        host.query_runtime.transport_budget.into_codec()
+        host.data_runtime.transport_capacity().transport_budget()
     );
 
     let store = host

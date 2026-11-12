@@ -17,18 +17,19 @@
 
 //! Original producer-owned paid input preparation, before the process gate.
 use super::*;
-use crate::task_execution::intent::{
-    TaskOperationQueuePermit, TaskOperationQueuePreparation, TaskOperationQueueRequest,
-};
+use crate::task_execution::intent::TaskOperationQueuePermit;
+#[cfg(test)]
+use crate::task_execution::intent::{TaskOperationQueuePreparation, TaskOperationQueueRequest};
 use novarocks_resource_contract::ExistingOwnerRetentionPin;
+#[cfg(test)]
+use novarocks_workload_control::joint_admission::JointLane;
 use novarocks_workload_control::{
     WorkError,
-    joint_admission::{JointLane, NativeQueuedInputGrant, NativeQueuedInputQuote},
+    joint_admission::{NativeQueuedInputGrant, NativeQueuedInputQuote},
 };
-use std::{
-    alloc::Layout,
-    task::{Context, Poll, Wake, Waker},
-};
+#[cfg(test)]
+use std::task::{Context, Poll, Waker};
+use std::{alloc::Layout, task::Wake};
 
 impl Wake for TaskAckIntakeInner {
     fn wake(self: Arc<Self>) {
@@ -156,6 +157,7 @@ pub(crate) fn queued_update_quote(
     queued_header_quote(0)
 }
 
+#[cfg(test)]
 impl NativeTaskOperationSink {
     pub(super) fn reserve_paid_queue_in(
         &self,
@@ -241,16 +243,13 @@ impl NativeTaskOperationSink {
         } else {
             NativeTransportLane::Ordinary
         };
-        match self
-            .data_runtime
-            .task_transport_supervisor()
-            .try_reserve_queue(
-                &self.transport_waiter,
-                request.backend_process_id(),
-                lane,
-                1,
-                request.queued_bytes(),
-            ) {
+        match self.supervisor.try_reserve_queue(
+            &self.transport_waiter,
+            request.backend_process_id(),
+            lane,
+            1,
+            request.queued_bytes(),
+        ) {
             Ok(physical) => {
                 let input = preparation
                     .grant

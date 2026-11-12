@@ -168,10 +168,8 @@ pub(super) static TASK_ATTEMPT_PUMPS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("register novarocks_task_attempt_pump_installed_total")
 });
 
-/// Registers every task transport collector.
-///
-/// The frontend management host owns the role-local registry; this is the one
-/// entry point it needs.
+/// Registers the legacy task transport collectors for fixture assertions.
+#[cfg(test)]
 pub(crate) fn register_metric_collectors(registry: &Registry) -> Result<(), String> {
     for collector in [
         Box::new(TASK_DISPATCH_LANE_DEPTH.clone()) as Box<dyn prometheus::core::Collector>,

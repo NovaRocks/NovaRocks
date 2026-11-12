@@ -245,12 +245,14 @@ pub(super) fn freeze_targets(
 /// to a process that is not in that set is not looked up elsewhere and not
 /// retried: it fails the attempt, because a replaced process is a different
 /// process.
+#[cfg(test)]
 pub(crate) struct NativeTaskOperationSink {
     pub(super) targets: BTreeMap<BackendProcessId, TaskBackendTarget>,
     pub(super) transport: TransportBudget,
     pub(super) attempt: AttemptWireFacts,
     pub(super) acks: TaskAckIntakeHandle,
     pub(super) data_runtime: FrontendDataRuntime,
+    pub(super) supervisor: crate::native::transport_supervisor::NativeTransportSupervisor,
     pub(super) proposal_wait: proposal_wait::OriginalProposalWait,
     pub(super) transport_waiter: std::mem::ManuallyDrop<NativeTransportWaiter>,
     pub(super) authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
@@ -258,6 +260,7 @@ pub(crate) struct NativeTaskOperationSink {
 
 // The original registration position cannot be returned while its shared
 // notification F is still registered. No preparation owns an alias to this F.
+#[cfg(test)]
 impl Drop for NativeTaskOperationSink {
     fn drop(&mut self) {
         let result =
@@ -276,6 +279,7 @@ impl Drop for NativeTaskOperationSink {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for NativeTaskOperationSink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -285,6 +289,7 @@ impl fmt::Debug for NativeTaskOperationSink {
     }
 }
 
+#[cfg(test)]
 impl NativeTaskOperationSink {
     pub(crate) fn new(
         backends: &[BackendProcessDescriptor],
@@ -294,21 +299,18 @@ impl NativeTaskOperationSink {
         data_runtime: FrontendDataRuntime,
         authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
     ) -> Result<Self, NativeTaskTransportCreationError> {
-        if !data_runtime
-            .task_transport_supervisor()
-            .accepts_transport_budget(transport)
-        {
+        let supervisor = data_runtime.task_transport_supervisor().clone();
+        if !supervisor.accepts_transport_budget(transport) {
             return Err(NativeTaskTransportCreationError::BudgetMismatch);
         }
-        let transport_waiter = data_runtime
-            .task_transport_supervisor()
-            .register_waiter(Arc::new(acks.clone()))?;
+        let transport_waiter = supervisor.register_waiter(Arc::new(acks.clone()))?;
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             transport,
             attempt,
             acks,
             data_runtime,
+            supervisor,
             proposal_wait: proposal_wait::OriginalProposalWait::default(),
             transport_waiter: std::mem::ManuallyDrop::new(transport_waiter),
             authority,
@@ -353,6 +355,7 @@ impl NativeTaskOperationSink {
     }
 }
 
+#[cfg(test)]
 impl TaskOperationSink for NativeTaskOperationSink {
     fn try_reserve_queue(
         &self,
@@ -584,6 +587,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
     }
 }
 
+#[cfg(test)]
 pub(super) fn supervisor_lane(batch: &DispatchBatch) -> NativeTransportLane {
     if batch
         .operations()
@@ -596,6 +600,7 @@ pub(super) fn supervisor_lane(batch: &DispatchBatch) -> NativeTransportLane {
     }
 }
 
+#[cfg(test)]
 pub(super) fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
     if intent.requires_control_progress() {
         NativeTransportLane::Control
@@ -604,11 +609,7 @@ pub(super) fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTran
     }
 }
 
-pub(super) fn is_small_control(intent: &OperationIntent) -> bool {
-    intent.native_method()
-        == novarocks_proto_codec::native_rpc::NativeRpcMethod::ApplyTaskControlOperations
-}
-
+#[cfg(test)]
 pub(super) fn settle_unencodable(
     sink: &NativeTaskOperationSink,
     items: Vec<(TaskOperationId, OperationKind, bool, String)>,

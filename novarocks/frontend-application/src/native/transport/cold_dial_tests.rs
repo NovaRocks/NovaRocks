@@ -53,7 +53,6 @@ fn original_runtime() -> FrontendDataRuntime {
         Arc::new(trust),
         FrontendNativeTransport::plaintext(),
         novarocks_task_codec::TransportBudget::DEFAULT,
-        8,
     )
     .unwrap()
 }

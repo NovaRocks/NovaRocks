@@ -235,7 +235,10 @@ impl CoveredTaskStatusSubscriber {
                 "covered participation is outside the frozen topology",
             ));
         }
-        let port = self.data_runtime.subscription_port();
+        let port = self
+            .data_runtime
+            .subscription_port()
+            .map_err(covered_registration)?;
         let runner_wake = self.intake.progress_wake();
         let mut created = false;
         let result = {

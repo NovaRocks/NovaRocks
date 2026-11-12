@@ -17,7 +17,9 @@
 
 //! Role-local original Apply join ownership, including raw-failure retirement.
 //! It introduces no Connector Work/ResultWindow authority.
+#[cfg(test)]
 use super::transport_supervisor::NativeTransportEncodingPermit;
+#[cfg(test)]
 use crate::task_execution::intent::TaskOperationQueuePermit;
 use novarocks_task_codec::TransportBudget;
 use std::{
@@ -44,6 +46,7 @@ pub(crate) use shared::{
 };
 
 pub(crate) enum ApplyReservations {
+    #[cfg(test)]
     Legacy {
         _queue: Vec<Box<dyn TaskOperationQueuePermit>>,
         _encoding: NativeTransportEncodingPermit,
@@ -51,6 +54,7 @@ pub(crate) enum ApplyReservations {
     Shared(shared::SharedApplyReservations),
 }
 impl ApplyReservations {
+    #[cfg(test)]
     pub(crate) fn new(
         queue: Vec<Box<dyn TaskOperationQueuePermit>>,
         encoding: NativeTransportEncodingPermit,
@@ -70,6 +74,7 @@ impl ApplyReservations {
     > {
         use novarocks_workload_control::joint_admission::NativeDispatchSource;
         match self {
+            #[cfg(test)]
             Self::Legacy { _queue, .. } => NativeDispatchSource::capture(
                 action,
                 reply,
@@ -110,11 +115,13 @@ type OriginalFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Requested payload layouts of the actual original Apply holder. This does
 /// not estimate a Tokio task, platform mutex backing or captured pointees.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OriginalInputLayouts {
     pub(crate) future: std::alloc::Layout,
     pub(crate) input: std::alloc::Layout,
 }
+#[cfg(test)]
 pub(crate) fn original_input_layouts<F: Future<Output = ()>>()
 -> Result<OriginalInputLayouts, novarocks_workload_control::WorkError> {
     use novarocks_type_contract::owned_resources::layout::arc_layout;
@@ -134,9 +141,11 @@ struct OriginalInput {
     raw_cause: Mutex<Option<RawValue>>,
     backing: Arc<ReservationBacking>,
 }
+#[cfg(test)]
 struct OriginalJob {
     input: Arc<OriginalInput>,
 }
+#[cfg(test)]
 impl Future for OriginalJob {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
@@ -244,7 +253,8 @@ struct OriginalRecord {
     reservations: Option<Arc<ReservationBacking>>,
 }
 struct State {
-    started: bool,
+    legacy_reaper_started: bool,
+    shared_open: bool,
     closed: bool,
     records: Box<[Option<OriginalRecord>]>,
     first_failure: Option<JoinFacts>,
@@ -265,9 +275,11 @@ impl Core {
         self.changed.notify_one();
     }
 }
+#[cfg(test)]
 struct ReaperExitGuard {
     core: Arc<Core>,
 }
+#[cfg(test)]
 impl Drop for ReaperExitGuard {
     fn drop(&mut self) {
         self.core
@@ -281,6 +293,11 @@ impl Drop for ReaperExitGuard {
 #[derive(Clone)]
 pub(crate) struct ApplySendPort {
     core: Arc<Core>,
+}
+enum ApplyAdmission {
+    #[cfg(test)]
+    Legacy,
+    Shared,
 }
 pub(crate) struct ApplySendOwner {
     core: Arc<Core>,
@@ -312,6 +329,7 @@ pub(crate) struct ApplySlot {
     index: usize,
     active: bool,
 }
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OriginalDisposition {
     Started,
@@ -345,12 +363,13 @@ impl ApplySendOwner {
         handle: Handle,
         budget: TransportBudget,
     ) -> Result<(Self, ApplySendPort), std::collections::TryReserveError> {
-        // Same exact process-item cap as NativeTransportSupervisor::max_items.
+        // Each original row is backed by the role's frozen process-item cap.
         // Allocate once BEFORE the reaper/role publishes any capability.
         let slots = allocate_original_slots(budget.max_backend_queued_operations())?;
         let core = Arc::new(Core {
             state: Mutex::new(State {
-                started: false,
+                legacy_reaper_started: false,
+                shared_open: false,
                 closed: false,
                 records: slots,
                 first_failure: None,
@@ -365,7 +384,7 @@ impl ApplySendOwner {
             core: Arc::clone(&core),
         };
         // No task exists before the original runtime moves into Host.
-        // Port admission remains closed until this owner explicitly starts.
+        // Port admission remains closed until this owner opens it.
         Ok((
             Self {
                 core,
@@ -379,13 +398,23 @@ impl ApplySendOwner {
             port,
         ))
     }
+    pub(crate) fn open_shared_bank(&mut self) -> Result<(), RegistrationFailure> {
+        let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.shared_open || state.closed {
+            return Err(RegistrationFailure::Closed);
+        }
+        state.shared_open = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_reaper(&mut self) -> Result<(), RegistrationFailure> {
         {
             let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.started || state.closed {
+            if state.legacy_reaper_started || state.closed {
                 return Err(RegistrationFailure::Closed);
             }
-            state.started = true;
+            state.legacy_reaper_started = true;
         }
         let original_core = Arc::clone(&self.core);
         let exit = ReaperExitGuard {
@@ -449,14 +478,40 @@ impl ApplySendOwner {
     }
     pub(crate) async fn drain_until(&mut self, deadline: Instant) -> DrainObservation {
         self.close();
-        if !self
+        let legacy_reaper_started = self
             .core
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .started
-        {
-            // Before Host starts there are no original jobs, reaper or joins.
+            .legacy_reaper_started;
+        if !legacy_reaper_started && !self.children_joined {
+            let rows_retired = async {
+                loop {
+                    let notified = self.core.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self
+                        .core
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .records
+                        .iter()
+                        .all(Option::is_none)
+                    {
+                        break;
+                    }
+                    // The original Shared source consumes its Join and
+                    // retires this row only after physical and reply exit.
+                    notified.await;
+                }
+            };
+            if tokio::time::timeout_at(deadline.into(), rows_retired)
+                .await
+                .is_err()
+            {
+                return DrainObservation::Deadline;
+            }
             self.children_joined = true;
         }
         if !self.children_joined {
@@ -528,8 +583,7 @@ impl Drop for ApplySendOwner {
     }
 }
 impl ApplySendPort {
-    /// Observe this original process owner's installed records. Readiness is
-    /// opened only after the composition starts its original reaper.
+    /// Observe this original process owner's installed records before admission opens.
     pub(crate) fn installed_records(&self) -> Result<usize, novarocks_workload_control::WorkError> {
         let state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.closed {
@@ -540,9 +594,10 @@ impl ApplySendPort {
 
     /// Refuse a closed role before starting a paid proposal. This does not
     /// reserve a row; reserve_original_slot rechecks the same state at accept.
+    #[cfg(test)]
     pub(crate) fn check_role_admission(&self) -> Result<(), RegistrationFailure> {
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.started || state.closed {
+        if !state.legacy_reaper_started || state.closed {
             state
                 .first_rejection
                 .get_or_insert(RegistrationFailure::Closed);
@@ -551,14 +606,35 @@ impl ApplySendPort {
         Ok(())
     }
 
-    /// Called while the ORIGINAL batch still owns its nonempty queue grants.
-    /// This derives a bookkeeping slot, not another admission/wallet charge.
+    #[cfg(test)]
     pub(crate) fn reserve_original_slot(
         &self,
         original_items: usize,
     ) -> Result<ApplySlot, RegistrationFailure> {
+        self.reserve_slot(original_items, ApplyAdmission::Legacy)
+    }
+
+    pub(crate) fn reserve_shared_slot(
+        &self,
+        original_items: usize,
+    ) -> Result<ApplySlot, RegistrationFailure> {
+        self.reserve_slot(original_items, ApplyAdmission::Shared)
+    }
+
+    /// The original batch still owns its nonempty queue grants. This derives
+    /// a bookkeeping slot from that charge.
+    fn reserve_slot(
+        &self,
+        original_items: usize,
+        admission: ApplyAdmission,
+    ) -> Result<ApplySlot, RegistrationFailure> {
         let mut state = self.core.state.lock().unwrap_or_else(|e| e.into_inner());
-        let failure = if !state.started || state.closed {
+        let open = match admission {
+            #[cfg(test)]
+            ApplyAdmission::Legacy => state.legacy_reaper_started,
+            ApplyAdmission::Shared => state.shared_open,
+        };
+        let failure = if !open || state.closed {
             Some(RegistrationFailure::Closed)
         } else if original_items == 0 {
             Some(RegistrationFailure::MissingOriginalCharge)
@@ -594,6 +670,7 @@ impl ApplySendPort {
 impl ApplySlot {
     /// Native caller passes the pure apply_operations(...) future directly.
     /// There is no await or user callback between transfer and Prepared custody.
+    #[cfg(test)]
     pub(crate) fn commit<F>(
         mut self,
         reservations: ApplyReservations,
@@ -611,16 +688,7 @@ impl ApplySlot {
                 .as_ref()
                 .map(Arc::clone)
         }
-        .unwrap_or_else(|| {
-            #[cfg(test)]
-            {
-                Arc::new(ReservationBacking::new(&self.core, 0, None, None))
-            }
-            #[cfg(not(test))]
-            {
-                panic!("original Native paid source must precede commit")
-            }
-        });
+        .unwrap_or_else(|| Arc::new(ReservationBacking::new(&self.core, 0, None, None)));
         *backing.physical.lock().unwrap_or_else(|e| e.into_inner()) = Some(reservations);
         let input = Arc::new(OriginalInput {
             future: Mutex::new(Some(Box::pin(future))),

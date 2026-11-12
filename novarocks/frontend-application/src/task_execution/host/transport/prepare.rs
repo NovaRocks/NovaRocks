@@ -331,7 +331,7 @@ impl Future for PrepareSend {
             }
             Poll::Ready(Ok(offer)) => offer,
         };
-        let slot = match this.apply.reserve_original_slot(this.items) {
+        let slot = match this.apply.reserve_shared_slot(this.items) {
             Ok(slot) => slot,
             Err(failure) => {
                 let notice = offer
@@ -444,6 +444,7 @@ impl Future for PrepareSend {
                     }
                     cold @ NativeDialHandoff::Reserved(_) => {
                         return Ok(Some(NativePhysicalOffer {
+                            #[cfg(test)]
                             encoding: None,
                             call: Some(NativeCallSource::Cold(cold)),
                         }));
@@ -483,9 +484,9 @@ impl Future for PrepareSend {
                 acquired,
                 call: call.expect("same SDK-qualified local call"),
             };
-            // None is only the retired TS member. The nonoptional original
-            // ledger guard above owns all required encoding funding.
+            // The original ledger guard owns the encoding funding.
             Ok(Some(NativePhysicalOffer {
+                #[cfg(test)]
                 encoding: None,
                 call: Some(call),
             }))
