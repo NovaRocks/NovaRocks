@@ -150,8 +150,11 @@ SQL client
 - `novarocks/frontend-application/src/**`
   FE application composition, SQL admission, catalog projection, native query
   adapter, supervised statement orchestration and domain publication.
-  `task_execution/**` owns Native attempt protocol facts; the common logical
-  execution owner and recovery policy remain in `novarocks/query-application/src/**`.
+  `novarocks/attempt-protocol/src/**` owns Native attempt protocol decisions.
+  `control_runtime/**` and `task_execution/host/**` bind the original I/O,
+  observations, reports and actual exit. The logical execution owner and
+  recovery policy remain in `novarocks/query-application/src/**`.
+  See [ADR-0228](docs/adr/ADR-0228-frontend-attempt-decisions-and-transport-custody.md).
   Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
@@ -232,8 +235,9 @@ SQL client
   `novarocks/workload-control/src/result_window/retained_bytes.rs`、
   `novarocks/query-application/src/cpu.rs` 与
   `novarocks/query-application/src/cpu/bounded_worker.rs`、
-  `novarocks/frontend-application/src/native/task_transport.rs`
-  分别拥有结果数据预算、实际 worker/队列和 Transport bytes/items。scope、完整 D 与
+  `novarocks/frontend-application/src/native/transport_capacity.rs`
+  分别拥有结果数据预算、实际 worker/队列和 FE 控制账本的传输 bytes/items 布局。
+  传输按进程和准确 BackendProcessId 计量，WC 继续提供原联合准入及载荷保管。scope、完整 D 与
   factory 身份不能自行授予资源；普通 Full 沿原队列可取消等待，不当作资源失败。
   出队归还队列位置，已开始工作及结果析构仍按实际退出归还原运行资源。
   Client 复用原结果窗口，Internal 计算位置与保留数据分开，不与 worker 数绑定。
@@ -583,9 +587,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
    业务 Ready、原 Future 的 poll/Drop 退出和 Unknown 库存的处置分别取证。
    结构退役不代表整族 Native 通过；实际验证范围、原始失败与验收资格须独立核对。
    ADR-0198 将内部计算就绪、publication、诊断和收敛分开；就绪不等于语句成功。
-   `execute_round_on_task_protocol` establishes every participation and creates every
-   task through a bounded, fair dispatcher
-   (`novarocks/frontend-application/src/task_execution/{round,dispatch,participation_owner}.rs`).
+   `novarocks/attempt-protocol/src/core.rs` drives Establish and Task creation.
+   The Frontend host dispatches the original effects through the shared runtime,
+   pays each send generation, and retains the actual work and results through exit.
    Each operation gets one verdict per domain -- Apply / Idempotent / Older /
    Conflict -- and a domain never rolls back, which is why replaying the exact
    request is the prescribed recovery for an unknown outcome and a conflicting
@@ -1187,7 +1191,8 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/query-application/src/coordination/**` and the minimal boundary in
   `novarocks/coordination-contract/**` (minimal neutral facts; ADR-0198), then inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
-  `novarocks/frontend-application/src/task_execution/**`,
+  `novarocks/attempt-protocol/src/**`,
+  `novarocks/frontend-application/src/task_execution/{bridge,host}/**`,
   `novarocks/worker-protocol/src/**`, `novarocks/worker/src/control_runtime/**`,
   `novarocks/control-runtime{,-core}/src/**`,
   `novarocks/native-adapter/src/{backend_application,task_protocol}.rs`, and

@@ -5,6 +5,10 @@ domain: [distributed-query-lifecycle, provider-spi, frontend-dml, table-maintena
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0228
+    scope: "The choice to keep an asynchronous imperative shell as the Native FE attempt decision owner. The logical execution owner, business readiness, publication, recovery and actual convergence rules remain active."
+    link: "ADR-0228-frontend-attempt-decisions-and-transport-custody.md"
 partially-supersedes:
   - id: ADR-0110
     scope: "Deriving an external-effect lifetime bound from a local statement deadline and unconditional age-gated orphan, owned-ref or unanchored CTAS collection; target OCC, autocommit and the absence of durable takeover remain active"

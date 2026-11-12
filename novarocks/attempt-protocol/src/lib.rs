@@ -17,6 +17,8 @@
 
 //! Deterministic frontend attempt protocol contracts.
 //!
+//! Design: ADR-0228.
+//!
 //! The shared boundary is the neutral activation/port vocabulary, frozen plan,
 //! input/effect values, seeded operation identities and synchronous step port.
 //! Concrete state is implemented independently of the FE host. There is no SDK,

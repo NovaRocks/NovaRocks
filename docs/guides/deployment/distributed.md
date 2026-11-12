@@ -567,6 +567,10 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 
 ### FE 分布式执行容量
 
+FE 的共用控制账本按进程及准确 `BackendProcessId` 申领 Native 传输条数和字节。队列字节与编码共存计费，普通工作受独立上限约束，为控制动作保留进展空间。进入 I/O 时归还纯队列阶段份额。实际 I/O 和 captures 退出后，原宿主归还同一次发送的剩余队列与编码份额。WC 继续提供排队输入、联合派发准入和原载荷保管。精确重放沿用冻结请求并为新发送代次重新准入。见 [ADR-0228](../../adr/ADR-0228-frontend-attempt-decisions-and-transport-custody.md)。
+
+访问 FE management `/metrics` 时，`novarocks_frontend_control_runtime_transport_process` 显示进程各维度用量和上限，`novarocks_frontend_control_runtime_transport_keyed` 显示活跃 BE 进程键的对应值。归零键退出账本。抓取同时读取 `novarocks_frontend_control_runtime_observation_available`，账本样本不可用时忽略该次缺失。容量等待指标只反映原登记和释放唤醒，实际准入仍以原请求重试为准。
+
 FE 默认将每个依赖域的累计保管上限设为 12 GiB，将原 Native 进程发送队列的累计字节上限设为 1 GiB。前者包含尚未交付的结果、写入和清理责任；后者覆盖排队及已接收发送的原始字节。它们是准入上限，不是启动时预分配量，也不代表进程 RSS 上限。默认支持目标是至少 8 个完整依赖域，同时保留前台与收尾操作的保护空间；实际支持界由启动时各资源作者的完整报价和物理容量共同验证。
 
 依赖域来自真实选中的 Provider、存储和 Native endpoint，数量不等于 BE 数。同一 BE 的 Data 与 Control endpoint 可能分别形成依赖域。计划使用的完整集合超过当前支持界时，会明确拒绝；系统不会丢弃域、猜测单机数量或自动提高显式配置。

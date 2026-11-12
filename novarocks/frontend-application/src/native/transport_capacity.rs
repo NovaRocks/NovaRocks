@@ -17,6 +17,8 @@
 
 //! The original Native transport windows, expressed by the shared ledger.
 //!
+//! Design: ADR-0228.
+//!
 //! Let I/B be process items/bytes, TI/TB the ordinary target items/bytes,
 //! CI the maximum batch items, MB the maximum encoded batch bytes, and
 //! CB=2*MB. TB=max(configured target bytes, CB), exactly as the retired
