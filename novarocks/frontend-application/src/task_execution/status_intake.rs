@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+pub use crate::wake::{CountingWake, TestIntakeWake};
+pub use crate::wake::{NotifyWake, StatusIntakeWake};
 
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity, TaskStatus};
@@ -52,83 +53,6 @@ pub enum StatusEvent {
     Published(Box<TaskStatus>),
     /// One task's retained record was reaped.
     Gone(TaskIdentity),
-}
-
-/// How the runner is woken.
-pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
-    fn wake(&self);
-}
-
-/// Test wake retaining the same asynchronous notification as its caller.
-/// Register before observing retained state so a racing wake is not lost.
-#[derive(Debug, Default)]
-#[cfg(test)]
-pub struct TestIntakeWake {
-    async_signal: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl TestIntakeWake {
-    /// The same original wake also follows its owner into async residual
-    /// supervision. Register before inspecting state to retain a racing wake.
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.async_signal.notified()
-    }
-}
-
-#[cfg(test)]
-impl StatusIntakeWake for TestIntakeWake {
-    fn wake(&self) {
-        self.async_signal.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl std::task::Wake for TestIntakeWake {
-    fn wake(self: Arc<Self>) {
-        StatusIntakeWake::wake(self.as_ref());
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        StatusIntakeWake::wake(self.as_ref());
-    }
-}
-
-/// Wakes a runner parked on a `Notify`.
-#[derive(Debug)]
-pub struct NotifyWake(Arc<tokio::sync::Notify>);
-
-impl NotifyWake {
-    pub fn new(notify: Arc<tokio::sync::Notify>) -> Self {
-        Self(notify)
-    }
-}
-
-impl StatusIntakeWake for NotifyWake {
-    fn wake(&self) {
-        self.0.notify_one();
-    }
-}
-
-/// Counts wakes instead of parking anything.
-///
-/// It exists so a test can assert that a callback woke the runner exactly
-/// once per publish without waiting on a task scheduler.
-#[derive(Debug, Default)]
-#[cfg(test)]
-pub struct CountingWake(AtomicUsize);
-
-#[cfg(test)]
-impl CountingWake {
-    pub fn count(&self) -> usize {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-#[cfg(test)]
-impl StatusIntakeWake for CountingWake {
-    fn wake(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
-    }
 }
 
 #[derive(Debug)]

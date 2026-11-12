@@ -47,7 +47,7 @@ use super::internal_result_cpu::{ProviderCreatorCpuSource, ProviderReadCpuJob};
 use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoResponsibility,
 };
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use futures::task::AtomicWaker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, sync::Arc};

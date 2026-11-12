@@ -45,7 +45,7 @@ use novarocks_workload_control::{
 use tokio::sync::oneshot;
 
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_workload_control::joint_admission::{
     InternalComputationGrant, InternalCpuActionAdmission, InternalCpuActionSource,
     InternalCpuFactoryBinding, JointLocalGrant,
@@ -1997,7 +1997,7 @@ pub(crate) fn admitted_internal_fixture() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_execution::status_intake::TestIntakeWake;
+    use crate::wake::TestIntakeWake;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
@@ -3106,7 +3106,7 @@ mod actual_close_tests {
             input,
             cancellation.view(),
             &runtime,
-            Arc::new(crate::task_execution::status_intake::TestIntakeWake::default()),
+            Arc::new(crate::wake::TestIntakeWake::default()),
             move |input, _| {
                 entered.send(()).unwrap();
                 let _ = blocked.recv();

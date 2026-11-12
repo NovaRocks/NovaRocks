@@ -17,18 +17,12 @@
 
 //! Frontend projection of actor-owned Abort effects into Native task intents.
 //!
-//! The query application freezes the exact operation identity. This adapter
-//! adds the Native carrier and owns a bounded handoff slot before it accepts
-//! the application submission. This slot is only the application-to-runner
-//! handoff; it is not a process transport or control-progress reservation.
-//! Production composition must drain the intake and enqueue
-//! [`OperationIntent::AbortParticipation`] through the runner's priority
-//! lifecycle lane, where the process authority reserves those capacities.
-//! This module neither owns a wire nor creates a second participation-lifecycle
-//! state machine.
+//! The attempt bridge uses the original submission and settlement values.
+//! TaskRound fixtures also retain the legacy bounded channel adapter.
 
 use std::collections::VecDeque;
 use std::fmt;
+#[cfg(test)]
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -37,18 +31,24 @@ use novarocks_execution::task_execution::{
     AbortCause, AbortParticipation, OperationKind, OperationOutcome, ParticipationReceipt,
     ParticipationState,
 };
+#[cfg(test)]
 use novarocks_query_application::coordination::{
     AbortParticipationEffectAdmission, AbortParticipationEffectPort,
-    AbortParticipationEffectReservation, AbortParticipationEffectSubmission,
-    AbortParticipationIssueIdentity, LateAbortParticipationWorkerSettlement,
-    ParticipationStandDownCause, ParticipationStandDownError,
+    AbortParticipationEffectReservation,
+};
+use novarocks_query_application::coordination::{
+    AbortParticipationEffectSubmission, AbortParticipationIssueIdentity,
+    LateAbortParticipationWorkerSettlement, ParticipationStandDownCause,
+    ParticipationStandDownError,
 };
 use tokio::sync::{mpsc, watch};
 
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+#[cfg(test)]
 use super::status_intake::StatusIntakeWake;
 
 /// Bounded application-to-Native Abort projection.
+#[cfg(test)]
 pub(crate) struct NativeAbortEffectAdapter {
     effects: Option<mpsc::Sender<NativeAbortEffect>>,
     submission_order: Arc<Mutex<VecDeque<OperationIntent>>>,
@@ -58,6 +58,7 @@ pub(crate) struct NativeAbortEffectAdapter {
         Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
+#[cfg(test)]
 impl fmt::Debug for NativeAbortEffectAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -70,8 +71,8 @@ impl fmt::Debug for NativeAbortEffectAdapter {
     }
 }
 
+#[cfg(test)]
 impl NativeAbortEffectAdapter {
-    #[cfg(test)]
     pub(crate) fn bounded(
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
@@ -82,7 +83,6 @@ impl NativeAbortEffectAdapter {
 
     /// Builds one attempt-local intake while publishing capacity changes on
     /// its logical execution's shared Abort port.
-    #[cfg(test)]
     pub(crate) fn bounded_with_capacity_epoch(
         capacity: NonZeroUsize,
         wake: Arc<dyn StatusIntakeWake>,
@@ -117,6 +117,7 @@ impl NativeAbortEffectAdapter {
     }
 }
 
+#[cfg(test)]
 impl AbortParticipationEffectPort for NativeAbortEffectAdapter {
     fn subscribe_capacity(&self) -> watch::Receiver<u64> {
         self.capacity_epoch.subscribe()
@@ -148,6 +149,7 @@ impl AbortParticipationEffectPort for NativeAbortEffectAdapter {
     }
 }
 
+#[cfg(test)]
 impl Drop for NativeAbortEffectAdapter {
     fn drop(&mut self) {
         // Closing the final sender is the state transition the serial runner
@@ -237,6 +239,7 @@ impl NativeAbortEffectIntake {
     }
 }
 
+#[cfg(test)]
 struct NativeAbortEffectReservation {
     identity: AbortParticipationIssueIdentity,
     permit: Option<mpsc::OwnedPermit<NativeAbortEffect>>,
@@ -247,6 +250,7 @@ struct NativeAbortEffectReservation {
         Option<Arc<dyn Fn(novarocks_execution_contract::ParticipationRef) + Send + Sync>>,
 }
 
+#[cfg(test)]
 impl fmt::Debug for NativeAbortEffectReservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -256,6 +260,7 @@ impl fmt::Debug for NativeAbortEffectReservation {
     }
 }
 
+#[cfg(test)]
 impl AbortParticipationEffectReservation for NativeAbortEffectReservation {
     fn submit(mut self: Box<Self>, submission: AbortParticipationEffectSubmission) {
         assert_eq!(
@@ -279,6 +284,7 @@ impl AbortParticipationEffectReservation for NativeAbortEffectReservation {
     }
 }
 
+#[cfg(test)]
 impl Drop for NativeAbortEffectReservation {
     fn drop(&mut self) {
         if self.permit.is_some() {
@@ -288,6 +294,7 @@ impl Drop for NativeAbortEffectReservation {
     }
 }
 
+#[cfg(test)]
 fn release_permit_then_publish_capacity(
     permit: &mut Option<mpsc::OwnedPermit<NativeAbortEffect>>,
     capacity_epoch: &watch::Sender<u64>,

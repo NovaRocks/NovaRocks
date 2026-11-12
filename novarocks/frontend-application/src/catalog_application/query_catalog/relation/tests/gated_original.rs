@@ -26,7 +26,7 @@ use crate::query_execution::mv_assembly::refresh_preparation::io_gate::{
 use crate::query_execution::{
     internal_result_cpu::InternalResultCpuOwner, maintenance::io_admission::MetadataIoAdmission,
 };
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_query_application::{
     cancellation::QueryCancellationView,
     cpu::QueryBlockingExecutorConfig,

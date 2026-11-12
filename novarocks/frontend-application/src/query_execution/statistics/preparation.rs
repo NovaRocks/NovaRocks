@@ -51,7 +51,7 @@ pub(crate) struct StatisticsComputationPlanningServices<'a> {
     pub(crate) functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) static_plan_carrier: CompiledPackageCarrier,
-    pub(crate) wake: Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+    pub(crate) wake: Arc<dyn crate::wake::StatusIntakeWake>,
 }
 
 /// Inline in the original Action PlanSlot, before any borrowed resolution.

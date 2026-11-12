@@ -22,7 +22,8 @@ use crate::{
         kernels::ViewExecutionKernel,
         maintenance::io_admission::MetadataIoAdmission,
     },
-    task_execution::{blocking_io::ConnectorBlockingIoSupervisor, status_intake::StatusIntakeWake},
+    task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+    wake::StatusIntakeWake,
 };
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_parser::ast::ShowViews;

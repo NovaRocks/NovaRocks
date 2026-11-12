@@ -193,7 +193,7 @@ type PhaseFuture = Pin<Box<dyn Future<Output = Result<(), CoreStatisticsAttemptE
 type CloseFuture = Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
 #[derive(Debug, Default)]
 struct StatisticsWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for StatisticsWake {
+impl crate::wake::StatusIntakeWake for StatisticsWake {
     fn wake(&self) {
         self.0.wake();
     }

@@ -286,7 +286,7 @@ mod tests {
     use crate::query_execution::internal_result_cpu::{
         InternalResultCpuOwner, InternalResultValue, admitted_internal_fixture,
     };
-    use crate::task_execution::status_intake::TestIntakeWake;
+    use crate::wake::TestIntakeWake;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use std::{
         num::NonZeroU64,

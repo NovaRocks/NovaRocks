@@ -165,7 +165,7 @@ pub(crate) struct MvRefreshPreparationServices {
     pub(crate) window: novarocks_workload_control::ResultWindowAlias,
     pub(crate) cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     pub(crate) runtime: tokio::runtime::Handle,
-    pub(crate) wake: Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+    pub(crate) wake: Arc<dyn crate::wake::StatusIntakeWake>,
     pub(crate) requests: Arc<dyn novarocks_state_store_api::StateStoreExecutionRequests>,
 }
 struct SourceReceiving {

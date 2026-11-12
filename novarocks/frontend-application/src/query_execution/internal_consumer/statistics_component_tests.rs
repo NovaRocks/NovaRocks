@@ -833,7 +833,7 @@ fn typed_statistics_child(
 
 #[derive(Debug)]
 struct StatisticsCpuFixtureWake;
-impl crate::task_execution::status_intake::StatusIntakeWake for StatisticsCpuFixtureWake {
+impl crate::wake::StatusIntakeWake for StatisticsCpuFixtureWake {
     fn wake(&self) {}
 }
 struct OriginalStatisticsCpuCause(Arc<std::sync::atomic::AtomicUsize>);

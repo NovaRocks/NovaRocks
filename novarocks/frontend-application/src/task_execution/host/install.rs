@@ -46,8 +46,8 @@ use crate::{
         },
         profile_diagnostics::TaskFinalInfoCollector,
         sources::AttemptEstablishFacts,
-        status_intake::StatusIntakeWake,
     },
+    wake::StatusIntakeWake,
 };
 use novarocks_attempt_protocol::{effect::PumpKind, ids::IdSeed, start::PayloadRef};
 use novarocks_control_runtime::{

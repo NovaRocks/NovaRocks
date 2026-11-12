@@ -81,6 +81,7 @@ pub(crate) mod topology;
 mod topology_metrics;
 pub use topology::ClusterBackendOpenConfig;
 mod view;
+mod wake;
 pub(crate) mod workload_lifecycle;
 
 #[cfg(novarocks_dev_controls)]

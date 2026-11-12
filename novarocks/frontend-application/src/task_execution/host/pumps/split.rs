@@ -33,9 +33,8 @@ use crate::{
             executor::{OriginalSplitPublisher, SplitAssignmentExecutor},
         },
     },
-    task_execution::{
-        error::TaskExecutionError, round::PumpCloseUnresolved, status_intake::StatusIntakeWake,
-    },
+    task_execution::{error::TaskExecutionError, round::PumpCloseUnresolved},
+    wake::StatusIntakeWake,
 };
 use novarocks_attempt_protocol::{
     effect::{EffectBody, TaskDomainIntent},

@@ -471,7 +471,7 @@ struct ProductionSourceRecipe {
 
 #[derive(Debug, Default)]
 struct SourcePreparationWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for SourcePreparationWake {
+impl crate::wake::StatusIntakeWake for SourcePreparationWake {
     fn wake(&self) {
         self.0.wake();
     }

@@ -33,7 +33,7 @@ use crate::query_execution::{
         turn_custody::{MvRefreshTurnCustody, MvTurnFailure},
     },
 };
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_query_application::{
     admitted_query_context::QueryResultCapacityBinding,
     api::StatementNativeHealthFailure,

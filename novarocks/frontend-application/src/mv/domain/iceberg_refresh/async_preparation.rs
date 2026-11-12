@@ -1533,7 +1533,7 @@ mod partition_planning_tests {
         maintenance::io_admission::MetadataIoAdmission,
         mv_assembly::refresh_preparation::io_gate::MvRefreshPreparationServices,
     };
-    use crate::task_execution::status_intake::StatusIntakeWake;
+    use crate::wake::StatusIntakeWake;
     use mv_schema::{MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract};
     use novarocks_query_application::{
         cancellation::QueryCancellationView, cpu::QueryBlockingExecutorConfig,

@@ -46,7 +46,7 @@ use crate::task_execution::blocking_io::{
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::round::{PumpCloseUnresolved, TaskRound, TurnPump};
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
 /// How many splits one task may hold before the driver stops pulling for it.
@@ -2146,7 +2146,7 @@ mod tests {
             stop: stop.clone(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(None)),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
 
         let profile = guard.profile_source().current();
@@ -2180,7 +2180,7 @@ mod tests {
                     scan: ScanNodeKey::new(FragmentId::from(1u32), 4),
                 },
             )))),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
         let detail = failed
             .failure()
@@ -2204,7 +2204,7 @@ mod tests {
             stop: RoundSplitAssignmentStop::default(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(Some(Ok(SplitSourceProfile::default())))),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
         assert!(
             healthy.failure().is_none(),
@@ -2589,7 +2589,7 @@ mod tests {
     fn a_source_drop_panic_retains_original_backing_and_reports_health_once() {
         use crate::task_execution::blocking_io::ConnectorBlockingIoError;
         use crate::task_execution::blocking_io::tests::{admitted, until};
-        use crate::task_execution::status_intake::CountingWake;
+        use crate::wake::CountingWake;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2732,7 +2732,7 @@ mod tests {
     #[test]
     fn closing_waits_for_the_original_enumeration_before_its_gated_source_close() {
         use crate::task_execution::blocking_io::tests::{admitted, until};
-        use crate::task_execution::status_intake::CountingWake;
+        use crate::wake::CountingWake;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

@@ -186,7 +186,7 @@ struct CommandInput {
 }
 #[derive(Debug, Default)]
 struct MvWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for MvWake {
+impl crate::wake::StatusIntakeWake for MvWake {
     fn wake(&self) {
         self.0.wake();
     }

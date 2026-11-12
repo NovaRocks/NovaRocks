@@ -2693,7 +2693,7 @@ mod tests {
             INTERNAL_PEAK_BYTES, InternalResultCpuOwner, InternalResultOperation,
             InternalResultValue,
         };
-        use crate::task_execution::status_intake::TestIntakeWake;
+        use crate::wake::TestIntakeWake;
         use arrow::array::{DictionaryArray, ListArray, StringArray, StructArray};
         use arrow::buffer::OffsetBuffer;
         use arrow::datatypes::Int32Type;

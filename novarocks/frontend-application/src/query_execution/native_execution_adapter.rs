@@ -104,7 +104,6 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
 use crate::task_execution::host::{
     install::{InstallAttemptHost, InstalledAttemptHost},
     pumps::DynamicFilterRecords,
@@ -121,7 +120,7 @@ use crate::task_execution::manifest_projection::{
 };
 use crate::task_execution::profile_diagnostics::TaskFinalInfoCollector;
 use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
-use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use crate::wake::NotifyWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
 
@@ -183,23 +182,6 @@ impl LogicalAbortRouter {
                 .insert(participation);
             closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
         })
-    }
-
-    fn install(
-        self: &Arc<Self>,
-        execution: novarocks_types::QueryExecutionId,
-        capacity: NonZeroUsize,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<(LogicalAbortRoute, NativeAbortEffectIntake), NativeAttemptActivationFailure> {
-        let route = self.reserve_route(execution)?;
-        let (adapter, intake) = NativeAbortEffectAdapter::bounded_with_observer(
-            capacity,
-            wake,
-            self.capacity_author(),
-            Some(self.closure_observer()),
-        );
-        route.publish(adapter);
-        Ok((route, intake))
     }
 
     pub(crate) fn prepare_registered_attempt(

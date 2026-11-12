@@ -32,7 +32,9 @@
 // Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 pub(crate) mod abort_effect;
+#[cfg(test)]
 pub(crate) mod actor_gate;
+#[cfg(test)]
 pub(crate) mod attempt_convergence;
 pub(crate) mod attempt_pumps;
 pub(crate) mod blocking_io;
