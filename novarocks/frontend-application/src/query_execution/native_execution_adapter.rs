@@ -2344,8 +2344,15 @@ impl ProductionManifestAttemptProjection {
                     *client_rows,
                 )
                 .map_err(|error| projection_message(error.to_string()))?;
+                let port = NativeBoundedRootReadPort::new(result_transport.clone());
+                #[cfg(novarocks_dev_controls)]
+                let port = port.with_root_observer(
+                    self.runtime
+                        .lifecycle_diagnostics
+                        .root_observer_for_execution(execution),
+                );
                 RootRelayBinding {
-                    port: Arc::new(NativeBoundedRootReadPort::new(result_transport.clone())),
+                    port: Arc::new(port),
                     frontier,
                     window: window.clone(),
                     max_wait: Duration::from_millis(250),

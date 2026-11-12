@@ -763,6 +763,56 @@ impl StatementObservationHandle {
         }
     }
 
+    /// Snapshot the already-applied Host observation at the first read call.
+    /// An absent or foreign Installed observation remains absent in this fact.
+    pub(crate) fn observe_first_root_read(
+        &self,
+        request: &novarocks_execution_contract::root_result::RootResultRead,
+    ) {
+        let root = request.root_task();
+        let execution = root.query_execution_id();
+        let installed = {
+            let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
+                return;
+            };
+            let Ok(mut state) = owner.state.lock() else {
+                return;
+            };
+            if !owner.active(&mut state) {
+                return;
+            }
+            let Some(run) = state.run_mut(self) else {
+                return;
+            };
+            if run.statement.is_none()
+                || run.binding_error.is_some()
+                || run.execution != Some(execution)
+            {
+                return;
+            }
+            run.root_status
+                .filter(|fact| fact.root == root && fact.installed)
+                .map(|fact| fact.status_version)
+        };
+        let installed = installed.map_or_else(|| "none".to_owned(), |v| v.get().to_string());
+        let wanted = request
+            .wanted()
+            .map_or_else(|| "none".to_owned(), |v| v.get().to_string());
+        eprintln!(
+            "{} execution_id={}:{}:{} stage={} task={} backend={} wanted={} consumed={} installed_status_version={}",
+            novarocks_failpoint::observation_marker::FRONTEND_ROOT_FIRST_READ,
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            root.stage_id().get(),
+            root.task_id().get(),
+            root.backend_process_id(),
+            wanted,
+            request.consumed(),
+            installed,
+        );
+    }
+
     pub(crate) fn bind_attempt(&self, execution: QueryExecutionId) {
         let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
             return;

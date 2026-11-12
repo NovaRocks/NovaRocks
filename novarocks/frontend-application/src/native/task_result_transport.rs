@@ -507,6 +507,10 @@ impl TaskResultTransport for NativeTaskResultTransport {
 pub(crate) struct NativeBoundedRootReadPort {
     transport: Arc<NativeTaskResultTransport>,
     sealed: std::sync::atomic::AtomicBool,
+    #[cfg(novarocks_dev_controls)]
+    root_observer: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+    #[cfg(novarocks_dev_controls)]
+    read_observed: std::sync::atomic::AtomicBool,
 }
 
 impl NativeBoundedRootReadPort {
@@ -514,7 +518,20 @@ impl NativeBoundedRootReadPort {
         Self {
             transport,
             sealed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(novarocks_dev_controls)]
+            root_observer: None,
+            #[cfg(novarocks_dev_controls)]
+            read_observed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_root_observer(
+        mut self,
+        observer: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+    ) -> Self {
+        self.root_observer = observer;
+        self
     }
 }
 
@@ -534,6 +551,14 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
                 + 'static,
         >,
     > {
+        #[cfg(novarocks_dev_controls)]
+        if let Some(observer) = &self.root_observer
+            && !self
+                .read_observed
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            observer.observe_first_root_read(&request);
+        }
         let root = request.root_task();
         let backend = root.backend_process_id();
         let sealed = self.sealed.load(std::sync::atomic::Ordering::Acquire);
