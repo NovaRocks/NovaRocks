@@ -239,10 +239,19 @@ struct Roles {
 }
 impl Roles {
     fn new() -> Self {
+        Self::with_history(None)
+    }
+
+    fn with_history(history: Option<novarocks_control_runtime::history::HistoryCapture>) -> Self {
         let layout = NativeTransportCapacity::from_transport(TransportBudget::DEFAULT).unwrap();
-        let ledger =
-            RuntimeLedger::with_keyed_families(layout.process_limits(), layout.keyed_families())
-                .unwrap();
+        let ledger = RuntimeLedger::with_keyed_families_and_observation(
+            layout.process_limits(),
+            layout.keyed_families(),
+            [],
+            history,
+            Default::default(),
+        )
+        .unwrap();
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         Self {
             ledger,
@@ -1699,9 +1708,15 @@ async fn actor_release_retires_the_exact_wc_grant_without_starting_a_send() {
     run_actor_send(ActorSendMode::Release, None).await;
 }
 
+#[tokio::test]
+async fn actor_replays_same_native_request_with_a_fresh_wc_input_after_original_queue_exit() {
+    run_actor_send(ActorSendMode::Replay, None).await;
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
+    Replay,
     Withdraw,
     Release,
 }
@@ -1736,7 +1751,7 @@ async fn run_actor_send(
             AttemptEffect, DispatchBatch, EffectBody, EffectClass,
             OperationIntent as ProtocolIntent, QueuedInputPayload,
         },
-        input::{ExecutorFact, QueuedInputGrantRef, WithdrawalOutcome},
+        input::{ExecutorFact, QueuedInputGrantRef, SendGeneration, WithdrawalOutcome},
     };
     use novarocks_control_runtime::{
         actor::ActorConfig,
@@ -1759,9 +1774,11 @@ async fn run_actor_send(
     };
     use novarocks_types::FrontendProcessId;
 
-    let roles = Roles::new();
+    let replay = mode == ActorSendMode::Replay;
+    let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
+    let roles = Roles::with_history(history.clone());
     let fail_core = failure_verdict.is_some();
-    let sends = mode == ActorSendMode::Send;
+    let sends = matches!(mode, ActorSendMode::Send | ActorSendMode::Replay);
     let withdraw = mode == ActorSendMode::Withdraw;
     let release = mode == ActorSendMode::Release;
     let mut peer = if sends {
@@ -1790,6 +1807,9 @@ async fn run_actor_send(
     let lifecycle = FailureLifecycle::freeze([participation].into_iter());
     let starts = lifecycle.starts();
     if let Some(peer) = &peer {
+        if replay {
+            peer.expect_transport_unknown();
+        }
         peer.accept_abort(participation);
         match failure_verdict {
             Some(OperationOutcome::Accepted) => peer.accept_abort(participation),
@@ -1807,28 +1827,29 @@ async fn run_actor_send(
     let key = send_key(&operation);
     let reference = QueuedInputGrantRef::new(NonZeroU64::MIN, key.generation);
     let protocol = ProtocolIntent::AbortParticipation(abort);
-    let admit_id = key.generation.admission_effect();
-    let admit = AttemptEffectEnvelope::new(AttemptEffect {
-        id: admit_id,
-        class: EffectClass::Settlement,
-        body: EffectBody::AdmitQueuedInput {
-            lane: protocol.lane(),
-            operation: protocol.clone(),
-            generation: key.generation,
-            payload: QueuedInputPayload::AlreadyRetained,
-        },
-    });
-    let send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
-    let (send, queue) = if release {
-        (
-            AttemptEffectEnvelope::new(AttemptEffect {
-                id: send_id,
-                class: EffectClass::Cleanup,
-                body: EffectBody::ReleaseQueuedInput { grant: reference },
-            }),
-            None,
-        )
-    } else {
+    let make_admit = |reference: QueuedInputGrantRef| {
+        AttemptEffectEnvelope::new(AttemptEffect {
+            id: reference.generation().admission_effect(),
+            class: EffectClass::Settlement,
+            body: EffectBody::AdmitQueuedInput {
+                lane: protocol.lane(),
+                operation: protocol.clone(),
+                generation: reference.generation(),
+                payload: QueuedInputPayload::AlreadyRetained,
+            },
+        })
+    };
+    let make_send = |id: AttemptActionId, reference: QueuedInputGrantRef| {
+        if release {
+            return (
+                AttemptEffectEnvelope::new(AttemptEffect {
+                    id,
+                    class: EffectClass::Cleanup,
+                    body: EffectBody::ReleaseQueuedInput { grant: reference },
+                }),
+                None,
+            );
+        }
         let queue = roles
             .scope
             .reserve_child_next(
@@ -1847,16 +1868,16 @@ async fn run_actor_send(
             .unwrap();
         let reservation = queue.reservation_id();
         let send = AttemptEffectEnvelope::new(AttemptEffect {
-            id: send_id,
+            id,
             class: EffectClass::Settlement,
             body: EffectBody::SendBatch {
                 batch: DispatchBatch {
                     backend,
                     lane: protocol.lane(),
                     control_progress: true,
-                    operations: Box::new([protocol]),
+                    operations: Box::new([protocol.clone()]),
                     queued_bytes: operation.queued_bytes(),
-                    queued_at: MonotonicInstant::from_origin(Duration::ZERO),
+                    queued_at: MonotonicInstant::ORIGIN,
                     queued_inputs: Box::new([reference]),
                 },
                 reservation: ReservationToken(NonZeroU64::new(reservation.get()).unwrap()),
@@ -1864,7 +1885,22 @@ async fn run_actor_send(
         });
         (send, Some(queue))
     };
+    let admit = make_admit(reference);
+    let send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let (send, queue) = make_send(send_id, reference);
     let reservation = queue.as_ref().map(|queue| queue.reservation_id());
+    let first_send_work = queue.as_ref().map(|queue| queue.work_id());
+    let replay_generation = SendGeneration::new(AttemptActionId::new(NonZeroU64::new(3).unwrap()));
+    let replay_reference = QueuedInputGrantRef::new(NonZeroU64::new(3).unwrap(), replay_generation);
+    let replay_send_id = AttemptActionId::new(NonZeroU64::new(4).unwrap());
+    let replay_commands = replay.then(|| {
+        let (send, guard) = make_send(replay_send_id, replay_reference);
+        let work = guard
+            .as_ref()
+            .expect("replay's original queue guard")
+            .work_id();
+        ([(make_admit(replay_reference), None), (send, guard)], work)
+    });
     struct ScopeOwner {
         scope: ScopeHandle,
         parent: WorkObligation,
@@ -2054,14 +2090,29 @@ async fn run_actor_send(
     let failure_payer = failure_capacity.id();
     let failure_work =
         ReportedWork::try_new(failure_work, failure_capacity, failure_report).unwrap();
+    let replay_work = replay_commands.as_ref().map(|(_, work)| *work);
+    let mut mailbox = [8; 4];
+    if replay {
+        mailbox[InputClass::Lifecycle.index()] += 2;
+    }
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
-        [(admit, None), (send.clone(), queue)],
-        [8; 4],
+        [(admit, None), (send.clone(), queue)].into_iter().chain(
+            replay_commands
+                .into_iter()
+                .flat_map(|(commands, _)| commands),
+        ),
+        mailbox,
         Some(failure_work.work()),
     );
     let admit_command = inbox.reserve_command(&parent);
     let send_command = inbox.reserve_command(&parent);
+    let replay_commands = replay.then(|| {
+        [
+            inbox.reserve_command(&parent),
+            inbox.reserve_command(&parent),
+        ]
+    });
     let admission = transport::AdmissionSource::new(
         &parent,
         &payer,
@@ -2202,7 +2253,7 @@ async fn run_actor_send(
             registration: inbox.registration().clone(),
             kind: FrontendActorKind::Test,
             config: ActorConfig {
-                mailbox: [8; 4],
+                mailbox,
                 max_batches: 4,
                 max_effects_per_step: 1,
                 max_dependencies_per_effect: 0,
@@ -2272,29 +2323,91 @@ async fn run_actor_send(
         }
     };
 
-    let admit_input = admit_command.fill(FrontendInput::Test(1)).unwrap();
-    assert!(actor_runtime.poll_one(Tick(1)).unwrap());
-    advance_host();
-    actor_runtime.retire_input(actor, admit_input).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            drive(&mut wc.driver);
-            advance_host();
-            if let Some((_, fact)) = inbox.try_commit_next() {
-                assert!(matches!(fact, ExecutorFact::QueuedInputGranted { grant, .. } if grant == reference));
-                break;
+    let submit =
+        |command: novarocks_control_runtime::actor_turn::ReservedInputObligation<FrontendActor>| {
+            let input = command.fill(FrontendInput::Test(1)).unwrap();
+            assert!(actor_runtime.poll_one(Tick(1)).unwrap());
+            input
+        };
+    let admit_original = async |wc: &mut Governed, command, expected| {
+        let input = submit(command);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                drive(&mut wc.driver);
+                advance_host();
+                if let Some((_, fact)) = inbox.try_commit_next() {
+                    let ExecutorFact::QueuedInputGranted {
+                        operation, grant, ..
+                    } = fact
+                    else {
+                        panic!("expected the actual WC admission: {fact:?}");
+                    };
+                    assert_eq!(operation, key.operation);
+                    assert_eq!(grant, expected);
+                    actor_runtime.retire_input(actor, input).unwrap();
+                    return grant;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+        })
+        .await
+        .unwrap()
+    };
+    let observe_send = async |wc: &mut Governed, effect_id, send_generation, expect_unknown| {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut started = false;
+            loop {
+                drive(&mut wc.driver);
+                advance_host();
+                if let Some((_, fact)) = inbox.try_commit_next() {
+                    match fact {
+                        ExecutorFact::Withdrawn { effect, outcome: WithdrawalOutcome::DefinitelyUnsent } if withdraw => {
+                            assert_eq!(effect, effect_id);
+                            return;
+                        }
+                        ExecutorFact::SendStarted { effect, .. } if sends => {
+                            assert_eq!(effect, effect_id);
+                            assert!(!started);
+                            started = true;
+                        }
+                        ExecutorFact::Operation(observed) if sends => {
+                            assert!(started);
+                            assert_eq!(observed.generation, send_generation);
+                            assert_eq!(observed.reply.operation_id(), key.operation);
+                            if expect_unknown {
+                                assert_eq!(observed.reply.dispatch_result(),
+                                    novarocks_attempt_protocol::operation::OperationDispatchResult::TransportUnknown);
+                            } else {
+                                assert_eq!(observed.reply.worker_outcome(), Some(OperationOutcome::Accepted));
+                            }
+                            break;
+                        }
+                        other => panic!("unexpected composed send fact: {other:?}"),
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        if sends {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while receipt.lock().unwrap().is_none() {
+                    drive(&mut wc.driver);
+                    advance_host();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
-    }).await.unwrap();
+    };
+    let first_grant = admit_original(&mut wc, admit_command, reference).await;
     if withdraw {
         assert_eq!(
             send.handoff().unwrap().withdraw(),
             novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
         );
     }
-    let send_input = send_command.fill(FrontendInput::Test(1)).unwrap();
-    assert!(actor_runtime.poll_one(Tick(1)).unwrap());
+    let send_input = submit(send_command);
     if release {
         advance_host();
         // Handoff completes the effect. The original cleanup Join has its
@@ -2309,70 +2422,24 @@ async fn run_actor_send(
                 .0,
             reservation.unwrap()
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let mut started = false;
-            loop {
-                drive(&mut wc.driver);
-                advance_host();
-                if let Some((_, fact)) = inbox.try_commit_next() {
-                    match fact {
-                        ExecutorFact::Withdrawn {
-                            effect,
-                            outcome: WithdrawalOutcome::DefinitelyUnsent,
-                        } if withdraw => {
-                            assert_eq!(effect, send_id);
-                            break;
-                        }
-                        ExecutorFact::SendStarted { effect, .. } if sends => {
-                            assert_eq!(effect, send_id);
-                            assert!(!started);
-                            started = true;
-                        }
-                        ExecutorFact::Operation(observed) if sends => {
-                            assert!(started);
-                            assert_eq!(observed.generation, key.generation);
-                            assert_eq!(observed.reply.operation_id(), key.operation);
-                            assert_eq!(
-                                observed.reply.worker_outcome(),
-                                Some(novarocks_execution_contract::OperationOutcome::Accepted)
-                            );
-                            break;
-                        }
-                        other => panic!("unexpected composed send fact: {other:?}"),
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        observe_send(&mut wc, send_id, key.generation, replay).await;
     }
     assert_eq!(starts.was_started(participation), sends);
     drop(starts);
     if sends {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                drive(&mut wc.driver);
-                advance_host();
-                if receipt.lock().unwrap().is_some() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(peer.as_ref().unwrap().control_requests(), 1);
     }
-    assert_eq!(
-        roles
-            .ledger
-            .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
-            .unwrap()
-            .unwrap()
-            .used,
-        [0, 0]
-    );
+    let assert_transport_usage = |expected| {
+        assert_eq!(
+            roles
+                .ledger
+                .try_capacity_dimensions([TOTAL_ITEMS, TOTAL_BYTES])
+                .unwrap()
+                .unwrap()
+                .used,
+            expected,
+        );
+    };
     if !release {
         assert!(
             actor_runtime
@@ -2382,6 +2449,84 @@ async fn run_actor_send(
         );
         actor_runtime.retire_input(actor, send_input).unwrap();
     }
+    if let Some(history) = &history {
+        let original_receipt = receipt
+            .lock()
+            .unwrap()
+            .take()
+            .expect("first original receipt");
+        assert_eq!(original_receipt.operation_id(), key.operation);
+        assert_eq!(
+            original_receipt.dispatch_result(),
+            crate::task_execution::operation::OperationDispatchResult::TransportUnknown,
+        );
+        // The script holds the second unbound guard until its command. Only
+        // that future send's capacity may remain when the first queue retires.
+        assert_transport_usage([1, u64::try_from(operation.queued_bytes()).unwrap()]);
+        let observed = history.drain(4096);
+        assert!(
+            observed.complete && observed.remaining == 0,
+            "{:?}",
+            observed.error
+        );
+        use novarocks_control_runtime_core::history::HistoryFact;
+        let first_reservation = reservation.unwrap();
+        let (partition, split_at) = observed
+            .entries
+            .iter()
+            .find_map(|entry| match entry.fact {
+                HistoryFact::CapacitySplit { from, to } if from == first_reservation => {
+                    Some((to, entry.ordinal))
+                }
+                _ => None,
+            })
+            .expect("the original send split its queue partition");
+        assert!(observed.entries.iter().any(|entry| entry.ordinal > split_at
+            && matches!(entry.fact, HistoryFact::ReservationRetired { reservation }
+                if reservation == partition)));
+
+        drop(original_receipt);
+        let [admit_command, send_command] = replay_commands.expect("original replay commands");
+        let actual = admit_original(&mut wc, admit_command, replay_reference).await;
+        assert_ne!(actual.record(), first_grant.record());
+        assert_ne!(actual.generation(), first_grant.generation());
+        let send = submit(send_command);
+        observe_send(&mut wc, replay_send_id, replay_generation, false).await;
+        actor_runtime.retire_input(actor, send).unwrap();
+        let requests = peer.as_ref().unwrap().applied_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0], requests[1],
+            "exact original request crosses both sends"
+        );
+        let remaining = history.drain(4096);
+        assert!(
+            remaining.complete && remaining.remaining == 0,
+            "{:?}",
+            remaining.error
+        );
+        let recorded = |predicate: fn(&HistoryFact, WorkId) -> bool, work| {
+            observed
+                .entries
+                .iter()
+                .chain(&remaining.entries)
+                .find(|entry| predicate(&entry.fact, work))
+                .expect("original Work history")
+                .ordinal
+        };
+        let first_retired = recorded(
+            |fact, original| matches!(fact, HistoryFact::WorkRetired { work, .. } if *work == original),
+            first_send_work.unwrap(),
+        );
+        let replay_started = recorded(
+            |fact, original| matches!(fact, HistoryFact::Started { work, .. } if *work == original),
+            replay_work.unwrap(),
+        );
+        // A single paid send result is reused only after the installed
+        // Source has retired the first send, including its WC input.
+        assert!(split_at < first_retired && first_retired < replay_started);
+    }
+    assert_transport_usage([0, 0]);
     if fail_core {
         {
             let mut waiting = Box::pin(terminal_owner.terminal());

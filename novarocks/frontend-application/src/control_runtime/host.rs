@@ -2971,7 +2971,11 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executor_refusal_preserves_the_same_paid_job_until_real_result_and_capture_exit() {
-        let ledger = RuntimeLedger::new(ResourceVector::default());
+        use novarocks_control_runtime::history::HistoryCapture;
+        use novarocks_control_runtime_core::history::{EffectHistoryPhase, HistoryFact};
+
+        let history = HistoryCapture::new(128);
+        let ledger = RuntimeLedger::with_history(ResourceVector::default(), history.clone());
         let scope = ledger
             .open_scope_next(None, Generation::new(1).unwrap())
             .unwrap();
@@ -2994,7 +2998,7 @@ mod tests {
             .bind(WorkKind::Business)
             .unwrap();
         let reference = work.reference();
-        let runtime = ActorRuntime::new();
+        let runtime = ActorRuntime::with_history(history.clone());
         let config = ActorConfig {
             mailbox: [4; 4],
             max_batches: 4,
@@ -3155,7 +3159,7 @@ mod tests {
         assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(custody.phase(), ExitCustodyPhase::Exited);
         assert!(!custody.try_retire().unwrap());
-        result
+        let (_, result_input) = result
             .fill_with_receipt(None, FrontendInput::Test(2))
             .unwrap_or_else(|_| panic!("original prepaid result input"));
         *returned.role.lock().unwrap() = Some(result);
@@ -3190,6 +3194,53 @@ mod tests {
         assert!(runtime.is_empty());
         assert!(ledger.is_empty());
         assert_eq!(custody.phase(), ExitCustodyPhase::Retired);
+
+        let trace = history.drain(128);
+        assert!(trace.complete && trace.remaining == 0, "{trace:?}");
+        assert_eq!(
+            trace
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.fact,
+                    HistoryFact::Effect {
+                        financial_work,
+                        phase: EffectHistoryPhase::Dispatched,
+                        ..
+                    } if financial_work == reference
+                ))
+                .count(),
+            1,
+            "refused handoffs cannot dispatch or mint another effect"
+        );
+        let exact_ordinal = |fact| {
+            let mut entries = trace.entries.iter().filter(|entry| entry.fact == fact);
+            let ordinal = entries
+                .next()
+                .expect("original Work lifecycle fact")
+                .ordinal;
+            assert!(entries.next().is_none(), "duplicate history fact: {fact:?}");
+            ordinal
+        };
+        let ScopedWorkRef { scope, work } = reference;
+        let started = exact_ordinal(HistoryFact::Started { scope, work });
+        let body_exited = exact_ordinal(HistoryFact::BodyExited { scope, work });
+        let captures_exited = exact_ordinal(HistoryFact::CapturesExited { scope, work });
+        let retired = exact_ordinal(HistoryFact::WorkRetired { scope, work });
+        let mut consumed = trace.entries.iter().filter(|entry| {
+            matches!(
+                entry.fact,
+                HistoryFact::InputConsumed { target, input }
+                    if target.actor == registration.actor() && input == result_input
+            )
+        });
+        let consumed_at = consumed
+            .next()
+            .expect("original Tokio result consumed")
+            .ordinal;
+        assert!(consumed.next().is_none(), "duplicate Tokio result");
+        assert!(started < body_exited && body_exited < captures_exited);
+        assert!(captures_exited < consumed_at && captures_exited < retired);
     }
     struct MemberServicePort(Option<tokio::sync::watch::Sender<u64>>);
     impl novarocks_query_application::api::BackendProcessObservationPort for MemberServicePort {
