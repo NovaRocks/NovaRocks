@@ -34,7 +34,7 @@ use crate::{
     },
     task_execution::{
         host::custody::TransportJoinRegistration, host::failure_lifecycle::LifecycleStarts,
-        intent::OperationAcknowledgement, operation::OperationDispatchResult,
+        intent::OperationAcknowledgement,
     },
 };
 use novarocks_control_runtime::{
@@ -397,18 +397,11 @@ async fn execute_prepared(
     let mut ready = match prepared {
         Ok(ready) => ready,
         Err(error) => {
-            for (intent, key) in captures.operations.iter().zip(captures.keys.iter()) {
-                captures.reports.record_ack(
-                    *key,
-                    OperationAcknowledgement::from_dispatch_result(
-                        intent.operation_id(),
-                        intent.kind(),
-                        OperationDispatchResult::NonWorkerRejected,
-                        crate::task_execution::intent::AckPayload::None,
-                    ),
-                );
-            }
-            return BodyOutcome::RawFailure(Box::new(error));
+            return captures.reports.preparation_failed(
+                &captures.operations,
+                &captures.keys,
+                error,
+            );
         }
     };
     captures.reports.send_started(captures.clock.now());

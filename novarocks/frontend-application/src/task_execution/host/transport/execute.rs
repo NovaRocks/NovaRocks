@@ -34,7 +34,7 @@ use novarocks_coordination_contract::MonotonicClock;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_proto_models::novarocks as proto;
 use std::{future::Future, task::Poll};
-fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
+pub(super) fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
     wire::classify_channel_failure(match error {
         ChannelAcquisitionError::Fatal(_) => wire::ChannelFailureClass::Fatal,
         ChannelAcquisitionError::RetryableNetwork(_) => wire::ChannelFailureClass::RetryableNetwork,

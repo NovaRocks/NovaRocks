@@ -18,7 +18,9 @@
 use super::{
     NativeReceiptInput, SendKey,
     admission_source::FailureRecords,
+    prepare::PreparationFailure,
     receipt_input::{NativeReceiptError, RetiredNativeReceipt, retire_passive_report_position},
+    source_ports::BodyOutcome,
 };
 use crate::task_execution::bridge::abort::AbortReceiptSlot;
 use crate::{
@@ -263,6 +265,41 @@ impl SendReports {
                 assert_eq!(ack.kind(), reply.kind);
                 assert!(reply.value.lock().unwrap().replace(ack).is_none());
             }
+        }
+    }
+
+    pub(super) fn preparation_failed(
+        &self,
+        operations: &[OperationIntent],
+        keys: &[SendKey],
+        failure: PreparationFailure,
+    ) -> BodyOutcome {
+        assert_eq!(operations.len(), keys.len());
+        let channel_dispatch = match (self, &failure) {
+            (Self::Actor(_), PreparationFailure::Channel(error)) => {
+                let dispatch = super::execute::classify_channel_error(error);
+                tracing::warn!(%error, ?dispatch, "task operation channel acquisition failed");
+                Some(dispatch)
+            }
+            _ => None,
+        };
+        for (intent, &key) in operations.iter().zip(keys) {
+            self.record_ack(
+                key,
+                OperationAcknowledgement::from_dispatch_result(
+                    intent.operation_id(),
+                    intent.kind(),
+                    channel_dispatch.unwrap_or(OperationDispatchResult::NonWorkerRejected),
+                    AckPayload::None,
+                ),
+            );
+        }
+        // Channel acquisition has the same typed outcome on both sides of
+        // preparation. The Source still waits for the original Join and
+        // report retirement before it releases this generation.
+        match channel_dispatch {
+            Some(_) => BodyOutcome::ReceiptsRecorded,
+            None => BodyOutcome::RawFailure(Box::new(failure)),
         }
     }
 
@@ -636,6 +673,115 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
     use std::{num::NonZeroU64, time::Duration};
+
+    #[test]
+    fn retryable_channel_preparation_reports_unknown_for_the_original_abort() {
+        use crate::native::transport::ChannelAcquisitionError;
+        use novarocks_attempt_protocol::input::{LocalDispatchResult, OperationReplyResult};
+        use novarocks_execution_contract::{AbortCause, AbortParticipation};
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let inbox = WithdrawalInbox::new(&scope);
+        let (mut work, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let participation = ParticipationRef::new(
+            QueryExecutionId::new(QueryId::new(9, 13), AttemptId::new(1).unwrap()).unwrap(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let effect = AttemptActionId::new(NonZeroU64::MIN);
+        let key = SendKey {
+            operation: TaskOperationId::new_v7(),
+            generation: SendGeneration::new(effect),
+        };
+        let abort = OperationIntent::AbortParticipation(AbortParticipation::new(
+            key.operation,
+            participation,
+            AbortCause::QueryFailed,
+        ));
+        let report = SendMemberReport::new(
+            inbox.reserve_native_receipt(&work, key, abort.kind()),
+            None,
+            FailureRecords::default(),
+            None,
+        );
+        let original = Arc::new(ActorSendReports::new(
+            effect,
+            SendReportRows {
+                started: NativeProgressInput::new(inbox.reserve_standing(&work)),
+                members: Box::new([report]),
+            },
+        ));
+        let reports = SendReports::Actor(Arc::clone(&original));
+        assert!(matches!(
+            reports.preparation_failed(
+                &[abort],
+                &[key],
+                PreparationFailure::Channel(ChannelAcquisitionError::retryable_network(
+                    "original channel was unavailable",
+                )),
+            ),
+            BodyOutcome::ReceiptsRecorded
+        ));
+        let (_, ExecutorFact::Operation(observed)) = inbox.try_commit_next().unwrap() else {
+            panic!("expected the original operation result");
+        };
+        assert_eq!(observed.generation, key.generation);
+        assert_eq!(observed.reply.operation_id(), key.operation);
+        assert!(matches!(
+            observed.reply.result,
+            OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                ..
+            }
+        ));
+        assert!(inbox.try_commit_next().is_none());
+
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        drop(reports);
+        let mut retirement = SendReportRetirement::after_join(original)
+            .unwrap_or_else(|_| panic!("the original reporting body has exited"));
+        assert!(matches!(
+            retirement.advance().unwrap(),
+            SendReportRetirementStep::Advanced(None)
+        ));
+        let SendReportRetirementStep::Advanced(Some(SendReportReturn::Receipt {
+            key: returned,
+            delivery_error: None,
+            receipt,
+            ..
+        })) = retirement.advance().unwrap()
+        else {
+            panic!("expected the original receipt after actual exit");
+        };
+        assert_eq!(returned, key);
+        assert_eq!(
+            receipt.original.dispatch_result(),
+            OperationDispatchResult::TransportUnknown
+        );
+        assert!(matches!(
+            retirement.advance().unwrap(),
+            SendReportRetirementStep::Retired
+        ));
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 8).unwrap();
+        inbox.finish();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+    }
 
     #[test]
     fn release_report_retains_only_the_exact_canonical_diagnostic_alias() {
