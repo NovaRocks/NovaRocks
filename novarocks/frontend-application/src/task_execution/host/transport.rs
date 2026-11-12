@@ -45,6 +45,8 @@ mod quote;
 mod receipt_input;
 mod release_wake;
 mod releases;
+#[cfg(test)]
+mod replacement_permission_tests;
 mod send;
 mod send_binding;
 mod send_reports;
