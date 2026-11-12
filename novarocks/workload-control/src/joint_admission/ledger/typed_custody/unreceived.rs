@@ -332,6 +332,42 @@ impl UnreceivedProductionOwner {
                     .ok_or(WorkError::ArithmeticOverflow)
             })
     }
+    /// Check one original occurrence in a complete received production.
+    pub fn received_facts_have_prefix(
+        &self,
+        record_size: std::num::NonZeroUsize,
+        prefix: &[u8],
+    ) -> Result<bool, WorkError> {
+        if prefix.is_empty() || prefix.len() > record_size.get() {
+            return Err(WorkError::Conflict);
+        }
+        let inner = self.inner.upgrade().ok_or(WorkError::Released)?;
+        let state = inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().ok_or(WorkError::NotReady)?;
+        for record in ledger
+            .claims
+            .values()
+            .filter_map(|row| row.production.as_ref())
+        {
+            if record.phase != Phase::Received || !Weak::ptr_eq(&record.origin, &self.origin) {
+                continue;
+            }
+            let chunks = record.facts.chunks_exact(record_size.get());
+            if !chunks.remainder().is_empty()
+                || u64::try_from(chunks.len()).ok() != Some(record.records)
+            {
+                return Err(WorkError::Conflict);
+            }
+            if chunks
+                .into_iter()
+                .any(|occurrence| occurrence.starts_with(prefix))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Pure diagnostic equality; bytes are retained even after every FE grant
     /// and session strong alias exits. The data itself grants no object access.
     pub fn retains_facts(&self, facts: &[u8]) -> Result<bool, WorkError> {

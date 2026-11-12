@@ -26,7 +26,8 @@ use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
-use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName, Query, Statement};
+use novarocks_parser::ast::{AddEqualityDelete, Expr, LiteralKind, ObjectName, Query};
+use novarocks_parser::{ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
@@ -36,7 +37,6 @@ use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::{Literal as SqlLiteral, ObjectName as SqlObjectName};
-use novarocks_types::schema::ColumnDef;
 
 type Literal = SqlLiteral;
 
@@ -45,14 +45,18 @@ pub(super) fn resolve_target(
     stmt: &AddEqualityDelete,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(crate::catalog_application::resolver::TargetBackend, String), String> {
+) -> Result<
+    (crate::catalog_application::resolver::TargetBackend, String),
+    crate::catalog_application::resolver::TargetResolutionError,
+> {
     let table = sql_object_name(&stmt.target);
     let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
     if target.provider_id.as_str() != "iceberg" {
-        return Err(format!(
+        return Err((format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
             target.provider_id.as_str()
-        ));
+        ))
+        .into());
     }
     Ok((target, "main".to_string()))
 }
@@ -122,19 +126,19 @@ pub(super) async fn prepare_equality_delete_statement_async(
     // Provider admission deliberately precedes literal carrier checks. A
     // rejection here leaves the accepted session in the original receiving.
     let delete_fields = input.validate(&rows)?;
-    let delete_query = build_equality_delete_sink_query(&delete_fields, &rows)?;
+    let delete_query = build_equality_delete_sink_query(&delete_fields, &stmt.rows)?;
     let (sql_write_input, table_bindings) =
         bind_equality_delete_write(target, target_binding.planning_pin(), &write_session)?;
     Ok(super::PreparedDeleteWrite {
+        match_read: None,
         state: state.clone(),
         target: target.clone(),
         delete_query,
-        sql_write_input,
+        write_plan: super::DeleteWritePlan::Direct(sql_write_input),
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
         write_session,
-        distribution: novarocks_sql::compiler::RootDistributionRequirement::Any,
     })
 }
 
@@ -217,7 +221,15 @@ fn bind_equality_delete_write(
 
 fn build_equality_delete_sink_query(
     delete_columns: &[ConnectorWriteFieldRequest],
-    rows: &[Vec<Literal>],
+    rows: &[Vec<Expr>],
+) -> Result<Query, String> {
+    let query = equality_delete_sink_query_ast(delete_columns, rows)?;
+    Ok(query)
+}
+
+fn equality_delete_sink_query_ast(
+    delete_columns: &[ConnectorWriteFieldRequest],
+    rows: &[Vec<Expr>],
 ) -> Result<Query, String> {
     if delete_columns.is_empty() {
         return Err("ADD EQUALITY DELETE requires at least one equality column".to_string());
@@ -225,6 +237,7 @@ fn build_equality_delete_sink_query(
     if rows.is_empty() {
         return Err("ADD EQUALITY DELETE sink query requires at least one row".to_string());
     }
+    let mut values = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() != delete_columns.len() {
             return Err(format!(
@@ -233,53 +246,75 @@ fn build_equality_delete_sink_query(
                 delete_columns.len()
             ));
         }
-    }
-
-    let target_columns = equality_delete_target_columns(delete_columns)?;
-    let alias = "__nr_eqdel";
-    let rendered_rows = rows
-        .iter()
-        .map(|row| {
-            let values = row
-                .iter()
-                .zip(target_columns.iter())
-                .map(|(literal, column)| {
-                    crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
-                        literal,
-                        &column.data_type,
-                    )
+        values.push(
+            row.iter()
+                .zip(delete_columns)
+                .map(|(value, column)| {
+                    equality_delete_literal_ast(value, column.field().data_type())
                 })
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ");
-            Ok(format!("({values})"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let value_columns = target_columns
-        .iter()
-        .map(|column| sql_identifier(&column.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values_sql = format!(
-        "(VALUES {}) AS {}({})",
-        rendered_rows.join(", "),
-        sql_identifier(alias),
-        value_columns
-    );
-    let select_items = target_columns
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    let alias = "__nr_eqdel";
+    let projection = delete_columns
         .iter()
         .map(|column| {
-            Ok(format!(
-                "{} AS {}",
-                crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
-                    &qualify_column(alias, &column.name),
-                    column,
-                )?,
-                sql_identifier(&column.name)
+            let value_type = column.execution_type().ok_or_else(|| {
+                "equality-delete source lacks its complete execution declaration".to_string()
+            })?;
+            let column_name = column.field().name();
+            Ok(build::item(
+                build::cast(
+                    build::column(
+                        build::ident(alias, Some('`')),
+                        build::ident(column_name, Some('`')),
+                    ),
+                    novarocks_sql::sql_type_syntax(value_type)
+                        .map_err(|error| error.to_string())?,
+                ),
+                Some(build::ident(column_name, Some('`'))),
+                true,
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let sql = format!("SELECT {} FROM {}", select_items.join(", "), values_sql);
-    parse_generated_query(&sql, "ADD EQUALITY DELETE sink")
+    let values = build::values(values)
+        .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
+    let source = build::derived(
+        build::query(values),
+        Some(build::alias(
+            build::ident(alias, Some('`')),
+            delete_columns
+                .iter()
+                .map(|column| build::ident(column.field().name(), Some('`')))
+                .collect(),
+            true,
+        )),
+    );
+    let select = build::select(
+        projection,
+        vec![build::relation(source)],
+        None,
+        ast::GroupBy::None,
+    )
+    .map_err(|error| format!("internal equality-delete query construction failed: {error}"))?;
+    Ok(build::query(ast::SetExpr::Select(Box::new(select))))
+}
+
+fn equality_delete_literal_ast(value: &Expr, data_type: &DataType) -> Result<Expr, String> {
+    // Preserve the existing literal-only admission, but never render its lossy
+    // semantic projection back into SQL syntax.
+    lower_literal(value)?;
+    if let Expr::Literal(literal) = value
+        && let LiteralKind::String(text) = &literal.kind
+        && matches!(data_type, DataType::Binary | DataType::LargeBinary)
+    {
+        let bytes = novarocks_sql::literal::latin1_string_to_bytes(text)?;
+        return Ok(Expr::Literal(ast::Literal {
+            kind: LiteralKind::HexString(hex::encode_upper(bytes)),
+            span: literal.span,
+        }));
+    }
+    Ok(value.clone())
 }
 
 /// Keep the admitted provider's complete binding beside the unchanged literal
@@ -315,58 +350,12 @@ fn equality_delete_input_fields(
         .collect()
 }
 
-fn equality_delete_target_columns(
-    delete_columns: &[ConnectorWriteFieldRequest],
-) -> Result<Vec<ColumnDef>, String> {
-    delete_columns
-        .iter()
-        .map(|column| {
-            let value = column.execution_type().ok_or_else(|| {
-                "equality-delete source lacks its complete execution declaration".to_string()
-            })?;
-            let logical_type = novarocks_types::sql_type_from_value_type(value)
-                .map_err(|error| error.to_string())?;
-            Ok(ColumnDef {
-                name: column.field().name().clone(),
-                data_type: value.data_type().clone(),
-                nullable: value.nullable(),
-                write_default: None,
-                logical_type: Some(logical_type),
-            })
-        })
-        .collect()
-}
-
-fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
-    let statements = novarocks_parser::parse(sql)
-        .map_err(|error| format!("{context}: native SQL parser rejection: {error}"))?;
-    match statements.as_slice() {
-        [Statement::Query(query)] => Ok(query.clone()),
-        [other] => Err(format!(
-            "{context}: generated non-query statement: {}",
-            novarocks_parser::printer::print_statement(other)
-        )),
-        _ => Err(format!(
-            "{context}: generated {} statements, expected exactly one query",
-            statements.len()
-        )),
-    }
-}
-
-fn qualify_column(alias: &str, column: &str) -> String {
-    format!("{}.{}", sql_identifier(alias), sql_identifier(column))
-}
-
-fn sql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
-
 /// Resolve the declared equality key columns from neutral connector metadata,
 /// then validate every literal against them.
 ///
 /// This used to build an Arrow `RecordBatch` from the same literals. Nothing
-/// consumed that batch: the values reach the writer as the SQL `VALUES` list
-/// [`build_equality_delete_sink_query`] renders, and the only thing the caller
+/// consumed that batch: the values reach the writer as the `VALUES` syntax
+/// [`build_equality_delete_sink_query`] constructs, and the only thing the caller
 /// read off the batch was `num_rows() == 0`. What the array builder did
 /// contribute was literal validation, so that is all this keeps.
 ///
@@ -783,6 +772,43 @@ mod tests {
 
     use novarocks_sql::semantic::Literal;
 
+    fn parsed_rows(sql: &str) -> Vec<Vec<novarocks_parser::ast::Expr>> {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        let novarocks_parser::ast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("VALUES");
+        };
+        values.rows.clone()
+    }
+
+    fn sink_values(query: &novarocks_parser::ast::Query) -> &novarocks_parser::ast::Values {
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let novarocks_parser::ast::TableFactor::Derived {
+            subquery, alias, ..
+        } = &select.from[0].relation
+        else {
+            panic!("derived VALUES");
+        };
+        let alias = alias.as_ref().expect("VALUES columns");
+        assert_eq!(alias.name.value, "__nr_eqdel");
+        assert!(alias.explicit_as);
+        assert_eq!(alias.name.quote_style, Some('`'));
+        assert!(
+            alias
+                .columns
+                .iter()
+                .all(|column| column.quote_style == Some('`'))
+        );
+        let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_ref() else {
+            panic!("VALUES");
+        };
+        values
+    }
+
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
@@ -1145,15 +1171,91 @@ mod tests {
             fields[1].execution_type(),
             table.execution_schema().bindings().get(1)
         );
-        let query = super::build_equality_delete_sink_query(&fields, &rows).expect("query");
-        let sql = novarocks_parser::printer::print_query(&query);
-
-        assert!(sql.contains("VALUES"));
-        assert!(sql.contains("CAST"));
-        assert!(sql.contains("id"));
-        assert!(sql.contains("category"));
-        assert!(sql.contains("NULL"));
+        let raw_rows = parsed_rows("VALUES (2, 'B'), (4, NULL)");
+        let query = super::build_equality_delete_sink_query(&fields, &raw_rows).expect("query");
+        assert_eq!(sink_values(&query).rows, raw_rows);
+        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        for (item, name, ty) in select
+            .projection
+            .iter()
+            .zip(["id", "category"])
+            .zip(["INT", "STRING"])
+            .map(|((item, name), ty)| (item, name, ty))
+        {
+            let novarocks_parser::ast::SelectItem::ExprWithAlias {
+                expr: novarocks_parser::ast::Expr::Cast(cast),
+                alias,
+                explicit_as,
+                ..
+            } = item
+            else {
+                panic!("typed equality-key projection");
+            };
+            assert_eq!(alias.value, name);
+            assert!(*explicit_as);
+            assert_eq!(cast.data_type.name.parts[0].value, ty);
+        }
     }
+    #[test]
+    fn equality_delete_keeps_numeric_spelling_after_literal_admission() {
+        for (source, scale) in [
+            ("VALUES (9007199254740993.125)", 3),
+            ("VALUES (-9007199254740993.125)", 3),
+            ("VALUES (1e21)", 0),
+        ] {
+            let rows = parsed_rows(source);
+            let data_type = DataType::Decimal128(38, scale);
+            let field = Field::new("key", data_type.clone(), true);
+            let values = rows[0]
+                .iter()
+                .map(super::lower_literal)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            super::validate_equality_literals(&field, &values.iter().collect::<Vec<_>>()).unwrap();
+            let fields = [
+                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                    field,
+                    novarocks_type_contract::FunctionValueType::new(data_type, true),
+                )
+                .unwrap(),
+            ];
+            let query = super::equality_delete_sink_query_ast(&fields, &rows).unwrap();
+            assert_eq!(sink_values(&query).rows, rows, "{source}");
+        }
+    }
+
+    #[test]
+    fn equality_delete_binary_literal_adaptation_uses_latin1_bytes_and_original_span() {
+        let text = novarocks_sql::literal::bytes_to_latin1_string(&[0, 0xff, b'\\', b'\'']);
+        let span = novarocks_parser::Span::new(9, 15);
+        let value = novarocks_parser::ast::Expr::Literal(novarocks_parser::ast::Literal {
+            kind: novarocks_parser::ast::LiteralKind::String(text),
+            span,
+        });
+        let fields = [
+            novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                Field::new("key", DataType::Binary, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+            )
+            .unwrap(),
+        ];
+        let query = super::build_equality_delete_sink_query(&fields, &[vec![value]]).unwrap();
+        let novarocks_parser::ast::Expr::Literal(literal) = &sink_values(&query).rows[0][0] else {
+            panic!("hexadecimal binary value");
+        };
+        assert_eq!(
+            literal.kind,
+            novarocks_parser::ast::LiteralKind::HexString("00FF5C27".into())
+        );
+        assert_eq!(literal.span, span);
+        let unsupported = novarocks_parser::build::string("雪");
+        let error =
+            super::equality_delete_literal_ast(&unsupported, &DataType::Binary).unwrap_err();
+        assert_eq!(error, "literal contains non-LATIN1 character: \"雪\"");
+    }
+
     /// Both production routes use these two stages. Resolving the complete
     /// provider input must not steal the later literal-admission decision.
     #[test]
@@ -1191,12 +1293,10 @@ mod tests {
             assert_eq!(before.field(), after.field());
             assert_eq!(before.execution_type(), after.execution_type());
         }
+        let raw_rows = parsed_rows("VALUES (7, NULL)");
         let query =
-            super::build_equality_delete_sink_query(&after, &rows).expect("same shape author");
-        let sql = novarocks_parser::printer::print_query(&query);
-        assert!(sql.contains("VALUES"));
-        assert!(sql.contains("NULL"));
-        assert!(sql.contains("category"));
+            super::build_equality_delete_sink_query(&after, &raw_rows).expect("same shape author");
+        assert_eq!(sink_values(&query).rows, raw_rows);
     }
 
     #[test]
@@ -1315,8 +1415,8 @@ mod tests {
         .expect("the selected id does not write the table's uuid column");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(Arc::ptr_eq(&session, &original_session));
-        let query =
-            super::build_equality_delete_sink_query(&fields, &[vec![Literal::Int(7)]]).unwrap();
-        assert!(novarocks_parser::printer::print_query(&query).contains("id"));
+        let raw_rows = parsed_rows("VALUES (7)");
+        let query = super::build_equality_delete_sink_query(&fields, &raw_rows).unwrap();
+        assert_eq!(sink_values(&query).rows, raw_rows);
     }
 }

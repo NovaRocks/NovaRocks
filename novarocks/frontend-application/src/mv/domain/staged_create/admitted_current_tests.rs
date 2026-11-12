@@ -65,6 +65,7 @@ struct TargetCaps {
     events: Mutex<Vec<&'static str>>,
     async_capture_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     async_refusal: Mutex<Option<ConnectorError>>,
+    capture_refusal: Mutex<Option<ConnectorError>>,
     cpu_tail: Mutex<Option<Arc<CaptureCpuTail>>>,
 }
 
@@ -123,7 +124,7 @@ impl CaptureCpuTail {
         self.changed.notify_all();
     }
 }
-struct CaptureTailRescue(Arc<CaptureCpuTail>);
+pub(crate) struct CaptureTailRescue(Arc<CaptureCpuTail>);
 impl Drop for CaptureTailRescue {
     fn drop(&mut self) {
         self.0.release();
@@ -214,6 +215,9 @@ impl ConnectorMetadata for TargetCaps {
             let gate = self.async_capture_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.await.expect("original fixture capture gate");
+            }
+            if let Some(error) = self.capture_refusal.lock().unwrap().take() {
+                return Err(error);
             }
             // This explicit fixture is a pure fact producer. It is not an
             // Iceberg schema/loader placement or network qualification.
@@ -484,6 +488,7 @@ impl Fixture {
             events: Mutex::new(vec![]),
             async_capture_gate: Mutex::new(None),
             async_refusal: Mutex::new(None),
+            capture_refusal: Mutex::new(None),
             cpu_tail: Mutex::new(None),
         });
         let template = novarocks_catalog_application::test_support::test_control_binding_for(
@@ -526,8 +531,7 @@ impl Fixture {
             .derive_document_storage_lease()
             .unwrap();
         let view = caps.current.lock().unwrap().clone();
-        let current =
-            decode_current_keyed_documents(view, catalog.clone(), Default::default()).unwrap();
+        let current = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         let entrance = ManagementEntrance::new(
             current.deployment_owner.clone(),
             current.process_incarnation.clone(),
@@ -579,8 +583,7 @@ impl Fixture {
             )
             .unwrap();
         assert_eq!(phase, ManagementObservationPhase::Ready);
-        let observed =
-            decode_current_keyed_documents(view, catalog.clone(), Default::default()).unwrap();
+        let observed = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         entrance
             .install_observed_target(
                 &state,
@@ -599,13 +602,8 @@ impl Fixture {
     }
 
     fn request(&self) -> MvCurrentProjectionRequest {
-        MvCurrentProjectionRequest::try_new(
-            self.catalog.clone(),
-            self.target.clone(),
-            context(),
-            Default::default(),
-        )
-        .unwrap()
+        MvCurrentProjectionRequest::try_new(self.catalog.clone(), self.target.clone(), context())
+            .unwrap()
     }
 
     async fn observe(&self, convergence: MvConvergence) -> CurrentResult {
@@ -631,7 +629,6 @@ impl Fixture {
         let current = decode_current_keyed_documents(
             self.caps.current.lock().unwrap().clone(),
             self.catalog.clone(),
-            Default::default(),
         )
         .unwrap();
         ManagementRequest::try_new(
@@ -960,7 +957,6 @@ async fn admitted_current_rejects_a_foreign_catalog_before_metadata_or_document_
         ),
         fixture.target.clone(),
         context(),
-        Default::default(),
     )
     .unwrap();
     let error = fixture
@@ -1456,6 +1452,7 @@ async fn original_current_capture_uses_each_selected_epoch_and_retains_the_actua
         events: Mutex::new(vec![]),
         async_capture_gate: Mutex::new(None),
         async_refusal: Mutex::new(None),
+        capture_refusal: Mutex::new(None),
         cpu_tail: Mutex::new(None),
     });
     let template = novarocks_catalog_application::test_support::test_control_binding_for(
@@ -1829,3 +1826,97 @@ async fn original_registration_physical_exit_keeps_failed_cleanup_and_same_owner
 
 #[path = "admitted_current_tests/retained_root_tests.rs"]
 mod retained_root_tests;
+
+// Test-only adapter for the original capture author. It deliberately does not
+// create a Root, CPU owner, StateStore owner or management admission.
+pub(crate) struct CurrentCaptureFixture {
+    caps: Arc<TargetCaps>,
+    pin: ConnectorControlPlanningPin,
+}
+impl CurrentCaptureFixture {
+    pub(crate) fn new() -> Self {
+        let (catalog, _) = keyed_view_fixture(Some(17), true);
+        let target = MvTarget::from_parts(Some("ice"), "sales", "mv");
+        let facts = KeyedProjectionFixture::new(target, Some(17))
+            .build()
+            .unwrap();
+        let observed = observed_current_keyed(&facts, catalog);
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: observed.view.table.instance_id.clone(),
+        };
+        let epoch = observed.view.owner.incarnation;
+        let caps = Arc::new(TargetCaps {
+            descriptor: descriptor.clone(),
+            epoch,
+            captured_object: Mutex::new(observed.view.object_id.clone()),
+            current: Mutex::new(observed.view),
+            conclusions: Mutex::new(VecDeque::new()),
+            events: Mutex::new(vec![]),
+            async_capture_gate: Mutex::new(None),
+            async_refusal: Mutex::new(None),
+            capture_refusal: Mutex::new(None),
+            cpu_tail: Mutex::new(None),
+        });
+        let template = novarocks_catalog_application::test_support::test_control_binding_for(
+            descriptor.instance_id.clone(),
+            3,
+        );
+        let binding = ConnectorControlBinding::try_new(
+            descriptor,
+            epoch,
+            caps.clone(),
+            Arc::clone(template.planning()),
+            Arc::clone(template.execution_distribution()),
+            None,
+        )
+        .unwrap();
+        Self {
+            caps,
+            pin: Resolver {
+                binding: Arc::new(binding),
+            }
+            .planning_pin(),
+        }
+    }
+    pub(crate) fn pin(&self) -> ConnectorControlPlanningPin {
+        self.pin.clone()
+    }
+    pub(crate) fn table(&self) -> ConnectorTableIdentity {
+        self.caps.current.lock().unwrap().table.clone()
+    }
+    pub(crate) fn hold_capture(&self, error: ConnectorError) -> tokio::sync::oneshot::Sender<()> {
+        let (release, held) = tokio::sync::oneshot::channel();
+        *self.caps.async_capture_gate.lock().unwrap() = Some(held);
+        *self.caps.capture_refusal.lock().unwrap() = Some(error);
+        release
+    }
+    pub(crate) fn hold_cpu_tail(&self) -> (CaptureTailRescue, tokio::sync::oneshot::Receiver<()>) {
+        let (signal, entered) = tokio::sync::oneshot::channel();
+        let tail = Arc::new(CaptureCpuTail {
+            entered: Mutex::new(Some(signal)),
+            released: Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            source_drops: std::sync::atomic::AtomicUsize::new(0),
+        });
+        *self.caps.cpu_tail.lock().unwrap() = Some(tail.clone());
+        (CaptureTailRescue(tail), entered)
+    }
+    pub(crate) fn events(&self) -> Vec<&'static str> {
+        self.caps.events.lock().unwrap().clone()
+    }
+}
+impl CaptureTailRescue {
+    pub(crate) fn release(&self) {
+        self.0.release();
+    }
+    pub(crate) fn calls(&self) -> usize {
+        self.0.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub(crate) fn source_drops(&self) -> usize {
+        self.0
+            .source_drops
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}

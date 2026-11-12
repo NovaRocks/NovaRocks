@@ -41,8 +41,6 @@ pub struct PayloadRef(pub NonZeroU64);
 pub struct FrozenCreation {
     pub resource: PayloadRef,
     pub queued_bytes: usize,
-    pub plan_carrier_bytes: usize,
-    pub descriptor_encoded_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

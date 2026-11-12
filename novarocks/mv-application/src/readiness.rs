@@ -19,13 +19,9 @@
 use crate::dependency::MvDependencyObjectIdentity;
 use crate::management::MvCurrentManagementAdmission;
 use crate::persistence::documents::MvDocumentError;
-use crate::persistence::validation::PersistenceDecodeBudget;
 use crate::process_runtime::{ProcessRuntime, ProjectionOrder, TargetReadiness};
 use crate::product::MvTarget;
-use crate::repository::{
-    MvProjectionInventoryBound, MvProjectionInventoryEntry, MvRepositoryError,
-    MvRepositoryErrorKind,
-};
+use crate::repository::{MvProjectionInventoryEntry, MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{CatalogHandle, ConnectorRequestContext, LakePublicationId};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -45,14 +41,12 @@ pub struct MvCurrentProjectionRequest {
     catalog: CatalogHandle,
     target: MvTarget,
     context: ConnectorRequestContext,
-    decode_budget: PersistenceDecodeBudget,
 }
 impl MvCurrentProjectionRequest {
     pub fn try_new(
         catalog: CatalogHandle,
         target: MvTarget,
         context: ConnectorRequestContext,
-        decode_budget: PersistenceDecodeBudget,
     ) -> Result<Self, MvProjectionError> {
         if target.catalog() != Some(catalog.catalog_name().as_str()) {
             return Err(MvProjectionError::new(
@@ -64,7 +58,6 @@ impl MvCurrentProjectionRequest {
             catalog,
             target,
             context,
-            decode_budget,
         })
     }
     pub fn catalog(&self) -> &CatalogHandle {
@@ -75,9 +68,6 @@ impl MvCurrentProjectionRequest {
     }
     pub fn context(&self) -> &ConnectorRequestContext {
         &self.context
-    }
-    pub fn decode_budget(&self) -> PersistenceDecodeBudget {
-        self.decode_budget
     }
 }
 
@@ -178,15 +168,7 @@ impl From<MvDocumentError> for MvProjectionError {
                     .unwrap_or_else(|| SharedFailureCause::new(error));
                 Self::new(kind, message).with_original_failure(original)
             }
-            error => {
-                let kind = match &error {
-                    MvDocumentError::Codec(
-                        crate::persistence::codec::PersistenceCodecError::ResourceBudget { .. },
-                    ) => MvProjectionErrorKind::BudgetExceeded,
-                    _ => MvProjectionErrorKind::CorruptDocument,
-                };
-                Self::new(kind, message)
-            }
+            _ => Self::new(MvProjectionErrorKind::CorruptDocument, message),
         }
     }
 }
@@ -343,11 +325,10 @@ impl MvKeyedReadinessService {
     > {
         self.legacy().load_ready_settled(target).await
     }
-    pub async fn bounded_projection_inventory(
+    pub async fn projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
-        self.legacy().bounded_projection_inventory(bound).await
+    ) -> Result<MvKeyedProjectionInventory, MvRepositoryError> {
+        self.legacy().projection_inventory().await
     }
     pub async fn list_ready_projections(
         &self,
@@ -454,7 +435,6 @@ impl MvKeyedReadinessExecution {
         source: &dyn MvKeyedCurrentProjectionSource,
     ) -> Result<MvKeyedProjectionInstallOutcome, MvProjectionError> {
         let target = request.target().clone();
-        let budget = request.decode_budget();
         let order = self.runtime.projection_order(target.clone());
         let (generation, expected) = {
             let mut cell = order.lock().await;
@@ -465,10 +445,7 @@ impl MvKeyedReadinessExecution {
                 target.clone(),
                 "fresh keyed Current observation pending".into(),
             );
-            let expected = self
-                .repository
-                .find_keyed_by_target(&target, budget)
-                .await?;
+            let expected = self.repository.find_keyed_by_target(&target).await?;
             (generation, expected)
         };
         let observed = source.observe_current_keyed(request.clone()).await;
@@ -477,10 +454,7 @@ impl MvKeyedReadinessExecution {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
         cell.settle(generation);
-        let current = self
-            .repository
-            .find_keyed_by_target(&target, budget)
-            .await?;
+        let current = self.repository.find_keyed_by_target(&target).await?;
         if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
@@ -560,11 +534,7 @@ impl MvKeyedReadinessExecution {
     > {
         let order = self.runtime.projection_order(target.clone());
         let cell = order.lock().await;
-        let Some(loaded) = self
-            .repository
-            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
-            .await?
-        else {
+        let Some(loaded) = self.repository.find_keyed_by_target(target).await? else {
             return Ok(None);
         };
         if !matches!(self.runtime.readiness(target), TargetReadiness::Ready)
@@ -597,17 +567,16 @@ impl MvKeyedCandidateReader {
             .collect())
     }
 }
-pub struct MvBoundedKeyedProjectionInventory {
+pub struct MvKeyedProjectionInventory {
     service: MvKeyedReadinessExecution,
     entries: std::vec::IntoIter<MvProjectionInventoryEntry>,
-    bound: MvProjectionInventoryBound,
 }
 #[derive(Debug)]
 pub struct ListedKeyedMvProjection {
     pub loaded: crate::state_store_repository::keyed::LoadedKeyedMvProjection,
     pub manageability: MvListedManageability,
 }
-impl MvBoundedKeyedProjectionInventory {
+impl MvKeyedProjectionInventory {
     pub fn order_by_namespace_and_name(&mut self) {
         self.entries.as_mut_slice().sort_by(|a, b| {
             a.target
@@ -628,7 +597,7 @@ impl MvBoundedKeyedProjectionInventory {
             let Some(loaded) = self
                 .service
                 .repository
-                .find_keyed_by_target_bounded(&entry.target, self.bound)
+                .find_keyed_by_target(&entry.target)
                 .await?
             else {
                 continue;
@@ -647,37 +616,19 @@ impl MvBoundedKeyedProjectionInventory {
         &mut self,
     ) -> Result<Option<ListedKeyedMvProjection>, MvRepositoryError> {
         for entry in self.entries.by_ref() {
-            let mut bound = self.bound;
             let state = self
                 .service
                 .runtime
-                .with_readiness(&entry.target, |state| {
-                    let bytes = match state {
-                        TargetReadiness::ReadOnly(r) | TargetReadiness::Unavailable(r) => r.len(),
-                        _ => 0,
-                    };
-                    bound.decode.max_working_set_bytes = bound
-                        .decode
-                        .max_working_set_bytes
-                        .checked_sub(bytes)
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| {
-                            MvRepositoryError::new(
-                                MvRepositoryErrorKind::InvalidRequest,
-                                "keyed readiness reason exceeds decode budget",
-                            )
-                        })?;
-                    Ok::<_, MvRepositoryError>(match state {
-                        TargetReadiness::Ready => Some(MvListedManageability::Manageable),
-                        TargetReadiness::ReadOnly(r) => {
-                            Some(MvListedManageability::ReadOnly(r.clone()))
-                        }
-                        TargetReadiness::Unavailable(r) => {
-                            Some(MvListedManageability::Unavailable(r.clone()))
-                        }
-                        TargetReadiness::Unobserved => None,
-                    })
-                })?;
+                .with_readiness(&entry.target, |state| match state {
+                    TargetReadiness::Ready => Some(MvListedManageability::Manageable),
+                    TargetReadiness::ReadOnly(reason) => {
+                        Some(MvListedManageability::ReadOnly(reason.clone()))
+                    }
+                    TargetReadiness::Unavailable(reason) => {
+                        Some(MvListedManageability::Unavailable(reason.clone()))
+                    }
+                    TargetReadiness::Unobserved => None,
+                });
             let Some(manageability) = state else {
                 continue;
             };
@@ -686,7 +637,7 @@ impl MvBoundedKeyedProjectionInventory {
             let Some(loaded) = self
                 .service
                 .repository
-                .find_keyed_by_target_bounded(&entry.target, bound)
+                .find_keyed_by_target(&entry.target)
                 .await?
             else {
                 continue;
@@ -797,7 +748,7 @@ impl MvKeyedReadinessExecution {
     ) -> Result<MvQueryAdmission, MvRepositoryError> {
         if self
             .repository
-            .find_keyed_by_target(target, PersistenceDecodeBudget::default())
+            .find_keyed_by_target(target)
             .await?
             .is_none()
         {
@@ -836,18 +787,16 @@ impl MvKeyedReadinessExecution {
         }
         self.load_ready(target).await
     }
-    pub async fn bounded_projection_inventory(
+    pub async fn projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<MvBoundedKeyedProjectionInventory, MvRepositoryError> {
-        Ok(MvBoundedKeyedProjectionInventory {
+    ) -> Result<MvKeyedProjectionInventory, MvRepositoryError> {
+        Ok(MvKeyedProjectionInventory {
             service: self.clone(),
             entries: self
                 .repository
-                .list_keyed_projection_inventory(bound)
+                .list_keyed_projection_inventory()
                 .await?
                 .into_iter(),
-            bound,
         })
     }
     pub async fn list_ready_projections(
@@ -920,11 +869,7 @@ impl MvKeyedReadinessExecution {
         cell.pending = Some(generation);
         self.runtime
             .set_unavailable(target.clone(), "MV deletion pending".into());
-        let expected = match self
-            .repository
-            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
-            .await
-        {
+        let expected = match self.repository.find_keyed_by_target(&target).await {
             Ok(v) => v,
             Err(e) => {
                 cell.settle(generation);
@@ -955,7 +900,7 @@ impl MvKeyedReadinessExecution {
         cell.settle(guard.generation);
         let current = request
             .repository
-            .find_keyed_by_target(&guard.target, PersistenceDecodeBudget::default())
+            .find_keyed_by_target(&guard.target)
             .await?;
         if current.as_ref().map(|v| &v.version) != guard.expected.as_ref().map(|v| &v.version) {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
@@ -1031,10 +976,7 @@ impl MvKeyedReadinessExecution {
                 target.clone(),
                 "fresh keyed read-only observation pending".into(),
             );
-            let expected = self
-                .repository
-                .find_keyed_by_target(&target, request.decode_budget())
-                .await?;
+            let expected = self.repository.find_keyed_by_target(&target).await?;
             (generation, expected, managed, installed)
         };
         let observed = source
@@ -1045,10 +987,7 @@ impl MvKeyedReadinessExecution {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
         cell.settle(generation);
-        let current = self
-            .repository
-            .find_keyed_by_target(&target, request.decode_budget())
-            .await?;
+        let current = self.repository.find_keyed_by_target(&target).await?;
         if current.as_ref().map(|v| &v.version) != expected.as_ref().map(|v| &v.version) {
             return Ok(MvKeyedProjectionInstallOutcome::Superseded);
         }
@@ -1114,10 +1053,7 @@ impl MvKeyedReadinessExecution {
         let mut cell = order.lock().await;
         cell.advance()?;
         cell.supersede();
-        let expected = self
-            .repository
-            .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
-            .await?;
+        let expected = self.repository.find_keyed_by_target(&target).await?;
         let loaded = self
             .repository
             .install_keyed_projection(operation, facts, expected)
@@ -1178,12 +1114,7 @@ mod keyed_tests {
     }
     fn input(published: bool) -> (MvCurrentProjectionRequest, Source) {
         let (catalog, view) = keyed_view_fixture(Some(17), published);
-        let decoded = decode_current_keyed_documents(
-            view,
-            catalog.clone(),
-            PersistenceDecodeBudget::default(),
-        )
-        .unwrap();
+        let decoded = decode_current_keyed_documents(view, catalog.clone()).unwrap();
         let stop = novarocks_spi::connector::ConnectorStopOwner::new();
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -1197,7 +1128,6 @@ mod keyed_tests {
                 catalog,
                 MvTarget::from_parts(Some("ice"), "sales", "mv"),
                 context,
-                PersistenceDecodeBudget::default(),
             )
             .unwrap(),
             Source(decoded),
@@ -1230,22 +1160,14 @@ mod keyed_tests {
                 .len(),
             1
         );
-        let bound = MvProjectionInventoryBound {
-            entries: 4,
-            snapshot_bytes: 64 * 1024,
-            raw_page_bytes: 1024 * 1024,
-            single_name_bytes: 1024,
-            continuation_token_bytes: 4096,
-            decode: PersistenceDecodeBudget::default(),
-        };
-        let mut inventory = service.bounded_projection_inventory(bound).await.unwrap();
+
+        let mut inventory = service.projection_inventory().await.unwrap();
         assert!(inventory.next_ready().await.unwrap().is_some());
         assert!(inventory.next_ready().await.unwrap().is_none());
         let dependencies = service
             .list_ready_dependencies_by_downstream_bounded(
                 &loaded,
                 MvDependencyReadBound {
-                    inventory: bound,
                     entries: 8,
                     collection_bytes: 64 * 1024,
                 },
@@ -1352,19 +1274,16 @@ impl ReadinessRepository {
     async fn find_keyed_by_target(
         &self,
         target: &MvTarget,
-        budget: PersistenceDecodeBudget,
     ) -> Result<
         Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
         MvRepositoryError,
     > {
         match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository.find_keyed_by_target(target, budget).await
-            }
+            ReadinessExecution::Legacy => self.repository.find_keyed_by_target(target).await,
             ReadinessExecution::Original(execution) => {
                 self.repository
                     .in_requests(execution.as_ref())
-                    .find_keyed_by_target(target, budget)
+                    .find_keyed_by_target(target)
                     .await
             }
         }
@@ -1386,28 +1305,7 @@ impl ReadinessRepository {
             }
         }
     }
-    async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<
-        Option<crate::state_store_repository::keyed::LoadedKeyedMvProjection>,
-        MvRepositoryError,
-    > {
-        match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository
-                    .find_keyed_by_target_bounded(target, bound)
-                    .await
-            }
-            ReadinessExecution::Original(execution) => {
-                self.repository
-                    .in_requests(execution.as_ref())
-                    .find_keyed_by_target_bounded(target, bound)
-                    .await
-            }
-        }
-    }
+
     async fn list_keyed_projections(
         &self,
     ) -> Result<Vec<crate::state_store_repository::keyed::LoadedKeyedMvProjection>, MvRepositoryError>
@@ -1424,16 +1322,13 @@ impl ReadinessRepository {
     }
     async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository.list_keyed_projection_inventory(bound).await
-            }
+            ReadinessExecution::Legacy => self.repository.list_keyed_projection_inventory().await,
             ReadinessExecution::Original(execution) => {
                 self.repository
                     .in_requests(execution.as_ref())
-                    .list_keyed_projection_inventory(bound)
+                    .list_keyed_projection_inventory()
                     .await
             }
         }

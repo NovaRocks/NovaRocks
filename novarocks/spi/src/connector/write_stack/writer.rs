@@ -23,14 +23,18 @@
 //! the append path holds no cross-driver lock and there is no "last driver
 //! finishes" protocol.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 
 use crate::connector::write_stack::runtime::{ConnectorCommitFragment, ConnectorWriterHandle};
 use crate::connector::write_stack::target::WriteTargetOrdinal;
-use crate::connector::{CatalogHandle, ConnectorError, ConnectorRequestContext};
+use crate::connector::{
+    CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+};
 
 /// Where, in this exact execution attempt, a writer is running.
 ///
@@ -85,6 +89,42 @@ impl ConnectorWriterPhysicalContext {
     }
 }
 
+/// Identity attached by the receiving task to one shard chunk. The sender
+/// identity comes from the authenticated exchange roster and the driver
+/// count from that task's frozen assignment. Neither is a payload column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorPositionShardSource {
+    group: ConnectorMutationContributionGroupId,
+    task_key: [u8; 16],
+    driver_count: NonZeroU32,
+}
+
+impl ConnectorPositionShardSource {
+    pub const fn new(
+        group: ConnectorMutationContributionGroupId,
+        task_key: [u8; 16],
+        driver_count: NonZeroU32,
+    ) -> Self {
+        Self {
+            group,
+            task_key,
+            driver_count,
+        }
+    }
+
+    pub const fn group(&self) -> ConnectorMutationContributionGroupId {
+        self.group
+    }
+
+    pub const fn task_key(&self) -> [u8; 16] {
+        self.task_key
+    }
+
+    pub const fn driver_count(&self) -> NonZeroU32 {
+        self.driver_count
+    }
+}
+
 /// Everything one driver needs to open its own writer.
 pub struct ConnectorOpenWriterRequest {
     pub handle: ConnectorWriterHandle,
@@ -92,6 +132,7 @@ pub struct ConnectorOpenWriterRequest {
     pub expected_schema: SchemaRef,
     pub physical: ConnectorWriterPhysicalContext,
     pub context: ConnectorRequestContext,
+    pub resources: Option<crate::connector::ConnectorExecutionResources>,
 }
 
 /// A driver-local asynchronous writer.
@@ -104,6 +145,18 @@ pub struct ConnectorOpenWriterRequest {
 #[async_trait::async_trait]
 pub trait ConnectorBatchWriter: Send {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError>;
+
+    /// Consume one position-shard batch from a single authenticated source.
+    async fn append_position_shards(
+        &mut self,
+        _source: ConnectorPositionShardSource,
+        _batch: RecordBatch,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "Connector writer does not admit position shards",
+        ))
+    }
 
     /// Seal this writer's complete output and describe every staged artifact.
     /// Before returning success, revoke this writer's local deletion authority

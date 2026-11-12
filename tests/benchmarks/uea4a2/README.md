@@ -2,7 +2,7 @@
 
 本目录名为历史布局，当前仅保留功能fixture及显式producer；release测量controller、pilot/calibration/window、比较器和workload门限已退出。四writer本地conformance数据的canonical owner见 [FS writer corpus](../../../novarocks/fs/tests/data/writer-corpus/README.md)。旧receipt/路径只解释来源，不证明当前远端健康。
 
-`uea4/iceberg-range-functional`使用至少16文件的A4输入，准确覆盖id=0..767、独立行值与LIMIT后退出；`connector/iceberg-short-range-concurrent`使用4096行单文件短表，四actor各查id1..10/value=3×id。输入由环境变量 `NOVAROCKS_UEA4A2_FIXTURE_MANIFEST` 和 `NOVAROCKS_ICEBERG_SHORT_FIXTURE_MANIFEST`明确绑定；对象凭据通过既有 `NOVAROCKS_UEA4A2_S3_ACCESS_KEY_ID`/`NOVAROCKS_UEA4A2_S3_SECRET_ACCESS_KEY`显式供给，manifest不保存secret。缺READY/object/hash/oracle直接失败，不从测量workload或旧校准receipt推导默认值。
+`uea4/iceberg-range-functional` 与 `connector/iceberg-short-range-concurrent` 在自己的私有 REST/MinIO/Spark 运行内生成并核验输入。多文件场景核对 24 个真实文件、id=0..767 的完整行序及 LIMIT 后退出。短表核对 4096 行一个真实文件，四个 actor 分别检查 id=1..10 与 value=3×id。两个入口均不消费预生成 manifest。
 
 多文件输入可以由保留的 [Iceberg fixture producer](../uea4a4/README.md)在任务私有namespace供给并独立verify。短表使用FS owner的原始Spark SQL模板，由输入owner按准确task namespace渲染并通过正常Spark写入/compact；`fixtures/publish_short_iceberg.py provision`要求明确 `--output`、`--database`、`--table`、`--spark-image-id`、`--spark-output`（官方Spark files输出）。publisher核对REST snapshot与4096行唯一datafile，独立PyArrow核对每行，并发布manifest/objects/READY；拒绝覆盖已有output。
 

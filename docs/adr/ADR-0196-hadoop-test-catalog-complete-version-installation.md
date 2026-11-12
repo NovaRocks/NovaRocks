@@ -5,6 +5,10 @@ domain: [provider-spi, table-maintenance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0227
+    scope: "Ruling 3 fixed 65,536-entry inventory limit; complete discovery, hint, installation and lifecycle rules remain active"
+    link: "ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md"
 partially-supersedes:
   - id: ADR-0077
     scope: "Complete local installation, physical version discovery and CREATE inventory prerequisite; conditional creation and exact positive attribution remain active"

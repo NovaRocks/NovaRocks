@@ -477,8 +477,10 @@ pub(crate) fn validate_node_output_closure(
         | NodeKind::NestLoopJoin { .. }
         | NodeKind::SetOp { .. }
         | NodeKind::Values { .. }
+        | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
-        | NodeKind::ChangeEventExpand { .. } => None,
+        | NodeKind::ChangeEventExpand { .. }
+        | NodeKind::PositionShard(_) => None,
     };
     if let Some(exact) = exact
         && exact.as_slice() != node.output.columns.as_ref()
@@ -728,11 +730,13 @@ pub(crate) fn value_origin_allowed(
         }
         (
             NodeKind::Values { .. }
+            | NodeKind::SystemRelation { .. }
             | NodeKind::Repeat { .. }
             | NodeKind::Unpivot { .. }
             | NodeKind::GenerateSeries { .. }
             | NodeKind::TableFunction { .. }
-            | NodeKind::ChangeEventExpand { .. },
+            | NodeKind::ChangeEventExpand { .. }
+            | NodeKind::PositionShard(_),
             ValueOrigin::NodeOutput {
                 node: owner,
                 output_ordinal,
@@ -747,10 +751,14 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
     let valid = match &node.kind {
         NodeKind::Scan { .. }
         | NodeKind::Values { .. }
+        | NodeKind::SystemRelation { .. }
         | NodeKind::GenerateSeries { .. }
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
         NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
+        NodeKind::PositionShard(spec) => {
+            !spec.inputs.is_empty() && node.inputs.len() == spec.inputs.len()
+        }
         NodeKind::TableFinish(spec) => {
             let logical = matches!(spec.count_mode, crate::FinishCountMode::LogicalChanges);
             node.inputs.len() == 1 + spec.inputs.summaries.iter().count()
@@ -1344,6 +1352,31 @@ pub(crate) fn validate_node_semantics(
                     path,
                     "INTERSECT and EXCEPT require singleton inputs or one exact shared partition space over every comparison ordinal",
                 ));
+            }
+        }
+        NodeKind::SystemRelation {
+            output_fields,
+            data,
+        } => {
+            if output_fields.len() != node.output.columns.len() {
+                errors.push(ValidationError::new(
+                    path,
+                    "system relation output width differs",
+                ));
+            }
+            for (field, value) in output_fields.iter().zip(node.output.columns.iter()) {
+                if let Some(value) = fragment.values().get(value)
+                    && (value.ty.data_type() != field.data_type()
+                        || value.ty.nullable() != field.is_nullable())
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "system relation field differs from its complete output type",
+                    ));
+                }
+            }
+            if let Err(message) = data.validate_schema(output_fields) {
+                errors.push(ValidationError::new(path, message));
             }
         }
         NodeKind::Values { rows } => {
@@ -2026,6 +2059,77 @@ pub(crate) fn validate_node_semantics(
                     errors.push(ValidationError::new(
                         path,
                         "generate-series argument type differs from its output",
+                    ));
+                }
+            }
+        }
+        NodeKind::PositionShard(spec) => {
+            let output = spec.output;
+            let required = |id, data_type| {
+                fragment
+                    .values()
+                    .get(&id)
+                    .is_some_and(|value| *value.ty.data_type() == data_type && !value.ty.nullable())
+            };
+            let partition_type = fragment
+                .values()
+                .get(&output.partition)
+                .map(|value| &value.ty);
+            let partition_is_row = partition_type
+                .is_some_and(|ty| ty.nullable() && matches!(ty.data_type(), DataType::Struct(_)));
+            let output_columns = output.columns();
+            let unique_outputs = output_columns.into_iter().collect::<BTreeSet<_>>().len();
+            if fragment.root() != node.id
+                || !matches!(fragment.sink(), crate::FragmentSink::Stream { .. })
+                || spec.group.to_bytes() == [0; 32]
+                || node.output.columns.as_ref() != output_columns
+                || unique_outputs != output_columns.len()
+                || !required(output.file, DataType::Utf8)
+                || !required(output.spec_id, DataType::Int32)
+                || !partition_is_row
+                || !required(output.driver_ordinal, DataType::Int64)
+                || !required(output.high32, DataType::Int32)
+                || !required(output.container_key, DataType::Int32)
+                || !required(output.index, DataType::Int64)
+                || !required(output.count, DataType::Int64)
+                || !required(output.bitmap, DataType::Binary)
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "position shard output does not match its declared group and layout",
+                ));
+            }
+            let mut routes = BTreeSet::new();
+            // The producer may emit a nullable envelope for other effects.
+            // PositionShard checks the required values on selected rows.
+            let raw_type = |id, expected| {
+                fragment
+                    .values()
+                    .get(&id)
+                    .is_some_and(|value| value.ty.data_type() == &expected)
+            };
+            for (input, &child) in spec.inputs.iter().zip(node.inputs.iter()) {
+                let columns = input.columns();
+                let exact_input = fragment
+                    .nodes()
+                    .get(&child)
+                    .is_some_and(|node| node.output.columns.as_ref() == columns);
+                if input.route.to_bytes() == [0; 32]
+                    || !routes.insert(input.route)
+                    || !exact_input
+                    || columns.into_iter().collect::<BTreeSet<_>>().len() != columns.len()
+                    || !raw_type(input.file, DataType::Utf8)
+                    || !raw_type(input.position, DataType::Int64)
+                    || !raw_type(input.spec_id, DataType::Int32)
+                    || fragment
+                        .values()
+                        .get(&input.partition)
+                        .map(|value| &value.ty)
+                        != partition_type
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "position contribution input does not match its declared route and layout",
                     ));
                 }
             }

@@ -714,6 +714,7 @@ fn pending_row(
                     queued_inputs: Box::new([QueuedInputGrantRef::new(
                         NonZeroU64::MIN,
                         key.generation,
+                        operation.encoded_protobuf_bytes().unwrap(),
                     )]),
                 },
                 reservation: ReservationToken(NonZeroU64::new(principal.get()).unwrap()),
@@ -1370,8 +1371,16 @@ async fn withdrawn_send_before_apply_retires_its_original_loan_after_join() {
         },
     ];
     let references = [
-        QueuedInputGrantRef::new(NonZeroU64::MIN, keys[0].generation),
-        QueuedInputGrantRef::new(NonZeroU64::new(2).unwrap(), keys[1].generation),
+        QueuedInputGrantRef::new(
+            NonZeroU64::MIN,
+            keys[0].generation,
+            operations[0].encoded_protobuf_bytes().unwrap(),
+        ),
+        QueuedInputGrantRef::new(
+            NonZeroU64::new(2).unwrap(),
+            keys[1].generation,
+            operations[1].encoded_protobuf_bytes().unwrap(),
+        ),
     ];
     let mut inputs = transport::GrantedInputs::default();
     inputs.install(references[0], wc.admit(keys[0], 0));
@@ -1911,6 +1920,17 @@ async fn run_actor_send(
     } else {
         ProtocolIntent::AbortParticipation(abort_request)
     };
+    let encoded_bytes = if let Some((_, original)) = &creation {
+        novarocks_task_codec::operation::wire_size::pending_create(
+            original.seed.fragment().content().len(),
+            original.sizing.lengths.metadata_bytes(),
+        )
+        .unwrap()
+    } else {
+        OperationIntent::AbortParticipation(abort_request)
+            .encoded_protobuf_bytes()
+            .unwrap()
+    };
     let reference_for = |effect: &AttemptEffect| {
         let EffectBody::AdmitQueuedInput {
             generation,
@@ -1926,13 +1946,18 @@ async fn run_actor_send(
         assert_eq!(exact.envelope(), abort_request.envelope());
         assert_eq!(exact.participation(), abort_request.participation());
         assert_eq!(exact.cause(), abort_request.cause());
-        QueuedInputGrantRef::new(NonZeroU64::new(effect.id.get()).unwrap(), *generation)
+        QueuedInputGrantRef::new(
+            NonZeroU64::new(effect.id.get()).unwrap(),
+            *generation,
+            encoded_bytes,
+        )
     };
     let core_admit = late_core.as_mut().map(|core| core.begin(1));
     let reference = core_admit.as_ref().map(reference_for).unwrap_or_else(|| {
         QueuedInputGrantRef::new(
             NonZeroU64::MIN,
             SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+            encoded_bytes,
         )
     });
     let key = transport::SendKey {
@@ -2033,7 +2058,11 @@ async fn run_actor_send(
     });
     let scripted_send_envelope = scripted_send.as_ref().map(|(send, _)| send.clone());
     let replay_generation = SendGeneration::new(AttemptActionId::new(NonZeroU64::new(3).unwrap()));
-    let replay_reference = QueuedInputGrantRef::new(NonZeroU64::new(3).unwrap(), replay_generation);
+    let replay_reference = QueuedInputGrantRef::new(
+        NonZeroU64::new(3).unwrap(),
+        replay_generation,
+        encoded_bytes,
+    );
     let replay_send_id = AttemptActionId::new(NonZeroU64::new(4).unwrap());
     let replay_commands = (replay && late_core.is_none()).then(|| {
         let (send, guard) = make_send(replay_send_id, replay_reference);

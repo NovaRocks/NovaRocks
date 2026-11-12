@@ -26,6 +26,28 @@ use novarocks_state_store_api::StateStoreProviderId;
 pub const FOUNDATIONDB_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("foundationdb");
 
+// Native FDB limits apply to physical keys/values. The unchanged codec prefixes
+// each record key with this namespace, one UUID and a tag, and wraps each value
+// in a format byte plus an instance UUID and attempt sequence. These logical
+// capacities deduct that existing representation before admitting requests.
+const KEYSPACE_PREFIX: &[u8] = b"NRSS\x01";
+const RECORD_KEY_OVERHEAD: usize = KEYSPACE_PREFIX.len() + std::mem::size_of::<uuid::Uuid>() + 1;
+const ATTEMPT_TAG_BYTES: usize = std::mem::size_of::<uuid::Uuid>() + std::mem::size_of::<u64>();
+const RECORD_VALUE_OVERHEAD: usize = 1 + ATTEMPT_TAG_BYTES;
+pub const FOUNDATIONDB_STATE_STORE_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        10_000 - RECORD_KEY_OVERHEAD,
+        100_000 - RECORD_VALUE_OVERHEAD,
+        10_000_000,
+        usize::MAX,
+    );
+pub const FOUNDATIONDB_STATE_STORE_DESCRIPTOR:
+    novarocks_state_store_api::StateStoreProviderDescriptor =
+    novarocks_state_store_api::StateStoreProviderDescriptor::new(
+        FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
+        FOUNDATIONDB_STATE_STORE_CAPACITY,
+    );
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FoundationDbProviderBuildError {
     NotCompiled,
@@ -246,6 +268,12 @@ impl FoundationDbStateStore {
         cluster_id: String,
         keyspace_id: Uuid,
     ) -> Result<Self, StateStoreError> {
+        if !FOUNDATIONDB_STATE_STORE_CAPACITY.accepts(&limits) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "FoundationDB opening limits exceed provider capacity",
+            ));
+        }
         let database_registration = Arc::new(database_registration);
         let database = database_registration.database()?;
         // One tag per open. An attempt identity is deliberately not convertible

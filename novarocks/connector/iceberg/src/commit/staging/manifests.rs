@@ -16,48 +16,17 @@
 // under the License.
 
 use super::invalid;
+use crate::commit::manifest_encoding::{
+    EncodedManifestEntry, ManifestWriteEncoding, SourcedManifestEntry,
+};
 use crate::commit::model::{
-    AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter, EntryIdentity, FrozenEntry,
-    ObjectIdentity,
+    AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter, FrozenEntry, ObjectIdentity,
 };
 use crate::iceberg::Result;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestFile,
-    ManifestListWriter, ManifestStatus, ManifestWriterBuilder, PartitionSpec, SchemaRef,
-    TableMetadata,
+    DataFile, FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter,
+    ManifestWriterBuilder, PartitionSpec, SchemaRef, TableMetadata,
 };
-
-/// Explicit file IDs never consume an inherited manifest cursor. Historical
-/// unassigned manifests preserve None until the manifest list assigns a range.
-pub struct FirstRowIdInheritance {
-    next: Option<i64>,
-}
-impl FirstRowIdInheritance {
-    pub fn new(manifest_first_row_id: Option<i64>) -> Self {
-        Self {
-            next: manifest_first_row_id,
-        }
-    }
-    pub fn resolve(&mut self, file: &DataFile, status: ManifestStatus) -> Result<Option<i64>> {
-        if let Some(id) = file.first_row_id() {
-            return Ok(Some(id));
-        }
-        if status == ManifestStatus::Deleted || file.content_type() != DataContentType::Data {
-            return Ok(None);
-        }
-        let Some(first) = self.next else {
-            return Ok(None);
-        };
-        let count = i64::try_from(file.record_count())
-            .map_err(|_| invalid("File row count exceeds row-ID range"))?;
-        self.next = Some(
-            first
-                .checked_add(count)
-                .ok_or_else(|| invalid("Manifest inherited row-ID range overflow"))?,
-        );
-        Ok(Some(first))
-    }
-}
 
 pub enum ManifestEntryWrite {
     Added(AddedContent),
@@ -65,8 +34,16 @@ pub enum ManifestEntryWrite {
     Deleted { file: DataFile, frozen: FrozenEntry },
 }
 
-/// Write one attempt-owned manifest. Existing logical rows retain their actual
-/// sequence and row identity; added physical replacements inherit file sequence.
+impl ManifestEntryWrite {
+    pub(crate) fn file(&self) -> &DataFile {
+        match self {
+            Self::Added(added) => added.file(),
+            Self::Existing { file, .. } | Self::Deleted { file, .. } => file,
+        }
+    }
+}
+
+/// Write one attempt-owned manifest using a caller's already known encoding.
 pub async fn write_manifest(
     artifacts: &dyn ArtifactWriter,
     version: FormatVersion,
@@ -76,10 +53,86 @@ pub async fn write_manifest(
     content: ManifestContentType,
     entries: impl IntoIterator<Item = ManifestEntryWrite>,
 ) -> Result<ManifestFile> {
+    let encoding = ManifestWriteEncoding::fixed(version, schema, spec)?;
+    let entries = entries
+        .into_iter()
+        .map(|entry| encoding.encode(entry, None));
+    write_encoded_manifest(
+        artifacts,
+        ArtifactClass::Attempt,
+        version,
+        snapshot_id,
+        &encoding,
+        content,
+        entries,
+    )
+    .await
+}
+
+pub(crate) async fn write_sourced_manifest(
+    artifacts: &dyn ArtifactWriter,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+    spec: &PartitionSpec,
+    content: ManifestContentType,
+    entries: Vec<SourcedManifestEntry>,
+) -> Result<ManifestFile> {
+    write_sourced_manifest_with_class(
+        artifacts,
+        ArtifactClass::Attempt,
+        metadata,
+        snapshot_id,
+        spec,
+        content,
+        entries,
+    )
+    .await
+}
+
+pub(crate) async fn write_sourced_manifest_with_class(
+    artifacts: &dyn ArtifactWriter,
+    class: ArtifactClass,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+    spec: &PartitionSpec,
+    content: ManifestContentType,
+    entries: Vec<SourcedManifestEntry>,
+) -> Result<ManifestFile> {
+    let encoding =
+        ManifestWriteEncoding::choose(metadata, spec, &entries, || artifacts.check_active())?;
+    let entries = entries
+        .into_iter()
+        .map(|entry| encoding.encode(entry.entry, Some(&entry.source)));
+    write_encoded_manifest(
+        artifacts,
+        class,
+        metadata.format_version(),
+        snapshot_id,
+        &encoding,
+        content,
+        entries,
+    )
+    .await
+}
+
+async fn write_encoded_manifest(
+    artifacts: &dyn ArtifactWriter,
+    class: ArtifactClass,
+    version: FormatVersion,
+    snapshot_id: i64,
+    encoding: &ManifestWriteEncoding,
+    content: ManifestContentType,
+    entries: impl IntoIterator<Item = Result<EncodedManifestEntry>>,
+) -> Result<ManifestFile> {
     artifacts.check_active()?;
-    let object = artifacts.allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)?;
+    let object = artifacts.allocate(class, ArtifactKind::Manifest)?;
     let output = artifacts.file_io().new_output(object.path())?;
-    let builder = ManifestWriterBuilder::new(output, Some(snapshot_id), schema, spec.clone());
+    let builder = ManifestWriterBuilder::new(
+        output,
+        Some(snapshot_id),
+        encoding.schema.clone(),
+        encoding.spec.clone(),
+    );
     let mut writer = match (version, content) {
         (FormatVersion::V1, ManifestContentType::Data) => builder.build_v1(),
         (FormatVersion::V1, ManifestContentType::Deletes) => {
@@ -92,21 +145,14 @@ pub async fn write_manifest(
     };
     for entry in entries {
         artifacts.check_active()?;
-        match entry {
-            ManifestEntryWrite::Added(added) => {
-                if added.partition_spec_id() != spec.spec_id() {
-                    return Err(invalid(
-                        "Added content partition spec does not match its manifest",
-                    ));
-                }
-                writer.add_file(
-                    added.file().clone(),
-                    added.data_sequence().manifest_writer_value(),
-                )?;
+        match entry? {
+            EncodedManifestEntry::Added {
+                file,
+                data_sequence,
+            } => {
+                writer.add_file(file, data_sequence.manifest_writer_value())?;
             }
-            ManifestEntryWrite::Existing { file, frozen } => {
-                let file = carry_file(file, &frozen, spec.spec_id())?;
-                let facts = frozen.facts();
+            EncodedManifestEntry::Existing { file, facts } => {
                 writer.add_existing_file(
                     file,
                     facts
@@ -118,35 +164,18 @@ pub async fn write_manifest(
                     facts.file_sequence,
                 )?;
             }
-            ManifestEntryWrite::Deleted { file, frozen } => {
-                let file = carry_file(file, &frozen, spec.spec_id())?;
+            EncodedManifestEntry::Deleted { file, facts } => {
                 writer.add_delete_file(
                     file,
-                    frozen
-                        .facts()
+                    facts
                         .data_sequence
                         .ok_or_else(|| invalid("Deleted entry has no assigned data sequence"))?,
-                    frozen.facts().file_sequence,
+                    facts.file_sequence,
                 )?;
             }
         }
     }
     writer.write_manifest_file().await
-}
-
-fn carry_file(file: DataFile, frozen: &FrozenEntry, spec_id: i32) -> Result<DataFile> {
-    let facts = frozen.facts();
-    if EntryIdentity::try_from(&file)? != *frozen.identity()
-        || facts.partition_spec_id != spec_id
-        || facts.partition != *file.partition()
-        || facts.record_count != file.record_count()
-    {
-        return Err(invalid(
-            "Carried data file does not match frozen entry facts",
-        ));
-    }
-    crate::commit::data_file::clone_data_file_with_first_row_id(&file, spec_id, facts.first_row_id)
-        .map_err(invalid)
 }
 
 pub struct ManifestListOutput {

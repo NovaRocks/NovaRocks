@@ -1151,6 +1151,7 @@ impl RawCreate {
                         vec![proto::TaskExchangeInbound {
                             destination_node_id: 10,
                             delivery: proto::ExchangeDeliveryRequirement::DemandDriven as i32,
+                            position_shard_source_dops: None,
                             sources: vec![proto::TaskExchangeSource {
                                 task: Some(proto::TaskIdentity {
                                     query_execution_id: Some(execution),
@@ -1687,13 +1688,13 @@ fn creation_column(result: &StatementResult, expected: &str) -> Result<()> {
     Ok(())
 }
 fn creation_baseline_rows(result: StatementResult) -> Result<Vec<i64>> {
-    creation_column(&result, "bigint")?;
+    creation_column(&result, "integer")?;
     result
         .rows
         .into_iter()
         .map(|row| match row.as_slice() {
             [TrinoValue::Integer(value)] => Ok(*value),
-            _ => bail!("creation baseline requires one non-null BIGINT: {row:?}"),
+            _ => bail!("creation baseline requires one non-null INTEGER: {row:?}"),
         })
         .collect()
 }

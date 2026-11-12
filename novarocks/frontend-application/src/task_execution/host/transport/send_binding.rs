@@ -261,6 +261,87 @@ impl FrozenSendRequests {
         self.originals.is_empty() && self.split_payloads.is_empty() && self.establish.is_none()
     }
 
+    /// Quote the same immutable request before queue admission without forming
+    /// an UpdateTask allocation or claiming the original split request.
+    pub(crate) fn encoded_protobuf_bytes(
+        &self,
+        passive: &ProtocolIntent,
+    ) -> novarocks_task_codec::operation::wire_size::SizeResult {
+        use novarocks_task_codec::operation::wire_size as size;
+        let wrong = || size::WireSizeError::NotCodecProduced;
+        if let ProtocolIntent::UpdateTask {
+            envelope,
+            identity,
+            domains,
+        } = passive
+        {
+            if domains.is_empty() {
+                return Err(wrong());
+            }
+            if domains
+                .iter()
+                .any(|domain| matches!(domain, TaskDomainIntent::TaskDynamicFilter { .. }))
+            {
+                return self
+                    .resolve(passive)
+                    .map_err(|_| wrong())?
+                    .encoded_protobuf_bytes();
+            }
+            if domains.len() != 1
+                && domains
+                    .iter()
+                    .any(|domain| matches!(domain, TaskDomainIntent::SplitAssignment { .. }))
+            {
+                return Err(wrong());
+            }
+            let control = passive.requires_control_progress();
+            let items = domains.iter().map(|domain| match domain {
+                TaskDomainIntent::SplitAssignment {
+                    node,
+                    offer,
+                    payload,
+                    queued_bytes,
+                } => {
+                    let original = self.split_payloads.get(payload).ok_or_else(wrong)?;
+                    if original.task != *identity
+                        || original.assignment.node() != *node
+                        || original.assignment.offer() != *offer
+                        || original.assignment.payload().encoded_len() != *queued_bytes
+                        || original
+                            .request
+                            .get()
+                            .is_some_and(|request| request.envelope() != *envelope)
+                    {
+                        return Err(wrong());
+                    }
+                    size::split_assignment(&original.assignment)
+                }
+                TaskDomainIntent::TaskDynamicFilter { .. } => Err(wrong()),
+                TaskDomainIntent::OpenExchangeEdges { version, edges } => {
+                    size::open_exchange_edges(*version, edges)
+                }
+                TaskDomainIntent::CloseExchangeDestination {
+                    version,
+                    edge,
+                    destination,
+                } => {
+                    let bytes = size::close_exchange_destination(*version, *edge, *destination)?;
+                    // The ordinary grammar wraps the close domain, while the
+                    // closed control grammar carries its body directly.
+                    if control {
+                        Ok(bytes)
+                    } else {
+                        size::close_domain(bytes)
+                    }
+                }
+            });
+            return size::batch_item(size::update_parts(*envelope, *identity, items, control)?);
+        }
+        self.resolve(passive)
+            .map_err(|_| wrong())?
+            .encoded_protobuf_bytes()
+    }
+
     /// These lifecycle commands already carry the complete immutable
     /// request in Core. The host copies the value into its paid batch and
     /// borrows rich backing only for the payload-bearing commands.
@@ -795,6 +876,13 @@ mod tests {
                 let projected = requests.resolve(&passive).unwrap();
                 assert_eq!(projected.operation_id(), operation);
                 assert_eq!(projected.queued_bytes(), passive.queued_bytes());
+                assert_eq!(
+                    requests.encoded_protobuf_bytes(&passive).unwrap(),
+                    novarocks_task_codec::operation::wire_size::batch_item(
+                        prost::Message::encoded_len(&original)
+                    )
+                    .unwrap()
+                );
                 assert_eq!(encode_operation(&projected, &wire).unwrap(), original);
             }
         }
@@ -881,6 +969,14 @@ mod tests {
                 queued_bytes: original.encoded_len(),
             }]),
         };
+        let quoted = store.requests.encoded_protobuf_bytes(&passive).unwrap();
+        assert!(
+            store.requests.split_payloads[&payload]
+                .request
+                .get()
+                .is_none(),
+            "queue preflight must not allocate or claim a split request"
+        );
         let OperationIntent::UpdateTask(first) = store.requests.resolve(&passive).unwrap() else {
             panic!("split update")
         };
@@ -892,6 +988,12 @@ mod tests {
         };
         assert!(Arc::ptr_eq(assignment.payload(), &original));
         assert!(Arc::ptr_eq(&first, &replay));
+        assert_eq!(
+            quoted,
+            OperationIntent::UpdateTask(first.clone())
+                .encoded_protobuf_bytes()
+                .unwrap()
+        );
         assert!(store.detach(payload).unwrap().is_none());
         drop((first, replay));
         drop(store.detach(payload).unwrap().unwrap());

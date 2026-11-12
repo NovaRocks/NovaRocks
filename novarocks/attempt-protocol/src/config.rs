@@ -30,8 +30,11 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrozenTransportLimits {
     pub max_batch_items: usize,
-    pub max_batch_encoded_bytes: usize,
-    pub max_descriptor_encoded_bytes: usize,
+    pub batch_target_encoded_bytes: usize,
+    pub ordinary_request_max_bytes: usize,
+    pub control_request_max_bytes: usize,
+    pub ordinary_queued_max_bytes: usize,
+    pub control_queued_max_bytes: usize,
     pub max_query_backend_queued_operations: usize,
     pub max_query_backend_queued_bytes: usize,
     pub max_backend_queued_operations: usize,
@@ -42,23 +45,25 @@ pub struct FrozenTransportLimits {
 }
 
 impl FrozenTransportLimits {
-    pub const fn max_operation_queued_bytes(self) -> usize {
-        self.max_batch_encoded_bytes
-    }
-    pub const fn batch_fits(self, items: usize, encoded_bytes: usize) -> bool {
-        items > 0 && items <= self.max_batch_items && encoded_bytes <= self.max_batch_encoded_bytes
-    }
-}
-
-impl FrozenTransportLimits {
     pub const fn max_batch_items(self) -> usize {
         self.max_batch_items
     }
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.max_batch_encoded_bytes
+    pub const fn batch_target_encoded_bytes(self) -> usize {
+        self.batch_target_encoded_bytes
     }
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.max_descriptor_encoded_bytes
+    pub const fn request_max_bytes(self, control: bool) -> usize {
+        if control {
+            self.control_request_max_bytes
+        } else {
+            self.ordinary_request_max_bytes
+        }
+    }
+    pub const fn queued_max_bytes(self, control: bool) -> usize {
+        if control {
+            self.control_queued_max_bytes
+        } else {
+            self.ordinary_queued_max_bytes
+        }
     }
     pub const fn max_query_backend_queued_operations(self) -> usize {
         self.max_query_backend_queued_operations

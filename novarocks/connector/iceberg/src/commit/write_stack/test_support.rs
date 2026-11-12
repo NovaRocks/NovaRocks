@@ -22,11 +22,12 @@
 
 use arrow::datatypes::{DataType, Field};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstanceId, ConnectorMutationEffectField,
+    ConnectorError, ConnectorExecutionResources, ConnectorInstanceId, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorWriteBaseVersion,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ProviderBindingEpoch,
+    ConnectorProviderBindingKey, ConnectorReservationBackend, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLedger, ConnectorTableHandle,
+    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    ConnectorWriteInputShape, ProviderBindingEpoch,
 };
 
 use crate::commit::write_stack::domain::{
@@ -36,12 +37,73 @@ use crate::commit::write_stack::domain::{
     IcebergWriteTableFacts, IcebergWriterOutput,
 };
 use crate::commit::write_stack::flavor::IcebergSessionMaterial;
-use crate::commit::write_stack::old_delete::{
-    IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
-};
 use crate::commit::write_stack::planning::{IcebergDataBranchPlan, IcebergDeleteBranchPlan};
-use crate::delete_file::{IcebergFileContent, IcebergFileFormat};
+use crate::delete_file::IcebergFileFormat;
 use crate::write_descriptor::IcebergPartitionDescriptor;
+
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteProductionProof, ConnectorWriterPhysicalContext, WriteTargetOrdinal,
+};
+use std::sync::Arc;
+
+pub(crate) fn received_write_proof(
+    target: WriteTargetOrdinal,
+    physical: ConnectorWriterPhysicalContext,
+) -> Arc<dyn ConnectorWriteProductionProof> {
+    struct ExactWriter {
+        target: WriteTargetOrdinal,
+        physical: ConnectorWriterPhysicalContext,
+    }
+    impl ConnectorWriteProductionProof for ExactWriter {
+        fn admits(
+            &self,
+            target: WriteTargetOrdinal,
+            physical: &ConnectorWriterPhysicalContext,
+        ) -> Result<bool, ConnectorError> {
+            Ok(target == self.target && physical == &self.physical)
+        }
+    }
+    Arc::new(ExactWriter { target, physical })
+}
+
+pub(crate) fn writer_resources() -> ConnectorExecutionResources {
+    ConnectorExecutionResources::from_admitted_ledger(Arc::new(LocalLedger))
+}
+
+struct LocalLedger;
+
+impl ConnectorResourceLedger for LocalLedger {
+    fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        Ok(ConnectorResourceCheckpoint::new(1))
+    }
+
+    fn try_reserve(
+        &self,
+        class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<Box<dyn ConnectorReservationBackend>, ConnectorError> {
+        assert_eq!(class, ConnectorResourceClass::WriterState);
+        Ok(Box::new(LocalReservation(bytes)))
+    }
+}
+
+struct LocalReservation(u64);
+
+impl ConnectorReservationBackend for LocalReservation {
+    fn bytes(&self) -> u64 {
+        self.0
+    }
+
+    fn try_grow(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        self.0 += bytes;
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        self.0 = bytes;
+        Ok(())
+    }
+}
 
 pub(crate) fn table_facts() -> IcebergWriteTableFacts {
     IcebergWriteTableFacts::try_new(
@@ -241,18 +303,6 @@ pub(crate) fn document_publication_facts_with_shape(
     IcebergDocumentPublicationFacts::new(declaration, shape)
 }
 
-pub(crate) fn document_publication_flavor(
-    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
-    shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
-) -> novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor {
-    let facts = document_publication_facts_with_shape(technique,
-        novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite, shape);
-    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-        declaration: facts.declaration().clone(),
-        shape,
-    }
-}
-
 pub(crate) fn sample_partition() -> IcebergArtifactPartition {
     IcebergArtifactPartition::try_new(
         String::new(),
@@ -286,64 +336,16 @@ pub(crate) fn dv_artifact(
     )
 }
 
-pub(crate) fn parquet_ref(
-    path: &str,
-    referenced: Option<&str>,
-    file_size: u64,
-    record_count: u64,
-) -> Result<IcebergOldDeleteArtifactRef, ConnectorError> {
-    IcebergOldDeleteArtifactRef::try_new(
-        path.to_string(),
-        IcebergFileContent::PositionDeletes,
-        IcebergFileFormat::Parquet,
-        file_size,
-        (record_count > 0).then_some(record_count),
-        None,
-        referenced.map(str::to_string),
-        Some(3),
-        None,
-        0,
-        IcebergStorageRoute::try_for_location(path)?,
-    )
-}
-
-pub(crate) fn puffin_ref(
-    path: &str,
-    referenced: Option<&str>,
-    file_size: u64,
-    record_count: u64,
-    offset: i64,
-    size: i64,
-) -> Result<IcebergOldDeleteArtifactRef, ConnectorError> {
-    IcebergOldDeleteArtifactRef::try_new(
-        path.to_string(),
-        IcebergFileContent::PositionDeletes,
-        IcebergFileFormat::Puffin,
-        file_size,
-        (record_count > 0).then_some(record_count),
-        Some(IcebergContentRange::try_new(offset, size)?),
-        referenced.map(str::to_string),
-        Some(3),
-        None,
-        0,
-        IcebergStorageRoute::try_for_location(path)?,
-    )
-}
-
-pub(crate) fn merge_target(
+pub(crate) fn position_rewrite_target(
     data_file: &str,
     record_count: u64,
-    references: Vec<IcebergOldDeleteArtifactRef>,
-) -> IcebergOldDeleteMergeTarget {
-    IcebergOldDeleteMergeTarget::try_new(
-        data_file.to_string(),
+) -> super::domain::IcebergPositionRewriteTarget {
+    super::domain::IcebergPositionRewriteTarget::try_new(
+        data_file.to_owned(),
         record_count,
-        Some(4),
         sample_partition(),
-        77,
-        references,
     )
-    .expect("merge target")
+    .expect("selected rewrite data file")
 }
 
 pub(crate) fn binding(name: &str, seed: u8, data_type: DataType) -> ConnectorWriteFieldBinding {
@@ -458,7 +460,6 @@ pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessio
         input,
         data_output: data.output,
         data_recipe: data.recipe,
-        merge_targets: Vec::new(),
         equality: None,
     }
 }
@@ -523,7 +524,7 @@ pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {
 
 pub(crate) fn delete_branch_plan(
     branch: IcebergWriteBranch,
-    merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    position_rewrite: Option<super::domain::IcebergPositionRewriteTarget>,
 ) -> IcebergDeleteBranchPlan {
     let file_format = match branch {
         IcebergWriteBranch::DeletionVector => IcebergFileFormat::Puffin,
@@ -537,7 +538,7 @@ pub(crate) fn delete_branch_plan(
             None,
         )
         .expect("output"),
-        merge_targets,
+        position_rewrite,
         input: delete_input_shape(branch),
     }
 }

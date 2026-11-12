@@ -92,7 +92,6 @@ fn malformed<T>(message: impl Into<String>) -> Result<T, PersistenceCodecError> 
 pub fn encode_keyed_interpretation(
     value: &InterpretationDocument,
 ) -> Result<EncodedDocument, PersistenceCodecError> {
-    preflight_interpretation_source(value)?;
     let mut canonical = value.clone();
     canonicalize_interpretation(&mut canonical);
     validate_interpretation(&canonical)?;
@@ -102,9 +101,8 @@ pub fn encode_keyed_interpretation(
 }
 pub fn decode_keyed_interpretation(
     bytes: &[u8],
-    budget: PersistenceDecodeBudget,
 ) -> Result<InterpretationDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::InterpretationDocument, budget)?;
+    wire::preflight(bytes, wire::Schema::InterpretationDocument)?;
     let dto = proto::InterpretationDocument::decode(bytes)
         .map_err(PersistenceCodecError::ProtobufDecode)?;
     if dto.format_version != Some(KEYED_INTERPRETATION_FORMAT_VERSION) {
@@ -139,18 +137,12 @@ pub fn encode_binding(value: &BindingDocument) -> Result<EncodedDocument, Persis
     };
     encode_message(dto)
 }
-pub fn decode_binding(
-    bytes: &[u8],
-    budget: PersistenceDecodeBudget,
-) -> Result<BindingDocument, PersistenceCodecError> {
-    wire::preflight(bytes, wire::Schema::BindingDocument, budget)?;
+pub fn decode_binding(bytes: &[u8]) -> Result<BindingDocument, PersistenceCodecError> {
+    wire::preflight(bytes, wire::Schema::BindingDocument)?;
     let dto =
         proto::BindingDocument::decode(bytes).map_err(PersistenceCodecError::ProtobufDecode)?;
     if dto.format_version != Some(BINDING_FORMAT_VERSION) {
         return malformed("unsupported binding format version");
-    }
-    if dto.data_versions.len() > budget.max_items {
-        return malformed("binding exceeds occurrence decode budget");
     }
     let value = BindingDocument {
         data_versions: dto
@@ -262,9 +254,6 @@ pub fn decode_publication_payload(
     interpretation_revision: DocumentRevision,
     binding: &BindingDocument,
 ) -> Result<KeyedPublicationDocument, PersistenceCodecError> {
-    if bytes.len() > 4096 {
-        return malformed("publication payload exceeds record bound");
-    }
     let mut cursor = Cursor { bytes, at: 0 };
     if cursor.take(1)? != [1] {
         return malformed("unknown publication payload layout");
@@ -334,49 +323,22 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Charge the simultaneously retained D/L/B/C models before any DTO allocation.
+/// Check each protobuf document's canonical structure before DTO conversion.
+/// Compact publication structure is checked by `decode_publication_payload`,
+/// which also needs the decoded definition and binding facts.
 pub fn preflight_keyed_document_set(
     d: &[u8],
     l: &[u8],
     b: &[u8],
     c: &[u8],
-    p: Option<&[u8]>,
-    budget: PersistenceDecodeBudget,
 ) -> Result<(), PersistenceCodecError> {
-    let mut bytes = p.map_or(0, |p| p.len());
-    let mut working = p.map_or(0, |p| p.len().saturating_mul(6));
-    let mut items = 0usize;
     for (content, schema) in [
         (d, wire::Schema::DefinitionDocument),
         (l, wire::Schema::InterpretationDocument),
         (b, wire::Schema::BindingDocument),
         (c, wire::Schema::ConfigurationDocument),
     ] {
-        let usage = wire::preflight(content, schema, budget)?;
-        bytes = bytes.saturating_add(usage.encoded_bytes);
-        working = working.saturating_add(usage.estimated_working_set_bytes);
-        items = items.saturating_add(usage.expanded_items);
-    }
-    for (resource, actual, maximum) in [
-        (
-            "keyed Current encoded set",
-            bytes,
-            crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES,
-        ),
-        (
-            "keyed Current decode working set",
-            working,
-            budget.max_working_set_bytes,
-        ),
-        ("keyed Current items", items, budget.max_items),
-    ] {
-        if actual > maximum {
-            return Err(PersistenceCodecError::ResourceBudget {
-                resource,
-                actual,
-                maximum,
-            });
-        }
+        wire::preflight(content, schema)?;
     }
     Ok(())
 }
@@ -435,10 +397,7 @@ mod tests {
             hex::encode(encoded.as_bytes()),
             "080112240a07696365626572671215636f6e6e6563746f722d736e617073686f742d69641801200912240a07696365626572671215636f6e6e6563746f722d736e617073686f742d696418012009"
         );
-        assert_eq!(
-            decode_binding(encoded.as_bytes(), PersistenceDecodeBudget::default()).unwrap(),
-            b
-        );
+        assert_eq!(decode_binding(encoded.as_bytes()).unwrap(), b);
         let bytes = encode_publication_payload(&p, &d, &b).unwrap();
         assert_eq!(
             hex::encode(&bytes),
@@ -519,7 +478,7 @@ mod tests {
         let (_, b, _) = fixture();
         let mut bytes = encode_binding(&b).unwrap().into_bytes();
         bytes.extend_from_slice(&[8, 1]);
-        assert!(decode_binding(&bytes, PersistenceDecodeBudget::default()).is_err());
-        assert!(decode_binding(&[8, 2], PersistenceDecodeBudget::default()).is_err());
+        assert!(decode_binding(&bytes).is_err());
+        assert!(decode_binding(&[8, 2]).is_err());
     }
 }

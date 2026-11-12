@@ -158,7 +158,7 @@ impl ControlSource {
         match &self.request {
             MvControlRequest::Drop { statement, .. } => {
                 let (first, _) = entrance
-                    .observe_keyed_drop_async(&documents, request.clone(), Default::default())
+                    .observe_keyed_drop_async(&documents, request.clone())
                     .await
                     .map_err(document)?;
                 let cancellation = body.cancel.clone();
@@ -176,7 +176,7 @@ impl ControlSource {
                     return Err(error.clone());
                 }
                 let (second, _) = entrance
-                    .observe_keyed_drop_async(&documents, request, Default::default())
+                    .observe_keyed_drop_async(&documents, request)
                     .await
                     .map_err(document)?;
                 if !first.matches(&second) {
@@ -240,11 +240,7 @@ impl ControlSource {
                         .await
                         .map_err(service_failure)?;
                     let (initial, admission, _) = entrance
-                        .observe_keyed_admission_async(
-                            &documents,
-                            request.clone(),
-                            Default::default(),
-                        )
+                        .observe_keyed_admission_async(&documents, request.clone())
                         .await
                         .map_err(document)?;
                     body.current_admission = Some(admission);
@@ -276,10 +272,7 @@ impl ControlSource {
                     }
                     // Admission itself is not a publication and grants no cancellation bypass.
                     let (observed, _) = observe_current_keyed_documents_with_management_async(
-                        &documents,
-                        request,
-                        Default::default(),
-                        &entrance,
+                        &documents, request, &entrance,
                     )
                     .await
                     .map_err(document)?;

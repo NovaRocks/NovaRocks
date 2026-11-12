@@ -22,7 +22,7 @@ use novarocks_query_application::{
     cancellation::QueryCancellationView,
     cpu::{QueryBlockingExecutorConfig, QueryBlockingExecutorOwner},
 };
-use novarocks_state_store_api::{StateStoreLimits, StateStoreProviderFactory};
+use novarocks_state_store_api::StateStoreProviderFactory;
 use novarocks_state_store_runtime::{
     StateStoreHost, StateStoreHostInput, StateStoreProviderRegistration,
     StateStoreProviderRegistry, StateStoreRunPolicy,
@@ -107,7 +107,7 @@ impl Fixture {
             StateStoreHostInput {
                 cluster_id: "show-original-component".into(),
                 provider_id: SQLITE_STATE_STORE_PROVIDER_ID,
-                limits: StateStoreLimits::default(),
+                limits: novarocks_state_store_sqlite::SQLITE_STATE_STORE_CAPACITY.limits(),
                 run_policy: StateStoreRunPolicy::default(),
             },
             Instant::now() + Duration::from_secs(5),
@@ -248,10 +248,7 @@ impl Fixture {
                     );
                     let trc_controls = host.clone();
                     let trc_system_relations =
-                        crate::query_execution::kernels::test_system_relations(
-                            trc_catalog.clone(),
-                            trc_controls.clone(),
-                        );
+                        std::sync::Arc::new(novarocks_query_application::system_tables::SystemTableRegistry::try_new([]).expect("sealed declaration fixture"));
                     IcebergMvCorePorts::new_with_management_entrance(
                         Arc::new(
                             novarocks_sql::compiler::build_builtin_engine_function_catalog()

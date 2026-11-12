@@ -1124,8 +1124,11 @@ mod tests {
                 coordination,
                 transport: FrozenTransportLimits {
                     max_batch_items: 4,
-                    max_batch_encoded_bytes: 4096,
-                    max_descriptor_encoded_bytes: 4096,
+                    batch_target_encoded_bytes: 4096,
+                    ordinary_request_max_bytes: 1_048_576,
+                    control_request_max_bytes: 1_048_576,
+                    ordinary_queued_max_bytes: 1_048_576,
+                    control_queued_max_bytes: 1_048_576,
                     max_query_backend_queued_operations: 1024,
                     max_query_backend_queued_bytes: 1_048_576,
                     max_backend_queued_operations: 4096,
@@ -1786,7 +1789,7 @@ mod tests {
         core.execution.apply_dispatched_reply(&admission).1.unwrap();
         let action = |value| AttemptActionId::new(id(value));
         let token = AttemptRequestToken::new(id(10));
-        let grant = QueuedInputGrantRef::new(id(2), SendGeneration::new(action(2)));
+        let grant = QueuedInputGrantRef::new(id(2), SendGeneration::new(action(2)), 64);
         let intent = queue_establish(&mut core.execution, participant, grant);
         assert!(matches!(
             core.authorize_candidate(&intent, token, action(10))
@@ -2149,7 +2152,7 @@ mod tests {
         )
         .unwrap();
 
-        let grant = QueuedInputGrantRef::new(id(5), SendGeneration::new(action(5)));
+        let grant = QueuedInputGrantRef::new(id(5), SendGeneration::new(action(5)), 64);
         let expiring = queue_establish(&mut core.execution, participation, grant);
         assert_eq!(core.next_round_deadline(), Some(expiry));
         core.begin_round_tail(true).unwrap();
@@ -4437,7 +4440,7 @@ mod tests {
         else {
             panic!("expected a fresh WC generation after actual QA permission");
         };
-        let first = QueuedInputGrantRef::new(id(71), generation);
+        let first = QueuedInputGrantRef::new(id(71), generation, 64);
         idle(&mut core);
         assert!(accept_grant(&mut core, &operation, first).effect.is_none());
         let AttemptEffect {
@@ -4596,7 +4599,7 @@ mod tests {
             panic!("expected separate WC admission for Establish");
         };
         assert_eq!(admitted.operation_id(), operation.operation_id());
-        let establish = QueuedInputGrantRef::new(id(73), generation);
+        let establish = QueuedInputGrantRef::new(id(73), generation, 64);
         idle(&mut core);
         assert!(
             accept_grant(&mut core, &operation, establish)
@@ -4615,7 +4618,7 @@ mod tests {
         idle(&mut core);
 
         if let Some((_, replay, replay_generation)) = admission_replay {
-            let late_grant = QueuedInputGrantRef::new(id(74), replay_generation);
+            let late_grant = QueuedInputGrantRef::new(id(74), replay_generation, 64);
             assert!(matches!(
                 accept_grant(&mut core, &replay, late_grant).effect,
                 Some(AttemptEffect {
@@ -4796,7 +4799,7 @@ mod tests {
         };
         assert!(replay_generation > generation);
         assert_eq!(frozen(&replay), expected);
-        let replay_grant = QueuedInputGrantRef::new(id(75), replay_generation);
+        let replay_grant = QueuedInputGrantRef::new(id(75), replay_generation, 64);
         // The first RPC start allows this independent Create candidate. Keep
         // its admission pending while the Establish observation is resolved.
         assert!(matches!(
@@ -5091,7 +5094,7 @@ mod tests {
             Some(Ok(()))
         );
 
-        let grant = QueuedInputGrantRef::new(id(70), generation);
+        let grant = QueuedInputGrantRef::new(id(70), generation, 64);
         step(
             &mut core,
             sources.transport,
@@ -5212,7 +5215,7 @@ mod tests {
             dispatch_admission(&mut core.execution, request, 1, OperationOutcome::Accepted);
         core.execution.apply_dispatched_reply(&received).1.unwrap();
         let grant =
-            QueuedInputGrantRef::new(id(3), SendGeneration::new(AttemptActionId::new(id(3))));
+            QueuedInputGrantRef::new(id(3), SendGeneration::new(AttemptActionId::new(id(3))), 64);
         let intent = queue_establish(&mut core.execution, participation, grant);
         let request = AttemptRequestToken::new(id(60));
         let guard = AttemptAuthorizationRef::new(id(61));

@@ -31,6 +31,7 @@ pub(crate) mod payload;
 pub(crate) mod physical;
 pub(crate) mod pipeline;
 pub(crate) mod runtime_filter;
+pub(crate) mod system_relation;
 pub(crate) mod table;
 pub mod vocabulary;
 pub(crate) use logical::build::{plan_output_columns, plan_query};

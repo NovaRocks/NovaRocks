@@ -320,7 +320,7 @@ impl StrictTail {
         assert_eq!(original.operation_id(), operation);
         let waiting = self.input(self.sources.actor, AttemptInput::Timer);
         assert!(self.advance(waiting, successful, no_terminal).is_none());
-        let grant = QueuedInputGrantRef::new(id(9003), generation);
+        let grant = QueuedInputGrantRef::new(id(9003), generation, 1);
         self.queue = Some(participation.backend_process_id());
         let granted = self.input(
             self.sources.transport,

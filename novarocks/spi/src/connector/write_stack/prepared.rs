@@ -164,11 +164,32 @@ impl WriteRowCountAccumulator {
     }
 }
 
+/// Read-only membership in the original writer cohort after receiving its
+/// complete result. A receipt still has to prove its own creation identity.
+pub trait ConnectorWriteProductionProof: Send + Sync {
+    fn admits(
+        &self,
+        target: WriteTargetOrdinal,
+        physical: &super::ConnectorWriterPhysicalContext,
+    ) -> Result<bool, ConnectorError>;
+}
+
 /// The complete, immutable set the frontend hands to a provider's finish.
-#[derive(Debug)]
 pub struct ConnectorPreparedWriteSet {
     row_count: u64,
     fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
+    production: Option<std::sync::Arc<dyn ConnectorWriteProductionProof>>,
+}
+
+impl std::fmt::Debug for ConnectorPreparedWriteSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorPreparedWriteSet")
+            .field("row_count", &self.row_count)
+            .field("fragments", &self.fragments)
+            .field("has_production", &self.production.is_some())
+            .finish()
+    }
 }
 
 impl ConnectorPreparedWriteSet {
@@ -223,6 +244,7 @@ impl ConnectorPreparedWriteSet {
         Ok(Self {
             row_count,
             fragments: std::mem::take(fragments),
+            production: None,
         })
     }
 
@@ -231,6 +253,25 @@ impl ConnectorPreparedWriteSet {
     /// have succeeded.
     pub const fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    pub fn with_received_production(
+        mut self,
+        proof: std::sync::Arc<dyn ConnectorWriteProductionProof>,
+    ) -> Self {
+        self.production = Some(proof);
+        self
+    }
+
+    pub fn admits_creation(
+        &self,
+        target: WriteTargetOrdinal,
+        physical: &super::ConnectorWriterPhysicalContext,
+    ) -> Result<bool, ConnectorError> {
+        match &self.production {
+            Some(production) => production.admits(target, physical),
+            None => Ok(false),
+        }
     }
 
     pub fn fragments(&self) -> &[(WriteTargetOrdinal, ConnectorCommitFragment)] {

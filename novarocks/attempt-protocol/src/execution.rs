@@ -3155,6 +3155,7 @@ mod bounded_drain_tests {
                     NonZeroU64::new(value).unwrap(),
                 ),
             ),
+            64,
         )
     }
     fn many_tasks(count: u32) -> QueryTaskExecution {
@@ -3186,8 +3187,6 @@ mod bounded_drain_tests {
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(n)).unwrap()),
                         queued_bytes: 256,
-                        plan_carrier_bytes: 0,
-                        descriptor_encoded_bytes: 0,
                     },
                 },
             );
@@ -6042,8 +6041,6 @@ mod bounded_drain_tests {
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),
                         queued_bytes: 256,
-                        plan_carrier_bytes: 0,
-                        descriptor_encoded_bytes: 0,
                     },
                 },
             );
@@ -6887,7 +6884,8 @@ mod stage_demand_cut_tests {
                             novarocks_coordination_contract::AttemptActionId::new(
                                 NonZeroU64::new(8).unwrap()
                             )
-                        )
+                        ),
+                        64
                     )
                 )
                 .unwrap(),
@@ -6987,6 +6985,7 @@ mod stage_demand_cut_tests {
                             NonZeroU64::new(9).unwrap(),
                         ),
                     ),
+                    64,
                 ),
             )
             .unwrap();
@@ -7087,6 +7086,7 @@ mod stage_demand_cut_tests {
                             NonZeroU64::new(grant).unwrap(),
                         ),
                     ),
+                    64,
                 ),
             )
             .unwrap();
@@ -7144,7 +7144,7 @@ mod stage_demand_cut_tests {
             execution.next_stage_cancel_admission(None).unwrap().0,
             operation
         );
-        let first_grant = QueuedInputGrantRef::new(key(1), generation);
+        let first_grant = QueuedInputGrantRef::new(key(1), generation, 64);
         assert!(matches!(
             execution
                 .observe_lifecycle_grant(operation, first_grant)
@@ -7208,7 +7208,7 @@ mod stage_demand_cut_tests {
         }));
         assert!(matches!(execution.apply_dispatched_reply(&accepted),
             (Some(EffectBody::Withdraw { effect }), Ok(())) if effect == action(4)));
-        let late_grant = QueuedInputGrantRef::new(key(4), replay_generation);
+        let late_grant = QueuedInputGrantRef::new(key(4), replay_generation, 64);
         assert!(
             matches!(execution.observe_lifecycle_grant(operation, late_grant).unwrap(),
             CreateGrantProgress::Release(grant) if grant == late_grant)
@@ -7270,7 +7270,7 @@ mod stage_demand_cut_tests {
             assert_eq!(frozen.envelope(), request.envelope());
             assert_eq!(frozen.identity(), request.identity());
             assert_eq!(frozen.reason(), request.reason());
-            let grant = QueuedInputGrantRef::new(grant_key, generation);
+            let grant = QueuedInputGrantRef::new(grant_key, generation, 64);
             assert!(matches!(
                 execution.observe_lifecycle_grant(operation, grant).unwrap(),
                 CreateGrantProgress::Queued

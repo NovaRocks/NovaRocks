@@ -1010,7 +1010,7 @@ impl NativeTaskExecutionHost {
         // Every compiled writer binds its write capability and every finish
         // its carrier validator here, before anything is published; a write
         // execution is opened only when a driver activates.
-        let writers = bind_compiled_writers(
+        let mut writers = bind_compiled_writers(
             program,
             &CompiledWriteTaskFacts {
                 #[cfg(novarocks_dev_controls)]
@@ -1084,13 +1084,6 @@ impl NativeTaskExecutionHost {
         // This is the original Arc birth. Submission and the private loan
         // borrow this same immutable backing, with no recreated program.
         let compiled = compiled.into_preparation();
-        let submission = CompiledTaskSubmission::try_new_with_writers(
-            Arc::clone(compiled.program()),
-            scans,
-            writers,
-            instance,
-        )
-        .map_err(protocol_failure)?;
 
         let profiler = established_query_options
             .runtime()
@@ -1127,6 +1120,19 @@ impl NativeTaskExecutionHost {
         typed_runtime
             .install_connector_resource_tracker(admission.task_mem_tracker())
             .map_err(internal_failure)?;
+        if writers.has_writers() {
+            let resources = typed_runtime
+                .admitted_connector_resources_for_bound_task(execution)
+                .map_err(internal_failure)?;
+            writers.install_resources(resources);
+        }
+        let submission = CompiledTaskSubmission::try_new_with_writers(
+            Arc::clone(compiled.program()),
+            scans,
+            writers,
+            instance,
+        )
+        .map_err(protocol_failure)?;
         // A binding clone borrows the same authority/account as the original
         // participation transport; it creates no new query registration or domain.
         let project_binding = admission
@@ -1173,6 +1179,23 @@ impl NativeTaskExecutionHost {
             context = context
                 .with_exchange_test_observer(Some(observer))
                 .with_exchange_receiver_port(Arc::new(receiver));
+        }
+        #[cfg(novarocks_dev_controls)]
+        if let Some(observations) = self.queries.observation_controls()
+            && let Some(observer) = observations
+                .observation_for(
+                    novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol
+                        .as_str(),
+                    execution,
+                )
+                .map_err(|detail| {
+                    internal_failure(NativePreparationContractFailure::new(
+                        NativePreparationReason::TestControl,
+                        detail,
+                    ))
+                })?
+        {
+            context = context.with_position_shard_test_observer(observer);
         }
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);
@@ -9434,9 +9457,17 @@ pub(crate) mod tests {
 
         fn sql_fragment(sql: &str, window: bool, receive: bool) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
+            let [novarocks_parser::ast::Statement::Query(query)]: [novarocks_parser::ast::Statement;
+                1] = novarocks_parser::parse(sql)
+                .expect("parse test query")
+                .try_into()
+                .expect("exactly one test statement")
+            else {
+                panic!("expected a test query");
+            };
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
-                SqlStatementInput::sql(sql),
+                SqlStatementInput::parsed_query(Box::new(query)),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

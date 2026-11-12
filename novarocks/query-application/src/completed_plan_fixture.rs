@@ -260,10 +260,23 @@ pub(crate) fn test_constant_policy() -> novarocks_sql::compiler::ConstantPolicy 
     }
 }
 
+/// Parse one owned query before handing test syntax to the compiler.
+pub(crate) fn parse_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let [novarocks_parser::ast::Statement::Query(query)]: [novarocks_parser::ast::Statement; 1] =
+        novarocks_parser::parse(sql)
+            .expect("parse test query")
+            .try_into()
+            .expect("exactly one test statement")
+    else {
+        panic!("expected a test query");
+    };
+    Box::new(query)
+}
+
 fn literal_query_request(version: [u8; 16], sql: &str) -> SqlFinalPlanCompileRequest {
     SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new(version).expect("plan version"),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::completed_plan_fixture::parse_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

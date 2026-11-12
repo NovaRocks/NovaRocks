@@ -203,7 +203,7 @@ fn caller_owned_success_and_ordinary_refusal_preserve_every_actual_prefix() {
 }
 
 #[test]
-fn caller_owned_read_exact_layout_and_all_six_axes_replay_without_prefix_overcharge() {
+fn caller_owned_read_exact_layout_and_all_five_axes_replay_without_prefix_overcharge() {
     for decode in [false, true] {
         let c = Control::default();
         let mut snapshots = Vec::new();
@@ -247,7 +247,7 @@ fn caller_owned_read_exact_layout_and_all_six_axes_replay_without_prefix_overcha
             &mut Vec::new(),
         )
         .unwrap();
-        for axis in 0..6 {
+        for axis in 0..5 {
             let result = run_read(
                 &Control::default(),
                 None,

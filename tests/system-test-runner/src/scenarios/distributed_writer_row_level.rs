@@ -24,7 +24,7 @@
 //! artifacts, a profile or a second implementation of event expansion.
 use super::*;
 #[path = "distributed_writer_dop_observation.rs"]
-mod dop_observation;
+pub(super) mod dop_observation;
 #[path = "distributed_writer_same_file.rs"]
 mod same_file;
 
@@ -41,22 +41,57 @@ fn unmatched_merge_sql(catalog: &str, database: &str, dop: i32) -> String {
     )
 }
 
+fn mixed_merge_sql(catalog: &str, database: &str, dop: i32) -> String {
+    format!(
+        "MERGE INTO {catalog}.{database}.logical_mix_{dop} t \
+         USING {catalog}.{database}.logical_mix_source_{dop} s ON t.id=s.id \
+         WHEN MATCHED AND s.id<>3 THEN UPDATE SET v=s.v \
+         WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,s.v)"
+    )
+}
+
+pub(super) const MULTI_FILE_DV_OBSERVATION: usize = 4;
+pub(super) const V2_POSITION_OBSERVATION: usize = 5;
+pub(super) const INITIAL_DELETE_DOP: i32 = 4;
+const MIXED_MERGE_OBSERVATION_START: usize = 6;
+pub(super) const OBSERVATION_COUNT: usize = 8;
+
+pub(super) fn initial_delete_sql(v3: bool) -> String {
+    let target = if v3 {
+        "row_level_dv"
+    } else {
+        "row_level_positional"
+    };
+    format!("DELETE FROM {CATALOG}.{DATABASE}.{target} WHERE id IN (1, 5, 9)")
+}
+
+fn writer_observation(sql: String, cluster_size: usize) -> StatementSpec {
+    use novarocks_failpoint::observation_marker::ObservationAction;
+    StatementSpec {
+        sql,
+        faults: vec![],
+        observations: (0..cluster_size)
+            .flat_map(|index| {
+                [
+                    (index, ObservationAction::WriterMarker.as_str(), None),
+                    (index, ObservationAction::TaskProtocol.as_str(), None),
+                ]
+            })
+            .collect(),
+    }
+}
+
 pub(super) fn observation_specs(cluster_size: usize) -> Vec<StatementSpec> {
     [1, 4]
         .into_iter()
-        .map(|dop| StatementSpec {
-            sql: unmatched_merge_sql(CATALOG, DATABASE, dop),
-            faults: vec![],
-            observations: (0..cluster_size)
-                .flat_map(|index| {
-                    [
-                        (index, novarocks_failpoint::observation_marker::ObservationAction::WriterMarker.as_str(), None),
-                        (index, novarocks_failpoint::observation_marker::ObservationAction::TaskProtocol.as_str(), None),
-                    ]
-                })
-                .collect(),
-        })
+        .map(|dop| writer_observation(unmatched_merge_sql(CATALOG, DATABASE, dop), cluster_size))
         .chain(same_file::observation_specs(cluster_size))
+        .chain([true, false].map(|v3| writer_observation(initial_delete_sql(v3), cluster_size)))
+        .chain(
+            [1, 4].map(|dop| {
+                writer_observation(mixed_merge_sql(CATALOG, DATABASE, dop), cluster_size)
+            }),
+        )
         .collect()
 }
 
@@ -147,7 +182,14 @@ pub(super) fn run(
             "check logical row-level write contracts with requested DOP {dop}"
         ));
         control.execute(format!("SET pipeline_dop = {dop}"))?;
-        mixed_actions(control, catalog, database, dop)?;
+        mixed_actions(
+            context,
+            control,
+            catalog,
+            database,
+            dop,
+            observations.take(MIXED_MERGE_OBSERVATION_START + index)?,
+        )?;
         partition_movement(
             context,
             control,
@@ -193,7 +235,14 @@ pub(super) fn run(
     Ok(())
 }
 
-fn mixed_actions(control: &mut SqlSession, catalog: &str, database: &str, dop: i32) -> Result<()> {
+fn mixed_actions(
+    context: &mut ScenarioContext,
+    control: &mut SqlSession,
+    catalog: &str,
+    database: &str,
+    dop: i32,
+    selected: SelectedStatement,
+) -> Result<()> {
     let table = format!("{catalog}.{database}.logical_mix_{dop}");
     let source = format!("{catalog}.{database}.logical_mix_source_{dop}");
     control.execute(format!(
@@ -205,22 +254,37 @@ fn mixed_actions(control: &mut SqlSession, catalog: &str, database: &str, dop: i
     control.execute(format!(
         "INSERT INTO {table} VALUES (1, 10), (2, 20), (3, 30), (4, 40)"
     ))?;
-    // Each INSERT seals an independent nonempty source file. The result is
-    // U=2/I=3, even though each Replace travels on two physical routes.
-    for rows in ["(1, 101), (10, 1000)", "(2, 202), (11, 1100)", "(12, 1200)"] {
+    let seeded = writer_file_row_counts(&control.execute(format!(
+        "SELECT _file, count(*) FROM {table} GROUP BY _file"
+    ))?)?;
+    anyhow::ensure!(
+        seeded.len() == 1 && seeded[0].1 == 4,
+        "mixed DELETE/Replace must select positions from one original file: {seeded:?}"
+    );
+    // Separate physical source files match rows in the same original target
+    // file. The first statement has U=2/I=3 and one matched no-action row.
+    for rows in [
+        "(1, 101), (10, 1000)",
+        "(2, 202), (11, 1100)",
+        "(3, 0), (12, 1200)",
+    ] {
         control.execute(format!("INSERT INTO {source} VALUES {rows}"))?;
     }
-    mutate(
+    let before = all_write_counters(context)?;
+    dop_observation::mutate_observed(
+        context,
         control,
+        &selected,
         &table,
-        &format!(
-            "MERGE INTO {table} t USING {source} s ON t.id=s.id \
-         WHEN MATCHED THEN UPDATE SET v=s.v \
-         WHEN NOT MATCHED THEN INSERT (id,v) VALUES (s.id,s.v)"
-        ),
-        5,
-        1,
-        "mixed MERGE U=2/I=3",
+        &mixed_merge_sql(catalog, database, dop),
+        &before,
+        dop_observation::MutationExpectation {
+            dop,
+            affected: 5,
+            reader_rows: None,
+            geometry: dop_observation::Geometry::MixedSameFile,
+            subject: "mixed MERGE U=2/I=3 across one old file",
+        },
     )?;
     assert_rows(
         control,
@@ -229,6 +293,37 @@ fn mixed_actions(control: &mut SqlSession, catalog: &str, database: &str, dop: i
             (1, 101),
             (2, 202),
             (3, 30),
+            (4, 40),
+            (10, 1000),
+            (11, 1100),
+            (12, 1200),
+        ],
+        "matched no-action row survives the mixed MERGE",
+    )?;
+    mutate(
+        control,
+        &table,
+        &format!(
+            "MERGE INTO {table} t USING {source} s ON t.id=s.id \
+             WHEN MATCHED AND s.id=3 THEN DELETE"
+        ),
+        1,
+        1,
+        "delete one more position from the same original file",
+    )?;
+    let deletes = writer_live_files(&control.execute(format!(
+        "SELECT content, file_path, file_format, record_count FROM {table}$files WHERE content=1"
+    ))?)?;
+    anyhow::ensure!(
+        deletes.len() == 1 && deletes[0].2 == "PUFFIN" && deletes[0].3 == 3,
+        "same-file Replace followed by Delete requires one cumulative DV with three positions: {deletes:?}"
+    );
+    assert_rows(
+        control,
+        &table,
+        &[
+            (1, 101),
+            (2, 202),
             (4, 40),
             (10, 1000),
             (11, 1100),
@@ -247,7 +342,7 @@ fn mixed_actions(control: &mut SqlSession, catalog: &str, database: &str, dop: i
         1,
         "matched MERGE D=2",
     )?;
-    let remaining = [(3, 30), (4, 40), (10, 1000), (11, 1100), (12, 1200)];
+    let remaining = [(4, 40), (10, 1000), (11, 1100), (12, 1200)];
     assert_rows(control, &table, &remaining, "matched delete")?;
     for (subject, sql) in [
         (
@@ -481,10 +576,13 @@ fn unmatched_inserts(
         &table,
         &unmatched_merge_sql(catalog, database, dop),
         &before,
-        dop,
-        386,
-        None,
-        "unmatched inserts retain duplicate SQL keys and omit FALSE/NULL actions",
+        dop_observation::MutationExpectation {
+            dop,
+            affected: 386,
+            reader_rows: None,
+            geometry: dop_observation::Geometry::DataAndEmptyDelete,
+            subject: "unmatched inserts retain duplicate SQL keys and omit FALSE/NULL actions",
+        },
     )?;
     let after = all_write_counters(context)?;
     // No target row matched. Nonzero finished-writer rows therefore identify

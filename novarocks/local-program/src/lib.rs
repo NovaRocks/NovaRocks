@@ -37,6 +37,7 @@ mod creation;
 mod expression_program;
 mod expression_roots;
 pub use expression_program::ExpressionProgram;
+mod batch_sequence;
 mod expressions;
 mod failure_projection;
 mod layout;
@@ -53,6 +54,7 @@ mod sink;
 mod typed_channels;
 mod typed_expressions;
 mod values;
+pub use batch_sequence::{BatchSequenceCreationFailure, StaticBatchSequence};
 mod writer_preparation;
 
 pub use compiled::{
@@ -96,13 +98,14 @@ pub use program::{
     JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph,
     MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
     NestedLoopJoinType, ProgramAssertionApplicability, ProgramCompileError, ProgramJoinCondition,
-    ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramScanSource, ProjectExpressionSlot,
-    ProjectExpressionSlots, RowAssertion, SetOpKind, SortExpression, SortTopNType,
-    StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
-    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
-    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
-    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
+    ProgramJoinKey, ProgramNode, ProgramNodeKind, ProgramPositionShardInput, ProgramScanSource,
+    ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion, SetOpKind, SortExpression,
+    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
+    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
+    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
+    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    WriterPartialAggregateCall,
 };
 pub use provenance::*;
 pub use provider_links::ProviderLinkError;

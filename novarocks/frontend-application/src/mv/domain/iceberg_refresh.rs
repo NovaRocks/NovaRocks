@@ -47,7 +47,9 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
-use crate::mv::domain::refresh::definition::{mv_definition_fingerprint, parse_mv_select_query};
+use crate::mv::domain::refresh::definition::{
+    mv_definition_fingerprint, read_stored_mv_query, stored_mv_identity,
+};
 #[cfg(test)]
 use crate::mv::domain::refresh::execution_policy::{
     non_join_incremental_write_mode, select_join_incremental_execution_mode,
@@ -128,7 +130,7 @@ use novarocks_types::naming::{TableIdentity, normalize_identifier};
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-    system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+    system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     constant_policy: novarocks_functions::ConstantPolicy,
     catalog_service: Arc<QueryCatalogService>,
@@ -162,7 +164,7 @@ impl IcebergMvCorePorts {
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         constant_policy: novarocks_functions::ConstantPolicy,
         view_service: Arc<dyn novarocks_query_application::view::ViewService>,
-        system_relations: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        system_relations: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     ) -> Self {
         Self {
             view_service,
@@ -181,7 +183,7 @@ impl IcebergMvCorePorts {
 
     pub(crate) fn system_relations(
         &self,
-    ) -> &novarocks_query_application::system_catalog::SystemCatalogRelations {
+    ) -> &Arc<novarocks_query_application::system_tables::SystemTableRegistry> {
         &self.system_relations
     }
 
@@ -2564,67 +2566,6 @@ mod join_delta_append_only_fast_path_tests {
         ));
     }
 
-    #[test]
-    fn join_delta_coalesce_uses_normalized_snapshot_ctes() {
-        let base_query = parse_query(
-            "select l.id, r.label from ice.ns.left l join ice.ns.right r on l.id = r.id",
-        );
-        let left = base("left");
-        let right = base("right");
-        let branches = crate::mv::domain::iceberg_join_branch::plan_join_delta_branches(
-            &left,
-            &right,
-            crate::mv::domain::iceberg_join_branch::SnapshotWindow { from: 10, to: 11 },
-            crate::mv::domain::iceberg_join_branch::SnapshotWindow { from: 20, to: 21 },
-            true,
-            true,
-        );
-        let mut branch_queries = Vec::new();
-        for branch in &branches {
-            let mut branch_query =
-                crate::mv::domain::iceberg_join_branch::rewrite_join_branch_query(
-                    &base_query,
-                    branch,
-                    "l",
-                    "r",
-                )
-                .expect("branch rewrite");
-            normalize_join_branch_snapshot_tables(&mut branch_query, branch)
-                .expect("snapshot normalization");
-            branch_queries.push(branch_query);
-        }
-
-        let coalesced =
-            crate::mv::domain::iceberg_join_branch::rewrite_join_delta_coalesce_query_with_branch_queries(
-                &base_query,
-                branch_queries,
-                "left-uuid",
-                "right-uuid",
-            )
-            .expect("coalesce rewrite");
-        let rendered = novarocks_parser::printer::print_query(&coalesced);
-
-        assert!(rendered.contains("right__at_20"), "sql={rendered}");
-        assert!(rendered.contains("left__at_11"), "sql={rendered}");
-        assert!(!rendered.contains("VERSION AS OF"), "sql={rendered}");
-        assert!(
-            rendered.contains("__nr_join_delta_branch_0"),
-            "sql={rendered}"
-        );
-        assert!(
-            rendered.contains("__nr_join_delta_branch_1"),
-            "sql={rendered}"
-        );
-    }
-
-    fn base(name: &str) -> TableIdentity {
-        TableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "ns".to_string(),
-            table: name.to_string(),
-        }
-    }
-
     fn parse_query(sql: &str) -> ast::Query {
         let statements = novarocks_parser::parse(sql).expect("parse");
         let [ast::Statement::Query(query)] = statements.as_slice() else {
@@ -2632,33 +2573,6 @@ mod join_delta_append_only_fast_path_tests {
         };
         query.clone()
     }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn normalize_join_branch_snapshot_tables(
-    query: &mut ast::Query,
-    branch: &crate::mv::domain::iceberg_join_branch::JoinDeltaBranchPlan,
-) -> Result<(), String> {
-    let ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("join branch snapshot normalization requires SELECT body".to_string());
-    };
-    let [from] = select.from.as_mut_slice() else {
-        return Err("join branch snapshot normalization requires one FROM item".to_string());
-    };
-    let [join] = from.joins.as_mut_slice() else {
-        return Err("join branch snapshot normalization requires one JOIN".to_string());
-    };
-    if let crate::mv::domain::iceberg_join_branch::BranchSide::Snapshot(snapshot_id) = branch.left {
-        rewrite_snapshot_table_factor(&mut from.relation, &branch.left_base, snapshot_id, None)?;
-    }
-    if let crate::mv::domain::iceberg_join_branch::BranchSide::Snapshot(snapshot_id) = branch.right
-    {
-        rewrite_snapshot_table_factor(&mut join.relation, &branch.right_base, snapshot_id, None)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]

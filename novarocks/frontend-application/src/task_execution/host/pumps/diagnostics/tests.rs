@@ -878,8 +878,6 @@ async fn original_ready_publishes_through_the_core_while_paid_diagnostic_read_is
                         creation: FrozenCreation {
                             resource: PayloadRef(NonZeroU64::new(index as u64 + 1).unwrap()),
                             queued_bytes: 256,
-                            plan_carrier_bytes: 64,
-                            descriptor_encoded_bytes: 64,
                         },
                     },
                 )

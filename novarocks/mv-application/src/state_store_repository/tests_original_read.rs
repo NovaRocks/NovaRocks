@@ -197,16 +197,6 @@ async fn original_repository(
         .unwrap();
     (repository, trace)
 }
-fn bound() -> MvProjectionInventoryBound {
-    MvProjectionInventoryBound {
-        entries: 4,
-        snapshot_bytes: 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-        decode: crate::persistence::validation::PersistenceDecodeBudget::default(),
-    }
-}
 
 #[tokio::test]
 async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependencies() {
@@ -230,7 +220,7 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
     let (_port, execution) = context();
     let (original, trace) = original_repository(store, &execution).await;
     let view = original.in_execution(&execution);
-    let inventory = view.list_keyed_projection_inventory(bound()).await.unwrap();
+    let inventory = view.list_keyed_projection_inventory().await.unwrap();
     assert_eq!(inventory.len(), 2);
     assert!(
         inventory
@@ -238,7 +228,7 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
             .any(|entry| entry.mv_id == first.projection.mv_id)
     );
     assert_eq!(
-        view.find_keyed_by_target_bounded(&first.projection.facts.target(), bound())
+        view.find_keyed_by_target(&first.projection.facts.target())
             .await
             .unwrap(),
         Some(first.clone())
@@ -247,7 +237,6 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
         .list_keyed_dependencies_by_downstream_bounded(
             &first,
             MvDependencyReadBound {
-                inventory: bound(),
                 ..dependency_bound()
             },
         )
@@ -266,7 +255,6 @@ async fn explicit_view_uses_original_snapshot_for_inventory_lookup_and_dependenc
 }
 fn dependency_bound() -> MvDependencyReadBound {
     MvDependencyReadBound {
-        inventory: bound(),
         entries: 32,
         collection_bytes: 1024 * 1024,
     }
@@ -331,7 +319,7 @@ async fn original_range_failure_closes_snapshot_and_retains_the_same_cause() {
     *trace.range_failure.lock().unwrap() = Some(cause.clone());
     let error = repository
         .in_execution(&execution)
-        .list_keyed_projection_inventory(bound())
+        .list_keyed_projection_inventory()
         .await
         .unwrap_err();
     assert_eq!(error.original_failure(), Some(&cause));
@@ -560,7 +548,7 @@ async fn original_write_view_preserves_guarded_cas_dependency_indexes_and_delete
         StateStoreErrorKind::PreconditionFailed
     );
     assert_eq!(
-        view.find_keyed_by_target(&replaced.projection.facts.target(), Default::default())
+        view.find_keyed_by_target(&replaced.projection.facts.target())
             .await
             .unwrap(),
         Some(replaced.clone())

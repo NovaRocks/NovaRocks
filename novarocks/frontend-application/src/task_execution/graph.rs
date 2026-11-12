@@ -67,6 +67,7 @@ fn bind_sink_edges(
     targets: &[StaticSinkTarget],
     outbound: &[&EdgeNode],
     stage_of_fragment: &BTreeMap<FragmentId, StageId>,
+    shard_edges: &mut BTreeSet<ExchangeEdgeId>,
 ) -> Result<Arc<[ExchangeEdgeId]>, TaskExecutionError> {
     if targets.len() != outbound.len() {
         return Err(TaskExecutionError::Schedule(
@@ -105,6 +106,12 @@ fn bind_sink_edges(
                 "task edge {} is bound to multiple static sinks",
                 edge.edge_id()
             )));
+        }
+        if matches!(
+            target.role(),
+            novarocks_physical_plan::OutputRole::PositionShards { .. }
+        ) {
+            shard_edges.insert(edge.edge_id());
         }
         sink_edges.push(edge.edge_id());
     }
@@ -479,21 +486,12 @@ fn task_topology_views(
 
 /// Binds one task's facts into its creation seed.
 ///
-/// The static plan's own encoded size is checked here, before anything is
-/// sent: the backend bounds the static plan together with the task
-/// assignment, so a static plan already over that bound can never become a
-/// legal creation. The combined bound is checked again once the assignment's
-/// exact size is known.
 fn bind_creation_seed(
     topology: &Arc<AttemptTopology>,
     views: &BTreeMap<TaskId, TaskTopologyView>,
-    edges: &BTreeMap<ExchangeEdgeId, EdgeNode>,
-    stage_of_fragment: &BTreeMap<FragmentId, StageId>,
-    sink_bindings: &mut BTreeMap<StageId, Arc<[ExchangeEdgeId]>>,
+    sink_edges: Arc<[ExchangeEdgeId]>,
     node: &TaskNode,
     facts: TaskPlanFacts,
-    transport_budget: TransportBudget,
-    #[cfg(test)] control_topology_targets: Option<&[StaticSinkTarget]>,
 ) -> Result<TaskCreationSeed, TaskExecutionError> {
     let TaskPlanFacts {
         fragment,
@@ -507,33 +505,9 @@ fn bind_creation_seed(
             fragment.facts().fragment_id()
         )));
     }
-    let static_bytes = fragment.content().len();
-    if static_bytes > transport_budget.max_descriptor_encoded_bytes() {
-        return Err(CapacityBound::DescriptorBytes {
-            limit: transport_budget.max_descriptor_encoded_bytes(),
-            actual: static_bytes,
-        }
-        .into());
-    }
     let view = views.get(&node.task_id()).cloned().ok_or_else(|| {
         TaskExecutionError::Schedule(format!("task {} has no view", node.identity))
     })?;
-    let sink_edges = match sink_bindings.get(&node.stage_id()) {
-        Some(binding) => Arc::clone(binding),
-        None => {
-            let outbound = view
-                .outbound()
-                .iter()
-                .map(|edge_id| &edges[edge_id])
-                .collect::<Vec<_>>();
-            let targets = fragment.facts().sink_targets();
-            #[cfg(test)]
-            let targets = control_topology_targets.unwrap_or(targets);
-            let binding = bind_sink_edges(targets, &outbound, stage_of_fragment)?;
-            sink_bindings.insert(node.stage_id(), Arc::clone(&binding));
-            binding
-        }
-    };
     Ok(TaskCreationSeed::new(
         Arc::clone(topology),
         view,
@@ -762,11 +736,6 @@ pub(crate) fn build_task_graph_from_manifest(
         }
     }
     let views = task_topology_views(&tasks, &edges);
-    let topology = Arc::new(AttemptTopology::try_new(
-        shared_edges,
-        &views.values().collect::<Vec<_>>(),
-    )?);
-
     let mut stage_of_fragment = BTreeMap::new();
     for (&stage_id, &fragment_id) in &stage_fragments {
         if stage_of_fragment.insert(fragment_id, stage_id).is_some() {
@@ -775,24 +744,70 @@ pub(crate) fn build_task_graph_from_manifest(
             )));
         }
     }
-    let mut seeds = BTreeMap::new();
+    let mut task_plans = BTreeMap::<TaskId, TaskPlanFacts>::new();
     let mut sink_bindings = BTreeMap::<StageId, Arc<[ExchangeEdgeId]>>::new();
+    let mut shard_edges = BTreeSet::new();
     for task in manifest.tasks() {
         #[cfg(test)]
         let control_topology_targets = plans.control_topology_targets(task.fragment_id());
         let facts = plans.take_plan(task.fragment_id(), task.instance_index())?;
         let task_id = task.identity().task_id();
+        if let std::collections::btree_map::Entry::Vacant(binding) =
+            sink_bindings.entry(task.identity().stage_id())
+        {
+            let outbound = views[&task_id]
+                .outbound()
+                .iter()
+                .map(|edge_id| &edges[edge_id])
+                .collect::<Vec<_>>();
+            let targets = facts.fragment.facts().sink_targets();
+            #[cfg(test)]
+            let targets = control_topology_targets.as_deref().unwrap_or(targets);
+            binding.insert(bind_sink_edges(
+                targets,
+                &outbound,
+                &stage_of_fragment,
+                &mut shard_edges,
+            )?);
+        }
+        task_plans.insert(task_id, facts);
+    }
+    for edge in &mut shared_edges {
+        if shard_edges.contains(&edge.edge_id()) {
+            edge.bind_position_shard_source_dops(|producer| {
+                let task = tasks_by_identity
+                    .get(&producer)
+                    .and_then(|task_id| task_plans.get(task_id))
+                    .ok_or_else(|| {
+                        TaskExecutionError::Schedule(format!(
+                            "position-shard producer {producer} has no native placement",
+                        ))
+                    })?;
+                u32::try_from(task.assignment.pipeline_dop().get())
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .ok_or_else(|| {
+                        TaskExecutionError::Schedule(format!(
+                            "position-shard producer {producer} DOP does not fit the native roster",
+                        ))
+                    })
+            })?;
+        }
+    }
+    let topology = Arc::new(AttemptTopology::try_new(
+        shared_edges,
+        &views.values().collect::<Vec<_>>(),
+    )?);
+
+    let mut seeds = BTreeMap::new();
+    for (task_id, facts) in task_plans {
+        let task = &tasks[&task_id];
         let seed = bind_creation_seed(
             &topology,
             &views,
-            &edges,
-            &stage_of_fragment,
-            &mut sink_bindings,
-            &tasks[&task_id],
+            Arc::clone(&sink_bindings[&task.stage_id()]),
+            task,
             facts,
-            transport_budget,
-            #[cfg(test)]
-            control_topology_targets.as_deref(),
         )?;
         seeds.insert(task_id, seed);
     }

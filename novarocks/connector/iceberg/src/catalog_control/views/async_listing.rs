@@ -145,7 +145,7 @@ impl Work {
                     self.request.namespace.namespace.clone(),
                 ),
             )?);
-            self.collector = Some(ConnectorListingCollector::new(self.request.bound)?);
+            self.collector = Some(ConnectorListingCollector::new(self.request.page_size)?);
         }
         self.next = Some(PageRequest {
             namespace: self.namespace.as_ref().unwrap().clone(),
@@ -155,7 +155,7 @@ impl Work {
                 .unwrap()
                 .continuation_token()
                 .map(str::to_owned),
-            size: self.request.bound.page_entries,
+            size: self.request.page_size.get(),
         });
         Ok(())
     }

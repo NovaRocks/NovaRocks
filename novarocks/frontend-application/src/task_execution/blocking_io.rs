@@ -409,6 +409,11 @@ pub(crate) mod tests {
         blocking: novarocks_query_application::cpu::QueryBlockingExecutorOwner,
     }
     impl OriginalExecutorsFixture {
+        pub(crate) fn blocking_executor(
+            &self,
+        ) -> novarocks_query_application::cpu::QueryBlockingExecutor {
+            self.blocking.executor()
+        }
         pub(crate) async fn shutdown(&mut self) {
             self.cpu
                 .shutdown_until(Instant::now() + Duration::from_secs(5))

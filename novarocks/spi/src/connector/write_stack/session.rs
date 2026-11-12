@@ -29,7 +29,8 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
+use novarocks_connector_contract::ConnectorMutationContributionGroupId;
 
 use crate::connector::distributed_rewrite::ConnectorDistributedRewriteShape;
 use crate::connector::handle::ConnectorPinnedFileSet;
@@ -538,6 +539,7 @@ pub struct ConnectorWriteTargetPlan {
     input: ConnectorWriteInputShape,
     statistics: WriteStatisticsContract,
     route: Option<ConnectorWriteRouteFacts>,
+    position_materialization: Option<ConnectorMutationContributionGroup>,
     routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
     rewrite_group_digest: Option<[u8; 32]>,
@@ -1032,6 +1034,114 @@ impl ConnectorWriteRouteFacts {
     }
 }
 
+/// The raw position routes that feed one final materialization writer.
+/// The target retains its own writer input independently of this shape.
+#[derive(Clone, Debug)]
+pub struct ConnectorMutationContributionGroup {
+    id: ConnectorMutationContributionGroupId,
+    raw_input: ConnectorWriteInputShape,
+    file_key: ConnectorWriteFieldToken,
+    routes: Vec<ConnectorWriteRouteFacts>,
+}
+
+impl ConnectorMutationContributionGroup {
+    pub fn try_new(
+        id: ConnectorMutationContributionGroupId,
+        raw_input: ConnectorWriteInputShape,
+        file_key: ConnectorWriteFieldToken,
+        routes: Vec<ConnectorWriteRouteFacts>,
+    ) -> Result<Self, ConnectorError> {
+        raw_input.validate()?;
+        let fields = raw_input.fields_iter().collect::<Vec<_>>();
+        let exact_layout = matches!(fields.as_slice(), [file, position, spec_id, partition]
+            if file.token() == file_key
+                && required_type(file.field(), &DataType::Utf8)
+                && required_type(position.field(), &DataType::Int64)
+                && required_type(spec_id.field(), &DataType::Int32)
+                && nullable_partition(partition.field()));
+        if id.to_bytes() == [0; 32]
+            || !matches!(&raw_input, ConnectorWriteInputShape::PositionDelete { .. })
+            || !exact_layout
+            || routes.is_empty()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "position materialization requires a group, raw position input and file key",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for route in &routes {
+            route.validate_against_input(&raw_input)?;
+            if route.route_id().to_bytes() == [0; 32]
+                || !ids.insert(route.route_id())
+                || route
+                    .accepted_effects()
+                    .contains(&ConnectorRowMutationEffect::Insert)
+                || !route.selection_bindings().is_empty()
+                || !matches!(
+                    &route.requirements().colocation,
+                    ConnectorWriteColocation::ByKey(keys) if keys.as_slice() == [file_key]
+                )
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "position contribution route differs from its group file key or delete effects",
+                ));
+            }
+        }
+        Ok(Self {
+            id,
+            raw_input,
+            file_key,
+            routes,
+        })
+    }
+
+    fn accepts_writer_input(&self, writer: &ConnectorWriteInputShape) -> bool {
+        if !matches!(writer, ConnectorWriteInputShape::DeletionVector { .. }) {
+            return false;
+        }
+        let fields = writer.fields_iter().collect::<Vec<_>>();
+        let raw = self.raw_input.fields_iter().collect::<Vec<_>>();
+        matches!((fields.as_slice(), raw.as_slice()),
+            ([file, spec_id, partition, driver, high32, container, index, count, bitmap],
+                [raw_file, _, raw_spec, raw_partition])
+                if file.field() == raw_file.field()
+                    && spec_id.field() == raw_spec.field()
+                    && partition.field() == raw_partition.field()
+                    && required_type(driver.field(), &DataType::Int64)
+                    && required_type(high32.field(), &DataType::Int32)
+                    && required_type(container.field(), &DataType::Int32)
+                    && required_type(index.field(), &DataType::Int64)
+                    && required_type(count.field(), &DataType::Int64)
+                    && required_type(bitmap.field(), &DataType::Binary))
+    }
+
+    pub const fn id(&self) -> ConnectorMutationContributionGroupId {
+        self.id
+    }
+
+    pub const fn raw_input(&self) -> &ConnectorWriteInputShape {
+        &self.raw_input
+    }
+
+    pub const fn file_key(&self) -> ConnectorWriteFieldToken {
+        self.file_key
+    }
+
+    pub fn routes(&self) -> &[ConnectorWriteRouteFacts] {
+        &self.routes
+    }
+}
+
+fn required_type(field: &arrow::datatypes::Field, ty: &DataType) -> bool {
+    !field.is_nullable() && field.data_type() == ty
+}
+
+fn nullable_partition(field: &arrow::datatypes::Field) -> bool {
+    field.is_nullable() && matches!(field.data_type(), DataType::Struct(_))
+}
+
 impl ConnectorWriteTargetPlan {
     pub const fn new(
         ordinal: WriteTargetOrdinal,
@@ -1046,6 +1156,7 @@ impl ConnectorWriteTargetPlan {
                 requirements: Vec::new(),
             },
             route: None,
+            position_materialization: None,
             routing_proof: None,
             rewrite_source: None,
             rewrite_group_digest: None,
@@ -1065,6 +1176,18 @@ impl ConnectorWriteTargetPlan {
     pub fn with_route(mut self, route: ConnectorWriteRouteFacts) -> Self {
         self.route = Some(route);
         self
+    }
+
+    pub fn with_position_materialization(
+        mut self,
+        group: ConnectorMutationContributionGroup,
+    ) -> Self {
+        self.position_materialization = Some(group);
+        self
+    }
+
+    pub const fn position_materialization(&self) -> Option<&ConnectorMutationContributionGroup> {
+        self.position_materialization.as_ref()
     }
 
     pub fn with_routing_proof(mut self, proof: ConnectorWriteCohortRoutingProof) -> Self {
@@ -1180,6 +1303,7 @@ impl ConnectorWriteSessionPlan {
             .map(ConnectorWriteTargetPlan::ordinal)
             .collect::<Vec<_>>();
         validate_dense_target_ordinals(&ordinals)?;
+        let mut groups = std::collections::BTreeSet::new();
         for target in &targets {
             if target.handle().binding() != commit.binding() {
                 return Err(ConnectorError::new(
@@ -1191,6 +1315,18 @@ impl ConnectorWriteSessionPlan {
             if let Some(route) = target.route() {
                 route.validate_against_input(target.input())?;
             }
+            if let Some(group) = target.position_materialization()
+                && (!groups.insert(group.id())
+                    || target.route().is_some()
+                    || target.rewrite_source().is_some()
+                    || copy_on_write.is_some()
+                    || !group.accepts_writer_input(target.input()))
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "position contribution group requires a unique materialization target",
+                ));
+            }
         }
         // Routing is a property of the whole session, not of individual
         // branches: if some branches carry routing facts and others do not, SQL
@@ -1198,7 +1334,9 @@ impl ConnectorWriteSessionPlan {
         // the rest.
         let routed = targets
             .iter()
-            .filter(|target| target.route().is_some())
+            .filter(|target| {
+                target.route().is_some() || target.position_materialization().is_some()
+            })
             .count();
         if routed != 0 && routed != targets.len() {
             return Err(ConnectorError::new(
@@ -1211,8 +1349,14 @@ impl ConnectorWriteSessionPlan {
         let mut seen = std::collections::BTreeSet::new();
         for target in &targets {
             target.statistics.validate_against(&target.input)?;
-            if let Some(route) = target.route()
-                && !seen.insert(route.route_id())
+            let direct = target.route().into_iter();
+            let grouped = target
+                .position_materialization()
+                .into_iter()
+                .flat_map(|group| group.routes());
+            if direct
+                .chain(grouped)
+                .any(|route| !seen.insert(route.route_id()))
             {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -2322,6 +2466,102 @@ mod tests {
             .expect_err("no accepted effects")
             .kind(),
             ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn position_group_binds_exact_raw_routes_and_a_separate_shard_input() {
+        let binding = |id, name, ty: DataType, nullable| {
+            ConnectorWriteFieldBinding::try_new_typed(
+                ConnectorWriteFieldToken::from_bytes([id; 32]),
+                arrow::datatypes::Field::new(name, ty.clone(), nullable),
+                novarocks_type_contract::FunctionValueType::new(ty, nullable),
+            )
+            .unwrap()
+        };
+        let file = binding(1, "_file", DataType::Utf8, false);
+        let pos = binding(2, "_pos", DataType::Int64, false);
+        let spec = binding(3, "_spec_id", DataType::Int32, false);
+        let part = binding(
+            4,
+            "_partition",
+            DataType::Struct(arrow::datatypes::Fields::empty()),
+            true,
+        );
+        let raw = ConnectorWriteInputShape::PositionDelete {
+            identity_fields: vec![file.clone(), pos],
+            partition_source_fields: vec![spec.clone(), part.clone()],
+        };
+        let shards = ConnectorWriteInputShape::DeletionVector {
+            identity_fields: vec![file.clone(), spec, part],
+            partition_source_fields: vec![
+                binding(5, "driver", DataType::Int64, false),
+                binding(6, "high32", DataType::Int32, false),
+                binding(7, "container", DataType::Int32, false),
+                binding(8, "index", DataType::Int64, false),
+                binding(9, "count", DataType::Int64, false),
+                binding(10, "bitmap", DataType::Binary, false),
+            ],
+        };
+        let route = |id, effect| {
+            ConnectorWriteRouteFacts::try_new(
+                ConnectorWriteRouteId::from_bytes([id; 32]),
+                vec![effect],
+                raw.fields_iter()
+                    .enumerate()
+                    .map(|(ordinal, field)| {
+                        ConnectorMutationRouteInput::new(field.token(), ordinal as u32)
+                    })
+                    .collect(),
+                ConnectorWriteRouteRequirements {
+                    colocation: ConnectorWriteColocation::ByKey(vec![file.token()]),
+                    layout: ConnectorWriteLayoutPreference::None,
+                },
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let delete = route(21, ConnectorRowMutationEffect::Delete);
+        let replace = route(22, ConnectorRowMutationEffect::Replace);
+        let group_id = ConnectorMutationContributionGroupId::from_bytes([31; 32]);
+        let group = ConnectorMutationContributionGroup::try_new(
+            group_id,
+            raw.clone(),
+            file.token(),
+            vec![delete.clone(), replace],
+        )
+        .unwrap();
+        assert_eq!(group.routes().len(), 2);
+        assert!(group.accepts_writer_input(&shards));
+        assert!(!group.accepts_writer_input(&raw));
+        assert!(
+            ConnectorMutationContributionGroup::try_new(
+                group_id,
+                raw.clone(),
+                file.token(),
+                vec![delete.clone(), delete],
+            )
+            .is_err()
+        );
+        assert!(
+            ConnectorMutationContributionGroup::try_new(
+                group_id,
+                raw.clone(),
+                file.token(),
+                vec![route(23, ConnectorRowMutationEffect::Insert)],
+            )
+            .is_err()
+        );
+        let adapter = adapter();
+        let target = ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(0).unwrap(),
+            adapter.wrap_writer_handle(Value),
+            shards,
+        )
+        .with_position_materialization(group);
+        assert!(
+            ConnectorWriteSessionPlan::try_new(adapter.wrap_commit_session(Value), vec![target])
+                .is_ok()
         );
     }
 

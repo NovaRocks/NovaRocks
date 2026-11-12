@@ -1,0 +1,13 @@
+-- query 5
+-- types	bigint	varchar
+id	value
+1	old
+2	old
+3	new
+
+-- query 6
+-- types	bigint	bigint	bigint
+id	p	q_times_100
+11	11	125
+12	3000000001	250
+13	3000000002	375

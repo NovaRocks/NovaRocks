@@ -22,7 +22,7 @@
 use super::*;
 use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
 use novarocks_resource_contract::SharedDependency;
-use novarocks_state_store_api::{StateStoreLimits, StateStoreProviderFactory};
+use novarocks_state_store_api::StateStoreProviderFactory;
 use novarocks_state_store_runtime::{
     StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
@@ -57,7 +57,7 @@ fn prepare_sqlite(path: &Path) -> FrontendStateStoreOpening {
         StateStoreHostInput {
             cluster_id: "actual-sqlite-original-composition".into(),
             provider_id: SQLITE_STATE_STORE_PROVIDER_ID,
-            limits: StateStoreLimits::default(),
+            limits: novarocks_state_store_sqlite::SQLITE_STATE_STORE_CAPACITY.limits(),
             run_policy: StateStoreRunPolicy::default(),
         },
         Instant::now() + Duration::from_secs(5),

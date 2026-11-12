@@ -39,7 +39,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let catalog = SqlPlannerTableSnapshot::new(&catalog);
     let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         session(),
         SqlPlanningEnvironment::Distributed,
@@ -219,7 +219,9 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
     reset();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([87; 16]).unwrap(),
-        SqlStatementInput::sql("SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h"),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(
+            "SELECT hour_from_unixtime(CAST(1700000000 AS BIGINT)) AS h",
+        )),
         SqlCompileIntent::Query,
         session(),
         SqlPlanningEnvironment::Distributed,

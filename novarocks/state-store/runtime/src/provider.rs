@@ -126,8 +126,7 @@ impl StateStoreProviderRegistry {
             ));
         };
         if input.cluster_id.trim().is_empty()
-            || input.limits.max_key_bytes == 0
-            || input.limits.max_key_bytes > registration.descriptor.max_key_bytes
+            || !registration.descriptor.capacity.accepts(&input.limits)
         {
             return Err(StateStoreHostError::new(
                 StateStoreHostErrorKind::InvalidConfiguration,

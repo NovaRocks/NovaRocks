@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderId};
+use novarocks_state_store_api::StateStoreProviderId;
 
 use crate::state_store_limits::{StateStoreLimitOverrides, resolve_state_store_limits};
 
@@ -50,7 +50,10 @@ impl StateStoreConfig {
         // Resolved for its validation only: an override that relaxes a hard
         // bound has to fail here, before anything opens a database. The
         // resolved value itself belongs to composition, which builds the store.
-        resolve_state_store_limits(&self.limits, MAX_KEY_BYTES)?;
+        resolve_state_store_limits(
+            &self.limits,
+            novarocks_state_store_sqlite::SQLITE_STATE_STORE_DESCRIPTOR.capacity,
+        )?;
         Ok(())
     }
 }

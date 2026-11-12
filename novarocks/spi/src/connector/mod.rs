@@ -190,7 +190,7 @@ pub use io_admission::{
     ConnectorIoStreamCustody, ConnectorIoWeakPhase, HdfsServiceOrigin, NetworkServiceOrigin,
     SelectedThriftServiceOrigin, SharedDependency, ThriftServiceOrigin,
 };
-pub use listing::{ConnectorListingBound, ConnectorListingBudget, ConnectorListingCollector};
+pub use listing::{ConnectorListingCollector, ConnectorListingPageSize};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,

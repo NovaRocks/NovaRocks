@@ -29,7 +29,6 @@ use std::sync::Arc;
 
 use novarocks_mv_application::persistence::documents::MvDocumentError;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
-use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::readiness::{
     MvCurrentProjectionRequest, MvKeyedProjectionInstallOutcome,
@@ -201,7 +200,6 @@ fn rediscover_one_target(
             discovered.catalog.clone(),
             target.clone(),
             context.clone(),
-            PersistenceDecodeBudget::default(),
         )
         .map_err(|error| format!("prepare read-only MV Current observation: {error}"))?;
         match ctx
@@ -299,13 +297,8 @@ pub(crate) fn rebuild_one_lake_package_if_missing_verified(
     target: MvTarget,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    let request = MvCurrentProjectionRequest::try_new(
-        catalog,
-        target,
-        context,
-        PersistenceDecodeBudget::default(),
-    )
-    .map_err(|error| format!("prepare targeted read-only MV observation: {error}"))?;
+    let request = MvCurrentProjectionRequest::try_new(catalog, target, context)
+        .map_err(|error| format!("prepare targeted read-only MV observation: {error}"))?;
     let source = LakeReadOnlyCurrentSource {
         connector_control,
         reader: readiness.candidate_reader(),
@@ -426,7 +419,6 @@ fn discover_managed_mv_targets(
     let namespaces = crate::connector::metadata_list_namespaces_with_planning_pin(
         planning.clone(),
         context.clone(),
-        novarocks_spi::connector::ConnectorListingBound::V1,
     )
     .map_err(|error| {
         ConnectorError::new(
@@ -716,12 +708,7 @@ pub(crate) async fn rebuild_one_lake_package_if_missing_verified_original(
             "MV catalog generation changed before read-only Current observation",
         ));
     }
-    let request = MvCurrentProjectionRequest::try_new(
-        catalog,
-        target,
-        context.clone(),
-        PersistenceDecodeBudget::default(),
-    )?;
+    let request = MvCurrentProjectionRequest::try_new(catalog, target, context.clone())?;
     let documents = planning
         .derive_document_storage_lease()
         .map_err(project_connector_error)?;
@@ -873,7 +860,6 @@ mod tests {
                 novarocks_spi::connector::ConnectorStopOwner::new().view(),
             )
             .expect("request context"),
-            PersistenceDecodeBudget::default(),
         )
         .expect("current request");
         assert_eq!(request.catalog(), &handle);

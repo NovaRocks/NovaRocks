@@ -46,15 +46,14 @@ use crate::dependency::MvDependencyObjectRef;
 use crate::persistence::dependency::StoredMvDependency;
 use crate::product::MvTarget;
 use crate::repository::{
-    MvDependencyReadBound, MvProjectionInventoryBound, MvProjectionInventoryBuilder,
-    MvProjectionInventoryEntry, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
+    MvDependencyReadBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
+    MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_dependency_with_budget, decode_record,
-    encode_record,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_dependency, decode_record, encode_record,
 };
 use self::key::{
     dependency_by_downstream_key, dependency_by_downstream_prefix,
@@ -270,7 +269,6 @@ impl BoundedRecordRange {
     async fn next<T: ReadAccess + ?Sized>(
         &mut self,
         transaction: &mut T,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Option<StateRecord>, MvRepositoryError> {
         if self.exhausted {
             return Ok(None);
@@ -287,47 +285,13 @@ impl BoundedRecordRange {
                 "MV inventory provider violated the exact page bound",
             ));
         }
-        if page
-            .continuation
-            .as_ref()
-            .is_some_and(|token| token.as_bytes().len() > bound.continuation_token_bytes)
-        {
-            return Err(invalid(
-                "MV inventory exceeds its continuation token byte bound",
-            ));
-        }
         if page.continuation.is_some() && page.continuation == self.continuation {
             return Err(corruption("MV inventory continuation made no progress"));
         }
-        let cursor_bytes = self
-            .previous
-            .as_ref()
-            .map_or(0, |key| key.as_bytes().len())
-            .saturating_add(
-                self.continuation
-                    .as_ref()
-                    .map_or(0, |token| token.as_bytes().len()),
-            );
         let Some(record) = page.records.into_iter().next() else {
             self.exhausted = true;
             return Ok(None);
         };
-        // Account old cursor, provider page and exact cursor copies together.
-        let raw_peak = record
-            .value
-            .as_bytes()
-            .len()
-            .saturating_add(record.key.as_bytes().len().saturating_mul(2))
-            .saturating_add(
-                page.continuation
-                    .as_ref()
-                    .map_or(0, |token| token.as_bytes().len())
-                    .saturating_mul(2),
-            )
-            .saturating_add(cursor_bytes);
-        if raw_peak > bound.raw_page_bytes {
-            return Err(invalid("MV inventory exceeds its raw page byte bound"));
-        }
         if let Some(token) = &page.continuation
             && token
                 .resume_after(&request)
@@ -348,7 +312,6 @@ impl BoundedRecordRange {
             })
             .transpose()
             .map_err(operation::state_store_error)?;
-        check_inventory_raw_record(&record, bound)?;
         if record.key < self.range.start
             || record.key >= self.range.end
             || self
@@ -366,25 +329,6 @@ impl BoundedRecordRange {
         );
         Ok(Some(record))
     }
-}
-
-fn check_inventory_raw_record(
-    record: &StateRecord,
-    bound: MvProjectionInventoryBound,
-) -> Result<(), MvRepositoryError> {
-    if record
-        .key
-        .as_bytes()
-        .len()
-        .checked_add(record.value.as_bytes().len())
-        .is_none_or(|bytes| bytes > bound.raw_page_bytes)
-    {
-        return Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::InvalidRequest,
-            "MV inventory exceeds its raw page byte bound",
-        ));
-    }
-    Ok(())
 }
 
 fn target_key(target: &MvTarget) -> Result<Key, String> {
@@ -750,11 +694,8 @@ impl StateStoreMvRepositoryExecution<'_> {
     pub async fn find_keyed_by_target(
         &self,
         target: &MvTarget,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<Option<keyed::LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.read_repository()
-            .find_keyed_by_target(target, budget)
-            .await
+        self.read_repository().find_keyed_by_target(target).await
     }
     pub async fn list_keyed_projections(
         &self,
@@ -763,21 +704,12 @@ impl StateStoreMvRepositoryExecution<'_> {
     }
     pub async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         self.read_repository()
-            .list_keyed_projection_inventory(bound)
+            .list_keyed_projection_inventory()
             .await
     }
-    pub async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<keyed::LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.read_repository()
-            .find_keyed_by_target_bounded(target, bound)
-            .await
-    }
+
     pub async fn list_keyed_dependencies_by_downstream_bounded(
         &self,
         loaded: &keyed::LoadedKeyedMvProjection,
@@ -862,13 +794,9 @@ impl ReadRepository<'_> {
             let inventory = roots
                 .into_iter()
                 .map(|record| {
-                    codec::decode_keyed_projection(
-                        &record.key,
-                        &record.value,
-                        crate::persistence::validation::PersistenceDecodeBudget::default(),
-                    )
-                    .map(|decoded| decoded.value)
-                    .map_err(corruption)
+                    codec::decode_keyed_projection(&record.key, &record.value)
+                        .map(|decoded| decoded.value)
+                        .map_err(corruption)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut dependencies = decode_dependencies(rows)?;
@@ -956,7 +884,6 @@ impl ReadRepository<'_> {
     pub async fn find_keyed_by_target(
         &self,
         target: &MvTarget,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<Option<keyed::LoadedKeyedMvProjection>, MvRepositoryError> {
         let key = target_key(target).map_err(corruption)?;
         let Some(lookup) = self.read_record(&key).await? else {
@@ -969,8 +896,7 @@ impl ReadRepository<'_> {
             .read_record(&key)
             .await?
             .ok_or_else(|| corruption("keyed MV lookup has no projection"))?;
-        let decoded =
-            codec::decode_keyed_projection(&key, &row.value, budget).map_err(corruption)?;
+        let decoded = codec::decode_keyed_projection(&key, &row.value).map_err(corruption)?;
         if decoded.value.facts.target() != *target {
             return Err(corruption("keyed MV lookup disagrees with its projection"));
         }
@@ -987,13 +913,9 @@ impl ReadRepository<'_> {
             .scan_prefix(projection_prefix().map_err(corruption)?)
             .await?
         {
-            let value = codec::decode_keyed_projection(
-                &row.key,
-                &row.value,
-                crate::persistence::validation::PersistenceDecodeBudget::default(),
-            )
-            .map_err(corruption)?
-            .value;
+            let value = codec::decode_keyed_projection(&row.key, &row.value)
+                .map_err(corruption)?
+                .value;
             if row.key != projection_by_id_key(value.mv_id).map_err(corruption)? {
                 return Err(corruption(
                     "keyed projection key differs from root identity",
@@ -1008,10 +930,9 @@ impl ReadRepository<'_> {
     }
     pub async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         let mut tx = self.begin_read().await?;
-        let result = keyed::bounded_keyed_inventory(&mut tx, bound).await;
+        let result = keyed::projection_inventory(&mut tx).await;
         let close = tx.read_close().await;
         match (result, close) {
             (Err(e), _) => Err(e),
@@ -1019,36 +940,7 @@ impl ReadRepository<'_> {
             (Ok(v), Ok(())) => Ok(v),
         }
     }
-    pub async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<keyed::LoadedKeyedMvProjection>, MvRepositoryError> {
-        MvProjectionInventoryBuilder::new(bound)?;
-        let index = target_key(target).map_err(corruption)?;
-        let Some(row) = self.read_record(&index).await? else {
-            return Ok(None);
-        };
-        check_inventory_raw_record(&row, bound)?;
-        let lookup: DecodedMvRecord<MvTargetLookup> =
-            decode_record(&index, &row.value).map_err(corruption)?;
-        let root = projection_by_id_key(lookup.value.mv_id).map_err(corruption)?;
-        let row = self
-            .read_record(&root)
-            .await?
-            .ok_or_else(|| corruption("keyed target lookup has no root"))?;
-        check_inventory_raw_record(&row, bound)?;
-        let facts = codec::decode_keyed_projection(&root, &row.value, bound.decode)
-            .map_err(corruption)?
-            .value;
-        if facts.facts.target() != *target {
-            return Err(corruption("keyed lookup disagrees with root"));
-        }
-        Ok(Some(keyed::LoadedKeyedMvProjection {
-            projection: facts,
-            version: crate::repository::MvProjectionVersion::from_store(row.version),
-        }))
-    }
+
     pub async fn list_keyed_dependencies_by_downstream_bounded(
         &self,
         loaded: &keyed::LoadedKeyedMvProjection,
@@ -1070,24 +962,18 @@ impl ReadRepository<'_> {
                     "keyed dependency root changed",
                 ));
             }
-            check_inventory_raw_record(&row, bound.inventory)?;
-            let projection =
-                codec::decode_keyed_projection(&root, &row.value, bound.inventory.decode)
-                    .map_err(corruption)?
-                    .value;
+            let projection = codec::decode_keyed_projection(&root, &row.value)
+                .map_err(corruption)?
+                .value;
             drop(row);
             let mut collector = DependencyCollector::new(bound)?;
             let mut range = BoundedRecordRange::new(
                 dependency_by_downstream_prefix(projection.mv_id).map_err(corruption)?,
             )?;
-            while let Some(row) = range.next(&mut tx, bound.inventory).await? {
-                let dependency = decode_dependency_with_budget(
-                    &row.key,
-                    &row.value,
-                    bound.inventory.decode.max_working_set_bytes,
-                )
-                .map_err(corruption)?
-                .value;
+            while let Some(row) = range.next(&mut tx).await? {
+                let dependency = decode_dependency(&row.key, &row.value)
+                    .map_err(corruption)?
+                    .value;
                 if row.key
                     != dependency_by_downstream_key(
                         dependency.downstream_mv_id,
@@ -1109,7 +995,7 @@ impl ReadRepository<'_> {
                 &dependencies,
             )?;
             drop(projection);
-            let inventory = keyed::bounded_keyed_inventory(&mut tx, bound.inventory).await?;
+            let inventory = keyed::projection_inventory(&mut tx).await?;
             classify(&mut dependencies, &inventory);
             Ok(dependencies)
         }
@@ -1143,10 +1029,7 @@ impl ReadRepository<'_> {
         loaded: &keyed::LoadedKeyedMvProjection,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
         let current = self
-            .find_keyed_by_target(
-                &loaded.projection.facts.target(),
-                crate::persistence::validation::PersistenceDecodeBudget::default(),
-            )
+            .find_keyed_by_target(&loaded.projection.facts.target())
             .await?;
         if current.as_ref().map(|v| &v.version) != Some(&loaded.version) {
             return Err(MvRepositoryError::new(
@@ -1365,10 +1248,7 @@ impl WriteRepository<'_> {
         })
         .await?;
         self.read_repository()
-            .find_keyed_by_target(
-                &target,
-                crate::persistence::validation::PersistenceDecodeBudget::default(),
-            )
+            .find_keyed_by_target(&target)
             .await?
             .ok_or_else(|| corruption("installed keyed projection is missing"))
     }
@@ -1472,13 +1352,9 @@ impl WriteCommand for InstallProjection {
                         "keyed projection changed before CAS",
                     )));
                 }
-                let stored = codec::decode_keyed_projection(
-                    &root,
-                    &record.value,
-                    crate::persistence::validation::PersistenceDecodeBudget::default(),
-                )
-                .map_err(|error| T::from_store(invalid_state_store(error)))?
-                .value;
+                let stored = codec::decode_keyed_projection(&root, &record.value)
+                    .map_err(|error| T::from_store(invalid_state_store(error)))?
+                    .value;
                 if stored.mv_id != expected.projection.mv_id || stored.facts.target() != target {
                     return Err(T::from_store(conflict_state_store(
                         "keyed projection root identity differs",
@@ -1574,13 +1450,9 @@ impl WriteCommand for DeleteProjection {
                 "keyed MV root changed before delete",
             )));
         }
-        let current = codec::decode_keyed_projection(
-            &key,
-            &row.value,
-            crate::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .map_err(|error| T::from_store(invalid_state_store(error)))?
-        .value;
+        let current = codec::decode_keyed_projection(&key, &row.value)
+            .map_err(|error| T::from_store(invalid_state_store(error)))?
+            .value;
         if current.facts.source_revision() != expected.projection.facts.source_revision() {
             return Err(T::from_store(conflict_state_store(
                 "keyed MV source changed before delete",

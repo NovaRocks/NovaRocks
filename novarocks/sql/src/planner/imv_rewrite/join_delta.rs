@@ -1242,6 +1242,7 @@ fn is_iceberg_row_identity_metadata_output(column: &OutputColumn) -> bool {
         || column
             .name
             .eq_ignore_ascii_case(crate::common::ICEBERG_LAST_UPDATED_SEQ_COL)
+        || super::target_locator::is_target_file_metadata(&column.name)
 }
 
 pub(crate) fn mark_delta_scan(
@@ -1483,6 +1484,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::Intersect(intersect) => intersect.output_columns.clone(),
         LogicalPlanKind::Except(except) => except.output_columns.clone(),
         LogicalPlanKind::Values(values) => values.columns.clone(),
+        LogicalPlanKind::SystemTable(table) => table.columns.clone(),
         LogicalPlanKind::GenerateSeries(generate) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: generate.column_name.clone(),

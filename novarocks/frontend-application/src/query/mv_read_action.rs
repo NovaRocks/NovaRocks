@@ -41,7 +41,7 @@ use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
     management::ManagementEntrance,
     persistence::dependency::StoredMvDependency,
-    readiness::{ListedKeyedMvProjection, MvBoundedKeyedProjectionInventory},
+    readiness::{ListedKeyedMvProjection, MvKeyedProjectionInventory},
     repository::MvRepositoryError,
 };
 use novarocks_query_application::{
@@ -104,7 +104,7 @@ struct Body {
     show: Option<(Option<String>, MvShowStatement)>,
     explain_lines: Option<Vec<String>>,
     turn: Turn,
-    inventory: Option<MvBoundedKeyedProjectionInventory>,
+    inventory: Option<MvKeyedProjectionInventory>,
     next: Option<Result<Option<ListedKeyedMvProjection>, MvRepositoryError>>,
     listed: Option<ListedKeyedMvProjection>,
     selection: Option<MvShowRowSelection>,

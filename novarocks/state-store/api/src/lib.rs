@@ -52,8 +52,7 @@ pub use execution::{
     StateStoreOriginalUnsupported, StateStoreReadExecution,
 };
 pub use limits::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
-    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
+    DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, StateStoreCapacity, StateStoreLimits,
 };
 pub use novarocks_resource_contract::SharedDependency;
 pub use provider::{

@@ -23,9 +23,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(test)]
+use crate::iceberg::spec::FormatVersion;
 use crate::iceberg::spec::{
-    DataContentType, FormatVersion, ManifestContentType, ManifestFile, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, Summary,
+    DataContentType, ManifestContentType, ManifestFile, Operation, Snapshot, SnapshotReference,
+    SnapshotRetention, Summary,
 };
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
@@ -45,24 +47,21 @@ impl super::staging::Preparer for OverwritePreparer {
         intent: &super::model::OperationIntent,
     ) -> crate::iceberg::Result<super::staging::PreparedChange> {
         validate_added_data(intent)?;
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
-        let removed: Vec<_> = inputs.live_set().await?.values().cloned().collect();
+        let (sources, live) = view.observe_live_sources().await?;
+        let removed = live.values().collect::<Vec<_>>();
         if removed.is_empty() && intent.changes().added.is_empty() && intent.summary().is_empty() {
             return Ok(super::staging::PreparedChange::default());
         }
         let snapshot_id = super::staging::new_snapshot_id(view.metadata());
-        let mut manifests = write_live_entry_groups(
+        let added = write_added_intent_data(view, intent, snapshot_id).await?;
+        let manifests = super::manifest_transform::ordinary_manifests(
             view,
             snapshot_id,
-            removed.iter().cloned().map(|e| (e, true)).collect(),
+            sources.as_ref(),
+            &removed,
+            added,
         )
         .await?;
-        manifests.extend(write_added_intent_data(view, intent, snapshot_id).await?);
         let operation = match (intent.changes().added.is_empty(), removed.is_empty()) {
             (true, true) | (false, true) => Operation::Append,
             (true, false) => Operation::Delete,
@@ -72,7 +71,7 @@ impl super::staging::Preparer for OverwritePreparer {
         // Every old entry is removed, so the new row total is fully known even
         // when the parent's total includes already-deleted rows or is absent.
         summary.insert("total-records".into(), summary["added-records"].clone());
-        prepare_snapshot_change(
+        prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,
@@ -162,86 +161,27 @@ pub(crate) async fn write_added_intent_data(
     Ok(manifests)
 }
 
-/// Carry true entry facts under their original partition spec. Assigned and
-/// unassigned data groups stay separate so historic first assignment cannot
-/// consume a second range for entries whose row IDs already exist.
-pub(crate) async fn write_live_entry_groups(
+/// Ordinary layout adds the standard manifest counts without altering row/file effects.
+pub(crate) async fn prepare_ordinary_snapshot_change(
     view: &super::staging::StagedView<'_>,
+    intent: &super::model::OperationIntent,
     snapshot_id: i64,
-    entries: Vec<(super::dependency::LiveEntry, bool)>,
-) -> crate::iceberg::Result<Vec<ManifestFile>> {
-    let mut groups: BTreeMap<(i32, bool, bool, bool), Vec<super::dependency::LiveEntry>> =
-        BTreeMap::new();
-    for (entry, deleted) in entries {
-        let is_data = entry.file.content_type() == DataContentType::Data;
-        let assigned = !deleted && is_data && entry.frozen.facts().first_row_id.is_some();
-        groups
-            .entry((
-                entry.frozen.facts().partition_spec_id,
-                is_data,
-                deleted,
-                assigned,
-            ))
-            .or_default()
-            .push(entry);
-    }
-    let mut manifests = Vec::new();
-    let metadata = view.metadata();
-    for ((spec_id, is_data, deleted, assigned), entries) in groups {
-        let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
-            crate::iceberg::Error::new(
-                crate::iceberg::ErrorKind::DataInvalid,
-                format!("Live entry references missing partition spec {spec_id}"),
-            )
-        })?;
-        let first = if assigned {
-            entries
-                .iter()
-                .filter_map(|e| e.frozen.facts().first_row_id)
-                .min()
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Assigned row ID is negative",
-                    )
-                })?
-        } else {
-            None
-        };
-        let mut manifest = super::staging::write_manifest(
-            view.artifacts(),
-            metadata.format_version(),
-            snapshot_id,
-            metadata.current_schema().clone(),
-            spec.as_ref().clone(),
-            if is_data {
-                ManifestContentType::Data
-            } else {
-                ManifestContentType::Deletes
-            },
-            entries.into_iter().map(|entry| {
-                if deleted {
-                    super::staging::ManifestEntryWrite::Deleted {
-                        file: entry.file,
-                        frozen: entry.frozen,
-                    }
-                } else {
-                    super::staging::ManifestEntryWrite::Existing {
-                        file: entry.file,
-                        frozen: entry.frozen,
-                    }
-                }
-            }),
-        )
-        .await?;
-        if metadata.format_version() == FormatVersion::V3 && assigned {
-            manifest.first_row_id = first;
-        }
-        manifests.push(manifest);
-    }
-    Ok(manifests)
+    operation: Operation,
+    manifests: super::manifest_transform::OrdinaryManifests,
+    mut properties: HashMap<String, String>,
+    truncate_full_table: bool,
+) -> crate::iceberg::Result<super::staging::PreparedChange> {
+    let manifests = manifests.into_snapshot_manifests(&mut properties);
+    prepare_snapshot_change(
+        view,
+        intent,
+        snapshot_id,
+        operation,
+        manifests,
+        properties,
+        truncate_full_table,
+    )
+    .await
 }
 
 /// Shared snapshot assembly uses the actual successful manifest-list allocation.
@@ -362,34 +302,24 @@ pub(crate) fn set_physical_rows_after_removal(
 /// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
 pub(crate) fn snapshot_file_summary(
     added: &[super::model::AddedContent],
-    removed: &[super::dependency::LiveEntry],
+    removed: &[&super::manifest_sources::LocatedEntry],
 ) -> crate::iceberg::Result<HashMap<String, String>> {
     let mut counters = BTreeMap::<&str, u64>::new();
-    for (file, is_added) in added
-        .iter()
-        .map(|a| (a.file(), true))
-        .chain(removed.iter().map(|e| (&e.file, false)))
-    {
-        let size = if file.content_type() == DataContentType::PositionDeletes
-            && file.file_format() == crate::iceberg::spec::DataFileFormat::Puffin
-        {
-            file.content_size_in_bytes()
-                .ok_or_else(|| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Deletion vector has no blob size",
-                    )
-                })?
-                .try_into()
-                .map_err(|_| {
-                    crate::iceberg::Error::new(
-                        crate::iceberg::ErrorKind::DataInvalid,
-                        "Deletion vector blob size is negative",
-                    )
-                })?
-        } else {
-            file.file_size_in_bytes()
-        };
+    let additions = added.iter().map(|added| {
+        let file = added.file();
+        super::row_delta_dv_metadata::logical_file_size(file)
+            .map(|size| (file.content_type(), file.record_count(), size, true))
+    });
+    let removals = removed.iter().map(|entry| {
+        Ok((
+            entry.content_type,
+            entry.frozen.facts().record_count,
+            entry.logical_size,
+            false,
+        ))
+    });
+    for effect in additions.chain(removals) {
+        let (content, records, size, is_added) = effect?;
         let mut bump = |key, value| -> crate::iceberg::Result<()> {
             let total = counters.entry(key).or_default();
             *total = total.checked_add(value).ok_or_else(|| {
@@ -408,7 +338,7 @@ pub(crate) fn snapshot_file_summary(
             },
             size,
         )?;
-        match file.content_type() {
+        match content {
             DataContentType::Data => {
                 bump(
                     if is_added {
@@ -424,7 +354,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "deleted-records"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
             DataContentType::PositionDeletes => {
@@ -450,7 +380,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "removed-position-deletes"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
             DataContentType::EqualityDeletes => {
@@ -476,7 +406,7 @@ pub(crate) fn snapshot_file_summary(
                     } else {
                         "removed-equality-deletes"
                     },
-                    file.record_count(),
+                    records,
                 )?;
             }
         }
@@ -1563,7 +1493,20 @@ pub(crate) mod preparer_tests {
             .find(|e| e.data_file().file_path() == "s3://b/p2.parquet")
             .unwrap();
         assert_eq!(survivor.status, ManifestStatus::Existing);
-        assert_eq!(survivor.data_file().first_row_id(), Some(0));
+        assert_eq!(survivor.data_file().first_row_id(), None);
+        let read = fixture.operation.begin_attempt().unwrap();
+        let mut inputs = super::super::dependency::ValidationInputs::new(
+            &after,
+            after.current_snapshot_id(),
+            &read,
+        );
+        let live = inputs.live_set().await.unwrap();
+        let survivor_id = super::super::model::EntryIdentity::DataFile {
+            path: "s3://b/p2.parquet".into(),
+        };
+        // The retained V2 object still has null on disk. The first V3 list
+        // allocated the two new rows before the five historical survivors.
+        assert_eq!(live[&survivor_id].frozen.facts().first_row_id, Some(2));
         assert_eq!(survivor.sequence_number, Some(1));
         assert_eq!(survivor.file_sequence_number, Some(1));
     }
@@ -1719,6 +1662,205 @@ pub(crate) mod preparer_tests {
         assert_eq!(old.data_file().first_row_id(), None);
         assert_eq!(old.sequence_number, Some(1));
         assert_eq!(old.file_sequence_number, Some(1));
+    }
+
+    #[tokio::test]
+    async fn ordinary_manifest_counts_exclude_intermediates_and_preserve_file_effects() {
+        use crate::commit::fast_append::FastAppendPreparer;
+        use crate::commit::model::ArtifactWriter;
+        use crate::iceberg::spec::{Literal, Transform};
+
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let base = fixture.metadata(FormatVersion::V3);
+        let old_spec_id = base.default_partition_spec_id();
+        let old = AddedContent::new_logical_data(
+            data("s3://b/historical.parquet", 3, Struct::empty()),
+            old_spec_id,
+        )
+        .unwrap();
+        let intent = fixture.intent(&base, "main", vec![old]);
+        let (base, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let current_spec = PartitionSpec::builder(base.current_schema().clone())
+            .add_partition_field("id", "partition_id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap()
+            .into_unbound();
+        let mut base = base
+            .into_builder(None)
+            .add_partition_spec(current_spec)
+            .unwrap()
+            .set_default_partition_spec(-1)
+            .unwrap()
+            .set_properties(HashMap::from([(
+                "commit.manifest-merge.enabled".into(),
+                "false".into(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let current_spec_id = base.default_partition_spec_id();
+        let added = |path, records, partition| {
+            AddedContent::new_logical_data(
+                data(
+                    path,
+                    records,
+                    Struct::from_iter([Some(Literal::long(partition))]),
+                ),
+                current_spec_id,
+            )
+            .unwrap()
+        };
+        for file in [
+            added("s3://b/a.parquet", 2, 1_i64),
+            added("s3://b/b.parquet", 5, 2_i64),
+        ] {
+            let intent = fixture.intent(&base, "main", vec![file]);
+            (base, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        }
+        let before = crate::manifest::load_manifest_list(
+            base.current_snapshot().unwrap(),
+            attempt.file_io(),
+            &base,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.entries().len(), 3);
+        let historical = before
+            .entries()
+            .iter()
+            .find(|descriptor| descriptor.partition_spec_id == old_spec_id)
+            .unwrap();
+        let base = base
+            .into_builder(None)
+            .set_properties(HashMap::from([
+                ("commit.manifest-merge.enabled".into(), "true".into()),
+                ("commit.manifest.min-count-to-merge".into(), "2".into()),
+            ]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = fixture.intent(&base, "main", vec![added("s3://b/c.parquet", 7, 3)]);
+        let (after_append, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let snapshot = after_append.current_snapshot().unwrap();
+        let after = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_append)
+            .await
+            .unwrap();
+        assert_eq!(after.entries().len(), 2);
+        assert!(after.entries().contains(historical));
+        let merged = after
+            .entries()
+            .iter()
+            .find(|descriptor| descriptor.partition_spec_id == current_spec_id)
+            .unwrap();
+        assert_eq!(merged.added_snapshot_id, snapshot.snapshot_id());
+        assert!(
+            before
+                .entries()
+                .iter()
+                .all(|old| old.manifest_path != merged.manifest_path)
+        );
+        for (property, expected) in [
+            ("manifests-created", "1"),
+            ("manifests-kept", "1"),
+            ("manifests-replaced", "2"),
+            ("added-data-files", "1"),
+            ("added-records", "7"),
+            ("deleted-data-files", "0"),
+            ("total-records", "17"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
+
+        let intent = fixture.intent(
+            &after_append,
+            "main",
+            vec![added("s3://b/replacement.parquet", 11, 4)],
+        );
+        let (after_overwrite, _) = fixture
+            .stage(after_append, &intent, &OverwritePreparer)
+            .await;
+        let snapshot = after_overwrite.current_snapshot().unwrap();
+        let outputs =
+            crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_overwrite)
+                .await
+                .unwrap();
+        assert_eq!(outputs.entries().len(), 2);
+        assert!(
+            outputs
+                .entries()
+                .iter()
+                .all(|descriptor| descriptor.added_snapshot_id == snapshot.snapshot_id())
+        );
+        assert!(outputs.entries().iter().all(|descriptor| {
+            after
+                .entries()
+                .iter()
+                .all(|old| old.manifest_path != descriptor.manifest_path)
+        }));
+        for (property, expected) in [
+            ("manifests-created", "2"),
+            ("manifests-kept", "0"),
+            ("manifests-replaced", "2"),
+            ("added-data-files", "1"),
+            ("added-records", "11"),
+            ("deleted-data-files", "4"),
+            ("deleted-records", "17"),
+            ("total-records", "11"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
+
+        let aged_off = outputs
+            .entries()
+            .iter()
+            .find(|manifest| manifest.partition_spec_id == old_spec_id)
+            .unwrap();
+        assert!(!aged_off.has_added_files() && !aged_off.has_existing_files());
+        let base = after_overwrite
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                "commit.manifest-merge.enabled".into(),
+                "false".into(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let intent = fixture.intent(&base, "main", vec![added("s3://b/d.parquet", 13, 5)]);
+        let (after_age_off, _) = fixture.stage(base, &intent, &FastAppendPreparer).await;
+        let snapshot = after_age_off.current_snapshot().unwrap();
+        let final_list =
+            crate::manifest::load_manifest_list(snapshot, attempt.file_io(), &after_age_off)
+                .await
+                .unwrap();
+        assert_eq!(final_list.entries().len(), 2);
+        assert!(!final_list.entries().contains(aged_off));
+        for (property, expected) in [
+            ("manifests-created", "1"),
+            ("manifests-kept", "1"),
+            ("manifests-replaced", "0"),
+            ("added-data-files", "1"),
+            ("added-records", "13"),
+            ("total-records", "24"),
+        ] {
+            assert_eq!(
+                snapshot.summary().additional_properties[property],
+                expected,
+                "{property}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -54,6 +54,6 @@ cannot create that target.
 
 `suite.toml` 的 `case_input` 只允许这一个固定 recipe。runner 在纯定义读取和选择后，使用原运行的 budget、storage、namespace 及访问投影调用固定的 `fixture.py prepare` 路径。准备保持原 Spark CREATE/INSERT/DELETE/branch/tag 顺序，以真实 SDK metadata 冻结唯一最早的 append snapshot ID、table UUID 和 metadata location；来源与实际输入字节的 hash 随 receipt 保存。
 
-q1 的 `verify-prepared` 核验该 receipt 及真实准备结果，q11 读取 metadata 并核验同一 ID，q12 使用其 numeric `VERSION AS OF`，继续比较原来的三行。剩余 SQL、38 个负例和 11 段旧期望保留。普通发现和 dry-run 不创建这些数据；没有可绑定输入时明确保留未绑定事实。
+q1 的 `verify-prepared` 核验该 receipt 及真实准备结果，q11 读取 metadata 并核验同一 ID，q12 使用其 numeric `VERSION AS OF`，继续比较原来的三行。当前资产共 61 步，保留 38 个拒绝断言；q57 改用标准 MV 系统表，q58 保留表列举，q59 改用 VIEW 类型过滤，HMS 不支持视图列举时为零行。改写期望仅作静态核对，未运行或 record；其余既有期望不重新录制。普通发现和 dry-run 不创建这些数据；没有可绑定输入时明确保留未绑定事实。
 
-准备之前先持久登记 intent；清理在首次派发前登记 attempt。正常 q58 清理与公共尾部共同遵守一次派发合同，失败或 Unknown 保留原件和诊断。远端 child 的 settlement receipt 不代替 host 进程组或 Server 退出证明；硬退出、缺失 receipt 和过期预算均不能补成成功。`case_input` 绑定固定 recipe，runner 使用其既有准备、核验和清理动作。
+准备之前先持久登记 intent；清理在首次派发前登记 attempt。正常 q60 清理、q61 删除 catalog 与公共尾部共同遵守一次派发合同，失败或 Unknown 保留原件和诊断。远端 child 的 settlement receipt 不代替 host 进程组或 Server 退出证明；硬退出、缺失 receipt 和过期预算均不能补成成功。`case_input` 绑定固定 recipe，runner 使用其既有准备、核验和清理动作。

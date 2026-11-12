@@ -38,8 +38,6 @@ use crate::persistence::definition::{
 };
 use crate::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 
-use crate::persistence::validation::PersistenceDecodeBudget;
-
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};
 
@@ -282,17 +280,16 @@ fn decode_document_revision(value: &str, subject: &str) -> Result<DocumentRevisi
         .map_err(|error| format!("decode MV Accelerator {subject}: {error}"))
 }
 
-/// Bounded structural check precedes the owned Avro/serde dependency datum.
-pub(crate) fn decode_dependency_with_budget(
+/// Structural check precedes the owned Avro/serde dependency datum.
+pub(crate) fn decode_dependency(
     key: &Key,
     value: &Value,
-    working_set_bytes: usize,
 ) -> Result<DecodedMvRecord<crate::persistence::dependency::StoredMvDependency>, String> {
     decode_record_checked(key, value, |kind, schema_id, payload| {
         if kind != MvRecordKind::Dependency || schema_id != 3 {
-            return Err("bounded MV dependency decode requires the registered V3 schema".into());
+            return Err("MV dependency decode requires the registered V3 schema".into());
         }
-        preflight::dependency_v3(payload, working_set_bytes)
+        preflight::dependency_v3(payload)
     })
 }
 
@@ -345,7 +342,7 @@ where
             if !matches!(schema_id, 3 | 4) {
                 return Err("MV projection preflight requires a registered schema".into());
             }
-            preflight::projection(payload, PersistenceDecodeBudget::default(), schema_id == 4)?;
+            preflight::projection(payload, schema_id == 4)?;
         }
         Ok(())
     })
@@ -504,17 +501,15 @@ pub fn encode_keyed_projection(
 pub fn decode_keyed_projection(
     key: &Key,
     value: &Value,
-    budget: PersistenceDecodeBudget,
 ) -> Result<DecodedMvRecord<crate::persistence::keyed_documents::StoredKeyedMvProjection>, String> {
     use crate::persistence::{codec::keyed::*, keyed_documents::*};
     use novarocks_spi::connector::{ConnectorSnapshotRecord, SnapshotFileTotals};
-    let mut documents = budget;
     let decoded: DecodedMvRecord<StoredMvProjectionAvro> =
         decode_record_checked(key, value, |kind, schema, payload| {
             if kind != MvRecordKind::Projection || schema != 4 {
                 return Err("legacy MV projection cannot be read through the keyed API".into());
             }
-            documents = preflight::projection(payload, budget, true)?;
+            preflight::projection(payload, true)?;
             Ok(())
         })?;
     let d = decoded.value;
@@ -524,16 +519,15 @@ pub fn decode_keyed_projection(
     let binding = d
         .binding
         .ok_or("legacy MV projection cannot be read through the keyed API")?;
-    let definition = decode_definition(&d.definition, documents).map_err(|e| e.to_string())?;
+    let definition = decode_definition(&d.definition).map_err(|e| e.to_string())?;
     let interpretation =
-        decode_keyed_interpretation(&d.interpretation, documents).map_err(|e| e.to_string())?;
-    let binding = decode_binding(&binding, documents).map_err(|e| e.to_string())?;
+        decode_keyed_interpretation(&d.interpretation).map_err(|e| e.to_string())?;
+    let binding = decode_binding(&binding).map_err(|e| e.to_string())?;
     let versions =
         build_keyed_versions(&definition, &interpretation, binding).map_err(|e| e.to_string())?;
     let source: MvAcceleratorSourceRevision = d.source_revision.try_into()?;
     let metadata_version: ConnectorCommittedVersion = d.metadata_version.try_into()?;
-    let configuration =
-        decode_configuration(&d.configuration, documents).map_err(|e| e.to_string())?;
+    let configuration = decode_configuration(&d.configuration).map_err(|e| e.to_string())?;
     let publication = d
         .publication
         .as_ref()

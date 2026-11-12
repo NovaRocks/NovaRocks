@@ -165,7 +165,7 @@ fn drive_dispatch_cut(budget: usize) -> (DispatchTrace, bool) {
         request.valid_for(),
     );
 
-    let grant = QueuedInputGrantRef::new(id(20), SendGeneration::new(action(20)));
+    let grant = QueuedInputGrantRef::new(id(20), SendGeneration::new(action(20)), 64);
     let intent = queue_establish(&mut core.execution, target, grant);
     let establish_authorization = AttemptAuthorizationRef::new(id(20));
     authorize(
@@ -414,7 +414,7 @@ fn authorize_queued_establish(
     let action = AttemptActionId::new(id(sequence));
     let token = AttemptRequestToken::new(id(sequence));
     let guard = AttemptAuthorizationRef::new(id(sequence));
-    let grant = QueuedInputGrantRef::new(id(sequence), SendGeneration::new(action));
+    let grant = QueuedInputGrantRef::new(id(sequence), SendGeneration::new(action), 64);
     let intent = queue_establish(&mut core.execution, participation, grant);
     assert!(matches!(
         core.authorize_candidate(&intent, token, action).unwrap(),
@@ -1022,7 +1022,7 @@ impl DrainTrace {
             execution.apply_dispatched_reply(&ticket).1.unwrap();
 
             let action = self.action();
-            let grant = QueuedInputGrantRef::new(id(self.next), SendGeneration::new(action));
+            let grant = QueuedInputGrantRef::new(id(self.next), SendGeneration::new(action), 64);
             let intent = queue_establish(&mut self.core.execution, participation, grant);
             let OperationIntent::EstablishParticipation {
                 initial_lease_sequence,
@@ -1089,7 +1089,7 @@ impl DrainTrace {
             else {
                 panic!("expected exact original Create admission for {task}");
             };
-            let grant = QueuedInputGrantRef::new(id(self.next), generation);
+            let grant = QueuedInputGrantRef::new(id(self.next), generation, 64);
             assert!(matches!(
                 self.core
                     .execution
@@ -1364,7 +1364,7 @@ impl DrainTrace {
         else {
             panic!("expected exact edge or cancel admission");
         };
-        let grant = QueuedInputGrantRef::new(id(self.next), generation);
+        let grant = QueuedInputGrantRef::new(id(self.next), generation, 64);
         let result = self
             .core
             .execution
@@ -1878,7 +1878,7 @@ fn strict_drain_preserves_original_create_split_and_late_exchange_open() {
         else {
             panic!("expected the exact normal Quiesce admission after all strict terminals");
         };
-        let grant = QueuedInputGrantRef::new(id(trace.next), generation);
+        let grant = QueuedInputGrantRef::new(id(trace.next), generation, 64);
         assert!(matches!(
             trace
                 .core

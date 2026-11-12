@@ -37,6 +37,28 @@ pub(super) fn plan_relation_scoped(
     control: &dyn PureCompileControl,
 ) -> Result<LogicalPlanNode, SqlCompileError> {
     match relation {
+        Relation::SystemTable {
+            declaration,
+            output_columns,
+            ..
+        } => {
+            let columns = output_columns
+                .iter()
+                .map(|column| column.planner_column())
+                .collect::<Vec<_>>();
+            let required_columns = (0..columns.len()).collect();
+            Ok(LogicalPlanNode::new(
+                LogicalPlanKind::SystemTable(
+                    crate::planner::system_relation::PlanSystemTableNode {
+                        declaration,
+                        columns,
+                        required_columns,
+                    },
+                ),
+                vec![],
+                None,
+            ))
+        }
         Relation::Scan(scan) => {
             // G1: reuse the ColumnIds the analyzer already minted for this
             // table's columns (carried on `scan.column_ids`). Minting fresh

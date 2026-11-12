@@ -49,7 +49,7 @@ impl IcebergRefCommandExecutor {
         statement: &novarocks_sql::semantic::command::AlterIcebergTableSqlCommand,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<StatementResult, String> {
+    ) -> Result<StatementResult, novarocks_query_application::api::CommandError> {
         crate::mv::domain::ref_flow::execute_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),

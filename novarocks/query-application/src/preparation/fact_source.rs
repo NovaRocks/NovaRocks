@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use novarocks_sql::compiler::{
     CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact, MaterializedViewNeed,
     ProviderReadFact, ProviderReadNeed, SqlCompileError, SqlFactBatch, SqlNeedBatch,
-    StatisticsFact, StatisticsNeed,
+    StatisticsFact, StatisticsNeed, SystemTableSnapshotFact, SystemTableSnapshotNeed,
 };
 
 use super::{final_plan::SqlCompletionFactSource, runtime_access::ReadAccessSink};
@@ -90,12 +90,22 @@ pub trait ProviderReadFactPort: Send + Sync {
     ) -> Result<Vec<ProviderReadFact>, String>;
 }
 
+/// Materializes optimized system-table occurrences in the original statement scope.
+#[async_trait]
+pub trait SystemTableSnapshotFactPort: Send + Sync {
+    async fn resolve_system_tables(
+        &self,
+        needs: &[SystemTableSnapshotNeed],
+    ) -> Result<Vec<SystemTableSnapshotFact>, SqlCompileError>;
+}
+
 /// The one place that knows which owner answers which kind of question.
 pub struct QueryCompletionFactSource<A> {
     catalog: Arc<dyn CatalogFactPort>,
     statistics: Arc<dyn StatisticsFactPort>,
     materialized_views: Arc<dyn MaterializedViewFactPort>,
     provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
+    system_tables: Arc<dyn SystemTableSnapshotFactPort>,
 }
 
 impl<A> QueryCompletionFactSource<A> {
@@ -104,12 +114,14 @@ impl<A> QueryCompletionFactSource<A> {
         statistics: Arc<dyn StatisticsFactPort>,
         materialized_views: Arc<dyn MaterializedViewFactPort>,
         provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
+        system_tables: Arc<dyn SystemTableSnapshotFactPort>,
     ) -> Self {
         Self {
             catalog,
             statistics,
             materialized_views,
             provider_reads,
+            system_tables,
         }
     }
 }
@@ -162,6 +174,36 @@ impl<A: Send + Sync> SqlCompletionFactSource for QueryCompletionFactSource<A> {
                 .and_then(|facts| expect_one_answer_each("materialized view", needs.len(), facts))
                 .map_err(Into::into)
                 .map(|facts| SqlFactBatch::MaterializedViews(facts.into_boxed_slice())),
+            SqlNeedBatch::ProviderInputs {
+                reads,
+                system_tables,
+            } => {
+                let reads = if reads.is_empty() {
+                    Vec::new()
+                } else {
+                    self.provider_reads
+                        .resolve_provider_reads(reads, taken)
+                        .await
+                        .and_then(|facts| {
+                            expect_one_answer_each("provider read", reads.len(), facts)
+                        })
+                        .map_err(SqlCompileError::from)?
+                };
+                let system_tables = if system_tables.is_empty() {
+                    Vec::new()
+                } else {
+                    let facts = self
+                        .system_tables
+                        .resolve_system_tables(system_tables)
+                        .await?;
+                    expect_one_answer_each("system table", system_tables.len(), facts)
+                        .map_err(SqlCompileError::from)?
+                };
+                Ok(SqlFactBatch::ProviderInputs {
+                    reads: reads.into_boxed_slice(),
+                    system_tables: system_tables.into_boxed_slice(),
+                })
+            }
             SqlNeedBatch::ProviderReads(needs) => self
                 .provider_reads
                 .resolve_provider_reads(needs, taken)
@@ -206,6 +248,7 @@ mod tests {
         ] {
             let source = QueryCompletionFactSource::new(
                 Arc::new(RefusingCatalog(original.clone())),
+                Arc::new(Silent),
                 Arc::new(Silent),
                 Arc::new(Silent),
                 Arc::new(Silent),
@@ -265,6 +308,16 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SystemTableSnapshotFactPort for Silent {
+        async fn resolve_system_tables(
+            &self,
+            _: &[SystemTableSnapshotNeed],
+        ) -> Result<Vec<SystemTableSnapshotFact>, SqlCompileError> {
+            Ok(Vec::new())
+        }
+    }
+
     /// An owner that answers fewer needs than it was asked leaves the compiler
     /// with a gap it cannot name, so the shortfall is refused here instead.
     #[test]
@@ -284,12 +337,17 @@ mod tests {
             Arc::new(Silent),
             Arc::new(Silent),
             Arc::new(Silent),
+            Arc::new(Silent),
         );
         let batches = [
             SqlNeedBatch::CatalogRelations(Box::default()),
             SqlNeedBatch::Statistics(Box::default()),
             SqlNeedBatch::MaterializedViews(Box::default()),
             SqlNeedBatch::ProviderReads(Box::default()),
+            SqlNeedBatch::ProviderInputs {
+                reads: Box::default(),
+                system_tables: Box::default(),
+            },
         ];
         let taken = ReadAccessSink::new();
         for needs in batches {
@@ -301,7 +359,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
             assert_eq!(answered.kind(), kind);
         }
-        // A lookup is not a freeze: routing four kinds of question took no
+        // A lookup is not a freeze: routing the declared question kinds took no
         // capability at all.
         assert!(taken.into_taken().is_empty());
     }

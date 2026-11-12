@@ -264,10 +264,19 @@ impl SendGeneration {
 pub struct QueuedInputGrantRef {
     record: NonZeroU64,
     generation: SendGeneration,
+    encoded_bytes: usize,
 }
 impl QueuedInputGrantRef {
-    pub const fn new(record: NonZeroU64, generation: SendGeneration) -> Self {
-        Self { record, generation }
+    pub const fn new(record: NonZeroU64, generation: SendGeneration, encoded_bytes: usize) -> Self {
+        Self {
+            record,
+            generation,
+            encoded_bytes,
+        }
+    }
+    /// Exact one-item method length authored by the original host codec.
+    pub const fn encoded_bytes(self) -> usize {
+        self.encoded_bytes
     }
     pub const fn record(self) -> NonZeroU64 {
         self.record

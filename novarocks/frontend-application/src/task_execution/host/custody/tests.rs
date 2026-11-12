@@ -2141,7 +2141,15 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             let FrontendEffect::Attempt(effect) = effect else {
                 unreachable!()
             };
-            self.admission.lock().unwrap().prepay(effect).unwrap()
+            self.admission
+                .lock()
+                .unwrap()
+                .prepay(
+                    effect,
+                    &self.requests.lock().unwrap(),
+                    novarocks_task_codec::TransportBudget::DEFAULT,
+                )
+                .unwrap()
         }
         fn bind_job(
             &mut self,
@@ -2499,7 +2507,6 @@ async fn original_admission_installs_wc_grant_and_payload_pin_before_publishing(
             panic!("publication installed the frozen request");
         };
         assert_eq!(original.envelope().operation_id(), key.operation);
-        assert_eq!(original.plan_carrier_bytes(), quote.plan_carrier_bytes);
         assert_eq!(original.queued_bytes(), quote.queued_bytes);
         assert!(original.same_original(&frozen));
         drop((original, frozen));

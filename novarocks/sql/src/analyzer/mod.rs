@@ -20,14 +20,6 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
-/// Share the catalog declaration author with checked inline relation creation.
-pub(crate) fn inline_column_value_type(
-    column: &novarocks_types::schema::ColumnDef,
-    control: &crate::compiler::SqlCompileControl,
-) -> Result<novarocks_type_contract::FunctionValueType, crate::compiler::SqlCompileError> {
-    helpers::column_value_type(column, control).map_err(Into::into)
-}
-
 /// A view TypeId carries no value NULL promises. Reuse the original recursive
 /// declaration author without changing the analyzed source or its domains.
 pub(crate) fn view_value_type(
@@ -370,7 +362,8 @@ fn analyze_with_factory_and_function_catalog_inner(
 
 /// Analysis state belongs to one SELECT, never to an enclosing query's children.
 struct GroupingAnalysis {
-    select_span: novarocks_parser::Span,
+    /// Identity only, never dereferenced; the scoped immutable AST outlives this state.
+    select: *const ast::Select,
     keys: Vec<ast::Expr>,
     repeat: bool,
     enabled: std::cell::Cell<bool>,
@@ -446,7 +439,7 @@ impl<'a> AnalyzerContext<'a> {
                 Vec::new()
             };
             std::rc::Rc::new(GroupingAnalysis {
-                select_span: select.span,
+                select,
                 keys,
                 repeat: repeat.is_some(),
                 enabled: std::cell::Cell::new(false),
@@ -890,7 +883,7 @@ impl<'a> AnalyzerContext<'a> {
                     .grouping_scope
                     .borrow()
                     .as_ref()
-                    .is_some_and(|state| state.select_span == s.span);
+                    .is_some_and(|state| std::ptr::eq(state.select, s.as_ref()));
                 if !same_select {
                     return self.with_grouping_scope(Some(s), |ctx| ctx.analyze_set_expr(set_expr));
                 }
@@ -1043,113 +1036,42 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
-    /// Analyze a VALUES clause.
+    /// Analyze ordinary syntax VALUES and the original checked materialized inputs.
     fn analyze_values(
         &self,
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
-        self.analyze_values_inner(Some(values), None)
-    }
-
-    fn analyze_inline_values(
-        &self,
-        values: &crate::catalog::SqlInlineRelation,
-    ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
-        self.analyze_values_inner(None, Some(values))
-    }
-
-    /// Syntax VALUES infer their fields. An already materialized relation
-    /// retains the original pools and starts from its complete declaration.
-    fn analyze_values_inner(
-        &self,
-        values: Option<&ast::Values>,
-        inline: Option<&crate::catalog::SqlInlineRelation>,
-    ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope();
-        let materialized = values.and_then(|values| {
-            self.materialized_values
-                .and_then(|source| source.rows_at(values))
-        });
-        let row_count = match inline {
-            Some(inline) => inline.rows,
-            None => materialized.map_or_else(
-                || values.expect("syntax VALUES input").rows.len(),
-                |rows| rows.len(),
-            ),
-        };
-        let mut resolved_rows = if inline.is_some() {
-            Vec::new()
-        } else {
-            Vec::with_capacity(row_count)
-        };
-        let mut column_types = match inline {
-            Some(inline) => inline
-                .columns
-                .iter()
-                .map(|column| column.value_type.clone())
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-        let mut batch = 0usize;
-        let mut batch_start = 0usize;
+        let materialized = self
+            .materialized_values
+            .and_then(|source| source.rows_at(values));
+        let row_count = materialized.map_or_else(|| values.rows.len(), |rows| rows.len());
+        let mut resolved_rows = Vec::with_capacity(row_count);
+        let mut column_types = Vec::new();
         for row_idx in 0..row_count {
             self.check_control()?;
-            let width = match inline {
-                Some(inline) => {
-                    while row_idx - batch_start
-                        >= inline.batches[batch][0].resource_facts().rows as usize
-                    {
-                        batch_start += inline.batches[batch][0].resource_facts().rows as usize;
-                        batch += 1;
-                        self.check_control()?;
-                    }
-                    inline.columns.len()
-                }
-                None => materialized.map_or_else(
-                    || values.expect("syntax VALUES input").rows[row_idx].len(),
-                    |rows| rows[row_idx].len(),
-                ),
-            };
+            let width =
+                materialized.map_or_else(|| values.rows[row_idx].len(), |rows| rows[row_idx].len());
             let mut resolved_row = Vec::with_capacity(width);
             for col_idx in 0..width {
                 self.check_control()?;
-                let typed = match (inline, materialized) {
-                    (Some(inline), _) => {
-                        let ordinal = u32::try_from(row_idx - batch_start).map_err(|_| {
-                            AnalyzeError::internal(
-                                "inline relation ordinal exceeds its checked pool",
-                            )
-                        })?;
-                        let value = inline.batches[batch][col_idx]
-                            .value(ordinal)
-                            .map_err(|error| AnalyzeError::internal(error.to_string()))?;
-                        TypedExpr {
-                            value_type: value.value_type().clone(),
-                            kind: ExprKind::Constant(value),
-                        }
+                let typed = if let Some(rows) = materialized {
+                    let value = &rows[row_idx][col_idx];
+                    TypedExpr {
+                        kind: ExprKind::Constant(value.clone()),
+                        value_type: value.value_type().clone(),
                     }
-                    (None, Some(rows)) => {
-                        let value = &rows[row_idx][col_idx];
-                        TypedExpr {
-                            kind: ExprKind::Constant(value.clone()),
-                            value_type: value.value_type().clone(),
-                        }
-                    }
-                    (None, None) => self.analyze_expr(
-                        &values.expect("syntax VALUES input").rows[row_idx][col_idx],
-                        &scope,
-                    )?,
+                } else {
+                    self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?
                 };
-                if inline.is_none() {
-                    if col_idx < column_types.len() {
-                        column_types[col_idx] = helpers::assignment_common_value_type(
-                            &column_types[col_idx],
-                            &typed.value_type,
-                            self.control,
-                        )?;
-                    } else {
-                        column_types.push(typed.value_type.clone());
-                    }
+                if col_idx < column_types.len() {
+                    column_types[col_idx] = helpers::assignment_common_value_type(
+                        &column_types[col_idx],
+                        &typed.value_type,
+                        self.control,
+                    )?;
+                } else {
+                    column_types.push(typed.value_type.clone());
                 }
                 resolved_row.push(typed);
             }
@@ -1160,20 +1082,11 @@ impl<'a> AnalyzerContext<'a> {
             .enumerate()
             .map(|(i, ty)| {
                 self.check_control()?;
-                let (name, field_name, value_type) = match inline {
-                    Some(inline) => {
-                        let name = inline.columns[i].name.to_string();
-                        (name.clone(), Some(name), ty.clone())
-                    }
-                    None => (
-                        format!("column_{i}"),
-                        None,
-                        helpers::with_nullability(ty.clone(), true),
-                    ),
-                };
+                let name = format!("column_{i}");
+                let value_type = helpers::with_nullability(ty.clone(), true);
                 let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
                 Ok(OutputColumn {
-                    field_name,
+                    field_name: None,
                     column_id,
                     name,
                     value_type,
@@ -2378,6 +2291,17 @@ impl<'a> AnalyzerContext<'a> {
         scope: &mut AnalyzerScope,
     ) -> Result<(), AnalyzeError> {
         match relation {
+            Relation::SystemTable {
+                alias,
+                output_columns,
+                ..
+            } => {
+                for column in output_columns {
+                    self.check_control()?;
+                    scope.add_field(Some(alias), column);
+                }
+                Ok(())
+            }
             Relation::Scan(scan) => {
                 let mut local_scope = self.new_scope();
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
@@ -5903,7 +5827,8 @@ mod tests {
                     || relation_contains_grouping_marker_literal(&join.right)
             }
             Relation::Unnest(unnest) => unnest.args.iter().any(contains_grouping_marker_literal),
-            Relation::Scan(_)
+            Relation::SystemTable { .. }
+            | Relation::Scan(_)
             | Relation::IcebergMetadataScan(_)
             | Relation::IcebergDeltaScan(_)
             | Relation::Subquery { .. }
@@ -6013,6 +5938,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nested_synthetic_selects_keep_their_own_grouping_analysis() {
+        struct SyntheticSelects;
+        impl ast::Fold for SyntheticSelects {
+            fn fold_select(&mut self, select: ast::Select) -> ast::Select {
+                let mut select = ast::fold_select(self, select);
+                select.span = novarocks_parser::Span::new(0, 0);
+                select
+            }
+        }
+
+        let query = parse_native_query(
+            "SELECT k, sum(g) AS total FROM \
+             (SELECT k, grouping(k) AS g FROM (VALUES (1), (2)) t(k) \
+              GROUP BY ROLLUP(k)) s GROUP BY k",
+        )
+        .unwrap();
+        let synthetic = ast::Fold::fold_query(&mut SyntheticSelects, query.clone());
+        let (expected, _, _) = analyze(&query, &TestCatalog, "default").unwrap();
+        let (actual, _, _) = analyze(&synthetic, &TestCatalog, "default").unwrap();
+        let output = |query: &ResolvedQuery| {
+            query
+                .output_columns
+                .iter()
+                .map(|column| {
+                    (
+                        column.field_name.clone(),
+                        column.value_type.data_type().clone(),
+                        column.value_type.nullable(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(output(&actual), output(&expected));
+        for resolved in [&expected, &actual] {
+            let QueryBody::Select(outer) = &resolved.body else {
+                panic!("outer SELECT");
+            };
+            assert_eq!(outer.group_by.len(), 1);
+            assert!(outer.repeat.is_none());
+            let Some(Relation::Subquery { query: inner, .. }) = &outer.from else {
+                panic!("derived SELECT");
+            };
+            let QueryBody::Select(inner) = &inner.body else {
+                panic!("inner SELECT");
+            };
+            let repeat = inner.repeat.as_ref().expect("inner ROLLUP");
+            assert_eq!(repeat.grouping_ids, vec![0, 1]);
+            assert_eq!(repeat.all_rollup_columns, vec!["k"]);
+            assert_eq!(repeat.grouping_fn_args.len(), 1);
+            assert_eq!(repeat.grouping_fn_args[0].1, vec!["k"]);
+            assert_eq!(
+                inner.projection[1].expr.value_type.data_type(),
+                &DataType::Int32
+            );
+        }
+    }
+
+    #[test]
+    fn same_location_selects_do_not_borrow_enclosing_grouping_keys() {
+        let mut outer = parse_native_query("SELECT a FROM (VALUES (1)) t(a) GROUP BY a").unwrap();
+        let mut inner =
+            parse_native_query("SELECT b, grouping(b) FROM (VALUES (1)) s(b) GROUP BY b").unwrap();
+        let ast::SetExpr::Select(outer_select) = outer.body.as_mut() else {
+            panic!("outer SELECT");
+        };
+        let ast::SetExpr::Select(inner_select) = inner.body.as_mut() else {
+            panic!("inner SELECT");
+        };
+        outer_select.span = novarocks_parser::Span::new(0, 0);
+        inner_select.span = novarocks_parser::Span::new(0, 0);
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let ctx = AnalyzerContext {
+            grouping_scope: Default::default(),
+            view_stack: Default::default(),
+            control: &control,
+            constant_policy: crate::constant::test_constant_policy(),
+            materialized_values: None,
+            catalog: &TestCatalog,
+            current_database: "default",
+            function_catalog: crate::functions::builtin_sql_function_catalog(),
+            sql_semantics: Default::default(),
+            factory: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::column_id::ColumnRefFactory::new(),
+            )),
+            ctes: Default::default(),
+            pending_ctes: Default::default(),
+            next_subquery_id: Default::default(),
+            next_lambda_slot_id: Default::default(),
+            collected_subqueries: Default::default(),
+            cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
+        };
+        ctx.with_grouping_scope(Some(outer_select), |ctx| {
+            let enclosing = ctx.grouping_scope.borrow().clone().unwrap();
+            let (body, columns) = ctx.analyze_set_expr(inner.body.as_ref())?;
+            assert_eq!(columns.len(), 2);
+            let QueryBody::Select(inner) = body else {
+                panic!("inner SELECT");
+            };
+            assert!(matches!(
+                inner.projection[1].expr.kind,
+                ExprKind::Literal(LiteralValue::Int(0))
+            ));
+            let restored = ctx.grouping_scope.borrow().clone().unwrap();
+            assert_eq!(restored.keys.len(), 1);
+            assert!(ast::SyntaxEq::syntax_eq(
+                &restored.keys[0],
+                &enclosing.keys[0]
+            ));
+            assert!(restored.calls.borrow().is_empty());
+            assert!(enclosing.calls.borrow().is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(ctx.grouping_scope.borrow().is_none());
     }
 
     #[test]

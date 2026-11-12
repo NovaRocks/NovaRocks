@@ -320,7 +320,7 @@ mod tests {
             .enqueue_reserved(
                 OperationIntent::AcquireParticipationAdmissionTicket(request),
                 execution.now,
-                QueuedInputGrantRef::new(id(sequence), generation),
+                QueuedInputGrantRef::new(id(sequence), generation, 64),
             )
             .unwrap();
         execution
@@ -395,7 +395,7 @@ mod tests {
             .unwrap();
         let operation = intent.operation_id();
         let generation = SendGeneration::new(AttemptActionId::new(id(200)));
-        let grant = QueuedInputGrantRef::new(id(201), generation);
+        let grant = QueuedInputGrantRef::new(id(201), generation, 64);
         execution
             .dispatcher
             .enqueue_reserved(intent, execution.now, grant)
@@ -616,7 +616,7 @@ mod tests {
                 let intent = queue_establish(
                     &mut execution,
                     participation,
-                    QueuedInputGrantRef::new(id(sequence + 10), generation),
+                    QueuedInputGrantRef::new(id(sequence + 10), generation, 64),
                 );
                 let batch = execution.dispatcher.take_batch().unwrap();
                 execution.dispatcher.accept_emitted(&batch, effect).unwrap();
@@ -783,7 +783,7 @@ mod tests {
         let generation = SendGeneration::new(AttemptActionId::new(id(2)));
         execution
             .dispatcher
-            .enqueue_reserved(intent, now, QueuedInputGrantRef::new(id(2), generation))
+            .enqueue_reserved(intent, now, QueuedInputGrantRef::new(id(2), generation, 64))
             .unwrap();
         execution
             .operation_targets

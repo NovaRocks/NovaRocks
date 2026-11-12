@@ -5,6 +5,10 @@ domain: [crate-boundary, provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0227
+    scope: "Fixed listing-capacity refusal in the all-name listing fallback; read-only entry, BASE TABLE typing, missing-table and metadata-I/O fallbacks remain active"
+    link: "ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md"
 partially-supersedes:
   - id: ADR-0174
     scope: "HMS H3 and H4 retention rows and their deletion conditions: both patches exit with the vendored HMS package, and the HMS consumer accepts read fallbacks instead of delivering an equivalent seam"

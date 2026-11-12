@@ -350,8 +350,11 @@ impl Cut {
         };
         assert_eq!(lane, operation.lane());
         assert_eq!(admitted.id, generation.admission_effect());
-        let grant =
-            QueuedInputGrantRef::new(id(2000 + generation.admission_effect().get()), generation);
+        let grant = QueuedInputGrantRef::new(
+            id(2000 + generation.admission_effect().get()),
+            generation,
+            1,
+        );
         let timer = self.actor(AttemptInput::Timer);
         assert!(self.advance(timer).await.is_none());
         let granted = self.step(

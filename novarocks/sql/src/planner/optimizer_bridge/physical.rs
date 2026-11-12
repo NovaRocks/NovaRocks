@@ -349,6 +349,9 @@ impl BridgeCtx<'_> {
                     output_columns: physical_join_output_columns(op.join_type, node)?,
                 }))
             }
+            Operator::PhysicalSystemTable(op) => Ok(PhysicalPlanKind::SystemTable(
+                crate::planner::system_relation::PhysicalSystemTableNode::planning(op.clone()),
+            )),
             Operator::PhysicalValues(op) => Ok(PhysicalPlanKind::Values(PlanValuesNode {
                 rows: op
                     .rows
@@ -679,6 +682,7 @@ fn validate_shape(node: &OptimizedOperatorNode) -> Result<(), String> {
     match &node.op {
         Operator::PhysicalScan(_)
         | Operator::PhysicalValues(_)
+        | Operator::PhysicalSystemTable(_)
         | Operator::PhysicalGenerateSeries(_)
         | Operator::PhysicalCTEConsume(_) => expect_arity(node, operator_name(&node.op), 0),
 
@@ -774,6 +778,7 @@ fn operator_name(op: &Operator) -> &'static str {
         Operator::PhysicalIntersect(_) => "PhysicalIntersect",
         Operator::PhysicalExcept(_) => "PhysicalExcept",
         Operator::PhysicalValues(_) => "PhysicalValues",
+        Operator::PhysicalSystemTable(_) => "PhysicalSystemTable",
         Operator::PhysicalGenerateSeries(_) => "PhysicalGenerateSeries",
         Operator::PhysicalTableFunction(_) => "PhysicalTableFunction",
         Operator::PhysicalAssertOneRow(_) => "PhysicalAssertOneRow",

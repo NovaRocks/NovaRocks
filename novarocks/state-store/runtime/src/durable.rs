@@ -308,7 +308,8 @@ mod tests {
         let record = TestRecord {
             payload: DurableOpaqueBytes::try_new(vec![0xff; 3]).expect("bounded payload"),
         };
-        let store = store(StateStoreLimits::default());
+        let store =
+            store(novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits());
         let encoded = store.encode(&record).expect("record is within its budget");
         assert_eq!(encoded.0.as_bytes().len(), TestRecord::ENCODED_LIMIT);
     }
@@ -325,11 +326,12 @@ mod tests {
             const ENCODED_LIMIT: usize = 10;
         }
 
-        let error = store(StateStoreLimits::default())
-            .encode(&OneByteOver {
-                payload: "leakproof",
-            })
-            .expect_err("record exceeds its budget");
+        let error =
+            store(novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits())
+                .encode(&OneByteOver {
+                    payload: "leakproof",
+                })
+                .expect_err("record exceeds its budget");
         assert_eq!(
             error,
             DurableRecordError::BudgetExceeded {
@@ -347,7 +349,7 @@ mod tests {
     fn state_store_limit_wins_when_it_is_tighter_than_record_limit() {
         let limits = StateStoreLimits {
             max_value_bytes: 19,
-            ..StateStoreLimits::default()
+            ..novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits()
         };
         let record = TestRecord {
             payload: DurableOpaqueBytes::try_new(vec![0xff; 3]).expect("bounded payload"),

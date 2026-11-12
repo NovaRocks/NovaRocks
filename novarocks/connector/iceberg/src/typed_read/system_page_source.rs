@@ -66,6 +66,7 @@ use crate::iceberg::spec::{
     ManifestFile, ManifestList, ManifestStatus, MapType, NestedField, PartitionSpec,
     PrimitiveLiteral, PrimitiveType, Schema, SnapshotRetention, StructType, TableMetadata, Type,
 };
+use crate::manifest::binding::EntrySequences;
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
@@ -849,10 +850,8 @@ impl<'a> FrozenMetadataReader<'a> {
     /// One manifest, parsed from its own bytes.
     ///
     /// `ManifestFile::load_manifest` is not used: it reads through a table
-    /// `FileIO` instead of this reader's access binding and range service, and
-    /// the inherited entry values it would have applied are applied explicitly
-    /// in [`ManifestEntryFacts::inherit`], where the inheritance rule is
-    /// visible instead of hidden.
+    /// `FileIO` instead of this reader's access binding and range service.
+    /// Row rendering binds sequence facts after reading the raw entries.
     async fn load_manifest(
         &mut self,
         manifest: &TrinoManifestFile,
@@ -956,40 +955,6 @@ struct ManifestEntryFacts {
     snapshot_id: Option<i64>,
     data_sequence_number: Option<i64>,
     file_sequence_number: Option<i64>,
-}
-
-/// Iceberg's initial sequence number, the value that marks a manifest written
-/// before sequence numbers were assigned.
-const INITIAL_SEQUENCE_NUMBER: i64 = 0;
-
-impl ManifestEntryFacts {
-    /// Apply the manifest-list inheritance the Iceberg spec defines.
-    ///
-    /// A null entry value is not "unknown": the spec says it is inherited from
-    /// the manifest that lists the file. Reproducing the rule here keeps the
-    /// values identical to the ones a catalog-side read would report.
-    fn inherit(
-        status: ManifestStatus,
-        snapshot_id: Option<i64>,
-        data_sequence_number: Option<i64>,
-        file_sequence_number: Option<i64>,
-        manifest: &TrinoManifestFile,
-    ) -> Self {
-        let inheritable = status == ManifestStatus::Added
-            || manifest.sequence_number() == INITIAL_SEQUENCE_NUMBER;
-        Self {
-            status: match status {
-                ManifestStatus::Existing => 0,
-                ManifestStatus::Added => 1,
-                ManifestStatus::Deleted => 2,
-            },
-            snapshot_id: snapshot_id.or(Some(manifest.added_snapshot_id())),
-            data_sequence_number: data_sequence_number
-                .or_else(|| inheritable.then(|| manifest.sequence_number())),
-            file_sequence_number: file_sequence_number
-                .or_else(|| inheritable.then(|| manifest.sequence_number())),
-        }
-    }
 }
 
 /// One materialized `$files` row: a manifest entry plus where it was found.
@@ -1108,13 +1073,22 @@ fn manifest_rows(
         if status_rule == EntryStatusRule::SkipDeleted && status == ManifestStatus::Deleted {
             continue;
         }
-        let facts = ManifestEntryFacts::inherit(
-            status,
-            entry.snapshot_id(),
-            entry.sequence_number(),
-            entry.file_sequence_number,
-            manifest_file,
+        let sequences = EntrySequences::resolve_from(
+            entry,
+            manifest_file.added_snapshot_id(),
+            manifest_file.sequence_number(),
+            false,
         );
+        let facts = ManifestEntryFacts {
+            status: match status {
+                ManifestStatus::Existing => 0,
+                ManifestStatus::Added => 1,
+                ManifestStatus::Deleted => 2,
+            },
+            snapshot_id: sequences.snapshot_id,
+            data_sequence_number: sequences.data_sequence,
+            file_sequence_number: sequences.file_sequence,
+        };
         let data_file = entry.data_file();
         let record_count = i64::try_from(data_file.record_count()).map_err(|_| {
             corrupt(format!(

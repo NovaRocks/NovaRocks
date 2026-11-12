@@ -511,6 +511,10 @@ pub(crate) struct IcebergCommitAttempt {
 }
 
 impl IcebergCommitAttempt {
+    pub(crate) fn io_window_width(&self) -> usize {
+        self.operation.inner.limits.io_requests as usize
+    }
+
     pub(crate) fn read_binding(&self) -> IcebergReadBinding {
         self.operation
             .inner

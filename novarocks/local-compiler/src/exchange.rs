@@ -286,7 +286,7 @@ fn lower_core_with_creation<H>(
         layout,
         input: CompiledExchangeInput {
             wire_layout,
-            role: crate::stream_sink::cut_role(cut.payload.role())?,
+            role: crate::stream_sink::cut_role(&cut.payload),
             delivery: crate::stream_sink::cut_delivery(cut.delivery),
             routing: match &cut.partitioning.destination {
                 Distribution::Hash { scheme, .. } => {

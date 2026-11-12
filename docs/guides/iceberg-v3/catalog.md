@@ -150,7 +150,7 @@ Hadoop 仅用于单写者测试，入口为 `novarocks/connector/iceberg/src/had
 
 **HMS 读取的三项回退。** HMS 直接使用上游 `iceberg-catalog-hms`，不维护补丁。上游做不到的三处，读取行为与 REST、Hadoop 不同：
 
-- **列表返回库中的全部名称。** `SHOW TABLES` 与 `information_schema.tables` 列出 Metastore 库中的全部条目，包括 Hive 表、Hive 视图与 Iceberg 视图。名称与 Trino 一致，类型不区分：`information_schema.tables` 把每个条目都标为 `BASE TABLE`，视图不会以 `VIEW` 出现。读取非 Iceberg 条目报 `No 'metadata_location' set on table`，并归为数据损坏；它表示该条目不是 Iceberg 表，不是 Iceberg 元数据损坏。列表上界按库中全部名称计数，Hive 表很多的库可能超出上界而整次报错。
+- **列表返回库中的全部名称。** `SHOW TABLES` 与 `information_schema.tables` 列出 Metastore 库中的全部条目，包括 Hive 表、Hive 视图与 Iceberg 视图。名称与 Trino 一致，类型不区分：`information_schema.tables` 把每个条目都标为 `BASE TABLE`，视图不会以 `VIEW` 出现。读取非 Iceberg 条目报 `No 'metadata_location' set on table`，并归为数据损坏；它表示该条目不是 Iceberg 表，不是 Iceberg 元数据损坏。列举不再按固定条目数或名字字节总量拒绝；完整枚举仍受原请求期限、取消与实际 I/O 资源约束。HMS 不支持视图列举，因此按 `table_type = 'VIEW'` 过滤时没有 VIEW 行，不因缺少这项能力报错。
 - **缺表报为服务不可用。** 读取不存在的表时，错误不是 `unknown table`，而是 `Unavailable` 类的 provider 错误：正文为 `Operation failed for hitting thrift error`，其后的错误来源中含 `NoSuchObjectException` 与表名。看到这一组合时先核对库名与表名；它表示缺表，不是 Metastore 故障。按错误类别自动重试的调用方可能会重试它。
 - **元数据读取不计入请求。** FE 读取 HMS 表的 metadata JSON、manifest list 与 manifest（包括元数据表与时间旅行规划）时，使用构造 catalog 时建立、不带请求上下文的 FileIO，不计入本次请求的存储准入、取消检查与依赖记账；取消查询要等在途读取结束。对 Metastore 的 Thrift 调用仍按请求准入，BE 读取数据文件不受影响。
 
@@ -160,12 +160,13 @@ Hadoop 仅用于单写者测试，入口为 `novarocks/connector/iceberg/src/had
 |---|---|
 | `SHOW TABLES FROM hms.sales` | `customers`、`orders`、`orders_v`，与 Trino 列出的名称一致 |
 | `SELECT table_name, table_type FROM hms.information_schema.tables WHERE table_schema = 'sales'` | 三行，均为 `BASE TABLE`；`orders_v` 的类型不准确 |
+| `SELECT table_name FROM hms.information_schema.tables WHERE table_schema = 'sales' AND table_type = 'VIEW'` | 零行；HMS 没有视图列举能力，条目类型回退仍保留 |
 | `SELECT * FROM hms.sales.orders` | 正常返回；FE 侧元数据读取不计入本次请求 |
 | `SELECT * FROM hms.sales.customers` | `No 'metadata_location' set on table`，归为数据损坏 |
 | `SELECT * FROM hms.sales.returns` | `Unavailable` 类 provider 错误，正文 `Operation failed for hitting thrift error`，来源中含 `NoSuchObjectException` |
 | `INSERT INTO hms.sales.orders ...` | 拒绝：只读兼容入口 |
 
-这三项是为不维护补丁而接受的回退，取舍与重新评估条件见 [ADR-0216](../../adr/ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md)。
+这三项是为不维护补丁而接受的回退，取舍与重新评估条件见 [HMS 版 ADR-0216](../../adr/ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md)。系统关系与无视图列举能力时的语义见 [ADR-0226](../../adr/ADR-0226-engine-metadata-through-typed-system-relations.md)，固定列举额度的退役范围见 [ADR-0227](../../adr/ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md)。
 
 Hive 的 provider 实现与 runtime 构造入口为 `catalog/hive.rs` 和 `catalog_runtime::build_hms_catalog`。本地 HMS fixture 由 `docker/iceberg-hive/` 管理，连接选定的版本化 REST fixture 网络供 Spark/对象存储访问。运行 `iceberg-hms` 前先按该目录操作说明启动 HMS。HMS 等外部 endpoint 尚在时，普通与 force catalog 删除均拒绝；先退出 HMS 自己的精确项目与连接。
 

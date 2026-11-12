@@ -646,6 +646,12 @@ impl<'a> TreeContext<'a> {
                     target.get()
                 ))?;
             }
+            novarocks_physical_plan::OutputRole::PositionShards { target, .. } => {
+                out.push(format_args!(
+                    "    ROLE: position-shards(target={})",
+                    target.get()
+                ))?;
+            }
             novarocks_physical_plan::OutputRole::Summary(kind) => {
                 out.push(format_args!(
                     "    ROLE: summary({}: {})",
@@ -1483,6 +1489,30 @@ impl TreeContext<'_> {
                     }
                 ))?;
             }
+            NodeKind::SystemRelation { data, .. } => {
+                let relation = self
+                    .node_annotation(fragment.id(), node.id, "sql.relation")
+                    .unwrap_or("system relation");
+                out.push(format_args!("{prefix}SYSTEM RELATION {relation}{stats}"))?;
+                for (key, label) in [
+                    ("sql.system.required_columns", "required columns"),
+                    ("sql.system.key_constraint", "key constraint"),
+                ] {
+                    if let Some(value) = self.node_annotation(fragment.id(), node.id, key) {
+                        out.push(format_args!("{pad}  {label}: {value}"))?;
+                    }
+                }
+                match data {
+                    novarocks_physical_plan::SystemRelationData::Deferred => {
+                        out.push(format_args!("{pad}     data deferred"))?
+                    }
+                    novarocks_physical_plan::SystemRelationData::Batches { batches, .. } => out
+                        .push(format_args!(
+                            "{pad}     snapshot batches: {}",
+                            batches.len()
+                        ))?,
+                }
+            }
             NodeKind::Values { rows } => {
                 out.push(format_args!("{prefix}VALUES ({} rows){stats}", rows.len()))?;
             }
@@ -1522,6 +1552,12 @@ impl TreeContext<'_> {
             }
             NodeKind::AssertOneRow(_) => {
                 out.push(format_args!("{prefix}ASSERT ONE ROW{stats}"))?;
+            }
+            NodeKind::PositionShard(spec) => {
+                out.push(format_args!(
+                    "{prefix}POSITION_SHARD_AGGREGATION(routes={}){stats}",
+                    spec.inputs.len(),
+                ))?;
             }
             NodeKind::ChangeEventExpand { events, .. } => {
                 out.push(format_args!(

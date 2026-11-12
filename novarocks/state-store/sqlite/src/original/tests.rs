@@ -23,7 +23,7 @@ use novarocks_query_application::cpu::{
 };
 use novarocks_state_store_api::{
     AttemptOutcome, CommitOutcome, Key, Precondition, StateStore, StateStoreBlockingOrigin,
-    StateStoreExecutionPort, StateStoreLimits, StateStoreOpenRequest, StateStoreOriginalOpen,
+    StateStoreExecutionPort, StateStoreOpenRequest, StateStoreOriginalOpen,
     StateStoreProviderFactory, StateStoreProviderInstance, Value,
 };
 use std::{
@@ -310,7 +310,7 @@ impl Rig {
 fn request() -> StateStoreOpenRequest {
     StateStoreOpenRequest {
         cluster_id: "original-custody".into(),
-        limits: StateStoreLimits::default(),
+        limits: crate::SQLITE_STATE_STORE_CAPACITY.limits(),
         deadline: Instant::now() + Duration::from_secs(5),
     }
 }
@@ -946,7 +946,7 @@ async fn instance_close_fixture() -> (
     let lifetime = Arc::downgrade(&store.lifetime);
     let descriptor = novarocks_state_store_api::StateStoreProviderDescriptor::new(
         crate::SQLITE_STATE_STORE_PROVIDER_ID,
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        crate::SQLITE_STATE_STORE_CAPACITY,
     );
     (
         temp,
@@ -1043,7 +1043,7 @@ async fn external_observation_cannot_drop_evidence_connection_outside_close_work
     let weak_evidence = Arc::downgrade(&value_store.evidence);
     let descriptor = novarocks_state_store_api::StateStoreProviderDescriptor::new(
         crate::SQLITE_STATE_STORE_PROVIDER_ID,
-        novarocks_state_store_api::MAX_KEY_BYTES,
+        crate::SQLITE_STATE_STORE_CAPACITY,
     );
     let mut instance = crate::provider::instance_from_store(descriptor, value_store);
     let external = instance.state_store().unwrap();
@@ -1300,7 +1300,7 @@ async fn cancelled_legacy_evidence_workers_keep_actual_connection_and_file_until
         let lifetime = Arc::downgrade(&value_store.lifetime);
         let descriptor = novarocks_state_store_api::StateStoreProviderDescriptor::new(
             crate::SQLITE_STATE_STORE_PROVIDER_ID,
-            novarocks_state_store_api::MAX_KEY_BYTES,
+            crate::SQLITE_STATE_STORE_CAPACITY,
         );
         let mut instance = crate::provider::instance_from_store(descriptor, value_store);
         let external = instance.state_store().unwrap();

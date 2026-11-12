@@ -119,7 +119,6 @@ fn flat() -> FlatPoolWriteLimits {
 pub fn encode_limits() -> PackageEncodeLimits {
     PackageEncodeLimits {
         source_retained_bytes: SOURCE,
-        max_wire_bytes: 64 * 1024 * 1024,
         views: TypeViewLimits {
             max_occurrences: 1_000_000,
             max_value_roots: 1_000_000,
@@ -190,7 +189,6 @@ pub fn encode_limits() -> PackageEncodeLimits {
         },
         reads: ProviderReadProjectionLimits {
             max_definitions: 100_000,
-            max_input_version_bytes: 1024,
             max_allocation_requests: 1_000_000,
             max_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,

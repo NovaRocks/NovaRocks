@@ -975,12 +975,6 @@ pub(crate) fn iceberg_write_shuffle_by_output_name(
     novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputName(output_name.into())
 }
 
-pub(crate) fn iceberg_write_shuffle_by_output_index(
-    output_index: usize,
-) -> novarocks_sql::compiler::RootDistributionRequirement {
-    novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
-}
-
 /// Compile the original INSERT source after asynchronously observing its
 /// catalog, statistics and provider facts. The statement action must retain
 /// `provider_source` until its close proves the original creator actually exited.
@@ -1001,7 +995,9 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+    system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding_async(
         state,
@@ -1017,8 +1013,9 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         connector_context,
         write_session,
         None,
-        &[],
+        overlays,
         provider_source,
+        system_table_sources,
     )
     .await
 }
@@ -1064,6 +1061,7 @@ pub(crate) async fn prepare_query_as_iceberg_write_at_write_target_async(
         Some(ordinal),
         overlays,
         provider_source,
+        crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
     )
     .await
 }
@@ -1088,6 +1086,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
     overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
+    system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let query_opts = Some(query_opts.unwrap_or_else(|| {
         crate::query_execution::contract::synthetic_statement_query_options(execution)
@@ -1104,13 +1103,15 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         capacity.clone(),
     )
     .map_err(|error| error.to_string())?
-    .with_query_local_overlays(overlays.to_vec());
+    .with_query_local_overlays(overlays.to_vec())
+    .with_system_table_source_policy(system_table_sources);
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider_source,
         state.completion_fact_owners()?,
-        scope.with_definition_owned(
-            state.constant_policy(),
+        scope.with_snapshot_planning_owned(
             crate::query_execution::planning::sql_compile_control_from_execution(execution),
+            execution.cancellation().clone(),
+            query_opts.as_ref(),
         ),
         typed_connector_session()?,
     )?;
@@ -1213,7 +1214,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         .encode_writer_handle_payload(target.handle())
         .map_err(|error| error.to_string())?;
     let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-    let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
+    let (mut completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
         optimize_request,
         sink,
         ordinal,
@@ -1226,6 +1227,13 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     let facts = provider_source
         .resolve_provider_reads(&needs, &access_sink)
         .await?;
+    let system_facts = provider_source
+        .resolve_system_tables(completion.system_table_needs())
+        .await
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    completion
+        .install_system_tables(system_facts.into_boxed_slice(), &compile_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     // The original Provider retains every pending creator. Do not extract the
     // final access set until its local creator exit is proven by the same source.
     provider_source
@@ -1247,6 +1255,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
         query_opts,
         write_session,
         &compile_control,
+        &capacity,
     )
 }
 
@@ -1348,6 +1357,7 @@ fn finish_prepared_iceberg_write_assembly(
     query_opts: Option<QueryOptions>,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     completion_control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
         session: write_session.as_ref(),
@@ -1386,6 +1396,7 @@ fn finish_prepared_iceberg_write_assembly(
         DmlQueryExecutionKernel::constant_policy(state),
         Some(&write_target_facts),
         completion_control,
+        capacity,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         encoded,

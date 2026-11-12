@@ -200,7 +200,6 @@ const fn flat_pool() -> FlatPoolWriteLimits {
 const fn frozen_encode_limits() -> PackageEncodeLimits {
     PackageEncodeLimits {
         source_retained_bytes: SOURCE,
-        max_wire_bytes: 64 * MIB,
         views: TypeViewLimits {
             max_occurrences: 1_000_000,
             max_value_roots: 1_000_000,
@@ -271,7 +270,6 @@ const fn frozen_encode_limits() -> PackageEncodeLimits {
         },
         reads: ProviderReadProjectionLimits {
             max_definitions: 100_000,
-            max_input_version_bytes: 1024,
             max_allocation_requests: 1_000_000,
             max_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,
@@ -549,7 +547,6 @@ mod tests {
         );
         // The decoder must not reject the sender's legitimate wire size.
         // A receiver-only sizing quota is not part of that compatibility.
-        assert!(encode.max_wire_bytes <= decode.wire.max_input_bytes);
         assert_eq!(decode.constant_policy, FROZEN_CONSTANT_POLICY);
         assert_eq!(
             decode

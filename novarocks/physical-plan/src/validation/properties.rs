@@ -1671,6 +1671,20 @@ fn derive_node_output_properties_from(
         NodeKind::ExchangeSource { .. } => {
             return Ok(exchange_anchor.map(super::cuts::inbound_cut_output_properties));
         }
+        NodeKind::SystemRelation { .. } => {
+            let expected = crate::PhysicalProperties {
+                distribution: Distribution::Singleton,
+                ordering: Box::default(),
+                row_multiplicity: RowMultiplicity::SingleCopy,
+            };
+            if target.actual(node, &expected) != &expected {
+                errors.push(ValidationError::new(
+                    path,
+                    "system relation requires single-copy singleton placement",
+                ));
+            }
+            return Ok(Some(expected));
+        }
         NodeKind::Values { .. } => {
             let NodeKind::Values { rows } = &node.kind else {
                 unreachable!();
@@ -1934,6 +1948,53 @@ fn derive_node_output_properties_from(
                 errors.push(ValidationError::new(
                     path,
                     "row-expanding operator output properties differ from its exact passthrough mapping",
+                ));
+            }
+            return Ok(Some(expected));
+        }
+        NodeKind::PositionShard(spec) => {
+            let Some(first) = node
+                .inputs
+                .first()
+                .and_then(|id| children.get(fragment, id))
+            else {
+                return Ok(None);
+            };
+            let Distribution::Hash { scheme, .. } = &first.distribution else {
+                errors.push(ValidationError::new(
+                    path,
+                    "position contributions require file hash distribution",
+                ));
+                return Ok(None);
+            };
+            for (id, input) in node.inputs.iter().zip(&spec.inputs) {
+                let expected = crate::PhysicalProperties {
+                    distribution: Distribution::Hash {
+                        keys: Box::new([input.file]),
+                        scheme: scheme.clone(),
+                    },
+                    row_multiplicity: RowMultiplicity::SingleCopy,
+                    ordering: Box::default(),
+                };
+                if children.get(fragment, id) != Some(&expected) {
+                    errors.push(ValidationError::new(
+                        path,
+                        "position contributions must use one shared file hash partition space",
+                    ));
+                }
+            }
+            let expected = crate::PhysicalProperties {
+                distribution: Distribution::Hash {
+                    keys: Box::new([spec.output.file]),
+                    scheme: scheme.clone(),
+                },
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            };
+            if target.actual(node, &expected) != &expected {
+                errors.push(ValidationError::new(
+                    path,
+                    "position shard output must preserve file hash ownership",
                 ));
             }
             return Ok(Some(expected));

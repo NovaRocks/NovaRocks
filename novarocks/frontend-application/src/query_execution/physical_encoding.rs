@@ -63,6 +63,32 @@ use crate::query_execution::preparation::attempt_access::{
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
 
+/// Production encoding borrows the admitted statement window. Pure semantic
+/// fixtures name their separate author explicitly and cannot enter production.
+#[derive(Clone, Copy)]
+pub(crate) enum EncodingAuthor<'a> {
+    Statement(&'a novarocks_query_application::admitted_query_context::QueryResultCapacityBinding),
+    #[cfg(test)]
+    SemanticFixture,
+}
+
+pub(crate) fn encoding_capacity(
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> Result<
+    &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    novarocks_plan_codec::PhysicalEncodeError,
+> {
+    execution.result_capacity().ok_or_else(|| {
+        novarocks_plan_codec::PhysicalEncodeError::Control(
+            novarocks_type_contract::CompileControlError::Source(
+                novarocks_failure_contract::SharedFailureCause::new(
+                    novarocks_workload_control::WorkError::NotReady,
+                ),
+            ),
+        )
+    })
+}
+
 /// A completed plan on the wire, the capabilities its reads will be performed
 /// with, and what opening each of those reads takes.
 /// One plan's version.
@@ -139,6 +165,43 @@ pub(crate) fn encode_completed_plan(
     statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_completed_plan_authored(
+        paired,
+        carrier,
+        statement_constant_policy,
+        write_targets,
+        control,
+        EncodingAuthor::Statement(capacity),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn encode_completed_plan_for_test(
+    paired: CompletedPlanWithAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_completed_plan_authored(
+        paired,
+        carrier,
+        statement_constant_policy,
+        write_targets,
+        control,
+        EncodingAuthor::SemanticFixture,
+    )
+}
+
+fn encode_completed_plan_authored(
+    paired: CompletedPlanWithAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: Option<&WriteTargetFacts<'_>>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
     let result = encode_completed_packages(
@@ -147,6 +210,7 @@ pub(crate) fn encode_completed_plan(
         statement_constant_policy,
         write_targets,
         control,
+        author,
     );
     if matches!(
         &result,
@@ -200,6 +264,7 @@ fn encode_completed_packages(
     statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
 ) -> Result<EncodedCompletedPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let (candidate, reads) = paired.into_parts();
     let (encodings, capabilities) = split_frozen_reads(reads);
@@ -210,6 +275,7 @@ fn encode_completed_packages(
         statement_constant_policy,
         write_targets,
         control,
+        author,
     )?;
     parts.bind_capabilities(capabilities)
 }
@@ -314,8 +380,27 @@ pub(crate) fn encode_completed_plan_borrowed(
     carrier: &CompiledPackageCarrier,
     policy: novarocks_physical_plan::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
-    encode_borrowed_original(candidate, access, carrier, policy, None, control)
+    encode_completed_plan_borrowed_authored(
+        candidate,
+        access,
+        carrier,
+        policy,
+        control,
+        EncodingAuthor::Statement(capacity),
+    )
+}
+
+fn encode_completed_plan_borrowed_authored(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_borrowed_original(candidate, access, carrier, policy, None, control, author)
 }
 
 pub(crate) fn encode_completed_write_plan_borrowed(
@@ -325,6 +410,27 @@ pub(crate) fn encode_completed_write_plan_borrowed(
     policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: &WriteTargetFacts<'_>,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
+    encode_completed_write_plan_borrowed_authored(
+        candidate,
+        access,
+        carrier,
+        policy,
+        write_targets,
+        control,
+        EncodingAuthor::Statement(capacity),
+    )
+}
+
+fn encode_completed_write_plan_borrowed_authored(
+    candidate: novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    access: &novarocks_query_application::preparation::FinalPlanRuntimeAccess<FrozenProviderRead>,
+    carrier: &CompiledPackageCarrier,
+    policy: novarocks_physical_plan::ConstantPolicy,
+    write_targets: &WriteTargetFacts<'_>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     encode_borrowed_original(
         candidate,
@@ -333,6 +439,7 @@ pub(crate) fn encode_completed_write_plan_borrowed(
         policy,
         Some(write_targets),
         control,
+        author,
     )
 }
 
@@ -343,6 +450,7 @@ fn encode_borrowed_original(
     policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     control.checkpoint(novarocks_type_contract::CompilePhase::Encode, 0)?;
     let mut encodings = BTreeMap::new();
@@ -372,6 +480,7 @@ fn encode_borrowed_original(
         policy,
         write_targets,
         control,
+        author,
     );
     if matches!(
         &result,
@@ -395,6 +504,7 @@ fn encode_static_packages(
     statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
     write_targets: Option<&WriteTargetFacts<'_>>,
     control: &dyn novarocks_type_contract::PureCompileControl,
+    author: EncodingAuthor<'_>,
 ) -> Result<EncodedStaticPlan, novarocks_plan_codec::PhysicalEncodeError> {
     let plan = candidate.plan();
     refuse_uncompiled_plan_shapes(plan)?;
@@ -431,6 +541,7 @@ fn encode_static_packages(
             topology.anchor,
             carrier,
             control,
+            author,
         )?,
         topology.anchor,
     )?;
@@ -964,6 +1075,15 @@ mod tests {
 
     use super::*;
 
+    fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
+        let mut statements = novarocks_parser::parse(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
+        Box::new(query)
+    }
+
     struct NoFacts;
 
     #[async_trait::async_trait]
@@ -998,7 +1118,7 @@ mod tests {
         let plan_fragments = completed.candidate().plan().fragments().len();
 
         let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let encoded = encode_completed_plan(
+        let encoded = encode_completed_plan_for_test(
             completed,
             &compiled_carrier(),
             crate::application::test_constant_policy(),
@@ -1387,7 +1507,7 @@ mod tests {
     ) {
         let completed = completed_for(sql);
         let plan = Arc::clone(completed.candidate().plan());
-        let encoded = encode_completed_plan(
+        let encoded = encode_completed_plan_for_test(
             completed,
             carrier,
             crate::application::test_constant_policy(),
@@ -1729,7 +1849,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([19; 16]).expect("plan version"),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -1860,7 +1980,7 @@ mod tests {
             decoded: std::sync::atomic::AtomicBool::new(false),
         };
         let before = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-        let error = match encode_completed_plan(
+        let error = match encode_completed_plan_for_test(
             completed,
             &carrier,
             crate::application::test_constant_policy(),
@@ -1915,7 +2035,7 @@ mod tests {
         ] {
             let completed = completed_for("SELECT a FROM (VALUES (1),(2)) t(a)");
             let before = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-            let error = match encode_completed_plan(
+            let error = match encode_completed_plan_for_test(
                 completed,
                 &compiled_carrier(),
                 crate::application::test_constant_policy(),
@@ -1961,7 +2081,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([23; 16]).unwrap(),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -2067,7 +2187,7 @@ mod tests {
         let control = SqlCompileControl::unbounded();
         let request = SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([24; 16]).unwrap(),
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -2278,7 +2398,7 @@ mod tests {
         let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
         let decimal = semantics.sql_mode().decimal_overflow_policy();
         let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-            SqlStatementInput::sql(&sql),
+            SqlStatementInput::parsed_query(query_ast(&sql)),
             SqlCompileIntent::IcebergWrite {
                 root_distribution: RootDistributionRequirement::Any,
             },
@@ -2541,7 +2661,7 @@ mod tests {
                 tail_error: error.clone(),
                 earlier_error: None,
             };
-            encode_completed_plan(
+            encode_completed_plan_for_test(
                 completed,
                 &compiled_carrier(),
                 crate::application::test_constant_policy(),
@@ -2584,7 +2704,7 @@ mod tests {
                 earlier_error: None,
             };
             assert!(matches!(
-                encode_completed_plan(
+                encode_completed_plan_for_test(
                     completed,
                     &compiled_carrier(),
                     crate::application::test_constant_policy(),
@@ -2623,7 +2743,7 @@ mod tests {
                 earlier_error: Some(error.clone()),
             };
             assert!(matches!(
-                encode_completed_plan(
+                encode_completed_plan_for_test(
                     completed,
                     &compiled_carrier(),
                     crate::application::test_constant_policy(),
@@ -2667,7 +2787,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
         let version = completed.candidate().plan().version();
-        let encoded = encode_completed_plan(
+        let encoded = encode_completed_plan_for_test(
             completed,
             &compiled_carrier(),
             crate::application::test_constant_policy(),
@@ -2928,7 +3048,7 @@ mod tests {
     ) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([9; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(query_ast(sql)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

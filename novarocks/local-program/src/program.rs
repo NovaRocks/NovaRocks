@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, FieldRef};
 use novarocks_connector_contract::{
-    ConnectorEnvelopeHeader, ConnectorReadProgramRecipe, ConnectorRowMutationEffect,
-    WriteTargetOrdinal,
+    ConnectorEnvelopeHeader, ConnectorMutationContributionGroupId, ConnectorReadProgramRecipe,
+    ConnectorRowMutationEffect, WriteTargetOrdinal,
 };
 use novarocks_functions::ResolvedAggregateSignature;
 use novarocks_type_contract::{
@@ -506,6 +506,15 @@ pub enum TableFunctionOutputSlot {
 /// Every execution node has a closed static representation. Task-owned inputs,
 /// exchange receivers, writer handles, and filter sessions are requirements.
 #[derive(Clone, Debug)]
+pub struct ProgramPositionShardInput {
+    pub input: ProgramNodeId,
+    pub file: SlotId,
+    pub position: SlotId,
+    pub spec_id: SlotId,
+    pub partition: SlotId,
+}
+
+#[derive(Clone, Debug)]
 pub enum ProgramNodeKind {
     AssertNumRows {
         input: ProgramNodeId,
@@ -513,6 +522,9 @@ pub enum ProgramNodeKind {
     },
     Values {
         values: StaticValues,
+    },
+    SystemRelation {
+        batches: crate::StaticBatchSequence,
     },
     /// Original integer-series computation over the subordinate bounds Values.
     GenerateSeries {
@@ -554,6 +566,12 @@ pub enum ProgramNodeKind {
         events: Vec<ChangeEventSpec>,
         output_slot_ids: Vec<SlotId>,
         effect_slot_id: SlotId,
+    },
+    PositionShard {
+        group: ConnectorMutationContributionGroupId,
+        inputs: Box<[ProgramPositionShardInput]>,
+        /// File, spec, partition, author driver, high32, container, index, count, bitmap.
+        output_slots: [SlotId; 9],
     },
     UnionAll {
         inputs: Vec<ProgramNodeId>,
@@ -683,7 +701,10 @@ impl ProgramNodeKind {
         mut visit: impl FnMut(ProgramNodeId) -> Result<(), E>,
     ) -> Result<(), E> {
         match self {
-            Self::Values { .. } | Self::Scan { .. } | Self::ExchangeSource { .. } => {}
+            Self::Values { .. }
+            | Self::SystemRelation { .. }
+            | Self::Scan { .. }
+            | Self::ExchangeSource { .. } => {}
             Self::AssertNumRows { input, .. }
             | Self::Project { input, .. }
             | Self::Unpivot { input, .. }
@@ -706,6 +727,11 @@ impl ProgramNodeKind {
                     visit(*child)?;
                 }
             }
+            Self::PositionShard { inputs, .. } => {
+                for input in inputs {
+                    visit(input.input)?;
+                }
+            }
             Self::Join { left, right, .. } | Self::NestedLoopJoin { left, right, .. } => {
                 visit(*left)?;
                 visit(*right)?;
@@ -721,6 +747,7 @@ impl ProgramNodeKind {
     ) -> Result<(), E> {
         match self {
             Self::Values { .. }
+            | Self::SystemRelation { .. }
             | Self::AssertNumRows { .. }
             | Self::Repeat { .. }
             | Self::UnionAll { .. }
@@ -888,6 +915,7 @@ impl ProgramNodeKind {
                     }
                 }
             }
+            Self::PositionShard { .. } => {}
             Self::Sort {
                 order_by,
                 partition_exprs,
@@ -1763,6 +1791,7 @@ impl LocalProgramGraph {
                     if matches!(
                         branch.contract().role,
                         crate::ProgramOutputRole::ProviderRoute { .. }
+                            | crate::ProgramOutputRole::PositionContribution { .. }
                     ) {
                         let mut includes_effect = branch.output_columns().is_empty();
                         for slot in branch.output_columns() {
@@ -2097,6 +2126,11 @@ fn validate_shape(
             work.step()?;
             if empty {
                 return Err(LocalProgramError::InvalidNodeShape.into());
+            }
+        }
+        ProgramNodeKind::SystemRelation { batches } => {
+            if work.identity(batches.layout())? != work.identity(&node.output_layout)? {
+                return Err(LocalProgramError::LayoutMismatch.into());
             }
         }
         ProgramNodeKind::Values { values } => {

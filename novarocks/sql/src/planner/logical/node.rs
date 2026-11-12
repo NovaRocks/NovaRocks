@@ -48,6 +48,7 @@ pub(crate) enum LogicalPlanKind {
     /// Sort/TopN offsets, or ExchangeFlavor::LimitOffset instead of a Limit kind.
     Limit(PlanLimitNode),
     Values(PlanValuesNode),
+    SystemTable(crate::planner::system_relation::PlanSystemTableNode),
     Repeat(PlanRepeatNode),
     Window(PlanWindowNode),
     GenerateSeries(PlanGenerateSeriesNode),
@@ -83,6 +84,7 @@ impl LogicalPlanKind {
             LogicalPlanKind::Sort(_) => "Sort",
             LogicalPlanKind::Limit(_) => "Limit",
             LogicalPlanKind::Values(_) => "Values",
+            LogicalPlanKind::SystemTable(_) => "SystemTable",
             LogicalPlanKind::Repeat(_) => "Repeat",
             LogicalPlanKind::Window(_) => "Window",
             LogicalPlanKind::GenerateSeries(_) => "GenerateSeries",
@@ -111,6 +113,7 @@ impl LogicalPlanKind {
             "Sort",
             "Limit",
             "Values",
+            "SystemTable",
             "Repeat",
             "Window",
             "GenerateSeries",

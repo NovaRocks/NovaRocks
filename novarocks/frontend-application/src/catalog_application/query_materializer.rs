@@ -251,8 +251,7 @@ pub struct CatalogServiceMaterializer<'a> {
     bindings: Arc<QueryTableBindingStore>,
     loader: Box<dyn QueryTableBindingLoader + 'a>,
     local_views: Option<novarocks_query_application::view::LocalViewSnapshot>,
-    system_relations: Option<novarocks_query_application::system_catalog::SystemCatalogRelations>,
-    definition_inputs: Option<system::DefinitionInputs>,
+    system_relations: Option<Arc<novarocks_query_application::system_tables::SystemTableRegistry>>,
     /// Typed classification paired with binding-store failure memoization.
     /// The binding store owns the canonical at-most-once load; this sidecar
     /// retains the original typed producer failure at legacy string-compatible
@@ -358,7 +357,6 @@ impl<'a> CatalogServiceMaterializer<'a> {
             loader,
             local_views: None,
             system_relations: None,
-            definition_inputs: None,
             resolution_errors: Mutex::new(HashMap::new()),
             original_resolution_errors: Mutex::new(HashMap::new()),
             catalog_application: None,
@@ -371,25 +369,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
 
     pub(crate) fn with_system_relations(
         mut self,
-        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
+        source: Arc<novarocks_query_application::system_tables::SystemTableRegistry>,
     ) -> Self {
         self.system_relations = Some(source);
         self
     }
-    pub(crate) fn with_definition_inputs(
-        mut self,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-        policy: novarocks_functions::ConstantPolicy,
-        control: novarocks_sql::compiler::SqlCompileControl,
-    ) -> Self {
-        self.definition_inputs = Some(system::DefinitionInputs {
-            context,
-            policy,
-            control,
-        });
-        self
-    }
-
     pub(crate) fn with_local_views(
         mut self,
         snapshot: novarocks_query_application::view::LocalViewSnapshot,
@@ -1560,9 +1544,15 @@ mod tests {
                     }),
                 );
                 let control = SqlCompileControl::unbounded();
+                let mut statements = novarocks_parser::parse(sql).unwrap();
+                assert_eq!(statements.len(), 1);
+                let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap()
+                else {
+                    panic!("expected one query");
+                };
                 let request = SqlFinalPlanCompileRequest::new(
                     novarocks_physical_plan::PlanVersionId::try_new([71; 16]).unwrap(),
-                    SqlStatementInput::sql(sql),
+                    SqlStatementInput::parsed_query(Box::new(query)),
                     SqlCompileIntent::Query,
                     SqlSessionContext {
                         sql_semantics: Default::default(),

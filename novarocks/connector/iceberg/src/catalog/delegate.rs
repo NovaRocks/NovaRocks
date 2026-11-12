@@ -19,13 +19,13 @@
 //!
 //! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
-//! Hadoop and HMS share bounded catalog reads. Publication is owned by
+//! Hadoop and HMS share complete catalog reads. Publication is owned by
 //! their prepared mechanisms and cannot be invoked through this delegate.
 //!
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorListingBound, ConnectorListingCollector,
+    ConnectorError, ConnectorErrorKind, ConnectorListingCollector, ConnectorListingPageSize,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -52,7 +52,7 @@ pub(super) fn table_ident(name: &CatalogTableName) -> Result<TableIdent, Connect
         .map_err(|error| invalid(format!("build Iceberg identity for {name}: {error}")))
 }
 
-/// Order a bounded listing and drop duplicate names.
+/// Order a complete listing and drop duplicate names.
 pub(crate) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
     names.sort();
     names.dedup();
@@ -81,17 +81,17 @@ impl CatalogDelegate {
     // ---- Reads ----------------------------------------------------------
 
     /// The vendored clients expose namespace enumeration only as one complete
-    /// listing, so the bound is enforced on that listing as it is retained.
+    /// listing; the caller still receives its complete authoritative contents.
     pub(super) async fn list_namespaces(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.list_namespaces_inner(bound).await
     }
 
     async fn list_namespaces_inner(
         &self,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let mut collector = ConnectorListingCollector::new(bound)?;
         let namespaces = {
@@ -124,11 +124,11 @@ impl CatalogDelegate {
     }
 
     /// One complete table listing from a client without a paging capability,
-    /// bounded as it is retained.
+    /// retained without a whole-listing quota.
     pub(super) async fn list_tables(
         &self,
         namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         self.list_tables_inner(namespace, bound).await
     }
@@ -136,7 +136,7 @@ impl CatalogDelegate {
     async fn list_tables_inner(
         &self,
         namespace: &CatalogNamespaceName,
-        bound: ConnectorListingBound,
+        bound: ConnectorListingPageSize,
     ) -> Result<Vec<String>, ConnectorError> {
         let ident = namespace_ident(namespace)?;
         let mut collector = ConnectorListingCollector::new(bound)?;

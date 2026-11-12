@@ -116,6 +116,11 @@ try {
   val t = Spark3Util.loadIcebergTable(org.apache.spark.sql.SparkSession.active, "ice_rest.uea4g_ivm_${uuid0}.base")
   t.refresh()
   val from = t.currentSnapshot().snapshotId()
+  val oldTasks = t.newScan().useSnapshot(from).planFiles()
+  val original = try oldTasks.asScala.toVector.head.file().copy() finally oldTasks.close()
+  // The original file is later removed wholesale. Position 1 is also hidden
+  // by equality, so this DV tests prestate applicability with the same row bag.
+  val oldVector = dv(t, Seq((original.location(), 1L))).head
   val fresh = data(t, Seq(Seq(2L, 1, "new-two"), Seq(5L, 1, "five"), Seq(6L, 1, "six")))
   val eq = equality(t, Seq(2L))
   val indexes = Seq(Seq(1L), Seq(1L, 2L)).map(ps => org.apache.iceberg.deletes.Deletes.toPositionIndex(org.apache.iceberg.io.CloseableIterable.withNoopClose[java.lang.Long](ps.map(Long.box).asJava)))
@@ -126,13 +131,14 @@ try {
   val immutableHash = java.security.MessageDigest.getInstance("SHA-256").digest(bytes(t.io(), destination.location())).map(b => f"${b & 0xff}%02x").mkString
   val next = vectors(1)
   t.updateProperties().set("uea4g.next-dv.path", next.location()).set("uea4g.next-dv.offset", next.contentOffset().toString).set("uea4g.next-dv.length", next.contentSizeInBytes().toString).set("uea4g.next-dv.file-size", next.fileSizeInBytes().toString).set("uea4g.next-dv.target", fresh.location()).set("uea4g.next-dv.sha256", immutableHash).commit()
-  t.newRowDelta().addRows(fresh).addDeletes(vectors(0)).addDeletes(eq).commit(); t.refresh()
+  t.newRowDelta().addRows(fresh).addDeletes(vectors(0)).addDeletes(oldVector).addDeletes(eq).commit(); t.refresh()
   val planned = t.newScan().planFiles(); val tasks = try planned.asScala.toVector finally planned.close()
   val newTask = tasks.find(_.file().location() == fresh.location()).get
   val oldTask = tasks.find(_.file().location() != fresh.location()).get
   require(newTask.file().dataSequenceNumber() == Long.box(2L))
   require(newTask.deletes().asScala.size == 1 && newTask.deletes().get(0).format() == FileFormat.PUFFIN && newTask.deletes().get(0).dataSequenceNumber() == Long.box(2L))
   require(oldTask.deletes().asScala.exists(d => d.content() == FileContent.EQUALITY_DELETES && d.dataSequenceNumber() == Long.box(2L)))
+  require(oldTask.deletes().asScala.exists(d => d.format() == FileFormat.PUFFIN && d.referencedDataFile() == original.location()))
   observe("ivm_same_commit", t, obj("writer_commit" -> "success", "from_snapshot" -> from, "immutable_puffin_sha256" -> immutableHash, "next_blob" -> describe(next), "independent_removed_rows" -> Seq(Seq(2L, 1, "dup"), Seq(2L, 1, "dup")), "independent_added_rows" -> Seq(Seq(2L, 1, "new-two"), Seq(6L, 1, "six"))), Some(Seq(Seq(1L, 1, "one"), Seq(2L, 1, "new-two"), Seq(3L, 1, "three"), Seq(4L, 1, "four"), Seq(6L, 1, "six"))))
   println("UEA4G_IVM_STAGE_1_OK")
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
@@ -178,7 +184,8 @@ try {
   val from = t.currentSnapshot().snapshotId()
   val planned = t.newScan().planFiles(); val tasks = try planned.asScala.toVector finally planned.close()
   val deletes = tasks.flatMap(_.deletes().asScala).groupBy(d => (d.location(), d.contentOffset())).values.map(_.head).toVector
-  val previousDv = deletes.find(_.format() == FileFormat.PUFFIN).get
+  val freshTarget = t.properties().get("uea4g.next-dv.target")
+  val previousDv = deletes.find(d => d.format() == FileFormat.PUFFIN && d.referencedDataFile() == freshTarget).get
   val previousEq = deletes.find(_.content() == FileContent.EQUALITY_DELETES).get
   val properties = t.properties()
   val path = properties.get("uea4g.next-dv.path")
@@ -232,7 +239,8 @@ try {
   val from = t.currentSnapshot().snapshotId()
   val planned = t.newScan().planFiles(); val tasks = try planned.asScala.toVector finally planned.close()
   val deletes = tasks.flatMap(_.deletes().asScala).groupBy(d => (d.location(), d.contentOffset())).values.map(_.head).toVector
-  val previousDv = deletes.find(_.format() == FileFormat.PUFFIN).get
+  val freshTarget = t.properties().get("uea4g.next-dv.target")
+  val previousDv = deletes.find(d => d.format() == FileFormat.PUFFIN && d.referencedDataFile() == freshTarget).get
   val previousEq = deletes.find(_.content() == FileContent.EQUALITY_DELETES).get
   val replacement = dv(t, Seq((previousDv.referencedDataFile(), 1L), (previousDv.referencedDataFile(), 2L))).head
   t.newRowDelta().validateFromSnapshot(from).removeDeletes(previousDv).removeDeletes(previousEq).addDeletes(replacement).addDeletes(equality(t, Seq(2L))).commit(); t.refresh()
@@ -280,10 +288,13 @@ try {
   t.refresh()
   val from = t.currentSnapshot().snapshotId()
   val planned = t.newScan().planFiles(); val tasks = try planned.asScala.toVector finally planned.close()
-  val original = tasks.find(_.file().recordCount() == 5L).get.file()
+  val originalTask = tasks.find(_.file().recordCount() == 5L).get
+  val original = originalTask.file()
+  require(originalTask.deletes().asScala.exists(d => d.format() == FileFormat.PUFFIN && d.referencedDataFile() == original.location()))
+  require(originalTask.deletes().asScala.exists(_.content() == FileContent.EQUALITY_DELETES))
   val added = Seq(Seq(7L, 1, "seven"), Seq(8L, 1, "eight"), Seq(8L, 1, "eight"))
   t.newOverwrite().deleteFile(original).addFile(data(t, added)).commit(); t.refresh()
-  observe("ivm_removed_and_added_files", t, obj("writer_commit" -> "success", "from_snapshot" -> from, "independent_removed_rows" -> Seq(Seq(1L, 1, "one"), Seq(3L, 1, "three"), Seq(4L, 1, "four")), "independent_added_rows" -> added), Some(added))
+  observe("ivm_removed_and_added_files", t, obj("writer_commit" -> "success", "from_snapshot" -> from, "removed_file" -> describe(original), "prestate_deletes" -> originalTask.deletes().asScala.toVector.map(describe), "independent_removed_rows" -> Seq(Seq(1L, 1, "one"), Seq(3L, 1, "three"), Seq(4L, 1, "four")), "independent_added_rows" -> added), Some(added))
   println("UEA4G_IVM_STAGE_4_OK")
 } catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA

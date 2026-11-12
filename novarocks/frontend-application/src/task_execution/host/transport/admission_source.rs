@@ -85,6 +85,7 @@ struct AdmissionHeader {
     effect: Arc<AttemptEffectEnvelope>,
     original: WorkRetirementObserver,
     transport_retired: bool,
+    encoded_bytes: Option<usize>,
 }
 
 struct Pending {
@@ -92,6 +93,7 @@ struct Pending {
     lane: usize,
     work: ReportedWork,
     bound: BoundQueue,
+    encoded_bytes: Option<usize>,
 }
 
 #[must_use = "the original result and any refused input remain in custody"]
@@ -369,11 +371,47 @@ impl AdmissionSource {
         }
     }
 
+    fn validate_request(
+        operation: &OperationIntent,
+        encoded: novarocks_task_codec::operation::wire_size::SizeResult,
+        transport: novarocks_task_codec::TransportBudget,
+    ) -> Result<usize, TaskExecutionError> {
+        use crate::task_execution::{error::CapacityBound, intent::NativeRequestWindows};
+        use novarocks_task_codec::operation::wire_size::WireSizeError;
+        use novarocks_workload_control::WorkError;
+        let encoded = encoded.map_err(|error| {
+            TaskExecutionError::Workload(match error {
+                WireSizeError::Overflow => WorkError::ArithmeticOverflow,
+                WireSizeError::NotCodecProduced => WorkError::Conflict,
+            })
+        })?;
+        let control = operation.requires_control_progress();
+        let limit = transport.message_limits().request_max_bytes(control);
+        if encoded > limit {
+            return Err(CapacityBound::OperationBytes {
+                limit,
+                actual: encoded,
+            }
+            .into());
+        }
+        let windows = NativeRequestWindows::for_transport(transport).map_err(|_| {
+            TaskExecutionError::Workload(WorkError::InvalidConfig("Native request windows"))
+        })?;
+        let limit = windows.empty_queue_capacity(control);
+        let actual = operation.queued_bytes();
+        if actual > limit {
+            return Err(CapacityBound::OperationBytes { limit, actual }.into());
+        }
+        Ok(encoded)
+    }
+
     /// Select and price the same pending metadata before the host claims its
     /// ticket. Full is the absence of the original purpose's result credit.
     pub(crate) fn prepay(
         &mut self,
         effect: &Arc<AttemptEffectEnvelope>,
+        requests: &FrozenSendRequests,
+        transport: novarocks_task_codec::TransportBudget,
     ) -> Result<Option<Position>, RuntimeError> {
         assert!(self.pending.is_none());
         let EffectBody::AdmitQueuedInput {
@@ -423,6 +461,27 @@ impl AdmissionSource {
             }
             payload_bytes = original.backing_bytes;
         }
+        let preflight = if withdrawn {
+            Ok(0)
+        } else {
+            let encoded = match creation.as_ref() {
+                Some(CreationAdmission { envelope, seed }) => {
+                    let original = seed.lock().unwrap();
+                    let original = original
+                        .as_ref()
+                        .expect("original unconsumed creation seed");
+                    novarocks_task_codec::operation::wire_size::create(
+                        *envelope,
+                        original.seed.fragment().content().len(),
+                        original.sizing.lengths.metadata_bytes(),
+                    )
+                    .and_then(novarocks_task_codec::operation::wire_size::batch_item)
+                }
+                None => requests.encoded_protobuf_bytes(operation),
+            };
+            Self::validate_request(operation, encoded, transport)
+        };
+        let encoded_bytes = preflight.as_ref().ok().copied();
         let [effect_layout, gate, bound, result, retirement, queue] =
             actor_transport_layouts(false).expect("original admission layout");
         let custody = crate::task_execution::host::custody::storage_layouts()
@@ -495,6 +554,7 @@ impl AdmissionSource {
             scope_generation: self.generation,
             control,
             quote,
+            preflight,
             authority: self.authority.clone(),
             creation,
         };
@@ -503,6 +563,7 @@ impl AdmissionSource {
             lane,
             work,
             bound,
+            encoded_bytes,
         });
         if let Some(payload) = payload_ref {
             let original = self.payloads.get_mut(&payload).unwrap();
@@ -528,6 +589,7 @@ impl AdmissionSource {
             effect: pending.effect.clone(),
             original: pending.work.work().retirement_observer(),
             transport_retired: false,
+            encoded_bytes: pending.encoded_bytes,
         };
         assert!(
             self.headers
@@ -702,6 +764,9 @@ impl AdmissionSource {
         let grant = QueuedInputGrantRef::new(
             NonZeroU64::new(result.effect.protocol.id.get()).unwrap(),
             *generation,
+            self.headers[&result.effect.protocol.id]
+                .encoded_bytes
+                .expect("only the exact preflighted input can publish a grant"),
         );
         if self.grants.contains(grant) {
             return Err(AdmissionResultError::DuplicateGrant);
@@ -842,5 +907,77 @@ impl AdmissionSource {
         roles.front_mut().unwrap().close_after_exit()?;
         roles.pop_front();
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_execution::error::CapacityBound;
+    use novarocks_execution_contract::{OperationEnvelope, OperationKind, TaskOperationId};
+    use novarocks_task_codec::{TransportBudget, TransportMessageLimits};
+
+    fn operation(queued_bytes: usize) -> OperationIntent {
+        let fixture = crate::task_execution::tests::manifest_unstarted_regression_fixture();
+        OperationIntent::CreateTask {
+            envelope: OperationEnvelope::with_default_wait(
+                TaskOperationId::new_v7(),
+                OperationKind::CreateTask,
+            ),
+            identity: fixture.execution().graph().root_identity(),
+            creation: PayloadRef(NonZeroU64::MIN),
+            queued_bytes,
+        }
+    }
+
+    fn transport() -> TransportBudget {
+        TransportBudget::new(
+            1,
+            255,
+            TransportMessageLimits {
+                ordinary_request_max_bytes: 1024,
+                control_request_max_bytes: 1024,
+                ..TransportMessageLimits::DEFAULT
+            },
+            1,
+            256 * 1024 * 1024,
+            2,
+            512 * 1024 * 1024,
+            1,
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn queued_input_preflight_checks_method_bytes_separately_from_queue_shape() {
+        let transport = transport();
+        let request = operation(512);
+        assert_eq!(
+            AdmissionSource::validate_request(&request, Ok(1024), transport),
+            Ok(1024)
+        );
+        assert_eq!(
+            AdmissionSource::validate_request(&request, Ok(1025), transport),
+            Err(TaskExecutionError::Capacity(
+                CapacityBound::OperationBytes {
+                    limit: 1024,
+                    actual: 1025,
+                }
+            ))
+        );
+        let limit = crate::task_execution::intent::NativeRequestWindows::for_transport(transport)
+            .unwrap()
+            .empty_queue_capacity(false);
+        assert_eq!(
+            AdmissionSource::validate_request(&operation(limit + 1), Ok(1024), transport),
+            Err(TaskExecutionError::Capacity(
+                CapacityBound::OperationBytes {
+                    limit,
+                    actual: limit + 1,
+                }
+            ))
+        );
     }
 }

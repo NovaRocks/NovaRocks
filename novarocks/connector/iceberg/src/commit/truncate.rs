@@ -45,21 +45,18 @@ impl super::staging::Preparer for TruncatePreparer {
                 "TRUNCATE cannot add files",
             ));
         }
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(intent.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs =
-            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
-        let removed: Vec<_> = inputs.live_set().await?.values().cloned().collect();
+        let (sources, live) = view.observe_live_sources().await?;
+        let removed = live.values().collect::<Vec<_>>();
         let snapshot_id = super::staging::new_snapshot_id(view.metadata());
-        let manifests = super::overwrite::write_live_entry_groups(
+        let manifests = super::manifest_transform::ordinary_manifests(
             view,
             snapshot_id,
-            removed.iter().cloned().map(|e| (e, true)).collect(),
+            sources.as_ref(),
+            &removed,
+            Vec::new(),
         )
         .await?;
-        super::overwrite::prepare_snapshot_change(
+        super::overwrite::prepare_ordinary_snapshot_change(
             view,
             intent,
             snapshot_id,

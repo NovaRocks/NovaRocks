@@ -134,7 +134,7 @@ generation，不再接入旧 cursor-only 模式。
 `novarocks/worker/src/control_runtime/{preparation,node_geometry}.rs` 的准备数量、bytes 和 per-participation position 预算
 在 job 实际退出后归还；发布 Installed 或 terminal 本身不能证明 job 已释放输入与临时
 展开资源。FE 的 `novarocks/attempt-protocol/src/core.rs` 推进每 BE 的部署窗口 W。
-Frontend 宿主绑定原工作、回执、传输容量与真实退出。见 [ADR-0228](../../adr/ADR-0228-frontend-attempt-decisions-and-transport-custody.md)。
+Frontend 宿主绑定原工作、回执、传输容量与真实退出。见 [ADR-0230](../../adr/ADR-0230-frontend-attempt-decisions-and-transport-custody.md)。
 Accepted ACK 或 RPC 未知结果继续占用原 W 位置。Installed、
 terminal evidence 或永久 stand-down 才能归还。W 必须小于等于该准确 BE immutable
 descriptor 广告的 per-participation 准备位置 P；两端预算分别由各自 owner 负责。

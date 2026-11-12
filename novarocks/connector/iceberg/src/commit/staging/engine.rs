@@ -25,7 +25,8 @@ use crate::commit::model::{
     FrozenRequestParts, IsolationLevel, ObjectIdentity, OperationIntent, OperationIntentParts,
     RequestShape, StagedCreateIdentity, TableTarget,
 };
-use crate::iceberg::spec::TableMetadata;
+use crate::commit::preparation::{CapturedMergePolicy, ManifestMergePolicy, PreparationContext};
+use crate::iceberg::spec::{ManifestList, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result, TableIdent, TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
@@ -250,13 +251,27 @@ pub struct StagingEngine<'a> {
     state: StagingState,
     intent: &'a OperationIntent,
     artifacts: &'a dyn ArtifactWriter,
+    context: PreparationContext,
+    completed_list: Option<(String, ManifestList)>,
 }
 
 impl<'a> StagingEngine<'a> {
+    #[cfg(test)]
     pub fn begin(
         base: StagingBase,
         intent: &'a OperationIntent,
         artifacts: &'a dyn ArtifactWriter,
+    ) -> Result<Self> {
+        // Direct staging fixtures drive their FileIO serially.
+        Self::begin_attempt(base, intent, artifacts, 1, &mut None)
+    }
+
+    pub(crate) fn begin_attempt(
+        base: StagingBase,
+        intent: &'a OperationIntent,
+        artifacts: &'a dyn ArtifactWriter,
+        io_window_width: usize,
+        captured: &mut Option<CapturedMergePolicy>,
     ) -> Result<Self> {
         artifacts.check_active()?;
         if artifacts.attempt_token().operation() != intent.token() {
@@ -264,25 +279,75 @@ impl<'a> StagingEngine<'a> {
                 "Staging attempt does not own this operation intent",
             ));
         }
+        let state = StagingState::begin(base, intent)?;
+        let merge_policy = match *captured {
+            Some(policy) => policy,
+            None => {
+                let policy = ManifestMergePolicy::capture(&state.metadata);
+                *captured = Some(policy);
+                policy
+            }
+        };
         Ok(Self {
-            state: StagingState::begin(base, intent)?,
+            state,
             intent,
             artifacts,
+            context: PreparationContext {
+                merge_policy,
+                io_window_width,
+            },
+            completed_list: None,
         })
     }
     pub fn metadata(&self) -> &TableMetadata {
         &self.state.metadata
     }
+    pub(crate) async fn snapshot_sources<'s>(
+        &'s self,
+        snapshot: &'s crate::iceberg::spec::Snapshot,
+    ) -> Result<crate::commit::manifest_sources::SnapshotSources<'s>> {
+        super::view::load_snapshot_sources(
+            self.metadata(),
+            self.artifacts,
+            self.completed_list.as_ref(),
+            snapshot,
+        )
+        .await
+    }
+
     pub fn updates(&self) -> &[TableUpdate] {
         &self.state.updates
     }
     pub fn view(&self) -> StagedView<'_> {
-        StagedView::new(&self.state.metadata, self.intent, self.artifacts)
+        StagedView::new(
+            &self.state.metadata,
+            self.intent,
+            self.artifacts,
+            self.context,
+            self.completed_list.as_ref(),
+        )
     }
     pub async fn stage(&mut self, preparer: &dyn Preparer) -> Result<()> {
         self.artifacts.check_active()?;
         let prepared = preparer.prepare(&self.view(), self.intent).await?;
-        self.stage_change(prepared)
+        self.artifacts.check_active()?;
+        let mut completed_list = None;
+        for update in &prepared.updates {
+            if let TableUpdate::AddSnapshot { snapshot } = update {
+                let list = crate::manifest::load_manifest_list(
+                    snapshot,
+                    self.artifacts.file_io(),
+                    &self.state.metadata,
+                )
+                .await?;
+                completed_list = Some((snapshot.manifest_list().to_owned(), list));
+            }
+        }
+        self.stage_change(prepared)?;
+        if completed_list.is_some() {
+            self.completed_list = completed_list;
+        }
+        Ok(())
     }
     pub fn stage_change(&mut self, change: PreparedChange) -> Result<()> {
         self.artifacts.check_active()?;

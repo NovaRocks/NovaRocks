@@ -186,24 +186,6 @@ impl ViewServiceTestExt for QueryViewService {
         let [ParsedStatement::View(statement)] = statements.as_slice() else {
             return Ok(None);
         };
-        if let novarocks_parser::ast::ViewStatement::Show(show) = statement {
-            let prepared = self.prepare_show_views(show, context)?;
-            let names = match &prepared.source {
-                crate::view::ShowViewsSource::Local(names) => names.clone(),
-                crate::view::ShowViewsSource::External { catalog, namespace } => engine
-                    .views
-                    .lock()
-                    .unwrap()
-                    .keys()
-                    .filter(|target| &target.catalog == catalog && &target.database == namespace)
-                    .map(|target| target.view.clone())
-                    .collect(),
-            };
-            return prepared
-                .finish(names)
-                .map(ViewStatementResult::Query)
-                .map(Some);
-        }
         self.execute_statement(engine, statement, context)
             .map(Some)
             .map_err(|error| error.to_string())
@@ -225,21 +207,14 @@ fn query_result(result: Option<ViewStatementResult>) -> QueryResult {
     result
 }
 
-fn query_rows(result: &QueryResult) -> Vec<String> {
-    result
-        .batches
-        .iter()
-        .flat_map(|batch| {
-            let values = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..values.len())
-                .map(|index| values.value(index).to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+fn local_view_names(service: &QueryViewService, namespace: &str) -> Vec<String> {
+    let snapshot = service.catalog_snapshot().unwrap();
+    let mut names = snapshot
+        .names_in_namespace("default_catalog", namespace)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn query_rows_at(result: &QueryResult, column: usize) -> Vec<String> {
@@ -260,7 +235,69 @@ fn query_rows_at(result: &QueryResult, column: usize) -> Vec<String> {
 }
 
 #[test]
-fn session_view_ddl_and_show_preserve_registry_behavior() {
+fn virtual_view_mutations_refuse_before_analysis_or_external_changes() {
+    let service = QueryViewService::new();
+    let engine = FakeViewEngine::default();
+    engine.insert_view(
+        ViewTarget {
+            catalog: "system".into(),
+            database: "metadata".into(),
+            view: "v".into(),
+        },
+        "SELECT 1 AS a",
+        "metadata",
+    );
+    for (catalog, database, name) in [
+        (None, "db", "system.metadata.v"),
+        (None, "db", "system.information_schema.v"),
+        (None, "db", "warehouse.information_schema.v"),
+        (None, "db", "information_schema.v"),
+        (Some("system"), "metadata", "v"),
+        (Some("warehouse"), "information_schema", "v"),
+        (Some("warehouse"), "db", "information_schema.v"),
+        (Some("DEFAULT_CATALOG"), "INFORMATION_SCHEMA", "v"),
+    ] {
+        for sql in [
+            format!("CREATE VIEW {name} AS SELECT 1 AS a"),
+            format!("CREATE VIEW IF NOT EXISTS {name} AS SELECT 1 AS a"),
+            format!("DROP VIEW {name}"),
+            format!("DROP VIEW IF EXISTS {name}"),
+        ] {
+            let statements = novarocks_parser::parse(&sql).unwrap();
+            let [ParsedStatement::View(statement)] = statements.as_slice() else {
+                panic!("view command")
+            };
+            let error =
+                match service.execute_statement(&engine, statement, context(catalog, database)) {
+                    Err(error) => error,
+                    Ok(_) => panic!("virtual view mutation succeeded: {sql}"),
+                };
+            assert_eq!(
+                error.kind(),
+                crate::api::CommandErrorKind::Unsupported,
+                "{sql}"
+            );
+            assert_eq!(*engine.analyzed_count.lock().unwrap(), 0);
+            assert!(engine.created.lock().unwrap().is_empty());
+            assert_eq!(
+                engine.views.lock().unwrap().len(),
+                1,
+                "read-only rejection precedes conditional DROP"
+            );
+        }
+    }
+    assert_eq!(
+        service
+            .catalog_snapshot()
+            .unwrap()
+            .names_in_namespace("default_catalog", "information_schema")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn session_view_ddl_preserves_registry_and_immutable_snapshot_behavior() {
     let service = QueryViewService::new();
     let engine = FakeViewEngine {
         analyze_local_sql: true,
@@ -279,13 +316,7 @@ fn session_view_ddl_and_show_preserve_registry_behavior() {
             .unwrap_err(),
         "view already exists: db.v1"
     );
-    let show = query_result(
-        service
-            .try_handle_statement(&engine, "SHOW   VIEWS", ctx)
-            .unwrap(),
-    );
-    assert_eq!(show.columns[0].name(), "Views_in_db");
-    assert_eq!(query_rows(&show), vec!["v1", "v2"]);
+    assert_eq!(local_view_names(&service, "db"), ["v1", "v2"]);
     declarations::analyze_snapshot_query(
         &service.catalog_snapshot().unwrap(),
         "SELECT x.a FROM v1 AS x",
@@ -352,12 +383,7 @@ fn local_views_do_not_exist_on_a_new_service_instance() {
             .is_none()
     );
     assert!(original.get(&identity).is_some());
-    let show = query_result(
-        restarted
-            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
-            .unwrap(),
-    );
-    assert!(query_rows(&show).is_empty());
+    assert!(local_view_names(&restarted, "db").is_empty());
 }
 
 #[test]
@@ -501,7 +527,7 @@ fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
 }
 
 #[test]
-fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
+fn iceberg_show_create_escapes_comment_and_preserves_original_body() {
     let service = QueryViewService::new();
     let engine = FakeViewEngine::default();
     let target = ViewTarget {
@@ -523,16 +549,6 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
             properties: HashMap::new(),
         },
     );
-    engine.insert_view(
-        ViewTarget {
-            catalog: "ice".to_string(),
-            database: "db".to_string(),
-            view: "a".to_string(),
-        },
-        "SELECT 2",
-        "db",
-    );
-
     let show_create = query_result(
         service
             .try_handle_statement(&engine, "SHOW   CREATE VIEW ice.db.v", context(None, "db"))
@@ -556,17 +572,6 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
         panic!("SHOW CREATE must be a supported CREATE VIEW statement")
     };
     assert_eq!(create.raw_query_source, "SELECT /* raw body */\n 1 AS a");
-
-    let show = query_result(
-        service
-            .try_handle_statement(
-                &engine,
-                "SHOW VIEWS FROM db",
-                context(Some("ice"), "ignored"),
-            )
-            .unwrap(),
-    );
-    assert_eq!(query_rows(&show), vec!["a", "v"]);
 }
 
 #[test]
@@ -582,70 +587,15 @@ fn dropping_external_database_does_not_remove_default_catalog_views() {
         .unwrap();
 
     service.drop_database("ice", "db").unwrap();
-    let show = query_result(
-        service
-            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
-            .unwrap(),
-    );
-    assert_eq!(query_rows(&show), vec!["v"]);
-
+    assert_eq!(local_view_names(&service, "db"), ["v"]);
+    let original = service.catalog_snapshot().unwrap();
     service.drop_database("default_catalog", "db").unwrap();
-    let show = query_result(
-        service
-            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
-            .unwrap(),
-    );
-    assert!(query_rows(&show).is_empty());
-}
-
-#[test]
-fn show_views_pure_declaration_keeps_external_selection_and_result_semantics() {
-    let service = QueryViewService::new();
-    let statements = novarocks_parser::parse("SHOW VIEWS FROM db").unwrap();
-    let [ParsedStatement::View(novarocks_parser::ast::ViewStatement::Show(show))] =
-        statements.as_slice()
-    else {
-        panic!("SHOW declaration");
-    };
-    let prepared = service
-        .prepare_show_views(show, context(Some("ice"), "ignored"))
-        .unwrap();
-    assert!(
-        matches!(&prepared.source, crate::view::ShowViewsSource::External { catalog, namespace } if catalog == "ice" && namespace == "db")
-    );
-    let result = prepared
-        .finish(vec!["z".into(), "a".into(), "z".into()])
-        .unwrap();
-    assert_eq!(result.columns[0].name(), "Views_in_db");
-    assert_eq!(query_rows(&result), ["a", "z"]);
-    assert!(
-        service
-            .prepare_show_views(
-                show,
-                ViewRequestContext {
-                    current_catalog: Some("ice"),
-                    current_database: "db",
-                    connector_context: None,
-                }
-            )
-            .is_err()
-    );
-}
-
-#[test]
-fn show_views_cannot_fall_back_to_synchronous_statement_dispatch() {
-    let service = QueryViewService::new();
-    let engine = FakeViewEngine::default();
-    let statements = novarocks_parser::parse("SHOW VIEWS").unwrap();
-    let [ParsedStatement::View(show)] = statements.as_slice() else {
-        panic!("SHOW declaration");
-    };
+    assert!(local_view_names(&service, "db").is_empty());
     assert_eq!(
-        service
-            .execute_statement(&engine, show, context(None, "db"))
-            .unwrap_err()
-            .to_string(),
-        "SHOW VIEWS requires its original governed read source"
+        original
+            .names_in_namespace("default_catalog", "db")
+            .collect::<Vec<_>>(),
+        ["v"]
     );
 }
 

@@ -83,7 +83,7 @@ pub(super) fn parse(
 
 /// Bound the syntax-tree depth of a homogeneous UNION ALL chain. Analysis
 /// still folds its operands in source order, retaining pairwise type widening.
-fn balance_union_all(expression: SetExpr) -> SetExpr {
+pub(crate) fn balance_union_all(expression: SetExpr) -> SetExpr {
     if !matches!(&expression, SetExpr::SetOperation(operation)
         if operation.operator == SetOperator::Union && operation.quantifier == SetQuantifier::All)
     {
@@ -108,7 +108,7 @@ fn balance_union_all(expression: SetExpr) -> SetExpr {
         let mut values = operands.into_iter();
         while let Some(left) = values.next() {
             if let Some(right) = values.next() {
-                let span = Span::new(left.span().start(), right.span().end());
+                let span = left.span().cover(right.span());
                 next_level.push(SetExpr::SetOperation(SetOperation {
                     left: Box::new(left),
                     operator: SetOperator::Union,

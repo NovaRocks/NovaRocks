@@ -20,7 +20,10 @@ use super::{
     queue_input::{AdmitQueuedInput, OriginalQueuedInput, SendKey},
     source_ports::{BodyOutcome, TransportLeg},
 };
-use crate::task_execution::creation::{CreateTaskIntent, PricedTaskCreation};
+use crate::task_execution::{
+    creation::{CreateTaskIntent, PricedTaskCreation},
+    error::TaskExecutionError,
+};
 use novarocks_control_runtime::exit_work::{GatedOutcome, GatedWork};
 use novarocks_control_runtime_core::identity::Generation;
 use novarocks_execution_contract::OperationEnvelope;
@@ -42,6 +45,7 @@ pub(crate) struct BoundQueue {
     pub(crate) scope_generation: Generation,
     pub(crate) control: bool,
     pub(crate) quote: NativeQueuedInputQuote,
+    pub(crate) preflight: Result<usize, TaskExecutionError>,
     pub(crate) authority: NativeAsyncActionAuthority,
     pub(super) creation: Option<CreationAdmission>,
 }
@@ -59,7 +63,13 @@ pub(crate) fn future_layout() -> std::alloc::Layout {
 /// Its inline values are included in the outer factory and tuple layouts.
 pub(crate) fn owned_preparation_layouts() -> [std::alloc::Layout; 5] {
     fn of<P, F>(
-        _: fn(SendKey, NativeAsyncActionAuthority, bool, NativeQueuedInputQuote) -> P,
+        _: fn(
+            SendKey,
+            NativeAsyncActionAuthority,
+            bool,
+            NativeQueuedInputQuote,
+            Result<usize, TaskExecutionError>,
+        ) -> P,
         body: fn(Option<CreationAdmission>, P::Output) -> F,
     ) -> [std::alloc::Layout; 4]
     where
@@ -82,10 +92,12 @@ async fn prepare_input(
     authority: NativeAsyncActionAuthority,
     control: bool,
     quote: NativeQueuedInputQuote,
-) -> Result<OriginalQueuedInput, novarocks_workload_control::WorkError> {
+    preflight: Result<usize, TaskExecutionError>,
+) -> Result<OriginalQueuedInput, TaskExecutionError> {
+    preflight?;
     match AdmitQueuedInput::new(key, &authority, control, quote) {
-        Ok(pre) => pre.await,
-        Err(error) => Err(error),
+        Ok(pre) => pre.await.map_err(TaskExecutionError::Workload),
+        Err(error) => Err(TaskExecutionError::Workload(error)),
     }
 }
 pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
@@ -101,14 +113,13 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
         scope_generation,
         control,
         quote,
+        preflight,
         authority,
         creation,
     } = *bound;
-    let pre = prepare_input(key, authority, control, quote);
-    let body: fn(
-        Option<CreationAdmission>,
-        Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
-    ) -> _ = return_input;
+    let pre = prepare_input(key, authority, control, quote, preflight);
+    let body: fn(Option<CreationAdmission>, Result<OriginalQueuedInput, TaskExecutionError>) -> _ =
+        return_input;
     let running = GatedWork::new(exit, creation, handoff, panic).run(scope_generation, pre, body);
     async move {
         let outcome = match running.await {
@@ -122,11 +133,12 @@ pub(crate) fn run(job: QueueJob) -> impl std::future::Future<Output = ()> {
 
 async fn return_input(
     creation: Option<CreationAdmission>,
-    prepared: Result<OriginalQueuedInput, novarocks_workload_control::WorkError>,
+    prepared: Result<OriginalQueuedInput, TaskExecutionError>,
 ) -> BodyOutcome {
     let input = match prepared {
         Ok(input) => input,
-        Err(error) => return BodyOutcome::LocalFailure(error),
+        Err(TaskExecutionError::Workload(error)) => return BodyOutcome::LocalFailure(error),
+        Err(error) => return BodyOutcome::CreationFailed(error),
     };
     let creation = if let Some(CreationAdmission { envelope, seed }) = creation {
         let pin = match input.retain_payload() {
@@ -148,4 +160,43 @@ async fn return_input(
         None
     };
     BodyOutcome::InputAdmitted { creation, input }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task_execution::error::CapacityBound;
+    use novarocks_attempt_protocol::input::SendGeneration;
+    use novarocks_coordination_contract::AttemptActionId;
+    use novarocks_execution_contract::TaskOperationId;
+    use std::num::NonZeroU64;
+
+    #[tokio::test]
+    async fn invalid_method_length_is_refused_before_wc_input_admission() {
+        let wc = super::super::queue_input::tests::Governed::new();
+        let key = SendKey {
+            operation: TaskOperationId::new_v7(),
+            generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+        };
+        let quote =
+            super::super::queued_input_quote(0, super::super::SourceLayouts { original: &[] })
+                .unwrap();
+        let bound = CapacityBound::OperationBytes {
+            limit: 1024,
+            actual: 1025,
+        };
+        let result = prepare_input(
+            key,
+            wc.authority(),
+            false,
+            quote,
+            Err(TaskExecutionError::Capacity(bound)),
+        )
+        .await;
+        assert!(matches!(result, Err(TaskExecutionError::Capacity(actual)) if actual == bound));
+        assert!(
+            wc.finish(),
+            "a refused request creates no WC proposal or queue grant"
+        );
+    }
 }

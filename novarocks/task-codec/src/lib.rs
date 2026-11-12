@@ -41,7 +41,7 @@ pub mod participation_convergence;
 pub mod resource_preflight;
 pub mod status;
 
-pub use budget::TransportBudget;
+pub use budget::{TransportBudget, TransportMessageLimits};
 
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 
@@ -608,6 +608,7 @@ mod tests {
             inbound: vec![novarocks::TaskExchangeInbound {
                 destination_node_id: 30,
                 delivery: novarocks::ExchangeDeliveryRequirement::DemandDriven as i32,
+                position_shard_source_dops: None,
                 sources: vec![
                     novarocks::TaskExchangeSource {
                         task: Some(encode_task_identity(identity(1, 1, process))),
@@ -700,6 +701,77 @@ mod tests {
                 .expect_err("the default enum value is not a partitioning")
                 .kind(),
             &ProtocolErrorKind::InvalidEnum
+        );
+    }
+
+    #[test]
+    fn position_shard_roster_is_optional_complete_positive_and_must_drain() {
+        let process = backend();
+        let mut wire = novarocks::TaskExchangeTopology {
+            outbound: Vec::new(),
+            inbound: vec![novarocks::TaskExchangeInbound {
+                destination_node_id: 4,
+                delivery: novarocks::ExchangeDeliveryRequirement::MustDrain as i32,
+                sources: vec![
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 2, process))),
+                        task_key: Some(unique(1, 2)),
+                        sender_ordinal: 1,
+                    },
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 1, process))),
+                        task_key: Some(unique(1, 1)),
+                        sender_ordinal: 0,
+                    },
+                ],
+                position_shard_source_dops: None,
+            }],
+        };
+        let decode = |wire: &novarocks::TaskExchangeTopology| {
+            decode_topology(wire, FieldPath::root("topology"))
+        };
+        let ordinary = decode(&wire).unwrap();
+        assert!(ordinary.inbound()[0].position_shard_source_dops().is_none());
+
+        for (dops, expected) in [
+            (vec![], ProtocolErrorKind::InconsistentFields),
+            (vec![1], ProtocolErrorKind::InconsistentFields),
+            (vec![1, 4, 1], ProtocolErrorKind::InconsistentFields),
+            (vec![1, 0], ProtocolErrorKind::OutOfRange),
+        ] {
+            wire.inbound[0].position_shard_source_dops =
+                Some(novarocks::TaskPositionShardSourceDops { sender_dops: dops });
+            let error = decode(&wire).unwrap_err();
+            assert_eq!(error.kind(), &expected);
+            assert!(
+                error
+                    .path()
+                    .to_string()
+                    .contains("position_shard_source_dops")
+            );
+        }
+
+        wire.inbound[0].position_shard_source_dops = Some(novarocks::TaskPositionShardSourceDops {
+            sender_dops: vec![1, 4],
+        });
+        let decoded = decode(&wire).unwrap();
+        let inbound = &decoded.inbound()[0];
+        let dops = inbound.position_shard_source_dops().unwrap();
+        assert_eq!(inbound.sources()[0].sender_ordinal(), 1);
+        assert_eq!(
+            dops[inbound.sources()[0].sender_ordinal() as usize].get(),
+            4
+        );
+        assert_eq!(
+            dops[inbound.sources()[1].sender_ordinal() as usize].get(),
+            1
+        );
+        assert_eq!(encode_topology(&decoded), wire);
+
+        wire.inbound[0].delivery = novarocks::ExchangeDeliveryRequirement::DemandDriven as i32;
+        assert_eq!(
+            decode(&wire).unwrap_err().kind(),
+            &ProtocolErrorKind::InconsistentFields
         );
     }
 

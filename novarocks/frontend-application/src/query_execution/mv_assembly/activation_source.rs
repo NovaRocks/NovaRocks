@@ -296,6 +296,7 @@ impl MvWritePreparationCustody {
         let facts = self.facts.take();
         let access = self.access.take();
         self.install_phase(MvWriteActivationRequest::Finish(MvWriteFinishInput {
+            capacity: self.capacity.clone(),
             continuation: Some(needs.continuation),
             facts,
             access,

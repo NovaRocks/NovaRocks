@@ -931,9 +931,9 @@ async fn an_oversized_batch_is_refused_before_any_item_is_walked() {
         .collect();
     let error = apply_task_operations_at(&author, ordinary(operations), timing())
         .await
-        .expect_err("item budget precedes decoding or author access");
+        .expect_err("item count precedes decoding or author access");
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(error.message().contains("item or byte budget"));
+    assert!(error.message().contains("item bound"));
     assert!(!error.message().contains("requires a command"));
     author.assert_drained();
 }

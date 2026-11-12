@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use novarocks_state_store_api::{
-    MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
+    StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
     StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
 };
@@ -259,7 +259,7 @@ impl FoundationDbStateStoreProviderFactory {
         Ok(Self {
             descriptor: StateStoreProviderDescriptor::new(
                 FOUNDATIONDB_STATE_STORE_PROVIDER_ID,
-                MAX_KEY_BYTES,
+                crate::FOUNDATIONDB_STATE_STORE_CAPACITY,
             ),
             cluster_file: config.cluster_file,
             keyspace_id: config.keyspace_id,
@@ -280,6 +280,12 @@ impl StateStoreProviderFactory for FoundationDbStateStoreProviderFactory {
     ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
         if Instant::now() >= request.deadline {
             return Err(provider_deadline_error());
+        }
+        if !crate::FOUNDATIONDB_STATE_STORE_CAPACITY.accepts(&request.limits) {
+            return Err(StateStoreError::new(
+                StateStoreErrorKind::InvalidConfiguration,
+                "foundationdb opening limits exceed provider capacity",
+            ));
         }
         let runtime = FoundationDbRuntime::boot(self.client)?;
         let (state_store, runtime) =
@@ -567,7 +573,7 @@ mod tests {
     impl StateStore for FakeStore {
         fn limits(&self) -> &StateStoreLimits {
             static LIMITS: std::sync::LazyLock<StateStoreLimits> =
-                std::sync::LazyLock::new(StateStoreLimits::default);
+                std::sync::LazyLock::new(|| crate::FOUNDATIONDB_STATE_STORE_CAPACITY.limits());
             &LIMITS
         }
 
@@ -636,7 +642,7 @@ mod tests {
     fn open_request(deadline: Instant) -> StateStoreOpenRequest {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
-            limits: StateStoreLimits::default(),
+            limits: crate::FOUNDATIONDB_STATE_STORE_CAPACITY.limits(),
             deadline,
         }
     }

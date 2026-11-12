@@ -30,13 +30,176 @@ import hashlib
 import json
 import pathlib
 import re
+from typing import Optional
 
 
 def row_bag(rows: list) -> collections.Counter:
     return collections.Counter(json.dumps(row, separators=(",", ":"), sort_keys=True) for row in rows)
 
 
-def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
+LINEAGE_PHASES = {
+    "mixed": {"manifest_mixed"},
+    "historical": {"manifest_old_bucket", "manifest_promoted_identity"},
+    "historical-check": {"manifest_old_bucket", "manifest_promoted_identity"},
+}
+
+
+def validate_lineage(records: list, artifact_paths: set, phase: str) -> list:
+    lineage = [record for record in records if record["record"] == "lineage"]
+    expected = LINEAGE_PHASES[phase]
+    if len(lineage) != len(expected) or {case["case"] for case in lineage} != expected:
+        raise ValueError(f"Incomplete manifest-lineage phase: {phase}")
+    for case in lineage:
+        rows = case["spark_rows"]
+        if phase == "historical-check":
+            new = rows[-1]
+            if not isinstance(new[-2], int) or new[-2] < 2:
+                raise ValueError(f"{case['case']}: missing distinct new row identity")
+            rows = rows[:-1] + [new[:-2] + [None, new[-1]]]
+        if row_bag(rows) != row_bag(case["independent_expected_rows"]):
+            raise ValueError(f"{case['case']}: independent lineage row-bag mismatch")
+        snapshots = case["snapshots"]
+        if len(snapshots) != (2 if phase == "historical-check" else 1):
+            raise ValueError(f"{case['case']}: missing expected snapshot observation")
+        required_paths = {case["metadata"]}
+        manifest_paths = set()
+        for snapshot in snapshots:
+            required_paths.add(snapshot["manifest_list"])
+            for manifest in snapshot["raw_manifests"]:
+                manifest_paths.add(manifest["path"])
+                for entry in manifest["entries"]:
+                    required_paths.add(entry["data_file"]["file_path"])
+        if (required_paths | manifest_paths) - artifact_paths:
+            raise ValueError(f"{case['case']}: incomplete lineage artifact export")
+        if phase == "mixed":
+            if case["mixed_manifest"] not in manifest_paths:
+                raise ValueError("Missing mixed manifest from the snapshot list")
+        elif not set(case["source_manifests"]) <= manifest_paths:
+            raise ValueError(f"{case['case']}: missing original manifests")
+    return lineage
+
+
+def check_lineage_seed(receipt: dict, seed_path: pathlib.Path) -> None:
+    seed_bytes = seed_path.read_bytes()
+    seed = json.loads(seed_bytes)
+    if seed["mode"] != "lineage" or seed["lineage_phase"] != "historical":
+        raise ValueError("Expected a historical lineage seed receipt")
+    for key in ("iceberg", "requested_warehouse", "namespace", "prefix"):
+        if receipt["runtime"][key] != seed["runtime"][key]:
+            raise ValueError(f"Lineage verification changed the seed {key}")
+    by_case = {case["case"]: case for case in seed["lineage"]}
+    for case in receipt["lineage"]:
+        before = by_case[case["case"]]
+        if case["table_uuid"] != before["table_uuid"] or case["snapshots"][0] != before["snapshots"][0]:
+            raise ValueError(f"{case['case']}: observed a different seed table or snapshot")
+    digests = {artifact["path"]: artifact["sha256"] for artifact in receipt["artifacts"]}
+    for artifact in seed["artifacts"]:
+        if artifact["kind"] != "metadata" and digests.get(artifact["path"]) != artifact["sha256"]:
+            raise ValueError(f"Append changed a historical object: {artifact['path']}")
+    receipt["lineage_seed_receipt"] = {
+        "path": str(seed_path.resolve()), "sha256": hashlib.sha256(seed_bytes).hexdigest(),
+    }
+
+
+def delete_key(entry: dict) -> tuple:
+    return tuple(entry.get(key) for key in
+                 ("path", "spec_id", "referenced_data_file", "content_offset", "content_size"))
+
+
+def delete_entry_for_comparison(entry: dict) -> dict:
+    # Java can report an absent metrics map as null. Rewriting a manifest
+    # through the Rust SDK serializes its empty map with no column statistics.
+    optional_metrics = {"value_counts", "null_value_counts", "nan_value_counts",
+                        "lower_bounds_base64", "upper_bounds_base64"}
+    return {field: {} if field in optional_metrics and value is None else value
+            for field, value in entry.items()}
+
+
+def check_mutation_seed(receipt: dict, seed_path: pathlib.Path) -> None:
+    seed_bytes = seed_path.read_bytes()
+    seed = json.loads(seed_bytes)
+    if seed["mode"] != "mutation-seed" or len(seed["cases"]) != 1:
+        raise ValueError("Expected the one original materialization seed receipt")
+    for key in ("iceberg", "iceberg_class_source", "requested_warehouse", "namespace", "prefix"):
+        if receipt["runtime"][key] != seed["runtime"][key]:
+            raise ValueError(f"Materialization verification changed the seed {key}")
+    before, after = seed["cases"][0], receipt["cases"][0]
+    lower, upper = before["generation"], after["generation"]
+    if (before["table"] != after["table"] or lower["table_uuid"] != upper["table_uuid"]
+            or upper["parent_snapshot"] != before["snapshot"]
+            or upper["snapshot_sequence"] != lower["snapshot_sequence"] + 1):
+        raise ValueError("Native DELETE must publish one child of the exact Java seed")
+    if lower["format_version"] != 3 or upper["format_version"] != 3:
+        raise ValueError("Materialization requires the upgraded v3 table")
+    if lower["current_spec"] != upper["current_spec"]:
+        raise ValueError("Native mutation changed the historical partition setup")
+    def by_data_path(entries):
+        return {entry["file"]["path"]: entry for entry in entries}
+
+    data = by_data_path(lower["live_data"])
+    if (len(data) != 3 or len(lower["live_data"]) != 3 or len(upper["live_data"]) != 3
+            or data != by_data_path(upper["live_data"])):
+        raise ValueError("Materialization changed data entries, sequence or row lineage")
+    if any(entry["file"]["spec_id"] == lower["current_spec"] for entry in data.values()):
+        raise ValueError("All targets in this fixture must have a historical spec")
+
+    before_deletes = {delete_key(entry): entry for entry in lower["live_deletes"]}
+    after_deletes = {delete_key(entry): entry for entry in upper["live_deletes"]}
+    if (len(before_deletes) != len(lower["live_deletes"])
+            or len(after_deletes) != len(upper["live_deletes"])):
+        raise ValueError("Delete receipt repeated a physical logical entry")
+    old_dvs = {entry["referenced_data_file"]: entry for entry in lower["old_dvs"]}
+    b, c = lower["target_b"], lower["untouched_c"]
+    if old_dvs[b]["path"] != old_dvs[c]["path"] or delete_key(old_dvs[b]) == delete_key(old_dvs[c]):
+        raise ValueError("Expected distinct target blobs in the original shared Puffin")
+    # The old vectors already include the applicable position rows. Verify Java
+    # actually suppresses the corresponding Parquet sources when a DV applies.
+    tasks = {task["data"]["path"]: task for task in before["java_planFiles"]["tasks"]}
+    for target in (b, c):
+        position_inputs = [delete_key(entry) for entry in tasks[target]["deletes"]
+                           if entry["content"] == "POSITION_DELETES"]
+        if position_inputs != [delete_key(old_dvs[target])]:
+            raise ValueError(f"Java seed did not observe the planned DV priority for {target}")
+
+    removed = {delete_key(lower["exclusive"]), delete_key(old_dvs[b])}
+    if before_deletes.keys() - after_deletes.keys() != removed:
+        raise ValueError("Expected only the exclusive Parquet and B's old logical blob to be removed")
+    preserved = set(before_deletes) - removed
+    if preserved != {delete_key(lower["shared"]), delete_key(lower["shadowed"]),
+                     delete_key(lower["equality"]), delete_key(old_dvs[c])}:
+        raise ValueError("Seed delete inventory did not contain the intended immutable peers")
+    if any(delete_entry_for_comparison(after_deletes[key]) != delete_entry_for_comparison(before_deletes[key])
+           for key in preserved):
+        raise ValueError("Native DELETE changed a shared, suppressed, equality, or untouched entry")
+
+    created = [after_deletes[key] for key in after_deletes.keys() - before_deletes.keys()]
+    expected_counts = {lower["target_a"]: 2, b: 3}
+    if len(created) != 2 or {entry["referenced_data_file"]: entry["record_count"]
+                              for entry in created} != expected_counts:
+        raise ValueError("New DVs did not preserve deduplicated old plus selected positions")
+    for entry in created:
+        target = data[entry["referenced_data_file"]]["file"]
+        if (entry["format"] != "PUFFIN" or entry["spec_id"] != target["spec_id"]
+                or entry["partition"] != target["partition"]
+                or entry["file_sequence"] != upper["snapshot_sequence"]
+                or entry["data_sequence"] < target["data_sequence"]
+                or entry["content_offset"] is None or not entry["content_size"]):
+            raise ValueError("New DV has the wrong format, historical partition or sequence")
+
+    digests = {artifact["path"]: artifact["sha256"] for artifact in receipt["artifacts"]}
+    for artifact in seed["artifacts"]:
+        if artifact["kind"] != "metadata" and digests.get(artifact["path"]) != artifact["sha256"]:
+            raise ValueError(f"Native DELETE modified a historical object: {artifact['path']}")
+    if any(entry["path"] not in digests for entry in created):
+        raise ValueError("New Puffin artifacts were not retained")
+    receipt["mutation_seed_receipt"] = {
+        "path": str(seed_path.resolve()), "sha256": hashlib.sha256(seed_bytes).hexdigest(),
+    }
+
+
+def validate(log: pathlib.Path, output: pathlib.Path, mode: str,
+             lineage_phase: Optional[str] = None, lineage_seed: Optional[pathlib.Path] = None,
+             mutation_seed: Optional[pathlib.Path] = None) -> dict:
     text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
     if "UEA4G_COMPLETE" not in text.splitlines():
         raise ValueError("Missing completion marker; Scala compilation or execution failed")
@@ -50,7 +213,13 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
     if len(names) != len(set(names)):
         raise ValueError("Duplicate case names")
     expected = {f"same_commit_{kind}" for kind in ("position", "equality", "dv")}
-    if mode == "promotion":
+    if mode == "lineage":
+        expected = set()
+    elif mode == "mutation-seed":
+        expected = {"materialization_seed"}
+    elif mode == "mutation-check":
+        expected = {"materialization_after"}
+    elif mode == "promotion":
         expected = {f"promotion_{partition}_{scan}" for partition in ("partitioned", "unpartitioned")
                     for scan in ("before", "snapshot", "current_projection")}
     elif mode == "projection":
@@ -152,6 +321,15 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str) -> dict:
             raise ValueError(f"{endpoint['case']}: endpoint added row-bag mismatch")
     receipt = {"runtime": runtime[0], "mode": mode, "cases": cases,
                "artifacts": artifacts, "registrations": registrations, "endpoint_oracles": endpoints}
+    if mode == "lineage":
+        receipt["lineage_phase"] = lineage_phase
+        receipt["lineage"] = validate_lineage(records, artifact_paths, lineage_phase)
+        if lineage_seed is not None:
+            check_lineage_seed(receipt, lineage_seed)
+    if mode == "mutation-check":
+        if mutation_seed is None:
+            raise ValueError("Materialization check requires the original seed receipt")
+        check_mutation_seed(receipt, mutation_seed)
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     for case in cases:
         planned = case["java_planFiles"]
@@ -164,6 +342,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection"), required=True)
+    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection", "lineage",
+                                           "mutation-seed", "mutation-check"), required=True)
+    parser.add_argument("--lineage-phase", choices=LINEAGE_PHASES)
+    parser.add_argument("--lineage-seed-receipt", type=pathlib.Path)
+    parser.add_argument("--mutation-seed-receipt", type=pathlib.Path)
     args = parser.parse_args()
-    validate(args.log, args.output, args.mode)
+    if (args.mode == "lineage") != (args.lineage_phase is not None):
+        parser.error("--lineage-phase is required with --mode lineage and unavailable otherwise")
+    if (args.lineage_phase == "historical-check") != (args.lineage_seed_receipt is not None):
+        parser.error("--lineage-seed-receipt is required with historical-check and unavailable otherwise")
+    if (args.mode == "mutation-check") != (args.mutation_seed_receipt is not None):
+        parser.error("--mutation-seed-receipt is required with mutation-check and unavailable otherwise")
+    validate(args.log, args.output, args.mode, args.lineage_phase, args.lineage_seed_receipt,
+             args.mutation_seed_receipt)

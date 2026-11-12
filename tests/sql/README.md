@@ -49,7 +49,7 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
 
 HMS 的 `iceberg-hms` suite 以封闭的 `hms-read-only-compatibility-v1` case 输入合同声明准备工作。runner 先做纯定义读取和 case 选择，由同一运行的 owner 在最终 SQL 绑定前准备真实表并冻结首个 append snapshot ID；只读发现入口不启动 producer，也不补造 snapshot ID。准备沿原 run 身份、namespace、storage 和截止时间执行，cloneable 的 SQL case 不携带清理权限。
 
-固定 recipe 的 q1 核验已准备的输入，q11 以 metadata 查询和独立行断言核验冻结 ID，q12 保留 numeric `VERSION AS OF` 和原三行期望。完整 59 步、38 个拒绝断言和 11 段旧期望继续受原比较规则约束。准备 receipt、绑定后每步实际 SQL 的 hash 以及输入 hash 保存在 `tests/sql/.runtime/hms-evidence/<namespace>/`。
+固定 recipe 的 q1 核验已准备的输入，q11 以 metadata 查询和独立行断言核验冻结 ID，q12 保留 numeric `VERSION AS OF` 和原三行期望。当前资产为 61 步、38 个拒绝断言，结果继续受原比较规则约束。q57 查询标准 MV 系统表，q58 列举库中的表，q59 按 `table_type = 'VIEW'` 过滤；HMS 没有视图列举能力，因此 q59 期望零行。q60 清理 fixture，q61 删除 catalog。HMS 在这次迁移中只作静态核对，相关改写期望未经过 record 或运行验证；其余既有期望不因迁移重新录制。准备 receipt、绑定后每步实际 SQL 的 hash 以及输入 hash 保存在 `tests/sql/.runtime/hms-evidence/<namespace>/`。
 
 该 owner 在公共收尾中保管失败、取消和未使用的准备结果；清理首次派发前持久登记，同一次失败或 Unknown 不自动重派。远端 Spark settlement、原 host 进程组及 Server 的真实退出分别取证，未知状态保留原 intent，截止时间不续期。具体 fixture 操作见 [HMS fixture](fixtures/iceberg-hms/README.md)。
 

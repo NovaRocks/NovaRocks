@@ -598,6 +598,62 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
 
+                if let Some(declaration) = self.catalog.resolve_system_table_for_analysis(
+                    catalog_override.as_deref(),
+                    &db_lower,
+                    &tbl_lower,
+                    version.as_ref(),
+                )? {
+                    if let Some(version) = version {
+                        return Err(AnalyzeError::unsupported_query_shape(
+                            "time travel is not supported on a system table",
+                            version.span,
+                        ));
+                    }
+                    let alias_name = alias
+                        .as_ref()
+                        .map(|alias| alias.name.value.clone())
+                        .unwrap_or_else(|| tbl.clone());
+                    let mut output_columns = declaration
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            self.check_control()?;
+                            Ok(OutputColumn {
+                                column_id: self.alloc_column_id(
+                                    Some(alias_name.clone()),
+                                    column.name.clone(),
+                                    column.value_type.clone(),
+                                ),
+                                name: column.name.clone(),
+                                field_name: Some(column.name.clone()),
+                                value_type: column.value_type.clone(),
+                                is_internal: false,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, AnalyzeError>>()?;
+                    if let Some(alias) = alias {
+                        crate::analysis::schema::apply_column_aliases(
+                            &mut output_columns,
+                            &alias.columns,
+                            alias.span,
+                        )?;
+                    }
+                    let mut scope = self.new_scope();
+                    for column in &output_columns {
+                        self.check_control()?;
+                        scope.add_field(Some(&alias_name), column);
+                    }
+                    return Ok((
+                        Relation::SystemTable {
+                            declaration: declaration.clone(),
+                            alias: alias_name,
+                            output_columns,
+                        },
+                        scope,
+                    ));
+                }
+
                 let resolved_table = if let Some(version) = version {
                     // Diagnose an invalid saved selection before asking the
                     // closed catalog for a key its collector did not publish.
@@ -618,40 +674,6 @@ impl<'a> super::AnalyzerContext<'a> {
                         &tbl_lower,
                     )? {
                         return self.analyze_view_relation(view, alias.as_ref(), &tbl, name.span);
-                    }
-                    if let Some(values) = self.catalog.resolve_inline_relation_for_analysis(
-                        catalog_override.as_deref(),
-                        &db_lower,
-                        &tbl_lower,
-                    )? {
-                        let (body, output_columns) = self.analyze_inline_values(values)?;
-                        let query = super::ResolvedQuery {
-                            body: super::QueryBody::Values(body),
-                            order_by: Vec::new(),
-                            limit: None,
-                            offset: None,
-                            output_columns,
-                            local_cte_ids: Vec::new(),
-                        };
-                        let output_columns =
-                            derived_table_output_columns(&query.output_columns, alias.as_ref())?;
-                        let alias_name = alias
-                            .as_ref()
-                            .map(|alias| alias.name.value.clone())
-                            .unwrap_or_else(|| tbl.clone());
-                        let mut scope = self.new_scope();
-                        for column in &output_columns {
-                            self.check_control()?;
-                            scope.add_field(Some(&alias_name), column);
-                        }
-                        return Ok((
-                            Relation::Subquery {
-                                query: Box::new(query),
-                                alias: alias_name,
-                                output_columns,
-                            },
-                            scope,
-                        ));
                     }
                     self.catalog
                         .resolve_table_for_analysis(

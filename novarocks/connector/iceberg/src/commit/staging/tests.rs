@@ -74,14 +74,14 @@ fn intent(shape: RequestShape) -> OperationIntent {
     })
     .unwrap()
 }
-struct TestWriter {
+pub(crate) struct TestWriter {
     io: FileIO,
     attempt: AttemptToken,
     ledger: Mutex<ArtifactLedger>,
     directory: tempfile::TempDir,
 }
 impl TestWriter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Handle::current();
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -156,12 +156,20 @@ fn change(updates: Vec<TableUpdate>) -> PreparedChange {
     }
 }
 fn append(metadata: &TableMetadata, id: i64) -> Vec<TableUpdate> {
+    append_with_list_path(
+        metadata,
+        id,
+        format!("s3://bucket/table/metadata/snap-{id}.avro"),
+    )
+}
+
+fn append_with_list_path(metadata: &TableMetadata, id: i64, list_path: String) -> Vec<TableUpdate> {
     let snapshot = Snapshot::builder()
         .with_snapshot_id(id)
         .with_parent_snapshot_id(metadata.snapshot_for_ref("main").map(|s| s.snapshot_id()))
         .with_sequence_number(metadata.next_sequence_number())
         .with_timestamp_ms(1_700_000_000_000 + id)
-        .with_manifest_list(format!("s3://bucket/table/metadata/snap-{id}.avro"))
+        .with_manifest_list(list_path)
         .with_summary(Summary {
             operation: Operation::Append,
             additional_properties: HashMap::new(),
@@ -350,7 +358,19 @@ impl Preparer for AppendObserver {
                 .map(|s| s.snapshot_id()),
             self.expected_parent
         );
-        Ok(change(append(view.metadata(), self.new_id)))
+        let list = write_manifest_list(
+            view.artifacts(),
+            view.metadata(),
+            self.new_id,
+            self.expected_parent,
+            [],
+        )
+        .await?;
+        Ok(change(append_with_list_path(
+            view.metadata(),
+            self.new_id,
+            list.object.path().to_owned(),
+        )))
     }
 }
 struct StatisticsObserver {
@@ -585,7 +605,7 @@ fn data(path: &str, count: u64, first_row_id: Option<i64>) -> DataFile {
 }
 #[test]
 fn explicit_and_deleted_row_ids_do_not_consume_inheritance_cursor() {
-    let mut cursor = FirstRowIdInheritance::new(Some(100));
+    let mut cursor = crate::manifest::binding::RowIdBinding::new(Some(100), false);
     assert_eq!(
         cursor
             .resolve(&data("a", 10, None), ManifestStatus::Existing)
@@ -611,7 +631,7 @@ fn explicit_and_deleted_row_ids_do_not_consume_inheritance_cursor() {
         Some(110)
     );
     assert_eq!(
-        FirstRowIdInheritance::new(None)
+        crate::manifest::binding::RowIdBinding::new(None, false)
             .resolve(&data("legacy", 5, None), ManifestStatus::Existing)
             .unwrap(),
         None

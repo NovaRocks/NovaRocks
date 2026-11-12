@@ -20,6 +20,19 @@ use novarocks_functions::{ConstantPolicy, KernelEvaluationControl, KernelFailure
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::time::Duration;
 
+/// Parse one owned query before handing test syntax to the compiler.
+pub(crate) fn parse_query(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let [novarocks_parser::ast::Statement::Query(query)]: [novarocks_parser::ast::Statement; 1] =
+        novarocks_parser::parse(sql)
+            .expect("parse test query")
+            .try_into()
+            .expect("exactly one test statement")
+    else {
+        panic!("expected a test query");
+    };
+    Box::new(query)
+}
+
 /// Unbounded compile and evaluation control. Waiting returns immediately so a
 /// sleeping kernel cannot stall a differential run.
 #[derive(Clone, Copy, Debug, Default)]

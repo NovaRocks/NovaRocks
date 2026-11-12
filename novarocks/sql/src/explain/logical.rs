@@ -232,7 +232,9 @@ fn visit(
             line!("{pad}EXCEPT");
             plan.children.len()
         }
-        LogicalPlanKind::Values(_) | LogicalPlanKind::GenerateSeries(_) => {
+        LogicalPlanKind::Values(_)
+        | LogicalPlanKind::SystemTable(_)
+        | LogicalPlanKind::GenerateSeries(_) => {
             line!(
                 "{pad}{}",
                 Header(&plan.kind, PlanNodeExplainStage::Logical, Some(diagnostic))
@@ -348,6 +350,12 @@ impl fmt::Display for Header<'_> {
                 out.write_char(']')
             }
             LogicalPlanKind::Values(node) => write!(out, "VALUES ({} rows)", node.rows.len()),
+            LogicalPlanKind::SystemTable(node) => write!(
+                out,
+                "SYSTEM TABLE {} [columns={:?}]",
+                node.declaration.qualified_name(),
+                node.required_columns
+            ),
             LogicalPlanKind::Repeat(node) => {
                 write!(out, "REPEAT ({} grouping sets)", node.grouping_ids.len())
             }

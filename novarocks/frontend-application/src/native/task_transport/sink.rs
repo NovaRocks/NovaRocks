@@ -362,6 +362,37 @@ impl TaskOperationSink for NativeTaskOperationSink {
         request: crate::task_execution::intent::TaskOperationQueueRequest,
         preparation: &mut crate::task_execution::intent::TaskOperationQueuePreparation,
     ) -> TaskOperationQueueAdmission {
+        let sizing = (|| -> Result<(), novarocks_workload_control::WorkError> {
+            use novarocks_workload_control::WorkError;
+            let bytes = request.encoded_bytes().map_err(|error| match error {
+                novarocks_task_codec::operation::wire_size::WireSizeError::Overflow => {
+                    WorkError::ArithmeticOverflow
+                }
+                novarocks_task_codec::operation::wire_size::WireSizeError::NotCodecProduced => {
+                    WorkError::Conflict
+                }
+            })?;
+            if bytes
+                > self
+                    .transport
+                    .message_limits()
+                    .request_max_bytes(request.requires_control_progress())
+            {
+                return Err(WorkError::Capacity("Native operation message length"));
+            }
+            let windows =
+                crate::task_execution::intent::NativeRequestWindows::for_transport(self.transport)
+                    .map_err(|_| WorkError::InvalidConfig("Native request windows"))?;
+            if request.queued_bytes()
+                > windows.empty_queue_capacity(request.requires_control_progress())
+            {
+                return Err(WorkError::Capacity("Native operation empty queue window"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = sizing {
+            return TaskOperationQueueAdmission::Rejected(error);
+        }
         let result = self.reserve_paid_queue_in(request, preparation);
         if matches!(
             &result,
@@ -535,6 +566,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             .expect("original paid encoding source remains installed");
         settle_unencodable(self, unencodable);
         observe_batch(batch.lane(), items, encoded_bytes);
+        let batch_requires_control = batch.operations()[0].requires_control_progress();
         let queue_permits = batch.commit_queue_permits();
         // All method runs inherit the same submit-time origin. A later run
         // cannot gain another full max-wait after earlier runs consumed time.
@@ -561,9 +593,13 @@ impl TaskOperationSink for NativeTaskOperationSink {
             physical: physical.call.take(),
             action_tail: Some(action_tail),
             reply_plan:
-                novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
-                    self.transport,
-                ),
+                novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+                    items,
+                    self.transport
+                        .message_limits()
+                        .response_max_bytes(batch_requires_control),
+                )
+                .expect("the same original reply layout was registered before admission"),
         };
         let reservations = ApplyReservations::new(queue_permits, encoding_permit);
         // The pure async constructor does not poll user code. Once committed,

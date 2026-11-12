@@ -23,16 +23,24 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use novarocks_state_store_api::{
-    AttemptId, AttemptOutcome, AttemptSupervisor, InDoubtAdjudicator, MAX_KEY_BYTES,
-    ReadTransaction, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
-    StateStoreProviderId, StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity,
-    WriteAttempt, WriteTransaction,
+    AttemptId, AttemptOutcome, AttemptSupervisor, InDoubtAdjudicator, ReadTransaction, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreOpenRequest,
+    StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
+    StateStoreProviderInstance, StateStoreProviderLifecycle, StoreIdentity, WriteAttempt,
+    WriteTransaction,
 };
+
+const TEST_CAPACITY: novarocks_state_store_api::StateStoreCapacity =
+    novarocks_state_store_api::StateStoreCapacity::new(
+        8 * 1024,
+        64 * 1024,
+        4 * 1024 * 1024,
+        10_000,
+    );
 
 const TEST_PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("test-provider");
 const TEST_DESCRIPTOR: StateStoreProviderDescriptor =
-    StateStoreProviderDescriptor::new(TEST_PROVIDER_ID, MAX_KEY_BYTES);
+    StateStoreProviderDescriptor::new(TEST_PROVIDER_ID, TEST_CAPACITY);
 
 fn assert_factory_object_safe(_: Box<dyn StateStoreProviderFactory>) {}
 fn assert_instance_object_safe(_: Box<dyn StateStoreProviderInstance>) {}
@@ -183,7 +191,7 @@ fn provider_id_has_value_order_hash_and_descriptor_identity() {
     assert_eq!(hash_of(a), hash_of(StateStoreProviderId::new("alpha")));
     assert_ne!(hash_of(a), hash_of(b));
     assert_eq!(TEST_DESCRIPTOR.id, TEST_PROVIDER_ID);
-    assert_eq!(TEST_DESCRIPTOR.max_key_bytes, MAX_KEY_BYTES);
+    assert_eq!(TEST_DESCRIPTOR.capacity, TEST_CAPACITY);
 }
 
 fn hash_of(id: StateStoreProviderId) -> u64 {
@@ -205,7 +213,7 @@ fn provider_traits_are_object_safe_and_factory_is_one_shot() {
 async fn instance_stops_exposure_before_shutdown_completes() {
     let mut instance = StubInstance {
         lifecycle: StateStoreProviderLifecycle::Ready,
-        store: Some(Arc::new(StubStateStore::new(StateStoreLimits::default()))),
+        store: Some(Arc::new(StubStateStore::new(TEST_CAPACITY.limits()))),
     };
     assert!(instance.state_store().is_some());
     instance
@@ -233,7 +241,7 @@ fn cleanup_context_keeps_primary_kind() {
 async fn factory_open_preserves_requested_limits_and_issues_scoped_attempts() {
     let tightened = StateStoreLimits {
         max_page_size: 17,
-        ..StateStoreLimits::default()
+        ..TEST_CAPACITY.limits()
     };
     let instance = Box::new(StubFactory)
         .open(StateStoreOpenRequest {

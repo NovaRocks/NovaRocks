@@ -23,6 +23,7 @@ use crate::runtime::task::ExecutionResult;
 
 use std::sync::{Arc, Mutex};
 
+use crate::exec::node::table_writer::PositionShardWriterSources;
 use crate::exec::pipeline::binding::ExchangeBinding;
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -117,6 +118,7 @@ pub struct ExchangeSourceFactory {
     node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
     receiver_progress: Arc<ExchangeReceiverProgress>,
+    position_shards: Option<Arc<PositionShardWriterSources>>,
 }
 
 /// The receiver registry owns the exact schema and decoded chunks. A source
@@ -137,7 +139,15 @@ impl ExchangeSourceFactory {
             node: ExchangeSourceIdentity { node_id },
             binding,
             receiver_progress: Arc::new(ExchangeReceiverProgress::new()),
+            position_shards: None,
         }
+    }
+    pub(crate) fn with_position_shards(
+        mut self,
+        roster: Option<Arc<PositionShardWriterSources>>,
+    ) -> Self {
+        self.position_shards = roster;
+        self
     }
 }
 
@@ -152,6 +162,7 @@ impl ExchangeSourceFactory {
             node: self.node,
             binding: self.binding.clone(),
             driver_id,
+            position_shards: self.position_shards.clone(),
             receiver: None,
             receiver_progress: Arc::clone(&self.receiver_progress),
             source_observable: Arc::clone(&source_observable),
@@ -187,6 +198,7 @@ struct ExchangeSourceOperator {
     node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
     driver_id: i32,
+    position_shards: Option<Arc<PositionShardWriterSources>>,
     receiver: Option<exchange::ExchangeReceiverPin>,
     source_observable: Arc<Observable>,
     receiver_progress: Arc<ExchangeReceiverProgress>,
@@ -306,10 +318,20 @@ impl SourceKernel for ExchangeSourceOperator {
         }
 
         let receiver = self.receiver.as_ref().expect("receiver");
-        let out = receiver.try_pop_next_with_stats(self.binding.expected_senders)?;
+        let out = receiver.try_pop_sourced_with_stats(self.binding.expected_senders)?;
 
         match out {
-            Some(exchange::ExchangePopResult::Chunk(chunk)) => {
+            Some(exchange::SourcedExchangePopResult::Chunk(item)) => {
+                let (source, mut chunk) = item.into_parts();
+                if let Some(roster) = &self.position_shards {
+                    let source = source.ok_or_else(|| {
+                        crate::exec::fragment::error::program_binding_failure(
+                            crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                            "Position shards require their authenticated native source",
+                        )
+                    })?;
+                    chunk.set_position_shard_source(roster.authenticate(source)?);
+                }
                 let input_rows = chunk.len();
                 if chunk.is_empty() {
                     debug!(
@@ -331,7 +353,7 @@ impl SourceKernel for ExchangeSourceOperator {
                     input_rows as u64,
                 ))
             }
-            Some(exchange::ExchangePopResult::Finished(stats)) => {
+            Some(exchange::SourcedExchangePopResult::Finished(stats)) => {
                 receiver.complete_input_consumption(self.binding.expected_senders)?;
                 #[cfg(novarocks_dev_controls)]
                 if let Some(observer) = self

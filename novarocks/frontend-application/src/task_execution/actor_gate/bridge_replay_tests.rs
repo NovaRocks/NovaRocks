@@ -256,7 +256,7 @@ impl Trace {
         else {
             panic!("expected a Core-issued queue request");
         };
-        let grant = QueuedInputGrantRef::new(positive(record), generation);
+        let grant = QueuedInputGrantRef::new(positive(record), generation, 1);
         self.wait_native();
         let accepted = self.step(
             self.sources.transport,

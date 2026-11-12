@@ -30,13 +30,10 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         | ShowProcessList
         | ShowAnalyzeJobs
         | ShowTableStats
-        | ShowBasicStatsMeta
-        | ShowHistogramStatsMeta
         | ShowCreateTable
         | ShowOptimize
         | ShowMaterializedViews
         | ExplainMaterializedViewRefresh
-        | ShowViews
         | ShowCreateView => return None,
         Analyze => "ANALYZE",
         CreateCatalog => "CREATE CATALOG",

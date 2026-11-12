@@ -123,6 +123,7 @@ pub enum CatalogApplicationErrorKind {
     Internal,
     UnsupportedSourceMode,
     DesiredStateEnumerationIncomplete,
+    UnsupportedOperation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,12 +195,45 @@ impl novarocks_failure_contract::FailureProjection for CatalogApplicationError {
             CatalogApplicationErrorKind::UnsupportedSourceMode => (C::Data, 906),
             CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete => (C::Dependency, 907),
             CatalogApplicationErrorKind::Interrupted => (C::Invariant, 908),
+            CatalogApplicationErrorKind::UnsupportedOperation => (C::Unsupported, 909),
         };
         FailureFact::new(
             class,
             FailureReason::new(domain::METADATA, std::num::NonZeroU16::new(reason).unwrap()),
         )
     }
+}
+
+/// Built-in system names never enter external catalog mutation admission.
+/// These pure checks are reused before process admission and by the domain
+/// mutation author, so source mode or malformed properties cannot hide them.
+pub fn validate_catalog_create_name(
+    instance: &novarocks_spi::connector::ConnectorInstanceId,
+) -> Result<(), CatalogApplicationError> {
+    if instance
+        .as_str()
+        .eq_ignore_ascii_case(novarocks_types::naming::SYSTEM_CATALOG)
+    {
+        return Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::AlreadyExists,
+            "the built-in system catalog already exists",
+        ));
+    }
+    Ok(())
+}
+pub fn validate_catalog_drop_name(
+    instance: &novarocks_spi::connector::ConnectorInstanceId,
+) -> Result<(), CatalogApplicationError> {
+    if instance
+        .as_str()
+        .eq_ignore_ascii_case(novarocks_types::naming::SYSTEM_CATALOG)
+    {
+        return Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::UnsupportedOperation,
+            "the built-in system catalog is read-only",
+        ));
+    }
+    Ok(())
 }
 
 /// Durable local desired-state effects, distinct from external lake publication.

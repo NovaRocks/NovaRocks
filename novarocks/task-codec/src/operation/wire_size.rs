@@ -50,10 +50,14 @@ fn bytes(tag: u32, len: usize) -> SizeResult {
     if len == 0 { Ok(0) } else { message(tag, len) }
 }
 fn envelope(value: OperationEnvelope) -> SizeResult {
-    // The original TaskOperationId is exactly one non-nil UUID-v7 byte field.
+    envelope_wait(value.max_wait())
+}
+fn envelope_wait(wait: MaxWait) -> SizeResult {
+    // Every original operation identity is one UUID-v7 byte field. Pricing
+    // this fixed representation does not mint or substitute an identity.
     add(
         message(1, message(1, 16)?)?,
-        uint(2, value.max_wait().get().as_millis() as u64),
+        uint(2, wait.get().as_millis() as u64),
     )
 }
 fn operation(value: OperationEnvelope, tag: u32, body: usize) -> SizeResult {
@@ -103,21 +107,55 @@ fn close_destination(value: &TaskDomainUpdate) -> SizeResult {
     else {
         return Err(WireSizeError::NotCodecProduced);
     };
+    close_exchange_destination(*version, *edge, *destination)
+}
+pub fn close_exchange_destination(
+    version: novarocks_execution_contract::DomainVersion,
+    edge: novarocks_execution_contract::ExchangeEdgeId,
+    destination: TaskIdentity,
+) -> SizeResult {
     add(
         uint(1, version.get()) + uint(2, edge.get() as u64),
-        message(3, task(*destination)?)?,
+        message(3, task(destination)?)?,
     )
 }
+pub fn close_domain(body_bytes: usize) -> SizeResult {
+    message(4, body_bytes)
+}
+pub fn open_exchange_edges(
+    version: novarocks_execution_contract::EdgeOpenVersion,
+    edges: &[novarocks_execution_contract::ExchangeEdgeId],
+) -> SizeResult {
+    let values = sum(edges
+        .iter()
+        .map(|edge| prost::encoding::encoded_len_varint(edge.get() as u64)))?;
+    message(3, add(uint(1, version.get() as u64), packed(2, values)?)?)
+}
+pub fn split_assignment(value: &novarocks_execution_contract::SplitAssignmentIntent) -> SizeResult {
+    let original = stored_message::<novarocks_proto_models::connector_read::SplitAssignment>(
+        value.payload().as_ref(),
+    )
+    .ok_or(WireSizeError::NotCodecProduced)?;
+    message(1, message(1, original.encoded_len())?)
+}
+/// Borrowed domains already quoted by this codec author. The result excludes
+/// the outer batch item, just like `update`.
+pub fn update_parts(
+    value: OperationEnvelope,
+    identity: TaskIdentity,
+    domains: impl IntoIterator<Item = SizeResult>,
+    control: bool,
+) -> SizeResult {
+    let mut body = message(1, task(identity)?)?;
+    for domain in domains {
+        body = add(body, message(2, domain?)?)?;
+    }
+    operation(value, if control { 7 } else { 3 }, body)
+}
+
 pub fn task_domain(value: &TaskDomainUpdate) -> SizeResult {
     match value {
-        TaskDomainUpdate::SplitAssignment(value) => {
-            let original =
-                stored_message::<novarocks_proto_models::connector_read::SplitAssignment>(
-                    value.payload().as_ref(),
-                )
-                .ok_or(WireSizeError::NotCodecProduced)?;
-            message(1, message(1, original.encoded_len())?)
-        }
+        TaskDomainUpdate::SplitAssignment(value) => split_assignment(value),
         TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
             let original = stored_message::<novarocks_proto_models::filter::RuntimeFilterEnvelope>(
                 payload.as_ref(),
@@ -129,12 +167,11 @@ pub fn task_domain(value: &TaskDomainUpdate) -> SizeResult {
             )
         }
         TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
-            let values = sum(edges
-                .iter()
-                .map(|edge| prost::encoding::encoded_len_varint(edge.get() as u64)))?;
-            message(3, add(uint(1, version.get() as u64), packed(2, values)?)?)
+            open_exchange_edges(*version, edges)
         }
-        TaskDomainUpdate::CloseExchangeDestination { .. } => message(4, close_destination(value)?),
+        TaskDomainUpdate::CloseExchangeDestination { .. } => {
+            close_domain(close_destination(value)?)
+        }
     }
 }
 pub fn create(value: OperationEnvelope, fragment_len: usize, metadata_len: usize) -> SizeResult {
@@ -144,19 +181,51 @@ pub fn create(value: OperationEnvelope, fragment_len: usize, metadata_len: usize
         add(bytes(4, fragment_len)?, bytes(5, metadata_len)?)?,
     )
 }
-pub fn update(value: &UpdateTask, control: bool) -> SizeResult {
-    let mut body = message(1, task(value.identity())?)?;
-    for domain in value.domains() {
-        // The control encoder removes exactly the TaskDomainUpdate oneof
-        // wrapper, retaining each original CloseExchangeDestination message.
+/// Exact one-item Create request size before assigning its operation identity.
+/// Creation uses the same default wait and fixed UUID-v7 representation.
+pub fn pending_create(fragment_len: usize, metadata_len: usize) -> SizeResult {
+    let body = add(bytes(4, fragment_len)?, bytes(5, metadata_len)?)?;
+    batch_item(add(
+        message(
+            1,
+            envelope_wait(MaxWait::default_for(OperationKind::CreateTask))?,
+        )?,
+        message(2, body)?,
+    )?)
+}
+fn update_body(identity: TaskIdentity, domains: &[TaskDomainUpdate], control: bool) -> SizeResult {
+    let mut body = message(1, task(identity)?)?;
+    for value in domains {
         let domain = if control {
-            close_destination(domain)?
+            close_destination(value)?
         } else {
-            task_domain(domain)?
+            task_domain(value)?
         };
         body = add(body, message(2, domain)?)?;
     }
-    operation(value.envelope(), if control { 7 } else { 3 }, body)
+    Ok(body)
+}
+pub fn update(value: &UpdateTask, control: bool) -> SizeResult {
+    operation(
+        value.envelope(),
+        if control { 7 } else { 3 },
+        update_body(value.identity(), value.domains(), control)?,
+    )
+}
+/// Exact one-item request size before the pending domain enters its queue.
+/// UpdateTask::try_new uses this same default wait and UUID representation;
+/// no request identity or allocation is created for a preview.
+pub fn pending_update(identity: TaskIdentity, domain: &TaskDomainUpdate) -> SizeResult {
+    let control = matches!(domain, TaskDomainUpdate::CloseExchangeDestination { .. });
+    let body = update_body(identity, std::slice::from_ref(domain), control)?;
+    let operation = add(
+        message(
+            1,
+            envelope_wait(MaxWait::default_for(OperationKind::UpdateTask))?,
+        )?,
+        message(if control { 7 } else { 3 }, body)?,
+    )?;
+    batch_item(operation)
 }
 pub fn cancel(value: CancelTask, control: bool) -> SizeResult {
     operation(
@@ -276,6 +345,10 @@ mod tests {
             assert_eq!(
                 create(envelope, fragment.len(), metadata.len()).unwrap(),
                 actual.encoded_len()
+            );
+            assert_eq!(
+                pending_create(fragment.len(), metadata.len()).unwrap(),
+                batch_item(actual.encoded_len()).unwrap()
             );
         }
         assert_eq!(

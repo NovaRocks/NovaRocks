@@ -19,19 +19,13 @@
 //! The envelope's registered schema and fingerprint are checked by the caller.
 //! No Avro Value, ByteBuf or document model exists until this check succeeds.
 
-use crate::persistence::validation::PersistenceDecodeBudget;
-
-pub(super) fn projection(
-    payload: &[u8],
-    budget: PersistenceDecodeBudget,
-    version_four: bool,
-) -> Result<PersistenceDecodeBudget, String> {
+pub(super) fn projection(payload: &[u8], version_four: bool) -> Result<(), String> {
     let mut input = Datum { remaining: payload };
     input.long()?; // mv_id
     let definition = input.bytes()?;
     let interpretation = input.bytes()?;
     let configuration = input.bytes()?;
-    let publication = input.optional(Datum::bytes)?;
+    input.optional(Datum::bytes)?;
     input.provider_version()?;
     input.optional(Datum::provider_version)?;
     input.optional(Datum::long)?;
@@ -59,61 +53,21 @@ pub(super) fn projection(
     if !input.remaining.is_empty() {
         return Err("MV Accelerator Avro payload has trailing bytes".into());
     }
-    // Avro datum, serde materialization and the immutable source revision can
-    // overlap with the document codec's own six-copy structural envelope.
-    // The outer schema has no collections: four payload copies plus fixed
-    // record/string headers cover its simultaneous owned representations.
-    let outer = payload
-        .len()
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(4096))
-        .ok_or("MV projection outer decode working set overflows")?;
-    let available = budget
-        .max_working_set_bytes
-        .checked_sub(outer)
-        .ok_or("MV projection exceeds its outer decode working set bound")?;
-    let documents = PersistenceDecodeBudget {
-        max_working_set_bytes: available,
-        ..budget
-    };
     if let Some(binding) = binding {
-        for content in [definition, interpretation, configuration, binding] {
-            if content.len() > documents.max_document_bytes {
-                return Err("keyed MV cache document exceeds decode bound".into());
-            }
-        }
-        if publication.is_some_and(|p| p.len() > 4096) {
-            return Err("keyed MV publication exceeds record bound".into());
-        }
-        if [
-            definition.len(),
-            interpretation.len(),
-            configuration.len(),
-            binding.len(),
-            publication.map_or(0, |p| p.len()),
-        ]
-        .into_iter()
-        .sum::<usize>()
-            > crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES
-        {
-            return Err("keyed MV document set exceeds decode bound".into());
-        }
         crate::persistence::codec::keyed::preflight_keyed_document_set(
             definition,
             interpretation,
             binding,
             configuration,
-            publication,
-            documents,
         )
         .map_err(|e| e.to_string())?;
-        return Ok(documents);
+        return Ok(());
     }
     Err("legacy MV projection has no keyed binding".into())
 }
 
 /// The registered dependency V3 is a fixed record, with no collections.
-pub(super) fn dependency_v3(payload: &[u8], working_set_bytes: usize) -> Result<(), String> {
+pub(super) fn dependency_v3(payload: &[u8]) -> Result<(), String> {
     let mut input = Datum { remaining: payload };
     input.long()?;
     input.long()?;
@@ -127,14 +81,6 @@ pub(super) fn dependency_v3(payload: &[u8], working_set_bytes: usize) -> Result<
     input.long()?;
     if !input.remaining.is_empty() {
         return Err("MV dependency Avro payload has trailing bytes".into());
-    }
-    if payload
-        .len()
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(4096))
-        .is_none_or(|n| n > working_set_bytes)
-    {
-        return Err("MV dependency exceeds its decode working set bound".into());
     }
     Ok(())
 }

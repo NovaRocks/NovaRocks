@@ -26,8 +26,6 @@ pub(crate) fn remote(value: u32) -> crate::remote_task::RemoteTask {
     let creation = FrozenCreation {
         resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),
         queued_bytes: 256,
-        plan_carrier_bytes: 0,
-        descriptor_encoded_bytes: 0,
     };
     let graph = crate::graph::TaskGraph::from_frozen(FrozenTaskGraph {
         root: identity,
@@ -101,8 +99,6 @@ pub(crate) fn frozen_graph_with_strict_input(
                 creation: FrozenCreation {
                     resource: PayloadRef(NonZeroU64::new(u64::from(index)).unwrap()),
                     queued_bytes: 256,
-                    plan_carrier_bytes: 0,
-                    descriptor_encoded_bytes: 0,
                 },
             },
         );
@@ -167,8 +163,11 @@ pub(crate) fn execution_with_graph(graph: TaskGraph) -> crate::execution::QueryT
     let positions = epochs.keys().map(|&p| (p, 16)).collect();
     let transport = crate::config::FrozenTransportLimits {
         max_batch_items: 4,
-        max_batch_encoded_bytes: 4096,
-        max_descriptor_encoded_bytes: 4096,
+        batch_target_encoded_bytes: 4096,
+        ordinary_request_max_bytes: 1_048_576,
+        control_request_max_bytes: 1_048_576,
+        ordinary_queued_max_bytes: 1_048_576,
+        control_queued_max_bytes: 1_048_576,
         max_query_backend_queued_operations: 1024,
         max_query_backend_queued_bytes: 1_048_576,
         max_backend_queued_operations: 4096,

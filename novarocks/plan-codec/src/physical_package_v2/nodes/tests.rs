@@ -581,7 +581,6 @@ fn provider_limits() -> ProviderBindingProjectionLimits {
 fn read_limits() -> ProviderReadProjectionLimits {
     ProviderReadProjectionLimits {
         max_definitions: 0,
-        max_input_version_bytes: 0,
         max_allocation_requests: 8,
         max_allocation_request_bytes: 65536,
         max_coexisting_source_and_request_bytes: COEX,

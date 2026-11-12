@@ -127,7 +127,7 @@ mod tests {
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
-    use novarocks_spi::connector::{ConnectorErrorKind, ConnectorListingBound};
+    use novarocks_spi::connector::ConnectorErrorKind;
 
     /// Build a catalog for a test the way production does.
     ///
@@ -277,7 +277,7 @@ mod tests {
         let listed = catalog
             .list_views(
                 CatalogNamespaceName::new("db"),
-                novarocks_spi::connector::ConnectorListingBound::V1,
+                novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
             )
             .await
             .expect_err("list_views must not answer with an empty list");
@@ -288,85 +288,6 @@ mod tests {
             .await
             .expect_err("load_view must not answer not-found");
         assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);
-    }
-
-    /// Hadoop enumeration has no paging, so its directory listing is bounded
-    /// as a whole: an over-bound namespace is refused with its typed bound on
-    /// both the generation path and the admitted-read path, never truncated.
-    #[test]
-    fn hadoop_table_listing_over_its_bound_is_refused_not_truncated() {
-        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
-        let bridge = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
-        bridge
-            .block_on(async move {
-                let warehouse = tempfile::tempdir().expect("warehouse");
-                let catalog = adopted(&hadoop_configuration(warehouse.path()))
-                    .await
-                    .expect("catalog");
-                assert!(matches!(
-                    namespace_fixture(Arc::clone(&catalog)).await,
-                    CatalogOutcome::KnownCommitted { .. }
-                ));
-                // A hint alone is no table. Publish real complete versions through
-                // the production owner so this fixture tests the enumeration bound.
-                for table in ["a", "b", "c"] {
-                    assert!(matches!(
-                        create_fixture(Arc::clone(&catalog), "db", table).await,
-                        CatalogOutcome::KnownCommitted { .. }
-                    ));
-                }
-                let runtime = tokio::runtime::Handle::current();
-                let binding = || {
-                    crate::access_binding::IcebergReadBinding::new(
-                        None,
-                        FsAccessResolver::new(),
-                        Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-                        novarocks_fs::TokioRefreshExecutor::shared(runtime.clone()),
-                        Arc::new(TokioFileIoSpawner::new(runtime.clone())),
-                    )
-                    .for_request(
-                        novarocks_spi::connector::ConnectorRequestContext::try_new(
-                            std::time::Instant::now() + std::time::Duration::from_secs(5),
-                            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-                            1024,
-                            4096,
-                        )
-                        .unwrap(),
-                    )
-                };
-                let namespace = || CatalogNamespaceName::new("db");
-                let exact = ConnectorListingBound {
-                    entries: 3,
-                    ..ConnectorListingBound::V1
-                };
-                let over = ConnectorListingBound {
-                    entries: 2,
-                    ..exact
-                };
-
-                assert_eq!(
-                    catalog.list_tables(namespace(), exact).await.unwrap(),
-                    ["a", "b", "c"]
-                );
-                assert_eq!(
-                    catalog
-                        .list_tables_for_read(namespace(), binding(), exact)
-                        .await
-                        .unwrap(),
-                    ["a", "b", "c"]
-                );
-                for error in [
-                    catalog.list_tables(namespace(), over).await.unwrap_err(),
-                    catalog
-                        .list_tables_for_read(namespace(), binding(), over)
-                        .await
-                        .unwrap_err(),
-                ] {
-                    assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-                    assert!(error.message().contains("entries bound"), "{error}");
-                }
-            })
-            .expect("publication bridge must exit before test cleanup");
     }
 
     /// Absence must be readable from the error's kind alone.

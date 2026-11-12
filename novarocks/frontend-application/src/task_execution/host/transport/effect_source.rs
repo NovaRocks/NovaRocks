@@ -618,10 +618,15 @@ impl EffectSource for AttemptTransportSource {
                 return Some(result);
             }
             match original.protocol.body {
-                EffectBody::AdmitQueuedInput { .. } => {
+                EffectBody::AdmitQueuedInput { ref operation, .. } => {
+                    let transport = self
+                        .contexts
+                        .get(&operation.backend_process_id())
+                        .expect("original Native backend transport context")
+                        .transport;
                     let result = self
                         .admission
-                        .prepay(original)
+                        .prepay(original, &self.requests, transport)
                         .expect("original admission prepayment")?;
                     self.pending = Some(Prepaid::Admission);
                     return Some(result);

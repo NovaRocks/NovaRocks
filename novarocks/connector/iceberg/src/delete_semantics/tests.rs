@@ -128,7 +128,7 @@ fn dv(path: &str, target: &str, sequence: i64) -> Arc<DeleteFact> {
     fact(
         path,
         sequence,
-        partition(1, Some(99)),
+        partition(1, Some(1)),
         DeleteKind::DeletionVector {
             exact_target: Arc::from(target),
         },
@@ -403,10 +403,19 @@ fn raw_position_and_equality_multiplicity_and_provenance_survive() {
         ),
     ] {
         let raw = raw(&fact, ManifestStatus::Existing, Some(4));
-        let observed = observation(vec![raw.clone(), raw]).unwrap();
+        let observed = DeleteObservation::from_source_entries_checked(
+            [(
+                Arc::from("manifest.avro"),
+                [(Some(2), raw.clone()), (Some(7), raw)],
+            )],
+            || Ok::<_, std::convert::Infallible>(()),
+        )
+        .unwrap_or_else(|_| panic!("valid physical source observation"));
         assert_eq!(observed.facts().len(), 2);
         assert_eq!(observed.facts()[0].provenance().unwrap().entry_ordinal, 0);
         assert_eq!(observed.facts()[1].provenance().unwrap().entry_ordinal, 1);
+        assert_eq!(observed.facts()[0].physical_ordinal(), Some(2));
+        assert_eq!(observed.facts()[1].physical_ordinal(), Some(7));
     }
 }
 
@@ -449,7 +458,7 @@ fn one_dv_blob_can_have_two_distinct_target_applications() {
     ));
     assert!(matches!(
         index
-            .for_data(&data("b", 9, 2, Some(2)))
+            .for_data(&data("b", 9, 1, Some(1)))
             .unwrap()
             .position(),
         PositionSource::OneDv(_)
@@ -532,42 +541,75 @@ fn kind_specific_sequences_include_same_commit_positions_but_not_equality() {
 }
 
 #[test]
-fn exact_path_position_and_dv_ignore_partition_but_untargeted_position_does_not() {
-    let data = data("d", 2, 1, Some(1));
-    let exact = fact(
-        "p",
-        2,
-        partition(2, Some(99)),
+fn exact_path_positions_and_dvs_require_the_target_partition() {
+    let target = data("d", 2, 1, Some(1));
+    for kind in [
         DeleteKind::Position {
             exact_target: Some(Arc::from("d")),
         },
-    );
-    let partitioned = fact(
-        "q",
+        DeleteKind::DeletionVector {
+            exact_target: Arc::from("d"),
+        },
+    ] {
+        for wrong in [partition(2, Some(1)), partition(1, Some(99))] {
+            let delete = fact("delete", 2, wrong, kind.clone());
+            assert_eq!(
+                delete_applies(&target, &delete).unwrap_err().kind,
+                DeleteSemanticsErrorKind::InvalidPartition
+            );
+            assert_eq!(
+                index(vec![delete]).for_data(&target).unwrap_err().kind,
+                DeleteSemanticsErrorKind::InvalidPartition
+            );
+        }
+        let matching = fact("matching", 2, partition(1, Some(1)), kind);
+        assert!(delete_applies(&target, &matching).unwrap());
+        assert_eq!(
+            index(vec![matching])
+                .for_data(&target)
+                .unwrap()
+                .member_count(),
+            1
+        );
+    }
+
+    let untargeted = fact(
+        "other-partition",
         2,
         partition(2, Some(99)),
         DeleteKind::Position { exact_target: None },
     );
+    assert!(!delete_applies(&target, &untargeted).unwrap());
     assert_eq!(
-        index(vec![exact, partitioned])
-            .for_data(&data)
-            .unwrap()
-            .member_count(),
-        1
-    );
-    assert_eq!(
-        index(vec![dv("v", "d", 2)])
-            .for_data(&data)
-            .unwrap()
-            .member_count(),
-        1
-    );
-    assert_eq!(
-        index(vec![dv("v", "other", 1)])
-            .for_data(&data)
+        index(vec![untargeted])
+            .for_data(&target)
             .unwrap()
             .member_count(),
         0
+    );
+    assert_eq!(
+        index(vec![dv("v", "other", 1)])
+            .for_data(&target)
+            .unwrap()
+            .member_count(),
+        0
+    );
+}
+
+#[test]
+fn exact_path_partition_validation_only_checks_the_position_sequence_suffix() {
+    let kind = DeleteKind::Position {
+        exact_target: Some(Arc::from("d")),
+    };
+    let older = fact("older", 2, partition(2, Some(99)), kind.clone());
+    let newer = fact("newer", 3, partition(1, Some(1)), kind);
+    let index = index(vec![newer, older.clone()]);
+    let newer_data = data("d", 3, 1, Some(1));
+    assert!(!delete_applies(&newer_data, &older).unwrap());
+    assert_eq!(index.for_data(&newer_data).unwrap().member_count(), 1);
+    assert_eq!(
+        index.for_data(&data("d", 2, 1, Some(1))).unwrap_err().kind,
+        DeleteSemanticsErrorKind::InvalidPartition
     );
 }
 
@@ -636,7 +678,7 @@ fn reliable_path_bounds_infer_exact_target_but_broad_or_missing_bounds_do_not() 
     let base = fact(
         "p",
         3,
-        partition(2, Some(2)),
+        partition(1, Some(1)),
         DeleteKind::Position { exact_target: None },
     );
     let narrow = with_metrics(&base, metrics("d", "d"));
@@ -1002,6 +1044,7 @@ fn reference(data: &DataFileFact, facts: &[Arc<DeleteFact>]) -> HashSet<DeleteAp
     let mut result = HashSet::new();
     if let Some(dv) = dv {
         assert!(dv.sequence().get() >= data.sequence().get());
+        assert_eq!(dv.partition(), data.partition());
         result.insert(dv.application().clone());
     }
     for fact in facts {
@@ -1014,7 +1057,9 @@ fn reference(data: &DataFileFact, facts: &[Arc<DeleteFact>]) -> HashSet<DeleteAp
                 dv.is_none()
                     && fact.sequence().get() >= data.sequence().get()
                     && match exact_target {
-                        Some(path) => path.as_ref() == data.path(),
+                        Some(path) => {
+                            path.as_ref() == data.path() && fact.partition() == data.partition()
+                        }
                         None => fact.partition() == data.partition(),
                     }
             }
@@ -1058,7 +1103,10 @@ fn candidate_index_matches_independent_reference_across_permutations() {
         let index = index(permutation);
         for d in 0..10 {
             for p in 0..3 {
-                for path in ["d", "other", "with-dv"] {
+                for (path, expected_partition) in [("d", 0), ("other", p), ("with-dv", 1)] {
+                    if p != expected_partition {
+                        continue;
+                    }
                     let data = data(path, d, 1, Some(p));
                     assert_eq!(
                         applications(&index.for_data(&data).unwrap()),

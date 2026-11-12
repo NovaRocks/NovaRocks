@@ -26,6 +26,84 @@ use novarocks_spi::connector::ConnectorProviderId;
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 
+/// Preserve typed virtual-target refusal before any external catalog lookup.
+/// Existing target/preparation diagnostics retain their original text channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetResolutionError {
+    Message(String),
+    Unsupported(novarocks_spi::connector::ConnectorError),
+}
+impl From<String> for TargetResolutionError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+impl std::fmt::Display for TargetResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::Unsupported(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for TargetResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Message(_) => None,
+            Self::Unsupported(error) => Some(error),
+        }
+    }
+}
+impl TargetResolutionError {
+    pub(crate) fn into_service(
+        self,
+    ) -> novarocks_query_application::session_error::QueryServiceError {
+        use novarocks_query_application::session_error::{
+            QueryServiceError, QueryServiceErrorKind,
+        };
+        match self {
+            Self::Message(message) => {
+                QueryServiceError::new(QueryServiceErrorKind::Internal, message)
+            }
+            Self::Unsupported(error) => QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ),
+        }
+    }
+}
+impl From<TargetResolutionError> for novarocks_query_application::api::CommandError {
+    fn from(error: TargetResolutionError) -> Self {
+        match error {
+            TargetResolutionError::Message(message) => Self::from(message),
+            TargetResolutionError::Unsupported(error) => {
+                Self::from_failure_cause(novarocks_failure_contract::SharedFailureCause::new(error))
+            }
+        }
+    }
+}
+impl From<TargetResolutionError> for novarocks_table_maintenance::runtime::TerminalError {
+    fn from(error: TargetResolutionError) -> Self {
+        match error {
+            TargetResolutionError::Message(message) => Self::pre_dispatch_failed(message),
+            TargetResolutionError::Unsupported(error) => Self::from_original_cause(error),
+        }
+    }
+}
+pub(crate) fn require_external_target(
+    catalog: &str,
+    namespace: &str,
+) -> Result<(), TargetResolutionError> {
+    if novarocks_sql::system_table::is_system_table_name(catalog, namespace) {
+        return Err(TargetResolutionError::Unsupported(
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "system catalogs and information_schema have no mutable external table target",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetBackend {
     pub provider_id: ConnectorProviderId,
@@ -95,14 +173,21 @@ pub fn resolve_table_target(
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<TargetBackend, String> {
+) -> Result<TargetBackend, TargetResolutionError> {
+    let resolved = resolve_catalog_table_name(
+        name.parts.as_slice(),
+        // The local session catalog is used only to identify virtual
+        // targets. Missing external selection is rejected below, before
+        // any provider admission; it grants no default external target.
+        Some(current_catalog.unwrap_or(DEFAULT_CATALOG_NAME)),
+        current_database,
+    )?;
+    require_external_target(&resolved.catalog, &resolved.namespace)?;
     reject_default_catalog_reference(name, current_catalog)?;
     if current_catalog.is_none() && name.parts.len() <= 2 {
-        return Err(missing_current_catalog_error("CREATE TABLE"));
+        return Err(missing_current_catalog_error("CREATE TABLE").into());
     }
 
-    let resolved =
-        resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
     let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         provider_id,
@@ -117,14 +202,21 @@ pub fn resolve_existing_table_target(
     name: &ObjectName,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<TargetBackend, String> {
+) -> Result<TargetBackend, TargetResolutionError> {
+    let resolved = resolve_catalog_table_name(
+        name.parts.as_slice(),
+        // The local session catalog is used only to identify virtual
+        // targets. Missing external selection is rejected below, before
+        // any provider admission; it grants no default external target.
+        Some(current_catalog.unwrap_or(DEFAULT_CATALOG_NAME)),
+        current_database,
+    )?;
+    require_external_target(&resolved.catalog, &resolved.namespace)?;
     reject_default_catalog_reference(name, current_catalog)?;
     if current_catalog.is_none() && name.parts.len() <= 2 {
-        return Err(missing_current_catalog_error("Table operation"));
+        return Err(missing_current_catalog_error("Table operation").into());
     }
 
-    let resolved =
-        resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
     let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         provider_id,
@@ -138,13 +230,17 @@ pub fn resolve_namespace_target(
     admission: &impl CatalogAdmission,
     name: &ObjectName,
     current_catalog: Option<&str>,
-) -> Result<TargetBackend, String> {
+) -> Result<TargetBackend, TargetResolutionError> {
+    let resolved = resolve_catalog_namespace_name(
+        name.parts.as_slice(),
+        Some(current_catalog.unwrap_or(DEFAULT_CATALOG_NAME)),
+    )?;
+    require_external_target(&resolved.catalog, &resolved.namespace)?;
     reject_default_catalog_reference(name, current_catalog)?;
     if current_catalog.is_none() && name.parts.len() == 1 {
-        return Err(missing_current_catalog_error("CREATE DATABASE"));
+        return Err(missing_current_catalog_error("CREATE DATABASE").into());
     }
 
-    let resolved = resolve_catalog_namespace_name(name.parts.as_slice(), current_catalog)?;
     let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
         provider_id,
@@ -260,6 +356,65 @@ mod tests {
         }
     }
 
+    struct ForbiddenCatalogAdmission;
+    impl super::CatalogAdmission for ForbiddenCatalogAdmission {
+        fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+            panic!("virtual target refusal must precede external catalog admission")
+        }
+    }
+
+    #[test]
+    fn virtual_write_targets_are_typed_refusals_before_catalog_admission() {
+        use novarocks_spi::connector::ConnectorErrorKind;
+        for (parts, catalog, database) in [
+            (vec!["system", "metadata", "materialized_views"], None, "db"),
+            (vec!["metadata", "materialized_views"], Some("system"), "db"),
+            (vec!["materialized_views"], Some("SYSTEM"), "metadata"),
+            (
+                vec!["warehouse", "information_schema", "tables"],
+                None,
+                "db",
+            ),
+            (vec!["information_schema", "tables"], None, "db"),
+            (vec!["tables"], Some("warehouse"), "INFORMATION_SCHEMA"),
+        ] {
+            let name = ObjectName {
+                parts: parts.into_iter().map(str::to_owned).collect(),
+            };
+            for result in [
+                resolve_table_target(&ForbiddenCatalogAdmission, &name, catalog, database),
+                resolve_existing_table_target(&ForbiddenCatalogAdmission, &name, catalog, database),
+            ] {
+                let error = result.expect_err("virtual targets cannot be mutated");
+                let TargetResolutionError::Unsupported(cause) = &error else {
+                    panic!("readonly refusal must retain its typed Connector fact: {error}")
+                };
+                assert_eq!(cause.kind(), ConnectorErrorKind::Unsupported);
+                let command = novarocks_query_application::api::CommandError::from(error.clone());
+                assert!(command.failure_cause().is_some());
+                assert!(error.into_service().failure_cause().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_namespace_mutations_are_refused_before_external_admission() {
+        for (parts, catalog) in [
+            (vec!["system", "metadata"], None),
+            (vec!["anything"], Some("system")),
+            (vec!["warehouse", "information_schema"], None),
+            (vec!["information_schema"], None),
+        ] {
+            let name = ObjectName {
+                parts: parts.into_iter().map(str::to_owned).collect(),
+            };
+            assert!(matches!(
+                resolve_namespace_target(&ForbiddenCatalogAdmission, &name, catalog),
+                Err(TargetResolutionError::Unsupported(_))
+            ));
+        }
+    }
+
     #[test]
     fn external_table_target_requires_catalog_admission_when_port_is_configured() {
         let admission = TestCatalogAdmission {
@@ -278,7 +433,7 @@ mod tests {
             "default_db",
         )
         .expect_err("absent attachment must block an external table target");
-        assert_eq!(error, "unknown catalog `warehouse`");
+        assert_eq!(error.to_string(), "unknown catalog `warehouse`");
     }
 
     #[test]
@@ -297,7 +452,7 @@ mod tests {
         )
         .expect_err("CREATE TABLE without a current external catalog must fail");
         assert_eq!(
-            error,
+            error.to_string(),
             "CREATE TABLE requires an external catalog; create one and SET catalog before using persistent tables"
         );
 
@@ -310,7 +465,7 @@ mod tests {
         )
         .expect_err("CREATE DATABASE without a current external catalog must fail");
         assert_eq!(
-            error,
+            error.to_string(),
             "CREATE DATABASE requires an external catalog; create one and SET catalog before using persistent tables"
         );
     }
@@ -336,7 +491,7 @@ mod tests {
             "default_db",
         )
         .expect_err("a default_catalog-qualified table must be rejected");
-        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), expected);
 
         // Selected through the session, with an unqualified name.
         let error = resolve_table_target(
@@ -348,7 +503,7 @@ mod tests {
             "db1",
         )
         .expect_err("a session on default_catalog must be rejected");
-        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), expected);
 
         // The name check is case-insensitive, so casing cannot bypass it.
         let error = resolve_existing_table_target(
@@ -364,7 +519,7 @@ mod tests {
             "default_db",
         )
         .expect_err("default_catalog rejection must ignore casing");
-        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), expected);
     }
 
     #[test]

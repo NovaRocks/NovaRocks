@@ -159,8 +159,15 @@ handler 前拒绝错误域，不转发到另一条 listener：
 独立门。等待资格可以设为零；`ordinary_running` 不得超过
 `max_blocking_threads`，`control_running` 不得超过 `control_worker_threads`，
 control 请求/响应上限也不得超过各自 ordinary 上限。Server 在启动前验证这些关系。
+四个 `*_request_max_bytes` / `*_response_max_bytes` 按具体 Native 方法生效；示例中的 64 MiB 是默认值，
+不是配置天花板。FE 客户端与 BE 入口应部署相同的消息上限；提高上限时同步调整两侧，并核对原请求
+排队窗口能容纳最大请求与必要控制载体。旧的 Task 描述符额度配置不再使用，48 MiB 只作组批目标，
+不能替代具体方法的有效线长限制。gRPC 的 32 位长度表示范围与 checked arithmetic 仍保留。
+
 上述默认组合的帧尺寸乘积估算是普通类 2048 MiB、控制类 520 MiB；它用于审查配置，
-不是进程 RSS 硬上限，具体负载的驻留和放大仍需观测。
+不是进程 RSS 或累计保留回复的内存上界。Joint 只登记回复布局责任，不提供回复总字节配额或物理内存
+授予；请求窗口与结果窗口也不替代该容量。实际资源与退出边界见
+[ADR-0227](../../adr/ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md)。
 
 启动 BE：
 
@@ -247,6 +254,11 @@ max_library_validation_bytes = 4294967296
 [runtime.native_ingress]
 worker_threads = 8
 max_blocking_threads = 64
+# Match the effective Native message limits on the BE nodes.
+ordinary_request_max_bytes = 67108864
+ordinary_response_max_bytes = 67108864
+control_request_max_bytes = 1048576
+control_response_max_bytes = 67108864
 
 [standalone_server]
 trino_port = 8080
@@ -269,9 +281,10 @@ backend_announce_lease_ttl_ms = 5000
 
 FE 必须显式填写 `[runtime.frontend_constant_policy]` 的全部十项限额。示例值是可调整的部署配置；这些维度分别限制常量行数、数组结构、逻辑元素、保留字节、类型、字典、metadata 和库验证工作，不代表内存 grant。BE 不需要此 FE 作者配置。
 
-FE 的 `[runtime.native_ingress]` 只设置本角色 Native report listener 的 async worker
-与 blocking pool 大小；Task ordinary/control 资格和消息界只装配在 BE listener。
-两种 role 使用同一正常配置模型，不能把 FE 的这些字段当成新的整集群查询配额。
+FE 的 `[runtime.native_ingress]` 设置本角色 Native report listener 的 async worker 与 blocking pool，
+同时给 FE Native 客户端提供各方法的有效请求/回复长度配置；上例显式与 BE 消息上限保持一致。
+Task ordinary/control 的运行与等待资格仍属于 BE listener，不是 FE 的整集群查询配额。
+提高消息上限不会自动增加原 transport 队列、BE Task 准备或结果窗口的实际资源容量。
 
 `[catalog_source]` 是 catalog desired-state 的唯一 authority。上例的 `dynamic-state-store`
 使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
@@ -563,11 +576,41 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 
 ### MEM-1-M07 配置迁移
 
-`[runtime.frontend_workload]` 中的 `control_bytes`、`per_scope_bytes` 已退役，旧键会报配置错误。FE 使用计数准入与固定结果窗口；不再从进程内存上限派生通用 LRA result budget。进程 MemoryAuthority 的控制 floor 使用 `[runtime.memory].control_bytes`，默认保持 64 MiB，FE/BE 进程启动仍在 work account 之前安装该保护。需要调整控制 floor 的部署应把原控制值移到新位置；`per_scope_bytes` 无替代 FE 配置。BE retained 保护与 M03/M04 后续接线边界保持独立。
+`[runtime.frontend_workload]` 中的 `control_bytes`、`per_scope_bytes` 已退役，旧键会报配置错误。FE 使用计数准入与原结果窗口；不再从进程内存上限派生通用 LRA result budget。进程 MemoryAuthority 的控制 floor 使用 `[runtime.memory].control_bytes`，默认保持 64 MiB，FE/BE 进程启动仍在 work account 之前安装该保护。需要调整控制 floor 的部署应把原控制值移到新位置；`per_scope_bytes` 无替代 FE 配置。BE retained 保护与 M03/M04 后续接线边界保持独立。
+
+### 原结果保留预算与大快照
+
+`[runtime.frontend_workload].client_result_all_objects_bytes` 配置每个原 Client holder 的
+保留预算，默认仍为 8 MiB（8388608 字节）。它组合到原 `ResultCapacityConfig.all_objects_bytes[0]`，
+不新增资源所有者，不改变 Client 窗口位置、CPU、Local/Internal 容量或并发。完整系统快照在同一个
+原 Root 下按实际字节计费；拆成更多批次不能减少整份快照的累计保留量。复制或编码时仍支付
+old+new 实际共存峰，最后真实别名退出后才归还。配置必须非零，保留实际表示范围与 checked 算术，
+不按历史 profile 设等值门或额外最大值。Native 操作回复不接入这个结果预算。
+
+BE 的 `[runtime].result_retained_bytes_per_root` 默认仍为 16 MiB（16777216 字节），
+`result_retained_bytes_per_process` 默认仍为 4 GiB（4294967296 字节）。每 Root 预算必须非零且
+不大于进程预算；原 `WorkerResultRetainedLimits`、实际授予、计费与背压继续生效。整 Root 同时
+保管 Arrow 输入、hydrate、scratch、元数据和输出段，不能与一份 wire payload 的长度上限比较。
+该错误启动比较已删除，实际报文长度及其余 Root renderer / typed IPC 政策保持各自边界。
+
+已计划的大名称 listing 及取消场景使用下面的显式资源输入；它们不是产品默认值、最小所需预算、
+新的能力上限或物理内存上界：
+
+| 角色与原配置 | 场景输入 | 依据与责任 |
+|---|---|---|
+| FE `runtime.frontend_workload.client_result_all_objects_bytes` | 201326592（192 MiB） | 原 Client 大快照组件正例使用的输入；继续同 Root 实际计费 |
+| 每个 BE `runtime.result_retained_bytes_per_root` | 268435456（256 MiB） | 原 Native 结果支持 geometry 的 Root 报价，覆盖输入与 hydrate 各 96 MiB、2 MiB scratch、1 MiB 元数据及有限分段/发送持有 |
+| 每个 BE `runtime.result_retained_bytes_per_process` | 4294967296（4 GiB） | 原进程预算，未从名称或 wire 字节数重新估算 |
+
+在原 1FE+3BE 场景记录 FE 与全部 BE 的有效配置；取消场景保留其 worker 覆盖，合并 overlay 时
+不要重复定义同一张 TOML 表。验证仍须经原 Native 路径实际返回并逐项核对 257 个完整名称：
+256 个各 64 KiB，另一个 1 字节，共 16777217 名称字节。COUNT、截短名称或组件正例不能代替该结果；
+较小原预算下的类型化资源拒绝仍是资源事实，不能改写为成功。场景还保留原有取消、实际退出和
+65537 行正例的独立断言。这些输入只说明场景的支持配置，不宣称原生运行或最终验收已经通过。
 
 ### FE 分布式执行容量
 
-FE 的共用控制账本按进程及准确 `BackendProcessId` 申领 Native 传输条数和字节。队列字节与编码共存计费，普通工作受独立上限约束，为控制动作保留进展空间。进入 I/O 时归还纯队列阶段份额。实际 I/O 和 captures 退出后，原宿主归还同一次发送的剩余队列与编码份额。WC 继续提供排队输入、联合派发准入和原载荷保管。精确重放沿用冻结请求并为新发送代次重新准入。见 [ADR-0228](../../adr/ADR-0228-frontend-attempt-decisions-and-transport-custody.md)。
+FE 的共用控制账本按进程及准确 `BackendProcessId` 申领 Native 传输条数和字节。队列字节与编码共存计费，普通工作受独立上限约束，为控制动作保留进展空间。进入 I/O 时归还纯队列阶段份额。实际 I/O 和 captures 退出后，原宿主归还同一次发送的剩余队列与编码份额。WC 继续提供排队输入、联合派发准入和原载荷保管。精确重放沿用冻结请求并为新发送代次重新准入。见 [ADR-0230](../../adr/ADR-0230-frontend-attempt-decisions-and-transport-custody.md)。
 
 访问 FE management `/metrics` 时，`novarocks_frontend_control_runtime_transport_process` 显示进程各维度用量和上限，`novarocks_frontend_control_runtime_transport_keyed` 显示活跃 BE 进程键的对应值。归零键退出账本。抓取同时读取 `novarocks_frontend_control_runtime_observation_available`，账本样本不可用时忽略该次缺失。容量等待指标只反映原登记和释放唤醒，实际准入仍以原请求重试为准。
 

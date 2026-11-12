@@ -137,7 +137,7 @@ impl FrontendQueryCompiler {
                     .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
                 let catalog = crate::query_execution::completion_facts::FrontendCatalogFacts::new(
                     self.completion_fact_owners(),
-                    scope.with_definition_planning(self.constant_policy(), sql_compile_control_from_execution(execution), Arc::clone(planning_cpu)),
+                    scope.with_snapshot_planning(sql_compile_control_from_execution(execution), execution.cancellation().clone(), query_options.as_ref(), Arc::clone(planning_cpu)),
                 );
                 Ok(catalog)
             }
@@ -234,9 +234,10 @@ impl FrontendQueryCompiler {
                     state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
-                .with_definition_planning(
-                    self.constant_policy(),
+                .with_snapshot_planning(
                     sql_compile_control_from_execution(execution),
+                    execution.cancellation().clone(),
+                    query_options.as_ref(),
                     Arc::clone(planning_cpu),
                 ),
                 crate::query_execution::compiler::typed_connector_session()
@@ -343,9 +344,10 @@ impl FrontendQueryCompiler {
                     state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
-                .with_definition_planning(
-                    self.constant_policy(),
+                .with_snapshot_planning(
                     sql_compile_control_from_execution(execution),
+                    execution.cancellation().clone(),
+                    query_options.as_ref(),
                     Arc::clone(planning_cpu),
                 ),
                 crate::query_execution::compiler::typed_connector_session()
@@ -394,6 +396,10 @@ impl FrontendQueryCompiler {
             planning_cpu,
             &mut Some(CompletedReadCpuInput::Encoding(Box::new(
                 ReadEncodingInput {
+                    capacity: execution
+                        .result_capacity()
+                        .cloned()
+                        .expect("validated original statement capacity"),
                     purpose: ReadEncodingPurpose::Profile(planning_started_at),
                     version,
                     options: query_options,

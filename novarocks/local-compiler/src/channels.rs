@@ -294,7 +294,9 @@ fn resolve_core_with_creation<H>(
                 work.flush()?;
                 (slots, port)
             }
-            NodeKind::ExchangeSource { .. } if node.inputs.is_empty() => {
+            NodeKind::SystemRelation { .. } | NodeKind::ExchangeSource { .. }
+                if node.inputs.is_empty() =>
+            {
                 // Each received occurrence is its own fresh channel. A repeated
                 // import is one sent value, so its first ordinal represents it.
                 let mut slots = Vec::new();
@@ -661,6 +663,7 @@ fn resolve_core_with_creation<H>(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::PositionShard(_) => fresh_relation(fragment, node, &mut next_slot, work)?,
             NodeKind::ChangeEventExpand { .. } => {
                 single_child(&node.inputs)?;
                 let mut slots = Vec::new();

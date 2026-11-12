@@ -165,7 +165,6 @@ enum CreationReplay {
 pub(crate) struct CreateCandidate {
     operation_id: TaskOperationId,
     request: TaskOperationQueueRequest,
-    plan_carrier_bytes: usize,
 }
 
 impl CreateCandidate {
@@ -175,11 +174,6 @@ impl CreateCandidate {
 
     pub(crate) const fn request(self) -> TaskOperationQueueRequest {
         self.request
-    }
-
-    /// The static plan and task assignment bytes the backend bounds together.
-    pub(crate) const fn plan_carrier_bytes(self) -> usize {
-        self.plan_carrier_bytes
     }
 }
 
@@ -685,7 +679,6 @@ impl RemoteTask {
                 self.identity.backend_process_id(),
                 creation.queued_bytes,
             ),
-            plan_carrier_bytes: creation.plan_carrier_bytes,
         }))
     }
 
@@ -1732,6 +1725,7 @@ mod bounded_discard_tests {
                     NonZeroU64::new(value).unwrap(),
                 ),
             ),
+            64,
         )
     }
     fn operation(value: u64) -> TaskOperationId {

@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{DataContentType, DataFileFormat};
+use anyhow::Context;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
@@ -67,7 +68,9 @@ pub async fn write_position_delete_files(
     staging_dir: &str,
     groups: Vec<PositionDeleteGroup>,
 ) -> Result<Vec<WrittenFile>, String> {
-    write_position_delete_files_with_journal(file_io, staging_dir, groups, None).await
+    write_position_delete_files_with_journal(file_io, staging_dir, groups, None)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 pub(crate) async fn write_position_delete_files_journaled(
@@ -75,7 +78,7 @@ pub(crate) async fn write_position_delete_files_journaled(
     staging_dir: &str,
     groups: Vec<PositionDeleteGroup>,
     journal: &StagedPathJournal,
-) -> Result<Vec<WrittenFile>, String> {
+) -> anyhow::Result<Vec<WrittenFile>> {
     write_position_delete_files_with_journal(file_io, staging_dir, groups, Some(journal)).await
 }
 
@@ -84,7 +87,7 @@ async fn write_position_delete_files_with_journal(
     staging_dir: &str,
     groups: Vec<PositionDeleteGroup>,
     journal: Option<&StagedPathJournal>,
-) -> Result<Vec<WrittenFile>, String> {
+) -> anyhow::Result<Vec<WrittenFile>> {
     let mut out = Vec::with_capacity(groups.len());
     for (idx, group) in groups.into_iter().enumerate() {
         if group.positions.is_empty() {
@@ -97,7 +100,8 @@ async fn write_position_delete_files_with_journal(
             "{staging_dir}/position-delete-{idx:08x}-{}.parquet",
             Uuid::new_v4()
         );
-        let bytes = encode_position_delete_parquet(&group.referenced_data_file, &sorted)?;
+        let bytes = encode_position_delete_parquet(&group.referenced_data_file, &sorted)
+            .map_err(anyhow::Error::msg)?;
         let file_size = bytes.len() as u64;
         if let Some(journal) = journal {
             journal.record(&path);
@@ -185,20 +189,22 @@ async fn write_bytes_via_file_io(
     file_io: &FileIO,
     path: &str,
     bytes: Vec<u8>,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let output = file_io
         .new_output(path)
-        .map_err(|e| format!("FileIO::new_output({path}) failed: {e}"))?;
-    let mut w = output
+        .with_context(|| format!("FileIO::new_output({path}) failed"))?;
+    let mut writer = output
         .writer()
         .await
-        .map_err(|e| format!("FileIO::writer({path}) failed: {e}"))?;
-    w.write(bytes.into())
+        .with_context(|| format!("FileIO::writer({path}) failed"))?;
+    writer
+        .write(bytes.into())
         .await
-        .map_err(|e| format!("write position-delete bytes to {path} failed: {e}"))?;
-    w.close()
+        .with_context(|| format!("write position-delete bytes to {path} failed"))?;
+    writer
+        .close()
         .await
-        .map_err(|e| format!("close position-delete output {path} failed: {e}"))?;
+        .with_context(|| format!("close position-delete output {path} failed"))?;
     Ok(())
 }
 

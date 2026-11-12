@@ -46,7 +46,6 @@ use std::{alloc::Layout, fmt, mem::size_of, sync::Arc};
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderReadProjectionLimits {
     pub max_definitions: usize,
-    pub max_input_version_bytes: usize,
     pub max_allocation_requests: usize,
     pub max_allocation_request_bytes: usize,
     pub max_coexisting_source_and_request_bytes: usize,
@@ -55,6 +54,7 @@ pub struct ProviderReadProjectionLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderReadProjectionFacts {
     pub definition_count: usize,
+    /// Cumulative version bytes retained in resource and work accounting.
     pub input_version_bytes: usize,
     pub allocation_requests_upper_bound: usize,
     pub allocation_request_bytes_upper_bound: usize,
@@ -362,7 +362,6 @@ fn prefix(
     if let Some(callback) = admit.as_mut() {
         let limits = envelope.2;
         if result.definition_count > limits.max_definitions
-            || result.input_version_bytes > limits.max_input_version_bytes
             || result.allocation_requests_upper_bound > limits.max_allocation_requests
             || result.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
             || result.coexisting_source_and_request_bytes_upper_bound
@@ -385,7 +384,6 @@ fn facts(
 ) -> Result<ProviderReadProjectionFacts, Error> {
     let result = prefix(n, input, &requests, envelope, admit)?;
     let limits = envelope.2;
-    cap(input, limits.max_input_version_bytes, work)?;
     cap(
         result.allocation_requests_upper_bound,
         limits.max_allocation_requests,

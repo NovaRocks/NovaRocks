@@ -51,9 +51,7 @@ use novarocks_execution::task_execution::{
     TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
 };
 
-use super::creation::{
-    CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes, plan_carrier_bytes,
-};
+use super::creation::{CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes};
 use super::error::{CapacityBound, TaskExecutionError};
 use super::intent::{
     AckPayload, OperationAcknowledgement, OperationIntent, TaskOperationQueuePermit,
@@ -198,7 +196,6 @@ enum CreationReplay {
 pub(crate) struct CreateCandidate {
     operation_id: TaskOperationId,
     request: TaskOperationQueueRequest,
-    plan_carrier_bytes: usize,
 }
 
 impl CreateCandidate {
@@ -208,11 +205,6 @@ impl CreateCandidate {
 
     pub(crate) const fn request(self) -> TaskOperationQueueRequest {
         self.request
-    }
-
-    /// The static plan and task assignment bytes the backend bounds together.
-    pub(crate) const fn plan_carrier_bytes(self) -> usize {
-        self.plan_carrier_bytes
     }
 }
 
@@ -674,12 +666,17 @@ impl RemoteTask {
             request: TaskOperationQueueRequest::create_task(
                 backend,
                 create_queued_bytes(self.create_envelope, &fragment, lengths),
+                novarocks_task_codec::operation::wire_size::create(
+                    self.create_envelope,
+                    fragment.content().len(),
+                    lengths.metadata_bytes(),
+                )
+                .and_then(novarocks_task_codec::operation::wire_size::batch_item),
             )
             .with_native_input(
                 crate::native::task_transport::queued_creation_quote(new_backing)
                     .map_err(TaskExecutionError::Workload)?,
             ),
-            plan_carrier_bytes: plan_carrier_bytes(&fragment, lengths),
         }))
     }
 
@@ -712,7 +709,7 @@ impl RemoteTask {
             return Ok(UpdateAdmission::Queued);
         };
         let request = super::intent::TaskOperationQueueRequest::task_update(
-            self.identity.backend_process_id(),
+            self.identity,
             input.update.as_ref().expect("original pending input"),
         );
         let permit = match sink.try_reserve_queue(request, &mut input.preparation) {
@@ -991,7 +988,6 @@ impl RemoteTask {
         {
             return None;
         }
-        let backend = self.identity.backend_process_id();
         if let Some(released) = &self.released_update {
             if self.normal_stand_down
                 && !released.request.domains().iter().all(is_destination_close)
@@ -1008,7 +1004,7 @@ impl RemoteTask {
         }
         let pending = self.pending.front()?;
         Some(UpdateCandidate {
-            request: TaskOperationQueueRequest::task_update(backend, &pending.update),
+            request: TaskOperationQueueRequest::task_update(self.identity, &pending.update),
             holds_queue_permit: true,
         })
     }
@@ -1835,10 +1831,7 @@ mod destination_close_tests {
     fn destination_close_reservation_matches_frozen_control_class() {
         let (mut producer, edge, target, _) = producer_with_two_destinations();
         let close = producer.prepare_destination_close(edge, target).unwrap();
-        let preview = TaskOperationQueueRequest::task_update(
-            producer.identity().backend_process_id(),
-            &close,
-        );
+        let preview = TaskOperationQueueRequest::task_update(producer.identity(), &close);
         assert!(preview.requires_control_progress());
         assert_eq!(
             preview.lane(),
@@ -1856,10 +1849,8 @@ mod destination_close_tests {
 
         let (mut ordinary_producer, edge, _, _) = producer_with_two_destinations();
         let open = ordinary_producer.prepare_edge_open(edge).unwrap();
-        let ordinary_preview = TaskOperationQueueRequest::task_update(
-            ordinary_producer.identity().backend_process_id(),
-            &open,
-        );
+        let ordinary_preview =
+            TaskOperationQueueRequest::task_update(ordinary_producer.identity(), &open);
         assert!(!ordinary_preview.requires_control_progress());
         ordinary_producer
             .enqueue_update(open, super::super::intent::test_queue_permit())

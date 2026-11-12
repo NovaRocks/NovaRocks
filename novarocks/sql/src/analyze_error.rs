@@ -30,6 +30,16 @@ const UNKNOWN_TABLE: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const UNKNOWN_CATALOG: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_catalog"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
+const UNKNOWN_SCHEMA: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.unknown_schema"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const UNKNOWN_COLUMN: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.unknown_column"),
     phase: ErrorPhase::Analyze,
@@ -120,6 +130,8 @@ const INTERNAL: ErrorCodeDescriptor = ErrorCodeDescriptor {
 /// only permitted aggregate owner.
 pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     UNKNOWN_TABLE,
+    UNKNOWN_CATALOG,
+    UNKNOWN_SCHEMA,
     UNKNOWN_COLUMN,
     UNKNOWN_FUNCTION,
     TYPE_MISMATCH,
@@ -143,6 +155,8 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnalyzeErrorKind {
     UnknownTable,
+    UnknownCatalog,
+    UnknownSchema,
     UnknownColumn,
     UnknownFunction,
     TypeMismatch,
@@ -168,6 +182,8 @@ impl AnalyzeErrorKind {
     pub const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
             Self::UnknownTable => UNKNOWN_TABLE,
+            Self::UnknownCatalog => UNKNOWN_CATALOG,
+            Self::UnknownSchema => UNKNOWN_SCHEMA,
             Self::UnknownColumn => UNKNOWN_COLUMN,
             Self::UnknownFunction => UNKNOWN_FUNCTION,
             Self::TypeMismatch => TYPE_MISMATCH,
@@ -195,6 +211,53 @@ struct StoredViewAnalysisCause {
     error: AnalyzeError,
 }
 
+/// The persisted definition whose source is being read, independent of its caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredDefinition {
+    kind: StoredDefinitionKind,
+    name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredDefinitionKind {
+    View,
+    MaterializedView,
+}
+
+impl StoredDefinition {
+    pub fn view(name: impl Into<String>) -> Self {
+        Self {
+            kind: StoredDefinitionKind::View,
+            name: name.into(),
+        }
+    }
+    pub fn materialized_view(name: impl Into<String>) -> Self {
+        Self {
+            kind: StoredDefinitionKind::MaterializedView,
+            name: name.into(),
+        }
+    }
+    pub fn kind(&self) -> StoredDefinitionKind {
+        self.kind
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredDefinitionSourceCause {
+    definition: StoredDefinition,
+    source_sql: std::sync::Arc<str>,
+    parser_error: Option<novarocks_parser::ParserError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoredDefinitionCause {
+    Analysis(StoredViewAnalysisCause),
+    Source(StoredDefinitionSourceCause),
+}
+
 /// A user-visible SQL analysis failure.
 ///
 /// Direct failures at user AST nodes carry their parser-owned span. Synthetic
@@ -206,7 +269,7 @@ pub struct AnalyzeError {
     span: Option<Span>,
     control: Option<novarocks_type_contract::CompileControlError>,
     source: Option<novarocks_failure_contract::SharedFailureCause>,
-    view_cause: Option<Box<StoredViewAnalysisCause>>,
+    view_cause: Option<Box<StoredDefinitionCause>>,
 }
 
 impl AnalyzeError {
@@ -282,11 +345,78 @@ impl AnalyzeError {
             format!("Failed analyzing stored view '{view}': {cause}"),
             span,
         );
-        error.view_cause = Some(Box::new(StoredViewAnalysisCause {
-            source_sql,
-            error: cause,
-        }));
+        error.view_cause = Some(Box::new(StoredDefinitionCause::Analysis(
+            StoredViewAnalysisCause {
+                source_sql,
+                error: cause,
+            },
+        )));
         error
+    }
+
+    /// Retain the actual parser failure together with the saved source it describes.
+    /// Only the reference span belongs to the caller's statement.
+    pub fn stored_definition_parse_failure(
+        definition: StoredDefinition,
+        source_sql: std::sync::Arc<str>,
+        parser_error: novarocks_parser::ParserError,
+        reference_span: Option<Span>,
+    ) -> Self {
+        let public = parser_error.to_user_error(&source_sql);
+        let detail = match public.location() {
+            Some(location) => format!(
+                "{} at {}:{}: {}",
+                public.code(),
+                location.line(),
+                location.column(),
+                public.message()
+            ),
+            None => format!("{}: {}", public.code(), public.message()),
+        };
+        let mut error = Self::invalid_view(
+            format!(
+                "Failed parsing stored view '{}': {detail}",
+                definition.name()
+            ),
+            reference_span,
+        );
+        error.view_cause = Some(Box::new(StoredDefinitionCause::Source(
+            StoredDefinitionSourceCause {
+                definition,
+                source_sql,
+                parser_error: Some(parser_error),
+            },
+        )));
+        error
+    }
+
+    pub fn stored_definition_not_query(
+        definition: StoredDefinition,
+        source_sql: std::sync::Arc<str>,
+        reference_span: Option<Span>,
+    ) -> Self {
+        let mut error = Self::invalid_view(
+            format!(
+                "Stored view '{}' source must contain exactly one query",
+                definition.name()
+            ),
+            reference_span,
+        );
+        error.view_cause = Some(Box::new(StoredDefinitionCause::Source(
+            StoredDefinitionSourceCause {
+                definition,
+                source_sql,
+                parser_error: None,
+            },
+        )));
+        error
+    }
+
+    pub fn stored_definition(&self) -> Option<&StoredDefinition> {
+        match self.view_cause.as_deref()? {
+            StoredDefinitionCause::Analysis(cause) => cause.error.stored_definition(),
+            StoredDefinitionCause::Source(cause) => Some(&cause.definition),
+        }
     }
 
     /// Rebase only public context; the complete original error and its actual
@@ -294,17 +424,20 @@ impl AnalyzeError {
     pub(crate) fn at_view_reference(self, source_sql: std::sync::Arc<str>, span: Span) -> Self {
         let mut outer = self.clone();
         outer.span = (!span.is_empty()).then_some(span);
-        outer.view_cause = Some(Box::new(StoredViewAnalysisCause {
-            source_sql,
-            error: self,
-        }));
+        outer.view_cause = Some(Box::new(StoredDefinitionCause::Analysis(
+            StoredViewAnalysisCause {
+                source_sql,
+                error: self,
+            },
+        )));
         outer
     }
 
     pub fn stored_view_definition_source(&self) -> Option<&str> {
-        self.view_cause
-            .as_ref()
-            .map(|cause| cause.source_sql.as_ref())
+        match self.view_cause.as_deref()? {
+            StoredDefinitionCause::Analysis(cause) => Some(&cause.source_sql),
+            StoredDefinitionCause::Source(cause) => Some(&cause.source_sql),
+        }
     }
 
     /// A memoized pure catalog selection has one semantic verdict, while
@@ -329,6 +462,30 @@ impl AnalyzeError {
             message,
             span.into().filter(|span| !span.is_empty()),
         )
+    }
+
+    pub(crate) fn system_table_lookup(
+        failure: crate::system_table::SystemTableLookupError,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Self {
+        use crate::system_table::SystemTableLookupError;
+        let (kind, message) = match failure {
+            SystemTableLookupError::CatalogNotFound => (
+                AnalyzeErrorKind::UnknownCatalog,
+                format!("catalog '{catalog}' does not exist"),
+            ),
+            SystemTableLookupError::SchemaNotFound => (
+                AnalyzeErrorKind::UnknownSchema,
+                format!("schema '{catalog}.{schema}' does not exist"),
+            ),
+            SystemTableLookupError::TableNotFound => (
+                AnalyzeErrorKind::UnknownTable,
+                format!("table '{catalog}.{schema}.{table}' does not exist"),
+            ),
+        };
+        Self::at_optional(kind, message, None)
     }
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
@@ -575,6 +732,7 @@ impl AnalyzeError {
     pub fn to_user_error(&self, source: Option<&str>) -> UserError {
         let location = self
             .span
+            .filter(|span| !span.is_empty())
             .zip(source)
             .map(|(span, source)| span.to_user_error_location(source));
         UserError::from_descriptor(
@@ -597,7 +755,12 @@ impl std::error::Error for AnalyzeError {
         self.source
             .as_ref()
             .map(|source| source as &(dyn std::error::Error + 'static))
-            .or_else(|| self.view_cause.as_deref().map(|cause| &cause.error as _))
+            .or_else(|| match self.view_cause.as_deref()? {
+                StoredDefinitionCause::Analysis(cause) => Some(&cause.error as _),
+                StoredDefinitionCause::Source(cause) => {
+                    cause.parser_error.as_ref().map(|error| error as _)
+                }
+            })
     }
 }
 
@@ -680,6 +843,8 @@ mod tests {
             codes,
             vec![
                 "sql.analyze.unknown_table",
+                "sql.analyze.unknown_catalog",
+                "sql.analyze.unknown_schema",
                 "sql.analyze.unknown_column",
                 "sql.analyze.unknown_function",
                 "sql.analyze.type_mismatch",
@@ -716,6 +881,31 @@ mod tests {
         let user_error = error.to_user_error(Some("SELECT x"));
         assert_eq!(user_error.phase(), ErrorPhase::Analyze);
         assert_eq!(user_error.location().expect("location").column(), 8);
+    }
+
+    #[test]
+    fn empty_spans_have_no_user_location_without_changing_the_error() {
+        let source = "SELECT 'é' AS label,\n  '雪', missing";
+        let start = source.find("missing").unwrap();
+        let span = Span::new(start, start + "missing".len());
+        let user_node = AnalyzeError::unknown_column("unknown column missing", span);
+        let synthetic = AnalyzeError::unknown_column("unknown column missing", Span::new(0, 0));
+        let expected = user_node.to_user_error(Some(source));
+        let location = expected.location().expect("user expression location");
+        assert_eq!(location.line(), 2);
+        assert_eq!(location.column(), 10);
+        assert_eq!(location.end_line(), Some(2));
+        assert_eq!(location.end_column(), Some(17));
+        for projected in [
+            synthetic.to_user_error(Some(source)),
+            user_node.to_user_error(None),
+            synthetic.to_user_error(None),
+        ] {
+            assert!(projected.location().is_none());
+            assert_eq!(projected.code(), expected.code());
+            assert_eq!(projected.message(), expected.message());
+            assert_eq!(projected.phase(), expected.phase());
+        }
     }
 
     #[test]

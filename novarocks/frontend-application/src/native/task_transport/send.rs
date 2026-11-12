@@ -318,7 +318,7 @@ pub(super) async fn send_operations_in(
             (call, acquired)
         }
     };
-    let mut grpc = client.grpc_for_reserved_call(reserved);
+    let mut grpc = client.grpc_for_reserved_call(reserved, method);
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported
@@ -416,6 +416,44 @@ pub(super) async fn send_operations_in(
     outcome
 }
 
+#[cfg(test)]
+async fn fixture_apply_request<T: prost::Message + Send + 'static>(
+    grpc: &mut super::transport::AuthenticatedOperationTestGrpc,
+    request: tonic::Request<T>,
+    method: NativeRpcMethod,
+    original_count: usize,
+    response_max: usize,
+) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+    let reply = novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+        original_count,
+        response_max,
+    )
+    .expect("the fixture retains its original request count and method limit");
+    let encoding =
+        novarocks_native_adapter::native_codec::NativeUnaryEncodingPlan::for_original_operation(
+            request.get_ref().encoded_len(),
+        )
+        .expect("a fixture method request is nonempty");
+    let path = match method {
+        NativeRpcMethod::ApplyTaskOperations => "/novarocks.NovaRocksGrpc/ApplyTaskOperations",
+        NativeRpcMethod::ApplyTaskControlOperations => {
+            "/novarocks.NovaRocksGrpc/ApplyTaskControlOperations"
+        }
+        _ => unreachable!("only original Apply fixtures use this codec"),
+    };
+    grpc.ready()
+        .await
+        .map_err(|error| tonic::Status::unknown(format!("Service was not ready: {error}")))?;
+    grpc.unary(
+        request,
+        tonic::codegen::http::uri::PathAndQuery::from_static(path),
+        novarocks_native_adapter::native_codec::NativeProstCodec::with_original_operation_plans(
+            reply, encoding,
+        ),
+    )
+    .await
+}
+
 // Legacy wire-only fixtures exercise their original request/classifier
 // contract directly. Production has no source-free call to this author.
 #[cfg(test)]
@@ -430,15 +468,17 @@ pub(super) async fn send_operations(
         EncodedMethodRequest::Ordinary(_) => NativeRpcMethod::ApplyTaskOperations,
         EncodedMethodRequest::Control(_) => NativeRpcMethod::ApplyTaskControlOperations,
     };
-    let (mut grpc, acquired) =
-        tokio::time::timeout_at(expires_at, client.grpc_with_channel_identity(method))
-            .await
-            .map_err(|_| OperationDispatchResult::TransportUnknown)?
-            .map_err(|error| {
-                let outcome = classify_channel_error(&error);
-                tracing::warn!(detail = %error, "task operation channel acquisition failed");
-                outcome
-            })?;
+    let (mut grpc, acquired) = tokio::time::timeout_at(
+        expires_at,
+        client.operation_test_grpc_with_channel_identity(method),
+    )
+    .await
+    .map_err(|_| OperationDispatchResult::TransportUnknown)?
+    .map_err(|error| {
+        let outcome = classify_channel_error(&error);
+        tracing::warn!(detail = %error, "task operation channel acquisition failed");
+        outcome
+    })?;
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported
@@ -447,12 +487,15 @@ pub(super) async fn send_operations(
         client.invalidate_channel_if_current(method, &acquired);
         return Err(OperationDispatchResult::TransportUnknown);
     }
+    let response_max = client.method_message_limits(method).1;
     let call = async {
         match request {
             EncodedMethodRequest::Ordinary(request) => {
+                let original_count = request.operations.len();
                 let mut wire = tonic::Request::new(request);
                 wire.set_timeout(remaining);
-                let rpc = grpc.apply_task_operations(wire);
+                let rpc =
+                    fixture_apply_request(&mut grpc, wire, method, original_count, response_max);
                 tokio::pin!(rpc);
                 let mut started = false;
                 std::future::poll_fn(|cx| {
@@ -468,9 +511,11 @@ pub(super) async fn send_operations(
                 .await
             }
             EncodedMethodRequest::Control(request) => {
+                let original_count = request.operations.len();
                 let mut wire = tonic::Request::new(request);
                 wire.set_timeout(remaining);
-                let rpc = grpc.apply_task_control_operations(wire);
+                let rpc =
+                    fixture_apply_request(&mut grpc, wire, method, original_count, response_max);
                 tokio::pin!(rpc);
                 let mut started = false;
                 std::future::poll_fn(|cx| {

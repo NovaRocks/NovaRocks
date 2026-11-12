@@ -357,7 +357,21 @@ fn edge_payload(
         crate::OutputRole::Relational => Some(Payload::Relational),
         crate::OutputRole::ProviderRoute { target } => {
             let proof = derivation.change_stream_writer(edge.id)?;
-            (proof.write_target_ordinal == target).then_some(Payload::ProviderRoute(proof))
+            if proof.write_target_ordinal != target {
+                return None;
+            }
+            let destination = plan.fragments().get(&edge.destination.fragment)?;
+            let root = destination.nodes().get(&destination.root())?;
+            match &root.kind {
+                NodeKind::PositionShard(spec) => Some(Payload::PositionContribution {
+                    group: spec.group,
+                    route: proof,
+                }),
+                _ => Some(Payload::ProviderRoute(proof)),
+            }
+        }
+        crate::OutputRole::PositionShards { group, target } => {
+            Some(Payload::PositionShards { group, target })
         }
         crate::OutputRole::WriterResults => {
             writer_result_cut(plan, edge).map(Payload::WriterResults)
@@ -554,7 +568,15 @@ pub(crate) fn validate_fragment_cuts_into(
                 )),
             }
         }
-        validate_inbound_change_stream_writer(fragment, cut, &path, errors);
+        if matches!(
+            cut.payload,
+            crate::ExchangePayloadContract::PositionContribution { .. }
+        ) {
+            validate_inbound_position_contribution(fragment, cut, &path, errors);
+        } else {
+            validate_inbound_change_stream_writer(fragment, cut, &path, errors);
+        }
+        validate_inbound_position_shards(fragment, cut, &path, errors);
         validate_inbound_writer_result_structure(fragment, cut, &path, errors);
     }
     let expected_inbound_list = fragment
@@ -713,6 +735,7 @@ pub(crate) fn validate_fragment_cuts_into(
             ));
         }
         validate_outbound_writer_result(fragment, cut, &path, errors);
+        validate_outbound_position_cut(fragment, cut, &path, errors);
         validate_distribution(
             fragment,
             &cut.partitioning.source,
@@ -775,6 +798,7 @@ pub(crate) fn validate_fragment_cuts_into(
         }
     }
     if let FragmentSink::Router { routes, .. } = fragment.sink() {
+        let mut target_contributions = BTreeMap::new();
         for route in routes {
             let cut = outbound_by_edge.get(&route.edge).copied();
             if cut.is_none_or(|cut| {
@@ -790,6 +814,22 @@ pub(crate) fn validate_fragment_cuts_into(
             }
             if let Some(cut) = cut {
                 validate_router_partitioning(route, &cut.partitioning.source, &path, errors);
+                let contribution = match (&cut.payload, &cut.partitioning.source) {
+                    (
+                        crate::ExchangePayloadContract::PositionContribution { group, .. },
+                        crate::Distribution::Hash { scheme, .. },
+                    ) => Some((*group, cut.destination_fragment, scheme)),
+                    _ => None,
+                };
+                if let Some(previous) =
+                    target_contributions.insert(route.write_target_ordinal, contribution)
+                    && (contribution.is_none() || previous != contribution)
+                {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "repeated router target requires one position contribution group and instance hash scheme",
+                    ));
+                }
                 let proof_matches = cut.change_stream_writer().is_some_and(|proof| {
                     proof.route_id == route.route_id
                         && proof.write_target_ordinal == route.write_target_ordinal
@@ -824,6 +864,26 @@ pub(crate) fn validate_fragment_cuts_into(
             ));
         }
     }
+    if let Some(root) = fragment.nodes().get(&fragment.root())
+        && let NodeKind::PositionShard(spec) = &root.kind
+        && (cuts.inbound.len() != spec.inputs.len()
+            || cuts.outbound.len() != 1
+            || cuts.inbound.iter().any(|cut| {
+                !matches!(
+                    cut.payload,
+                    crate::ExchangePayloadContract::PositionContribution { .. }
+                )
+            })
+            || !matches!(
+                cuts.outbound[0].payload,
+                crate::ExchangePayloadContract::PositionShards { .. }
+            ))
+    {
+        errors.push(ValidationError::new(
+            &path,
+            "position aggregation must consume its complete contribution group and emit one shard stream",
+        ));
+    }
     validate_fragment_writer_results(fragment, cuts, &path, errors);
     validate_fragment_summary_inputs(fragment, cuts, errors);
     validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
@@ -833,6 +893,154 @@ pub(crate) fn validate_fragment_cuts_into(
         &format!("{path}.runtime_filter_bindings"),
         errors,
     );
+}
+
+fn validate_inbound_position_contribution(
+    fragment: &Fragment,
+    cut: &InboundFragmentCut,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let crate::ExchangePayloadContract::PositionContribution { group, route } = &cut.payload else {
+        return;
+    };
+    let matched = fragment.nodes().get(&fragment.root()).is_some_and(|root| {
+        let NodeKind::PositionShard(spec) = &root.kind else {
+            return false;
+        };
+        spec.group == *group
+            && spec.target == route.write_target_ordinal
+            && root.inputs.iter().zip(&spec.inputs).any(|(node, input)| {
+                *node == cut.destination_node
+                    && input.route == route.route_id
+                    && input
+                        .columns()
+                        .into_iter()
+                        .eq(cut.imports.iter().map(|import| import.destination))
+                    && file_hash(&cut.partitioning.destination, input.file)
+            })
+    });
+    if cut.kind != crate::EdgeKind::ChangeStreamRouter
+        || cut.delivery != crate::DeliveryRequirement::MustDrain
+        || group.to_bytes() == [0; 32]
+        || !matched
+        || !route
+            .fields
+            .iter()
+            .map(|field| (field.source, field.destination))
+            .eq(cut
+                .imports
+                .iter()
+                .map(|import| (import.source.value, import.destination)))
+    {
+        errors.push(ValidationError::new(
+            path,
+            "inbound cut differs from its position contribution",
+        ));
+    }
+}
+
+fn file_hash(distribution: &crate::Distribution, file: crate::ValueId) -> bool {
+    matches!(distribution, crate::Distribution::Hash { keys, scheme }
+        if keys.as_ref() == [file]
+            && scheme.definition.algorithm
+                == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1)
+}
+
+fn validate_inbound_position_shards(
+    fragment: &Fragment,
+    cut: &InboundFragmentCut,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let crate::ExchangePayloadContract::PositionShards { group, target } = cut.payload else {
+        return;
+    };
+    let dop = fragment.dop_domain();
+    let writer_matches = fragment.nodes().get(&fragment.root()).is_some_and(|node| {
+        matches!(&node.kind, NodeKind::TableWriter { target: writer }
+            if node.inputs.as_ref() == [cut.destination_node]
+                && writer.write_target_ordinal == target
+                && writer.required_distribution == crate::Distribution::Singleton
+                && writer.input.iter().copied().eq(cut.imports.iter().map(|i| i.destination)))
+    });
+    if !writer_matches
+        || group.to_bytes() == [0; 32]
+        || cut.kind != crate::EdgeKind::Stream
+        || cut.delivery != crate::DeliveryRequirement::MustDrain
+        || cut.partitioning.destination != crate::Distribution::Singleton
+        || cut.partitioning.destination_multiplicity != crate::RowMultiplicity::SingleCopy
+        || *fragment.stage_placement() != crate::StagePlacementPolicy::Singleton
+        || dop.min != 1
+        || dop.max != 1
+        || !has_position_shard_layout(cut.imports.iter().map(|import| &import.source.ty))
+    {
+        errors.push(ValidationError::new(
+            path,
+            "position shards require their exact direct singleton writer at DOP 1",
+        ));
+    }
+}
+
+fn has_position_shard_layout<'a>(
+    types: impl ExactSizeIterator<Item = &'a crate::ValueType>,
+) -> bool {
+    use arrow_schema::DataType;
+    types.len() == 9
+        && types.enumerate().all(|(ordinal, ty)| {
+            let data_type = ty.data_type();
+            if ordinal == 2 {
+                return ty.nullable() && matches!(data_type, DataType::Struct(_));
+            }
+            !ty.nullable()
+                && match ordinal {
+                    0 => data_type == &DataType::Utf8,
+                    1 | 4 | 5 => data_type == &DataType::Int32,
+                    3 | 6 | 7 => data_type == &DataType::Int64,
+                    8 => data_type == &DataType::Binary,
+                    _ => false,
+                }
+        })
+}
+
+fn validate_outbound_position_cut(
+    fragment: &Fragment,
+    cut: &OutboundFragmentCut,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    let valid = match &cut.payload {
+        crate::ExchangePayloadContract::PositionContribution { group, route } => {
+            group.to_bytes() != [0; 32]
+                && cut.kind == crate::EdgeKind::ChangeStreamRouter
+                && cut.delivery == crate::DeliveryRequirement::MustDrain
+                && matches!(fragment.sink(), FragmentSink::Router { routes, .. }
+                if routes.iter().any(|r| r.edge == cut.edge && r.route_id == route.route_id
+                    && r.accepted_effects.iter().all(|effect| {
+                        !matches!(effect, novarocks_connector_contract::ConnectorRowMutationEffect::Insert)
+                    })))
+                && route.fields.len() == 4
+                && file_hash(&cut.partitioning.source, route.fields[0].source)
+        }
+        crate::ExchangePayloadContract::PositionShards { group, target } => {
+            cut.kind == crate::EdgeKind::Stream
+                && cut.delivery == crate::DeliveryRequirement::MustDrain
+                && cut.partitioning.destination == crate::Distribution::Singleton
+                && fragment.nodes().get(&fragment.root()).is_some_and(|node| {
+                    matches!(&node.kind, NodeKind::PositionShard(spec)
+                        if spec.group == *group && spec.target == *target
+                            && spec.output.columns().into_iter()
+                                .eq(cut.projection.iter().map(|column| column.value)))
+                })
+        }
+        _ => true,
+    };
+    if !valid {
+        errors.push(ValidationError::new(
+            path,
+            "outbound cut differs from its position shard contract",
+        ));
+    }
 }
 
 pub(crate) fn validate_inbound_change_stream_writer(

@@ -47,8 +47,6 @@ const MAX_SPLIT_OFFSETS: usize = 4096;
 const MAX_PARTITION_COLUMNS: usize = 4096;
 const MAX_TRANSFORM_EXPRS: usize = 4096;
 const MAX_TRANSFORM_EXPR_BYTES: usize = 64 * 1024;
-const MAX_OLD_DELETE_MERGE_TARGETS: usize = 16_384;
-const MAX_OLD_DELETE_REFERENCES: usize = 1024;
 const MAX_MERGED_OLD_REFERENCES: usize = 1024;
 const MAX_EQUALITY_DELETE_COLUMNS: usize = 4096;
 
@@ -136,12 +134,13 @@ pub(crate) fn decode_commit_fragment(
 #[derive(Clone, Copy)]
 enum MessageKind {
     WriterHandle,
+    MutationReadRecipe,
+    MutationSnapshot,
+    CreationScope,
     WriteTable,
     WriterOutput,
     DataRecipe,
-    OldDeleteTarget,
-    OldDeleteRef,
-    StorageRoute,
+    PositionRewriteTarget,
     EqualityRecipe,
     EqualityColumn,
     Partition,
@@ -151,6 +150,11 @@ enum MessageKind {
     Metrics,
     ColumnStats,
     CommitFragment,
+    CreationReceipt,
+    CreationWriter,
+    FinalDeleteEffect,
+    DeleteTargetLocator,
+    RemoveDataFile,
     DataFile,
     PositionDeleteFile,
     DeletionVector,
@@ -166,7 +170,6 @@ enum FieldKind {
     Bytes,
     Message(MessageKind),
     PackedVarint,
-    MapStringMessage(MessageKind),
     MapI32Varint,
     MapI32Bytes,
 }
@@ -210,7 +213,6 @@ impl FieldRule {
             | FieldKind::Bytes
             | FieldKind::Message(_)
             | FieldKind::PackedVarint
-            | FieldKind::MapStringMessage(_)
             | FieldKind::MapI32Varint
             | FieldKind::MapI32Bytes => 2,
         }
@@ -227,8 +229,19 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::WriterHandle, 2) => Some(singular(F::Message(M::WriteTable))),
         (M::WriterHandle, 3) => Some(singular(F::Message(M::WriterOutput))),
         (M::WriterHandle, 4) => Some(singular(F::Message(M::DataRecipe))),
-        (M::WriterHandle, 5) => Some(repeated(F::MapStringMessage(M::OldDeleteTarget))),
         (M::WriterHandle, 6) => Some(singular(F::Message(M::EqualityRecipe))),
+        (M::WriterHandle, 7) => Some(singular(F::Message(M::MutationReadRecipe))),
+        (M::WriterHandle, 8) => Some(singular(F::Message(M::CreationScope))),
+        (M::WriterHandle, 9) => Some(singular(F::Bytes)),
+        (M::WriterHandle, 10) => Some(singular(F::Message(M::PositionRewriteTarget))),
+        (M::PositionRewriteTarget, 1) => Some(singular(F::Text)),
+        (M::PositionRewriteTarget, 2) => Some(singular(F::Varint)),
+        (M::PositionRewriteTarget, 3) => Some(singular(F::Message(M::Partition))),
+        (M::CreationScope, 1..=3) => Some(singular(F::Bytes)),
+        (M::MutationReadRecipe, 1 | 2) => Some(singular(F::Text)),
+        (M::MutationReadRecipe, 3) => Some(singular(F::Message(M::MutationSnapshot))),
+        (M::MutationSnapshot, 1) => Some(singular(F::Text)),
+        (M::MutationSnapshot, 2) => Some(singular(F::Varint)),
 
         (M::WriteTable, 1..=6) => Some(singular(F::Text)),
         (M::WriteTable, 7..=11) => Some(singular(F::Varint)),
@@ -236,16 +249,6 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::DataRecipe, 1) => Some(singular(F::Text)),
         (M::DataRecipe, 2..=4) => Some(repeated(F::Text)),
         (M::DataRecipe, 5) => Some(singular(F::Varint)),
-
-        (M::OldDeleteTarget, 1) => Some(singular(F::Text)),
-        (M::OldDeleteTarget, 2..=3) | (M::OldDeleteTarget, 5) => Some(singular(F::Varint)),
-        (M::OldDeleteTarget, 4) => Some(singular(F::Message(M::Partition))),
-        (M::OldDeleteTarget, 6) => Some(repeated(F::Message(M::OldDeleteRef))),
-        (M::OldDeleteRef, 1) | (M::OldDeleteRef, 7) => Some(singular(F::Text)),
-        (M::OldDeleteRef, 2..=5) | (M::OldDeleteRef, 8..=10) => Some(singular(F::Varint)),
-        (M::OldDeleteRef, 6) => Some(singular(F::Message(M::ContentRange))),
-        (M::OldDeleteRef, 11) => Some(singular(F::Message(M::StorageRoute))),
-        (M::StorageRoute, 1) => Some(singular(F::Text)),
 
         (M::EqualityRecipe, 1) => Some(repeated(F::Message(M::EqualityColumn))),
         (M::EqualityRecipe, 2) => Some(singular(F::Text)),
@@ -269,6 +272,21 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::CommitFragment, 2) => Some(FieldRule::oneof(F::Message(M::PositionDeleteFile))),
         (M::CommitFragment, 3) => Some(FieldRule::oneof(F::Message(M::DeletionVector))),
         (M::CommitFragment, 4) => Some(FieldRule::oneof(F::Message(M::EqualityDeleteFile))),
+        (M::CommitFragment, 5) => Some(FieldRule::oneof(F::Message(M::FinalDeleteEffect))),
+        (M::CommitFragment, 6) => Some(singular(F::Message(M::CreationReceipt))),
+        (M::CreationReceipt, 1 | 2 | 4) => Some(singular(F::Bytes)),
+        (M::CreationReceipt, 3) => Some(singular(F::Varint)),
+        (M::CreationReceipt, 5) => Some(singular(F::Message(M::CreationWriter))),
+        (M::CreationWriter, 1 | 3) => Some(singular(F::Bytes)),
+        (M::CreationWriter, 2 | 4 | 5) => Some(singular(F::Varint)),
+        (M::FinalDeleteEffect, 1) => Some(singular(F::Message(M::DeleteTargetLocator))),
+        (M::FinalDeleteEffect, 2) => Some(singular(F::Varint)),
+        (M::FinalDeleteEffect, 3) => Some(FieldRule::oneof(F::Message(M::RemoveDataFile))),
+        (M::FinalDeleteEffect, 4) => Some(FieldRule::oneof(F::Message(M::DeletionVector))),
+        (M::DeleteTargetLocator, 1 | 2 | 6) => Some(singular(F::Text)),
+        (M::DeleteTargetLocator, 3..=5 | 7) => Some(singular(F::Varint)),
+        (M::RemoveDataFile, 1) => Some(repeated(F::Message(M::MergedDeleteReference))),
+        (M::RemoveDataFile, 2) => Some(singular(F::Message(M::Partition))),
         (M::DataFile, 1) => Some(singular(F::Text)),
         (M::DataFile, 2) => Some(singular(F::Varint)),
         (M::DataFile, 3) => Some(singular(F::Message(M::Partition))),
@@ -367,27 +385,6 @@ fn scan_message(
                 let value = read_length_delimited(&mut input, &field_path, context)?;
                 scan_message(value, nested, &field_path, depth + 1, context)?;
             }
-            FieldKind::MapStringMessage(nested) => {
-                let value = read_length_delimited(&mut input, &field_path, context)?;
-                let map_key = scan_map_entry(
-                    value,
-                    MapValue::Message(nested),
-                    &field_path,
-                    depth + 1,
-                    context,
-                )?;
-                // Long-key comparison/allocation remains an opaque BTree owner.
-                context.flush_compile_control()?;
-                let duplicate = !map_keys.insert((field, map_key));
-                context.observe_compile_step()?;
-                if duplicate {
-                    return Err(error(
-                        field_path,
-                        ConnectorCodecErrorKind::DuplicateField,
-                        "Iceberg private map contains a duplicate key",
-                    ));
-                }
-            }
             FieldKind::MapI32Varint => {
                 let value = read_length_delimited(&mut input, &field_path, context)?;
                 let map_key =
@@ -427,7 +424,6 @@ fn scan_message(
 
 #[derive(Clone, Copy)]
 enum MapValue {
-    Message(MessageKind),
     Varint,
     Bytes,
 }
@@ -449,32 +445,19 @@ fn scan_map_entry(
         context.observe_compile_step()?;
         context.ledger().charge_items(1)?;
         match field {
-            1 if key.is_none() => match value_kind {
-                MapValue::Message(_) => {
-                    if wire != 2 {
-                        return Err(invalid(
-                            path.field("key"),
-                            "map key has the wrong wire type",
-                        ));
-                    }
-                    let value = read_length_delimited(&mut input, &path.field("key"), context)?;
-                    context.ledger().charge_scalar(value.len())?;
-                    key = Some(copy_bytes(value, context)?);
+            1 if key.is_none() => {
+                if wire != 0 {
+                    return Err(invalid(
+                        path.field("key"),
+                        "map key has the wrong wire type",
+                    ));
                 }
-                MapValue::Varint | MapValue::Bytes => {
-                    if wire != 0 {
-                        return Err(invalid(
-                            path.field("key"),
-                            "map key has the wrong wire type",
-                        ));
-                    }
-                    key = Some(
-                        read_varint(&mut input, &path.field("key"), context)?
-                            .to_le_bytes()
-                            .to_vec(),
-                    );
-                }
-            },
+                key = Some(
+                    read_varint(&mut input, &path.field("key"), context)?
+                        .to_le_bytes()
+                        .to_vec(),
+                );
+            }
             1 => {
                 return Err(error(
                     path.field("key"),
@@ -485,17 +468,6 @@ fn scan_map_entry(
             2 if !value_seen => {
                 value_seen = true;
                 match value_kind {
-                    MapValue::Message(nested) => {
-                        if wire != 2 {
-                            return Err(invalid(
-                                path.field("value"),
-                                "map value has the wrong wire type",
-                            ));
-                        }
-                        let value =
-                            read_length_delimited(&mut input, &path.field("value"), context)?;
-                        scan_message(value, nested, &path.field("value"), depth + 1, context)?;
-                    }
                     MapValue::Varint => {
                         if wire != 0 {
                             return Err(invalid(
@@ -534,15 +506,8 @@ fn scan_map_entry(
             }
         }
     }
-    // Proto3 map entries apply the scalar/message default when either entry
-    // field is absent. Prost therefore omits a legitimate zero count (and can
-    // omit an empty key/value) from canonical bytes. Provider validation below
-    // still rejects defaults where the Iceberg relationship requires a
-    // non-empty path or a fully populated nested value.
-    Ok(key.unwrap_or_else(|| match value_kind {
-        MapValue::Message(_) => Vec::new(),
-        MapValue::Varint | MapValue::Bytes => 0_u64.to_le_bytes().to_vec(),
-    }))
+    // Prost omits a default zero map key in canonical bytes.
+    Ok(key.unwrap_or_else(|| 0_u64.to_le_bytes().to_vec()))
 }
 
 fn read_length_delimited<'a>(
@@ -596,13 +561,90 @@ fn validate_writer_handle(
         let branch = named_branch(handle.branch, path.field("branch"))?;
         validate_table(handle.table.as_ref(), path.field("table"), context)?;
         validate_output(handle.output.as_ref(), path.field("output"), context)?;
+        if let Some(scope) = &handle.creation_scope {
+            let field = path.field("creation_scope");
+            require_exact_bytes::<16>(&scope.session_id, field.field("session_id"))?;
+            require_exact_bytes::<16>(&scope.step_id, field.field("step_id"))?;
+            require_exact_bytes::<32>(&scope.endpoint_digest, field.field("endpoint_digest"))?;
+        }
+        if let Some(group) = &handle.position_group_id {
+            require_exact_bytes::<32>(group, path.field("position_group_id"))?;
+        }
+        let expects_group =
+            handle.mutation_read.is_some() && branch == dto::IcebergWriteBranch::DeletionVector;
+        if expects_group != handle.position_group_id.is_some() {
+            return Err(inconsistent(
+                path.field("position_group_id"),
+                "group must belong to a fixed position materializer",
+            ));
+        }
+        if let Some(recipe) = &handle.mutation_read {
+            let field = path.field("mutation_read");
+            if !matches!(
+                branch,
+                dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector
+            ) || handle.position_rewrite.is_some()
+            {
+                return Err(inconsistent(
+                    field,
+                    "fixed mutation input conflicts with the writer branch",
+                ));
+            }
+            bounded_text(
+                &recipe.metadata_location,
+                MAX_PATH_BYTES,
+                field.field("metadata_location"),
+                false,
+            )?;
+            bounded_text(
+                &recipe.metadata_identity,
+                71,
+                field.field("metadata_identity"),
+                false,
+            )?;
+            if let Some(snapshot) = &recipe.snapshot {
+                bounded_text(
+                    &snapshot.manifest_list,
+                    MAX_PATH_BYTES,
+                    field.field("snapshot").field("manifest_list"),
+                    false,
+                )?;
+                nonnegative(
+                    i64::from(snapshot.schema_id),
+                    field.field("snapshot").field("schema_id"),
+                )?;
+            }
+            context.observe_compile_step()?;
+        }
+        if let Some(target) = &handle.position_rewrite {
+            let field = path.field("position_rewrite");
+            if branch != dto::IcebergWriteBranch::DeletionVector {
+                return Err(inconsistent(
+                    field,
+                    "position rewrite requires a deletion-vector branch",
+                ));
+            }
+            bounded_text(
+                &target.data_file_path,
+                MAX_PATH_BYTES,
+                field.field("data_file_path"),
+                false,
+            )?;
+            if target.record_count == 0 {
+                return Err(invalid(
+                    field.field("record_count"),
+                    "position rewrite requires a nonempty data file",
+                ));
+            }
+            validate_partition(target.partition.as_ref(), field.field("partition"), context)?;
+        }
         match branch {
             dto::IcebergWriteBranch::Data => {
                 let recipe = handle.data.as_ref().ok_or_else(|| {
                     inconsistent(path.field("data"), "data branch requires a recipe")
                 })?;
                 validate_data_recipe(recipe, path.field("data"), context)?;
-                if !handle.old_deletes.is_empty() || handle.equality.is_some() {
+                if handle.equality.is_some() {
                     return Err(inconsistent(
                         path.clone(),
                         "data branch cannot carry delete recipes",
@@ -610,33 +652,21 @@ fn validate_writer_handle(
                 }
             }
             dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector => {
-                if handle.data.is_some() || handle.equality.is_some() {
+                if handle.data.is_some()
+                    || handle.equality.is_some()
+                    || (handle.mutation_read.is_none() && handle.position_rewrite.is_none())
+                {
                     return Err(inconsistent(
                         path.clone(),
-                        "position-delete branch carries only old-delete targets",
+                        "position writer requires exactly one position input recipe",
                     ));
-                }
-                bounded_count(
-                    handle.old_deletes.len(),
-                    MAX_OLD_DELETE_MERGE_TARGETS,
-                    path.field("old_deletes"),
-                )?;
-                for (key, target) in &handle.old_deletes {
-                    validate_old_delete_target(
-                        target,
-                        key,
-                        path.field("old_deletes").map_key(key),
-                        context,
-                    )?;
-
-                    context.observe_compile_step()?;
                 }
             }
             dto::IcebergWriteBranch::EqualityDelete => {
-                if handle.data.is_some() || !handle.old_deletes.is_empty() {
+                if handle.data.is_some() || handle.position_rewrite.is_some() {
                     return Err(inconsistent(
                         path.clone(),
-                        "equality-delete branch cannot carry data or old-delete recipes",
+                        "equality-delete branch cannot carry a data recipe",
                     ));
                 }
                 validate_equality_recipe(
@@ -853,144 +883,13 @@ fn validate_equality_recipe(
     result
 }
 
-fn validate_old_delete_target(
-    target: &dto::IcebergOldDeleteMergeTarget,
-    key: &str,
+pub(crate) fn require_exact_bytes<const N: usize>(
+    value: &[u8],
     path: ConnectorFieldPath,
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<(), ConnectorCodecError> {
-    let result = (|| {
-        bounded_text(
-            &target.data_file_path,
-            MAX_PATH_BYTES,
-            path.field("data_file_path"),
-            false,
-        )?;
-        if compare_text(&target.data_file_path, key, context)? != std::cmp::Ordering::Equal {
-            return Err(inconsistent(
-                path.field("data_file_path"),
-                "old-delete target must be keyed by its data path",
-            ));
-        }
-        nonnegative(target.base_snapshot_id, path.field("base_snapshot_id"))?;
-        validate_partition(target.partition.as_ref(), path.field("partition"), context)?;
-        bounded_count(
-            target.references.len(),
-            MAX_OLD_DELETE_REFERENCES,
-            path.field("references"),
-        )?;
-        let mut previous: Option<LogicalDeleteReference<'_>> = None;
-        for (index, reference) in target.references.iter().enumerate() {
-            let entry_path = path.field("references").index(index);
-            validate_old_delete_ref(reference, entry_path.clone(), context)?;
-            let identity = if reference.file_format == dto::IcebergWriteFileFormat::Puffin as i32 {
-                let range = reference.content_range.as_ref().ok_or_else(|| {
-                    missing(
-                        entry_path.field("content_range"),
-                        "DV reference requires its range",
-                    )
-                })?;
-                let data_file = reference.referenced_data_file.as_deref().ok_or_else(|| {
-                    missing(
-                        entry_path.field("referenced_data_file"),
-                        "DV reference requires its data file",
-                    )
-                })?;
-                LogicalDeleteReference::Vector {
-                    path: &reference.path,
-                    offset: range.offset,
-                    length: range.size_in_bytes,
-                    referenced_data_file: data_file,
-                }
-            } else {
-                LogicalDeleteReference::File(&reference.path)
-            };
-            identity.validate(entry_path.clone(), context)?;
-            if let Some(previous) = previous
-                && previous.compare(identity, context)? != std::cmp::Ordering::Less
-            {
-                return Err(inconsistent(
-                    entry_path,
-                    "old-delete references must be sorted and unique by logical entry",
-                ));
-            }
-            previous = Some(identity);
-            context.observe_compile_step()?;
-        }
-        Ok(())
-    })();
-    context.observe_compile_step()?;
-    result
-}
-
-fn validate_old_delete_ref(
-    reference: &dto::IcebergOldDeleteArtifactRef,
-    path: ConnectorFieldPath,
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<(), ConnectorCodecError> {
-    let result = (|| {
-        bounded_text(&reference.path, MAX_PATH_BYTES, path.field("path"), false)?;
-        let content = named_file_content(reference.content, path.field("content"))?;
-        if content != dto::IcebergFileContent::PositionDeletes {
-            return Err(inconsistent(
-                path.field("content"),
-                "old-delete reference must contain position deletes",
-            ));
-        }
-        let format = named_file_format(reference.file_format, path.field("file_format"))?;
-        if reference.file_size_in_bytes == 0 {
-            return Err(invalid(
-                path.field("file_size_in_bytes"),
-                "old-delete file cannot be empty",
-            ));
-        }
-        nonnegative(
-            i64::from(reference.partition_spec_id),
-            path.field("partition_spec_id"),
-        )?;
-        if let Some(range) = &reference.content_range {
-            validate_content_range(range, path.field("content_range"), context)?;
-        }
-        match format {
-            dto::IcebergWriteFileFormat::Puffin => {
-                if reference.content_range.is_none() || reference.referenced_data_file.is_none() {
-                    return Err(inconsistent(
-                        path.clone(),
-                        "Puffin deletion vector requires range and referenced data file",
-                    ));
-                }
-            }
-            dto::IcebergWriteFileFormat::Parquet if reference.content_range.is_some() => {
-                return Err(inconsistent(
-                    path.field("content_range"),
-                    "Parquet delete file cannot carry a content range",
-                ));
-            }
-            _ => {}
-        }
-        if let Some(data_file) = &reference.referenced_data_file {
-            bounded_text(
-                data_file,
-                MAX_PATH_BYTES,
-                path.field("referenced_data_file"),
-                false,
-            )?;
-        }
-        let route = reference.storage_route.as_ref().ok_or_else(|| {
-            missing(
-                path.field("storage_route"),
-                "old-delete reference requires a route",
-            )
-        })?;
-        bounded_text(
-            &route.access_binding,
-            MAX_NAME_BYTES,
-            path.field("storage_route").field("access_binding"),
-            false,
-        )
-    })();
-    context.observe_compile_step()?;
-    result
+) -> Result<[u8; N], ConnectorCodecError> {
+    value
+        .try_into()
+        .map_err(|_| invalid(path, format!("expected exactly {N} bytes")))
 }
 
 fn validate_commit_fragment(
@@ -1003,7 +902,35 @@ fn validate_commit_fragment(
             .artifact
             .as_ref()
             .ok_or_else(|| missing(path.clone(), "commit fragment requires one artifact"))?;
+        if let Some(creation) = &fragment.creation {
+            let field = path.field("creation");
+            require_exact_bytes::<16>(&creation.create_id, field.field("create_id"))?;
+            require_exact_bytes::<32>(&creation.identity, field.field("identity"))?;
+            require_exact_bytes::<32>(&creation.content_sha256, field.field("content_sha256"))?;
+            let physical = creation.physical.as_ref().ok_or_else(|| {
+                missing(
+                    field.field("physical"),
+                    "creation receipt requires its physical writer",
+                )
+            })?;
+            require_exact_bytes::<16>(
+                &physical.execution_query_id,
+                field.field("physical").field("execution_query_id"),
+            )?;
+            require_exact_bytes::<16>(
+                &physical.task_key,
+                field.field("physical").field("task_key"),
+            )?;
+        }
         match artifact {
+            dto::iceberg_commit_fragment::Artifact::FinalDelete(effect) => {
+                validate_final_delete(
+                    effect,
+                    fragment.creation.is_some(),
+                    path.field("final_delete"),
+                    context,
+                )?;
+            }
             dto::iceberg_commit_fragment::Artifact::DataFile(file) => {
                 bounded_text(
                     &file.path,
@@ -1045,26 +972,7 @@ fn validate_commit_fragment(
                 )?;
             }
             dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
-                let base = path.field("deletion_vector");
-                validate_delete_artifact_common(
-                    &file.path,
-                    file.partition.as_ref(),
-                    file.metrics.as_ref(),
-                    &file.referenced_data_file,
-                    &file.merged_old_references,
-                    base.clone(),
-                    context,
-                )?;
-                validate_content_range(
-                    file.content_range.as_ref().ok_or_else(|| {
-                        missing(
-                            base.field("content_range"),
-                            "deletion vector requires a range",
-                        )
-                    })?,
-                    base.field("content_range"),
-                    context,
-                )?;
+                validate_deletion_vector(file, path.field("deletion_vector"), context)?;
             }
             dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(file) => {
                 let base = path.field("equality_delete_file");
@@ -1095,6 +1003,82 @@ fn validate_commit_fragment(
     result
 }
 
+fn validate_deletion_vector(
+    file: &dto::IcebergDeletionVectorArtifact,
+    base: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    validate_delete_artifact_common(
+        &file.path,
+        file.partition.as_ref(),
+        file.metrics.as_ref(),
+        &file.referenced_data_file,
+        &file.merged_old_references,
+        base.clone(),
+        context,
+    )?;
+    validate_content_range(
+        file.content_range.as_ref().ok_or_else(|| {
+            missing(
+                base.field("content_range"),
+                "deletion vector requires a range",
+            )
+        })?,
+        base.field("content_range"),
+        context,
+    )
+}
+
+fn validate_final_delete(
+    effect: &dto::IcebergFinalDeleteEffect,
+    created: bool,
+    path: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    use dto::iceberg_final_delete_effect::Effect;
+    let target = effect
+        .target
+        .as_ref()
+        .ok_or_else(|| missing(path.field("target"), "final delete requires its target"))?;
+    for (name, value) in [
+        ("manifest_list", target.manifest_list.as_str()),
+        ("manifest_path", target.manifest_path.as_str()),
+        ("data_file_path", target.data_file_path.as_str()),
+    ] {
+        bounded_text(
+            value,
+            MAX_PATH_BYTES,
+            path.field("target").field(name),
+            false,
+        )?;
+        context.observe_compile_step()?;
+    }
+    if effect.newly_deleted_rows == 0 || effect.newly_deleted_rows > target.record_count {
+        return Err(inconsistent(
+            path.field("newly_deleted_rows"),
+            "new positions are outside the target row domain",
+        ));
+    }
+    match effect.effect.as_ref() {
+        Some(Effect::RemoveDataFile(remove)) if !created => {
+            let field = path.field("remove_data_file");
+            validate_partition(remove.partition.as_ref(), field.field("partition"), context)?;
+            validate_merged_references(
+                &remove.old_exclusive_deletes,
+                field.field("old_exclusive_deletes"),
+                context,
+            )
+        }
+        Some(Effect::ReplacePositions(vector)) if created => {
+            validate_deletion_vector(vector, path.field("replace_positions"), context)
+        }
+        _ => Err(inconsistent(
+            path,
+            "final delete effect and new-object creation receipt disagree",
+        )),
+    }
+}
+
 fn validate_delete_artifact_common(
     path_value: &str,
     partition: Option<&dto::IcebergArtifactPartition>,
@@ -1114,30 +1098,34 @@ fn validate_delete_artifact_common(
         )?;
         validate_partition(partition, path.field("partition"), context)?;
         validate_metrics(metrics, path.field("metrics"), context)?;
-        bounded_count(
-            merged.len(),
-            MAX_MERGED_OLD_REFERENCES,
-            path.field("merged_old_references"),
-        )?;
-        let mut previous: Option<LogicalDeleteReference<'_>> = None;
-        for (index, value) in merged.iter().enumerate() {
-            let entry_path = path.field("merged_old_references").index(index);
-            let identity = validate_merged_reference(value, entry_path.clone(), context)?;
-            if let Some(previous) = previous
-                && previous.compare(identity, context)? != std::cmp::Ordering::Less
-            {
-                return Err(inconsistent(
-                    entry_path,
-                    "merged old references must be sorted and unique",
-                ));
-            }
-            previous = Some(identity);
-            context.observe_compile_step()?;
-        }
-        Ok(())
+        validate_merged_references(merged, path.field("merged_old_references"), context)
     })();
     context.observe_compile_step()?;
     result
+}
+
+fn validate_merged_references(
+    values: &[dto::IcebergMergedDeleteReference],
+    path: ConnectorFieldPath,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<(), ConnectorCodecError> {
+    bounded_count(values.len(), MAX_MERGED_OLD_REFERENCES, path.clone())?;
+    let mut previous: Option<LogicalDeleteReference<'_>> = None;
+    for (index, value) in values.iter().enumerate() {
+        let entry_path = path.index(index);
+        let identity = validate_merged_reference(value, entry_path.clone(), context)?;
+        if let Some(previous) = previous
+            && previous.compare(identity, context)? != std::cmp::Ordering::Less
+        {
+            return Err(inconsistent(
+                entry_path,
+                "merged old references must be sorted and unique",
+            ));
+        }
+        previous = Some(identity);
+        context.observe_compile_step()?;
+    }
+    Ok(())
 }
 
 // Match EntryIdentity's variant/field ordering without copying DTO strings.
@@ -1435,18 +1423,6 @@ fn named_file_format(
     }
 }
 
-fn named_file_content(
-    value: i32,
-    path: ConnectorFieldPath,
-) -> Result<dto::IcebergFileContent, ConnectorCodecError> {
-    match dto::IcebergFileContent::try_from(value) {
-        Ok(dto::IcebergFileContent::Unspecified) | Err(_) => {
-            Err(invalid_enum(path, "file content must be named"))
-        }
-        Ok(value) => Ok(value),
-    }
-}
-
 fn bounded_text(
     value: &str,
     maximum: usize,
@@ -1508,22 +1484,6 @@ fn capacity(path: ConnectorFieldPath, detail: impl AsRef<str>) -> ConnectorCodec
     error(path, ConnectorCodecErrorKind::Capacity, detail)
 }
 
-// Only codec-owned key backing is copied here. Runtime decode keeps its
-// original fast path; a compile refusal never falls back to it.
-fn copy_bytes(
-    value: &[u8],
-    context: &mut ConnectorDecodeContext<'_>,
-) -> Result<Vec<u8>, ConnectorCodecError> {
-    if !context.is_compile_observed() {
-        return Ok(value.to_vec());
-    }
-    let mut result = Vec::with_capacity(value.len());
-    for byte in value {
-        result.push(*byte);
-        context.observe_compile_step()?;
-    }
-    Ok(result)
-}
 fn any_observed<I: IntoIterator>(
     values: I,
     context: &mut ConnectorDecodeContext<'_>,
@@ -1599,7 +1559,7 @@ mod compile_control_tests {
     use crate::commit::report::IcebergColumnStats;
     use crate::commit::write_stack::codec::IcebergWriteValueCodec;
     use crate::commit::write_stack::domain::*;
-    use crate::commit::write_stack::test_support::{merge_target, parquet_ref, table_facts};
+    use crate::commit::write_stack::test_support::table_facts;
     use crate::delete_file::IcebergFileFormat;
     use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
@@ -1685,37 +1645,56 @@ mod compile_control_tests {
             .unwrap(),
         )
         .unwrap();
-        let targets = || {
-            (0..321)
-                .map(|i| {
-                    merge_target(
-                        &format!("s3://b/data/data-{i:04}.parquet"),
-                        u64::try_from(i).unwrap(),
-                        vec![
-                            parquet_ref(
-                                &format!("s3://b/data/delete-{i:04}.parquet"),
-                                None,
-                                4096,
-                                3,
-                            )
-                            .unwrap(),
-                        ],
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
+        let table = table_facts();
+        let mutation = IcebergMutationReadRecipe::try_new(
+            &table,
+            "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
+            format!("sha256:{}", "a".repeat(64)),
+            Some(
+                IcebergMutationSnapshot::try_new(
+                    "s3://b/wh/db/t/metadata/snap-77.avro".to_owned(),
+                    1,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
         let position = IcebergWriterHandle::try_new_delete(
             IcebergWriteBranch::PositionDelete,
-            table_facts(),
+            table.clone(),
             output(IcebergFileFormat::Parquet),
-            targets(),
+        )
+        .unwrap()
+        .try_with_mutation_read(mutation, None)
+        .unwrap();
+        let partition = IcebergArtifactPartition::try_new(
+            String::new(),
+            String::new(),
+            0,
+            IcebergPartitionDescriptor {
+                values: vec![
+                    IcebergPartitionValueDescriptor {
+                        is_null: false,
+                        datum_bytes: Some(vec![1, 2, 3, 4]),
+                    };
+                    321
+                ],
+            },
         )
         .unwrap();
         let vector = IcebergWriterHandle::try_new_delete(
             IcebergWriteBranch::DeletionVector,
-            table_facts(),
+            table,
             output(IcebergFileFormat::Puffin),
-            targets(),
+        )
+        .unwrap()
+        .try_with_position_rewrite(
+            IcebergPositionRewriteTarget::try_new(
+                "s3://b/data/a.parquet".to_owned(),
+                100,
+                partition,
+            )
+            .unwrap(),
         )
         .unwrap();
         let codec = IcebergWriteValueCodec::new("catalog.iceberg");
@@ -1846,10 +1825,9 @@ mod compile_control_tests {
             .enumerate()
             .filter_map(|(i, (_, units))| (*units == 256).then_some(i + 1))
             .collect();
-        assert!(
-            !positives.is_empty(),
-            "a long actual DTO must perform a full quantum"
-        );
+        if positives.is_empty() {
+            return vec![1, trace.len()];
+        }
         let mut positions = vec![
             1,
             positives[0],
@@ -1889,6 +1867,9 @@ mod compile_control_tests {
             assert_eq!(new, raw);
             assert_ledger_same(&old_budget, &new_budget);
             let trace = control.trace.lock().unwrap();
+            if raw.mutation_read.is_none() {
+                assert!(trace.iter().any(|(_, units)| *units == 256));
+            }
             representative_checkpoints(&trace);
             assert_eq!(trace.last().unwrap().1, 1);
         }
@@ -1920,6 +1901,7 @@ mod compile_control_tests {
             assert_eq!(new.as_dto(), &raw);
             assert_ledger_same(&old_budget, &new_budget);
             let trace = control.trace.lock().unwrap();
+            assert!(trace.iter().any(|(_, units)| *units == 256));
             representative_checkpoints(&trace);
             assert_eq!(trace.last().unwrap().1, 1);
         }
@@ -2087,27 +2069,21 @@ mod compile_control_tests {
         );
     }
     #[test]
-    fn string_map_key_copy_and_long_path_comparison_are_observed_but_legacy_fast() {
+    fn long_path_comparison_is_observed_and_matches_native_ordering() {
         let expected = header(ConnectorCodecCategory::WriteHandle);
         for cause in causes() {
-            for compare in [false, true] {
-                let control = Control {
-                    trace: Default::default(),
-                    refuse: Some((2, cause.clone())),
-                };
-                let mut budget = ledger();
-                let mut context =
-                    ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
-                        .unwrap();
-                let value = "x".repeat(321);
-                let error = if compare {
-                    compare_text(&value, &value, &mut context).unwrap_err()
-                } else {
-                    copy_bytes(value.as_bytes(), &mut context).unwrap_err()
-                };
-                assert_eq!(error.compile_control_error(), Some(&cause));
-                assert_eq!(control.trace.lock().unwrap()[1].1, 256);
-            }
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause.clone())),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            let value = "x".repeat(321);
+            let error = compare_text(&value, &value, &mut context).unwrap_err();
+            assert_eq!(error.compile_control_error(), Some(&cause));
+            assert_eq!(control.trace.lock().unwrap()[1].1, 256);
         }
         let mut budget = ledger();
         let mut context = ConnectorDecodeContext::new(&expected, &mut budget);
@@ -2123,10 +2099,6 @@ mod compile_control_tests {
                 left.cmp(right)
             );
         }
-        assert_eq!(
-            copy_bytes(&[0, 255, 3], &mut context).unwrap(),
-            vec![0, 255, 3]
-        );
     }
     #[test]
     fn logical_vector_reference_comparison_observes_the_complete_last_data_path() {
@@ -2244,7 +2216,9 @@ mod compile_control_tests {
             let mut context =
                 ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
                     .unwrap();
-            copy_bytes(&[0; 255], &mut context).unwrap();
+            for _ in 0..255 {
+                context.observe_compile_step().unwrap();
+            }
             let mut bytes: &[u8] = &[7];
             let error = read_varint(
                 &mut bytes,

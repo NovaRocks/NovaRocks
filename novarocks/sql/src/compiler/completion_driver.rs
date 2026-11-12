@@ -342,6 +342,17 @@ pub(crate) struct SqlProviderReadCompletionState {
     physical: PhysicalPlanNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     needs: Box<[ProviderReadNeed]>,
+    system_needs: Box<[super::completion::SystemTableSnapshotNeed]>,
+}
+
+impl SqlProviderReadCompletionState {
+    pub(super) const fn kind(&self) -> super::completion::NeedKind {
+        if self.system_needs.is_empty() {
+            super::completion::NeedKind::ProviderRead
+        } else {
+            super::completion::NeedKind::ProviderInputs
+        }
+    }
 }
 
 /// Exact provider results paired with the scan occurrences that requested
@@ -897,11 +908,26 @@ fn provider_or_ready_step(
         .session
         .optimizer_settings
         .connector_static_predicate_pushdown_enabled();
-    let (physical, needs) =
-        collect_provider_needs(physical, next_need_ordinal, offer_predicates, control)?;
-    if !needs.is_empty() {
+    let (physical, needs, system_needs) = collect_provider_inputs(
+        physical,
+        next_need_ordinal,
+        offer_predicates,
+        !matches!(
+            common.display_intent,
+            SqlDisplayIntent::Explain { analyze: false, .. }
+        ),
+        control,
+    )?;
+    if !needs.is_empty() || !system_needs.is_empty() {
         return Ok(CompilerStep::need(
-            SqlNeedBatch::ProviderReads(needs.clone()),
+            if system_needs.is_empty() {
+                SqlNeedBatch::ProviderReads(needs.clone())
+            } else {
+                SqlNeedBatch::ProviderInputs {
+                    reads: needs.clone(),
+                    system_tables: system_needs.clone(),
+                }
+            },
             CompilerContinuation::provider_read(SqlProviderReadCompletionState {
                 root_allow_throw_exception,
                 common,
@@ -909,6 +935,7 @@ fn provider_or_ready_step(
                 root_semantics,
                 query_statistics,
                 needs,
+                system_needs,
             }),
         ));
     }
@@ -934,6 +961,12 @@ fn provider_or_ready_step(
     ))
 }
 
+type CollectedProviderInputs = (
+    PhysicalPlanNode,
+    Box<[ProviderReadNeed]>,
+    Box<[super::completion::SystemTableSnapshotNeed]>,
+);
+
 /// State every provider read one physical plan performs, and address each of
 /// its scans by the occurrence that read will be accounted for under.
 ///
@@ -941,12 +974,41 @@ fn provider_or_ready_step(
 /// it directly, because a write is compiled by the owner that sealed its
 /// target rather than driven need-by-need -- but it states the same needs, so
 /// it states them the same way.
+pub(crate) fn collect_provider_inputs(
+    plan: PhysicalPlanNode,
+    next_need_ordinal: u32,
+    offer_predicates: bool,
+    materialize_system_tables: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<CollectedProviderInputs, SqlCompileError> {
+    let (physical, reads, mut next_need) =
+        collect_provider_needs_with_next(plan, next_need_ordinal, offer_predicates, control)?;
+    let (physical, system_tables) = super::system_table_completion::collect(
+        physical,
+        &mut next_need,
+        materialize_system_tables,
+        control,
+    )?;
+    Ok((physical, reads, system_tables))
+}
+
 pub(crate) fn collect_provider_needs(
+    plan: PhysicalPlanNode,
+    next_need_ordinal: u32,
+    offer_predicates: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
+    let (plan, needs, _) =
+        collect_provider_needs_with_next(plan, next_need_ordinal, offer_predicates, control)?;
+    Ok((plan, needs))
+}
+
+fn collect_provider_needs_with_next(
     plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,
     control: &dyn novarocks_type_contract::PureCompileControl,
-) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
+) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>, u32), SqlCompileError> {
     #[derive(Default)]
     struct ProviderReadOccurrenceAllocator {
         next: u32,
@@ -1059,7 +1121,7 @@ pub(crate) fn collect_provider_needs(
         &mut work,
     )?;
     work.finish()?;
-    Ok((plan, needs.into_boxed_slice()))
+    Ok((plan, needs.into_boxed_slice(), next_need_ordinal))
 }
 
 enum ProviderColumnProjectionError {
@@ -1242,6 +1304,21 @@ fn provider_columns(
     Ok((columns.into_boxed_slice(), predicate_columns))
 }
 
+pub(super) fn resume_provider_inputs(
+    mut state: SqlProviderReadCompletionState,
+    facts: Box<[ProviderReadFact]>,
+    system_facts: Box<[super::completion::SystemTableSnapshotFact]>,
+    control: &SqlCompileControl,
+) -> Result<CompilerStep, SqlCompileError> {
+    super::system_table_completion::install(
+        &mut state.physical,
+        &state.system_needs,
+        system_facts,
+        control,
+    )?;
+    resume_provider_read(state, facts, control)
+}
+
 pub(super) fn resume_provider_read(
     state: SqlProviderReadCompletionState,
     facts: Box<[ProviderReadFact]>,
@@ -1345,7 +1422,7 @@ mod tests {
         };
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([17; 16]).expect("plan version"),
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             intent,
             SqlSessionContext {
                 sql_semantics: crate::sql_mode::SqlSemanticSettings::default(),
@@ -1781,7 +1858,7 @@ mod tests {
         }
     }
 
-    fn resolved_table(need: &CatalogRelationNeed) -> ResolvedAnalyzerTable {
+    pub(super) fn resolved_table(need: &CatalogRelationNeed) -> ResolvedAnalyzerTable {
         let relation = need.relation();
         ResolvedAnalyzerTable::from_planner(
             Some(&relation.catalog),
@@ -1805,6 +1882,9 @@ mod tests {
                     )
                     .expect("table identity"),
                     match need.target() {
+                        crate::compiler::CatalogLookupTarget::SystemTable => {
+                            panic!("ordinary table fixture cannot provide a system declaration")
+                        }
                         crate::compiler::CatalogLookupTarget::Table { .. } => SqlScanKind::Data {
                             version: SqlTableVersionSelector::Current,
                         },
@@ -1934,7 +2014,7 @@ mod tests {
             .expect("catalog round")
     }
 
-    fn answer_statistics(compilation: SqlCompilation) -> SqlCompileProgress {
+    pub(super) fn answer_statistics(compilation: SqlCompilation) -> SqlCompileProgress {
         let needs = match compilation.needs() {
             SqlNeedBatch::Statistics(needs) => needs.to_vec(),
             other => panic!("expected statistics needs, got {other:?}"),
@@ -2157,6 +2237,9 @@ mod tests {
                         SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
                         SqlNeedBatch::MaterializedViews(_) => {
                             panic!("fixture disabled optional MV discovery")
+                        }
+                        SqlNeedBatch::ProviderInputs { .. } => {
+                            panic!("root intrinsic fixture has no system tables")
                         }
                     };
                 }
@@ -2446,6 +2529,9 @@ mod tests {
                 }
                 SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
                 SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                SqlNeedBatch::ProviderInputs { .. } => {
+                    panic!("base query fixture has no system tables")
+                }
             };
         }
     }
@@ -3963,7 +4049,7 @@ mod tests {
         let catalog = MergeCatalog;
         let functions = builtin_sql_function_catalog();
         let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-            SqlStatementInput::sql(sql),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(sql)),
             SqlCompileIntent::DmlInternalRead,
             request("SELECT 1", SqlCompileIntent::Query).session,
             SqlPlanningEnvironment::Distributed,
@@ -4104,7 +4190,9 @@ mod tests {
         let catalog = FrozenOrdersCatalog;
         let functions = builtin_sql_function_catalog();
         let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select order_key from orders"),
+            SqlStatementInput::parsed_query(crate::compiler::test_query(
+                "select order_key from orders",
+            )),
             SqlCompileIntent::Query,
             request("select 1", SqlCompileIntent::Query).session,
             SqlPlanningEnvironment::Distributed,
@@ -4511,3 +4599,6 @@ mod catalogue_retention_tests;
 #[cfg(test)]
 #[path = "view_completion_tests.rs"]
 mod view_completion_tests;
+
+#[cfg(test)]
+mod system_tables_tests;

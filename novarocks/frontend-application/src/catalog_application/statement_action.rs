@@ -109,6 +109,12 @@ pub(crate) fn prepare_for_application(
 ) -> Result<Box<dyn GovernedStatementAction>, SharedFailureCause> {
     let input = match command {
         CatalogSqlCommand::CreateCatalog(command) => {
+            let instance = novarocks_spi::connector::ConnectorInstanceId::parse(
+                &novarocks_types::naming::normalize_identifier(&command.name).map_err(invalid)?,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+            novarocks_catalog_application::validate_catalog_create_name(&instance)
+                .map_err(SharedFailureCause::new)?;
             Mutation::Create(lower_semantic_create_catalog(&command).map_err(invalid)?)
         }
         CatalogSqlCommand::DropCatalog { name, if_exists } => Mutation::Drop(CatalogDropCommand {
@@ -124,6 +130,15 @@ pub(crate) fn prepare_for_application(
             ));
         }
     };
+    match &input {
+        Mutation::Create(command) => {
+            novarocks_catalog_application::validate_catalog_create_name(&command.instance_id)
+        }
+        Mutation::Drop(command) => {
+            novarocks_catalog_application::validate_catalog_drop_name(&command.instance_id)
+        }
+    }
+    .map_err(SharedFailureCause::new)?;
     let application = application.ok_or_else(|| invalid("catalog application is unavailable"))?;
     application
         .require_catalog_mutation_admission()

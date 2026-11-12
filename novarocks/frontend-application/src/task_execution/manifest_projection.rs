@@ -284,6 +284,9 @@ impl AttemptManifestProjection {
             &mut next,
         )?;
         let establish = Arc::new(establish);
+        let windows = super::intent::NativeRequestWindows::for_transport(transport)
+            .map_err(TaskExecutionError::Schedule)?;
+        let message_limits = transport.message_limits();
         let start = AttemptStart {
             activation: AttemptActivation {
                 identity,
@@ -306,8 +309,11 @@ impl AttemptManifestProjection {
                 coordination: policy.coordination,
                 transport: FrozenTransportLimits {
                     max_batch_items: transport.max_batch_items(),
-                    max_batch_encoded_bytes: transport.max_batch_encoded_bytes(),
-                    max_descriptor_encoded_bytes: transport.max_descriptor_encoded_bytes(),
+                    batch_target_encoded_bytes: transport.batch_target_encoded_bytes(),
+                    ordinary_request_max_bytes: message_limits.ordinary_request_max_bytes,
+                    control_request_max_bytes: message_limits.control_request_max_bytes,
+                    ordinary_queued_max_bytes: windows.empty_queue_capacity(false),
+                    control_queued_max_bytes: windows.empty_queue_capacity(true),
                     max_query_backend_queued_operations: transport
                         .max_query_backend_queued_operations(),
                     max_query_backend_queued_bytes: transport.max_query_backend_queued_bytes(),

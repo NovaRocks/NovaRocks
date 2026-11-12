@@ -188,8 +188,6 @@ pub enum CapacityBound {
         backend: BackendProcessId,
         limit: usize,
     },
-    /// One descriptor's encoded plan.
-    DescriptorBytes { limit: usize, actual: usize },
     /// One operation's queue-side carrier.
     OperationBytes { limit: usize, actual: usize },
     /// Edge-open versions one producer task can mint.
@@ -257,14 +255,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
             Self::ActiveTasksPerBackend { limit, .. } => {
                 (45, None, None, D::Items, None, u64::try_from(limit).ok())
             }
-            Self::DescriptorBytes { limit, actual } => (
-                46,
-                Some(S::Request),
-                Some(S::Request),
-                D::Bytes,
-                u64::try_from(actual).ok(),
-                u64::try_from(limit).ok(),
-            ),
             Self::OperationBytes { limit, actual } => (
                 47,
                 Some(S::Request),
@@ -320,10 +310,6 @@ impl fmt::Display for CapacityBound {
             Self::ActiveTasksPerBackend { backend, limit } => write!(
                 formatter,
                 "active tasks on backend {backend} reached {limit}"
-            ),
-            Self::DescriptorBytes { limit, actual } => write!(
-                formatter,
-                "descriptor plan is {actual} bytes, limit is {limit}"
             ),
             Self::OperationBytes { limit, actual } => write!(
                 formatter,

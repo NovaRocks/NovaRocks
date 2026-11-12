@@ -31,31 +31,6 @@ use crate::persistence::identity::{
     ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
 };
 
-pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
-pub const DEFAULT_MAX_DOCUMENT_SET_BYTES: usize = 256 * 1024;
-pub const DEFAULT_MAX_DECODE_WORKING_SET_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_MAX_DOCUMENT_ITEMS: usize = 4096;
-pub const DEFAULT_MAX_STRUCTURE_DEPTH: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PersistenceDecodeBudget {
-    pub max_document_bytes: usize,
-    pub max_working_set_bytes: usize,
-    pub max_items: usize,
-    pub max_depth: usize,
-}
-
-impl Default for PersistenceDecodeBudget {
-    fn default() -> Self {
-        Self {
-            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
-            max_working_set_bytes: DEFAULT_MAX_DECODE_WORKING_SET_BYTES,
-            max_items: DEFAULT_MAX_DOCUMENT_ITEMS,
-            max_depth: DEFAULT_MAX_STRUCTURE_DEPTH,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
     path: String,
@@ -121,7 +96,6 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
     }
 
     let mut occurrences = BTreeMap::new();
-    let mut item_count = document.relation_occurrences.len() + document.outputs.len();
     for relation in &document.relation_occurrences {
         if occurrences
             .insert(relation.occurrence_id, relation)
@@ -161,7 +135,6 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
                 "at least one stable field binding is required",
             ));
         }
-        item_count = item_count.saturating_add(relation.fields.len());
         let mut fields = BTreeSet::new();
         for field in &relation.fields {
             if !fields.insert(&field.field_id) {
@@ -215,7 +188,6 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
             }
             _ => {}
         }
-        item_count = item_count.saturating_add(output.expression.source_fields.len());
         let mut refs = BTreeSet::new();
         for reference in &output.expression.source_fields {
             if !refs.insert((reference.occurrence_id, &reference.field_id)) {
@@ -245,7 +217,7 @@ pub fn validate_definition(document: &DefinitionDocument) -> Result<(), Validati
             }
         }
     }
-    enforce_item_budget("definition", item_count)
+    Ok(())
 }
 
 pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), ValidationError> {
@@ -586,19 +558,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
         }
     }
 
-    let item_count = document.outputs.len()
-        + document.state_slots.len()
-        + document.aggregates.len()
-        + document.branches.len()
-        + document.target.fields.len()
-        + document.target.partition_fields.len()
-        + document.apply_key.components.len()
-        + document
-            .aggregates
-            .iter()
-            .map(|value| value.source_fields.len() + value.state_slot_ids.len())
-            .sum::<usize>();
-    enforce_item_budget("interpretation", item_count)
+    Ok(())
 }
 
 fn validate_retraction_count_owner(
@@ -884,19 +844,6 @@ fn unique_identities<T: Ord>(path: &str, values: &[T]) -> Result<(), ValidationE
         if !seen.insert(value) {
             return Err(ValidationError::new(path, "contains a duplicate identity"));
         }
-    }
-    Ok(())
-}
-
-fn enforce_item_budget(path: &str, count: usize) -> Result<(), ValidationError> {
-    if count > DEFAULT_MAX_DOCUMENT_ITEMS {
-        return Err(ValidationError::new(
-            path,
-            format!(
-                "contains {count} expanded items, exceeding the {}-item budget",
-                DEFAULT_MAX_DOCUMENT_ITEMS
-            ),
-        ));
     }
     Ok(())
 }

@@ -19,11 +19,8 @@ impl StateStoreMvRepository {
     pub async fn find_keyed_by_target(
         &self,
         target: &MvTarget,
-        budget: crate::persistence::validation::PersistenceDecodeBudget,
     ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.read_repository()
-            .find_keyed_by_target(target, budget)
-            .await
+        self.read_repository().find_keyed_by_target(target).await
     }
     /// The existing sequence, lookup and dependency indexes are updated in the
     /// same transaction. A stale expected root is a conflict, never overwritten.
@@ -71,21 +68,12 @@ impl StateStoreMvRepository {
     }
     pub async fn list_keyed_projection_inventory(
         &self,
-        bound: MvProjectionInventoryBound,
     ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
         self.read_repository()
-            .list_keyed_projection_inventory(bound)
+            .list_keyed_projection_inventory()
             .await
     }
-    pub async fn find_keyed_by_target_bounded(
-        &self,
-        target: &MvTarget,
-        bound: MvProjectionInventoryBound,
-    ) -> Result<Option<LoadedKeyedMvProjection>, MvRepositoryError> {
-        self.read_repository()
-            .find_keyed_by_target_bounded(target, bound)
-            .await
-    }
+
     pub async fn delete_keyed_projection(
         &self,
         operation_id: Uuid,
@@ -105,14 +93,13 @@ impl StateStoreMvRepository {
             .await
     }
 }
-pub(super) async fn bounded_keyed_inventory<T: ReadAccess + ?Sized>(
+pub(super) async fn projection_inventory<T: ReadAccess + ?Sized>(
     tx: &mut T,
-    bound: MvProjectionInventoryBound,
 ) -> Result<Vec<MvProjectionInventoryEntry>, MvRepositoryError> {
-    let mut inventory = MvProjectionInventoryBuilder::new(bound)?;
+    let mut inventory = MvProjectionInventoryBuilder::new()?;
     let mut range = BoundedRecordRange::new(projection_prefix().map_err(corruption)?)?;
-    while let Some(row) = range.next(tx, bound).await? {
-        let projection = decode_keyed_projection(&row.key, &row.value, bound.decode)
+    while let Some(row) = range.next(tx).await? {
+        let projection = decode_keyed_projection(&row.key, &row.value)
             .map_err(corruption)?
             .value;
         if row.key != projection_by_id_key(projection.mv_id).map_err(corruption)? {
@@ -149,14 +136,12 @@ impl StateStoreMvRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::{keyed_documents::*, validation::PersistenceDecodeBudget};
+    use crate::persistence::keyed_documents::*;
     #[tokio::test]
     async fn keyed_projection_roundtrips_on_existing_owner_with_guarded_cas() {
         let (_, repository) = super::super::tests_definition::repository().await;
         let (catalog, view) = crate::persistence::keyed_documents::tests::fixture(Some(17), true);
-        let observed =
-            decode_current_keyed_documents(view, catalog, PersistenceDecodeBudget::default())
-                .unwrap();
+        let observed = decode_current_keyed_documents(view, catalog).unwrap();
         let facts = MvKeyedDocumentProjection::try_from_current(observed).unwrap();
         let target = facts.target();
         let first = repository
@@ -164,10 +149,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repository
-                .find_keyed_by_target(&target, PersistenceDecodeBudget::default())
-                .await
-                .unwrap(),
+            repository.find_keyed_by_target(&target).await.unwrap(),
             Some(first.clone())
         );
         let second = repository

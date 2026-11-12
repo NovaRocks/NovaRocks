@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/mv-application/**"]
+paths = ["novarocks/mv-application/**", "novarocks/frontend-application/**", "novarocks/sql/**", "novarocks/connector/iceberg/**"]
 
 [reuse]
 scope = "suite"

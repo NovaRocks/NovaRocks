@@ -154,7 +154,7 @@ SQL client
   `control_runtime/**` and `task_execution/host/**` bind the original I/O,
   observations, reports and actual exit. The logical execution owner and
   recovery policy remain in `novarocks/query-application/src/**`.
-  See [ADR-0228](docs/adr/ADR-0228-frontend-attempt-decisions-and-transport-custody.md).
+  See [ADR-0230](docs/adr/ADR-0230-frontend-attempt-decisions-and-transport-custody.md).
   Long-lived Catalog
   generation ownership remains in `novarocks/catalog-application/src/**`.
   `state_family/**` is the closed manifest of every frontend-local state
@@ -185,6 +185,11 @@ SQL client
   源码结构与局部测试不证明整族原生或最终全工作区验证完成。
 
 ### 4.2 SQL Frontend: Parse, Plan, Admit
+
+- `novarocks/sql/src/system_table.rs` 与 `novarocks/query-application/src/system_tables/**`
+  系统表纯声明、catalog 绑定、注册表、请求与类型化批快照契约。SQL 先完成名称/声明补全，
+  再按所需列与保守键约束请求快照；普通 EXPLAIN 不获取快照。注册表不保管某句的 pin、IO 或 CPU。
+  `system` 与各 catalog 的 `information_schema` 保持只读，见 ADR-0226。
 
 - `novarocks/parser/src/**`
   Hand-written lexer, parser and AST, including the StarRocks-compatible
@@ -305,6 +310,13 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 仍须清零修复账、相关登记及 pure 排除清单，并完成原生 1FE+3BE 与全部约定 CI 的最终验证。
 
 ### 4.4 Local Program and Operators
+
+- `novarocks/physical-plan/src/system_relation.rs`、
+  `novarocks/plan-codec/src/physical_package_v2/system_relation.rs`、
+  `novarocks/local-compiler/src/system_relation.rs` 与
+  `novarocks/execution/src/exec/pipeline/builder/compiled_system_relation.rs`
+  拥有独立系统关系的批序列、编解码、降级与 BE 游标源；每次消费批次，不整份拼接，
+  不登记为 SQL 常量或借用 `StaticValues`。类型、几何和实际存储责任仍由原作者核对，见 ADR-0226/0227。
 
 - `novarocks/local-compiler/src/**`
   只消费已冻结的 package、pure function/provider facts，产生纯 `LocalProgram`；
@@ -482,6 +494,14 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   和 unsafe 地址/生命周期要求。smoke 不证明性能或所有生产调用面已接线。
 
 ### 4.8 Connectors / Catalog Backends / Filesystem
+
+- `novarocks/frontend-application/src/system_tables/**` 与
+  `novarocks/frontend-application/src/query_execution/completion_facts/system_source.rs`
+  分别拥有系统表 Provider 与原语句快照 Source。目录行来自原 catalog generation，MV 行来自原产品事实；
+  Source 保留原 typed pin、IO、CPU、Root 与结果窗口，借用取消后继续等真实退出。
+  `novarocks/frontend-application/src/server.rs` 组合静态注册表；`mv/domain/freshness.rs` 区分基表缺失、
+  对象/版本变化和其它类型化读取失败。SHOW MATERIALIZED VIEWS、SHOW BACKENDS、SHOW TABLE STATS 保留。
+  元数据列举与任务传输的固定额度退役范围见 ADR-0227；Joint 只记责，不提供回复总字节容量。
 
 - `novarocks/types/src/{naming,schema}.rs`
   Neutral catalog naming and schema vocabulary. It contains no catalog runtime
@@ -1114,6 +1134,43 @@ failing statement can leave the shared server in a state where later cases fail
 for reasons of their own, so the count overstates the problem. Re-run a
 suspected case against a clean server before attributing it to the change.
 
+### 8.6 Rust Test Organization
+
+Where a Rust test lives, what it may depend on and who supplies its input are
+decided by the [Rust test organization guide](docs/guides/development/rust-test-organization.md).
+Existing neighbours predate it and are not examples. Before writing a test,
+answer its [placement procedure](docs/guides/development/rust-test-organization.md#放置判定程序):
+
+1. Whose property does the assertion protect? The crate that must change when
+   it fails owns the test.
+2. Are all needed crates inside the owner's production dependency closure, a
+   testkit of that closure, or mechanical test support? A composition across two
+   crates with no production edge goes to a seam test package.
+3. Does it need private items? Yes: a white-box test file under `src/`. No:
+   `<crate>/tests/it`. A test that needs the crate's own testkit must be in
+   `tests/it`.
+4. Does it need a target-level property (custom harness, global allocator,
+   `required-features`, Loom, Miri, a binary-scoped nextest group)? Only then a
+   standalone integration target; a test that also needs private items stays
+   under `src/`.
+5. Does an existing subject file, in any layout, already cover this behaviour
+   axis? Add the case there; create a new file only when none fits.
+6. Where does the input come from? Take the nearest sufficient rung of the
+   fixture ladder.
+
+The guide is in a trial period. Its
+[trial rules](docs/guides/development/rust-test-organization.md#试行期规则) constrain new tests:
+
+- Do not add flat `foo_tests.rs` siblings or new `#[cfg(test)] mod xxx_tests;`
+  lines in a production `mod.rs`.
+- Do not add one-binary-per-file integration targets; new public-contract tests
+  go to `tests/it`.
+- Do not add dev-dependencies outside the owner's production dependency closure.
+
+Adding cases to an existing flat test file is allowed, and existing tests are
+not migrated opportunistically. The guide wins where this summary and the guide
+differ.
+
 ## 9. Suggested Starting Points for Typical Changes
 
 - **工作签发、退出与启动入口**：先读 ADR-0218，再看
@@ -1347,6 +1404,10 @@ repository. The final development checkpoint is the target commit's composition,
 with selection gaps, deferrals and heavy obligations visible. Expand known
 contracts to their affected domains; unbounded impact requires broad coverage.
 Explicit required runs in the approved plan remain required.
+
+A plan task that adds Rust tests also states their placement: which existing
+subject file it extends, or why a new file is needed, following
+[test placement in plans](docs/guides/development/rust-test-organization.md#plan-中的测试落点).
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by

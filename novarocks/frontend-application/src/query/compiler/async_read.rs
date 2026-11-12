@@ -34,11 +34,6 @@ struct ReadDistributedMetadata {
     query: Query,
     planning: novarocks_spi::connector::ConnectorPlanningContext,
 }
-enum ReadMetadataPrepared {
-    Immediate(Box<PreparedQueryOperation>),
-    Distributed(Box<ReadDistributedMetadata>),
-}
-
 impl FrontendQueryCompiler {
     pub(crate) fn new_planning_cpu_source(&self) -> Arc<FrontendPlanningCpuSource> {
         FrontendPlanningCpuSource::new(self.connector_blocking_io.clone())
@@ -61,61 +56,31 @@ impl FrontendQueryCompiler {
         Result<PreparedQueryOperation, FrontendQueryCompilerError>,
         StatementNativeHealthFailure,
     > {
-        let metadata: Result<ReadMetadataPrepared, FrontendQueryCompilerError> = async {
-        purpose.validate(statement)?;
-        let Statement::Query(original) = statement else {
-            return Err(FrontendQueryCompilerError::Engine(
-                "read preparation requires a query".into(),
-            ));
-        };
-        if information_schema::is_local_materialized_views_query(original) {
-            let requests = state_store.as_ref().ok_or_else(|| {
-                FrontendQueryCompilerError::Application(
-                    novarocks_query_application::session_error::QueryServiceError::from_failure_cause(
-                        novarocks_failure_contract::SharedFailureCause::new(
-                            novarocks_state_store_api::StateStoreOriginalUnsupported,
-                        ),
-                    ),
-                )
-            })?;
-            if let Some(result) = information_schema::try_query_materialized_views_in(
-                self.system_tables.mv_readiness().as_ref(),
-                original,
-                Arc::clone(requests),
+        let metadata: Result<ReadDistributedMetadata, FrontendQueryCompilerError> = async {
+            purpose.validate(statement)?;
+            let Statement::Query(original) = statement else {
+                return Err(FrontendQueryCompilerError::Engine(
+                    "read preparation requires a query".into(),
+                ));
+            };
+            let planning = connector_planning_context_for_query_on_runtime(
+                self.connector_blocking_io.runtime(),
+                query_options.as_ref(),
+                context.execution().cancellation().clone(),
+            )?;
+            let planning = novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
+                planning.request().clone().with_io_admission(io),
             )
-            .await
-            .map_err(FrontendQueryCompilerError::Application)?
-            {
-                return Ok(ReadMetadataPrepared::Immediate(Box::new(PreparedQueryOperation::immediate(result))));
-            }
+            .map_err(|e| FrontendQueryCompilerError::Engine(e.to_string()))?;
+            Ok(ReadDistributedMetadata {
+                query: original.clone(),
+                planning,
+            })
         }
-        let planning = connector_planning_context_for_query_on_runtime(
-            self.connector_blocking_io.runtime(),
-            query_options.as_ref(),
-            context.execution().cancellation().clone(),
-        )?;
-        let planning = novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
-            planning.request().clone().with_io_admission(io),
-        )
-        .map_err(|e| FrontendQueryCompilerError::Engine(e.to_string()))?;
-        let connector_context = planning.request();
-        let mut query = original.clone();
-        novarocks_query_application::system_catalog_rewrite::rewrite_query_async(
-            self.system_tables.facts_port().as_ref(),
-            self.system_tables.system_catalog().as_ref(),
-            connector_context,
-            &mut query,
-        )
-        .await?;
-            Ok(ReadMetadataPrepared::Distributed(Box::new(ReadDistributedMetadata { query, planning })))
-        }.await;
+        .await;
         let (query, planning) = match metadata {
             Err(error) => return Ok(Err(error)),
-            Ok(ReadMetadataPrepared::Immediate(operation)) => return Ok(Ok(*operation)),
-            Ok(ReadMetadataPrepared::Distributed(prepared)) => {
-                let ReadDistributedMetadata { query, planning } = *prepared;
-                (query, planning)
-            }
+            Ok(ReadDistributedMetadata { query, planning }) => (query, planning),
         };
         self.complete_async_read(
             purpose,
@@ -191,9 +156,10 @@ impl FrontendQueryCompiler {
                     state_store,
                 )
                 .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?
-                .with_definition_planning(
-                    self.constant_policy(),
+                .with_snapshot_planning(
                     sql_compile_control_from_execution(execution),
+                    execution.cancellation().clone(),
+                    query_options.as_ref(),
                     Arc::clone(planning_cpu),
                 ),
                 crate::query_execution::compiler::typed_connector_session()
@@ -250,6 +216,10 @@ impl FrontendQueryCompiler {
             planning_cpu,
             &mut Some(CompletedReadCpuInput::Encoding(Box::new(
                 ReadEncodingInput {
+                    capacity: execution
+                        .result_capacity()
+                        .cloned()
+                        .expect("validated original statement capacity"),
                     purpose: ReadEncodingPurpose::Read(purpose),
                     version,
                     options: query_options,

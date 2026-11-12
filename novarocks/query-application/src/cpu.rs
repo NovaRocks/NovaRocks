@@ -1372,14 +1372,14 @@ mod tests {
             .executor()
             .run(|| {
                 let request = SqlAnalyzeRequest::new(
-                    SqlStatementInput::sql(
+                    SqlStatementInput::parsed_query(crate::completed_plan_fixture::parse_query(
                         "WITH RECURSIVE numbers AS (
                         SELECT CAST(1 AS BIGINT) AS n, CAST(1 AS BIGINT) AS category
                         UNION SELECT n + 1, 1 FROM numbers WHERE n < 5
                         UNION SELECT n, 2 FROM numbers
                     ) SELECT /*+ SET_VAR(enable_recursive_cte=true)*/ DISTINCT n, category
                       FROM numbers ORDER BY n, category",
-                    ),
+                    )),
                     SqlCompileIntent::Query,
                     SqlSessionContext {
                         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

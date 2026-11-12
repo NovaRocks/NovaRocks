@@ -58,13 +58,20 @@ pub struct LiveFile {
 }
 
 pub fn validate_delete_file_for_row_lineage(file: &DataFile) -> Result<(), String> {
-    if file.content_type() == DataContentType::EqualityDeletes {
+    validate_delete_format_for_row_lineage(file.content_type(), file.file_format())
+}
+
+fn validate_delete_format_for_row_lineage(
+    content: DataContentType,
+    format: DataFileFormat,
+) -> Result<(), String> {
+    if content == DataContentType::EqualityDeletes {
         return Err(
             "row-lineage DELETE does not support equality-delete files; compact them away first"
                 .to_string(),
         );
     }
-    if file.file_format() != DataFileFormat::Puffin {
+    if format != DataFileFormat::Puffin {
         return Err(
             "row-lineage DELETE found v2 position-delete files; compact them away before writing Puffin deletion vectors"
                 .to_string(),
@@ -88,12 +95,24 @@ pub fn partition_spec_by_id(
 }
 
 pub fn dv_data_file(written: &WrittenDvFile, referenced: &LiveFile) -> Result<DataFile, String> {
+    dv_data_file_for_partition(
+        written,
+        referenced.partition_spec_id,
+        referenced.data_file.partition(),
+    )
+}
+
+pub(super) fn dv_data_file_for_partition(
+    written: &WrittenDvFile,
+    spec_id: i32,
+    partition: &crate::iceberg::spec::Struct,
+) -> Result<DataFile, String> {
     DataFileBuilder::default()
         .content(DataContentType::PositionDeletes)
         .file_path(written.path.clone())
         .file_format(DataFileFormat::Puffin)
-        .partition(referenced.data_file.partition().clone())
-        .partition_spec_id(referenced.partition_spec_id)
+        .partition(partition.clone())
+        .partition_spec_id(spec_id)
         .record_count(written.cardinality)
         .file_size_in_bytes(written.file_size_in_bytes)
         .referenced_data_file(Some(written.referenced_data_file.clone()))
@@ -103,83 +122,8 @@ pub fn dv_data_file(written: &WrittenDvFile, referenced: &LiveFile) -> Result<Da
         .map_err(|e| format!("build DV DataFile failed: {e}"))
 }
 
-/// Count records in retained data files; deletion vectors do not remove them.
-pub fn dv_total_records(
-    parent_total_records: Option<u64>,
-    added_data_records: u64,
-) -> Result<Option<u64>, String> {
-    parent_total_records
-        .map(|parent| {
-            parent.checked_add(added_data_records).ok_or_else(|| {
-                format!(
-                    "DV physical total-records overflow: parent={parent}, added={added_data_records}"
-                )
-            })
-        })
-        .transpose()
-}
-
 pub fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
-}
-
-/// Attempt-local row mutation input keyed by full logical entry identity.
-pub(crate) struct RowLiveIndex {
-    pub live: crate::commit::dependency::LiveSet,
-    pub dvs_by_data: BTreeMap<String, crate::commit::model::EntryIdentity>,
-}
-
-impl RowLiveIndex {
-    pub async fn load(
-        view: &crate::commit::staging::StagedView<'_>,
-    ) -> crate::iceberg::Result<Self> {
-        let parent = view
-            .metadata()
-            .snapshot_for_ref(view.target_ref())
-            .map(|s| s.snapshot_id());
-        let mut inputs = crate::commit::dependency::ValidationInputs::new(
-            view.metadata(),
-            parent,
-            view.artifacts(),
-        );
-        Self::from_live(inputs.live_set().await?.clone())
-    }
-
-    fn from_live(live: crate::commit::dependency::LiveSet) -> crate::iceberg::Result<Self> {
-        use crate::commit::model::EntryIdentity;
-        let mut dvs_by_data = BTreeMap::new();
-        for (identity, entry) in &live {
-            if entry.file.content_type() == DataContentType::Data {
-                continue;
-            }
-            validate_delete_file_for_row_lineage(&entry.file).map_err(to_iceberg_unexpected)?;
-            let EntryIdentity::DeletionVector {
-                referenced_data_file,
-                ..
-            } = identity
-            else {
-                return Err(to_iceberg_unexpected(
-                    "Row mutation requires exact deletion-vector identities".into(),
-                ));
-            };
-            if !live.contains_key(&EntryIdentity::DataFile {
-                path: referenced_data_file.clone(),
-            }) {
-                return Err(to_iceberg_unexpected(format!(
-                    "Live deletion vector references absent data file {referenced_data_file}"
-                )));
-            }
-            if dvs_by_data
-                .insert(referenced_data_file.clone(), identity.clone())
-                .is_some()
-            {
-                return Err(to_iceberg_unexpected(format!(
-                    "More than one live deletion vector references data file {referenced_data_file}"
-                )));
-            }
-        }
-        Ok(Self { live, dvs_by_data })
-    }
 }
 
 /// An individual DV accounts for its blob, rather than its shared Puffin object.
@@ -203,7 +147,18 @@ pub(crate) async fn write_added_entry_groups(
     snapshot_id: i64,
     files: impl IntoIterator<Item = crate::commit::model::AddedContent>,
 ) -> crate::iceberg::Result<Vec<ManifestFile>> {
-    use crate::commit::staging::{ManifestEntryWrite, write_manifest};
+    write_added_entry_groups_with_partitions(view, snapshot_id, files, None).await
+}
+
+pub(crate) async fn write_added_entry_groups_with_partitions(
+    view: &crate::commit::staging::StagedView<'_>,
+    snapshot_id: i64,
+    files: impl IntoIterator<Item = crate::commit::model::AddedContent>,
+    historical: Option<&BTreeMap<i32, crate::iceberg::spec::StructType>>,
+) -> crate::iceberg::Result<Vec<ManifestFile>> {
+    use crate::commit::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
+    use crate::commit::staging::{ManifestEntryWrite, write_manifest, write_sourced_manifest};
+    use std::sync::Arc;
     let mut grouped: BTreeMap<(i32, bool, bool), Vec<crate::commit::model::AddedContent>> =
         BTreeMap::new();
     for added in files {
@@ -220,12 +175,52 @@ pub(crate) async fn write_added_entry_groups(
     let mut out = Vec::new();
     for ((spec_id, deletes, assigned), files) in grouped {
         let first = files.iter().filter_map(|a| a.file().first_row_id()).min();
+        let spec = partition_spec_by_id(view.metadata(), spec_id)?;
+        if deletes && let Some(historical) = historical {
+            let partition_type = historical.get(&spec_id).ok_or_else(|| {
+                to_iceberg_unexpected("New position output has no historical partition type".into())
+            })?;
+            if files.iter().any(|added| {
+                let file = added.file();
+                file.content_type() != DataContentType::PositionDeletes
+                    || !file.lower_bounds().is_empty()
+                    || !file.upper_bounds().is_empty()
+            }) {
+                return Err(to_iceberg_unexpected(
+                    "Historical position output cannot carry table-column bounds".into(),
+                ));
+            }
+            let source = Arc::new(ManifestWriteSource::for_position_output(
+                view.metadata().current_schema().clone(),
+                (*spec).clone(),
+                partition_type.clone(),
+            ));
+            let entries = files
+                .into_iter()
+                .map(|added| SourcedManifestEntry {
+                    source: source.clone(),
+                    entry: ManifestEntryWrite::Added(added),
+                })
+                .collect();
+            out.push(
+                write_sourced_manifest(
+                    view.artifacts(),
+                    view.metadata(),
+                    snapshot_id,
+                    spec.as_ref(),
+                    ManifestContentType::Deletes,
+                    entries,
+                )
+                .await?,
+            );
+            continue;
+        }
         let mut mf = write_manifest(
             view.artifacts(),
             view.metadata().format_version(),
             snapshot_id,
             view.metadata().current_schema().clone(),
-            (*partition_spec_by_id(view.metadata(), spec_id)?).clone(),
+            (*spec).clone(),
             if deletes {
                 ManifestContentType::Deletes
             } else {
@@ -535,15 +530,6 @@ mod t8b_tests {
         physical
     }
 
-    #[test]
-    fn dv_physical_record_total_preserves_unknown_and_rejects_overflow() {
-        assert_eq!(dv_total_records(None, 3).unwrap(), None);
-        assert_eq!(dv_total_records(Some(0), 0).unwrap(), Some(0));
-        assert_eq!(dv_total_records(Some(2), 0).unwrap(), Some(2));
-        assert_eq!(dv_total_records(Some(2), 3).unwrap(), Some(5));
-        assert!(dv_total_records(Some(u64::MAX), 1).is_err());
-    }
-
     async fn raw_entries(writer: &Writer, metadata: &TableMetadata) -> Vec<ManifestEntry> {
         let list = crate::manifest::load_manifest_list(
             metadata.current_snapshot().unwrap(),
@@ -599,11 +585,15 @@ mod t8b_tests {
             vec![dv("replacement.puffin", 4, "a.parquet", 2)],
             vec![old],
         );
+        let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
+            Arc::new(metadata.clone()),
+            &intent,
+            &writer,
+        )
+        .await
+        .unwrap();
         let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        engine
-            .stage(&crate::commit::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer)
-            .await
-            .unwrap();
+        engine.stage(&preparer).await.unwrap();
         let snapshot = engine.metadata().current_snapshot().unwrap();
         assert_eq!(snapshot.summary().operation, Operation::Delete);
         assert_eq!(snapshot.added_rows_count(), Some(0));
@@ -690,11 +680,15 @@ mod t8b_tests {
             ],
             vec![],
         );
+        let preparer = crate::commit::write_stack::control::observed_materialized_staging_fixture(
+            Arc::new(metadata.clone()),
+            &intent,
+            &writer,
+        )
+        .await
+        .unwrap();
         let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        engine
-            .stage(&crate::commit::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer)
-            .await
-            .unwrap();
+        engine.stage(&preparer).await.unwrap();
         let snapshot = engine.metadata().current_snapshot().unwrap();
         assert_eq!(snapshot.summary().operation, Operation::Overwrite);
         assert_eq!(snapshot.added_rows_count(), Some(7));
@@ -718,7 +712,7 @@ mod t8b_tests {
             })
             .collect::<Vec<_>>();
         ranges.sort();
-        assert_eq!(ranges, vec![(0, 3), (3, 3), (6, 1)]);
+        assert_eq!(ranges, vec![(0, 1), (1, 3), (4, 3)]);
     }
     #[tokio::test]
     async fn t8b_data_only_mor_is_append_and_allocates_new_rows() {
@@ -727,7 +721,7 @@ mod t8b_tests {
         let intent = intent(&metadata, vec![data("insert.parquet", 2, None)], vec![]);
         let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
         engine
-            .stage(&crate::commit::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer)
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
             .await
             .unwrap();
         assert_eq!(
@@ -877,7 +871,7 @@ mod t8b_tests {
                 .frozen
                 .facts()
                 .first_row_id,
-            Some(3)
+            Some(5)
         );
         assert_eq!(
             after[&EntryIdentity::DataFile {
@@ -886,7 +880,7 @@ mod t8b_tests {
                 .frozen
                 .facts()
                 .first_row_id,
-            Some(6)
+            Some(3)
         );
         assert_eq!(engine.metadata().next_row_id(), 8);
     }
@@ -958,7 +952,6 @@ mod t8b_tests {
         assert_eq!(summary["total-delete-files"], "1");
         assert_eq!(summary["total-records"], "5");
         assert_eq!(assert_physical_record_total(engine.metadata(), &after), 5);
-        assert!(RowLiveIndex::from_live(after).is_ok());
         assert!(
             writer
                 .ledger
@@ -970,7 +963,7 @@ mod t8b_tests {
     }
 
     #[tokio::test]
-    async fn t8b_coalesces_new_blobs_without_deleting_their_owned_objects() {
+    async fn materialized_staging_refuses_duplicate_final_vectors_and_preserves_objects() {
         let writer = Writer::new();
         let metadata = baseline(&writer, false, false).await;
         let mut additions = Vec::new();
@@ -1000,46 +993,15 @@ mod t8b_tests {
             input_paths.push(object.path().to_owned());
         }
         let intent = intent(&metadata, additions, vec![]);
-        let mut engine = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
-        engine
-            .stage(&crate::commit::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer)
-            .await
-            .unwrap();
-        let after = live(&writer, engine.metadata()).await;
-        let output = after
-            .values()
-            .find(|e| e.file.content_type() == DataContentType::PositionDeletes)
-            .unwrap();
-        assert_eq!(
-            after
-                .values()
-                .filter(|e| e.file.content_type() == DataContentType::PositionDeletes)
-                .count(),
-            1
-        );
-        let vector = crate::commit::read_deletion_vector_puffin(
-            writer.file_io(),
-            output.file.file_path(),
-            output.file.content_offset().unwrap(),
-            output.file.content_size_in_bytes().unwrap(),
+        let error = crate::commit::write_stack::control::observed_materialized_staging_fixture(
+            Arc::new(metadata),
+            &intent,
+            &writer,
         )
         .await
-        .unwrap();
-        assert_eq!(vector.cardinality(), 2);
-        assert_eq!(assert_physical_record_total(engine.metadata(), &after), 6);
-        let summary = &engine
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .summary()
-            .additional_properties;
-        assert_eq!(
-            summary["total-position-deletes"],
-            vector.cardinality().to_string()
-        );
-        assert!(!summary.contains_key("deleted-records"));
-        assert!(vector.contains(0));
-        assert!(vector.contains(2));
+        .err()
+        .expect("a second final effect for the same file must be refused");
+        assert!(error.to_string().contains("multiple deletion vectors"));
         for path in input_paths {
             assert!(
                 writer
@@ -1096,27 +1058,5 @@ mod t8b_tests {
             .unwrap();
         assert_eq!(entry.sequence_number, None);
         assert_eq!(entry.file_sequence_number, None);
-    }
-
-    #[tokio::test]
-    async fn t8b_rejects_two_live_dvs_for_one_data_file_even_in_distinct_objects() {
-        let writer = Writer::new();
-        let metadata = baseline(&writer, false, true).await;
-        let mut entries = live(&writer, &metadata).await;
-        let original = entries
-            .values()
-            .find(|e| e.file.referenced_data_file().as_deref() == Some("a.parquet"))
-            .unwrap()
-            .clone();
-        let file = dv("other.puffin", 4, "a.parquet", 1);
-        let identity = EntryIdentity::try_from(&file).unwrap();
-        entries.insert(
-            identity.clone(),
-            crate::commit::dependency::LiveEntry {
-                file,
-                frozen: FrozenEntry::new(identity, original.frozen.facts().clone()).unwrap(),
-            },
-        );
-        assert!(RowLiveIndex::from_live(entries).is_err());
     }
 }

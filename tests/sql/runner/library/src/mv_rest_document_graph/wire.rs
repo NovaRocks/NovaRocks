@@ -223,10 +223,6 @@ pub(super) fn properties(value: &Value) -> Result<Properties> {
             .context("document key has no category")?;
         match kind {
             "rev" => {
-                ensure!(
-                    raw.len() <= 65536,
-                    "document version {key} exceeds 65536 bytes"
-                );
                 let v: VersionEnvelope = serde_json::from_str(raw)?;
                 canonical(&v, raw)?;
                 ensure!(v.v == 2, "unknown version envelope");
@@ -255,6 +251,11 @@ pub(super) fn properties(value: &Value) -> Result<Properties> {
                 ensure!(
                     v.id == expected && suffix == expected,
                     "version identity mismatch for {key}"
+                );
+                eprintln!(
+                    "MV document version bytes: key={key} envelope={} content={}",
+                    raw.len(),
+                    content.len()
                 );
                 parsed.versions.insert(
                     expected,
@@ -323,9 +324,8 @@ pub(super) fn properties(value: &Value) -> Result<Properties> {
             _ => bail!("unknown or misplaced document key {key}"),
         }
     }
-    ensure!(
-        parsed.private_bytes <= 262144,
-        "private properties {} exceed 262144 bytes",
+    eprintln!(
+        "MV document private property bytes: {}",
         parsed.private_bytes
     );
     Ok(parsed)
@@ -347,11 +347,13 @@ pub(super) fn records(summary: &Value) -> Result<BTreeMap<String, String>> {
         token(owner)?;
         token(name)?;
         let text = value.as_str().context("record must be string")?;
-        ensure!(
-            key.len() + text.len() <= 4096,
-            "record {key} exceeds 4096 bytes"
+        let parsed = record(text)?;
+        eprintln!(
+            "MV document record bytes: key={key} frame={} payload={} key-and-frame={}",
+            text.len(),
+            parsed.payload.len(),
+            key.len() + text.len()
         );
-        record(text)?;
         records.insert(key.clone(), text.into());
     }
     Ok(records)

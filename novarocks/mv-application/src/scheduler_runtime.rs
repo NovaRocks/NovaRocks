@@ -26,6 +26,7 @@ use crate::maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshFailure {
     message: String,
+    user_error: Option<novarocks_user_error::UserError>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
     execution: Option<novarocks_query_application::execution_error::ExecutionFailureInput>,
 }
@@ -37,9 +38,19 @@ impl MvRefreshFailure {
     ) -> Self {
         Self {
             message: message.into(),
+            user_error: None,
             compile_control,
             execution: None,
         }
+    }
+    /// Retain the caller's location-free domain projection for diagnostics.
+    /// Codes and messages do not determine the scheduler's product policy.
+    pub fn with_user_error(mut self, error: Option<novarocks_user_error::UserError>) -> Self {
+        self.user_error = error;
+        self
+    }
+    pub fn user_error(&self) -> Option<&novarocks_user_error::UserError> {
+        self.user_error.as_ref()
     }
     /// Retain the original execution projection independently of compile control.
     /// Diagnostic payload does not determine the scheduler's product policy.

@@ -148,7 +148,9 @@ pub(crate) async fn plan_iceberg_mv_refresh_with_connector_context(
 
     let resolution = &mv_definition.facts.definition().query.resolution;
     let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&refresh_query_source).map_err(RefreshError::from)?,
+        &read_stored_mv_query(&refresh_query_source, &stored_mv_identity(&mv_definition))
+            .map_err(novarocks_sql::compiler::SqlCompileError::Analyze)
+            .map_err(RefreshError::from)?,
         Some(resolution.default_catalog.as_str()),
         &resolution.default_namespace,
     );
@@ -1757,9 +1759,9 @@ mod partition_planning_tests {
             let trc_catalog =
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
             let trc_controls = host.clone();
-            let trc_system_relations = crate::query_execution::kernels::test_system_relations(
-                trc_catalog.clone(),
-                trc_controls.clone(),
+            let trc_system_relations = std::sync::Arc::new(
+                novarocks_query_application::system_tables::SystemTableRegistry::try_new([])
+                    .expect("sealed declaration fixture"),
             );
             IcebergMvCorePorts::new_with_management_entrance(
                 Arc::new(novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap()),

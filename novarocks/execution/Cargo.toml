@@ -11,6 +11,8 @@ workspace = true
 doctest = false
 
 [dependencies]
+novarocks-connector-contract.workspace = true
+roaring.workspace = true
 novarocks-arrow-batch-codec.workspace = true
 novarocks-failpoint.workspace = true
 novarocks-control-runtime.workspace = true
@@ -59,7 +61,6 @@ novarocks-workload-control.workspace = true
 novarocks-query-application.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-physical-plan.workspace = true
-novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
 novarocks-plan-codec = { workspace = true }
 novarocks-sql = { workspace = true }

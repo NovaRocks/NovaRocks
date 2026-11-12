@@ -453,11 +453,18 @@ fn lower_typed_create(
                 .as_ref()
                 .unwrap_or(&TypedRefreshPolicy::Manual { deferred: false }),
         )?,
-        select_sql: novarocks_parser::printer::print_query(&select_query),
+        select_sql: statement.raw_query_source.clone(),
         select_query,
         properties: lower_typed_properties(&statement.properties)?,
         primary_key,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn lower_typed_create_for_tests(
+    statement: &novarocks_parser::ast::CreateMaterializedView,
+) -> Result<MvCreateStatement, String> {
+    lower_typed_create(statement)
 }
 
 fn lower_typed_alter(
@@ -862,10 +869,7 @@ mod tests {
             lowered.partition_by.as_deref(),
             Some([MvCreatePartitionField::Month { column }]) if column == "order_date"
         ));
-        assert_eq!(
-            novarocks_parser::printer::print_query(&lowered.select_query),
-            lowered.select_sql
-        );
+        assert_eq!(create.raw_query_source, lowered.select_sql);
     }
 
     #[test]

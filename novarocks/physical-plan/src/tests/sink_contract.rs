@@ -1178,6 +1178,49 @@ fn independent_router_source_rejects_a_drifted_destination_writer_proof() {
 }
 
 #[test]
+fn position_contribution_cannot_replace_a_direct_router_writer_proof() {
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
+    let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
+    let crate::ExchangePayloadContract::ProviderRoute(route) = &cuts.inbound[0].payload else {
+        panic!("expected provider route");
+    };
+    cuts.inbound[0].payload = crate::ExchangePayloadContract::PositionContribution {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes(
+            [7; 32],
+        ),
+        route: route.clone(),
+    };
+    let errors = validate_fragment(writer, &cuts)
+        .expect_err("a direct writer cannot aggregate position routes");
+    assert!(errors.errors().iter().any(|error| {
+        error
+            .message()
+            .contains("inbound cut differs from its position contribution")
+    }));
+}
+
+#[test]
+fn position_shard_cut_requires_a_stream_and_exact_writer_input() {
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();
+    let mut cuts = fragment_cuts(&plan, writer.id()).unwrap();
+    cuts.inbound[0].payload = crate::ExchangePayloadContract::PositionShards {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes(
+            [7; 32],
+        ),
+        target: write_target_ordinal(0),
+    };
+    let errors = validate_fragment(writer, &cuts)
+        .expect_err("a routed scalar is not an authenticated shard stream");
+    assert!(errors.errors().iter().any(|error| {
+        error
+            .message()
+            .contains("position shards require their exact direct singleton writer at DOP 1")
+    }));
+}
+
+#[test]
 fn independent_router_writer_rejects_a_drifted_source_route_proof() {
     let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
     let writer = plan.fragments().get(&FragmentId::new(722)).unwrap();

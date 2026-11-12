@@ -40,7 +40,7 @@ fn table_free_sql(sql: &str) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

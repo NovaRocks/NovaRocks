@@ -141,7 +141,12 @@ impl OrderedQueue {
     fn front(&self) -> Option<&QueuedOperation> {
         self.entries.first_key_value().map(|(_, value)| value)
     }
-    fn batch_prefix(&self, allowance: usize, max_bytes: usize) -> Option<BatchPrefix> {
+    fn batch_prefix(
+        &self,
+        allowance: usize,
+        batch_target: usize,
+        request_max: usize,
+    ) -> Option<BatchPrefix> {
         let head = self.front()?;
         let run = head.intent.native_run_key();
         let mut prefix = BatchPrefix {
@@ -150,6 +155,7 @@ impl OrderedQueue {
             queued_at: head.queued_at,
             control_progress: run.0,
         };
+        let mut encoded_bytes = 0_usize;
         for entry in self.entries.values().take(allowance) {
             if entry.intent.native_run_key() != run {
                 break;
@@ -157,9 +163,17 @@ impl OrderedQueue {
             let Some(bytes) = prefix.bytes.checked_add(entry.queued_bytes) else {
                 break;
             };
-            if bytes > max_bytes {
+            let Some(encoded) = encoded_bytes.checked_add(entry.queue_permit.encoded_bytes())
+            else {
+                break;
+            };
+            // A legal head can exceed the grouping target. Subsequent items
+            // obey the target and the original method's exact wire limit.
+            if prefix.items > 0 && (bytes > batch_target.min(request_max) || encoded > request_max)
+            {
                 break;
             }
+            encoded_bytes = encoded;
             prefix.items += 1;
             prefix.bytes = bytes;
             prefix.queued_at = prefix.queued_at.min(entry.queued_at);
@@ -375,6 +389,16 @@ impl OperationDispatcher {
         queue_permit: QueuedInputGrantRef,
     ) -> Result<(), TaskExecutionError> {
         self.validate_operation_carrier(&intent)?;
+        let encoded_limit = self
+            .transport
+            .request_max_bytes(intent.requires_control_progress());
+        if queue_permit.encoded_bytes() > encoded_limit {
+            return Err(CapacityBound::OperationBytes {
+                limit: encoded_limit,
+                actual: queue_permit.encoded_bytes(),
+            }
+            .into());
+        }
         let operation_id = intent.operation_id();
         if self.operation_state(operation_id)? != DispatchOperationState::Absent {
             return Err(TaskExecutionError::Schedule(
@@ -440,24 +464,6 @@ impl OperationDispatcher {
         intent: &OperationIntent,
     ) -> Result<(), TaskExecutionError> {
         self.validate_queue_request(intent.queue_request())?;
-        // Descriptor bytes are checked at the same original creation projection.
-        // The core keeps the signed quote, never an executable descriptor.
-        Ok(())
-    }
-
-    /// Refuses a create whose static plan and task assignment together exceed
-    /// the bound the backend enforces on them.
-    ///
-    /// This is a property of the request itself, not of any queue: waiting
-    /// cannot make it smaller, so it fails closed rather than backpressuring.
-    pub(super) fn validate_plan_carrier_bytes(
-        &self,
-        actual: usize,
-    ) -> Result<(), TaskExecutionError> {
-        let limit = self.transport.max_descriptor_encoded_bytes();
-        if actual > limit {
-            return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
-        }
         Ok(())
     }
 
@@ -492,7 +498,9 @@ impl OperationDispatcher {
         request: TaskOperationQueueRequest,
     ) -> Result<(), TaskExecutionError> {
         let queued_bytes = request.queued_bytes();
-        let operation_limit = self.transport.max_operation_queued_bytes();
+        let operation_limit = self
+            .transport
+            .queued_max_bytes(request.requires_control_progress());
         if queued_bytes > operation_limit {
             return Err(CapacityBound::OperationBytes {
                 limit: operation_limit,
@@ -665,8 +673,16 @@ impl OperationDispatcher {
         let queues = self.backends.get(&backend)?;
         let allowance =
             batch_allowance(queues, lane, self.budget, self.transport.max_batch_items());
-        let prefix =
-            queues.lanes[lane].batch_prefix(allowance, self.transport.max_batch_encoded_bytes())?;
+        let prefix = queues.lanes[lane].batch_prefix(
+            allowance,
+            self.transport.batch_target_encoded_bytes(),
+            self.transport.request_max_bytes(
+                queues.lanes[lane]
+                    .front()?
+                    .intent
+                    .requires_control_progress(),
+            ),
+        )?;
         Some(self.take_batch_prefix(backend, lane, prefix))
     }
 
@@ -954,8 +970,11 @@ mod indexed_queue_tests {
     fn limits() -> TransportBudget {
         TransportBudget {
             max_batch_items: 4,
-            max_batch_encoded_bytes: 4096,
-            max_descriptor_encoded_bytes: 4096,
+            batch_target_encoded_bytes: 4096,
+            ordinary_request_max_bytes: 1_048_576,
+            control_request_max_bytes: 1_048_576,
+            ordinary_queued_max_bytes: 1_048_576,
+            control_queued_max_bytes: 1_048_576,
             max_query_backend_queued_operations: 1024,
             max_query_backend_queued_bytes: 1_048_576,
             max_backend_queued_operations: 4096,
@@ -976,6 +995,7 @@ mod indexed_queue_tests {
                     NonZeroU64::new(value).unwrap(),
                 ),
             ),
+            64,
         )
     }
     fn operation(value: u64) -> OperationIntent {
@@ -1012,7 +1032,7 @@ mod indexed_queue_tests {
     #[test]
     fn oversized_operation_is_refused_before_it_enters_the_queue() {
         let transport = TransportBudget {
-            max_batch_encoded_bytes: 255,
+            ordinary_queued_max_bytes: 255,
             ..limits()
         };
         let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
@@ -1034,6 +1054,80 @@ mod indexed_queue_tests {
         assert_eq!(dispatcher.queued_items(), 0);
         assert_eq!(dispatcher.queue_deadline(), None);
         assert_eq!(dispatcher.take_released_grant(), None);
+    }
+
+    #[test]
+    fn legal_head_above_the_grouping_target_is_dispatched() {
+        let mut dispatcher = OperationDispatcher::new(
+            DispatchBudget::DEFAULT,
+            TransportBudget {
+                batch_target_encoded_bytes: 128,
+                ..limits()
+            },
+        );
+        let original = operation(1);
+        let id = original.operation_id();
+        dispatcher
+            .enqueue_reserved(original, at(0), grant(1))
+            .unwrap();
+        let batch = dispatcher
+            .take_batch()
+            .expect("legal oversized head progresses");
+        assert_eq!(batch.operations().len(), 1);
+        assert_eq!(batch.operations()[0].operation_id(), id);
+        assert_eq!(batch.queued_bytes(), 256);
+    }
+
+    #[test]
+    fn batching_obeys_exact_method_bytes_independently_of_queue_bytes() {
+        let mut dispatcher = OperationDispatcher::new(
+            DispatchBudget::DEFAULT,
+            TransportBudget {
+                ordinary_request_max_bytes: 600,
+                batch_target_encoded_bytes: 4096,
+                ..limits()
+            },
+        );
+        for sequence in 1..=2 {
+            let input = QueuedInputGrantRef::new(
+                NonZeroU64::new(sequence).unwrap(),
+                grant(sequence).generation(),
+                400,
+            );
+            dispatcher
+                .enqueue_reserved(operation(sequence), at(0), input)
+                .unwrap();
+        }
+        let batch = dispatcher.take_batch().unwrap();
+        assert_eq!(
+            batch.operations().len(),
+            1,
+            "two 400-byte wire items exceed 600 despite a 512-byte queue shape"
+        );
+        assert_eq!(batch.queued_bytes(), 256);
+        assert_eq!(dispatcher.queued_items(), 1);
+    }
+
+    #[test]
+    fn exact_method_overflow_cannot_enter_the_dispatcher() {
+        let mut dispatcher = OperationDispatcher::new(
+            DispatchBudget::DEFAULT,
+            TransportBudget {
+                ordinary_request_max_bytes: 300,
+                ..limits()
+            },
+        );
+        let input = QueuedInputGrantRef::new(NonZeroU64::MIN, grant(1).generation(), 301);
+        assert_eq!(
+            dispatcher.enqueue_reserved(operation(1), at(0), input),
+            Err(TaskExecutionError::Capacity(
+                CapacityBound::OperationBytes {
+                    limit: 300,
+                    actual: 301
+                }
+            )),
+        );
+        assert_eq!(dispatcher.queued_items(), 0);
     }
 
     #[test]
@@ -1078,7 +1172,7 @@ mod indexed_queue_tests {
             DispatchBudget::new(count, count, count, count).unwrap(),
             TransportBudget {
                 max_batch_items: count,
-                max_batch_encoded_bytes: 32_768,
+                batch_target_encoded_bytes: 32_768,
                 ..limits()
             },
         );

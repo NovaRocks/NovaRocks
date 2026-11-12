@@ -18,6 +18,7 @@ use super::*;
 use novarocks_fs::{
     FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileIoSpawner,
 };
+use novarocks_spi::connector::ConnectorStopOwner;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogVersion, ConnectorInstanceId,
     ConnectorIoAdmissionPort, ConnectorIoRequest, ConnectorPayloadRetentionGuard,
@@ -27,7 +28,7 @@ use novarocks_spi::connector::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn binding(config: Option<ObjectStoreConfig>) -> IcebergReadBinding {
     let runtime = tokio::runtime::Handle::current();
@@ -93,7 +94,7 @@ async fn original_cleanup_retains_its_phase_after_work_cancel_or_expiry() {
         let deadline = phase.request.deadline();
         assert!(phase.request.check_active().is_ok());
         assert!(!path.exists());
-        assert!(journal.last().is_none());
+        assert!(journal.last_owned().is_none());
         cleanup.run(&journal).await.unwrap();
         assert_eq!(cleanup.phase.as_ref().unwrap().request.deadline(), deadline);
     }
@@ -123,7 +124,8 @@ async fn cleanup_uses_the_original_s3_pool_after_work_stops_without_object_io() 
         ConnectorErrorKind::InvalidRequest
     );
     let mut cleanup = UnsealedWriterCleanup::new(bound.clone(), work, path);
-    let phase_context = cleanup.phase().request.clone();
+    let journal = StagedPathJournal::default();
+    let phase_context = cleanup.phase(&journal).request.clone();
     // Resolving the same pooled operator performs no object request. Work is
     // still stopped; only its already-existing cleanup obligation proceeds.
     bound
@@ -168,7 +170,7 @@ async fn real_cleanup_admission_denial_keeps_path_and_same_phase_on_reentry() {
     let failure = cleanup.run(&journal).await.unwrap_err();
     assert_eq!(failure.kind(), ConnectorErrorKind::Internal);
     assert!(path.exists());
-    assert_eq!(journal.last().as_deref(), Some(location.as_str()));
+    assert_eq!(journal.last_owned().as_deref(), Some(location.as_str()));
     assert_eq!(io.0.load(Ordering::SeqCst), 1);
     let phase = cleanup.phase.as_ref().unwrap();
     let deadline = phase.request.deadline();
@@ -176,7 +178,7 @@ async fn real_cleanup_admission_denial_keeps_path_and_same_phase_on_reentry() {
     assert_eq!(cleanup.phase.as_ref().unwrap().request.deadline(), deadline);
     assert_eq!(io.0.load(Ordering::SeqCst), 2);
     assert!(path.exists());
-    assert_eq!(journal.last().as_deref(), Some(location.as_str()));
+    assert_eq!(journal.last_owned().as_deref(), Some(location.as_str()));
     // Deterministic fixture exhaustion of this SAME phase; no sleep or
     // production clock override is introduced.
     let expired = cleanup
@@ -193,7 +195,7 @@ async fn real_cleanup_admission_denial_keeps_path_and_same_phase_on_reentry() {
     );
     assert_eq!(io.0.load(Ordering::SeqCst), 2);
     assert!(path.exists());
-    assert!(journal.last().is_some());
+    assert!(journal.last_owned().is_some());
 }
 
 #[tokio::test]
@@ -217,7 +219,7 @@ async fn cleanup_round_yield_does_not_cap_the_original_journal() {
         location,
     );
     cleanup.run(&journal).await.unwrap();
-    assert!(journal.last().is_none());
+    assert!(journal.last_owned().is_none());
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
@@ -279,7 +281,8 @@ async fn cleanup_projection_preserves_original_scope_capabilities_and_restrictio
     let marker = original.request_scope_extension_or_insert_with(|| String::from("same scope"));
     let ticket = operations.admit(Arc::new(|| {})).unwrap();
     let mut cleanup = UnsealedWriterCleanup::new(binding(None), original.clone(), "file:///owned");
-    let projected = &cleanup.phase().request;
+    let journal = StagedPathJournal::default();
+    let projected = &cleanup.phase(&journal).request;
     assert!(Arc::ptr_eq(
         &marker,
         &projected.request_scope_extension_or_insert_with(|| String::from("wrong"))

@@ -762,10 +762,10 @@ pub(crate) mod tests {
     use novarocks_coordination_contract::{ExecutionEffect, MonotonicInstant};
     use novarocks_execution::task_execution::{
         AcquireParticipationAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
-        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomainId,
-        CredentialEpoch, CredentialUpdate, EstablishParticipation, LeaseReceipt, LeaseSequence,
-        LeaseValidFor, OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationReceipt,
-        ParticipationRef, ParticipationState, TaskOperationId,
+        CredentialDomainId, CredentialEpoch, CredentialUpdate, EstablishParticipation,
+        LeaseReceipt, LeaseSequence, LeaseValidFor, OperationOutcome,
+        ParticipationAdmissionTicketReceipt, ParticipationReceipt, ParticipationRef,
+        ParticipationState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
         AbortParticipationEffectPort, LogicalExecutionActorConfig,
@@ -1136,40 +1136,30 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    #[derive(Debug)]
-    struct TestContent;
-
-    impl CodecOwnedContent for TestContent {
-        fn fingerprint(&self) -> ContentFingerprint {
-            ContentFingerprint::from_bytes([31; 16])
-        }
-
-        fn encoded_len(&self) -> usize {
-            1
-        }
-    }
-
-    struct TestSecret;
-
-    impl ConfidentialContent for TestSecret {
-        fn encoded_len(&self) -> usize {
-            1
-        }
-
-        fn matches(&self, other: &dyn ConfidentialContent) -> bool {
-            other.encoded_len() == 1
-        }
-    }
-
     fn establish_facts() -> ParticipationEstablishFacts {
         ParticipationEstablishFacts {
-            catalog_binding: Arc::new(TestContent),
-            initial_runtime_filter: Arc::new(TestContent),
-            query_options: Arc::new(TestContent),
+            catalog_binding: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.catalog",
+                novarocks_proto_models::catalog::CatalogSet::default(),
+            )),
+            initial_runtime_filter: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.filter",
+                novarocks_proto_models::novarocks::RuntimeFilterContribution::default(),
+            )),
+            query_options: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                b"test.options",
+                novarocks_proto_models::novarocks::QueryOptions::default(),
+            )),
             initial_credential: CredentialUpdate::new(
                 CredentialDomainId::new(31),
                 CredentialEpoch::new(1).unwrap(),
-                Arc::new(TestSecret),
+                Arc::new(
+                    novarocks_task_codec::domain::WireCredential::decode(
+                        &[],
+                        novarocks_proto_codec::FieldPath::root("test.credential"),
+                    )
+                    .unwrap(),
+                ),
             ),
         }
     }

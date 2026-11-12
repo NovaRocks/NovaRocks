@@ -18,12 +18,14 @@
 //! Inline document updates contain only this channel's exact keys.
 // Design: ADR-0180 (docs/adr/ADR-0180-inline-keyed-documents-and-snapshot-records.md)
 
+// Design: ADR-0224 (docs/adr/ADR-0224-mv-document-capacity-comes-from-real-boundaries.md)
+
 use super::{envelope, keys, limits, record, view};
 use crate::iceberg::TableUpdate;
 use crate::iceberg::spec::TableMetadata;
 use novarocks_spi::connector::{
     ConnectorDocumentVersion, ConnectorError, ConnectorErrorKind, DocumentIdentity, KeyedCreate,
-    KeyedDocumentLimits, KeyedMarkerWrite, KeyedPublication,
+    KeyedMarkerWrite, KeyedPublication,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -36,9 +38,6 @@ fn versions_into(
     updates: &mut HashMap<String, String>,
 ) -> Result<(), ConnectorError> {
     for version in versions {
-        if !available.contains_key(&version.identity()) {
-            limits::check_version(version, KeyedDocumentLimits::default())?;
-        }
         if let Some(previous) = available.insert(version.identity(), version.clone())
             && previous != *version
         {
@@ -89,7 +88,6 @@ pub(crate) fn create_properties(
     for (owner, id) in &documents.roots {
         properties.insert(keys::root_key(owner), id.to_hex());
     }
-    limits::check_private_properties(&properties, Some(0), KeyedDocumentLimits::default())?;
     trace_updates(
         &HashMap::new(),
         &[TableUpdate::SetProperties {
@@ -112,9 +110,6 @@ pub(crate) fn marker_properties(
         .iter()
         .map(|(key, value)| Ok((keys::marker_key(key), envelope::encode_marker(key, value)?)))
         .collect::<Result<HashMap<_, _>, ConnectorError>>()?;
-    let mut after = metadata.properties().clone();
-    after.extend(properties.clone());
-    limits::check_private_properties(&after, None, KeyedDocumentLimits::default())?;
     trace_updates(
         metadata.properties(),
         &[TableUpdate::SetProperties {
@@ -137,10 +132,6 @@ pub(crate) fn publication_updates(
     documents.validate()?;
     let parsed = view::parse_properties(metadata.properties())
         .map_err(super::super::observation::keyed_read_error)?;
-    let has_new_versions = documents
-        .versions
-        .iter()
-        .any(|version| !parsed.versions.contains_key(&version.identity()));
     let previous_records = metadata
         .current_snapshot()
         .map(|snapshot| {
@@ -182,18 +173,6 @@ pub(crate) fn publication_updates(
     }
     let mut summary = BTreeMap::new();
     for entry in &documents.records {
-        let unchanged_structure = previous_records.iter().any(|previous| {
-            previous.owner == entry.owner
-                && previous.name == entry.name
-                && previous.binding == entry.binding
-        });
-        if !unchanged_structure
-            || entry
-                .binding
-                .is_some_and(|id| !metadata.properties().contains_key(&keys::version_key(id)))
-        {
-            limits::check_record(entry, KeyedDocumentLimits::default())?;
-        }
         summary.insert(
             keys::record_key(&entry.owner, &entry.name),
             record::encode_record(entry)?,
@@ -204,14 +183,6 @@ pub(crate) fn publication_updates(
         .iter()
         .map(keys::marker_key)
         .collect();
-    if has_new_versions || !documents.markers_set.is_empty() {
-        let mut after = metadata.properties().clone();
-        after.extend(properties.clone());
-        for key in &removals {
-            after.remove(key);
-        }
-        limits::check_private_properties(&after, None, KeyedDocumentLimits::default())?;
-    }
     let mut updates = Vec::new();
     if !properties.is_empty() {
         updates.push(TableUpdate::SetProperties {

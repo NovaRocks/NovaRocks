@@ -212,11 +212,13 @@ where
         if raw.len() != source.remaining() {
             return Err(Status::internal("native codec received a split frame"));
         }
-        check_resource_shape::<U>(raw)?;
-        if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>()
-            && let Some(plan) = self.operation_reply_plan
-        {
+        if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>() {
+            let plan = self.operation_reply_plan.ok_or_else(|| {
+                Status::internal("Native operation reply requires its original request layout plan")
+            })?;
             plan.check(raw).map_err(operation_reply_failure)?;
+        } else {
+            check_resource_shape::<U>(raw)?;
         }
         U::decode(source)
             .map(Some)
@@ -252,20 +254,13 @@ pub fn is_operation_reply_preflight_failure(status: &Status) -> bool {
 }
 
 fn operation_reply_failure(error: resource_preflight::ResourcePreflightError) -> Status {
-    let mut status = Status::data_loss("Native operation reply exceeds its paid backing plan");
+    let mut status =
+        Status::data_loss("Native operation reply exceeds its registered layout model");
     status.set_source(Arc::new(OperationReplyPreflightFailure(error)));
     status
 }
 
 fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {
-    if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsResponse>() {
-        return resource_preflight::check_operation_reply(raw).map_err(|error| {
-            let mut status =
-                Status::data_loss("Native operation reply exceeds its resource grammar");
-            status.set_source(Arc::new(OperationReplyPreflightFailure(error)));
-            status
-        });
-    }
     let result = if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsRequest>() {
         resource_preflight::check_operation_batch(raw)
     } else if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskControlOperationsRequest>() {
@@ -305,9 +300,13 @@ mod tests {
         let expected = request.encode_to_vec();
         let plan = NativeUnaryEncodingPlan::for_original_operation(expected.len()).unwrap();
         assert_eq!(plan.retained_bytes(), expected.len() + 5);
-        let reply = resource_preflight::OperationReplyDecodePlan::for_transport(
-            novarocks_task_codec::TransportBudget::DEFAULT,
-        );
+        let reply = resource_preflight::OperationReplyDecodePlan::for_response(
+            1,
+            novarocks_task_codec::TransportBudget::DEFAULT
+                .message_limits()
+                .ordinary_response_max_bytes,
+        )
+        .unwrap();
         let mut codec = NativeProstCodec::<
             proto::ApplyTaskOperationsRequest,
             proto::ApplyTaskOperationsResponse,
@@ -349,9 +348,13 @@ mod tests {
         use hyper::body::Body;
         use tonic::codec::EncodeBody;
         let plan = NativeUnaryEncodingPlan::for_original_operation(1).unwrap();
-        let reply = resource_preflight::OperationReplyDecodePlan::for_transport(
-            novarocks_task_codec::TransportBudget::DEFAULT,
-        );
+        let reply = resource_preflight::OperationReplyDecodePlan::for_response(
+            1,
+            novarocks_task_codec::TransportBudget::DEFAULT
+                .message_limits()
+                .ordinary_response_max_bytes,
+        )
+        .unwrap();
         let mut codec = NativeProstCodec::<
             proto::ApplyTaskOperationsRequest,
             proto::ApplyTaskOperationsResponse,

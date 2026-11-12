@@ -306,11 +306,8 @@ mod original_codec_failure_tests {
     use novarocks_failure_contract::{FailureClass, FailureProjection};
     #[test]
     fn actual_binding_document_decode_failure_keeps_its_codec_source_through_create() {
-        let error = novarocks_mv_application::persistence::codec::keyed::decode_binding(
-            &[0xff],
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
-        )
-        .unwrap_err();
+        let error = novarocks_mv_application::persistence::codec::keyed::decode_binding(&[0xff])
+            .unwrap_err();
         assert!(matches!(&error, novarocks_mv_application::persistence::codec::PersistenceCodecError::ProtobufDecode(_) | novarocks_mv_application::persistence::codec::PersistenceCodecError::MalformedWire(_)));
         let expected = error.failure_fact();
         let application = codec_failure(error);

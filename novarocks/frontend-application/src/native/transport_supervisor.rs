@@ -103,7 +103,10 @@ pub(crate) struct NativeTransportSupervisorBudget {
     // Capacity kept available for the control lane under ordinary saturation.
     reserved_control_items: usize,
     reserved_control_bytes: usize,
-    max_batch_encoded_bytes: usize,
+    batch_target_encoded_bytes: usize,
+    ordinary_request_max_bytes: usize,
+    control_request_max_bytes: usize,
+    ordinary_queued_max_bytes: usize,
     max_waiters: usize,
 }
 
@@ -117,27 +120,30 @@ pub(crate) struct NativeTaskOperationCapacityFacts {
     pub(crate) target_retained_bytes: usize,
     pub(crate) control_reserved_items: usize,
     pub(crate) control_reserved_bytes: usize,
-    pub(crate) maximum_batch_encoded_bytes: usize,
+    pub(crate) batch_target_encoded_bytes: usize,
+    pub(crate) ordinary_request_max_bytes: usize,
+    pub(crate) control_request_max_bytes: usize,
     pub(crate) waiter_records: usize,
 }
 
 impl NativeTransportSupervisorBudget {
     pub(crate) fn from_transport(transport: TransportBudget) -> Result<Self, String> {
-        let reserved_control_bytes = transport.max_retained_batch_bytes();
+        let windows =
+            crate::task_execution::intent::NativeRequestWindows::for_transport(transport)?;
+        let reserved_control_bytes = windows.control_reserved_bytes;
         let budget = Self {
             max_items: transport.max_backend_queued_operations(),
             max_encoded_bytes: transport.max_backend_queued_bytes(),
             max_target_items: transport.max_query_backend_queued_operations(),
-            // Queue and encoded forms overlap until the RPC settles. A
-            // configured one-batch target window must still fit that batch.
-            max_target_retained_bytes: transport
-                .max_query_backend_queued_bytes()
-                .max(transport.max_retained_batch_bytes()),
+            max_target_retained_bytes: transport.max_query_backend_queued_bytes(),
             reserved_control_items: transport.max_batch_items(),
             // During admission both the immutable operation payload and its
             // encoded request are live. Reserve one maximum batch of each.
             reserved_control_bytes,
-            max_batch_encoded_bytes: transport.max_batch_encoded_bytes(),
+            batch_target_encoded_bytes: transport.batch_target_encoded_bytes(),
+            ordinary_request_max_bytes: windows.ordinary_request_max_bytes,
+            control_request_max_bytes: windows.control_request_max_bytes,
+            ordinary_queued_max_bytes: windows.ordinary_queued_max_bytes,
             max_waiters: transport.max_backend_queued_operations(),
         };
         budget.validate()?;
@@ -149,11 +155,18 @@ impl NativeTransportSupervisorBudget {
             .reserved_control_items
             .checked_mul(2)
             .ok_or_else(|| "native task transport item windows overflowed".to_owned())?;
+        let ordinary = self
+            .ordinary_queued_max_bytes
+            .checked_add(self.ordinary_request_max_bytes)
+            .ok_or_else(|| "native task transport retained-byte windows overflowed".to_owned())?;
         let minimum_bytes = self
             .reserved_control_bytes
-            .checked_mul(2)
+            .checked_add(ordinary)
             .ok_or_else(|| "native task transport retained-byte windows overflowed".to_owned())?;
-        if minimum_items > self.max_items || minimum_bytes > self.max_encoded_bytes {
+        if minimum_items > self.max_items
+            || minimum_bytes > self.max_encoded_bytes
+            || ordinary > self.max_target_retained_bytes
+        {
             return Err(
                 "native task transport process bounds must fit one maximum ordinary batch and one maximum control batch"
                     .to_owned(),
@@ -177,7 +190,10 @@ impl NativeTransportSupervisorBudget {
             max_target_retained_bytes: max_encoded_bytes,
             reserved_control_items,
             reserved_control_bytes,
-            max_batch_encoded_bytes: reserved_control_bytes / 2,
+            batch_target_encoded_bytes: reserved_control_bytes / 2,
+            ordinary_request_max_bytes: reserved_control_bytes / 2,
+            control_request_max_bytes: reserved_control_bytes / 2,
+            ordinary_queued_max_bytes: reserved_control_bytes / 2,
             max_waiters,
         };
         if max_items == 0
@@ -275,7 +291,9 @@ impl NativeTransportSupervisor {
             target_retained_bytes: budget.max_target_retained_bytes,
             control_reserved_items: budget.reserved_control_items,
             control_reserved_bytes: budget.reserved_control_bytes,
-            maximum_batch_encoded_bytes: budget.max_batch_encoded_bytes,
+            batch_target_encoded_bytes: budget.batch_target_encoded_bytes,
+            ordinary_request_max_bytes: budget.ordinary_request_max_bytes,
+            control_request_max_bytes: budget.control_request_max_bytes,
             waiter_records: budget.max_waiters,
         }
     }
@@ -386,7 +404,7 @@ impl NativeTransportSupervisor {
                             .inner
                             .budget
                             .max_target_retained_bytes
-                            .saturating_sub(self.inner.budget.max_batch_encoded_bytes)));
+                            .saturating_sub(self.inner.budget.ordinary_request_max_bytes)));
         let ordinary_window = self
             .inner
             .budget
@@ -396,7 +414,10 @@ impl NativeTransportSupervisor {
             NativeTransportLane::Ordinary => ordinary_window,
             NativeTransportLane::Control => self.inner.budget.reserved_control_bytes,
         }
-        .saturating_sub(self.inner.budget.max_batch_encoded_bytes);
+        .saturating_sub(match lane {
+            NativeTransportLane::Ordinary => self.inner.budget.ordinary_request_max_bytes,
+            NativeTransportLane::Control => self.inner.budget.control_request_max_bytes,
+        });
         let lane_queue_bytes = match lane {
             NativeTransportLane::Ordinary => state.ordinary_queue_bytes,
             NativeTransportLane::Control => state.control_queue_bytes,
@@ -479,7 +500,11 @@ impl NativeTransportSupervisor {
         lane: NativeTransportLane,
         encoded_bytes: usize,
     ) -> Result<NativeTransportEncodingPermit, NativeEncodingReservationFailure> {
-        if encoded_bytes == 0 || encoded_bytes > self.inner.budget.max_batch_encoded_bytes {
+        let request_max = match lane {
+            NativeTransportLane::Ordinary => self.inner.budget.ordinary_request_max_bytes,
+            NativeTransportLane::Control => self.inner.budget.control_request_max_bytes,
+        };
+        if encoded_bytes == 0 || encoded_bytes > request_max {
             return Err(NativeEncodingReservationFailure::InvalidBytes);
         }
         let mut state = self
@@ -558,7 +583,10 @@ impl NativeTransportSupervisor {
             waiter,
             target,
             lane,
-            self.inner.budget.max_batch_encoded_bytes,
+            match lane {
+                NativeTransportLane::Ordinary => self.inner.budget.ordinary_request_max_bytes,
+                NativeTransportLane::Control => self.inner.budget.control_request_max_bytes,
+            },
         ) {
             Ok(permit) => Ok(permit),
             Err(NativeEncodingReservationFailure::Backpressured(reason)) => Err(reason),
@@ -932,9 +960,9 @@ mod tests {
         .unwrap();
         let bytes = plan.protobuf_bytes();
         assert_eq!(plan.retained_bytes(), bytes + 5);
-        assert!(bytes < supervisor.inner.budget.max_batch_encoded_bytes);
+        assert!(bytes < supervisor.inner.budget.batch_target_encoded_bytes);
         let unchanged = supervisor.snapshot();
-        for invalid in [0, supervisor.inner.budget.max_batch_encoded_bytes + 1] {
+        for invalid in [0, supervisor.inner.budget.ordinary_request_max_bytes + 1] {
             assert_eq!(
                 supervisor
                     .try_reserve_original_encoding(
@@ -975,7 +1003,7 @@ mod tests {
         );
         // The old maximum reservation would not admit these same held inputs.
         assert!(
-            8 * (bytes + supervisor.inner.budget.max_batch_encoded_bytes)
+            8 * (bytes + supervisor.inner.budget.batch_target_encoded_bytes)
                 > supervisor.inner.budget.max_encoded_bytes
                     - supervisor.inner.budget.reserved_control_bytes
         );
@@ -1224,30 +1252,45 @@ mod tests {
     #[test]
     fn one_maximum_ordinary_batch_is_always_admissible() {
         let target = BackendProcessId::new_v7();
-        let transport = TransportBudget::new(2, 10, 5, 2, 20, 4, 40, 1, 2, Duration::from_secs(1))
-            .expect("one ordinary and one control batch fit exactly");
+        let transport = TransportBudget::new(
+            2,
+            10,
+            novarocks_task_codec::TransportMessageLimits::DEFAULT,
+            2,
+            256 * 1024 * 1024,
+            4,
+            512 * 1024 * 1024,
+            1,
+            2,
+            Duration::from_secs(1),
+        )
+        .expect("one ordinary and one control batch fit exactly");
         let supervisor = NativeTransportSupervisor::from_transport(transport)
             .expect("the transport budget proves both windows");
         let wake = Arc::new(CountingWake::default());
         let waiter = supervisor
             .register_waiter(wake)
             .expect("register one attempt");
+        let windows =
+            crate::task_execution::intent::NativeRequestWindows::for_transport(transport).unwrap();
+        let queued = windows.empty_queue_capacity(false);
+        let encoded = windows.ordinary_request_max_bytes;
         let permit = reserve_for_send(
             &supervisor,
             &waiter,
             target,
             NativeTransportLane::Ordinary,
             transport.max_batch_items(),
-            transport.max_operation_queued_bytes(),
-            transport.max_batch_encoded_bytes(),
+            queued,
+            encoded,
         );
         assert_eq!(
             supervisor.snapshot(),
             NativeTransportSnapshot {
                 retained_items: 2,
-                retained_queued_and_encoded_bytes: 20,
+                retained_queued_and_encoded_bytes: queued + encoded,
                 ordinary_items: 2,
-                ordinary_queued_and_encoded_bytes: 20,
+                ordinary_queued_and_encoded_bytes: queued + encoded,
                 waiting_attempts: 0,
             }
         );
@@ -1257,9 +1300,11 @@ mod tests {
 
     #[test]
     fn one_slow_target_across_attempts_cannot_exhaust_a_healthy_targets_window() {
-        let transport = TransportBudget::new(2, 10, 5, 4, 40, 8, 100, 1, 2, Duration::from_secs(1))
-            .expect("one target and the process have independent windows");
-        let supervisor = NativeTransportSupervisor::from_transport(transport).expect("budget");
+        // Isolate shared-target backpressure from production quote arithmetic.
+        let mut budget = NativeTransportSupervisorBudget::new(8, 100, 2, 20, 8).unwrap();
+        budget.max_target_items = 4;
+        budget.max_target_retained_bytes = 40;
+        let supervisor = NativeTransportSupervisor::new(budget);
         let slow = BackendProcessId::new_v7();
         let healthy = BackendProcessId::new_v7();
         let slow_first = supervisor

@@ -27,10 +27,6 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const KEYED_DOCUMENT_VERSION_BYTES: usize = 64 * 1024;
-pub const KEYED_DOCUMENT_PRIVATE_BYTES: usize = 256 * 1024;
-pub const KEYED_DOCUMENT_RECORD_BYTES: usize = 4 * 1024;
-
 pub fn validate_document_token(value: &str) -> Result<(), ConnectorError> {
     let bytes = value.as_bytes();
     if bytes.is_empty()
@@ -515,22 +511,6 @@ pub enum CommitConclusion {
     InvalidatedUndetermined,
     StillUnknown,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyedDocumentLimits {
-    pub version_value_bytes: usize,
-    pub private_property_bytes: usize,
-    pub record_bytes: usize,
-}
-impl Default for KeyedDocumentLimits {
-    fn default() -> Self {
-        Self {
-            version_value_bytes: KEYED_DOCUMENT_VERSION_BYTES,
-            private_property_bytes: KEYED_DOCUMENT_PRIVATE_BYTES,
-            record_bytes: KEYED_DOCUMENT_RECORD_BYTES,
-        }
-    }
-}
-
 /// The exact admission remains attached to every catalog mutation.
 #[expect(
     clippy::large_enum_variant,

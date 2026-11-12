@@ -80,6 +80,8 @@ impl Default for AsyncWriterQueueConfig {
 /// The queued provider copy always travels with its original typed projection.
 /// It retains only immutable batch/type loans and this copy's finite storage.
 pub(crate) struct WriterAppendBatch {
+    position_shard_source:
+        Option<novarocks_spi::connector::write_stack::ConnectorPositionShardSource>,
     batch: RecordBatch,
     projection: ChunkBatchProjection,
     construction: ValueTypeStorageLifetime,
@@ -103,10 +105,19 @@ impl WriterAppendBatch {
         ).map_err(|_| novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic)?)?;
         let batch = projection.record_batch().clone();
         Ok(Self {
+            position_shard_source: None,
             batch,
             projection,
             construction: owner.storage_lifetime(),
         })
+    }
+
+    pub(crate) fn with_position_shard_source(
+        mut self,
+        source: Option<novarocks_spi::connector::write_stack::ConnectorPositionShardSource>,
+    ) -> Self {
+        self.position_shard_source = source;
+        self
     }
 
     // Original accounting tests explicitly author expansion fixtures. This is
@@ -114,6 +125,7 @@ impl WriterAppendBatch {
     #[cfg(test)]
     pub(crate) fn from_fixture_projection(projection: ChunkBatchProjection) -> Self {
         Self {
+            position_shard_source: None,
             batch: projection.record_batch().clone(),
             projection,
             construction: ValueTypeStorageLifetime::pure(),
@@ -1601,13 +1613,19 @@ async fn run_writer_actor<O: Send + 'static>(
                 let rows = command.rows;
                 let bytes = command.bytes;
                 let WriterAppendBatch {
+                    position_shard_source,
                     batch,
                     projection,
                     construction,
                 } = command.batch;
                 let writer_call = writer.as_mut();
                 let outcome = await_lifecycle(
-                    move || writer_call.append(batch),
+                    move || async move {
+                        match position_shard_source {
+                            Some(source) => writer_call.append_position_shards(source, batch).await,
+                            None => writer_call.append(batch).await,
+                        }
+                    },
                     shared.as_ref(),
                     &runtime_error,
                     WriterPhase::Append,
@@ -2089,6 +2107,7 @@ pub(crate) mod tests {
 
     fn request() -> ConnectorOpenWriterRequest {
         ConnectorOpenWriterRequest {
+            resources: None,
             handle: writer_handle(),
             target: target(0),
             expected_schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),

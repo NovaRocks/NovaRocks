@@ -41,7 +41,7 @@ use novarocks_sql::compiler::{
 use novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifact;
 
 /// The opaque SQL artifact comes back unchanged with its captured catalog.
-/// Parsing its private SQL remains the original SQL author's responsibility.
+/// Its private query AST remains owned by the original SQL author.
 pub(crate) enum MvCatalogCaptureQuery {
     Query(Box<novarocks_parser::ast::Query>),
     FirstSql(SqlMvFirstRefreshArtifact),
@@ -359,12 +359,7 @@ pub(crate) async fn capture_catalog(
         input.ports.catalog_application(),
     )
     .with_local_views(local_views)
-    .with_system_relations(input.ports.system_relations().clone())
-    .with_definition_inputs(
-        input.context.clone(),
-        input.ports.constant_policy(),
-        input.control.clone(),
-    );
+    .with_system_relations(input.ports.system_relations().clone());
     while !preparation.needs().is_empty() {
         let mut facts = Vec::with_capacity(preparation.needs().len());
         for need in preparation.needs() {

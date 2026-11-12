@@ -29,7 +29,7 @@ pub(super) fn logical(sql: &str, raw_limit: Option<i64>) -> Result<(), SqlCompil
         source_session.sql_semantics = source_session.sql_semantics.with_group_concat_max_len(raw);
     }
     SqlCompiler::analyze(SqlAnalyzeRequest::new(
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
         SqlCompileIntent::LogicalOnly,
         source_session,
         SqlPlanningEnvironment::Distributed,

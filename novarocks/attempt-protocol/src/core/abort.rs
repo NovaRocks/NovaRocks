@@ -683,7 +683,7 @@ mod tests {
             .begin(&execution, action(10), request, generation(2))
             .unwrap();
         aborts.admit_next().unwrap();
-        let grant = QueuedInputGrantRef::new(id(20), generation(2));
+        let grant = QueuedInputGrantRef::new(id(20), generation(2), 64);
         aborts.grant(&mut execution, operation, grant).unwrap();
         assert!(matches!(
             execution
@@ -796,7 +796,7 @@ mod tests {
             .unwrap();
         let first = aborts.admit_next().unwrap();
         assert_eq!(first.id, action(1));
-        let first_grant = QueuedInputGrantRef::new(id(8), generation(1));
+        let first_grant = QueuedInputGrantRef::new(id(8), generation(1), 64);
         assert!(
             aborts
                 .grant(&mut execution, operation, first_grant)
@@ -882,7 +882,7 @@ mod tests {
             participation,
             AbortCause::QueryFailed,
         )));
-        let late_grant = QueuedInputGrantRef::new(id(9), generation(2));
+        let late_grant = QueuedInputGrantRef::new(id(9), generation(2), 64);
         assert!(
             matches!(aborts.grant(&mut execution, operation, late_grant).unwrap(),
             Some(EffectBody::ReleaseQueuedInput { grant }) if grant == late_grant)

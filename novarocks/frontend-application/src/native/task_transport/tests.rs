@@ -50,10 +50,12 @@ fn original_method_run_progress_quotes_the_full_supported_count_and_rejects_mixe
     assert_eq!(quote.custody().get(JointResource::QueueRecords), 0);
     assert_eq!(
         quote.custody().get(JointResource::PayloadBytes),
-        (novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
-            + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
-                budget
+        (budget.message_limits().control_response_max_bytes
+            + novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+                operations.len(),
+                budget.message_limits().control_response_max_bytes,
             )
+            .unwrap()
             .peak_bytes()) as u64
     );
     let mut over = operations.clone();
@@ -938,7 +940,11 @@ impl Loopback {
         let (shutdown, stop) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(NovaRocksGrpcServer::new(peer))
+                .add_service(
+                    NovaRocksGrpcServer::new(peer)
+                        .max_decoding_message_size(128 * 1024 * 1024)
+                        .max_encoding_message_size(128 * 1024 * 1024),
+                )
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = stop.await;
                 })
@@ -1101,14 +1107,24 @@ struct SinkFixture {
 }
 
 mod governed_wire;
+mod message_limits;
 
 fn sink_fixture(loopback: Loopback, backend: BackendProcessId) -> SinkFixture {
-    let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+    sink_fixture_with_budget(loopback, backend, TransportBudget::DEFAULT)
+}
+
+fn sink_fixture_with_budget(
+    loopback: Loopback,
+    backend: BackendProcessId,
+    budget: TransportBudget,
+) -> SinkFixture {
+    let runtime =
+        FrontendDataRuntime::new_with_task_budget(tokio::runtime::Handle::current(), budget);
     let acks = TaskAckIntake::new(Arc::new(CountingWake::default()));
     let governed = governed_wire::GovernedWireRole::new(&loopback);
     let sink = NativeTaskOperationSink::new(
         &[loopback.descriptor(backend)],
-        TransportBudget::DEFAULT,
+        budget,
         test_attempt_facts(),
         acks.handle(),
         runtime.clone(),
@@ -1941,9 +1957,19 @@ fn dropping_an_accepted_send_settles_only_its_remaining_items_as_unknown() {
 #[test]
 fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
     let backend = BackendProcessId::new_v7();
-    let transport =
-        TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
-            .expect("one ordinary and one control batch fit");
+    let transport = TransportBudget::new(
+        2,
+        1024,
+        novarocks_task_codec::TransportMessageLimits::DEFAULT,
+        4,
+        256 * 1024 * 1024,
+        4,
+        512 * 1024 * 1024,
+        1,
+        2,
+        Duration::from_secs(1),
+    )
+    .expect("one ordinary and one control batch fit");
     let dispatch = DispatchBudget::new(1, 1, 1, 1).expect("nonzero lane permits");
     let mut dispatcher = OperationDispatcher::new(dispatch, transport);
     dispatcher
@@ -1991,7 +2017,9 @@ fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
             backend,
             NativeTransportLane::Ordinary,
             transport.max_batch_items(),
-            transport.max_operation_queued_bytes(),
+            crate::task_execution::intent::NativeRequestWindows::for_transport(transport)
+                .unwrap()
+                .empty_queue_capacity(false),
         )
         .expect("fill the ordinary queue window exactly");
     let ordinary_encoding = supervisor
@@ -2362,8 +2390,8 @@ async fn real_goaway_conformance_case(reason: h2::Reason) -> anyhow::Result<()> 
     let client = &fixture.sink.targets[&backend].client;
     let operation = tokio::time::timeout(Duration::from_secs(5), async {
         let method = NativeRpcMethod::ApplyTaskOperations;
-        let (mut grpc, acquired) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
-        let response = grpc.apply_task_operations(Request::new(wire.clone())).await;
+        let (mut grpc, acquired) = client.operation_test_grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+        let response = fixture_apply_request(&mut grpc, Request::new(wire.clone()), method, wire.operations.len(), client.method_message_limits(method).1).await;
         let proof = proof.await?;
         anyhow::ensure!(proof.stream_id > proof.last_stream_id && proof.last_stream_id == 0, "actual stream did not exceed actual GOAWAY last id");
         anyhow::ensure!(proof.reason == u32::from(reason) && proof.body == expected, "actual frame or original request bytes differ");
@@ -2381,8 +2409,8 @@ async fn real_goaway_conformance_case(reason: h2::Reason) -> anyhow::Result<()> 
                 drop(status);
                 if reason == h2::Reason::NO_ERROR && classified == OperationDispatchResult::TransportUnknown {
                     client.invalidate_channel_if_current(method, &acquired);
-                    let (mut grpc, _) = client.grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
-                    receipt = Some(grpc.apply_task_operations(Request::new(wire.clone())).await?.into_inner());
+                    let (mut grpc, _) = client.operation_test_grpc_with_channel_identity(method).await.map_err(|error| anyhow::anyhow!("{error}"))?;
+                    receipt = Some(fixture_apply_request(&mut grpc, Request::new(wire.clone()), method, wire.operations.len(), client.method_message_limits(method).1).await?.into_inner());
                 }
                 (Some(code), observed, Some(classified))
             }
@@ -2620,60 +2648,28 @@ async fn an_observation_read_is_refused_before_the_wire() {
     let fixture = sink_fixture(Loopback::start().await, backend);
     let supervisor = fixture.sink.data_runtime.task_transport_supervisor();
     let before = supervisor.snapshot();
-    let mut batch = released_batch(
-        backend,
-        vec![OperationIntent::FetchTaskDynamicFilters(
-            FetchTaskDynamicFilters::new(TaskOperationId::new_v7(), identity(1, backend), None),
-        )],
-    );
-    let original_id = batch.operations()[0].operation_id();
-    let original_bytes = batch.queued_bytes();
-    let permits = batch
-        .operations()
-        .iter()
-        .map(|intent| fixture.governed.reserve(&fixture.sink, intent))
-        .collect();
-    batch.replace_fixture_permits(permits);
-    let held = supervisor.snapshot();
-    assert_eq!(held.retained_items, before.retained_items + 1);
-    assert!(held.retained_queued_and_encoded_bytes > before.retained_queued_and_encoded_bytes);
-
-    let returned = match fixture.sink.try_submit(batch) {
-        TaskOperationSubmit::AdmissionFailed {
-            batch,
-            error: novarocks_workload_control::WorkError::Conflict,
-        } => batch,
-        other => panic!("a read must be refused by the closed batch vocabulary: {other:?}"),
-    };
-    assert_eq!(returned.operations().len(), 1);
-    assert_eq!(returned.operations()[0].operation_id(), original_id);
-    assert_eq!(
-        returned.operations()[0].kind(),
-        OperationKind::FetchTaskDynamicFilters
-    );
-    assert_eq!(returned.queued_bytes(), original_bytes);
-    assert_eq!(
-        supervisor.snapshot(),
-        held,
-        "the caller still owns its exact paid input"
-    );
-    assert!(
-        fixture.acks.drain_events().is_empty(),
-        "refusal cannot manufacture an ACK"
-    );
-    assert!(
-        fixture.loopback.peer.applied().is_empty(),
-        "a read has its own RPC and never becomes a batch item"
-    );
-    assert_eq!(fixture.loopback.peer.control_requests(), 0);
-    drop(returned);
-    fixture.governed.drive();
+    let intent = OperationIntent::FetchTaskDynamicFilters(FetchTaskDynamicFilters::new(
+        TaskOperationId::new_v7(),
+        identity(1, backend),
+        None,
+    ));
+    let mut preparation = crate::task_execution::intent::TaskOperationQueuePreparation::new();
+    assert!(matches!(
+        fixture
+            .sink
+            .try_reserve_queue(intent.queue_request(), &mut preparation),
+        TaskOperationQueueAdmission::Rejected(novarocks_workload_control::WorkError::Conflict)
+    ));
     assert_eq!(
         supervisor.snapshot(),
         before,
-        "only actual input drop returns the queue charge"
+        "a non-operation has no batch encoding and cannot acquire a queue reservation"
     );
     assert!(fixture.acks.drain_events().is_empty());
+    assert!(fixture.loopback.peer.applied().is_empty());
+    assert_eq!(fixture.loopback.peer.control_requests(), 0);
+    drop(preparation);
+    message_limits::close(fixture).await;
 }
 
 #[test]
@@ -4999,8 +4995,19 @@ async fn constructor_refusals_keep_their_actual_producer_facts() {
         }
     );
     assert_eq!(error.failure_fact().reason().code(), 103);
-    let other_budget =
-        TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1)).unwrap();
+    let other_budget = TransportBudget::new(
+        2,
+        1024,
+        novarocks_task_codec::TransportMessageLimits::DEFAULT,
+        4,
+        256 * 1024 * 1024,
+        4,
+        512 * 1024 * 1024,
+        1,
+        2,
+        Duration::from_secs(1),
+    )
+    .unwrap();
     let error = NativeTaskOperationSink::new(
         &[descriptor],
         other_budget,

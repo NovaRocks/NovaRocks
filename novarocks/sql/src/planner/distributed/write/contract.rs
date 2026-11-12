@@ -25,8 +25,11 @@
 //! frozen.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::write_stack::{
+    ConnectorMutationContributionGroup, WriteTargetOrdinal,
+};
 use novarocks_spi::connector::{ConnectorEncodedPayload, ConnectorWriteFieldToken};
 use novarocks_types::schema::ColumnDef;
 
@@ -49,6 +52,7 @@ pub enum ConnectorWriteInputBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct SqlWritePlanInput {
     pub(crate) contract: SqlWriteSinkContract,
+    pub(crate) position_materialization: Option<Arc<ConnectorMutationContributionGroup>>,
     pub(crate) input: ConnectorWriteInputBinding,
     pub(crate) finish_count_mode: novarocks_physical_plan::FinishCountMode,
     /// A root-only projection supplied by SQL when hidden or state columns
@@ -244,6 +248,7 @@ pub(crate) mod test_support {
         SqlWritePlanInput {
             contract: SqlWriteSinkContract::try_new(SqlWriteSinkMode::Data, target, vec![column])
                 .expect("valid SQL write contract"),
+            position_materialization: None,
             input,
             finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
             root_output_exprs: None,

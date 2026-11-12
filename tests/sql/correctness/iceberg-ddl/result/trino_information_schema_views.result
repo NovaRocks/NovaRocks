@@ -1,0 +1,43 @@
+-- query 2
+-- types	varchar	varchar
+table_name	table_type
+metadata_base	BASE TABLE
+metadata_view	VIEW
+
+-- query 4
+-- types	varchar	varchar
+table_name	table_type
+metadata_base	BASE TABLE
+metadata_view	VIEW
+
+-- query 5
+-- types	varchar
+table_name
+metadata_view
+
+-- query 6
+-- types	varchar
+table_name
+metadata_base
+
+-- query 7
+-- types	varchar	varchar
+table_name	table_type
+metadata_base	BASE TABLE
+metadata_view	VIEW
+
+-- query 8
+-- types	varchar	varchar
+table_name	table_type
+metadata_base	BASE TABLE
+metadata_view	VIEW
+
+-- query 10
+-- types	bigint
+a
+7
+
+-- query 12
+-- types	varchar	varchar
+table_name	table_type
+materialized_views	BASE TABLE

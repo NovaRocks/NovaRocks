@@ -205,10 +205,7 @@ pub enum CapacityBound {
         backend: BackendProcessId,
         limit: usize,
     },
-    /// One descriptor's encoded plan.
-    DescriptorBytes { limit: usize, actual: usize },
     /// One operation's queue-side carrier.
-    #[cfg(test)]
     OperationBytes { limit: usize, actual: usize },
     /// Edge-open versions one producer task can mint.
     ///
@@ -281,15 +278,6 @@ impl novarocks_execution_contract::failure::FailureProjection for CapacityBound 
             Self::ActiveTasksPerBackend { limit, .. } => {
                 (45, None, None, D::Items, None, u64::try_from(limit).ok())
             }
-            Self::DescriptorBytes { limit, actual } => (
-                46,
-                Some(S::Request),
-                Some(S::Request),
-                D::Bytes,
-                u64::try_from(actual).ok(),
-                u64::try_from(limit).ok(),
-            ),
-            #[cfg(test)]
             Self::OperationBytes { limit, actual } => (
                 47,
                 Some(S::Request),
@@ -352,14 +340,9 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "active tasks on backend {backend} reached {limit}"
             ),
-            Self::DescriptorBytes { limit, actual } => write!(
-                formatter,
-                "descriptor plan is {actual} bytes, limit is {limit}"
-            ),
-            #[cfg(test)]
             Self::OperationBytes { limit, actual } => write!(
                 formatter,
-                "operation queue carrier is {actual} bytes, limit is {limit}"
+                "operation requires {actual} bytes, limit is {limit}"
             ),
             #[cfg(test)]
             Self::EdgeOpenVersions { limit } => {
@@ -1199,7 +1182,7 @@ mod capacity_projection_tests {
     #[test]
     fn measured_request_bytes_and_known_zero_survive_the_canonical_boundary() {
         for bound in [
-            CapacityBound::DescriptorBytes {
+            CapacityBound::OperationBytes {
                 limit: 0,
                 actual: 0,
             },
@@ -1214,8 +1197,7 @@ mod capacity_projection_tests {
             let facts = input.fact().resource().unwrap();
             assert_eq!(facts.dimension, ResourceDimension::Bytes);
             let (limit, actual) = match bound {
-                CapacityBound::DescriptorBytes { limit, actual }
-                | CapacityBound::OperationBytes { limit, actual } => (limit, actual),
+                CapacityBound::OperationBytes { limit, actual } => (limit, actual),
                 _ => unreachable!(),
             };
             assert_eq!(facts.limit, Some(limit as u64));

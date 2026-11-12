@@ -815,6 +815,7 @@ impl ConnectorWriteSession {
     }
 
     fn freeze_received_input(&self) -> Result<Arc<ReceivedWriteInput>, ConnectorError> {
+        let production = self.received_creation_proof()?;
         let mut union = self.lock_accumulated()?;
         if let Some(received) = &union.received {
             return Ok(Arc::clone(received));
@@ -827,6 +828,10 @@ impl ConnectorWriteSession {
             &mut union.fragments,
             &self.expected_targets(),
         )?;
+        let prepared = match production {
+            Some(proof) => prepared.with_received_production(proof),
+            None => prepared,
+        };
         let received = Arc::new(ReceivedWriteInput {
             prepared,
             statistics: std::mem::take(&mut union.statistics),
@@ -2335,9 +2340,7 @@ pub(crate) mod tests {
             );
         let observed =
             novarocks_mv_application::persistence::keyed_documents::decode_current_keyed_documents(
-                view,
-                catalog,
-                Default::default(),
+                view, catalog,
             )
             .unwrap();
         let mut p = observed.publication.unwrap();

@@ -42,23 +42,6 @@ pub struct MvReadinessPort {
     controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
-fn local_inventory_bound() -> novarocks_mv_application::repository::MvProjectionInventoryBound {
-    use novarocks_mv_application::repository::MvProjectionInventoryBound;
-
-    MvProjectionInventoryBound {
-        entries: novarocks_query_application::api::LocalResultBound::V1.rows,
-        snapshot_bytes: 16 * 1024 * 1024,
-        raw_page_bytes: 1024 * 1024,
-        single_name_bytes: 65_536,
-        continuation_token_bytes: 4096,
-        decode: novarocks_mv_application::persistence::validation::PersistenceDecodeBudget {
-            max_document_bytes: 1024 * 1024,
-            max_working_set_bytes: 4 * 1024 * 1024,
-            ..Default::default()
-        },
-    }
-}
-
 /// Read-only inventory for query-local MV candidate discovery.
 ///
 /// A query freezes and validates every returned lake publication before it can
@@ -352,13 +335,9 @@ impl MvReadinessExecution<'_> {
     /// its next_ready/next_listable methods are async product methods.
     pub(crate) async fn local_projection_inventory(
         &self,
-    ) -> Result<
-        novarocks_mv_application::readiness::MvBoundedKeyedProjectionInventory,
-        MvRepositoryError,
-    > {
-        self.service
-            .bounded_projection_inventory(local_inventory_bound())
-            .await
+    ) -> Result<novarocks_mv_application::readiness::MvKeyedProjectionInventory, MvRepositoryError>
+    {
+        self.service.projection_inventory().await
     }
     pub(crate) async fn list_ready_projections(
         &self,
@@ -381,7 +360,6 @@ impl MvReadinessExecution<'_> {
             .list_ready_dependencies_by_downstream_bounded(
                 projection,
                 novarocks_mv_application::repository::MvDependencyReadBound {
-                    inventory: local_inventory_bound(),
                     entries: 4096,
                     collection_bytes: 4 * 1024 * 1024,
                 },
@@ -500,7 +478,7 @@ impl MvCandidateReader {
             management,
             ..
         } = self;
-        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),Default::default(),management).await.map_err(document_application_error)?;
+        let (mut observed,convergence)=novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(lease,request.clone(),management).await.map_err(document_application_error)?;
         if observed.deployment_owner != *management.owner()
             || observed.process_incarnation != *management.incarnation()
         {
@@ -524,7 +502,6 @@ impl MvCandidateReader {
                 request.catalog_handle,
                 target,
                 request.context,
-                Default::default(),
             )
             .map_err(projection_application_error)?;
             let operation = Uuid::now_v7();
@@ -558,7 +535,7 @@ impl MvCandidateReader {
         }
         if convergence.reinstall_current_projection {
             let (fresh, admission, _) = management
-                .observe_keyed_admission_async(lease, request.clone(), Default::default())
+                .observe_keyed_admission_async(lease, request.clone())
                 .await
                 .map_err(document_application_error)?;
             observed = fresh;
@@ -578,7 +555,6 @@ impl MvCandidateReader {
                 request.catalog_handle,
                 target,
                 request.context,
-                Default::default(),
             )
             .map_err(projection_application_error)?;
             let operation = Uuid::now_v7();
@@ -1013,9 +989,14 @@ mod original_request_tests {
             SqlStatementInput, builtin_sql_function_catalog,
         };
         let control = SqlCompileControl::unbounded();
+        let mut statements = novarocks_parser::parse("select order_key from orders").unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
         let request = SqlFinalPlanCompileRequest::new(
             novarocks_physical_plan::PlanVersionId::try_new([17; 16]).unwrap(),
-            SqlStatementInput::sql("select order_key from orders"),
+            SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

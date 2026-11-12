@@ -27,7 +27,6 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use super::test_support::{MysqlCommitTestApi, MysqlProviderTestHarness};
-use novarocks_state_store_api::MAX_VALUE_BYTES;
 
 use crate::{
     MYSQL_MAX_KEY_BYTES, MySqlClientConfig, MySqlTlsMode, MysqlTestLimitOverrides,
@@ -40,10 +39,27 @@ use novarocks_state_store_api::{
     StateRecord, StateStore, StateStoreError, Value, VersionToken, WriteTransaction,
 };
 
-const MAX_LINE_BYTES: usize = 160 * 1024;
 const MAX_KEY_HEX_BYTES: usize = MYSQL_MAX_KEY_BYTES * 2;
-const MAX_VALUE_HEX_BYTES: usize = MAX_VALUE_BYTES * 2;
+const MAX_VALUE_HEX_BYTES: usize = crate::MYSQL_STATE_STORE_CAPACITY.max_value_bytes * 2;
 const MAX_TOKEN_HEX_BYTES: usize = 16 * 1024;
+// Widest canonical Put: JSON syntax, u64 id, hyphenated UUID, key/value hex,
+// version-precondition token hex, and a newline. Hex fields need no escaping.
+// Preserve the pre-existing accepted frame range for every other command.
+const PUT_JSON_SYNTAX: &str =
+    r#"{"command":"Put","id":,"handle":"","key":"","value":"","precondition":{"version":""}}"#;
+const MAX_PUT_LINE_BYTES: usize = PUT_JSON_SYNTAX.len()
+    + 20
+    + 36
+    + MAX_KEY_HEX_BYTES
+    + MAX_VALUE_HEX_BYTES
+    + MAX_TOKEN_HEX_BYTES
+    + 1;
+const MAX_LINE_BYTES: usize = if MAX_PUT_LINE_BYTES > 160 * 1024 {
+    MAX_PUT_LINE_BYTES
+} else {
+    160 * 1024
+};
+
 const COMMIT_HOOK_DEADLINE: Duration = Duration::from_secs(5);
 const COMMIT_OWNER_DEADLINE: Duration = Duration::from_secs(6);
 const COMMAND_DEADLINE: Duration = Duration::from_secs(5);
@@ -890,5 +906,51 @@ pub fn run_stdio() -> i32 {
             eprintln!("state-store-mysql-helper: runtime startup failed");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_protocol_accepts_complete_provider_capacity_put() {
+        let line = format!(
+            r#"{{"command":"Put","id":{},"handle":"{}","key":"{}","value":"{}","precondition":{{"version":"{}"}}}}
+"#,
+            u64::MAX,
+            Uuid::nil(),
+            "ab".repeat(crate::MYSQL_STATE_STORE_CAPACITY.max_key_bytes),
+            "cd".repeat(crate::MYSQL_STATE_STORE_CAPACITY.max_value_bytes),
+            "ef".repeat(MAX_TOKEN_HEX_BYTES / 2),
+        );
+        assert_eq!(line.len(), MAX_PUT_LINE_BYTES);
+        let mut retained = Vec::new();
+        let mut input = line.as_bytes();
+        assert_eq!(
+            read_bounded_line(&mut input, &mut retained).await.unwrap(),
+            line.len()
+        );
+        let Request::Put {
+            id,
+            key,
+            value,
+            precondition,
+            ..
+        } = parse_request(&retained).unwrap()
+        else {
+            panic!("expected Put");
+        };
+        assert_eq!(id, u64::MAX);
+        assert_eq!(key.len(), MAX_KEY_HEX_BYTES);
+        assert_eq!(value.len(), MAX_VALUE_HEX_BYTES);
+        assert!(super::precondition(id, precondition).is_ok());
+        assert!(line.len() >= 160 * 1024);
+        assert_eq!(
+            parse_request(&vec![b' '; MAX_LINE_BYTES + 1])
+                .unwrap_err()
+                .code,
+            "LineTooLong"
+        );
     }
 }

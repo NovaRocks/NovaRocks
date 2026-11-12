@@ -75,11 +75,6 @@ fn limit(message: &'static str) -> ScanError {
 
 /// Checks the repeated operation count before prost constructs a task batch.
 pub fn check_operation_batch(raw: &[u8]) -> Result<(), ResourcePreflightError> {
-    if raw.len() > TransportBudget::DEFAULT.max_batch_encoded_bytes() {
-        return Err(ResourcePreflightError(
-            "task operation batch exceeds 48 MiB",
-        ));
-    }
     finish(scan_batch(raw, false))
 }
 
@@ -497,21 +492,9 @@ fn scan_status_subscription(raw: &[u8]) -> ScanResult {
     })
 }
 
-/// Checks the static creation carrier before decoding its protobuf object.
-pub fn check_frozen_fragment(raw: &[u8]) -> Result<(), ResourcePreflightError> {
-    if raw.len() > TransportBudget::DEFAULT.max_descriptor_encoded_bytes() {
-        return Err(ResourcePreflightError("frozen fragment exceeds 16 MiB"));
-    }
-    Ok(())
-}
-
-/// Checks the task-local carrier and the two carriers' combined plan bytes
-/// before decoding the metadata protobuf object.
-pub fn check_creation_metadata(
-    raw: &[u8],
-    frozen_raw_bytes: usize,
-) -> Result<(), ResourcePreflightError> {
-    finish(scan_creation_metadata(raw, frozen_raw_bytes))
+/// Checks task metadata object counts before prost constructs its fields.
+pub fn check_creation_metadata(raw: &[u8]) -> Result<(), ResourcePreflightError> {
+    finish(scan_creation_metadata(raw))
 }
 
 fn checked_increment(count: &mut usize, max: usize, message: &'static str) -> ScanResult {
@@ -669,7 +652,6 @@ fn scan_credential_domain(raw: &[u8], count: &mut usize) -> ScanResult {
 
 #[derive(Default)]
 struct MetadataCounts {
-    assignment_bytes: usize,
     initial_domains: usize,
     split_nodes: usize,
     outbound_edges: usize,
@@ -678,27 +660,12 @@ struct MetadataCounts {
     sink_edges: usize,
 }
 
-fn scan_creation_metadata(raw: &[u8], frozen_raw_bytes: usize) -> ScanResult {
+fn scan_creation_metadata(raw: &[u8]) -> ScanResult {
     let mut counts = MetadataCounts::default();
     for_fields(raw, |field, value| {
         match (field, value) {
             (2, Value::Bytes(descriptor)) => scan_descriptor(descriptor, &mut counts)?,
-            // The static fragment and the task assignment together describe
-            // what one task runs, so they share one plan-carrier bound. Every
-            // occurrence counts: prost merges repeated singular messages.
             (5, Value::Bytes(assignment)) => {
-                counts.assignment_bytes = counts
-                    .assignment_bytes
-                    .checked_add(assignment.len())
-                    .ok_or_else(|| limit("creation plan carriers exceed 16 MiB"))?;
-                if frozen_raw_bytes
-                    .checked_add(counts.assignment_bytes)
-                    .is_none_or(|total| {
-                        total > TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
-                    })
-                {
-                    return Err(limit("creation plan carriers exceed 16 MiB"));
-                }
                 scan_assignment(assignment, &mut counts)?;
             }
             (4, Value::Bytes(domain)) => {
@@ -758,12 +725,23 @@ fn scan_topology(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
                     MAX_TOPOLOGY_ENTRIES,
                     "task topology exceeds 256 inbound nodes",
                 )?;
-                scan_repeated_message_field(
-                    node,
-                    2,
-                    MAX_INBOUND_SOURCES,
-                    "exchange inbound exceeds 4096 sources",
-                )?;
+                let mut sources = 0;
+                let mut source_dops = 0;
+                for_fields(node, |field, value| match (field, value) {
+                    (2, Value::Bytes(_)) => checked_increment(
+                        &mut sources,
+                        MAX_INBOUND_SOURCES,
+                        "exchange inbound exceeds 4096 sources",
+                    ),
+                    (4, Value::Bytes(roster)) => count_repeated_varints(
+                        roster,
+                        1,
+                        &mut source_dops,
+                        MAX_INBOUND_SOURCES,
+                        "position-shard roster exceeds 4096 sender DOPs",
+                    ),
+                    _ => Ok(()),
+                })?;
             }
             _ => {}
         }
@@ -941,17 +919,6 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn frozen_package_outer_carrier_keeps_the_transport_byte_bound() {
-        let maximum = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
-        let raw = vec![0_u8; maximum + 1];
-        assert!(check_frozen_fragment(&raw[..maximum]).is_ok());
-        assert_eq!(
-            check_frozen_fragment(&raw).unwrap_err().to_string(),
-            "frozen fragment exceeds 16 MiB"
-        );
-    }
-
-    #[test]
     fn batch_rejects_33_operations_before_decode() {
         let raw = novarocks::ApplyTaskOperationsRequest {
             operations: vec![novarocks::TaskOperation::default(); 33],
@@ -982,10 +949,35 @@ mod tests {
         let mut metadata = Vec::new();
         write_bytes_field(&mut metadata, 2, &descriptor);
         assert_eq!(
-            check_creation_metadata(&metadata, 0)
+            check_creation_metadata(&metadata).unwrap_err().to_string(),
+            "task descriptor exceeds 1024 split nodes"
+        );
+    }
+
+    #[test]
+    fn position_shard_roster_preflight_counts_packed_and_merged_occurrences() {
+        let mut roster = Vec::new();
+        write_bytes_field(&mut roster, 1, &vec![1; MAX_INBOUND_SOURCES]);
+        let mut inbound = Vec::new();
+        write_bytes_field(&mut inbound, 4, &roster);
+        let wrap = |inbound: &[u8]| {
+            let mut topology = Vec::new();
+            write_bytes_field(&mut topology, 2, inbound);
+            let mut descriptor = Vec::new();
+            write_bytes_field(&mut descriptor, 5, &topology);
+            let mut metadata = Vec::new();
+            write_bytes_field(&mut metadata, 2, &descriptor);
+            metadata
+        };
+        assert!(check_creation_metadata(&wrap(&inbound)).is_ok());
+        // Prost would merge this second singular wrapper and append one
+        // unpacked sender DOP. The bound must apply before Prost allocates.
+        write_bytes_field(&mut inbound, 4, &[0x08, 0x01]);
+        assert_eq!(
+            check_creation_metadata(&wrap(&inbound))
                 .unwrap_err()
                 .to_string(),
-            "task descriptor exceeds 1024 split nodes"
+            "position-shard roster exceeds 4096 sender DOPs",
         );
     }
 
@@ -1009,31 +1001,9 @@ mod tests {
             1200
         );
         assert_eq!(
-            check_creation_metadata(&metadata, 0)
-                .unwrap_err()
-                .to_string(),
+            check_creation_metadata(&metadata).unwrap_err().to_string(),
             "task descriptor exceeds 1024 split nodes"
         );
-    }
-
-    #[test]
-    fn carrier_pair_checks_assignment_bytes_before_metadata_decode() {
-        let mut metadata = Vec::new();
-        write_bytes_field(&mut metadata, 5, &[0x08, 0x00]);
-        let max = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
-        assert!(check_creation_metadata(&metadata, max - 2).is_ok());
-        assert_eq!(
-            check_creation_metadata(&metadata, max - 1)
-                .unwrap_err()
-                .to_string(),
-            "creation plan carriers exceed 16 MiB"
-        );
-        // prost merges repeated occurrences of one singular message, so the
-        // bound is over every occurrence rather than the last one.
-        let mut repeated = metadata.clone();
-        write_bytes_field(&mut repeated, 5, &[0x08, 0x00]);
-        assert!(check_creation_metadata(&repeated, max - 4).is_ok());
-        assert!(check_creation_metadata(&repeated, max - 3).is_err());
     }
 
     #[test]
@@ -1047,9 +1017,9 @@ mod tests {
             write_bytes_field(&mut metadata, 5, &assignment);
             metadata
         };
-        assert!(check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES), 0).is_ok());
+        assert!(check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES)).is_ok());
         assert_eq!(
-            check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES + 1), 0)
+            check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES + 1))
                 .unwrap_err()
                 .to_string(),
             "task assignment exceeds 1024 initial scan nodes"
@@ -1065,9 +1035,9 @@ mod tests {
             write_bytes_field(&mut metadata, 5, &assignment);
             metadata
         };
-        assert!(check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES), 0).is_ok());
+        assert!(check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES)).is_ok());
         assert_eq!(
-            check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES + 1), 0)
+            check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES + 1))
                 .unwrap_err()
                 .to_string(),
             "task assignment exceeds 256 sink edges"
@@ -1076,13 +1046,11 @@ mod tests {
 
     #[test]
     fn a_retired_instance_parameter_field_is_no_longer_a_creation_carrier() {
-        // Field 3 is reserved. It is not a carrier this scanner bounds, so
-        // it neither counts toward the plan-carrier bound nor is walked; the
-        // codec's decode is the only interpreter of what it would mean.
+        // Field 3 is reserved and is not walked. Prost remains the sole
+        // interpreter of unknown fields.
         let mut metadata = Vec::new();
         write_bytes_field(&mut metadata, 3, &[0x5a, 0x00]);
-        let max = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
-        assert!(check_creation_metadata(&metadata, max).is_ok());
+        assert!(check_creation_metadata(&metadata).is_ok());
     }
 
     #[test]
@@ -1098,9 +1066,7 @@ mod tests {
         let mut metadata = Vec::new();
         write_bytes_field(&mut metadata, 2, &descriptor);
         assert_eq!(
-            check_creation_metadata(&metadata, 0)
-                .unwrap_err()
-                .to_string(),
+            check_creation_metadata(&metadata).unwrap_err().to_string(),
             "exchange edge exceeds 4096 destinations"
         );
     }
@@ -1187,9 +1153,7 @@ mod tests {
         let mut metadata = Vec::new();
         write_bytes_field(&mut metadata, 4, &domain);
         assert_eq!(
-            check_creation_metadata(&metadata, 0)
-                .unwrap_err()
-                .to_string(),
+            check_creation_metadata(&metadata).unwrap_err().to_string(),
             "open exchange domain exceeds 256 edges"
         );
 

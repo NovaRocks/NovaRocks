@@ -82,8 +82,6 @@ pub(crate) fn start() -> AttemptStart {
                         creation: FrozenCreation {
                             resource: PayloadRef(positive(1)),
                             queued_bytes: 256,
-                            plan_carrier_bytes: 64,
-                            descriptor_encoded_bytes: 64,
                         },
                     },
                 )]
@@ -117,8 +115,11 @@ pub(crate) fn start() -> AttemptStart {
             coordination,
             transport: FrozenTransportLimits {
                 max_batch_items: 4,
-                max_batch_encoded_bytes: 4096,
-                max_descriptor_encoded_bytes: 4096,
+                batch_target_encoded_bytes: 4096,
+                ordinary_request_max_bytes: 4096,
+                control_request_max_bytes: 4096,
+                ordinary_queued_max_bytes: 4096,
+                control_queued_max_bytes: 4096,
                 max_query_backend_queued_operations: 1024,
                 max_query_backend_queued_bytes: 1_048_576,
                 max_backend_queued_operations: 4096,
@@ -324,7 +325,7 @@ impl OriginalAbortCore {
         assert_eq!(admission, generation.admission_effect());
         assert_eq!(self.finish_round().round_result, Some(Ok(())));
 
-        let grant = QueuedInputGrantRef::new(positive(grant_position), generation);
+        let grant = QueuedInputGrantRef::new(positive(grant_position), generation, 1);
         self.queue.full = queue_full;
         let stage_attempts = self.queue.attempts;
         let granted = self.step(
@@ -434,7 +435,7 @@ impl OriginalAbortCore {
         assert_eq!(expired.definitely_unsent_abort, Some(key.operation));
         assert!(expired.notice_action.is_some());
         assert!(expired.round_result.is_none());
-        let expected_grant = QueuedInputGrantRef::new(positive(71), key.generation);
+        let expected_grant = QueuedInputGrantRef::new(positive(71), key.generation, 1);
         assert!(matches!(
             expired.effect,
             Some(AttemptEffect { body: EffectBody::ReleaseQueuedInput { grant }, .. })

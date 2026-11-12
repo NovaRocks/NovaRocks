@@ -1539,6 +1539,7 @@ impl Documents {
             "expiry never used a Full table load"
         );
         create_mv(context, conn, "stable")?;
+        let mut first_ordinary = None;
         for n in 0..300 {
             execute(
                 context,
@@ -1552,11 +1553,18 @@ impl Documents {
                 self.assert_refs_since(start, "stable")?;
             }
             if n % 25 == 0 {
-                save_graph(
+                let observed = save_graph(
                     context,
-                    "continuous-refresh-progress",
+                    if n == 0 {
+                        "continuous-refresh-first"
+                    } else {
+                        "continuous-refresh-progress"
+                    },
                     &load_metadata(context, rest, NS, "stable")?,
                 )?;
+                if n == 0 {
+                    first_ordinary = Some((observed.private_bytes, observed.binding));
+                }
             }
         }
         let stable = load_metadata(context, rest, NS, "stable")?;
@@ -1582,9 +1590,23 @@ impl Documents {
             logical_rows == count,
             "publication logical rows differ from the complete MV: P={logical_rows:?} actual={count:?}"
         );
+        let (first_private_bytes, first_binding) =
+            first_ordinary.context("first ordinary refresh graph is missing")?;
         ensure!(
-            graph.private_bytes <= 262144 && graph.record_bytes.iter().all(|b| *b <= 4096),
-            "inline documents exceeded frozen limits"
+            graph.private_bytes == first_private_bytes,
+            "ordinary refreshes grew private properties: first={first_private_bytes}, final={}",
+            graph.private_bytes
+        );
+        // Graph counts every private record. One MV record in each snapshot
+        // and the matching total exclude additional records in any snapshot.
+        ensure!(
+            graph.record_bytes.len() == graph.snapshots.len()
+                && graph.snapshots.iter().all(|(_, record)| {
+                    record.as_ref().is_some_and(|record| {
+                        record.binding.as_deref() == Some(first_binding.as_str())
+                    })
+                }),
+            "ordinary refresh snapshots must each carry one record of the first binding"
         );
         let start = self.audit()?.len();
         execute(

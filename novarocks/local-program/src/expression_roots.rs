@@ -441,6 +441,7 @@ impl<H> RootCollector<'_, '_, H> {
         use EvaluationDemand::{TruthOnly, Value};
         use ProgramNodeExpressionRole as Role;
         match kind {
+            ProgramNodeKind::SystemRelation { .. } => {}
             ProgramNodeKind::Values { values } => {
                 // Constant cells are materialized backing; only dynamic cells
                 // are runtime roots, in row-major order.
@@ -459,6 +460,7 @@ impl<H> RootCollector<'_, '_, H> {
             ProgramNodeKind::AssertNumRows { .. }
             | ProgramNodeKind::Repeat { .. }
             | ProgramNodeKind::UnionAll { .. }
+            | ProgramNodeKind::PositionShard { .. }
             | ProgramNodeKind::Limit { .. }
             | ProgramNodeKind::TableFunction { .. }
             | ProgramNodeKind::GenerateSeries { .. }

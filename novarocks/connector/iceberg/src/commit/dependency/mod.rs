@@ -18,15 +18,20 @@
 //! Dependency validation reads only the input class that the dependency requires.
 
 mod builtin;
-#[cfg(test)]
-mod history;
+#[allow(
+    dead_code,
+    reason = "RWM-12 and RWM-17 consume the history facts after switching their policies."
+)]
+pub(crate) mod history;
 mod inputs;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
 #[cfg(test)]
 pub use history::{HistoryGap, HistoryWindow, history_window};
-pub use inputs::{LiveEntry, LiveSet, ValidationInputs};
+#[cfg(test)]
+pub use inputs::LiveSet;
+pub use inputs::ValidationInputs;
 
 use super::model::{Dependency, EntryIdentity};
 

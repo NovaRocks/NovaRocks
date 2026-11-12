@@ -505,7 +505,7 @@ impl ConnectorMetadata for IcebergMetadata {
         self.ensure_owner(&request.instance_id)?;
         let namespaces = self
             .runtime
-            .list_namespaces_for_request(&request.context, request.bound);
+            .list_namespaces_for_request(&request.context, request.page_size);
         self.validate_context(&request.context)?;
         namespaces
             .map_err(classified_control_error)?
@@ -530,7 +530,7 @@ impl ConnectorMetadata for IcebergMetadata {
             self.ensure_owner(&request.instance_id)?;
             let namespaces = self
                 .runtime
-                .list_namespaces_for_request_async(&request.context, request.bound)
+                .list_namespaces_for_request_async(&request.context, request.page_size)
                 .await;
             self.validate_context(&request.context)?;
             namespaces
@@ -639,7 +639,7 @@ impl ConnectorMetadata for IcebergMetadata {
         let tables = self.runtime.list_tables_for_request(
             &request.namespace.namespace,
             &request.context,
-            request.bound,
+            request.page_size,
         );
         self.validate_context(&request.context)?;
         tables
@@ -668,7 +668,7 @@ impl ConnectorMetadata for IcebergMetadata {
                 .list_tables_for_request_async(
                     &request.namespace.namespace,
                     &request.context,
-                    request.bound,
+                    request.page_size,
                 )
                 .await;
             self.validate_context(&request.context)?;
@@ -1457,6 +1457,11 @@ pub(crate) fn build_table_metadata(
         row_mutation_frozen_source: false,
         hidden_columns,
     };
+    let mutation_metadata = if payload.metadata_table_type.is_none() {
+        mutation_metadata_schema(metadata, &definition_schema)?
+    } else {
+        None
+    };
     let (schema, execution_schema) = if let Some(metadata_table_type) = payload.metadata_table_type
     {
         let columns = metadata_table_output_columns(metadata_table_type, metadata, creation)?;
@@ -1473,6 +1478,9 @@ pub(crate) fn build_table_metadata(
         // `_last_updated_sequence_number` unresolvable.
         let mut fields = base_schema.fields().to_vec();
         fields.extend(metadata_arrow_fields(&payload.metadata_columns)?);
+        if let Some(mutation) = &mutation_metadata {
+            fields.extend(mutation.arrow_fields()?);
+        }
         let schema = Arc::new(Schema::new_with_metadata(
             fields,
             base_schema.metadata().clone(),
@@ -1481,6 +1489,7 @@ pub(crate) fn build_table_metadata(
             &nominal_document,
             definition_schema.as_ref(),
             &payload.metadata_columns,
+            mutation_metadata.as_ref(),
             creation,
         )?;
         (schema, execution)
@@ -1488,10 +1497,17 @@ pub(crate) fn build_table_metadata(
     let planning_facts = if payload.metadata_table_type.is_some() {
         ConnectorTablePlanningFacts::empty()
     } else {
+        let mut metadata_columns = payload.metadata_columns.clone();
+        if let Some(mutation) = &mutation_metadata {
+            metadata_columns.extend([
+                mutation.spec_field().name.clone(),
+                mutation.partition_field().name.clone(),
+            ]);
+        }
         let input = IcebergTablePlanningFactsInput {
             schema: &schema,
             iceberg_schema: Some(definition_schema.as_ref()),
-            metadata_columns: &payload.metadata_columns,
+            metadata_columns: &metadata_columns,
             hidden_columns: &payload.hidden_columns,
             nominal_declarations: &nominal_document.nominals,
             table_metadata: Some(metadata),
@@ -2176,6 +2192,11 @@ pub(crate) fn projected_schema_with_metadata(
     let mut fields = storage.fields().to_vec();
     let metadata_fields = metadata_arrow_fields(&table.metadata_columns)?;
     fields.extend(metadata_fields);
+    if !table.row_mutation_frozen_source
+        && let Some(mutation) = mutation_metadata_schema(metadata, &storage_schema)?
+    {
+        fields.extend(mutation.arrow_fields()?);
+    }
     let indexes = if projection.is_empty() {
         (0..fields.len()).collect::<Vec<_>>()
     } else {
@@ -2464,7 +2485,7 @@ fn select_snapshot(
 fn is_metadata_column(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number"
+        "_file" | "_pos" | "_row_id" | "_last_updated_sequence_number" | "_spec_id" | "_partition"
     )
 }
 
@@ -2683,6 +2704,17 @@ fn annotate_hidden_fields(schema: SchemaRef, hidden: &[String]) -> SchemaRef {
         })
         .collect();
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+pub(crate) fn mutation_metadata_schema(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
+) -> Result<Option<crate::typed_read::schema_binding::MutationMetadataSchema>, ConnectorError> {
+    (metadata.format_version() >= crate::iceberg::spec::FormatVersion::V2)
+        .then(|| {
+            crate::typed_read::schema_binding::MutationMetadataSchema::try_new(metadata, schema)
+        })
+        .transpose()
 }
 
 pub(crate) fn metadata_column_names(metadata: &crate::iceberg::spec::TableMetadata) -> Vec<String> {
@@ -3459,7 +3491,9 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
         assert_eq!(
@@ -3471,7 +3505,9 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
         for metadata in [&to, &current] {
@@ -3484,6 +3520,18 @@ mod plan_splits_pruning_tests {
                         .is_nullable()
                 );
             }
+            let spec = metadata.schema().field_with_name("_spec_id").unwrap();
+            assert_eq!(spec.data_type(), &arrow::datatypes::DataType::Int32);
+            assert!(!spec.is_nullable());
+            let partition = metadata.schema().field_with_name("_partition").unwrap();
+            assert!(partition.is_nullable());
+            let arrow::datatypes::DataType::Struct(fields) = partition.data_type() else {
+                panic!("expected a mutation partition struct");
+            };
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name(), "future_partition");
+            assert_eq!(fields[0].data_type(), &arrow::datatypes::DataType::Int32);
+            assert!(fields[0].is_nullable());
         }
         assert_eq!(
             to.execution_schema()
@@ -3498,17 +3546,19 @@ mod plan_splits_pruning_tests {
                 "_file",
                 "_pos",
                 "_row_id",
-                "_last_updated_sequence_number"
+                "_last_updated_sequence_number",
+                "_spec_id",
+                "_partition"
             ]
         );
-        assert_eq!(to.planning_facts.column_facts().len(), 6);
+        assert_eq!(to.planning_facts.column_facts().len(), 8);
         assert_eq!(
             to.planning_facts
                 .column_facts()
                 .iter()
                 .map(|f| f.field_ordinal())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5]
+            [0, 1, 2, 3, 4, 5, 6, 7]
         );
         assert_eq!(to.planning_facts.column_facts()[1].write_default(), None);
         assert_eq!(
@@ -4569,8 +4619,24 @@ mod plan_splits_pruning_tests {
                     .unwrap();
                 drop(owner.take());
                 assert!(weak.upgrade().is_none());
-                assert_eq!(result.to_metadata().schema().field(0).name(), "id");
-                assert_eq!(result.to_metadata().schema().fields().len(), 3);
+                let schema = result.to_metadata().schema();
+                assert_eq!(
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>(),
+                    ["id", "_file", "_pos", "_spec_id", "_partition"],
+                );
+                assert!(!schema.field(3).is_nullable());
+                assert_eq!(
+                    schema.field(3).data_type(),
+                    &arrow::datatypes::DataType::Int32
+                );
+                assert_eq!(
+                    schema.field(4).data_type(),
+                    &arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::empty()),
+                );
             });
         }
     }
@@ -4764,7 +4830,7 @@ mod plan_splits_pruning_tests {
         }
         async fn list_namespaces(
             &self,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_namespaces(bound).await
         }
@@ -4777,7 +4843,7 @@ mod plan_splits_pruning_tests {
         async fn list_tables(
             &self,
             name: crate::catalog::CatalogNamespaceName,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_tables(name, bound).await
         }
@@ -4803,7 +4869,7 @@ mod plan_splits_pruning_tests {
         async fn list_views(
             &self,
             name: crate::catalog::CatalogNamespaceName,
-            bound: novarocks_spi::connector::ConnectorListingBound,
+            bound: novarocks_spi::connector::ConnectorListingPageSize,
         ) -> Result<Vec<String>, ConnectorError> {
             self.inner.list_views(name, bound).await
         }

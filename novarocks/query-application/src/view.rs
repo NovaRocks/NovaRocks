@@ -80,36 +80,9 @@ pub struct ResolvedExternalView {
     pub properties: HashMap<String, String>,
 }
 
-/// Pure SHOW preparation, before any selected Provider is called.
-/// Local names and external names share the same original result author.
-pub enum ShowViewsSource {
-    Local(Vec<String>),
-    External { catalog: String, namespace: String },
-}
-pub struct PreparedShowViews {
-    pub column_name: String,
-    pub source: ShowViewsSource,
-}
-impl PreparedShowViews {
-    pub fn finish(self, mut names: Vec<String>) -> Result<QueryResult, String> {
-        if matches!(self.source, ShowViewsSource::External { .. }) {
-            names.sort();
-            names.dedup();
-        }
-        names.sort();
-        crate::view_service::build_query_result(vec![(self.column_name, names)])
-    }
-}
-
 /// Query-application-owned view command and declaration service.
 pub trait ViewService: Send + Sync {
     fn catalog_snapshot(&self) -> Result<LocalViewSnapshot, String>;
-
-    fn prepare_show_views(
-        &self,
-        statement: &novarocks_parser::ast::ShowViews,
-        context: ViewRequestContext<'_>,
-    ) -> Result<PreparedShowViews, String>;
 
     fn execute_statement(
         &self,

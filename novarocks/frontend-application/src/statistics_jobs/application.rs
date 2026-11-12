@@ -497,6 +497,17 @@ impl StatisticsApplicationError {
         }
     }
 
+    /// Preserve the original connector fact at synchronous command admission.
+    pub(crate) fn into_command_error(self) -> novarocks_query_application::api::CommandError {
+        use novarocks_query_application::api::{CommandError, CommandErrorKind};
+        match self.source {
+            Some(source) => CommandError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(source),
+            ),
+            None => CommandError::new(CommandErrorKind::Rejected, self.message),
+        }
+    }
+
     pub(crate) fn from_statistics_job(
         job: &novarocks_statistics_application::StatisticsJob,
     ) -> Self {

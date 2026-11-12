@@ -459,7 +459,8 @@ fn relation_occurrence_ids(
             ids.extend(relation_occurrence_ids(&join.right, builder)?);
             Ok(ids)
         }
-        Relation::IcebergMetadataScan(_)
+        Relation::SystemTable { .. }
+        | Relation::IcebergMetadataScan(_)
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)
@@ -565,7 +566,8 @@ fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Re
             let lineages = register_query(query, builder)?;
             bind_output_lineages(output_columns, &lineages, builder)
         }
-        Relation::IcebergMetadataScan(_)
+        Relation::SystemTable { .. }
+        | Relation::IcebergMetadataScan(_)
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)
@@ -706,7 +708,8 @@ fn collect_relation_semantics(
             collect_relation_semantics(&join.left, branch_occurrences, builder)?;
             collect_relation_semantics(&join.right, branch_occurrences, builder)
         }
-        Relation::Scan(_)
+        Relation::SystemTable { .. }
+        | Relation::Scan(_)
         | Relation::IcebergMetadataScan(_)
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)

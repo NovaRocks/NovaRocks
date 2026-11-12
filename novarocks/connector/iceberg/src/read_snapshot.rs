@@ -23,14 +23,24 @@ use std::sync::Arc;
 use crate::delete_semantics::{
     DataFileFact, DeleteCandidateIndex, DeleteContentAddress, DeleteKind, DeleteObservation,
     DeleteReadFacts, EntrySequence, EqualityFieldGroup, FieldMetrics, FileMetrics, LoadView,
-    ManifestDeleteObservation, POSITION_FILE_PATH_FIELD_ID, PinnedEndpointFacts, RawDeleteEntry,
-    RawDeleteFile, ReadDomain, ReadObservationId, StatisticsPolicy, TypedPartition,
+    POSITION_FILE_PATH_FIELD_ID, PinnedEndpointFacts, RawDeleteEntry, RawDeleteFile, ReadDomain,
+    ReadObservationId, StatisticsPolicy, TypedPartition,
 };
+#[cfg(test)]
+use crate::iceberg::spec::Literal;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, Literal, ManifestFile, ManifestStatus, NestedField,
-    PrimitiveLiteral, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, ManifestFile, ManifestStatus,
+    NestedField, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
+use crate::manifest::binding::BoundEntry;
+#[cfg(test)]
+use crate::manifest::partition_types::legal_partition_type_join;
+pub(crate) use crate::manifest::partition_types::{
+    PartitionSourceTypeFailure, partition_source_types, partition_source_types_checked,
+    resolved_partition_primitive, resolved_partition_values,
+};
+use crate::manifest::source::ManifestSource;
 use crate::read_model::{
     IcebergDataFileMetadata, IcebergReadFile, IcebergReadSnapshot, iceberg_partition_key,
 };
@@ -72,9 +82,26 @@ pub(crate) fn mint_read_domain(
 
 /// Resolve storage partition types once from the pinned field-ID history.
 /// A missing projected source does not erase its historical storage facts.
-fn frozen_partition_types(
+pub(crate) fn frozen_partition_types(
     metadata: &TableMetadata,
     query: &Schema,
+) -> Result<BTreeMap<i32, StructType>, String> {
+    resolve_partition_types(metadata, query, false)
+}
+
+/// A mutation's signed file metadata is independent of the source query's
+/// schema projection, including a historical branch's narrower field type.
+pub(crate) fn historical_mutation_partition_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+) -> Result<BTreeMap<i32, StructType>, String> {
+    resolve_partition_types(metadata, query, true)
+}
+
+fn resolve_partition_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+    prefer_historical: bool,
 ) -> Result<BTreeMap<i32, StructType>, String> {
     let mut sources = BTreeMap::<i32, (PrimitiveType, PrimitiveType)>::new();
     for spec in metadata.partition_specs_iter() {
@@ -94,13 +121,18 @@ fn frozen_partition_types(
                 .iter()
                 .map(|field| {
                     let (query_source, storage_proof) = &sources[&field.source_id];
+                    let preferred = if prefer_historical {
+                        storage_proof
+                    } else {
+                        query_source
+                    };
                     // The query may predate a transform introduced by a later
                     // spec (for example hour after Date -> Timestamp). Prove
                     // that spec's storage type from the retained legal chain;
                     // do not force its unrelated query projection to change.
                     let ty = match field
                         .transform
-                        .result_type(&Type::Primitive(query_source.clone()))
+                        .result_type(&Type::Primitive(preferred.clone()))
                     {
                         Ok(ty) => ty,
                         Err(_) => field
@@ -120,142 +152,20 @@ fn frozen_partition_types(
         .collect()
 }
 
-/// A historical type failure never replaces its creating caller's control cause.
-#[derive(Debug)]
-pub(crate) enum PartitionSourceTypeFailure<E> {
-    Semantic(String),
-    Original(E),
-}
-impl<E> From<String> for PartitionSourceTypeFailure<E> {
-    fn from(message: String) -> Self {
-        Self::Semantic(message)
-    }
-}
-
-pub(crate) fn partition_source_types(
-    metadata: &TableMetadata,
-    query: &Schema,
-    source_id: i32,
-) -> Result<(PrimitiveType, PrimitiveType), String> {
-    partition_source_types_checked(metadata, query, source_id, || {
-        Ok::<(), std::convert::Infallible>(())
-    })
-    .map_err(|cause| match cause {
-        PartitionSourceTypeFailure::Semantic(message) => message,
-        PartitionSourceTypeFailure::Original(never) => match never {},
-    })
-}
-
-/// One exact retained-type policy shared by read domains and metadata authors.
-/// Primitive declarations own no variable-size backing; each schema lookup is
-/// observed before entry and caller failures retain their original identity.
-pub(crate) fn partition_source_types_checked<E>(
-    metadata: &TableMetadata,
-    query: &Schema,
-    source_id: i32,
-    mut active: impl FnMut() -> Result<(), E>,
-) -> Result<(PrimitiveType, PrimitiveType), PartitionSourceTypeFailure<E>> {
-    let mut historical = None;
-    for schema in metadata.schemas_iter() {
-        active().map_err(PartitionSourceTypeFailure::Original)?;
-        let Some(source) = schema.field_by_id(source_id) else {
-            continue;
-        };
-        let Type::Primitive(ty) = source.field_type.as_ref() else {
-            return Err(format!(
-                "partition source {} is not primitive in retained schema {}",
-                source_id,
-                schema.schema_id()
-            )
-            .into());
-        };
-        historical = Some(match historical {
-            None => ty.clone(),
-            Some(previous) => legal_partition_type_join(metadata.format_version(), &previous, ty)
-                .ok_or_else(|| {
-                format!(
-                    "partition source {} has incompatible retained types {previous:?} and {ty:?}",
-                    source_id
-                )
-            })?,
-        });
-    }
-    let historical = historical.ok_or_else(|| {
-        format!(
-            "partition source {} has no retained schema type evidence",
-            source_id
-        )
-    })?;
-    active().map_err(PartitionSourceTypeFailure::Original)?;
-    let resolved = match query.field_by_id(source_id) {
-        Some(source) => {
-            let Type::Primitive(ty) = source.field_type.as_ref() else {
-                return Err(format!(
-                    "partition source {} is not primitive in the query schema",
-                    source_id
-                )
-                .into());
-            };
-            legal_partition_type_join(metadata.format_version(), &historical, ty).ok_or_else(
-                || {
-                    format!(
-                        "query partition source {} conflicts with retained schema types",
-                        source_id
-                    )
-                },
-            )?;
-            ty.clone()
-        }
-        None => historical.clone(),
-    };
-    Ok((resolved, historical))
-}
-
-fn legal_partition_type_join(
-    version: crate::iceberg::spec::FormatVersion,
-    a: &PrimitiveType,
-    b: &PrimitiveType,
-) -> Option<PrimitiveType> {
-    use PrimitiveType::*;
-    if a == b {
-        return Some(a.clone());
-    }
-    match (a, b) {
-        (Int, Long) | (Long, Int) => Some(Long),
-        (Float, Double) | (Double, Float) => Some(Double),
-        (Date, Timestamp) | (Timestamp, Date)
-            if version == crate::iceberg::spec::FormatVersion::V3 =>
-        {
-            Some(Timestamp)
-        }
-        (Date, TimestampNs) | (TimestampNs, Date)
-            if version == crate::iceberg::spec::FormatVersion::V3 =>
-        {
-            Some(TimestampNs)
-        }
-        (
-            Decimal {
-                precision: p,
-                scale: s,
-            },
-            Decimal {
-                precision: q,
-                scale: t,
-            },
-        ) if s == t => Some(Decimal {
-            precision: (*p).max(*q),
-            scale: *s,
-        }),
-        _ => None,
-    }
-}
-
-fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
+pub(crate) fn metadata_identity(metadata: &TableMetadata) -> Result<String, String> {
     // This is a canonical fact identity, not the raw metadata object's digest.
     // SDK map/set iteration cannot change a pinned relation's identity.
+    let digest = metadata_identity_digest(metadata)?;
+    Ok(format!(
+        "sha256:{:x}",
+        sha2::digest::Output::<Sha256>::from(digest)
+    ))
+}
+
+pub(crate) fn metadata_identity_digest(metadata: &TableMetadata) -> Result<[u8; 32], String> {
     let bytes =
         crate::delete_semantics::canonical_metadata_json(metadata).map_err(|e| e.to_string())?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    Ok(Sha256::digest(bytes).into())
 }
 
 pub async fn build_read_snapshot_at(
@@ -555,14 +465,16 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             continue;
         }
         seen_manifests.insert(key);
+        let source =
+            ManifestSource::committed(snapshot_id, snapshot.manifest_list(), manifest_file);
         let manifest = match io {
             Some(io) => {
                 let bytes = io.read(&manifest_file.manifest_path).await?;
-                crate::manifest::decode_manifest(&bytes, manifest_file).map_err(|error| {
+                crate::manifest::parse_manifest_checked(&bytes).map_err(|error| {
                     ReadFailure::Original(crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::raw_read_failure(error).into())
                 })?
             }
-            None => crate::manifest::load_manifest(manifest_file, table.file_io())
+            None => source.load(table.file_io())
                 .await
                 .map_err(|error| {
                     if error.kind() == crate::iceberg::ErrorKind::FeatureUnsupported {
@@ -606,25 +518,15 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         }
         let mut delete_entries = Vec::new();
 
-        let mut next_first_row_id = manifest_file
-            .first_row_id
-            .map(|v| i64::try_from(v).map_err(|_| format!("manifest first_row_id too large: {v}")))
-            .transpose()?;
-        for entry in manifest.entries() {
+        for entry in source.bind(&manifest).map_err(|error| error.to_string())? {
             check_read_control(control)?;
             check_cow_active(capture)?;
-            // Deleted entries are not live facts; unresolved sequence metadata
-            // on them cannot become a read failure or an inheritance fallback.
-            if entry.status == ManifestStatus::Deleted {
+            let entry = entry.map_err(|error| error.to_string())?;
+            // Historical tombstones are excluded from the live read observation.
+            if entry.raw.status == ManifestStatus::Deleted {
                 continue;
             }
-            let sequence = EntrySequence {
-                format_version: manifest.metadata().format_version,
-                status: entry.status,
-                data_sequence: entry.sequence_number(),
-                manifest_sequence: manifest_file.sequence_number,
-            };
-            let df = entry.data_file();
+            let df = entry.raw.data_file();
             let typed_partition = if let Some(capture) = capture {
                 TypedPartition::bind_type_checked(
                     spec,
@@ -646,18 +548,10 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
             let metrics = manifest_metrics_checked(df, &schema, capture)?;
             match df.content_type() {
                 DataContentType::Data => {
-                    let count = i64::try_from(df.record_count())
+                    i64::try_from(df.record_count())
                         .map_err(|_| format!("record_count too large for {}", df.file_path()))?;
-                    let first_row_id = df.first_row_id().or(next_first_row_id);
-                    if let Some(next) = next_first_row_id.as_mut() {
-                        *next = next.checked_add(count).ok_or_else(|| {
-                            format!(
-                                "first_row_id overflow for manifest {}",
-                                manifest_file.manifest_path
-                            )
-                        })?;
-                    }
-
+                    let sequence =
+                        observed_data_sequence(&entry, manifest.metadata().format_version);
                     let data = DataFileFact::try_new(
                         df.file_path(),
                         sequence.required_sequence().map_err(|e| e.to_string())?,
@@ -673,109 +567,39 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                         data,
                         values,
                         manifest_file.manifest_path.clone(),
-                        first_row_id,
+                        entry.first_row_id,
                     ));
                 }
                 DataContentType::PositionDeletes | DataContentType::EqualityDeletes => {
-                    i64::try_from(df.file_size_in_bytes()).map_err(|_| {
-                        format!("delete file size is unrepresentable: {}", df.file_path())
-                    })?;
-                    i64::try_from(df.record_count()).map_err(|_| {
-                        format!("delete record count is unrepresentable: {}", df.file_path())
-                    })?;
-
-                    let (address, kind) = match (df.content_type(), df.file_format()) {
-                        (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
-                            let offset = df.content_offset().ok_or_else(|| {
-                                format!("Puffin DV {} missing content_offset", df.file_path())
-                            })?;
-                            let size = df.content_size_in_bytes().ok_or_else(|| {
-                                format!(
-                                    "Puffin DV {} missing content_size_in_bytes",
-                                    df.file_path()
-                                )
-                            })?;
-                            let target = df.referenced_data_file().ok_or_else(|| {
-                                format!("Puffin DV {} missing referenced_data_file", df.file_path())
-                            })?;
-                            (
-                                DeleteContentAddress::puffin(
-                                    df.file_path(),
-                                    offset,
-                                    size,
-                                    df.file_size_in_bytes(),
-                                ),
-                                DeleteKind::DeletionVector {
-                                    exact_target: target.into(),
-                                },
-                            )
-                        }
-                        (DataContentType::PositionDeletes, DataFileFormat::Parquet) => (
-                            DeleteContentAddress::file(df.file_path()),
-                            DeleteKind::Position {
-                                exact_target: df.referenced_data_file().map(Arc::from),
-                            },
-                        ),
-                        (DataContentType::EqualityDeletes, DataFileFormat::Parquet) => {
-                            let ids = df.equality_ids().ok_or_else(|| {
-                                format!("equality delete {} missing equality_ids", df.file_path())
-                            })?;
-                            let fields = EqualityFieldGroup::bind(&ids, &schema)
-                                .map_err(|e| e.to_string())?;
-                            (
-                                DeleteContentAddress::file(df.file_path()),
-                                DeleteKind::Equality(fields),
-                            )
-                        }
-                        _ => {
-                            return Err(format!(
-                                "unsupported Iceberg delete format {:?}: {}",
-                                df.file_format(),
-                                df.file_path()
-                            )
-                            .into());
-                        }
-                    };
-                    if df.key_metadata().is_some_and(|k| !k.is_empty()) {
-                        return Err(format!(
-                            "Iceberg encrypted delete file {} is unsupported",
-                            df.file_path()
-                        )
-                        .into());
-                    }
-                    delete_entries.push(RawDeleteEntry {
-                        sequence,
-                        file: RawDeleteFile {
-                            address: address.map_err(|e| e.to_string())?,
-                            kind,
-                            partition: typed_partition,
-                            read: DeleteReadFacts {
-                                format: df.file_format().into(),
-                                file_size: df.file_size_in_bytes(),
-                                record_count: df.record_count(),
-                                key_metadata: Arc::from(df.key_metadata().unwrap_or_default()),
-                            },
+                    delete_entries.push((
+                        Some(entry.ordinal),
+                        observed_raw_delete_entry(
+                            &entry,
+                            manifest.metadata().format_version,
+                            &schema,
+                            typed_partition,
                             metrics,
-                        },
-                    });
+                        )?,
+                    ));
                 }
             }
         }
 
-        delete_manifests.push(ManifestDeleteObservation {
-            manifest_path: Arc::from(manifest_file.manifest_path.as_str()),
-            entries: delete_entries,
-        });
+        delete_manifests.push((
+            Arc::from(manifest_file.manifest_path.as_str()),
+            delete_entries,
+        ));
     }
 
-    let observation =
-        DeleteObservation::from_manifests_checked(delete_manifests, || check_cow_active(capture))
-            .map_err(|e| match e {
-            crate::delete_semantics::ConstructionFailure::Semantic(e) => {
-                ReadFailure::Semantic(e.to_string())
-            }
-            crate::delete_semantics::ConstructionFailure::Original(e) => e,
-        })?;
+    let observation = DeleteObservation::from_source_entries_checked(delete_manifests, || {
+        check_cow_active(capture)
+    })
+    .map_err(|e| match e {
+        crate::delete_semantics::ConstructionFailure::Semantic(e) => {
+            ReadFailure::Semantic(e.to_string())
+        }
+        crate::delete_semantics::ConstructionFailure::Original(e) => e,
+    })?;
     if let Some(receiving) = all_deletes {
         if !receiving.is_empty() {
             return Err(ReadFailure::Semantic(
@@ -799,7 +623,15 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         check_read_control(control)?;
         check_cow_active(capture)?;
 
-        let logical = index.for_data(&data).map_err(|e| e.to_string())?;
+        let logical = index.for_data(&data).map_err(|error| {
+            if error.kind == crate::delete_semantics::DeleteSemanticsErrorKind::InvalidPartition {
+                ReadFailure::Original(
+                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.message).into(),
+                )
+            } else {
+                ReadFailure::Semantic(error.message)
+            }
+        })?;
         let deletes = metadata_delete_load_view(&logical);
         files.push(df.into_file(
             FinalReadFileFacts {
@@ -1044,39 +876,92 @@ impl ObservedDataFileProjection for FrozenCowDataFileProjection {
     }
 }
 
-pub(crate) fn resolved_partition_values(
-    values: &Struct,
-    partition_type: &crate::iceberg::spec::StructType,
-) -> Struct {
-    Struct::from_iter(
-        values
-            .fields()
-            .iter()
-            .zip(partition_type.fields())
-            .map(|(value, field)| match (value, field.field_type.as_ref()) {
-                (Some(Literal::Primitive(value)), Type::Primitive(target)) => Some(
-                    Literal::Primitive(resolved_partition_primitive(value, target).into_owned()),
-                ),
-                _ => value.clone(),
-            }),
-    )
+fn observed_data_sequence(entry: &BoundEntry<'_>, format_version: FormatVersion) -> EntrySequence {
+    EntrySequence {
+        format_version,
+        status: entry.raw.status,
+        data_sequence: entry.sequences.data_sequence,
+        manifest_sequence: entry.source.descriptor.sequence_number,
+    }
 }
 
-/// The admitted lossless partition promotions; unrelated literals remain exact
-/// and are rejected by their final typed consumer rather than coerced here.
-pub(crate) fn resolved_partition_primitive<'a>(
-    value: &'a PrimitiveLiteral,
-    target: &PrimitiveType,
-) -> std::borrow::Cow<'a, PrimitiveLiteral> {
-    match (value, target) {
-        (PrimitiveLiteral::Int(value), PrimitiveType::Long) => {
-            std::borrow::Cow::Owned(PrimitiveLiteral::Long(i64::from(*value)))
+/// Preserve the raw observation until duplicate and applicability checks close it.
+pub(crate) fn observed_raw_delete_entry(
+    entry: &BoundEntry<'_>,
+    format_version: FormatVersion,
+    schema: &Schema,
+    partition: TypedPartition,
+    metrics: FileMetrics,
+) -> Result<RawDeleteEntry, String> {
+    let df = entry.raw.data_file();
+    i64::try_from(df.file_size_in_bytes())
+        .map_err(|_| format!("delete file size is unrepresentable: {}", df.file_path()))?;
+    i64::try_from(df.record_count())
+        .map_err(|_| format!("delete record count is unrepresentable: {}", df.file_path()))?;
+
+    let (address, kind) = match (df.content_type(), df.file_format()) {
+        (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
+            let offset = df
+                .content_offset()
+                .ok_or_else(|| format!("Puffin DV {} missing content_offset", df.file_path()))?;
+            let size = df.content_size_in_bytes().ok_or_else(|| {
+                format!("Puffin DV {} missing content_size_in_bytes", df.file_path())
+            })?;
+            let target = df.referenced_data_file().ok_or_else(|| {
+                format!("Puffin DV {} missing referenced_data_file", df.file_path())
+            })?;
+            (
+                DeleteContentAddress::puffin(df.file_path(), offset, size, df.file_size_in_bytes()),
+                DeleteKind::DeletionVector {
+                    exact_target: target.into(),
+                },
+            )
         }
-        (PrimitiveLiteral::Float(value), PrimitiveType::Double) => {
-            std::borrow::Cow::Owned(PrimitiveLiteral::Double(f64::from(value.0).into()))
+        (DataContentType::PositionDeletes, DataFileFormat::Parquet) => (
+            DeleteContentAddress::file(df.file_path()),
+            DeleteKind::Position {
+                exact_target: df.referenced_data_file().map(Arc::from),
+            },
+        ),
+        (DataContentType::EqualityDeletes, DataFileFormat::Parquet) => {
+            let ids = df.equality_ids().ok_or_else(|| {
+                format!("equality delete {} missing equality_ids", df.file_path())
+            })?;
+            let fields = EqualityFieldGroup::bind(&ids, schema).map_err(|e| e.to_string())?;
+            (
+                DeleteContentAddress::file(df.file_path()),
+                DeleteKind::Equality(fields),
+            )
         }
-        _ => std::borrow::Cow::Borrowed(value),
+        _ => {
+            return Err(format!(
+                "unsupported Iceberg delete format {:?}: {}",
+                df.file_format(),
+                df.file_path()
+            ));
+        }
+    };
+    if df.key_metadata().is_some_and(|k| !k.is_empty()) {
+        return Err(format!(
+            "Iceberg encrypted delete file {} is unsupported",
+            df.file_path()
+        ));
     }
+    Ok(RawDeleteEntry {
+        sequence: observed_data_sequence(entry, format_version),
+        file: RawDeleteFile {
+            address: address.map_err(|e| e.to_string())?,
+            kind,
+            partition,
+            read: DeleteReadFacts {
+                format: df.file_format().into(),
+                file_size: df.file_size_in_bytes(),
+                record_count: df.record_count(),
+                key_metadata: Arc::from(df.key_metadata().unwrap_or_default()),
+            },
+            metrics,
+        },
+    })
 }
 
 fn manifest_metrics_checked(
@@ -2344,7 +2229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn avro_exact_position_target_ignores_the_delete_partition_tuple() {
+    async fn avro_exact_position_target_rejects_a_different_delete_partition_tuple() {
         let data = file(
             "a",
             DataContentType::Data,
@@ -2361,17 +2246,12 @@ mod tests {
         .build()
         .unwrap();
         let table = table(vec![vec![(data, 5)], vec![(delete, 5)]], None, true).await;
-        let snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
-        assert_eq!(snapshot.files[0].deletes.member_count(), 1);
-        assert_ne!(
-            snapshot.files[0]
-                .deletes
-                .members()
-                .next()
-                .unwrap()
-                .partition(),
-            snapshot.files[0].logical_delete_set().data().partition()
-        );
+        let error = build_read_snapshot_at_with_control(&table, 77, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.message().contains("partition differs from target a"));
+        assert!(error.message().contains("delete spec 0, data spec 0"));
     }
 
     #[tokio::test]
@@ -2432,7 +2312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn avro_exact_target_ignores_delete_spec_for_positions_and_dvs() {
+    async fn avro_exact_target_rejects_different_delete_spec_for_positions_and_dvs() {
         for puffin in [false, true] {
             let values = Struct::from_iter([Some(Literal::string("emea"))]);
             let mut delete = file(
@@ -2457,12 +2337,9 @@ mod tests {
                 true,
             )
             .await;
-            let snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
-            let read = &snapshot.files[0];
-            let fact = read.deletes.members().next().unwrap();
-            assert_eq!(read.logical_delete_set().data().partition().spec_id(), 0);
-            assert_eq!(fact.partition().spec_id(), 1);
-            assert_eq!(read.deletes.member_count(), 1);
+            let error = build_read_snapshot_at(&table, 77).await.unwrap_err();
+            assert!(error.contains("partition differs from target a"), "{error}");
+            assert!(error.contains("delete spec 1, data spec 0"), "{error}");
         }
     }
 

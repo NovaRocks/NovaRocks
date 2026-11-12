@@ -34,6 +34,15 @@ use novarocks_type_contract::{
 };
 use std::sync::{Arc, LazyLock, Mutex};
 
+fn query_ast(sql: &str) -> Box<novarocks_parser::ast::Query> {
+    let mut statements = novarocks_parser::parse(sql).unwrap();
+    assert_eq!(statements.len(), 1);
+    let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+        panic!("expected one query");
+    };
+    Box::new(query)
+}
+
 #[derive(Clone)]
 enum Mode {
     CompiledCore,
@@ -306,7 +315,7 @@ pub(super) fn compile_with_observer(
     };
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([83; 16]).unwrap(),
-        SqlStatementInput::sql(sql),
+        SqlStatementInput::parsed_query(query_ast(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),

@@ -261,8 +261,6 @@ mod tests {
                     creation: FrozenCreation {
                         resource: PayloadRef(NonZeroU64::new(u64::from(value)).unwrap()),
                         queued_bytes: 256,
-                        plan_carrier_bytes: 0,
-                        descriptor_encoded_bytes: 0,
                     },
                 },
             );

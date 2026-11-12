@@ -831,10 +831,6 @@ fn lower_statistics_command(
         StatisticsStatement::ShowTableStats(statement) => StatisticsSqlCommand::ShowTableStats {
             table: lower_object_name(&statement.name),
         },
-        StatisticsStatement::ShowBasicStatsMeta(_) => StatisticsSqlCommand::ShowBasicStatsMeta,
-        StatisticsStatement::ShowHistogramStatsMeta(_) => {
-            StatisticsSqlCommand::ShowHistogramStatsMeta
-        }
         StatisticsStatement::DropStats(statement) => StatisticsSqlCommand::DropStats {
             table: lower_object_name(&statement.name),
         },
@@ -1482,8 +1478,6 @@ mod tests {
             ("SHOW ANALYZE JOBS", "SHOW ANALYZE"),
             ("CANCEL ANALYZE job-7", "CANCEL ANALYZE"),
             ("SHOW TABLE STATS lake.db.events", "SHOW TABLE STATS"),
-            ("SHOW BASIC STATS META", "SHOW BASIC STATS META"),
-            ("SHOW HISTOGRAM STATS META", "SHOW HISTOGRAM STATS META"),
             ("DROP STATS lake.db.events", "DROP STATS"),
             (
                 "DROP HISTOGRAM ON lake.db.events (event_type)",
@@ -1507,8 +1501,6 @@ mod tests {
                 StatisticsSqlCommand::ShowAnalyzeJobs => "SHOW ANALYZE",
                 StatisticsSqlCommand::CancelAnalyze { .. } => "CANCEL ANALYZE",
                 StatisticsSqlCommand::ShowTableStats { .. } => "SHOW TABLE STATS",
-                StatisticsSqlCommand::ShowBasicStatsMeta => "SHOW BASIC STATS META",
-                StatisticsSqlCommand::ShowHistogramStatsMeta => "SHOW HISTOGRAM STATS META",
                 StatisticsSqlCommand::DropStats { .. } => "DROP STATS",
                 StatisticsSqlCommand::DropHistogram { .. } => "DROP HISTOGRAM",
                 StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {

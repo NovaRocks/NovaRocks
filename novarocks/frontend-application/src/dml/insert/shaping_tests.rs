@@ -18,7 +18,8 @@
 use super::{omitted_insert_expr, shape_insert_source};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use novarocks_parser::ast::SyntaxEq;
-use novarocks_parser::{Span, ast, printer};
+use novarocks_parser::{SYNTHETIC, Span, ast, printer};
+use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_types::schema::{ColumnDef, ColumnDefault};
 use std::sync::Arc;
 
@@ -38,6 +39,87 @@ fn parse_query(sql: &str) -> ast::Query {
         panic!("expected one query");
     };
     query.clone()
+}
+
+fn analyze_shaped_query(query: ast::Query) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
+    use novarocks_sql::compiler::{
+        SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent,
+        SqlCompiler, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+        SqlStatementInput,
+    };
+    let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
+    let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+    let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
+    SqlCompiler::analyze(SqlAnalyzeRequest::new(
+        SqlStatementInput::parsed_query(Box::new(query)),
+        SqlCompileIntent::Query,
+        SqlSessionContext {
+            current_catalog: None,
+            current_database: "db".into(),
+            optimizer_settings: SessionOptimizerSettings::default(),
+            sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        },
+        SqlPlanningEnvironment::Distributed,
+        &snapshot,
+        &functions,
+        crate::query_execution::constant_eval::constant_evaluator(),
+        None,
+        crate::application::test_constant_policy(),
+        SqlCompileControl::unbounded(),
+    ))?
+    .into_pending()
+    .map(|_| ())
+}
+
+// Replay the c8890b1dd CAST author: parse only the type template, then install
+// the original typed expression without printing or reparsing that expression.
+fn baseline_target_cast(expr: ast::Expr, type_sql: &str) -> ast::Expr {
+    let template = parse_query(&format!("SELECT CAST(NULL AS {type_sql})"));
+    let ast::Expr::Cast(cast) = projection_expr(select(&template.body), 0) else {
+        panic!("baseline type template");
+    };
+    let mut cast = cast.clone();
+    cast.span = expr.span();
+    cast.expr = Box::new(expr);
+    ast::Expr::Cast(cast)
+}
+
+fn baseline_default_values(default: ast::Expr, default_type_sql: &str) -> ast::Query {
+    let mut query = parse_query("VALUES (1)");
+    let ast::SetExpr::Values(values) = query.body.as_mut() else {
+        panic!("baseline VALUES source");
+    };
+    values.rows[0] = vec![
+        baseline_target_cast(values.rows[0][0].clone(), "INT"),
+        baseline_target_cast(default, default_type_sql),
+    ];
+    query
+}
+
+fn assert_existing_default_rejection(
+    shaped: ast::Query,
+    baseline: ast::Query,
+    kind: AnalyzeErrorKind,
+    message: &str,
+) {
+    assert!(shaped.syntax_eq(&baseline));
+    let novarocks_sql::compiler::SqlCompileError::Analyze(original) =
+        analyze_shaped_query(baseline).expect_err("the original AST has this analysis boundary")
+    else {
+        panic!("baseline must retain its analysis error");
+    };
+    let novarocks_sql::compiler::SqlCompileError::Analyze(current) =
+        analyze_shaped_query(shaped).expect_err("the migrated AST keeps the original rejection")
+    else {
+        panic!("migrated AST must retain its analysis error");
+    };
+    assert_eq!(original.kind(), kind);
+    assert_eq!(original.message(), message);
+    assert_eq!(original.span(), Some(SYNTHETIC));
+    assert_eq!(current.kind(), original.kind());
+    assert_eq!(current.code(), original.code());
+    assert_eq!(current.message(), original.message());
+    assert_eq!(current.span(), original.span());
 }
 
 fn shape(sql: &str, columns: &[ColumnDef]) -> ast::Query {
@@ -348,6 +430,143 @@ fn binary_literals_and_defaults_preserve_every_latin1_byte() {
 }
 
 #[test]
+fn typed_decimal_defaults_keep_coefficients_beyond_source_integer_width() {
+    let coefficient = 12345678901234567890123456789012345678_i128;
+    let mut decimal = column("d", DataType::Decimal128(38, 0));
+    decimal.write_default = Some(ColumnDefault::Decimal {
+        unscaled: coefficient,
+        precision: 38,
+        scale: 0,
+    });
+    assert_eq!(
+        number_text(&omitted_insert_expr(&decimal).unwrap()),
+        coefficient.to_string()
+    );
+    let columns = [column("id", DataType::Int32), decimal];
+    let shaped = shape_insert_source(
+        &parse_query("VALUES (1)"),
+        &["id".into()],
+        &columns,
+        &columns,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        number_text(cast_input(&rows(&shaped)[0][1], "DECIMAL(38, 0)")),
+        coefficient.to_string()
+    );
+    // The original number author retained this coefficient as a raw Number;
+    // the analyzer still rejects an integer literal wider than i64 before CAST.
+    let baseline = baseline_default_values(
+        ast::Expr::Literal(ast::Literal {
+            kind: ast::LiteralKind::Number(coefficient.to_string()),
+            span: SYNTHETIC,
+        }),
+        "DECIMAL(38, 0)",
+    );
+    assert_existing_default_rejection(
+        shaped,
+        baseline,
+        AnalyzeErrorKind::InvalidLiteral,
+        &format!("invalid integer literal: {coefficient}"),
+    );
+}
+
+#[test]
+fn typed_single_field_struct_defaults_keep_their_values_tuple() {
+    let mut structure = column(
+        "s",
+        DataType::Struct(Fields::from(vec![Arc::new(Field::new(
+            "only",
+            DataType::Int64,
+            true,
+        ))])),
+    );
+    structure.write_default = Some(ColumnDefault::Struct(vec![(
+        "only".into(),
+        ColumnDefault::Int64(7),
+    )]));
+    let original = omitted_insert_expr(&structure).unwrap();
+    let ast::Expr::Tuple(tuple) = &original else {
+        panic!("typed Struct value");
+    };
+    assert_eq!(tuple.expressions.len(), 1);
+    assert_eq!(number_text(&tuple.expressions[0]), "7");
+    let columns = [column("id", DataType::Int32), structure];
+    let shaped = shape_insert_source(
+        &parse_query("VALUES (1)"),
+        &["id".into()],
+        &columns,
+        &columns,
+    )
+    .unwrap()
+    .unwrap();
+    let ast::Expr::Cast(cast) = &rows(&shaped)[0][1] else {
+        panic!("Struct target cast");
+    };
+    assert!(matches!(cast.expr.as_ref(), ast::Expr::Tuple(tuple) if tuple.expressions.len() == 1));
+    // The original tuple author kept even one field as Tuple, and recursive
+    // target shaping cast its child. The analyzer rejects that Tuple unchanged.
+    let baseline = baseline_default_values(
+        ast::Expr::Tuple(ast::TupleExpr {
+            expressions: vec![baseline_target_cast(
+                ast::Expr::Literal(ast::Literal {
+                    kind: ast::LiteralKind::Number("7".into()),
+                    span: SYNTHETIC,
+                }),
+                "BIGINT",
+            )],
+            span: SYNTHETIC,
+        }),
+        "STRUCT<`only` BIGINT>",
+    );
+    assert_existing_default_rejection(
+        shaped,
+        baseline,
+        AnalyzeErrorKind::UnsupportedExpression,
+        "unsupported expression: (CAST(7 AS BIGINT))",
+    );
+    // The old SELECT wrapper reparsed '(7)' as parentheses. Only that wrapper
+    // takes the canonical syntax path; VALUES must keep its typed tuple.
+    assert!(matches!(
+        super::canonical_insert_wrapper_expression(original).unwrap(),
+        ast::Expr::Nested(_)
+    ));
+}
+
+#[test]
+fn select_wrapper_normalizes_generated_defaults_and_retains_user_positions() {
+    let mut decimal = column("d", DataType::Decimal128(5, 2));
+    decimal.write_default = Some(ColumnDefault::Decimal {
+        unscaled: -12345,
+        precision: 5,
+        scale: 2,
+    });
+    let columns = [column("id", DataType::Int32), decimal];
+    let source = parse_query("SELECT\n  1 AS original");
+    let shaped = shape_insert_source(&source, &["id".into()], &columns, &columns)
+        .unwrap()
+        .unwrap();
+    let expected = parse_query(
+        "SELECT CAST(1 AS INT), CAST(-123.45 AS DECIMAL(5, 2)) FROM (SELECT 1 AS original) AS __nr_insert_literal_src",
+    );
+    let ast::SetExpr::Query(wrapper) = shaped.body.as_ref() else {
+        panic!("target wrapper");
+    };
+    assert!(wrapper.as_ref().syntax_eq(&expected));
+    let ast::SetExpr::Select(inner) = source.body.as_ref() else {
+        panic!("original SELECT");
+    };
+    let outer = select(&shaped.body);
+    let ast::Expr::Cast(cast) = projection_expr(outer, 0) else {
+        panic!("target cast");
+    };
+    assert_eq!(cast.span, projection_expr(inner, 0).span());
+    assert_eq!(cast.expr.span(), projection_expr(inner, 0).span());
+    analyze_shaped_query(shaped).expect("the original generated default keeps its typed value");
+}
+
+#[test]
 fn recursive_nonempty_defaults_preserve_decimal_coefficients_and_nulls() {
     let decimal_default = ColumnDefault::Decimal {
         unscaled: -123456789123456789,
@@ -598,35 +817,6 @@ fn source_filters_aliases_distinct_and_general_query_controls_are_retained() {
 #[test]
 fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
     use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
-    fn analyze(query: ast::Query) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
-        use novarocks_sql::compiler::{
-            SessionOptimizerSettings, SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent,
-            SqlCompiler, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
-            SqlStatementInput,
-        };
-        let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
-        let snapshot = SqlPlannerTableSnapshot::new(&catalog);
-        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-        SqlCompiler::analyze(SqlAnalyzeRequest::new(
-            SqlStatementInput::parsed_query(Box::new(query)),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                current_catalog: None,
-                current_database: "db".into(),
-                optimizer_settings: SessionOptimizerSettings::default(),
-                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            &snapshot,
-            &functions,
-            crate::query_execution::constant_eval::constant_evaluator(),
-            None,
-            crate::application::test_constant_policy(),
-            SqlCompileControl::unbounded(),
-        ))?
-        .into_pending()
-        .map(|_| ())
-    }
     for (domain, source, target_name) in [
         // The test owns opaque cast preservation, independently of the
         // unavailable legacy to_bitmap overload. This real aggregate-backed
@@ -647,9 +837,11 @@ fn literal_target_casts_keep_original_bitmap_and_hll_declarations() {
         };
         let original_call = cast_input(&nested.expression, target_name);
         assert_eq!(printer::print_expr(original_call), source);
-        analyze(query).expect("the actual compiler must accept the original complete opaque cast");
+        analyze_shaped_query(query)
+            .expect("the actual compiler must accept the original complete opaque cast");
         let error =
-            analyze(parse_query(&format!("SELECT CAST(X'00' AS {target_name})"))).unwrap_err();
+            analyze_shaped_query(parse_query(&format!("SELECT CAST(X'00' AS {target_name})")))
+                .unwrap_err();
         assert!(
             error.to_string().contains("no matching declared overload"),
             "{error}"

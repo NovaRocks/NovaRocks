@@ -239,9 +239,15 @@ fn original_run_inventory(
         .checked_add(encoding.retained_bytes())
         .ok_or(WorkError::ArithmeticOverflow)?;
     let replies = array::<std::sync::OnceLock<OperationAcknowledgement>>(operations.len())?.size();
-    let plan =
-        novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(budget);
-    let reply = novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+    let response_max = budget
+        .message_limits()
+        .response_max_bytes(first.requires_control_progress());
+    let plan = novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+        operations.len(),
+        response_max,
+    )
+    .map_err(|_| WorkError::ArithmeticOverflow)?;
+    let reply = response_max
         .checked_add(plan.peak_bytes())
         .ok_or(WorkError::ArithmeticOverflow)?;
     Ok((

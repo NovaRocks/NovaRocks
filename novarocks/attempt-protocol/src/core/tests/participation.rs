@@ -386,7 +386,7 @@ impl Fixture {
     fn emit_fixture_send(&mut self, operation: &OperationIntent, sequence: u64) -> SendGeneration {
         let effect = AttemptActionId::new(id(sequence));
         let generation = SendGeneration::new(effect);
-        let grant = QueuedInputGrantRef::new(id(sequence + 1), generation);
+        let grant = QueuedInputGrantRef::new(id(sequence + 1), generation, 64);
         let execution = &mut self.core.execution;
         execution
             .begin_lifecycle_admission(operation.clone(), effect)
@@ -654,7 +654,7 @@ fn stop_dispatches_the_original_actor_abort_after_terminal_cleanup() {
         assert!(!fixture.core.execution.has_pending_terminal_cleanup());
 
         let operation = OperationIntent::AbortParticipation(request);
-        let grant = QueuedInputGrantRef::new(id(802), generation);
+        let grant = QueuedInputGrantRef::new(id(802), generation, 64);
         let granted = fixture.step(
             fixture.sources.transport,
             AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
@@ -815,7 +815,7 @@ fn emit_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
     assert_eq!(generation.admission_effect(), admit);
     fixture.drain(|effect| panic!("admission has no WC grant yet: {effect:?}"));
 
-    let grant = QueuedInputGrantRef::new(id(831), generation);
+    let grant = QueuedInputGrantRef::new(id(831), generation, 64);
     assert!(
         fixture
             .step(
@@ -995,7 +995,7 @@ fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort(
         // The minimum dispatch quote is larger than the four-unit scan turn.
         fixture.units = 128;
         let abort = OperationIntent::AbortParticipation(request);
-        let grant = QueuedInputGrantRef::new(id(832), generation);
+        let grant = QueuedInputGrantRef::new(id(832), generation, 64);
         let granted = fixture.step(
             fixture.sources.transport,
             AttemptInput::Executor(ExecutorFact::QueuedInputGranted {

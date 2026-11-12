@@ -1316,6 +1316,8 @@ fn try_partition_only_page_source(
                 constants.push((Arc::clone(column.target()), value.clone()));
             }
             IcebergColumnSource::Physical { .. }
+            | IcebergColumnSource::MutationSpecId(_)
+            | IcebergColumnSource::MutationPartition(_)
             | IcebergColumnSource::InitialDefault
             | IcebergColumnSource::TypedNull
             | IcebergColumnSource::Metadata(_)

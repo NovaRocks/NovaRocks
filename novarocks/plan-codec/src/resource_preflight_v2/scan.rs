@@ -105,6 +105,7 @@ type Admission<'a> = dyn FnMut(&DecodeResourceUsage) -> Result<(), CompileContro
 struct Accounting<'borrow, 'admit> {
     limits: DecodeProjectionLimits,
     usage: DecodeResourceUsage,
+    system_relation: bool,
     admit: Option<&'borrow mut Admission<'admit>>,
 }
 impl Accounting<'_, '_> {
@@ -115,6 +116,10 @@ impl Accounting<'_, '_> {
         Ok(())
     }
     fn heap(&mut self, bytes: usize) -> Result<(), E> {
+        if self.system_relation {
+            self.usage.system_relation_requested_heap_bytes_upper =
+                checked_add(self.usage.system_relation_requested_heap_bytes_upper, bytes)?;
+        }
         self.usage.cumulative_requested_heap_bytes_upper =
             checked_add(self.usage.cumulative_requested_heap_bytes_upper, bytes)?;
         self.usage.peak_requested_heap_bytes_upper =
@@ -287,6 +292,7 @@ fn scan_core(
     let mut accounting = Accounting {
         limits,
         admit,
+        system_relation: false,
         usage: DecodeResourceUsage {
             input_bytes: raw.len(),
             root_inline_bytes: root.layout.size,
@@ -305,6 +311,7 @@ fn scan_core(
     struct Frame {
         object: usize,
         end_remaining: usize,
+        system_relation: bool,
     }
     // Prost merge_loop reads each field against the complete shared suffix,
     // then checks whether that field crossed the enclosing length boundary.
@@ -316,6 +323,7 @@ fn scan_core(
     frames[0] = Some(Frame {
         object: schema.root,
         end_remaining: 0,
+        system_relation: false,
     });
     let mut depth = 0_usize;
     let result = (|| -> Result<(), E> {
@@ -335,7 +343,10 @@ fn scan_core(
                 depth -= 1;
                 continue;
             }
+            let before_key_remaining = cursor.remaining().len();
             let (tag, wire) = cursor.key(work)?.ok_or(E::Malformed)?;
+            // Field 25 is the independent data component of this exact generated root.
+            accounting.system_relation = frame.system_relation || (depth == 0 && tag == 25);
             accounting.field()?;
             let object = schema
                 .objects
@@ -425,6 +436,14 @@ fn scan_core(
                     return Err(E::Malformed);
                 }
                 let end_remaining = delimited_end(&mut cursor, work)?;
+                if depth == 0 && tag == 25 {
+                    accounting.usage.system_relation_input_bytes = checked_add(
+                        accounting.usage.system_relation_input_bytes,
+                        before_key_remaining
+                            .checked_sub(end_remaining)
+                            .ok_or(E::Malformed)?,
+                    )?;
+                }
                 if depth == PROST_RECURSION_LIMIT {
                     return Err(E::Malformed);
                 }
@@ -435,6 +454,7 @@ fn scan_core(
                 frames[depth] = Some(Frame {
                     object: child,
                     end_remaining,
+                    system_relation: accounting.system_relation,
                 });
             } else {
                 if wire != WireType::LengthDelimited {

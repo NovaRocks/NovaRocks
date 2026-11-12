@@ -308,6 +308,20 @@ async fn encode_and_send(
     if !receipts.freeze_dispatch(expires).await {
         return BodyOutcome::ReceiptsRecorded;
     }
+    let original_count = match &request.request {
+        wire::EncodedMethodRequest::Ordinary(value) => value.operations.len(),
+        wire::EncodedMethodRequest::Control(value) => value.operations.len(),
+    };
+    let control = matches!(&request.request, wire::EncodedMethodRequest::Control(_));
+    let reply_plan =
+        novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+            original_count,
+            captures
+                .transport
+                .message_limits()
+                .response_max_bytes(control),
+        )
+        .expect("the same original reply layout was registered before admission");
     let response = super::execute::send_operations_in(
         &captures.client,
         request.request,
@@ -317,9 +331,7 @@ async fn encode_and_send(
         captures.lifecycle.as_ref(),
         &mut ready.call,
         &mut action_tail,
-        novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_transport(
-            captures.transport,
-        ),
+        reply_plan,
     )
     .await;
     match response {

@@ -101,12 +101,6 @@ enum Request {
         context: ConnectorRequestContext,
     },
 
-    SystemCatalogFacts {
-        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
-        context: ConnectorRequestContext,
-        catalog: String,
-        include_tables: bool,
-    },
     ReferenceFacts {
         planning_pin: ConnectorControlPlanningPin,
         request: novarocks_spi::connector::ConnectorReadReferenceFactsRequest,
@@ -142,7 +136,6 @@ enum Response {
     InstallCurrent(Result<(), MvApplicationError>),
     MetadataReady,
     ReferenceFactsReady,
-    SystemCatalogFactsReady,
     ViewMetadataReady,
     SourceRead(Result<(), ConnectorError>),
 }
@@ -255,14 +248,6 @@ pub(crate) struct MvRefreshPreparationIo {
     admission: Arc<MvPublicationAdmissionReceiving>,
     registration: Arc<CurrentProjectionRegistration>,
     metadata_result: Mutex<Option<Result<ConnectorTablePreparation, ConnectorError>>>,
-    system_catalog_result: Mutex<
-        Option<
-            Result<
-                Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
-                novarocks_sql::compiler::SqlCompileError,
-            >,
-        >,
-    >,
     reference_result: Mutex<
         Option<Result<novarocks_spi::connector::ConnectorReadReferenceFacts, ConnectorError>>,
     >,
@@ -314,7 +299,6 @@ impl MvRefreshPreparationIo {
             registration: Arc::new(CurrentProjectionRegistration::new()),
             metadata_result: Mutex::new(None),
             reference_result: Mutex::new(None),
-            system_catalog_result: Mutex::new(None),
             view_result: Mutex::new(None),
             source_result: Mutex::new(None),
             current_metadata_cpu,
@@ -523,35 +507,6 @@ impl MvRefreshPreparationIo {
                             Err(error)=>Err(contract_error(error)),
                         };
                         Response::InstallCurrent(result)
-                    }
-                    Request::SystemCatalogFacts {
-                        source,
-                        context,
-                        catalog,
-                        include_tables,
-                    } => {
-                        let mut child = source.facts_port().definition_system_catalog_facts_async(
-                            &context,
-                            &catalog,
-                            include_tables,
-                        );
-                        let result = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
-                        {
-                            let gate = original_gate
-                                .upgrade()
-                                .expect("original MV gate outlives its child");
-                            let mut receiver = gate
-                                .system_catalog_result
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            assert!(
-                                receiver.is_none(),
-                                "original MV system catalog receiver is occupied"
-                            );
-                            *receiver = Some(result);
-                        }
-                        drop(child);
-                        Response::SystemCatalogFactsReady
                     }
                     Request::ReferenceFacts {
                         planning_pin,
@@ -998,33 +953,6 @@ impl MvRefreshPreparationIo {
         .map_err(crate::connector::schema_creation::connector_schema_error)
     }
 
-    pub(crate) async fn system_catalog_facts(
-        &self,
-        source: novarocks_query_application::system_catalog::SystemCatalogRelations,
-        context: ConnectorRequestContext,
-        catalog: String,
-        include_tables: bool,
-    ) -> Result<
-        Option<novarocks_query_application::system_catalog_rewrite::SystemCatalogFacts>,
-        novarocks_sql::compiler::SqlCompileError,
-    > {
-        let Response::SystemCatalogFactsReady = self
-            .exchange(Request::SystemCatalogFacts {
-                source,
-                context,
-                catalog,
-                include_tables,
-            })
-            .await
-        else {
-            panic!("MV system catalog response changed kind")
-        };
-        self.system_catalog_result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .expect("original system catalog result was received before its child exited")
-    }
     pub(crate) async fn reference_facts(
         &self,
         planning_pin: &ConnectorControlPlanningPin,
@@ -1405,11 +1333,7 @@ mod repository_original_cause_tests {
             novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "orders");
         let error = match repository
             .in_requests(&requests)
-            .find_keyed_by_target(
-                &target,
-                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(
-                ),
-            )
+            .find_keyed_by_target(&target)
             .await
         {
             Err(error) => error,

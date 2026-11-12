@@ -226,8 +226,13 @@ fn paid_send(
         operation: protocol.operation_id(),
         generation: generation_id,
     };
-    let grant =
-        QueuedInputGrantRef::new(NonZeroU64::new(generation_ordinal).unwrap(), generation_id);
+    let grant = QueuedInputGrantRef::new(
+        NonZeroU64::new(generation_ordinal).unwrap(),
+        generation_id,
+        transport::FrozenSendRequests::default()
+            .encoded_protobuf_bytes(protocol)
+            .unwrap(),
+    );
     let backend = protocol.backend_process_id();
     let bytes = protocol.queued_bytes();
     let guard = roles

@@ -159,7 +159,17 @@ impl BatchDispatchPass {
             }
 
             let prefix = queue
-                .batch_prefix(allowance, dispatcher.transport.max_batch_encoded_bytes())
+                .batch_prefix(
+                    allowance,
+                    dispatcher.transport.batch_target_encoded_bytes(),
+                    dispatcher.transport.request_max_bytes(
+                        queue
+                            .front()
+                            .expect("nonempty lane")
+                            .intent
+                            .requires_control_progress(),
+                    ),
+                )
                 .expect("enqueue validated the original head carrier");
             for entry in queue.entries.values().take(prefix.items) {
                 validate_send(&entry.intent)?;

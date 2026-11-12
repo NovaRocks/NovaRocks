@@ -52,7 +52,9 @@ pub(crate) mod create_original;
 
 #[path = "staged_create/current_metadata_cpu.rs"]
 mod current_metadata_cpu;
-pub(crate) use current_metadata_cpu::{CurrentMetadataCapture, CurrentProjectionMetadataCpu};
+pub(crate) use current_metadata_cpu::{
+    CaptureFailure, CurrentMetadataCapture, CurrentProjectionMetadataCpu,
+};
 
 pub(crate) fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
     now_unix_millis().map(ManagementTimestamp::from_unix_millis)
@@ -194,10 +196,7 @@ fn install_current_projection(
     effect: &str,
 ) -> Result<(), String> {
     let request = novarocks_mv_application::readiness::MvCurrentProjectionRequest::try_new(
-        catalog,
-        target,
-        context,
-        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        catalog, target, context,
     )
     .map_err(|error| format!("prepare the {effect} MV Current observation: {error}"))?;
     let source = ManagedTargetCurrentSource {
@@ -241,10 +240,7 @@ async fn install_current_projection_async_in(
         registration,
     } = services;
     let request = novarocks_mv_application::readiness::MvCurrentProjectionRequest::try_new(
-        catalog,
-        target,
-        context,
-        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        catalog, target, context,
     )?;
     let source = OriginalManagedTargetCurrentSource {
         entrance,
@@ -1195,7 +1191,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             MvConvergence::AdmittedCurrent | MvConvergence::MetadataOnlyCurrent { .. } => {
                 let (observed, admission, _) = self
                     .entrance
-                    .observe_keyed_admission_async(&documents, observation, request.decode_budget())
+                    .observe_keyed_admission_async(&documents, observation)
                     .await
                     .map_err(MvProjectionError::from)?;
                 if let MvConvergence::MetadataOnlyCurrent { expected } = &self.convergence
@@ -1243,12 +1239,8 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             .complete_keyed_current_observation_async(pending, &documents, observation.clone())
             .await
             .map_err(current_projection_observation)?;
-        let mut observed = decode_current_keyed_documents(
-            view,
-            request.catalog().clone(),
-            request.decode_budget(),
-        )
-        .map_err(MvProjectionError::from)?;
+        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+            .map_err(MvProjectionError::from)?;
         let convergence = self
             .entrance
             .resolve_pending_slot_changes_async(&documents, observation.clone())
@@ -1317,24 +1309,16 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
                 .resolve_pending_slot_changes_async(&documents, registered_request.clone())
                 .await
                 .map_err(current_projection_connector)?;
-            observed = decode_current_keyed_documents(
-                view,
-                request.catalog().clone(),
-                request.decode_budget(),
-            )
-            .map_err(MvProjectionError::from)?;
+            observed = decode_current_keyed_documents(view, request.catalog().clone())
+                .map_err(MvProjectionError::from)?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
             let (_, view) = state
                 .complete_keyed_current_observation_async(pending, &documents, observation)
                 .await
                 .map_err(current_projection_observation)?;
-            observed = decode_current_keyed_documents(
-                view,
-                request.catalog().clone(),
-                request.decode_budget(),
-            )
-            .map_err(MvProjectionError::from)?;
+            observed = decode_current_keyed_documents(view, request.catalog().clone())
+                .map_err(MvProjectionError::from)?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
         let admission = self
@@ -1416,7 +1400,7 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             MvConvergence::AdmittedCurrent | MvConvergence::MetadataOnlyCurrent { .. } => {
                 let (observed, admission, _) = self
                     .entrance
-                    .observe_keyed_admission(&documents, observation, request.decode_budget())
+                    .observe_keyed_admission(&documents, observation)
                     .map_err(|e| conflict(format!("observe admitted MV Current: {e}")))?;
                 if let MvConvergence::MetadataOnlyCurrent { expected } = &self.convergence
                     && !metadata_only_current_matches(expected, &observed)
@@ -1461,12 +1445,8 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
         let (phase, view) = state
             .complete_keyed_current_observation(pending, &documents, observation.clone())
             .map_err(|e| conflict(format!("complete MV observation: {e:?}")))?;
-        let mut observed = decode_current_keyed_documents(
-            view,
-            request.catalog().clone(),
-            request.decode_budget(),
-        )
-        .map_err(|e| conflict(e.to_string()))?;
+        let mut observed = decode_current_keyed_documents(view, request.catalog().clone())
+            .map_err(|e| conflict(e.to_string()))?;
         let convergence = self
             .entrance
             .resolve_pending_slot_changes(&documents, observation.clone())
@@ -1525,23 +1505,15 @@ impl novarocks_mv_application::readiness::MvKeyedCurrentProjectionSource
             self.entrance
                 .resolve_pending_slot_changes(&documents, registered_request.clone())
                 .map_err(|e| conflict(e.to_string()))?;
-            observed = decode_current_keyed_documents(
-                view,
-                request.catalog().clone(),
-                request.decode_budget(),
-            )
-            .map_err(|e| conflict(e.to_string()))?;
+            observed = decode_current_keyed_documents(view, request.catalog().clone())
+                .map_err(|e| conflict(e.to_string()))?;
         } else if convergence.reinstall_current_projection {
             let pending=state.begin_current_observation(novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(*uuid::Uuid::now_v7().as_bytes())).map_err(|e|conflict(format!("begin resolved MV observation: {e:?}")))?;
             let (_, view) = state
                 .complete_keyed_current_observation(pending, &documents, observation)
                 .map_err(|e| conflict(format!("complete resolved MV observation: {e:?}")))?;
-            observed = decode_current_keyed_documents(
-                view,
-                request.catalog().clone(),
-                request.decode_budget(),
-            )
-            .map_err(|e| conflict(e.to_string()))?;
+            observed = decode_current_keyed_documents(view, request.catalog().clone())
+                .map_err(|e| conflict(e.to_string()))?;
         }
         validate_current_publication_carrier(self.published, &observed).map_err(conflict)?;
         let admission = self
@@ -1634,7 +1606,6 @@ impl AdmittedMvPublication {
         );
         let (documents, _) = novarocks_mv_application::persistence::keyed_documents::observe_current_keyed_documents_with_management_async(
             &document_lease, request,
-            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
             &self.entrance,
         ).await.map_err(|error| {
             // The producer owns every Connector/Keyed failure fact. Pure
@@ -2174,7 +2145,7 @@ pub(crate) async fn admit_mv_publication_async_in(
 
 #[cfg(test)]
 #[path = "staged_create/admitted_current_tests.rs"]
-mod admitted_current_tests;
+pub(crate) mod admitted_current_tests;
 
 #[cfg(test)]
 mod tests {

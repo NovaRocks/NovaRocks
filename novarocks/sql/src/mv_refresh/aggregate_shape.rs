@@ -22,9 +22,8 @@
 //! execution remain application/runtime concerns.
 
 use super::{AggregateFunctionKind, VisibleAggregateOutput};
-use novarocks_parser::Span;
-use novarocks_parser::ast;
 use novarocks_parser::printer;
+use novarocks_parser::{ast, build};
 
 pub(crate) const SQL_MV_ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const SQL_MV_AGG_STATE_PREFIX: &str = "__agg_state_";
@@ -189,12 +188,11 @@ pub(crate) fn rewrite_select_sql_for_state(
                 let key = calls.group_keys.get(*index).ok_or_else(|| {
                     format!("rewrite_select_sql_for_state: group key index {index} out of range")
                 })?;
-                projection.push(ast::SelectItem::ExprWithAlias {
-                    expr: key.expr.clone(),
-                    alias: select_alias_ident(&key.output_name),
-                    explicit_as: true,
-                    span: Span::new(0, 0),
-                });
+                projection.push(build::item(
+                    key.expr.clone(),
+                    Some(select_alias_ident(&key.output_name)),
+                    true,
+                ));
             }
             VisibleAggregateOutput::Aggregate(index) => {
                 let aggregate = calls.aggregates.get(*index).ok_or_else(|| {
@@ -343,7 +341,7 @@ fn state_combinator_select_items(
 ) -> Result<Vec<ast::SelectItem>, String> {
     let argument = match &aggregate.input {
         SqlAggregateInput::Star if aggregate.function == AggregateFunctionKind::Count => {
-            number_literal("1")
+            build::integer(1)
         }
         SqlAggregateInput::Star => {
             return Err(format!(
@@ -409,9 +407,9 @@ fn select_alias_ident(alias: &str) -> ast::Ident {
         .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
     if plain {
-        synthetic_ident(alias, false)
+        build::ident(alias, None)
     } else {
-        synthetic_ident(alias, true)
+        build::ident(alias, Some('`'))
     }
 }
 
@@ -420,67 +418,19 @@ fn aggregate_select_item(
     argument: ast::Expr,
     alias: &str,
 ) -> Result<ast::SelectItem, String> {
-    let function = ast::FunctionCall {
-        name: ast::ObjectName {
-            parts: vec![synthetic_ident(function_name, false)],
-            span: Span::new(0, 0),
-        },
-        arguments: vec![argument],
-        quantifier: ast::FunctionQuantifier::None,
-        order_by: vec![],
-        separator: None,
-        filter: None,
-        null_treatment: None,
-        over: None,
-        substring_from_syntax: false,
-        span: Span::new(0, 0),
-    };
-    Ok(ast::SelectItem::ExprWithAlias {
-        expr: ast::Expr::FunctionCall(function),
-        alias: synthetic_ident(alias, false),
-        explicit_as: true,
-        span: Span::new(0, 0),
-    })
+    Ok(build::item(
+        build::function(
+            build::object_name(vec![build::ident(function_name, None)])
+                .map_err(|error| error.to_string())?,
+            vec![argument],
+        ),
+        Some(build::ident(alias, None)),
+        true,
+    ))
 }
 
 fn count_star_select_item(alias: &str) -> ast::SelectItem {
-    let function = ast::FunctionCall {
-        name: ast::ObjectName {
-            parts: vec![synthetic_ident("COUNT", false)],
-            span: Span::new(0, 0),
-        },
-        arguments: vec![ast::Expr::Identifier(synthetic_ident("*", false))],
-        quantifier: ast::FunctionQuantifier::None,
-        order_by: vec![],
-        separator: None,
-        filter: None,
-        null_treatment: None,
-        over: None,
-        substring_from_syntax: false,
-        span: Span::new(0, 0),
-    };
-    ast::SelectItem::ExprWithAlias {
-        expr: ast::Expr::FunctionCall(function),
-        alias: synthetic_ident(alias, false),
-        explicit_as: true,
-        span: Span::new(0, 0),
-    }
-}
-
-fn synthetic_ident(value: &str, quoted: bool) -> ast::Ident {
-    ast::Ident {
-        value: value.to_string(),
-        quoted,
-        quote_style: quoted.then_some('`'),
-        span: Span::new(0, 0),
-    }
-}
-
-fn number_literal(value: &str) -> ast::Expr {
-    ast::Expr::Literal(ast::Literal {
-        kind: ast::LiteralKind::Number(value.to_string()),
-        span: Span::new(0, 0),
-    })
+    build::item(build::count_star(), Some(build::ident(alias, None)), true)
 }
 
 #[cfg(test)]

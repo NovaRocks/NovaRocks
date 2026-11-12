@@ -75,7 +75,6 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 64;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
-pub const NATIVE_MAX_MESSAGE_BYTES: usize = GRPC_MAX_MESSAGE_BYTES;
 
 /// Server-validated limits for one Native listener. The listener owns only
 /// local transport and scheduling capacity, not FE query admission or Worker
@@ -341,8 +340,10 @@ impl NativeRpcListener {
                                 ingress_config.control_request_max_bytes,
                                 ingress_config.control_response_max_bytes,
                             ),
-                            NativeEndpointDomain::FrontendMembership =>
-                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES),
+                            NativeEndpointDomain::FrontendMembership => (
+                                ingress_config.ordinary_request_max_bytes,
+                                ingress_config.ordinary_response_max_bytes,
+                            ),
                         };
                         let ordinary_service = NovaRocksGrpcServer::new(service.clone())
                             .max_decoding_message_size(request_limit)

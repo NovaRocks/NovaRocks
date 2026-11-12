@@ -21,6 +21,9 @@
 use super::*;
 use crate::query_execution::completion_facts::FrontendCompletionCustody;
 use crate::query_execution::dml::mutation::OwnedMutationStatement;
+use crate::query_execution::dml::mutation_match_read::{
+    bind_mutation_match_read, mutation_match_select,
+};
 use crate::query_execution::write_session::WriteBeginReceiving;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
@@ -34,8 +37,8 @@ type Target = crate::catalog_application::resolver::TargetBackend;
 /// Pure provider-signed preparation of the exact admitted UPDATE or MERGE.
 /// COW has not begun a write; its matching computation must run first.
 pub(crate) enum PreparedMutationFacts {
-    Update(PreparedUpdateMutation),
-    Merge(PreparedMergeMutation),
+    Update(Box<PreparedUpdateMutation>),
+    Merge(Box<PreparedMergeMutation>),
 }
 
 pub(crate) async fn prepare_mutation_facts_async(
@@ -92,6 +95,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Update),
         OwnedMutationStatement::Merge(statement) => finish_merge_mutation_preparation(
             statement,
@@ -103,6 +107,7 @@ pub(crate) async fn prepare_mutation_facts_async(
             connector_context,
             operation_id,
         )
+        .map(Box::new)
         .map(PreparedMutationFacts::Merge),
     }
 }
@@ -188,12 +193,13 @@ impl PreparedMutationFacts {
                 self.planning_pin(),
             )?,
             catalog_properties,
-            crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
                 self.target(),
                 self.target_ref(),
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
                 mor_change_stream_input_request(self.columns())?,
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                Some(self.signed()?.base_version().clone()),
                 novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
                 self.context().clone(),
             )?,
@@ -202,9 +208,8 @@ impl PreparedMutationFacts {
         .await
         .map_err(|error| format!("begin connector write session: {error}"))?;
         // Same receiving owns the accepted session before query shaping can fail.
-        let (query, kind, assertion) = match self.as_ref() {
+        let (mut query, kind, assertion) = match self.as_ref() {
             Self::Update(p) => build_update_mor_producer(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -212,7 +217,6 @@ impl PreparedMutationFacts {
                 &p.target_ref,
             )?,
             Self::Merge(p) => build_merge_mor_producer(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -221,6 +225,29 @@ impl PreparedMutationFacts {
                 &p.target_ref,
             )?,
         };
+        let from = mutation_match_select(&mut query)?;
+        let (target_factor, preparations) = match self.as_ref() {
+            Self::Update(p) => (&mut from.relation, p.mor_preparations.as_ref()),
+            Self::Merge(p) => {
+                let [join] = from.joins.as_mut_slice() else {
+                    return Err("generated MERGE lost its match target join".into());
+                };
+                (&mut join.relation, p.mor_preparations.as_ref())
+            }
+        };
+        let preparations = preparations.ok_or("MOR lost its original match preparation")?;
+        let original = preparations
+            .match_observation
+            .as_ref()
+            .ok_or("MOR lost its original match observation")?;
+        let match_read = bind_mutation_match_read(
+            self.target(),
+            target_factor,
+            true,
+            &preparations.preparation,
+            original,
+            self.planning_pin(),
+        )?;
         Ok(PreparedMorMutationWrite {
             state: state.clone(),
             facts: Arc::clone(self),
@@ -229,6 +256,7 @@ impl PreparedMutationFacts {
             kind,
             assertion,
             bindings: Arc::new(QueryTableBindingStore::try_new()?),
+            match_read,
         })
     }
 
@@ -238,6 +266,20 @@ impl PreparedMutationFacts {
     ) -> Result<PreparedCowSelection, DmlError> {
         if !self.is_copy_on_write() {
             return Err("COW selection requires its signed copy-on-write strategy".into());
+        }
+        match self.as_ref() {
+            Self::Update(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
+            Self::Merge(prepared) => {
+                prepared
+                    .stmt
+                    .cow_text()
+                    .map_err(DmlError::DeferredLowering)?;
+            }
         }
         if let Self::Merge(prepared) = self.as_ref()
             && matches!(
@@ -253,8 +295,7 @@ impl PreparedMutationFacts {
         let query = match self.as_ref() {
             Self::Update(p) => {
                 let source_sql = mutation_source_to_sql(
-                    state,
-                    &p.stmt.source,
+                    &p.stmt.cow_text()?.source,
                     p.current_catalog.as_deref(),
                     &p.target,
                 )?;
@@ -266,7 +307,6 @@ impl PreparedMutationFacts {
                 )?
             }
             Self::Merge(p) => build_exact_cow_merge_selection_query(
-                state,
                 &p.target,
                 &p.stmt,
                 p.current_catalog.as_deref(),
@@ -343,6 +383,7 @@ pub(crate) struct PreparedMorMutationWrite {
     kind: DmlChangeStreamKind,
     assertion: Option<DmlPreExpandKeyedAssert>,
     bindings: Arc<QueryTableBindingStore>,
+    match_read: crate::catalog_application::query_materializer::QueryLocalTableOverlay,
 }
 impl PreparedMorMutationWrite {
     pub(crate) async fn compile_async(
@@ -356,98 +397,154 @@ impl PreparedMorMutationWrite {
             self.facts.planning_pin(),
             self.bindings.as_ref(),
         )?;
-        install_fact_source(&self.state, &self.facts, &self.bindings, provider)?;
-        let mut query = self.query.clone();
-        if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
-            crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
-                &self.state,
-                Some(&self.facts.target().catalog),
-                &self.facts.target().namespace,
-                &mut query,
-                self.facts.context(),
-            )
-            .await?;
-        }
-        let control = crate::query_execution::planning::sql_compile_control_from_execution(
-            self.facts.execution(),
-        );
-        let mut preparation =
-            novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-                novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
-                novarocks_sql::compiler::SqlSessionContext {
-                    sql_semantics: self.facts.execution().sql_semantics().clone(),
-                    // The old analyzer materializer supplied this effective catalog
-                    // for unqualified mutation sources; freeze that same fact here.
-                    current_catalog: Some(self.facts.target().catalog.clone()),
-                    current_database: self.facts.target().namespace.clone(),
-                    optimizer_settings: dml_change_stream_optimizer_settings(),
-                },
-                control.clone(),
-                novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-                None,
-            )
-            .map_err(DmlError::from_compile)?;
-        while !preparation.needs().is_empty() {
-            let facts = provider
-                .resolve_catalog_relations(preparation.needs())
-                .await
-                .map_err(DmlError::from_compile)?;
-            preparation = preparation
-                .continue_catalog(facts.into_boxed_slice())
-                .map_err(DmlError::from_compile)?;
-        }
-        let analyzed = preparation
-            .analyze(
-                &[],
-                self.state.function_catalog().as_ref(),
-                crate::query_execution::constant_eval::constant_evaluator(),
-                self.state.constant_policy(),
-            )
-            .map_err(DmlError::from_compile)?;
-        let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
-            &self.state, Arc::clone(&self.bindings), self.facts.context(),
-        ).await?;
-        let optimize_request = novarocks_sql::compiler::SqlOptimizeRequest::new(
-            analyzed,
-            &statistics,
-            control.clone(),
-        );
-        let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
-        let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
-            DmlChangeStreamCompileRequest {
-                optimize_request,
+        compile_routed_mutation_write(
+            RoutedMutationWrite {
+                state: &self.state,
+                target: self.facts.target(),
+                execution: self.facts.execution(),
+                context: self.facts.context(),
+                bindings: &self.bindings,
+                match_read: &self.match_read,
+                session: &self.session,
+                query: &self.query,
                 kind: self.kind.clone(),
+                assertion: self.assertion.clone(),
                 routes,
                 statistics_targets,
-                pre_expand_keyed_assert: self.assertion.clone(),
-                shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
             },
-            decimal_overflow_policy,
-        )?;
-        let sink = novarocks_query_application::preparation::ReadAccessSink::new();
-        let facts = provider.resolve_provider_reads(&needs, &sink).await?;
-        provider
-            .close()
-            .await
-            .map_err(|error| format!("{}: {}", error.detail(), error.cause()))?;
-        let access = sink
-            .try_into_access()
-            .map_err(|(error, _)| error.to_string())?;
-        let options = Some(options.unwrap_or_else(|| {
-            crate::query_execution::contract::synthetic_statement_query_options(
-                self.facts.execution(),
-            )
-        }));
-        finish_change_stream_write(
-            &self.state,
-            completion,
-            facts,
-            access,
-            &self.session,
+            provider,
             options,
-            &control,
         )
+        .await
     }
+}
+
+pub(crate) struct RoutedMutationWrite<'a> {
+    pub state: &'a DmlExecutionKernel,
+    pub target: &'a crate::catalog_application::resolver::TargetBackend,
+    pub execution: &'a QueryExecutionContext,
+    pub context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    pub bindings: &'a Arc<QueryTableBindingStore>,
+    pub match_read: &'a crate::catalog_application::query_materializer::QueryLocalTableOverlay,
+    pub session: &'a Arc<ConnectorWriteSession>,
+    pub query: &'a novarocks_parser::ast::Query,
+    pub kind: DmlChangeStreamKind,
+    pub assertion: Option<DmlPreExpandKeyedAssert>,
+    pub routes: Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>,
+    pub statistics_targets: Vec<novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget>,
+}
+
+pub(crate) async fn compile_routed_mutation_write(
+    write: RoutedMutationWrite<'_>,
+    provider: &FrontendCompletionCustody,
+    options: Option<QueryOptions>,
+) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, DmlError> {
+    let RoutedMutationWrite {
+        state,
+        target,
+        execution,
+        context,
+        bindings,
+        match_read,
+        session,
+        query,
+        kind,
+        assertion,
+        routes,
+        statistics_targets,
+    } = write;
+    install_dml_fact_source(
+        state,
+        execution,
+        target,
+        context,
+        bindings,
+        std::slice::from_ref(match_read),
+        provider,
+    )?;
+    let mut query = query.clone();
+    if crate::query_execution::planning::time_travel::has_time_travel_refs(&query) {
+        crate::query_execution::planning::time_travel::rewrite_time_travel_refs_async(
+            state,
+            Some(&target.catalog),
+            &target.namespace,
+            &mut query,
+            context,
+        )
+        .await?;
+    }
+    let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
+        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
+        novarocks_sql::compiler::SqlSessionContext {
+            sql_semantics: execution.sql_semantics().clone(),
+            // The old analyzer materializer supplied this effective catalog
+            // for unqualified mutation sources; freeze that same fact here.
+            current_catalog: Some(target.catalog.clone()),
+            current_database: target.namespace.clone(),
+            optimizer_settings: dml_change_stream_optimizer_settings(),
+        },
+        control.clone(),
+        novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
+        None,
+    )
+    .map_err(DmlError::from_compile)?;
+    while !preparation.needs().is_empty() {
+        let facts = provider
+            .resolve_catalog_relations(preparation.needs())
+            .await
+            .map_err(DmlError::from_compile)?;
+        preparation = preparation
+            .continue_catalog(facts.into_boxed_slice())
+            .map_err(DmlError::from_compile)?;
+    }
+    let analyzed = preparation
+        .analyze(
+            &[],
+            state.function_catalog().as_ref(),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            state.constant_policy(),
+        )
+        .map_err(DmlError::from_compile)?;
+    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
+        state, Arc::clone(bindings), context,
+    ).await?;
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone());
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
+        DmlChangeStreamCompileRequest {
+            optimize_request,
+            kind,
+            routes,
+            statistics_targets,
+            pre_expand_keyed_assert: assertion,
+            shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
+        },
+        decimal_overflow_policy,
+    )?;
+    let sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let facts = provider.resolve_provider_reads(&needs, &sink).await?;
+    provider
+        .close()
+        .await
+        .map_err(|error| format!("{}: {}", error.detail(), error.cause()))?;
+    let access = sink
+        .try_into_access()
+        .map_err(|(error, _)| error.to_string())?;
+    let options = Some(options.unwrap_or_else(|| {
+        crate::query_execution::contract::synthetic_statement_query_options(execution)
+    }));
+    finish_change_stream_write(
+        state,
+        completion,
+        facts,
+        access,
+        session,
+        options,
+        &control,
+        crate::query_execution::physical_encoding::encoding_capacity(execution)?,
+    )
 }
 
 fn install_fact_source(
@@ -456,27 +553,48 @@ fn install_fact_source(
     bindings: &Arc<QueryTableBindingStore>,
     provider: &FrontendCompletionCustody,
 ) -> Result<(), String> {
-    let capacity = facts
-        .execution()
-        .result_capacity()
-        .cloned()
-        .ok_or_else(|| {
-            "async mutation compilation requires its admitted result capacity".to_owned()
-        })?;
+    install_dml_fact_source(
+        state,
+        facts.execution(),
+        facts.target(),
+        facts.context(),
+        bindings,
+        &[],
+        provider,
+    )
+}
+
+fn install_dml_fact_source(
+    state: &DmlExecutionKernel,
+    execution: &QueryExecutionContext,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    bindings: &Arc<QueryTableBindingStore>,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
+    provider: &FrontendCompletionCustody,
+) -> Result<(), String> {
+    let capacity = execution.result_capacity().cloned().ok_or_else(|| {
+        "async mutation compilation requires its admitted result capacity".to_owned()
+    })?;
     let scope = crate::query_execution::completion_facts::StatementFactScope::binding_only(
         Arc::clone(bindings),
-        facts.context().clone(),
-        Some(&facts.target().catalog),
+        context.clone(),
+        Some(&target.catalog),
         capacity.scope(),
         capacity.clone(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .with_query_local_overlays(overlays.to_vec())
+    .with_system_table_source_policy(
+        crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
+    );
     crate::query_execution::completion_facts::install_frontend_fact_source(
         provider,
         state.completion_fact_owners()?,
-        scope.with_definition_owned(
-            state.constant_policy(),
-            crate::query_execution::planning::sql_compile_control_from_execution(facts.execution()),
+        scope.with_snapshot_planning_owned(
+            crate::query_execution::planning::sql_compile_control_from_execution(execution),
+            execution.cancellation().clone(),
+            None,
         ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
@@ -562,6 +680,7 @@ impl PreparedCowSelection {
             &self.declarations,
             options.as_ref(),
             &control,
+            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
         )?;
         let signed = self.facts.signed()?;
         Ok(PreparedCowMatchAssembly {

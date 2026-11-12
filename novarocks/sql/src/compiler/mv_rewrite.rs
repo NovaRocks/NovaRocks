@@ -530,6 +530,25 @@ impl SqlImvRewriteSnapshotBuilder {
 pub struct SqlImvRewriteSnapshotHandle(Arc<SqlImvRewriteSnapshot>);
 
 impl SqlImvRewriteSnapshotHandle {
+    pub fn with_target_file_metadata(
+        mut self,
+        metadata: [novarocks_types::schema::ColumnDef; 2],
+    ) -> Result<Self, String> {
+        let [spec, partition] = &metadata;
+        if spec.name != "_spec_id"
+            || spec.nullable
+            || spec.data_type != arrow::datatypes::DataType::Int32
+            || partition.name != "_partition"
+            || !partition.nullable
+            || !matches!(partition.data_type, arrow::datatypes::DataType::Struct(_))
+            || self.0.target_file_metadata.is_some()
+        {
+            return Err("IMV target file metadata differs from its signed scan contract".into());
+        }
+        Arc::make_mut(&mut self.0).target_file_metadata = Some(Arc::new(metadata));
+        Ok(self)
+    }
+
     pub(crate) fn snapshot(&self) -> &Arc<SqlImvRewriteSnapshot> {
         &self.0
     }
@@ -1530,6 +1549,7 @@ pub(crate) struct SqlImvRewriteSnapshot {
     /// SQL-safe target field facts projected by the application.  This avoids
     /// exposing an Iceberg schema or Iceberg default-literal values to SQL.
     pub(crate) target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
+    pub(crate) target_file_metadata: Option<Arc<[novarocks_types::schema::ColumnDef; 2]>>,
     /// SQL projection of the persisted MV planning contract frozen at
     /// admission. Resolving or mutating the serialized contract remains in
     /// the application facade.
@@ -1604,6 +1624,7 @@ impl SqlImvRewriteSnapshot {
             target_snapshot_id,
             target_table_uuid,
             target_columns,
+            target_file_metadata: None,
             schema_contract,
             aggregate_execution,
         })
@@ -4029,9 +4050,9 @@ mod tests {
                 }
                 let control = crate::compiler::SqlCompileControl::unbounded();
                 let mut request = SqlAnalyzeRequest::new(
-                    SqlStatementInput::sql(format!(
+                    SqlStatementInput::parsed_query(Box::new(test_query(&format!(
                         "SELECT k FROM iceberg.db.base WHERE k > {minimum}"
-                    )),
+                    )))),
                     crate::compiler::SqlCompileIntent::Query,
                     SqlSessionContext {
                         current_catalog: Some("iceberg".into()),

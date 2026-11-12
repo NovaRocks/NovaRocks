@@ -233,7 +233,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String>;
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>;
 
     /// Capture the provider-owned physical identity together with submission
     /// target resolution. Durable callers persist this value with the logical
@@ -793,7 +793,8 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String> {
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
+    {
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             &self.kernel,
             &novarocks_sql::semantic::ObjectName {
@@ -1015,7 +1016,8 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         &self,
         name_parts: &[String],
         context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceTarget, String> {
+    ) -> Result<MaintenanceTarget, crate::catalog_application::resolver::TargetResolutionError>
+    {
         self.request_engine()?.resolve_target(name_parts, context)
     }
 
@@ -1301,6 +1303,7 @@ fn freeze_rewrite_cohort_recipe(
     static_plan_carrier: &crate::query_execution::package_freeze::CompiledPackageCarrier,
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &novarocks_sql::compiler::SqlCompileControl,
+    capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> Result<RewriteCohortPlanParts, novarocks_sql::compiler::SqlCompileError> {
     let session = &recipe.session;
     let execution = &recipe.execution;
@@ -1381,6 +1384,7 @@ fn freeze_rewrite_cohort_recipe(
         constant_policy,
         &write_target_facts,
         control,
+        capacity,
     )
     .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
     // Every fallible pairing/description check still borrows the unique access

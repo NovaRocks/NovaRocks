@@ -40,11 +40,12 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     // Two source rows exercise the same matched UPDATE and unmatched INSERT
     // branches as the native row-level scenario. The target supplies the exact
     // locator and v3 lineage columns consumed by the production SQL builder.
-    let match_sql = build_merge_match_query_sql(
+    let query = merge_query_fixture(
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(2 AS BIGINT) AS v, \
          'fixture.parquet' AS _file, CAST(0 AS BIGINT) AS _pos, \
          CAST(20 AS BIGINT) AS _row_id, \
-         CAST(1 AS BIGINT) AS _last_updated_sequence_number) AS t",
+         CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, \
+         CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
         "t",
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(2000 AS BIGINT) AS v \
          UNION ALL SELECT CAST(99 AS BIGINT), CAST(9900 AS BIGINT)) AS s",
@@ -57,7 +58,6 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         Some(MERGE_ACTION_MATCHED_UPDATE),
         true,
     );
-    let query = parse_generated_query(&match_sql, "MOR MERGE router witness").unwrap();
     let control = SqlCompileControl::unbounded();
     let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
     let snapshot = SqlPlannerTableSnapshot::new(&catalog);
@@ -163,6 +163,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         DmlChangeStreamCompileRequest {
             optimize_request: SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
             kind: DmlChangeStreamKind::Merge {
+                file_metadata: None,
                 target_columns: columns,
                 matched_update: true,
                 matched_delete: false,
@@ -301,13 +302,14 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
             )
         })
         .unwrap();
-    let novarocks_physical_plan::FragmentSink::Router {
-        routes, ..
-    } = router.sink()
-    else {
+    let novarocks_physical_plan::FragmentSink::Router { routes, .. } = router.sink() else {
         unreachable!()
     };
-    let summary = router.summaries().iter().find(|summary| summary.kind() == novarocks_physical_plan::SummaryKind::WriteCounts).unwrap();
+    let summary = router
+        .summaries()
+        .iter()
+        .find(|summary| summary.kind() == novarocks_physical_plan::SummaryKind::WriteCounts)
+        .unwrap();
     let sink_facts =
         crate::native::fragment_encoder::frozen::tests::sink_targets_for_completed_fragment(
             router,
@@ -416,7 +418,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .unwrap_or_else(|(error, _)| panic!("pair original completed plan: {error}"));
     let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
-    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
         paired,
         &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
             novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,
@@ -448,7 +450,13 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         "literal source has no external read capability"
     );
     let declared = encoded.plan_facts.write_root_summary_kinds().unwrap();
-    assert_eq!(*declared, novarocks_result_contract::PerKind { write_counts: Some(()), delete_verification: None });
+    assert_eq!(
+        *declared,
+        novarocks_result_contract::PerKind {
+            write_counts: Some(()),
+            delete_verification: None
+        }
+    );
     let router_artifact = encoded.native.get(router_fragment).unwrap();
     assert_eq!(
         router_artifact.facts().summary_outputs().write_counts,

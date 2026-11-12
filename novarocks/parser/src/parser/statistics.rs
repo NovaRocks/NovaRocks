@@ -21,7 +21,7 @@ use crate::{
     ParseError, Span, TokenKind,
     ast::statistics::{
         AnalyzeMode, AnalyzeTable, CancelAnalyze, DropHistogram, DropMultipleColumnsStats,
-        DropStats, ShowAnalyzeJobs, ShowBasicStatsMeta, ShowHistogramStatsMeta, ShowTableStats,
+        DropStats, ShowAnalyzeJobs, ShowTableStats,
     },
     ast::{Statement, StatisticsStatement},
     token::Symbol,
@@ -40,7 +40,7 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
         return parse_cancel(parser).map(Some);
     }
     if parser.current_is_word("SHOW")
-        && ["ANALYZE", "TABLE", "BASIC", "HISTOGRAM"]
+        && ["ANALYZE", "TABLE"]
             .iter()
             .any(|word| parser.peek_word(1, word))
     {
@@ -154,23 +154,7 @@ fn parse_show(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
             },
         )));
     }
-    if parser.consume_if_word("BASIC") {
-        parser.consume_word("STATS")?;
-        parser.consume_word("META")?;
-        return Ok(Statement::Statistics(
-            StatisticsStatement::ShowBasicStatsMeta(ShowBasicStatsMeta {
-                span: Span::new(start, parser.current_offset()),
-            }),
-        ));
-    }
-    parser.consume_word("HISTOGRAM")?;
-    parser.consume_word("STATS")?;
-    parser.consume_word("META")?;
-    Ok(Statement::Statistics(
-        StatisticsStatement::ShowHistogramStatsMeta(ShowHistogramStatsMeta {
-            span: Span::new(start, parser.current_offset()),
-        }),
-    ))
+    Err(parser.unexpected("ANALYZE or TABLE STATS"))
 }
 
 fn parse_drop(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {

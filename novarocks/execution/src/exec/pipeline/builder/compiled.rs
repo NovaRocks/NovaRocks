@@ -689,6 +689,21 @@ fn build_node(
     }
     let node_id = display_id(id)?;
     let mut build = match node.kind() {
+        ProgramNodeKind::SystemRelation { .. } => {
+            let source: Box<dyn OperatorFactory> = Box::new(
+                system_relation_source::CompiledSystemRelationSourceFactory::try_new(
+                    Arc::clone(program),
+                    id,
+                    Arc::clone(error),
+                )?,
+            );
+            let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines: Vec::new(),
+                stream: StreamDesc::any(1),
+            })
+        }
         ProgramNodeKind::Values { .. } => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(values_source::CompiledValuesSourceFactory::try_new(
@@ -910,8 +925,43 @@ fn build_node(
                     format!("missing exchange binding for compiled receiver node {receiver}"),
                 )
             })?;
-            let source: Box<dyn OperatorFactory> =
-                Box::new(ExchangeSourceFactory::new_compiled(node_id, binding));
+            let position_shards = match program.exchange_inputs().get(&id).map(|input| input.role) {
+                Some(novarocks_local_program::ProgramOutputRole::PositionShards {
+                    group, ..
+                }) => {
+                    let root = program.graph().root();
+                    if !matches!(
+                        program.graph().nodes()[root.index()].kind(),
+                        ProgramNodeKind::TableWriter { input, .. } if *input == id
+                    ) || binding.key.node_id != receiver
+                    {
+                        return Err(program_failure(
+                            FragmentBindingErrorKind::InvalidAssignment,
+                            "Position shard exchange requires its exact direct root writer",
+                        ));
+                    }
+                    Some(
+                        ctx.compiled_writers
+                            .writer(root)
+                            .and_then(|writer| writer.position_shards.as_ref())
+                            .filter(|sources| {
+                                sources.matches_receiver(receiver, group, binding.expected_senders)
+                            })
+                            .cloned()
+                            .ok_or_else(|| {
+                                program_failure(
+                                    FragmentBindingErrorKind::MissingAssignment,
+                                    "Position shard exchange has no matching writer source roster",
+                                )
+                            })?,
+                    )
+                }
+                _ => None,
+            };
+            let source: Box<dyn OperatorFactory> = Box::new(
+                ExchangeSourceFactory::new_compiled(node_id, binding)
+                    .with_position_shards(position_shards),
+            );
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -1183,6 +1233,19 @@ fn build_node(
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
+        ProgramNodeKind::PositionShard {
+            inputs,
+            output_slots,
+            ..
+        } => build_position_shards(
+            program,
+            id,
+            node_id,
+            (inputs, output_slots),
+            ctx,
+            error,
+            ordered,
+        ),
         ProgramNodeKind::ChangeEventExpand { input, .. } => {
             let factory = CompiledChangeEventProcessorFactory::try_new(
                 Arc::clone(program),
@@ -1247,6 +1310,7 @@ fn build_node(
                 }
                 let label = match node.kind() {
                     ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
+                    ProgramNodeKind::SystemRelation { .. } => "SystemRelationSource".to_string(),
                     _ => factory.name().to_string(),
                 };
                 Box::new(ProfiledCompiledFactory {
@@ -1260,6 +1324,114 @@ fn build_node(
             .collect();
     }
     Ok(build)
+}
+
+/// All contribution receivers feed one file-hash exchange whose producer
+/// roster includes the actual drivers of every input pipeline.
+fn build_position_shards(
+    program: &Arc<LocalProgram>,
+    id: ProgramNodeId,
+    node_id: i32,
+    ports: (
+        &[novarocks_local_program::ProgramPositionShardInput],
+        &[novarocks_types::SlotId; 9],
+    ),
+    ctx: &mut PipelineBuildContext,
+    error: &Arc<RuntimeErrorState>,
+    ordered: Option<&CompiledOrderedFilterContext>,
+) -> ExecutionResult<PipelineBuildResult> {
+    use crate::exec::operators::position_shard::PositionShardFactory;
+    use novarocks_type_contract::FunctionValueType;
+
+    let invalid = |detail| program_failure(FragmentBindingErrorKind::InvalidAssignment, detail);
+    let (inputs, output_slots) = ports;
+    let nodes = program.graph().nodes();
+    let output = nodes[id.index()].output_layout();
+    if inputs.is_empty() || output.slots() != output_slots {
+        return Err(invalid(
+            "Position shard output or contribution ports differ",
+        ));
+    }
+
+    let key = output
+        .value_binding(output_slots[0])
+        .ok_or_else(|| invalid("Position shards have no frozen output file key"))?;
+    let key = FunctionValueType::try_from_typed_binding(key.clone())
+        .map_err(ExecutionFailure::from_domain)?;
+    if key.nullable() {
+        return Err(invalid("Position shard file key must be required"));
+    }
+    let mut builds = Vec::with_capacity(inputs.len());
+    let mut producers = 0usize;
+    for input in inputs {
+        let child = nodes
+            .get(input.input.index())
+            .ok_or_else(|| invalid("Missing position contribution input"))?;
+        let layout = child.output_layout();
+        if !matches!(child.kind(), ProgramNodeKind::ExchangeSource { .. })
+            || layout.slots() != [input.file, input.position, input.spec_id, input.partition]
+        {
+            return Err(invalid(
+                "Position contribution differs from its exact receiver layout",
+            ));
+        }
+        let ty = layout
+            .value_binding(input.file)
+            .ok_or_else(|| invalid("Position contribution has no frozen file key type"))?;
+        let ty = FunctionValueType::try_from_typed_binding(ty.clone())
+            .map_err(ExecutionFailure::from_domain)?;
+        if !key.same_physical_binding_ignoring_root_nullability_observed(&ty, || {
+            Ok::<_, ExecutionFailure>(())
+        })? {
+            return Err(invalid(
+                "Position contributions have different file key types",
+            ));
+        }
+        let build = build_node(program, input.input, ctx, error, ordered)?;
+        let dop = usize::try_from(build.pipeline.dop)
+            .map_err(|_| invalid("Invalid position contribution producer width"))?;
+        producers = producers
+            .checked_add(dop)
+            .ok_or_else(|| invalid("Position contribution producer count overflow"))?;
+        builds.push(build);
+    }
+
+    let dop = ctx.pipeline_dop;
+    let partitions = usize::try_from(dop).map_err(|_| invalid("Invalid position shard DOP"))?;
+    let exchanger = LocalExchanger::new_with_limits(
+        partitions,
+        producers,
+        LocalExchangePartitionSpec::HierarchicalFileInput(key),
+        ctx.local_exchange_buffer_mem_limit_per_driver,
+        ctx.local_exchange_max_buffered_rows,
+    );
+    let mut extra_pipelines = Vec::new();
+    for mut build in builds {
+        build
+            .pipeline
+            .factories
+            .push(Box::new(LocalExchangeSinkFactory::new(
+                node_id,
+                Arc::clone(&exchanger),
+            )));
+        build.pipeline.needs_sink = false;
+        extra_pipelines.push(build.pipeline);
+        extra_pipelines.append(&mut build.extra_pipelines);
+    }
+    let source = Box::new(LocalExchangeSourceFactory::new(
+        node_id, partitions, exchanger,
+    ));
+    let mut pipeline = new_source_pipeline_with_dop(ctx, source, dop);
+    pipeline.factories.push(Box::new(PositionShardFactory::new(
+        output.clone(),
+        Arc::clone(error),
+        dop,
+    )));
+    Ok(PipelineBuildResult {
+        pipeline,
+        extra_pipelines,
+        stream: StreamDesc::any(dop),
+    })
 }
 
 /// UnionAll as the compiler lowers it: every input is that branch's
@@ -1422,6 +1594,8 @@ fn assertion_mode(mode: &AssertRowsMode) -> AssertNumRowsMode {
     }
 }
 
+#[path = "compiled_system_relation.rs"]
+mod system_relation_source;
 #[path = "compiled_values.rs"]
 mod values_source;
 
@@ -1522,3 +1696,7 @@ mod compiled_window_metadata_tests;
 #[cfg(test)]
 #[path = "compiled_migration_shape_tests.rs"]
 mod migration_shape_tests;
+
+#[cfg(test)]
+#[path = "compiled_system_relation_tests.rs"]
+mod system_relation_tests;

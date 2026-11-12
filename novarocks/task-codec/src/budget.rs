@@ -21,12 +21,67 @@
 
 use std::time::Duration;
 
-/// Payload and queue budgets of the operation transport.
+/// Effective unary message limits supplied by role configuration. These are
+/// protobuf message lengths; gRPC owns its separate five-byte frame header.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TransportMessageLimits {
+    pub ordinary_request_max_bytes: usize,
+    pub ordinary_response_max_bytes: usize,
+    pub control_request_max_bytes: usize,
+    pub control_response_max_bytes: usize,
+}
+
+impl TransportMessageLimits {
+    pub const DEFAULT: Self = Self {
+        ordinary_request_max_bytes: 64 * 1024 * 1024,
+        ordinary_response_max_bytes: 64 * 1024 * 1024,
+        control_request_max_bytes: 1024 * 1024,
+        control_response_max_bytes: 64 * 1024 * 1024,
+    };
+
+    pub fn validate(self) -> Option<Self> {
+        for bytes in [
+            self.ordinary_request_max_bytes,
+            self.ordinary_response_max_bytes,
+            self.control_request_max_bytes,
+            self.control_response_max_bytes,
+        ] {
+            if bytes == 0 || u32::try_from(bytes).is_err() {
+                return None;
+            }
+        }
+        if self.control_request_max_bytes > self.ordinary_request_max_bytes
+            || self.control_response_max_bytes > self.ordinary_response_max_bytes
+        {
+            return None;
+        }
+        Some(self)
+    }
+
+    pub const fn request_max_bytes(self, control: bool) -> usize {
+        if control {
+            self.control_request_max_bytes
+        } else {
+            self.ordinary_request_max_bytes
+        }
+    }
+    pub const fn response_max_bytes(self, control: bool) -> usize {
+        if control {
+            self.control_response_max_bytes
+        } else {
+            self.ordinary_response_max_bytes
+        }
+    }
+}
+
+/// Request grouping targets and the original queue policy. The FE queue
+/// author separately validates its queued-carrier bound against these actual
+/// windows before installing transport; encoded bytes are not queued bytes.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TransportBudget {
     max_batch_items: usize,
-    max_batch_encoded_bytes: usize,
-    max_descriptor_encoded_bytes: usize,
+    batch_target_encoded_bytes: usize,
+    message_limits: TransportMessageLimits,
     max_query_backend_queued_operations: usize,
     max_query_backend_queued_bytes: usize,
     max_backend_queued_operations: usize,
@@ -39,8 +94,8 @@ pub struct TransportBudget {
 impl TransportBudget {
     pub const DEFAULT: Self = Self {
         max_batch_items: 32,
-        max_batch_encoded_bytes: 48 * 1024 * 1024,
-        max_descriptor_encoded_bytes: 16 * 1024 * 1024,
+        batch_target_encoded_bytes: 48 * 1024 * 1024,
+        message_limits: TransportMessageLimits::DEFAULT,
         max_query_backend_queued_operations: 4096,
         max_query_backend_queued_bytes: 256 * 1024 * 1024,
         max_backend_queued_operations: 16384,
@@ -50,24 +105,13 @@ impl TransportBudget {
         frontend_queue_residence: Duration::from_secs(15),
     };
 
-    /// Builds a budget, rejecting a zero or an inverted bound.
-    ///
-    /// The defaults are the frozen contract, but a deployment has to be able
-    /// to tighten them and a test has to be able to prove the enforcement
-    /// path without manufacturing a 48 MiB payload. The ordering rules are
-    /// what make the bounds a hierarchy rather than ten unrelated numbers: a
-    /// descriptor has to fit in a batch, a batch in one query's queue, and
-    /// that queue in the process's, or the smaller bound makes the larger one
-    /// unreachable. The process window also retains one queued carrier and
-    /// one encoded request for both an ordinary batch and its control reserve,
-    /// so it must fit two maximum retained batches. The task counts nest for
-    /// the same reason — a
-    /// `ParticipationRef` names one query on one backend, so one context's
-    /// tasks are a subset of that backend's.
+    /// Validate the queue policy and message representation. Request-window
+    /// consistency additionally consumes the original FE queue author's Q-hat;
+    /// it cannot be inferred from a grouping target or message length alone.
     pub fn new(
         max_batch_items: usize,
-        max_batch_encoded_bytes: usize,
-        max_descriptor_encoded_bytes: usize,
+        batch_target_encoded_bytes: usize,
+        message_limits: TransportMessageLimits,
         max_query_backend_queued_operations: usize,
         max_query_backend_queued_bytes: usize,
         max_backend_queued_operations: usize,
@@ -76,9 +120,9 @@ impl TransportBudget {
         max_active_tasks_per_backend: usize,
         frontend_queue_residence: Duration,
     ) -> Option<Self> {
+        message_limits.validate()?;
         if max_batch_items == 0
-            || max_batch_encoded_bytes == 0
-            || max_descriptor_encoded_bytes == 0
+            || batch_target_encoded_bytes == 0
             || max_query_backend_queued_operations == 0
             || max_query_backend_queued_bytes == 0
             || max_backend_queued_operations == 0
@@ -89,24 +133,19 @@ impl TransportBudget {
         {
             return None;
         }
-        let max_retained_batch_bytes = max_batch_encoded_bytes.checked_mul(2)?;
-        let minimum_process_retained_bytes = max_retained_batch_bytes.checked_mul(2)?;
         let minimum_process_items = max_batch_items.checked_mul(2)?;
-        if max_descriptor_encoded_bytes > max_batch_encoded_bytes
-            || max_batch_encoded_bytes > max_query_backend_queued_bytes
-            || max_query_backend_queued_bytes > max_backend_queued_bytes
+        if max_query_backend_queued_bytes > max_backend_queued_bytes
             || max_batch_items > max_query_backend_queued_operations
             || max_query_backend_queued_operations > max_backend_queued_operations
             || max_tasks_per_participation > max_active_tasks_per_backend
             || minimum_process_items > max_backend_queued_operations
-            || minimum_process_retained_bytes > max_backend_queued_bytes
         {
             return None;
         }
         Some(Self {
             max_batch_items,
-            max_batch_encoded_bytes,
-            max_descriptor_encoded_bytes,
+            batch_target_encoded_bytes,
+            message_limits,
             max_query_backend_queued_operations,
             max_query_backend_queued_bytes,
             max_backend_queued_operations,
@@ -116,95 +155,77 @@ impl TransportBudget {
             frontend_queue_residence,
         })
     }
-
     pub const fn max_batch_items(self) -> usize {
         self.max_batch_items
     }
-
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.max_batch_encoded_bytes
+    pub const fn batch_target_encoded_bytes(self) -> usize {
+        self.batch_target_encoded_bytes
     }
-
-    /// Largest retained queue-side carrier for one operation.
-    ///
-    /// The dispatcher enforces this before enqueueing. This closes the
-    /// otherwise unbounded first-item exception when it forms a batch.
-    pub const fn max_operation_queued_bytes(self) -> usize {
-        self.max_batch_encoded_bytes
+    pub const fn message_limits(self) -> TransportMessageLimits {
+        self.message_limits
     }
-
-    /// Largest queued carrier plus encoded request retained by one batch.
-    pub const fn max_retained_batch_bytes(self) -> usize {
-        self.max_batch_encoded_bytes.saturating_mul(2)
-    }
-
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.max_descriptor_encoded_bytes
-    }
-
     pub const fn max_query_backend_queued_operations(self) -> usize {
         self.max_query_backend_queued_operations
     }
-
     pub const fn max_query_backend_queued_bytes(self) -> usize {
         self.max_query_backend_queued_bytes
     }
-
     pub const fn max_backend_queued_operations(self) -> usize {
         self.max_backend_queued_operations
     }
-
     pub const fn max_backend_queued_bytes(self) -> usize {
         self.max_backend_queued_bytes
     }
-
     pub const fn max_tasks_per_participation(self) -> usize {
         self.max_tasks_per_participation
     }
-
     pub const fn max_active_tasks_per_backend(self) -> usize {
         self.max_active_tasks_per_backend
     }
-
-    /// How long an operation may sit in the frontend queue before it fails
-    /// closed locally rather than being sent late.
     pub const fn frontend_queue_residence(self) -> Duration {
         self.frontend_queue_residence
     }
 
-    /// Whether a batch of `items` totalling `encoded_bytes` fits.
-    pub const fn batch_fits(self, items: usize, encoded_bytes: usize) -> bool {
-        items > 0 && items <= self.max_batch_items && encoded_bytes <= self.max_batch_encoded_bytes
+    /// Grouping bytes are a target, not a codec refusal. The actual method
+    /// limit is checked by its transport before an operation is reserved.
+    pub const fn batch_fits(self, items: usize, _encoded_bytes: usize) -> bool {
+        items > 0 && items <= self.max_batch_items
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::TransportBudget;
-
+    use super::*;
     #[test]
-    fn batches_are_nonempty_and_bounded() {
+    fn grouping_target_does_not_reject_large_operations() {
         let budget = TransportBudget::DEFAULT;
-        assert!(budget.batch_fits(1, 1));
+        assert!(budget.batch_fits(1, budget.batch_target_encoded_bytes() + 1));
         assert!(!budget.batch_fits(0, 0));
         assert!(!budget.batch_fits(budget.max_batch_items() + 1, 1));
-        assert!(!budget.batch_fits(1, budget.max_batch_encoded_bytes() + 1));
     }
-
     #[test]
-    fn process_window_must_fit_one_ordinary_batch_and_one_control_batch() {
+    fn message_limits_follow_grpc_length_representation() {
+        let limits = TransportMessageLimits {
+            ordinary_request_max_bytes: 128 * 1024 * 1024,
+            ordinary_response_max_bytes: 128 * 1024 * 1024,
+            ..TransportMessageLimits::DEFAULT
+        };
+        assert_eq!(limits.validate(), Some(limits));
         assert!(
-            TransportBudget::new(2, 10, 5, 2, 20, 4, 40, 1, 2, Duration::from_secs(1)).is_some()
+            TransportMessageLimits {
+                ordinary_request_max_bytes: u32::MAX as usize + 1,
+                ..limits
+            }
+            .validate()
+            .is_none()
         );
         assert!(
-            TransportBudget::new(2, 10, 5, 2, 20, 3, 40, 1, 2, Duration::from_secs(1)).is_none(),
-            "three process items cannot hold two ordinary and two control items"
-        );
-        assert!(
-            TransportBudget::new(2, 10, 5, 2, 20, 4, 39, 1, 2, Duration::from_secs(1)).is_none(),
-            "the process byte window retains queued and encoded forms of both batches"
+            TransportMessageLimits {
+                control_request_max_bytes: 0,
+                ..limits
+            }
+            .validate()
+            .is_none()
         );
     }
 }

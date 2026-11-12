@@ -20,20 +20,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 mode=anomalies
+lineage_phase=""
+lineage_seed_receipt=""
+mutation_seed_receipt=""
 namespace=""
 prefix=""
 output=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fixture-budget-secs) export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
+    --mutation-seed-receipt) mutation_seed_receipt="$2"; shift 2 ;;
+    --lineage-seed-receipt) lineage_seed_receipt="$2"; shift 2 ;;
+    --lineage-phase) lineage_phase="$2"; shift 2 ;;
     --mode) mode="$2"; shift 2 ;;
     --namespace) namespace="$2"; shift 2 ;;
     --prefix) prefix="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
-    *) echo "usage: $0 --output DIR [--mode anomalies|positive|corpus|promotion] [--namespace NAME] [--prefix NAME]" >&2; exit 2 ;;
+    *) echo "usage: $0 --output DIR [--mode anomalies|positive|corpus|promotion|lineage|mutation-seed|mutation-check] [--lineage-phase mixed|historical|historical-check] [--lineage-seed-receipt FILE] [--mutation-seed-receipt FILE] [--namespace NAME] [--prefix NAME]" >&2; exit 2 ;;
   esac
 done
-[[ "$mode" == anomalies || "$mode" == positive || "$mode" == corpus || "$mode" == promotion ]] || { echo "Invalid mode: $mode" >&2; exit 2; }
+[[ "$mode" == anomalies || "$mode" == positive || "$mode" == corpus || "$mode" == promotion || "$mode" == lineage || "$mode" == mutation-seed || "$mode" == mutation-check ]] || { echo "Invalid mode: $mode" >&2; exit 2; }
+if [[ "$mode" == lineage ]]; then
+  case "$lineage_phase" in
+    mixed|historical|historical-check) ;;
+    *) echo "--mode lineage requires --lineage-phase mixed|historical|historical-check" >&2; exit 2 ;;
+  esac
+elif [[ -n "$lineage_phase" ]]; then
+  echo "--lineage-phase requires --mode lineage" >&2
+  exit 2
+fi
+if [[ "$lineage_phase" == historical-check ]]; then
+  [[ -f "$lineage_seed_receipt" ]] || { echo "Missing historical lineage seed receipt" >&2; exit 2; }
+elif [[ -n "$lineage_seed_receipt" ]]; then
+  echo "--lineage-seed-receipt requires --lineage-phase historical-check" >&2
+  exit 2
+fi
+if [[ "$mode" == mutation-check ]]; then
+  [[ -f "$mutation_seed_receipt" ]] || { echo "Missing materialization seed receipt" >&2; exit 2; }
+elif [[ -n "$mutation_seed_receipt" ]]; then
+  echo "--mutation-seed-receipt requires --mode mutation-check" >&2
+  exit 2
+fi
 [[ -n "$output" ]] || { echo "--output is required" >&2; exit 2; }
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$WORKSPACE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"
@@ -54,15 +81,24 @@ export NOVA_ENV_REST_ENV_FILE
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 [[ ! -e "$output/receipt.json" && ! -e "$output/spark.log" ]] || { echo "Use a fresh output directory" >&2; exit 1; }
+if [[ "$mode" == mutation-seed || "$mode" == mutation-check ]]; then
+  printf '%s\n' "$NOVA_FIXTURE_RUN_CONTEXT" >"$output/run-context.json"
+fi
 scala_file="$output/fixture.scala"
-python3 - "$SCRIPT_DIR" "$scala_file" "$namespace" "$prefix" "$mode" <<'PY'
+python3 - "$SCRIPT_DIR" "$scala_file" "$namespace" "$prefix" "$mode" "$lineage_phase" <<'PY'
 import json
 import pathlib
 import sys
-source, destination, namespace, prefix, mode = sys.argv[1:]
+source, destination, namespace, prefix, mode, lineage_phase = sys.argv[1:]
 root = pathlib.Path(source)
 body = (root / "generate.scala").read_text()
-if mode in ("anomalies", "corpus", "promotion"):
+if mode in ("anomalies", "lineage"):
+    body += "\n" + (root / "avro.scala").read_text()
+if mode == "lineage":
+    body += "\n" + (root / "row_lineage.scala").read_text()
+elif mode in ("mutation-seed", "mutation-check"):
+    body += "\n" + (root / "mutation.scala").read_text()
+elif mode in ("anomalies", "corpus", "promotion"):
     body += "\n" + (root / (mode + ".scala")).read_text()
 body += "\ntry {\n"
 body += f"  DeleteApplicabilityFixture.initialize(org.apache.spark.sql.SparkSession.active, {json.dumps(namespace)}, {json.dumps(prefix)})\n"
@@ -74,6 +110,12 @@ elif mode == "corpus":
     body += "  DeleteApplicabilityCorpus.run()\n"
 elif mode == "promotion":
     body += "  DeleteApplicabilityPromotion.run()\n"
+elif mode in ("mutation-seed", "mutation-check"):
+    method = "seed" if mode == "mutation-seed" else "check"
+    body += f"  DeleteMaterializationFixture.{method}()\n"
+elif mode == "lineage":
+    method = {"mixed": "mixed", "historical": "historical", "historical-check": "verifyHistorical"}[lineage_phase]
+    body += f"  ManifestLineageFixture.{method}()\n"
 body += '  println("UEA4G_COMPLETE")\n'
 body += "} catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }\n"
 pathlib.Path(destination).write_text(body)
@@ -82,7 +124,17 @@ if ! "$WORKSPACE_ROOT/docker/iceberg-rest/spark-shell.sh" "$scala_file" >"$outpu
   grep -v '^UEA4G_RECEIPT ' "$output/spark.log" | tail -80 >&2
   exit 1
 fi
-python3 "$SCRIPT_DIR/validate_receipts.py" "$output/spark.log" --output "$output" --mode "$mode"
+receipt_args=(--output "$output" --mode "$mode")
+if [[ "$mode" == lineage ]]; then
+  receipt_args+=(--lineage-phase "$lineage_phase")
+  if [[ "$lineage_phase" == historical-check ]]; then
+    receipt_args+=(--lineage-seed-receipt "$lineage_seed_receipt")
+  fi
+fi
+if [[ "$mode" == mutation-check ]]; then
+  receipt_args+=(--mutation-seed-receipt "$mutation_seed_receipt")
+fi
+python3 "$SCRIPT_DIR/validate_receipts.py" "$output/spark.log" "${receipt_args[@]}"
 if [[ "$mode" == promotion ]]; then
   printf 'UEA4G_OBSERVATION_OK namespace=%s prefix=%s receipt=%s/receipt.json\n' "$namespace" "$prefix" "$output"
 else

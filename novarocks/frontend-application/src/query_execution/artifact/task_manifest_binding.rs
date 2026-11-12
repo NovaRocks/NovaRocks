@@ -84,6 +84,7 @@ impl BoundManifestBackend {
 pub(crate) struct BoundWriterCohort {
     plan: novarocks_query_application::api::PlanSeal,
     task: TaskIdentity,
+    task_key: UniqueId,
     fragment: FragmentId,
     writer: crate::native::fragment_encoder::frozen::StaticTableWriter,
 }
@@ -93,6 +94,10 @@ impl BoundWriterCohort {
     }
     pub(crate) const fn task(self) -> TaskIdentity {
         self.task
+    }
+
+    pub(crate) const fn task_key(self) -> UniqueId {
+        self.task_key
     }
     pub(crate) const fn fragment(self) -> FragmentId {
         self.fragment
@@ -1015,6 +1020,7 @@ fn bound_writer_cohorts<'a>(
             .map(move |writer| BoundWriterCohort {
                 plan,
                 task: task.identity,
+                task_key: task.task_key(),
                 fragment: task.fragment_id,
                 writer,
             })
@@ -2002,9 +2008,14 @@ mod tests {
         }
 
         let version = PlanVersionId::try_new([83; 16]).expect("finite component plan version");
+        let mut statements = novarocks_parser::parse("SELECT 7 AS payload").unwrap();
+        assert_eq!(statements.len(), 1);
+        let novarocks_parser::ast::Statement::Query(query) = statements.pop().unwrap() else {
+            panic!("expected one query");
+        };
         let request = SqlFinalPlanCompileRequest::new(
             version,
-            SqlStatementInput::sql("SELECT 7 AS payload"),
+            SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -2088,7 +2099,7 @@ mod tests {
         let paired = paired
             .freeze_root_output(output)
             .unwrap_or_else(|(error, _access)| panic!("freeze the original root purpose: {error}"));
-        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        let encoded = crate::query_execution::physical_encoding::encode_completed_plan_for_test(
             paired,
             &crate::query_execution::package_freeze::CompiledPackageCarrier::for_test(
                 novarocks_plan_codec::physical_package_v2::FROZEN_PACKAGE_ADMISSION,

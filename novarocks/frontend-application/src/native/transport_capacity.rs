@@ -20,9 +20,10 @@
 //! Design: ADR-0228.
 //!
 //! Let I/B be process items/bytes, TI/TB the ordinary target items/bytes,
-//! CI the maximum batch items, MB the maximum encoded batch bytes, and
-//! CB=2*MB. TB=max(configured target bytes, CB), exactly as the retired
-//! supervisor. Process dimensions precede keyed dimensions on admission.
+//! CI the maximum batch items, MO/MC the ordinary/control method request
+//! limits, and CB=Qhat(MC)+MC from the original intent queue author. TB is
+//! the configured ordinary target window. Process dimensions precede keyed
+//! dimensions on admission; the grouping target is never a hard limit.
 //!
 //! | Dimension | Limit | Queue stage | Encoding stage | In-flight release |
 //! |---|---|---|---|---|
@@ -30,13 +31,13 @@
 //! | 2 total bytes | B | queued bytes | encoded bytes | - |
 //! | 3 ordinary items | I-CI | ordinary items | - | - |
 //! | 4 ordinary bytes | B-CB | ordinary queued bytes | ordinary encoded bytes | - |
-//! | 5 ordinary queue bytes | B-CB-MB | ordinary queued bytes | - | queue bytes |
-//! | 6 control queue bytes | CB-MB | control queued bytes | - | queue bytes |
+//! | 5 ordinary queue bytes | B-CB-MO | ordinary queued bytes | - | queue bytes |
+//! | 6 control queue bytes | CB-MC | control queued bytes | - | queue bytes |
 //! | 7 target items | TI+CI | items | - | - |
 //! | 8 target bytes | TB+CB | queued bytes | encoded bytes | - |
 //! | 9 target ordinary items | TI | ordinary items | - | - |
 //! | 10 target ordinary bytes | TB | ordinary queued bytes | ordinary encoded bytes | - |
-//! | 11 target ordinary queue bytes | TB-MB | ordinary queued bytes | - | queue bytes |
+//! | 11 target ordinary queue bytes | TB-MO | ordinary queued bytes | - | queue bytes |
 //!
 //! `process_limits` and `keyed_families` configure the original ledger once.
 //! `queue_resources`/`encoding_resources` describe one original reservation;
@@ -119,7 +120,6 @@ pub(crate) struct TransportCapacityFacts {
     pub(crate) target_retained_bytes: usize,
     pub(crate) control_reserved_items: usize,
     pub(crate) control_reserved_bytes: usize,
-    pub(crate) maximum_batch_encoded_bytes: usize,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct NativeTransportCapacity {
@@ -130,43 +130,38 @@ pub(crate) struct NativeTransportCapacity {
 }
 impl NativeTransportCapacity {
     pub(crate) fn from_transport(source: TransportBudget) -> Result<Self, String> {
+        let windows = crate::task_execution::intent::NativeRequestWindows::for_transport(source)?;
+        Self::from_request_windows(source, windows)
+    }
+    fn from_request_windows(
+        source: TransportBudget,
+        windows: crate::task_execution::intent::NativeRequestWindows,
+    ) -> Result<Self, String> {
         let items = source.max_backend_queued_operations();
-        let bytes = source.max_backend_queued_bytes();
+        let bytes = windows.process_retained_bytes;
         let target_items = source.max_query_backend_queued_operations();
         let batch_items = source.max_batch_items();
-        let batch_bytes = source.max_batch_encoded_bytes();
-        let control_bytes = batch_bytes
-            .checked_mul(2)
-            .ok_or("native task transport retained-byte windows overflowed")?;
-        let target_bytes = source.max_query_backend_queued_bytes().max(control_bytes);
-        if batch_items
-            .checked_mul(2)
-            .ok_or("native task transport item windows overflowed")?
-            > items
-            || control_bytes
-                .checked_mul(2)
-                .ok_or("native task transport retained-byte windows overflowed")?
-                > bytes
-        {
-            return Err("native task transport process bounds must fit one maximum ordinary batch and one maximum control batch".into());
-        }
+        let ordinary_request_bytes = windows.ordinary_request_max_bytes;
+        let control_request_bytes = windows.control_request_max_bytes;
+        let control_bytes = windows.control_reserved_bytes;
+        let target_bytes = windows.target_retained_bytes;
         let process = [
             items,
             bytes,
             items - batch_items,
             bytes - control_bytes,
-            bytes - control_bytes - batch_bytes,
-            control_bytes - batch_bytes,
+            bytes - control_bytes - ordinary_request_bytes,
+            control_bytes - control_request_bytes,
         ];
         let target = [
             target_items.saturating_add(batch_items),
             target_bytes.saturating_add(control_bytes),
             target_items,
             target_bytes,
-            target_bytes - batch_bytes,
+            target_bytes - ordinary_request_bytes,
         ];
-        // TransportBudget rejects zero MB/CI and enforces 2*CB <= B and
-        // 2*CI <= I. TB >= CB=2*MB. Hence every derived limit is positive;
+        // TransportBudget and the original queue author validate the complete
+        // queued+encoded request windows. Every derived limit is positive;
         // ResourceVector must never erase a configured zero-limit dimension.
         assert!(process.into_iter().chain(target).all(|limit| limit > 0));
         let process_limits = limits(PROCESS_DIMENSIONS, process)?;
@@ -180,7 +175,6 @@ impl NativeTransportCapacity {
                 target_retained_bytes: target_bytes,
                 control_reserved_items: batch_items,
                 control_reserved_bytes: control_bytes,
-                maximum_batch_encoded_bytes: batch_bytes,
             },
             process_limits,
             target_limits,
@@ -247,7 +241,13 @@ impl NativeTransportCapacity {
         lane: TransportCapacityLane,
         bytes: usize,
     ) -> Result<ReservationResources, TransportCapacityError> {
-        if bytes == 0 || bytes > self.source.max_batch_encoded_bytes() {
+        if bytes == 0
+            || bytes
+                > self
+                    .source
+                    .message_limits()
+                    .request_max_bytes(lane == TransportCapacityLane::Control)
+        {
             return Err(TransportCapacityError::InvalidEncodingBytes);
         }
         self.byte_resources(backend, lane, bytes, true)
@@ -309,7 +309,13 @@ impl NativeTransportCapacity {
         reserved: usize,
         actual: usize,
     ) -> Result<ReservationResources, TransportCapacityError> {
-        if reserved == 0 || reserved > self.source.max_batch_encoded_bytes() {
+        if reserved == 0
+            || reserved
+                > self
+                    .source
+                    .message_limits()
+                    .request_max_bytes(lane == TransportCapacityLane::Control)
+        {
             return Err(TransportCapacityError::InvalidEncodingBytes);
         }
         self.byte_resources(
@@ -436,7 +442,12 @@ mod tests {
         TransportBudget::new(
             batch_items,
             10,
-            5,
+            novarocks_task_codec::TransportMessageLimits {
+                ordinary_request_max_bytes: 10,
+                ordinary_response_max_bytes: 10,
+                control_request_max_bytes: 10,
+                control_response_max_bytes: 10,
+            },
             target_items,
             target_bytes,
             items,
@@ -447,8 +458,66 @@ mod tests {
         )
         .unwrap()
     }
+    // Small synthetic Qhat/M values isolate the shared-ledger arithmetic tests.
+    // Production always obtains these windows from NativeRequestWindows.
+    fn fixture_windows(source: TransportBudget) -> Result<NativeTransportCapacity, String> {
+        NativeTransportCapacity::from_request_windows(
+            source,
+            crate::task_execution::intent::NativeRequestWindows {
+                ordinary_queued_max_bytes: 10,
+                control_queued_max_bytes: 10,
+                ordinary_request_max_bytes: 10,
+                control_request_max_bytes: 10,
+                control_reserved_bytes: 20,
+                process_retained_bytes: source.max_backend_queued_bytes(),
+                target_retained_bytes: source.max_query_backend_queued_bytes(),
+            },
+        )
+    }
+    #[test]
+    fn production_windows_follow_the_original_queue_author_and_method_limits() {
+        let source = TransportBudget::DEFAULT;
+        let windows =
+            crate::task_execution::intent::NativeRequestWindows::for_transport(source).unwrap();
+        let layout = NativeTransportCapacity::from_transport(source).unwrap();
+        assert_eq!(
+            layout.process_limits.get(ORDINARY_QUEUE_BYTES),
+            (windows.process_retained_bytes
+                - windows.control_reserved_bytes
+                - windows.ordinary_request_max_bytes) as u64
+        );
+        assert_eq!(
+            layout.target_limits.get(TARGET_ORDINARY_QUEUE_BYTES),
+            (windows.target_retained_bytes - windows.ordinary_request_max_bytes) as u64
+        );
+        assert_eq!(
+            layout.process_limits.get(CONTROL_QUEUE_BYTES),
+            windows.empty_queue_capacity(true) as u64
+        );
+        assert_eq!(
+            layout.facts.control_reserved_bytes,
+            windows.control_reserved_bytes
+        );
+        let backend = backend(1);
+        let above_target = source.batch_target_encoded_bytes() + 1;
+        assert!(
+            layout
+                .encoding_resources(backend, ORDINARY, above_target)
+                .is_ok()
+        );
+        assert!(
+            layout
+                .encoding_resources(
+                    backend,
+                    CONTROL,
+                    source.message_limits().control_request_max_bytes + 1
+                )
+                .is_err()
+        );
+        assert!(NativeTransportCapacity::from_transport(transport(4, 100, 4, 100, 1)).is_err());
+    }
     fn layout() -> NativeTransportCapacity {
-        NativeTransportCapacity::from_transport(transport(4, 100, 4, 100, 1)).unwrap()
+        fixture_windows(transport(4, 100, 4, 100, 1)).unwrap()
     }
     fn ledger(layout: &NativeTransportCapacity) -> RuntimeLedger {
         RuntimeLedger::with_keyed_families(layout.process_limits(), layout.keyed_families())
@@ -543,14 +612,8 @@ mod tests {
         );
         assert!(layout.accepts_transport_budget(transport(4, 100, 4, 100, 1)));
         assert_eq!(layout.capacity_sources().control_reserved_bytes, 20);
-        let huge = NativeTransportCapacity::from_transport(transport(
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            usize::MAX,
-            1,
-        ))
-        .unwrap();
+        let huge =
+            fixture_windows(transport(usize::MAX, usize::MAX, usize::MAX, usize::MAX, 1)).unwrap();
         assert_eq!(
             huge.target_limits.get(TARGET_ITEMS),
             u64::try_from(usize::MAX).unwrap()
@@ -595,7 +658,7 @@ mod tests {
     }
     #[test]
     fn process_shortfall_wins_even_when_target_is_also_full() {
-        let layout = NativeTransportCapacity::from_transport(transport(4, 100, 1, 40, 1)).unwrap();
+        let layout = fixture_windows(transport(4, 100, 1, 40, 1)).unwrap();
         let ledger = ledger(&layout);
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         let slow = backend(1);
@@ -661,7 +724,7 @@ mod tests {
     }
     #[test]
     fn one_slow_target_across_attempts_preserves_healthy_and_control_capacity() {
-        let layout = NativeTransportCapacity::from_transport(transport(8, 100, 4, 40, 2)).unwrap();
+        let layout = fixture_windows(transport(8, 100, 4, 40, 2)).unwrap();
         let ledger = ledger(&layout);
         let first_scope = ledger.open_scope_next(None, generation()).unwrap();
         let second_scope = ledger.open_scope_next(None, generation()).unwrap();
@@ -707,7 +770,7 @@ mod tests {
     }
     #[test]
     fn encoding_checks_target_bytes_and_invalid_quotes_remain_permanent_errors() {
-        let layout = NativeTransportCapacity::from_transport(transport(16, 200, 8, 40, 2)).unwrap();
+        let layout = fixture_windows(transport(16, 200, 8, 40, 2)).unwrap();
         let ledger = ledger(&layout);
         let scope = ledger.open_scope_next(None, generation()).unwrap();
         let target = backend(1);

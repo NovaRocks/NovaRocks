@@ -20,10 +20,11 @@ use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 use novarocks_proto_models::novarocks as wire;
 use prost::Message;
 
-// This is the real generated client's Codec path. The in-memory transport
-// returns one legal gRPC frame; it is not a replacement decoder or a peer task.
-async fn decode_through_generated_client(
+// Exercise the original caller's real Tonic Codec path. The in-memory
+// transport returns one gRPC frame, without replacing the decoder or peer task.
+async fn decode_through_original_codec(
     response: wire::ApplyTaskOperationsResponse,
+    original_count: Option<usize>,
 ) -> Result<wire::ApplyTaskOperationsResponse, tonic::Status> {
     let payload = response.encode_to_vec();
     let mut frame = Vec::with_capacity(5 + payload.len());
@@ -43,29 +44,60 @@ async fn decode_through_generated_client(
             )
         }
     });
-    NovaRocksGrpcClient::new(service)
-        .apply_task_operations(wire::ApplyTaskOperationsRequest::default())
+    let Some(original_count) = original_count else {
+        return NovaRocksGrpcClient::new(service)
+            .apply_task_operations(wire::ApplyTaskOperationsRequest::default())
+            .await
+            .map(tonic::Response::into_inner);
+    };
+    let request = wire::ApplyTaskOperationsRequest {
+        operations: vec![wire::TaskOperation::default(); original_count],
+    };
+    let maximum = novarocks_task_codec::TransportMessageLimits::DEFAULT.ordinary_response_max_bytes;
+    let reply = novarocks_task_codec::resource_preflight::OperationReplyDecodePlan::for_response(
+        original_count,
+        maximum,
+    )
+    .unwrap();
+    let encoding =
+        super::NativeUnaryEncodingPlan::for_original_operation(request.encoded_len()).unwrap();
+    let mut client = tonic::client::Grpc::new(service).max_decoding_message_size(maximum);
+    client
+        .ready()
+        .await
+        .expect("the in-memory transport is ready");
+    client
+        .unary(
+            tonic::Request::new(request),
+            tonic::codegen::http::uri::PathAndQuery::from_static(
+                "/novarocks.NovaRocksGrpc/ApplyTaskOperations",
+            ),
+            super::NativeProstCodec::with_original_operation_plans(reply, encoding),
+        )
         .await
         .map(tonic::Response::into_inner)
 }
 
 #[tokio::test]
-async fn generated_client_bounds_apply_reply_before_prost_expands_receipts() {
+async fn original_request_bounds_apply_reply_before_prost_expands_receipts() {
     let maximum = novarocks_task_codec::TransportBudget::DEFAULT.max_batch_items();
     let allowed = wire::ApplyTaskOperationsResponse {
         receipts: vec![wire::TaskOperationReceipt::default(); maximum],
     };
     assert_eq!(
-        decode_through_generated_client(allowed)
+        decode_through_original_codec(allowed, Some(maximum))
             .await
             .unwrap()
             .receipts
             .len(),
         maximum
     );
-    let error = decode_through_generated_client(wire::ApplyTaskOperationsResponse {
-        receipts: vec![wire::TaskOperationReceipt::default(); maximum + 1],
-    })
+    let error = decode_through_original_codec(
+        wire::ApplyTaskOperationsResponse {
+            receipts: vec![wire::TaskOperationReceipt::default(); maximum + 1],
+        },
+        Some(maximum),
+    )
     .await
     .unwrap_err();
     assert_eq!(error.code(), tonic::Code::DataLoss);
@@ -76,7 +108,7 @@ async fn generated_client_bounds_apply_reply_before_prost_expands_receipts() {
 }
 
 #[tokio::test]
-async fn generated_client_bounds_nested_ack_and_release_telemetry() {
+async fn original_request_bounds_nested_ack_and_release_telemetry() {
     use wire::{task_operation_receipt::Result, task_operation_verdict::Ack};
     let domain_ack = Ack::CreateTask(wire::CreateTaskAck {
         accepted_domains: vec![
@@ -96,18 +128,31 @@ async fn generated_client_bounds_nested_ack_and_release_telemetry() {
         ..Default::default()
     });
     for ack in [domain_ack, release_ack] {
-        let error = decode_through_generated_client(wire::ApplyTaskOperationsResponse {
-            receipts: vec![wire::TaskOperationReceipt {
-                result: Some(Result::Verdict(wire::TaskOperationVerdict {
-                    ack: Some(ack),
+        let error = decode_through_original_codec(
+            wire::ApplyTaskOperationsResponse {
+                receipts: vec![wire::TaskOperationReceipt {
+                    result: Some(Result::Verdict(wire::TaskOperationVerdict {
+                        ack: Some(ack),
+                        ..Default::default()
+                    })),
                     ..Default::default()
-                })),
-                ..Default::default()
-            }],
-        })
+                }],
+            },
+            Some(1),
+        )
         .await
         .unwrap_err();
         assert_eq!(error.code(), tonic::Code::DataLoss);
         assert!(is_operation_reply_preflight_failure(&error));
     }
+}
+
+#[tokio::test]
+async fn a_default_generated_client_cannot_invent_the_original_reply_plan() {
+    let error = decode_through_original_codec(wire::ApplyTaskOperationsResponse::default(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(error.message().contains("original request layout plan"));
+    assert!(!is_operation_reply_preflight_failure(&error));
 }

@@ -228,29 +228,30 @@ fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
 
 fn scheduler_outcome_log_fields(
     disposition: &ScheduledRefreshDisposition,
-) -> Option<(&'static str, &str)> {
-    match disposition {
+) -> Option<(&'static str, Option<&'static str>, &str)> {
+    let (kind, reason) = match disposition {
         ScheduledRefreshDisposition::TransientUnavailable(reason) => {
-            Some(("transient_unavailable", reason.message()))
+            ("transient_unavailable", reason)
         }
-        ScheduledRefreshDisposition::InvalidDefinition(reason) => {
-            Some(("invalid_definition", reason.message()))
-        }
-        ScheduledRefreshDisposition::TerminalFailure(reason) => {
-            Some(("terminal_failure", reason.message()))
-        }
-        ScheduledRefreshDisposition::Corruption(reason) => Some(("corruption", reason.message())),
-        ScheduledRefreshDisposition::InvariantViolation(reason) => {
-            Some(("invariant_violation", reason.message()))
-        }
-        ScheduledRefreshDisposition::TargetGone(_) => {
-            Some(("target_gone", "MV target no longer exists"))
-        }
+        ScheduledRefreshDisposition::InvalidDefinition(reason) => ("invalid_definition", reason),
+        ScheduledRefreshDisposition::TerminalFailure(reason) => ("terminal_failure", reason),
+        ScheduledRefreshDisposition::Corruption(reason) => ("corruption", reason),
+        ScheduledRefreshDisposition::InvariantViolation(reason) => ("invariant_violation", reason),
+        ScheduledRefreshDisposition::TargetGone(reason) => ("target_gone", reason),
         ScheduledRefreshDisposition::Completed
         | ScheduledRefreshDisposition::NoOp
         | ScheduledRefreshDisposition::AlreadyActive(_)
-        | ScheduledRefreshDisposition::ShutdownCancelled(_) => None,
-    }
+        | ScheduledRefreshDisposition::ShutdownCancelled(_) => return None,
+    };
+    Some((
+        kind,
+        reason.user_error().map(|error| error.code().as_str()),
+        if matches!(disposition, ScheduledRefreshDisposition::TargetGone(_)) {
+            "MV target no longer exists"
+        } else {
+            reason.message()
+        },
+    ))
 }
 
 fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposition {
@@ -269,7 +270,8 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
         error.message(),
         error.compile_control_error(),
     )
-    .with_execution_failure(execution);
+    .with_execution_failure(execution)
+    .with_user_error(error.analyze_error().map(|error| error.to_user_error(None)));
     match error.kind() {
         MvApplicationErrorKind::AlreadyActive => {
             ScheduledRefreshDisposition::AlreadyActive(failure)
@@ -432,7 +434,7 @@ mod compile_control_tests {
             assert_eq!(disposition.compile_control_error(), Some(control.clone()));
             assert_eq!(
                 scheduler_outcome_log_fields(&disposition),
-                Some(("invalid_definition", message.as_str()))
+                Some(("invalid_definition", None, message.as_str()))
             );
             let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
                 true, 1, 1, 10, 40,
@@ -530,7 +532,7 @@ mod compile_control_tests {
         let disposition = application_disposition(error);
         assert_eq!(
             scheduler_outcome_log_fields(&disposition),
-            Some(("transient_unavailable", message.as_str()))
+            Some(("transient_unavailable", None, message.as_str()))
         );
         let mut runtime =
             MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
@@ -546,6 +548,66 @@ mod compile_control_tests {
     }
 
     #[test]
+    fn stored_mv_parser_failure_retains_its_domain_code_in_scheduler_diagnostics() {
+        use super::{application_disposition, scheduler_outcome_log_fields};
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        use novarocks_sql::compiler::SqlCompileError;
+
+        let target = novarocks_types::naming::TableIdentity::new("ice", "db", "broken_mv");
+        let source = "SELECT\n (";
+        let parser_error = novarocks_parser::parse(source).unwrap_err();
+        let analyze = crate::mv::domain::refresh::definition::read_stored_mv_query(source, &target)
+            .unwrap_err();
+        assert_eq!(
+            std::error::Error::source(&analyze)
+                .unwrap()
+                .downcast_ref::<novarocks_parser::ParserError>(),
+            Some(&parser_error)
+        );
+        let domain = crate::mv::domain::application::MvApplicationError::from_compile(
+            SqlCompileError::Analyze(analyze),
+        );
+        let message = domain.message().to_owned();
+        let disposition = application_disposition(domain);
+        let super::ScheduledRefreshDisposition::InvalidDefinition(failure) = &disposition else {
+            panic!("invalid definition stays blocked");
+        };
+        let user = failure
+            .user_error()
+            .expect("domain-owned neutral projection");
+        assert_eq!(user.code().as_str(), "sql.analyze.invalid_view");
+        assert!(user.location().is_none());
+        assert!(user.message().contains("ice.db.broken_mv"));
+        assert!(
+            user.message()
+                .contains(parser_error.to_user_error(source).code().as_str())
+        );
+        assert_eq!(
+            scheduler_outcome_log_fields(&disposition),
+            Some((
+                "invalid_definition",
+                Some("sql.analyze.invalid_view"),
+                message.as_str()
+            ))
+        );
+        assert!(failure.execution_failure().is_none());
+        assert!(failure.compile_control_error().is_none());
+        let expected = user.clone();
+        let mut runtime =
+            MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
+        let MvRefreshRuntimeDecision::Blocked { error } = runtime.record(&7, disposition, 100)
+        else {
+            panic!("parser failure does not change scheduler policy");
+        };
+        assert_eq!(error.user_error(), Some(&expected));
+        assert_eq!(error.message(), message);
+        assert!(runtime.is_suppressed(&7, i64::MAX));
+    }
+
+    #[test]
     fn definition_preparation_error_remains_blocked() {
         use super::{application_disposition, scheduler_outcome_log_fields};
         use novarocks_mv_application::scheduler::MvSchedulerConfig;
@@ -558,7 +620,7 @@ mod compile_control_tests {
         let disposition = application_disposition(error);
         assert_eq!(
             scheduler_outcome_log_fields(&disposition),
-            Some(("invalid_definition", message.as_str()))
+            Some(("invalid_definition", None, message.as_str()))
         );
         let mut runtime =
             MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(true, 1, 1, 10, 40));
@@ -592,7 +654,7 @@ mod compile_control_tests {
             assert_eq!(disposition.compile_control_error(), Some(control.clone()));
             assert_eq!(
                 scheduler_outcome_log_fields(&disposition),
-                Some(("invalid_definition", message.as_str()))
+                Some(("invalid_definition", None, message.as_str()))
             );
             let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
                 true, 1, 1, 10, 40,

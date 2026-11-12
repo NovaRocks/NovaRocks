@@ -136,8 +136,11 @@ impl TerminalTrace {
             .unwrap();
 
         let record = self.next_id();
-        let establish_grant =
-            QueuedInputGrantRef::new(record, SendGeneration::new(AttemptActionId::new(record)));
+        let establish_grant = QueuedInputGrantRef::new(
+            record,
+            SendGeneration::new(AttemptActionId::new(record)),
+            64,
+        );
         let establish = queue_establish(&mut self.core.execution, participation, establish_grant);
         self.dispatch(
             &establish,
@@ -199,7 +202,7 @@ impl TerminalTrace {
         else {
             panic!("expected original Create admission");
         };
-        let grant = QueuedInputGrantRef::new(record, generation);
+        let grant = QueuedInputGrantRef::new(record, generation, 64);
         assert!(matches!(
             self.core
                 .execution
@@ -1891,7 +1894,7 @@ fn successful_seal_releases_queued_startup_without_native_dispatch() {
         assert_eq!(trace.finish_observation_round(now, observed).0, Ok(()));
 
         let action = AttemptActionId::new(trace.next_id());
-        let grant = QueuedInputGrantRef::new(trace.next_id(), SendGeneration::new(action));
+        let grant = QueuedInputGrantRef::new(trace.next_id(), SendGeneration::new(action), 64);
         let request = admission_intent(&mut trace.core.execution, target);
         let guard = AttemptAuthorizationRef::new(trace.next_id());
         let (intent, decision) = if establish {

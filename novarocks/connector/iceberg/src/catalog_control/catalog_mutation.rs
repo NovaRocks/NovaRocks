@@ -2236,7 +2236,7 @@ fn execute_view_publication(
                         .list_tables_for_request(
                             &namespace,
                             &request.context,
-                            novarocks_spi::connector::ConnectorListingBound::V1,
+                            novarocks_spi::connector::ConnectorListingPageSize::DEFAULT,
                         )
                         .map_err(|(kind, message)| ConnectorError::new(kind, message))?
                         .iter()
@@ -9708,128 +9708,6 @@ mod tests {
             server.shut_down();
             assert!(root.snapshot().generations.is_empty());
         }
-    }
-
-    #[test]
-    fn async_keyed_preparation_refusal_keeps_original_connector_failure_after_diagnostic() {
-        use novarocks_failure_contract::FailureProjection;
-        use novarocks_spi::connector::{
-            ConnectorCatalogMutationReceiving, ConnectorMarkerKey, ConnectorMarkerValue,
-            KeyedDocumentLimits, KeyedMarkerWrite, KeyedMutation,
-        };
-
-        let (executor, _warehouse, provider) = document_provider();
-        let table = guarded_table(&provider);
-        let planning = document_control_planning_pin(&provider);
-        let lease = planning.derive_mutation_lease().unwrap();
-        let before = provider
-            .runtime()
-            .load_table(&table.namespace, &table.table)
-            .unwrap();
-        let before_files = metadata_file_count(before.table.metadata().location());
-        let markers = KeyedMarkerWrite {
-            markers: BTreeMap::from([(
-                ConnectorMarkerKey {
-                    owner: "novarocks.mv".into(),
-                    name: "pending".into(),
-                    binding: "original-preparation-refusal".into(),
-                },
-                ConnectorMarkerValue {
-                    format: ConnectorDocumentFormat::try_new("novarocks.mv", "pending", 1).unwrap(),
-                    content: Bytes::from(vec![
-                        b'x';
-                        KeyedDocumentLimits::default().private_property_bytes
-                    ]),
-                },
-            )]),
-        };
-        // Token/format admission succeeds. Only the actual encoded-property
-        // preparation, not an artificial test refusal, rejects this request.
-        markers.validate().unwrap();
-        let expected = crate::document_storage::keyed::write::marker_properties(
-            before.table.metadata(),
-            &markers,
-        )
-        .unwrap_err();
-        assert_eq!(expected.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(
-            expected
-                .message()
-                .starts_with("document private properties table encoded size ")
-        );
-        let request = keyed_channel_request(&provider, &table, KeyedMutation::Markers(markers));
-        let target = request.target.clone();
-        let receiving = ConnectorCatalogMutationReceiving::new();
-        executor
-            .block_on(lease.execute_async_in(request, &receiving))
-            .unwrap();
-
-        {
-            let observed = receiving.observation();
-            assert!(observed.dispatched());
-            assert_eq!(observed.validation(), Some(&Ok(())));
-            assert!(observed.provider_exited());
-            assert!(observed.applied_receipt().is_none());
-            assert!(observed.needed_committed().is_none());
-            assert!(observed.needed_validation().is_none());
-            // This slot is installed immediately before the real attempt, so a
-            // lease-level refusal cannot satisfy this regression.
-            observed
-                .original_owner()
-                .unwrap()
-                .validate_owner(&target)
-                .unwrap();
-            let Some(Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup })) =
-                observed.raw_outcome()
-            else {
-                panic!("actual preparation must return an original uncommitted refusal")
-            };
-            assert_eq!(cleanup, &ExternalMutationFinalization::Complete);
-            assert_eq!(failure.kind(), ConnectorMutationFailureKind::InvalidRequest);
-            assert_eq!(failure.message(), expected.to_string());
-            let source = failure
-                .connector_source()
-                .expect("the actual preparer's ConnectorError stays attached");
-            assert_eq!(source, &expected);
-            assert_eq!(source.failure_fact(), expected.failure_fact());
-            assert_eq!(failure.failure_fact(), expected.failure_fact());
-            assert!(!source.message().contains("retained snapshot"));
-            assert!(!failure.message().contains("diagnostic"));
-        }
-        assert!(!receiving.foreign_exit_unproven());
-
-        provider
-            .runtime()
-            .control_state()
-            .invalidate_table_cache(&table.namespace, &table.table);
-        let after = provider
-            .runtime()
-            .load_table(&table.namespace, &table.table)
-            .unwrap();
-        assert_eq!(
-            after.table.metadata_location(),
-            before.table.metadata_location()
-        );
-        assert_eq!(
-            after.table.metadata().uuid(),
-            before.table.metadata().uuid()
-        );
-        assert_eq!(
-            after.table.metadata().properties(),
-            before.table.metadata().properties()
-        );
-        assert_eq!(
-            after.table.metadata().current_snapshot_id(),
-            before.table.metadata().current_snapshot_id()
-        );
-        assert_eq!(
-            after.table.metadata().snapshots().len(),
-            before.table.metadata().snapshots().len()
-        );
-        assert_eq!(
-            metadata_file_count(after.table.metadata().location()),
-            before_files
-        );
     }
 
     #[test]

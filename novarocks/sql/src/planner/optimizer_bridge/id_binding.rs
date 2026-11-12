@@ -55,6 +55,9 @@ fn verify_node(
         .collect::<Result<Vec<_>, _>>()?;
 
     let derived = match &node.op {
+        Operator::PhysicalSystemTable(op) => {
+            Ok(output_ids(op.columns.iter().map(|column| column.column_id)))
+        }
         Operator::PhysicalScan(op) => Ok(output_ids(op.columns.iter().map(|c| c.column_id))),
         Operator::PhysicalValues(op) => {
             let empty = HashSet::new();

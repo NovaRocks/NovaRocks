@@ -718,11 +718,13 @@ impl PhysicalExpressionRoots {
                             }
                         }
                     }
-                    NodeKind::Limit { .. }
+                    NodeKind::SystemRelation { .. }
+                    | NodeKind::Limit { .. }
                     | NodeKind::SetOp { .. }
                     | NodeKind::Repeat { .. }
                     | NodeKind::AssertOneRow(_)
                     | NodeKind::ExchangeSource { .. }
+                    | NodeKind::PositionShard(_)
                     | NodeKind::TableWriter { .. } => {}
                 }
                 collector.step()?;

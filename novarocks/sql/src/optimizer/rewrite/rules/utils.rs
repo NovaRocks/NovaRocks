@@ -270,6 +270,7 @@ pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
         Operator::LogicalIntersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalExcept(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalValues(v) => v.columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalSystemTable(v) => v.columns.iter().map(|c| c.column_id).collect(),
         Operator::LogicalGenerateSeries(g) => {
             if g.output_column_id == ColumnId::UNSET {
                 vec![]
@@ -383,6 +384,11 @@ fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<
         Operator::LogicalExcept(_) => {
             if let Some(first) = expr.children.first() {
                 collect_qualified_output_columns_opt_inner(first, out);
+            }
+        }
+        Operator::LogicalSystemTable(v) => {
+            for c in &v.columns {
+                out.insert((None, c.name.to_lowercase()));
             }
         }
         Operator::LogicalValues(v) => {
@@ -653,6 +659,7 @@ mod typed_legacy {
             LogicalPlanKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
+            LogicalPlanKind::SystemTable(v) => v.columns.iter().map(|c| c.column_id).collect(),
             LogicalPlanKind::GenerateSeries(g) => {
                 if g.output_column_id == ColumnId::UNSET {
                     vec![]
@@ -730,6 +737,11 @@ mod typed_legacy {
             }
             LogicalPlanKind::Aggregate(a) => {
                 for c in &a.output_columns {
+                    out.insert((None, c.name.to_lowercase()));
+                }
+            }
+            LogicalPlanKind::SystemTable(v) => {
+                for c in &v.columns {
                     out.insert((None, c.name.to_lowercase()));
                 }
             }

@@ -41,6 +41,8 @@ mod relation;
 mod resource;
 mod runtime_filter_binding;
 mod structure_input;
+mod system_relation;
+pub use system_relation::*;
 mod validation;
 pub mod wait_graph;
 mod write_execution;
@@ -95,7 +97,7 @@ pub use write_execution::*;
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 21;
+pub const PLAN_CONTRACT_REVISION: u32 = 24;
 
 #[cfg(test)]
 mod tests;

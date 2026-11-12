@@ -62,6 +62,7 @@ pub(crate) struct EdgeProducer {
     task: TaskIdentity,
     task_key: UniqueId,
     sender_ordinal: u32,
+    position_shard_dop: Option<NonZeroU32>,
 }
 
 impl EdgeProducer {
@@ -70,6 +71,7 @@ impl EdgeProducer {
             task,
             task_key,
             sender_ordinal,
+            position_shard_dop: None,
         }
     }
 }
@@ -135,9 +137,19 @@ impl SharedEdge {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn edge_id(&self) -> ExchangeEdgeId {
         self.edge_id
+    }
+
+    /// Fill the actual placement widths only for a checked shard edge.
+    pub(crate) fn bind_position_shard_source_dops(
+        &mut self,
+        mut placement_dop: impl FnMut(TaskIdentity) -> Result<NonZeroU32, TaskExecutionError>,
+    ) -> Result<(), TaskExecutionError> {
+        for producer in &mut self.producers {
+            producer.position_shard_dop = Some(placement_dop(producer.task)?);
+        }
+        Ok(())
     }
 
     /// This edge as one of its producers freezes it.
@@ -247,7 +259,15 @@ impl AttemptTopology {
         node: FragmentNodeId,
         edge_ids: &[ExchangeEdgeId],
     ) -> Result<ExchangeInbound, TaskExecutionError> {
-        let mut sources = Vec::new();
+        let source_count = edge_ids.iter().try_fold(0usize, |count, edge_id| {
+            count
+                .checked_add(self.edge(*edge_id)?.producers.len())
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule("creation inbound source count overflow".into())
+                })
+        })?;
+        let mut sources = Vec::with_capacity(source_count);
+        let mut source_dops = Vec::new();
         let mut delivery = None;
         for edge_id in edge_ids {
             let edge = self.edge(*edge_id)?;
@@ -258,9 +278,19 @@ impl AttemptTopology {
                 )));
             }
             delivery = Some(edge.delivery);
-            sources.extend(edge.producers.iter().map(|producer| {
-                ExchangeSource::new(producer.task, producer.task_key, producer.sender_ordinal)
-            }));
+            for producer in &edge.producers {
+                sources.push(ExchangeSource::new(
+                    producer.task,
+                    producer.task_key,
+                    producer.sender_ordinal,
+                ));
+                if let Some(dop) = producer.position_shard_dop {
+                    if source_dops.is_empty() {
+                        source_dops.reserve_exact(source_count);
+                    }
+                    source_dops.push((producer.sender_ordinal, dop));
+                }
+            }
         }
         let delivery = delivery.ok_or_else(|| {
             TaskExecutionError::Schedule(format!(
@@ -268,7 +298,14 @@ impl AttemptTopology {
                 node.get()
             ))
         })?;
-        Ok(ExchangeInbound::try_new(node, sources, delivery)?)
+        let inbound = ExchangeInbound::try_new(node, sources, delivery)?;
+        if source_dops.is_empty() {
+            return Ok(inbound);
+        }
+        source_dops.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        Ok(inbound.try_with_position_shard_source_dops(
+            source_dops.into_iter().map(|(_, dop)| dop).collect(),
+        )?)
     }
 }
 
@@ -306,6 +343,11 @@ impl TaskTopologyView {
 pub(crate) struct CreationLengths {
     metadata: usize,
     assignment: usize,
+}
+impl CreationLengths {
+    pub(crate) const fn metadata_bytes(self) -> usize {
+        self.metadata
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -483,6 +525,7 @@ impl TaskCreationSeed {
         // range clone is needed by pricing or freezing.
         let mut destination_count = 0usize;
         let mut source_count = 0usize;
+        let mut source_dop_count = 0usize;
         let mut host_bytes = 0usize;
         for edge_id in self.view.outbound.iter() {
             let edge = self.topology.edge(*edge_id)?;
@@ -524,6 +567,7 @@ impl TaskCreationSeed {
         }
         for (node, edge_ids) in self.view.inbound.iter() {
             let mut bytes = 0usize;
+            let mut source_dop_bytes = 0usize;
             let mut delivery = None;
             for edge_id in edge_ids.iter() {
                 let edge = self.topology.edge(*edge_id)?;
@@ -534,17 +578,29 @@ impl TaskCreationSeed {
                 }
                 delivery = Some(edge.delivery);
                 source_count = add(source_count, edge.producers.len())?;
-                for source in edge.producers.iter() {
-                    let source =
-                        wire_size::source(source.task, source.task_key, source.sender_ordinal)
-                            .map_err(|_| failure())?;
+                for producer in edge.producers.iter() {
+                    let source = wire_size::source(
+                        producer.task,
+                        producer.task_key,
+                        producer.sender_ordinal,
+                    )
+                    .map_err(|_| failure())?;
                     bytes = add(bytes, wire_size::message(2, source).map_err(|_| failure())?)?;
+                    if let Some(dop) = producer.position_shard_dop {
+                        source_dop_count = add(source_dop_count, 1)?;
+                        source_dop_bytes =
+                            add(source_dop_bytes, encoded_len_varint(u64::from(dop.get())))?;
+                    }
                 }
             }
             let delivery = delivery.ok_or_else(|| {
                 TaskExecutionError::Schedule("creation input has no producer edge".into())
             })?;
             bytes = add(bytes, wire_size::inbound_header(node.get(), delivery))?;
+            if source_dop_bytes != 0 {
+                let roster = wire_size::packed(1, source_dop_bytes).map_err(|_| failure())?;
+                bytes = add(bytes, wire_size::message(4, roster).map_err(|_| failure())?)?;
+            }
             topology_bytes = add(
                 topology_bytes,
                 wire_size::message(2, bytes).map_err(|_| failure())?,
@@ -554,6 +610,11 @@ impl TaskCreationSeed {
         array!(proto::TaskExchangeDestination, destination_count);
         array!(ExchangeSource, source_count);
         array!(proto::TaskExchangeSource, source_count);
+        // The ordinal sort's scratch roster, the frozen descriptor's widths,
+        // and the protobuf packed field each have their own element layout.
+        array!((u32, NonZeroU32), source_dop_count);
+        array!(NonZeroU32, source_dop_count);
+        array!(u32, source_dop_count);
         // Every projected task identity has one original 16-byte process ID.
         // Three more belong to descriptor/participation headers; only the actual
         // generated creation constructors allocate these original Vec values.
@@ -687,8 +748,6 @@ impl PricedTaskCreation {
                     sizing.lengths.metadata,
                 )
                 .saturating_add(OPERATION_FIXED_BYTES),
-            plan_carrier_bytes: plan_carrier_bytes(fragment, sizing.lengths),
-            descriptor_encoded_bytes: sizing.descriptor_encoded_bytes,
         };
         Ok((metadata, Self { seed, sizing }))
     }
@@ -739,12 +798,6 @@ impl FrozenCreationParts {
             assignment: self.assignment_len,
         }
     }
-}
-
-/// The plan-carrier bytes one creation holds: its fragment's static plan and
-/// its task assignment, which the backend bounds together.
-pub(crate) fn plan_carrier_bytes(fragment: &FragmentArtifact, lengths: CreationLengths) -> usize {
-    fragment.content().len().saturating_add(lengths.assignment)
 }
 
 /// What one create operation occupies in a frontend queue.
@@ -823,10 +876,6 @@ impl CreateTaskIntent {
             &self.original.parts.fragment,
             self.original.parts.lengths(),
         )
-    }
-    #[cfg(test)]
-    pub(crate) fn plan_carrier_bytes(&self) -> usize {
-        plan_carrier_bytes(&self.original.parts.fragment, self.original.parts.lengths())
     }
     #[cfg(test)]
     pub(crate) fn retained_payload_bytes_for_test(&self) -> u64 {
@@ -1016,6 +1065,120 @@ pub(crate) mod tests {
             backend,
             frontend: FrontendProcessId::new_v7(),
         }
+    }
+
+    #[test]
+    fn position_shard_roster_follows_the_whole_inbound_sender_union() {
+        use novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+
+        let fixture = fixture();
+        let mut left = fixture.topology.edges.values().next().unwrap().clone();
+        left.delivery = MustDrain;
+        let mut right = left.clone();
+        let [first, second] = left.producers.as_ref() else {
+            panic!("expected exactly two fixture sources");
+        };
+        right.producers = Box::new([*first]);
+        left.producers = Box::new([*second]);
+        right.edge_id = ExchangeEdgeId::new(2).unwrap();
+        let node = left.destination_node_id;
+        let ids = [left.edge_id, right.edge_id];
+        let view = TaskTopologyView::new(Vec::new(), BTreeMap::from([(node, ids.to_vec())]));
+
+        left.bind_position_shard_source_dops(|task| {
+            assert_eq!(task, fixture.producers[1]);
+            Ok(NonZeroU32::new(4).unwrap())
+        })
+        .unwrap();
+        let failure =
+            AttemptTopology::try_new(vec![left.clone(), right.clone()], &[&view]).unwrap_err();
+        assert!(failure.to_string().contains("full sender set"));
+
+        right
+            .bind_position_shard_source_dops(|task| {
+                assert_eq!(task, fixture.producers[0]);
+                Ok(NonZeroU32::new(1).unwrap())
+            })
+            .unwrap();
+        let topology = AttemptTopology::try_new(vec![left, right], &[&view]).unwrap();
+        let inbound = topology.inbound(node, &ids).unwrap();
+        assert_eq!(inbound.sources()[0].sender_ordinal(), 1);
+        assert_eq!(inbound.sources()[1].sender_ordinal(), 0);
+        assert_eq!(
+            inbound
+                .position_shard_source_dops()
+                .unwrap()
+                .iter()
+                .map(|dop| dop.get())
+                .collect::<Vec<_>>(),
+            [1, 4],
+        );
+    }
+
+    #[test]
+    fn position_shard_creation_freezes_the_exact_priced_inbound_roster() {
+        let fixture = fixture();
+        let seed = |shards| {
+            let mut edge = fixture.topology.edges.values().next().unwrap().clone();
+            edge.delivery = novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+            let receiver = &edge.destinations[0];
+            let (identity, task_key) = (receiver.task, receiver.task_key);
+            if shards {
+                edge.bind_position_shard_source_dops(|task| {
+                    let width = if task == fixture.producers[0] { 1 } else { 300 };
+                    Ok(NonZeroU32::new(width).unwrap())
+                })
+                .unwrap();
+            }
+            let view = TaskTopologyView::new(
+                Vec::new(),
+                BTreeMap::from([(edge.destination_node_id, vec![edge.edge_id()])]),
+            );
+            TaskCreationSeed::new(
+                Arc::new(AttemptTopology::try_new(vec![edge], &[&view]).unwrap()),
+                view,
+                producer_artifact(),
+                Arc::from([]),
+                TaskCreationFacts {
+                    identity,
+                    participation: ParticipationRef::new(
+                        execution(),
+                        fixture.frontend,
+                        fixture.backend,
+                    ),
+                    task_key,
+                    pipeline_dop: NonZeroUsize::new(1).unwrap(),
+                    split_plan_nodes: Vec::new(),
+                    instance_ordinal: 0,
+                    initial_scan_ranges: BTreeMap::new(),
+                },
+            )
+        };
+        let ordinary = seed(false).size_without_projection().unwrap();
+        let shards = seed(true);
+        let priced = shards.size_without_projection().unwrap();
+        let roster = proto::TaskPositionShardSourceDops {
+            sender_dops: vec![1, 300],
+        };
+        let roster_wire =
+            novarocks_task_codec::creation::size::message(4, roster.encoded_len()).unwrap();
+        let metadata_delta = priced.lengths.metadata - ordinary.lengths.metadata;
+        assert!(metadata_delta >= roster_wire);
+        assert_eq!(
+            priced.new_backing_bytes - ordinary.new_backing_bytes,
+            metadata_delta
+                + 2 * (std::mem::size_of::<(u32, NonZeroU32)>()
+                    + std::mem::size_of::<NonZeroU32>()
+                    + std::mem::size_of::<u32>()),
+        );
+        let parts = shards.freeze(priced.lengths).unwrap();
+        assert_eq!(parts.lengths(), priced.lengths);
+        let metadata = proto::CreationMetadata::decode(parts.metadata().bytes().clone()).unwrap();
+        let topology = metadata.descriptor.unwrap().topology.unwrap();
+        assert_eq!(
+            topology.inbound[0].position_shard_source_dops.as_ref(),
+            Some(&roster)
+        );
     }
 
     #[test]

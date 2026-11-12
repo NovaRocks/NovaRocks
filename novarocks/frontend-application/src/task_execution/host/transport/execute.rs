@@ -114,7 +114,7 @@ pub(crate) async fn send_operations_in(
             (call, acquired)
         }
     };
-    let mut grpc = client.grpc_for_reserved_call(reserved);
+    let mut grpc = client.grpc_for_reserved_call(reserved, method);
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported

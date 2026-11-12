@@ -41,7 +41,7 @@ use crate::fs_io;
 use crate::resources::IcebergCatalogRuntime;
 use novarocks_spi::connector::{
     ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope, ConnectorError,
-    ConnectorErrorKind, ConnectorListingBound, ConnectorListingBudget, ConnectorOperationControl,
+    ConnectorErrorKind, ConnectorListingPageSize, ConnectorOperationControl,
     MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
     MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
@@ -143,8 +143,12 @@ pub(crate) fn plan_manifest_for_table(
         .block_on(async move {
             listing_admission
                 .run_wait_for_exit(&context, async move {
-                    list_direct_files_async(&directory, &owned_binding, ConnectorListingBound::V1)
-                        .await
+                    list_direct_files_async(
+                        &directory,
+                        &owned_binding,
+                        ConnectorListingPageSize::DEFAULT,
+                    )
+                    .await
                 })
                 .await
         })
@@ -541,7 +545,12 @@ fn list_direct_files(
     binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<Vec<ListedFile>, ConnectorError> {
-    list_direct_files_bounded(directory, binding, runtime, ConnectorListingBound::V1)
+    list_direct_files_bounded(
+        directory,
+        binding,
+        runtime,
+        ConnectorListingPageSize::DEFAULT,
+    )
 }
 
 #[cfg(test)]
@@ -549,7 +558,7 @@ fn list_direct_files_bounded(
     directory: &str,
     binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
-    bound: ConnectorListingBound,
+    bound: ConnectorListingPageSize,
 ) -> Result<Vec<ListedFile>, ConnectorError> {
     let directory = directory.to_owned();
     let binding = binding.clone();
@@ -561,10 +570,8 @@ fn list_direct_files_bounded(
 async fn list_direct_files_async(
     directory: &str,
     binding: &IcebergReadBinding,
-    bound: ConnectorListingBound,
+    bound: ConnectorListingPageSize,
 ) -> Result<Vec<ListedFile>, ConnectorError> {
-    let mut source_budget = ConnectorListingBudget::new(bound)?;
-    let mut retained_budget = ConnectorListingBudget::new(bound)?;
     check_source_active(binding)?;
     let access = fs_io::resolve_access_for_location(directory, binding).map_err(|error| {
         add_files_invalid(format!("resolve ADD FILES directory {directory}: {error}"))
@@ -581,7 +588,7 @@ async fn list_direct_files_async(
     check_source_active(binding)?;
     let mut entries = operator
         .lister_with(&prefix)
-        .limit(bound.page_entries)
+        .limit(bound.get())
         .await
         .map_err(|error| {
             ConnectorError::from(novarocks_fs::map_object_store_listing_error(error))
@@ -602,7 +609,7 @@ async fn list_direct_files_async(
         }
         // Include ignored entries: a directory of hidden files is still
         // a finite source enumeration, and consumes the same SDK work.
-        source_budget.admit_names(std::iter::once(entry.path()))?;
+
         let entry_path = entry.path().trim_end_matches('/');
         let relative = entry_path
             .strip_prefix(&prefix)
@@ -655,7 +662,7 @@ async fn list_direct_files_async(
                 "ADD FILES canonical file location exceeds 16 KiB",
             ));
         }
-        retained_budget.admit_qualified_names(&location_prefix, std::iter::once(relative_path))?;
+
         let location = fs_io::format_resolved_location(access.handle(), entry.path())
             .map_err(add_files_invalid)?;
         let object_identity = metadata
@@ -1158,48 +1165,6 @@ mod tests {
                 .to_string()
                 .contains("not a Parquet")
         );
-    }
-
-    #[test]
-    fn direct_listing_refuses_whole_batch_including_hidden_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.parquet"), b"data").unwrap();
-        std::fs::write(dir.path().join("_ignored"), b"data").unwrap();
-        let directory = format!("file://{}", dir.path().display());
-        let (owner, runtime) = catalog_runtime();
-        let binding = binding(&owner, None);
-        let error = super::list_direct_files_bounded(
-            &directory,
-            &binding,
-            &runtime,
-            novarocks_spi::connector::ConnectorListingBound {
-                entries: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("entries bound"), "{error}");
-        assert!(dir.path().join("a.parquet").exists());
-    }
-
-    #[test]
-    fn direct_listing_checks_name_bytes_before_retaining() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("wide.parquet"), b"data").unwrap();
-        let directory = format!("file://{}", dir.path().display());
-        let (owner, runtime) = catalog_runtime();
-        let binding = binding(&owner, None);
-        let error = super::list_direct_files_bounded(
-            &directory,
-            &binding,
-            &runtime,
-            novarocks_spi::connector::ConnectorListingBound {
-                name_bytes: 1,
-                ..novarocks_spi::connector::ConnectorListingBound::V1
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("name_bytes bound"), "{error}");
     }
 
     #[test]

@@ -319,57 +319,121 @@ fn apply_position_delete_batch(
     batch: novarocks_fs::FileBatch,
     deleted: &mut RoaringTreemap,
 ) -> Result<(), String> {
-    {
-        let batch = batch.batch;
-        let schema = batch.schema();
-        let file_path_index = schema.index_of(FILE_PATH_COLUMN).map_err(|error| {
+    visit_position_delete_rows(&spec.path, Some(data_file_path), batch, |_, position| {
+        deleted.insert(position);
+    })
+}
+
+/// Closed whole-object coverage. A missing path proves an empty contribution
+/// only after every projected row group has completed without a path filter.
+pub(crate) struct PositionDeleteIndex {
+    pub(crate) rows: u64,
+    pub(crate) by_path: std::collections::BTreeMap<String, RoaringTreemap>,
+}
+
+impl PositionDeleteIndex {
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.by_path.iter().fold(
+            std::mem::size_of::<Self>() as u64,
+            |total, (path, positions)| {
+                total
+                    .saturating_add(path.capacity() as u64)
+                    .saturating_add(std::mem::size_of::<(String, RoaringTreemap)>() as u64)
+                    .saturating_add(positions.serialized_size() as u64)
+            },
+        )
+    }
+}
+
+pub(crate) async fn load_position_delete_index(
+    spec: &IcebergDeleteFileSpec,
+    access: &FsAccessHandle,
+    context: &FileReadContext,
+) -> Result<PositionDeleteIndex, novarocks_spi::connector::ConnectorError> {
+    let mut index = PositionDeleteIndex {
+        rows: 0,
+        by_path: std::collections::BTreeMap::new(),
+    };
+    crate::file_reader::visit_parquet_batches_async(
+        access,
+        &spec.path,
+        spec.length,
+        position_delete_projection(),
+        Vec::new(),
+        context.clone(),
+        |batch| {
+            visit_position_delete_rows(&spec.path, None, batch, |path, position| {
+                index.rows += 1;
+                if let Some(positions) = index.by_path.get_mut(path) {
+                    positions.insert(position);
+                } else {
+                    index
+                        .by_path
+                        .insert(path.to_owned(), RoaringTreemap::from([position]));
+                }
+            })
+            .map_err(crate::file_reader::corrupt_delete_content)
+        },
+    )
+    .await?;
+    context
+        .check_active()
+        .map_err(crate::file_reader::map_file_error)?;
+    Ok(index)
+}
+
+fn visit_position_delete_rows(
+    source: &str,
+    target: Option<&str>,
+    batch: novarocks_fs::FileBatch,
+    mut row: impl FnMut(&str, u64),
+) -> Result<(), String> {
+    let batch = batch.batch;
+    let schema = batch.schema();
+    let file_path_index = schema.index_of(FILE_PATH_COLUMN).map_err(|error| {
+        format!("projected batch from {source} missing `{FILE_PATH_COLUMN}`: {error}")
+    })?;
+    let pos_index = schema.index_of(POS_COLUMN).map_err(|error| {
+        format!("projected batch from {source} missing `{POS_COLUMN}`: {error}")
+    })?;
+    let file_paths = batch
+        .column(file_path_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
             format!(
-                "projected batch from {} missing `{FILE_PATH_COLUMN}`: {error}",
-                spec.path
+                "iceberg position-delete file {source} column `{FILE_PATH_COLUMN}` is not STRING"
             )
         })?;
-        let pos_index = schema.index_of(POS_COLUMN).map_err(|error| {
-            format!(
-                "projected batch from {} missing `{POS_COLUMN}`: {error}",
-                spec.path
-            )
+    let positions = batch
+        .column(pos_index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            format!("iceberg position-delete file {source} column `{POS_COLUMN}` is not BIGINT")
         })?;
-        let file_paths = batch
-            .column(file_path_index)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                format!(
-                    "iceberg position-delete file {} column `{FILE_PATH_COLUMN}` is not STRING",
-                    spec.path
-                )
-            })?;
-        let positions = batch
-            .column(pos_index)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                format!(
-                    "iceberg position-delete file {} column `{POS_COLUMN}` is not BIGINT",
-                    spec.path
-                )
-            })?;
-        for row in 0..batch.num_rows() {
-            if file_paths.is_null(row)
-                || positions.is_null(row)
-                || file_paths.value(row) != data_file_path
-            {
+    for index in 0..batch.num_rows() {
+        if file_paths.is_null(index) || positions.is_null(index) {
+            // The existing single-target path discards undecidable rows.
+            // Complete-object coverage must account for each original row.
+            if target.is_some() {
                 continue;
             }
-            let position = positions.value(row);
-            if position < 0 {
-                return Err(format!(
-                    "iceberg position-delete file {} has negative pos {} for data file {data_file_path}",
-                    spec.path, position
-                ));
-            }
-            deleted.insert(position as u64);
+            return Err(format!(
+                "iceberg position-delete file {source} has a null path or position"
+            ));
         }
+        let path = file_paths.value(index);
+        if target.is_some_and(|target| target != path) {
+            continue;
+        }
+        let position = u64::try_from(positions.value(index)).map_err(|_| {
+            format!(
+                "iceberg position-delete file {source} has negative pos {} for data file {path}",
+                positions.value(index),
+            )
+        })?;
+        row(path, position);
     }
     Ok(())
 }
@@ -845,8 +909,13 @@ mod tests {
         let delete_path = directory.path().join("deletes.parquet");
         write_delete_parquet(
             &delete_path,
-            &["/data/a.parquet", "/data/b.parquet", "/data/a.parquet"],
-            &[2, 3, 5],
+            &[
+                "/data/a.parquet",
+                "/data/b.parquet",
+                "/data/a.parquet",
+                "/data/a.parquet",
+            ],
+            &[2, 3, 5, 2],
         );
 
         let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
@@ -896,6 +965,20 @@ mod tests {
         )
         .expect("read position deletes");
         assert_eq!(deleted.iter().collect::<Vec<_>>(), vec![2, 5]);
+
+        let whole = runtime
+            .block_on(load_position_delete_index(&spec, &access, &context))
+            .expect("read the complete shared delete object");
+        assert_eq!(whole.rows, 4);
+        assert_eq!(
+            whole.by_path["/data/a.parquet"].iter().collect::<Vec<_>>(),
+            [2, 5]
+        );
+        assert_eq!(
+            whole.by_path["/data/b.parquet"].iter().collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(!whole.by_path.contains_key("/data/absent.parquet"));
 
         let foreign = IcebergDeleteFileSpec {
             referenced_data_file: Some("/data/b.parquet".to_string()),

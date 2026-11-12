@@ -117,8 +117,6 @@ impl QueryTaskExecution {
         }
         self.dispatcher
             .validate_queue_request(candidate.request())?;
-        self.dispatcher
-            .validate_plan_carrier_bytes(candidate.plan_carrier_bytes())?;
         if self.dispatcher.local_capacity(candidate.request()) != LocalQueueCapacity::Fits {
             return Ok(None);
         }

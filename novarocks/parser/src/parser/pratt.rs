@@ -46,7 +46,7 @@ const UNARY_ARITHMETIC_PRECEDENCE: u8 = 70;
 /// Keep long same-operator boolean chains shallow before any caller clones or
 /// walks the parsed tree. SQL's three-valued AND/OR are associative, and the
 /// in-order sequence of operands is unchanged.
-fn balance_boolean_chain(expression: Expr) -> Expr {
+pub(crate) fn balance_boolean_chain(expression: Expr) -> Expr {
     let operator = match &expression {
         Expr::Binary(binary)
             if matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) =>
@@ -71,7 +71,7 @@ fn balance_boolean_chain(expression: Expr) -> Expr {
         let mut values = operands.into_iter();
         while let Some(left) = values.next() {
             if let Some(right) = values.next() {
-                let span = Span::new(left.span().start(), right.span().end());
+                let span = left.span().cover(right.span());
                 next_level.push(Expr::Binary(BinaryExpr {
                     left: Box::new(left),
                     operator,

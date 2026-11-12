@@ -73,6 +73,7 @@ fn enqueue(
         crate::input::SendGeneration::new(novarocks_coordination_contract::AttemptActionId::new(
             NonZeroU64::new(ids.grant).unwrap(),
         )),
+        64,
     );
     ids.grant += 1;
     producer.enqueue_update(ids.operations.issue(), update, original)

@@ -606,6 +606,7 @@ mod tests {
             409 => Expected::Rejected(Kind::Conflict),
             401 | 419 => Expected::Rejected(Kind::Unauthenticated),
             403 => Expected::Rejected(Kind::PermissionDenied),
+            413 => Expected::Rejected(Kind::ResourceExhausted),
             _ => Expected::Unknown,
         }
     }
@@ -806,8 +807,8 @@ mod tests {
     #[tokio::test]
     async fn every_endpoint_maps_every_status_line_as_spec_5_7_prescribes() {
         let statuses = [
-            200, 201, 202, 204, 400, 401, 403, 404, 408, 409, 419, 429, 500, 501, 502, 503, 504,
-            505,
+            200, 201, 202, 204, 400, 401, 403, 404, 408, 409, 413, 415, 419, 429, 500, 501, 502,
+            503, 504, 505,
         ];
         for endpoint in ENDPOINTS {
             for status in statuses {

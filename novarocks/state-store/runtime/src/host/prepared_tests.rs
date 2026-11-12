@@ -20,7 +20,6 @@ use super::*;
 use crate::StateStoreProviderRegistration;
 use novarocks_state_store_api::{
     InstanceScope, StateStoreBlockingOriginal, StateStoreBlockingSlot, StateStoreExecutionPort,
-    StateStoreLimits,
 };
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
 use std::sync::{
@@ -30,8 +29,10 @@ use std::sync::{
 use std::time::Duration;
 
 const ID: StateStoreProviderId = StateStoreProviderId::new("prepared-host-test");
-const DESCRIPTOR: StateStoreProviderDescriptor =
-    StateStoreProviderDescriptor::new(ID, novarocks_state_store_api::MAX_KEY_BYTES);
+const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
+    ID,
+    novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY,
+);
 fn vocabulary() -> StateStoreBlockingSourceVocabulary {
     StateStoreBlockingSourceVocabulary::for_provider::<
         NoPhysicalSource,
@@ -94,7 +95,7 @@ fn input() -> StateStoreHostInput {
     StateStoreHostInput {
         cluster_id: "prepared-host".into(),
         provider_id: ID,
-        limits: StateStoreLimits::default(),
+        limits: novarocks_state_store_testkit::testing::IN_MEMORY_STATE_STORE_CAPACITY.limits(),
         run_policy: StateStoreRunPolicy::default(),
     }
 }
@@ -216,7 +217,7 @@ fn prepared_with_facts(
         descriptor: if mismatch {
             StateStoreProviderDescriptor::new(
                 StateStoreProviderId::new("wrong-instance"),
-                DESCRIPTOR.max_key_bytes,
+                DESCRIPTOR.capacity,
             )
         } else {
             DESCRIPTOR

@@ -485,6 +485,17 @@ impl CatalogDesiredStateSnapshot {
     ) -> Result<Self, CatalogApplicationError> {
         let mut located = BTreeMap::new();
         for entry in entries {
+            if entry
+                .config()
+                .instance_id()
+                .as_str()
+                .eq_ignore_ascii_case(novarocks_types::naming::SYSTEM_CATALOG)
+            {
+                return Err(untrustworthy_enumeration(
+                    mode,
+                    "the built-in system catalog cannot be an external desired-state entry",
+                ));
+            }
             if entry.config().config_format_version() == 0 {
                 return Err(untrustworthy_enumeration(
                     mode,
@@ -952,6 +963,27 @@ mod tests {
             )
             .expect("valid logical config"),
         )
+    }
+
+    #[test]
+    fn reserved_system_entry_refuses_the_complete_desired_state_snapshot_for_every_source() {
+        for mode in [
+            CatalogDesiredStateSourceMode::DynamicStateStore,
+            CatalogDesiredStateSourceMode::StaticFile,
+            CatalogDesiredStateSourceMode::ManagedController,
+        ] {
+            for name in ["system", "SyStEm"] {
+                let error = CatalogDesiredStateSnapshot::try_new(
+                    mode,
+                    [entry("catalog.valid", "valid"), entry(name, "reserved")],
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete
+                );
+            }
+        }
     }
 
     #[test]

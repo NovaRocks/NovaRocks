@@ -61,6 +61,7 @@ pub(crate) enum CutDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackageTypeOwner {
     Value(p::ValueId),
+    SystemRelation(p::NodeId),
     Expression(p::ExprId),
     Binding(BindingOccurrence),
     Relation(p::NodeId),
@@ -434,6 +435,15 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
                     walk.completed()?;
                 }
             }
+            p::NodeKind::SystemRelation { output_fields, .. } => {
+                for (ordinal, field) in output_fields.iter().enumerate() {
+                    walk.emit(
+                        O::SystemRelation(*id),
+                        C::Field(ordinal),
+                        PackageTypeSource::StrictField(field),
+                    )?;
+                }
+            }
             p::NodeKind::Aggregate { .. }
             | p::NodeKind::TopN { .. }
             | p::NodeKind::Filter { .. }
@@ -450,6 +460,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::GenerateSeries { .. }
             | p::NodeKind::AssertOneRow(_)
             | p::NodeKind::ChangeEventExpand { .. }
+            | p::NodeKind::PositionShard(_)
             | p::NodeKind::ExchangeSource { .. } => {}
         }
         walk.completed()?;

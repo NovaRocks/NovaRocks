@@ -45,6 +45,18 @@ pub struct FrozenBytes {
     encoded_vec_capacity: Option<usize>,
 }
 
+// Bytes::from_owner uses a repr(C) Owned<T> allocation containing its atomic
+// reference count followed by T (bytes 1.11.1, Cargo.lock). Keep this dependency
+// layout next to the one constructor whose public creation facts it describes.
+struct EncodedBacking<C> {
+    bytes: Vec<u8>,
+    _custody: C,
+}
+impl<C> AsRef<[u8]> for EncodedBacking<C> {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 impl FrozenBytes {
     /// Freezes bytes that the caller has just encoded, or has just received
     /// exactly as they were encoded. Nobody re-encodes them afterwards.
@@ -62,6 +74,25 @@ impl FrozenBytes {
         let capacity = bytes.capacity();
         Self {
             bytes: bytes.into(),
+            encoded_vec_capacity: Some(capacity),
+        }
+    }
+    /// Quote the owner allocation before constructing Bytes. Payload capacity
+    /// is quoted by the original encoder before it allocates its Vec.
+    pub fn encoded_custody_layout<C>() -> Result<std::alloc::Layout, std::alloc::LayoutError> {
+        std::alloc::Layout::new::<std::sync::atomic::AtomicUsize>()
+            .extend(std::alloc::Layout::new::<EncodedBacking<C>>())
+            .map(|(layout, _)| layout.pad_to_align())
+    }
+    /// The exact original Vec and its storage receipt travel with every Bytes
+    /// alias. Dropping a fragment header cannot refund a live transport alias.
+    pub fn freeze_encoded_with_custody<C: Send + 'static>(bytes: Vec<u8>, custody: C) -> Self {
+        let capacity = bytes.capacity();
+        Self {
+            bytes: Bytes::from_owner(EncodedBacking {
+                bytes,
+                _custody: custody,
+            }),
             encoded_vec_capacity: Some(capacity),
         }
     }
@@ -254,5 +285,39 @@ mod tests {
             .downcast::<Assignment>()
             .expect("the producing owner recovers its own representation");
         assert_eq!(stored.0, 7);
+    }
+}
+
+#[cfg(test)]
+mod frozen_byte_custody_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Custody(Arc<AtomicBool>);
+    impl Drop for Custody {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[test]
+    fn original_encoded_capacity_and_custody_follow_the_last_transport_alias() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut encoded = Vec::with_capacity(128);
+        encoded.extend_from_slice(b"original fragment");
+        let pointer = encoded.as_ptr();
+        let capacity = encoded.capacity();
+        let frozen = FrozenBytes::freeze_encoded_with_custody(encoded, Custody(dropped.clone()));
+        assert_eq!(frozen.encoded_backing_capacity(), Some(capacity));
+        assert_eq!(frozen.bytes().as_ptr(), pointer);
+        let rpc = frozen.to_bytes();
+        let replay = rpc.clone();
+        drop(frozen);
+        drop(rpc);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert_eq!(&replay[..], b"original fragment");
+        drop(replay);
+        assert!(dropped.load(Ordering::Acquire));
     }
 }

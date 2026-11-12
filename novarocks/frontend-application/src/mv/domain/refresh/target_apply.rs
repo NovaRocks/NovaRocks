@@ -20,10 +20,6 @@
 use novarocks_sql::planning::mv::{SqlMvInternalTargetColumn, mv_internal_target_column};
 use novarocks_sql::semantic::TableColumnDef;
 
-pub(crate) use novarocks_sql::planning::mv::{
-    iceberg_mv_physical_select_sql, validate_reserved_projection_output_names,
-};
-
 pub(crate) fn apply_key_table_column() -> TableColumnDef {
     internal_target_column(SqlMvInternalTargetColumn::ApplyKey)
 }
