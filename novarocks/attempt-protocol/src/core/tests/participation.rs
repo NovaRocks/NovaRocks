@@ -747,6 +747,7 @@ struct SentAdmission {
     issue: AttemptAuthorizationRef,
     generation: SendGeneration,
     begin: AttemptRequestToken,
+    send: AttemptActionId,
 }
 
 fn reply_fixture_authorization(
@@ -766,12 +767,11 @@ fn reply_fixture_authorization(
     )
 }
 
-fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
+fn emit_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
     use novarocks_coordination_contract::AttemptAuthorization;
 
     fixture.queue_control = false;
     let sources = fixture.sources;
-    let sent_at = fixture.now;
     assert!(
         fixture
             .step(sources.actor, AttemptInput::StartProtocol)
@@ -841,13 +841,24 @@ fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
     assert_eq!(batch.operations.len(), 1);
     assert_eq!(batch.operations[0].operation_id(), operation_id);
     fixture.drain(|effect| panic!("admission still awaits Worker: {effect:?}"));
+    SentAdmission {
+        request: first,
+        issue,
+        generation,
+        begin,
+        send,
+    }
+}
+
+fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
+    let admission = emit_fixture_admission(fixture);
     assert!(
         fixture
             .step(
-                sources.native,
+                fixture.sources.native,
                 AttemptInput::Executor(ExecutorFact::SendStarted {
-                    effect: send,
-                    started_at: sent_at,
+                    effect: admission.send,
+                    started_at: fixture.now,
                 }),
             )
             .effect
@@ -855,12 +866,7 @@ fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
     );
     fixture.drain(|effect| panic!("send start does not produce a ticket: {effect:?}"));
 
-    SentAdmission {
-        request: first,
-        issue,
-        generation,
-        begin,
-    }
+    admission
 }
 
 #[test]
@@ -1089,6 +1095,7 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
         issue,
         generation,
         begin,
+        ..
     } = send_fixture_admission(&mut fixture);
     let sources = fixture.sources;
     let operation = OperationIntent::AcquireParticipationAdmissionTicket(first);
@@ -1294,6 +1301,221 @@ fn computation_ready_starts_normal_drain_without_a_root_seal() {
         Some(OperationIntent::QuiesceParticipation(request))
             if request.participation() == fixture.participation
     ));
+}
+
+#[test]
+fn remote_convergence_distinguishes_unused_admission_from_uncertain_or_held_participation() {
+    use crate::input::{MembershipObservation, WithdrawalOutcome};
+    use novarocks_coordination_contract::{
+        AttemptConvergenceClosure, AttemptConvergenceMode, AttemptParticipationConvergence,
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Admission {
+        Pristine,
+        Unsent,
+        Unknown,
+        Held,
+        EstablishUnknown,
+    }
+
+    let collect_convergence = |fixture: &mut Fixture, first: Option<AttemptEffect>| {
+        let mut read = None;
+        let mut closure = None;
+        let mut observe = |effect: AttemptEffect| match effect.body {
+            EffectBody::ObserveProcess {
+                request,
+                participation,
+            } => assert!(read.replace((request, participation)).is_none()),
+            EffectBody::Port(port) => match port.body {
+                AttemptToLogicalBody::ConvergenceProgress {
+                    local_exited: false,
+                    closure: Some(original),
+                    lifecycle_runtime_filters: None,
+                } => assert!(closure.replace(original).is_none()),
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                    AttemptFailure::TaskProtocol(ref error),
+                )) if **error == schedule("original stop") => {}
+                other => panic!("expected remote-only convergence, got {other:?}"),
+            },
+            EffectBody::PrepareLocalConvergence | EffectBody::ReleaseCreationPayload { .. } => {}
+            _ => panic!("unexpected convergence effect: {effect:?}"),
+        };
+        if let Some(effect) = first {
+            observe(effect);
+        }
+        fixture.drain(observe);
+        (read, closure)
+    };
+    let original_process = |fixture: &mut Fixture, request, participation| {
+        fixture
+            .step(
+                fixture.sources.process,
+                AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                    request,
+                    participation,
+                    sampled_at: fixture.now,
+                    observation: MembershipObservation::ExactOriginal,
+                }),
+            )
+            .effect
+    };
+
+    for case in [
+        Admission::Pristine,
+        Admission::Unsent,
+        Admission::Unknown,
+        Admission::Held,
+        Admission::EstablishUnknown,
+    ] {
+        let before = match case {
+            Admission::Held => BeforeStop::Ticket,
+            Admission::EstablishUnknown => BeforeStop::EstablishUnknown,
+            _ => BeforeStop::Pristine,
+        };
+        let mut fixture = Fixture::new(before, 128);
+        let sent = match case {
+            Admission::Unsent => Some(emit_fixture_admission(&mut fixture)),
+            Admission::Unknown => Some(send_fixture_admission(&mut fixture)),
+            _ => None,
+        };
+        let participation = fixture.participation;
+        fixture.stop(AttemptStopReason::Client);
+        let mut withdraw = None;
+        let observe_cleanup = |effect: AttemptEffect| match effect.body {
+            EffectBody::ReleaseCreationPayload { .. } => {}
+            EffectBody::Port(port) => assert!(matches!(
+                port.body,
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                    AttemptFailure::TaskProtocol(ref error)
+                )) if **error == schedule("original stop")
+            )),
+            _ => panic!("unexpected stop effect: {effect:?}"),
+        };
+        fixture.drain(|effect| {
+            if let EffectBody::Withdraw { effect } = effect.body {
+                assert!(withdraw.replace(effect).is_none());
+            } else {
+                observe_cleanup(effect);
+            }
+        });
+
+        if let Some(sent) = sent {
+            assert_eq!(
+                fixture.core.execution.dispatcher().in_flight_operations(),
+                1
+            );
+            assert!(
+                !fixture
+                    .core
+                    .execution
+                    .participation_never_established(participation)
+            );
+            let settled = if case == Admission::Unsent {
+                assert_eq!(withdraw, Some(sent.send));
+                fixture.step(
+                    fixture.sources.transport,
+                    AttemptInput::Executor(ExecutorFact::Withdrawn {
+                        effect: sent.send,
+                        outcome: WithdrawalOutcome::DefinitelyUnsent,
+                    }),
+                )
+            } else {
+                assert!(withdraw.is_none());
+                let operation = OperationIntent::AcquireParticipationAdmissionTicket(sent.request);
+                fixture.step(
+                    fixture.sources.native,
+                    AttemptInput::Executor(ExecutorFact::Operation(reply(
+                        &operation,
+                        sent.generation,
+                        OperationReplyResult::Local {
+                            result: LocalDispatchResult::TransportUnknown,
+                            failure: None,
+                            protocol_failure: None,
+                            detail: None,
+                        },
+                    ))),
+                )
+            };
+            assert!(settled.effect.is_none());
+            fixture.drain(observe_cleanup);
+            assert_eq!(
+                fixture.core.execution.dispatcher().in_flight_operations(),
+                0
+            );
+        } else {
+            assert!(withdraw.is_none());
+        }
+
+        let is_never_established = matches!(case, Admission::Pristine | Admission::Unsent);
+        assert_eq!(
+            fixture
+                .core
+                .execution
+                .participation_never_established(participation),
+            is_never_established,
+            "{case:?}"
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+        let deadline = fixture.now.saturating_add(Duration::from_secs(3));
+        let begun = fixture.step(
+            fixture.sources.actor,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: fixture.activation,
+                body: LogicalToAttemptBody::BeginConvergence {
+                    mode: AttemptConvergenceMode::Cleanup,
+                    remote_deadline: deadline,
+                    computation_ready: None,
+                    retain_diagnostics: false,
+                },
+            }),
+        );
+        let (read, closure) = collect_convergence(&mut fixture, begun.effect);
+        if is_never_established {
+            assert!(read.is_none(), "{case:?}");
+            assert!(
+                matches!(
+                    closure.as_deref(),
+                    Some(AttemptConvergenceClosure::Evidence(rows))
+                        if rows.as_slice() == [(participation, AttemptParticipationConvergence::NeverEstablished)]
+                ),
+                "{case:?}"
+            );
+        } else {
+            assert!(closure.is_none(), "{case:?}");
+            let (first, original) = read.expect("unresolved participation needs a process read");
+            assert_eq!(original, participation);
+            let effect = original_process(&mut fixture, first, original);
+            let (read, closure) = collect_convergence(&mut fixture, effect);
+            assert!(read.is_none() && closure.is_none(), "{case:?}");
+            assert_eq!(fixture.core.next_deadline(), Some(deadline));
+
+            fixture.now = deadline;
+            let (read, closure) = collect_convergence(&mut fixture, None);
+            assert!(closure.is_none(), "{case:?}");
+            let (last, original) =
+                read.expect("the deadline still needs the original process read");
+            assert_eq!(original, participation);
+            assert_ne!(first, last);
+            let effect = original_process(&mut fixture, last, original);
+            let (read, closure) = collect_convergence(&mut fixture, effect);
+            assert!(read.is_none(), "{case:?}");
+            assert!(
+                matches!(
+                    closure.as_deref(),
+                    Some(AttemptConvergenceClosure::RemoteTrackingEnded { exact_participations })
+                        if exact_participations.as_ref() == [participation]
+                ),
+                "{case:?}"
+            );
+        }
+    }
 }
 
 #[test]
