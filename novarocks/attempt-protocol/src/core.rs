@@ -720,6 +720,15 @@ impl Core {
         }
     }
 
+    /// Observe an already accepted Task failure without selecting a terminal.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn selected_task_failure_for_test(
+        &self,
+    ) -> Option<&novarocks_coordination_contract::SelectedTaskTermination> {
+        self.execution.selected_task_failure()
+    }
+
     /// Observe the demand latch and its live recovery deadline in a fixture.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]

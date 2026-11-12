@@ -37,6 +37,9 @@ pub(crate) mod transport;
 
 pub(crate) mod replacement_client;
 
+#[cfg(test)]
+mod terminal_priority_tests;
+
 /// A paid pass resumes across turns. A new mark arriving during a pass
 /// survives until the next pass, since it may concern an earlier position.
 #[derive(Default)]
