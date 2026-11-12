@@ -120,3 +120,6 @@ mod tests {
         assert!(queue.claim_with_notification().is_none());
     }
 }
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod strict_tail_tests;

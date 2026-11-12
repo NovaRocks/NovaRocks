@@ -902,6 +902,18 @@ impl LogicalExecutionTestHarness {
         )
     }
 
+    /// Moves the original client stream to its single test consumer.
+    pub fn take_client_result_stream(&mut self) -> QueryResultStream {
+        let output = self
+            .output
+            .take()
+            .expect("the original client output is transferred once");
+        let ExecutionOutput::Rows(stream) = output.into_output() else {
+            panic!("the fixture installed a client result stream");
+        };
+        stream
+    }
+
     /// Drives the production root relay with the original running permit and
     /// reports its logical decision. The caller can still observe the same
     /// registered actor while the relay is pending.

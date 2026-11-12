@@ -4262,15 +4262,19 @@ fn a_union_node_counts_every_producer_of_every_edge_that_feeds_it() {
 fn delivery_chain_harness(
     delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
 ) -> Harness {
+    Harness::from_graph(delivery_chain_graph(delivery))
+}
+
+pub(crate) fn delivery_chain_graph(
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+) -> TaskGraph {
     let schedule = chain_schedule(&[0], &[1]);
     let mut edges = chain_edges();
     for edge in &mut edges {
         edge.delivery = delivery;
     }
-    Harness::from_graph(
-        build_graph(&schedule, &edges, &backends(2), 512)
-            .expect("the delivery contract forms the original chain"),
-    )
+    build_graph(&schedule, &edges, &backends(2), 512)
+        .expect("the delivery contract forms the original chain")
 }
 
 /// The original required-input chain with a real Finished root status and
