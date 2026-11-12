@@ -44,7 +44,7 @@ under the License.
 | 只用 crate 的公共 API（公开契约） | `<crate>/tests/it/` 下承载该领域的子模块 |
 | 需要本 crate 的领域 testkit | 只能是 `<crate>/tests/it/` |
 | 检查下游怎样消费上游的真实产物，且下游生产依赖上游 | 下游 crate 的 `tests/it/` |
-| 检查穿过两个 crate 的最终结果，而它们之间没有生产依赖 | 对应的接缝测试 package |
+| 从上游的原始输入出发、检查下游最终结果，而两侧之间没有生产依赖 | 对应的接缝测试 package |
 | 需要 Loom、Miri、全局 allocator、自定义 harness、`required-features` 或按 binary 选择的资源组 | 独立的 `<crate>/tests/<name>.rs`，顶部写明理由；同时需要私有项的留在 `src/` 内按该模式门控的模块 |
 | 启动真实进程、走真实协议或多个角色协作 | 拥有该场景的 Server、cluster harness 或 System owner，沿现有入口 |
 | 多个 crate 要用同一份领域输入 | 事实 owner 的领域 testkit，见 [fixture 归属阶梯](#fixture-归属阶梯) |
@@ -56,17 +56,22 @@ under the License.
 
 ### 第 1 问：断言保护谁的性质
 
-**怎样判定。** 设想这条断言失败：它说的是哪个 crate 承诺的行为没有兑现。那个 crate 就是断言的 owner。
+原则是：断言失败时，哪个 crate 承诺的行为没有兑现，测试就归哪个 crate。
 
-- 断言检查的是交接，即下游消费上游的真实产物之后的行为。owner 是消费方，上游产物只是输入。
-- 断言的结论要经过链条上多个 crate 的真实产物才能得到。候选 owner 是链条上最下游、其行为被断言的那个 crate；
-  它能不能留在那里由第 2 问决定。
-- 一个测试里有几条彼此独立的断言，各自说的是不同 crate 的行为。按 owner 拆开，各归各处。
+**怎样判定。** 以测试函数为单位，看它直接调用并观察的入口。
+
+- 只调用一个 crate 的入口：owner 是那个 crate。
+- 沿一条链依次调用多个 crate 的入口：owner 是最下游的那个，即测试最后调用并观察其结果的入口所在的 crate。
+  链条中间对上游产物的检查是前置条件，随测试留下，不单独拆走。它能不能留在最下游的 crate 由第 2 问决定。
+- 只有当一个测试函数里的几组断言之间没有前后依赖，删掉任何一组都不影响其余各组的结论时，才按各自的入口拆开。
+
+写新测试时先选层。要保护的行为如果在上游 crate 自己的入口就能观察到，就写在上游；
+只有当行为要到下游才显现时才写在下游。这就是 test-governance 所说的最低充分层级。
 
 **得到什么。** 一个 owner crate。
 
-**反例。** 测试文件在 Execution 的目录里，用了 SQL 编译器，断言的是 SQL 产出的计划有几个参数。
-“文件在哪个目录”和“用了哪个 crate 的类型”都不决定 owner；这条断言说的是 SQL 的行为，所以它归 SQL。
+**反例。** 测试文件在 Execution 的目录里，只调用了 SQL 编译器，断言的是 SQL 产出的计划有几个参数。
+“文件在哪个目录”和“用了哪个 crate 的类型”都不决定 owner；它只调用并观察了 SQL 的入口，所以归 SQL。
 
 ### 第 2 问：需要的 crate 是否都在 owner 的生产依赖闭包内
 
@@ -79,11 +84,12 @@ cargo tree -p <crate> -e normal --locked --prefix none | grep '^novarocks' | sor
 **怎样判定。** 列出测试必须编入的 workspace 成员。允许的只有三类：闭包内的 crate、闭包内 crate 的领域 testkit、
 机械支持（`novarocks-test-support`）。第三方库不在这条规则之内。都在范围内就进入第 3 问。
 
-有越出范围的 crate 时，做一次替换检验：把越界 crate 的产物换成一份在闭包内构造的等价输入，这还是同一条断言吗？
+有越出范围的 crate 时，做一次替换检验。看测试的期望值是相对什么陈述的：
 
-- 是。越界的 crate 只是输入的构造者。改用闭包内的输入，进入第 3 问。
-- 不是。断言的要点就是上游的真实产物一路被正确处理到底。它属于对应的接缝测试 package，位置判定到此结束，
-  第 5、6 问在那个 package 内照常适用。
+- 期望值相对 owner 自己的输入陈述，例如“这个程序对这几列求值得到这些值”。越界的 crate 只是用来把输入构造出来，
+  换一种构造方式期望值不变。改用闭包内的输入，进入第 3 问。
+- 期望值相对上游的原始输入陈述，例如“这条 SQL 文本求值得到这些值”。换掉上游的真实产物，期望值就失去了依据。
+  它属于对应的接缝测试 package，位置判定到此结束，第 5、6 问在那个 package 内照常适用。
 
 接缝两侧之间如果有生产依赖，上游本来就在下游的闭包内，不会走到这一步。
 
@@ -99,7 +105,8 @@ cargo tree -p <crate> -e normal --locked --prefix none | grep '^novarocks' | sor
 ### 第 3 问：是否需要私有项
 
 **怎样判定。** 断言必须触及 owner crate 里的非 `pub` 项，或只在 `cfg(test)` 下存在的观察点，才能写出来吗。
-这里看的是被测对象和观察点。测试自己的 helper 与 fixture 不算，它们随测试一起移动。
+这里看的是生产代码：被测对象、观察点，以及搭建观察环境时必须调用的非 `pub` 生产项，都算。
+测试自己的 helper 与 fixture 不算，它们随测试一起移动。
 
 - 需要：白盒测试，留在 `src/`，形态见[白盒测试的形态](#白盒测试的形态)。
 - 不需要：公开契约测试，进 `<crate>/tests/it/`。
@@ -135,8 +142,9 @@ cargo tree -p <crate> -e normal --locked --prefix none | grep '^novarocks' | sor
 **怎样判定。** 在 owner crate 里找承载同一个行为轴的测试文件。行为轴是被测对象的一个行为维度，
 例如空值语义、溢出、取消；可以把它理解为读者会对这个对象提的一个问题，例如“它怎样处理 NULL”。
 
-- 有，而且它与第 3、4 问得到的位置同属一类（都在 `src/` 内，或都是集成测试）：把用例加进那个文件。
-  这包括旧布局里的文件，例如平铺的 `foo_tests.rs` 和顶层的 `tests/<name>.rs`。
+- 有，而且它与第 3、4 问得到的位置同属一类（都在 `src/` 内，或都是集成测试，并且独立 target 的理由相同）：
+  把用例加进那个文件。这包括旧布局里的文件，例如平铺的 `foo_tests.rs` 和顶层的 `tests/<name>.rs`。
+  判断标准是文件里已有的用例是否在回答同一个问题，不是文件名；以层次、契约或工作项命名的宽泛文件不算现成主题。
 - 没有：在第 3、4 问得到的规范位置新建文件，按行为轴命名。新建之前要能回答“为什么没有现成主题可容纳”。
 
 **得到什么。** 一个具体的文件。写 plan 时把它记为测试落点，见 [plan 中的测试落点](#plan-中的测试落点)。
@@ -182,7 +190,7 @@ exec/chunk/tests/
 
 ## 公开契约测试与集成 target
 
-公开契约测试默认集中在一个集成 target 里，按领域分子模块：
+公开契约测试默认集中在一个集成 target 里，子模块按行为轴命名：
 
 ```text
 <crate>/tests/it/main.rs    # mod scan; mod output_contract;
@@ -194,7 +202,7 @@ exec/chunk/tests/
 Cargo 把 `tests/it/main.rs` 编成一个名为 `it` 的集成测试。每个集成 target 是一个独立的链接单元，
 `tests/` 下每个顶层文件一个 binary 会把链接成本乘以文件数，所以不为每个主题建一个顶层文件。
 
-一个 binary 不是终点。公开契约测试多到按领域分开更合适时，可以拆成少数几个按领域命名的 target，
+一个 binary 不是终点。公开契约测试多到分开更合适时，可以拆成少数几个按领域命名的 target，
 前提是它们共用的输入已经放进 `fixtures` 模块或 testkit，而不是在各个 target 里各留一份。
 
 > **试行**：按领域拆分的具体做法，以及拆分后身份与处置的同步步骤，等待集成 target 的试点确认。
@@ -356,7 +364,8 @@ fn concat_is_strict_on_null() {
 | 跨 crate 的领域输入 | testkit | `novarocks/<domain>/testkit` |
 | 进程、端口、I/O 等机械资源 | support | `tests/test-support` |
 
-`tests/` 目录下的文件按主题命名，不带 `_test` 或 `_tests` 后缀。这适用于白盒的 `foo/tests/` 和公开契约的 `tests/it/`。
+`tests/` 目录下的文件按行为轴命名，不带 `_test` 或 `_tests` 后缀。这适用于白盒的 `foo/tests/` 和公开契约的 `tests/it/`。
+有 target 级理由的独立 target 同样按行为轴命名，可以带表示运行模式的后缀，例如 `_loom`。
 命名规则约束文件与模块，不要求重命名测试函数。
 
 > **试行**：crate 内多棵测试树共用的 `cfg(test)` 模块的统一拼写，等待白盒测试树的试点确认。在那之前新建的这类模块使用 `fixtures`。
@@ -384,6 +393,7 @@ fn concat_is_strict_on_null() {
 1. 不新建平铺的 `foo_tests.rs` 兄弟文件，不在生产 `mod.rs` 里新增 `#[cfg(test)] mod xxx_tests;`。
    新的白盒测试文件进测试树。
 2. 不新增“每个文件一个 binary”的集成 target。新的公开契约测试进 `tests/it/`，这个 crate 还没有就新建。
+   第 4 问清单内的独立 target 不受此限。
 3. 不新增越出生产依赖闭包的 dev 依赖。
 
 ### 不要求的事
@@ -397,12 +407,17 @@ fn concat_is_strict_on_null() {
 有三种情形，判定程序给出的结果现在还落不了地：
 
 - 位置是接缝测试 package，而它尚未建立；
-- 第 6 问指向一个尚未建立的领域 testkit，例如 SQL 领域 testkit；
+- 测试需要的领域输入目前只存在于另一个 crate 的测试 helper 里，对应的领域 testkit 尚未建立。
+  当前的例子是“声明字段后的真实 SQL 编译”，它的构造代码在 Execution 的测试目录里；
 - 结果取决于上表中待确认的规则，例如经局部编译器取得输入的下层测试。
 
-这三种情形的做法相同：新用例暂时加进现有同类用例所在的文件，使用那里已有的输入构造。
-“同类”指输入来源和断言对象都相同的用例。不因此新增越出闭包的 dev 依赖，也不把那里的 helper 复制到别处。
+这三种情形的做法相同，并且优先于上面的三条约束：新用例暂时加进现有同类用例所在的文件，使用那里已有的输入构造。
+“同类”指输入来源和断言对象都相同的用例。那个文件所在的 crate 已有的越界 dev 依赖可以继续使用，
+但不因此新增越出闭包的 dev 依赖，也不把那里的 helper 复制到别处。
 没有现成的同类文件时，在 plan 的测试落点里写明判定结果和暂时的位置。
+
+不属于这三种情形的新测试直接放到判定结果的位置。例如只需要 owner 自己公共 API 就能构造输入的公开契约测试，
+现在就进 `tests/it/`。
 
 对应的试点合入后，本节会改为实际位置，之后的新用例直接按判定结果放置。
 
@@ -412,29 +427,31 @@ fn concat_is_strict_on_null() {
 
 **A：SQL 编译 `SELECT concat(a,b,c) FROM t` 后检查计划的参数个数与类型顺序。**
 现位于 `novarocks/execution/src/exec/expr/f3_concat_trim_sql_boundary_tests.rs`。
-第 1 问：断言失败要修 SQL，owner 是 SQL。第 2 问：只需要 SQL 自己。第 3 问：检查的是 SQL 编译的公开产物，不需要私有项。
+第 1 问：它只调用并观察 SQL 编译器，owner 是 SQL。第 2 问：只需要 SQL 闭包内的 crate。第 3 问：检查的是 SQL 编译的公开产物，不需要私有项。
 第 4 问：不需要。结果：SQL 的 `tests/it/`。
 
 **B：搭一个只含 `concat` 的物理计划片段，经局部编译器得到 `LocalProgram`，检查它对 NULL 与空串的求值。**
-与 A 在同一个文件里。第 1 问：断言说的是 Execution 的求值行为，owner 是 Execution。
-第 2 问：物理计划与局部编译器不在 Execution 的闭包内。替换检验：换成一份等价的 `LocalProgram` 输入，断言不变，
-所以它们只是输入的构造者。第 3 问：求值入口是公共 API，观察的也是公共结果。
+与 A 在同一个文件里。第 1 问：它最后调用并观察的是 Execution 的求值入口，owner 是 Execution。
+第 2 问：物理计划与局部编译器不在 Execution 的闭包内。替换检验：期望值是相对“这个程序对这几列求值”陈述的，
+换一种方式构造同一个程序期望值不变，所以它们只是输入的构造者。第 3 问：求值入口是公共 API，观察的也是公共结果。
 结果：归 Execution。它最终是留在 Execution 并改用闭包内的输入，还是随输入的构造方式另行安置，属于待确认的规则；
 在那之前，同类新用例按“规范位置尚不存在时”加进现有文件。
 A 与 B 同在一个文件却归属不同，所以要按断言逐个判定，不按文件判定。
 
 **C：SQL 文本经 SQL 编译、package 编码、局部编译后求值，检查最终结果。**
 现位于 `novarocks/execution/src/exec/expr/signed_cast_nullability_sql_tests.rs`。
-第 1 问：哪一段出错都会让它失败，它保护的是组合的最终结果。第 2 问：需要 SQL 和 Execution 两侧，
-Execution 的生产闭包里没有 SQL。替换检验：换掉 SQL 的真实产物，它就不再是“这条 SQL 求值得到什么”的断言。
-结果：“编译到执行”接缝测试 package。其中只检查 SQL 计划形态的断言可以拆给 SQL；
-需要 Execution 私有项的断言（例如内部内存记账归零）拆给 Execution 的白盒测试。
+第 1 问：它沿链依次调用 SQL 编译、package 编码、局部编译和 Execution 求值，最下游是 Execution；
+中间对计划和 package 的检查是前置条件，随测试留下。第 2 问：SQL 等上游不在 Execution 的闭包内。
+替换检验：期望值是相对 SQL 文本陈述的。结果：“编译到执行”接缝测试 package。
+其中必须调用 Execution 非 `pub` 生产项的断言（内部内存记账归零）在接缝 package 里写不出来，
+拆给 Execution 的白盒测试。
 
 **D：Query Application 冻结 SQL 产出的结果声明，并拒绝与声明不符的输出。**
 现位于 `novarocks/execution/src/exec/expr/numeric_unary_public_transport_tests.rs`。
-第 1 问：检查的是交接，归消费方 Query Application。第 2 问：Query Application 生产依赖 SQL，在闭包内。
+第 1 问：它先调用 SQL，再调用并观察 Query Application 的冻结入口，最下游是 Query Application；
+对 SQL 声明的检查是前置条件，随测试留下。第 2 问：Query Application 生产依赖 SQL，在闭包内。
 第 3 问：用的是 Query Application 的公共 API。结果：Query Application 的 `tests/it/`，SQL 的真实产物作输入。
-第 6 问指向 SQL 领域 testkit，它尚未建立，所以现在新增的同类用例按“规范位置尚不存在时”加进现有文件。
+它需要的 SQL 输入构造目前只在 Execution 的测试 helper 里，所以现在新增的同类用例按“规范位置尚不存在时”加进现有文件。
 
 **E：新增，验证某个哈希表的私有探测序列在冲突下的行为。**
 第 1 问：owner 是哈希表所在的 crate。第 2 问：在闭包内。第 3 问：需要私有项。第 5 问：已有承载冲突行为的主题文件就加进去。
