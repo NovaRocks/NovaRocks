@@ -868,15 +868,27 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_abort_rearms_only_after_its_original_control_input_retires() {
-        exercise_registered_abort_route(false).await;
+        exercise_registered_abort_route(RegisteredAbortCase::Replay).await;
     }
 
     #[tokio::test]
     async fn failed_abort_route_fences_settlement_and_returns_the_original_control_input() {
-        exercise_registered_abort_route(true).await;
+        exercise_registered_abort_route(RegisteredAbortCase::OwnerFailed).await;
     }
 
-    async fn exercise_registered_abort_route(fail_owner: bool) {
+    #[tokio::test]
+    async fn registered_abort_rejects_invalid_participation_receipts_without_losing_authority() {
+        exercise_registered_abort_route(RegisteredAbortCase::InvalidReceipts).await;
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum RegisteredAbortCase {
+        Replay,
+        OwnerFailed,
+        InvalidReceipts,
+    }
+
+    async fn exercise_registered_abort_route(case: RegisteredAbortCase) {
         use crate::{
             control_runtime::actor::FrontendActor,
             query_execution::native_execution_adapter::LogicalAbortRouter,
@@ -889,7 +901,7 @@ mod tests {
             },
         };
         use novarocks_attempt_protocol::input::{AttemptInput, SendGeneration};
-        use novarocks_control_runtime::transaction::RuntimeLedger;
+        use novarocks_control_runtime::{actor_turn::InputPhase, transaction::RuntimeLedger};
         use novarocks_control_runtime_core::{
             capacity::{ReservationResources, ResourceVector},
             identity::Generation,
@@ -900,7 +912,9 @@ mod tests {
             AbortIssueSettlement, AttemptActionId, AttemptToLogical, AttemptToLogicalBody,
             LogicalToAttemptBody,
         };
-        use novarocks_query_application::coordination::AbortParticipationIssueState;
+        use novarocks_query_application::coordination::{
+            AbortParticipationIssueState, LogicalExecutionJoinReadiness,
+        };
         use std::num::NonZeroU64;
 
         let exact = participation(BackendProcessId::new_v7());
@@ -953,6 +967,7 @@ mod tests {
             .unwrap()
             .into_standing_input()
             .unwrap();
+        let standing_id = position.id();
         let port = Arc::new(AttemptAbortIngress::new(
             inbox.registration().clone(),
             activation,
@@ -1020,6 +1035,164 @@ mod tests {
                 settlement,
             },
         };
+        let finish = async |logical: &mut LogicalExecutionTestHarness, inbox: WithdrawalInbox| {
+            logical
+                .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+            drop(route);
+            work.body_exited().unwrap();
+            work.captures_exited().unwrap();
+            assert!(port.close_after_exit().unwrap());
+            payer.finish().unwrap();
+            scope.close_external().unwrap();
+            ledger.reap_scope_ready(scope.id(), 8).unwrap();
+            inbox.finish();
+            ledger.remove_scope(scope.id()).unwrap();
+            assert!(ledger.is_empty());
+        };
+        if case == RegisteredAbortCase::InvalidReceipts {
+            let (input, AttemptInput::Port(original)) = inbox.try_commit_owner_control().unwrap()
+            else {
+                panic!("original Abort Control input");
+            };
+            assert_eq!(original.activation, activation);
+            assert_eq!(identity.activation(), activation);
+            assert_eq!(identity.participation(), exact);
+            let LogicalToAttemptBody::Abort { action, request } = original.body else {
+                panic!("original Abort request");
+            };
+            assert_eq!(action, first);
+            assert_eq!(request.envelope().operation_id(), operation);
+            assert_eq!(request.participation(), exact);
+            assert_eq!(request.cause(), AbortCause::QueryFailed);
+            let custody = runtime.input_custody(actor, input).unwrap().unwrap();
+            assert_eq!(custody.standing_input_id, Some(standing_id));
+            assert_eq!(custody.class, InputClass::Control);
+            assert_eq!(custody.phase, InputPhase::Committed);
+            let original_closure = logical
+                .stand_down_snapshot(exact)
+                .await
+                .unwrap()
+                .unwrap()
+                .closure();
+            let send = physical(10);
+            let worker = settle(
+                first,
+                send,
+                Some(send),
+                AbortIssueSettlement::Worker(OperationOutcome::Accepted),
+            );
+            let foreign = participation(BackendProcessId::new_v7());
+            for (payload, reason) in [
+                (
+                    AckPayload::None,
+                    NativeAbortEffectAckError::MissingParticipationReceipt,
+                ),
+                (
+                    AckPayload::Participation(ParticipationReceipt::new(
+                        foreign,
+                        ParticipationState::Aborting,
+                    )),
+                    NativeAbortEffectAckError::ParticipationReceiptIdentityMismatch,
+                ),
+                (
+                    AckPayload::Participation(ParticipationReceipt::new(
+                        exact,
+                        ParticipationState::Active,
+                    )),
+                    NativeAbortEffectAckError::NonClosingParticipationReceipt,
+                ),
+            ] {
+                // Each candidate is independent. The real receipt slot is
+                // single-assignment and all candidates name the original send.
+                let receipt = AbortReceiptSlot::new(
+                    SendKey {
+                        operation,
+                        generation: SendGeneration::new(send),
+                    },
+                    exact,
+                );
+                receipt.record(&OperationAcknowledgement::worker_receipt(
+                    operation,
+                    OperationKind::AbortParticipation,
+                    OperationOutcome::Accepted,
+                    payload,
+                ));
+                assert!(matches!(
+                    settlement_owner.apply(&worker, Some(&receipt)),
+                    Err(AbortSettlementRefusal::InvalidReceipt(original)) if original == reason
+                ));
+                assert_eq!(runtime.input_custody(actor, input).unwrap(), Some(custody));
+                assert!(matches!(
+                    router.try_reserve(identity),
+                    AbortParticipationEffectAdmission::Backpressured
+                ));
+                let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+                assert_eq!(snapshot.identity(), Some(identity));
+                assert_eq!(
+                    snapshot.issue_state(),
+                    Some(AbortParticipationIssueState::TransportOwned)
+                );
+                assert_eq!(snapshot.closure(), original_closure);
+            }
+            let failed = settlement_owner
+                .apply(
+                    &settle(first, send, None, AbortIssueSettlement::FailedClosed),
+                    None,
+                )
+                .unwrap();
+            failed.result.unwrap();
+            let mut retirement = failed
+                .retirement
+                .expect("original authority survived every refusal");
+            assert!(retirement.retire_ready().unwrap());
+            assert!(runtime.input_custody(actor, input).unwrap().is_none());
+            drop(retirement);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if logical
+                        .stand_down_snapshot(exact)
+                        .await
+                        .unwrap()
+                        .is_some_and(|snapshot| {
+                            snapshot.closure() == ParticipationClosureState::AbortIssueExhausted
+                                && snapshot.issue_state()
+                                    == Some(AbortParticipationIssueState::FailedClosed)
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // Leave the original route open so a mistaken unknown-outcome
+            // replay would still be able to occupy this paid Control slot.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let roles = runtime.standing_input_inventory(actor, None, 16).unwrap();
+            let role = roles
+                .iter()
+                .find(|role| role.standing_input_id == standing_id)
+                .unwrap();
+            assert_eq!(
+                role.in_flight, None,
+                "FailedClosed cannot authorize an Abort replay"
+            );
+            assert!(!matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ));
+            drop(settlement_owner);
+            logical
+                .observe_worker_process_replaced(exact)
+                .await
+                .unwrap();
+            finish(&mut logical, inbox).await;
+            return;
+        }
+
         let mut capacity = port.subscribe_capacity();
         let unknown = settlement_owner
             .apply(
@@ -1079,7 +1252,7 @@ mod tests {
         assert_eq!(replay_request.envelope(), request.envelope());
         assert_eq!(replay_request.participation(), request.participation());
         assert_eq!(replay_request.cause(), request.cause());
-        if fail_owner {
+        if case == RegisteredAbortCase::OwnerFailed {
             let mut drained = settlement_owner.drain_failed();
             assert!(drained.errors.is_empty());
             assert_eq!(drained.retirements.len(), 1);
@@ -1185,21 +1358,7 @@ mod tests {
             .observe_worker_stopped_and_participation_fenced(exact)
             .await
             .unwrap();
-        logical
-            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        drop(route);
-        work.body_exited().unwrap();
-        work.captures_exited().unwrap();
-        assert!(port.close_after_exit().unwrap());
-        payer.finish().unwrap();
-        scope.close_external().unwrap();
-        ledger.reap_scope_ready(scope.id(), 8).unwrap();
-        inbox.finish();
-        ledger.remove_scope(scope.id()).unwrap();
-        assert!(ledger.is_empty());
+        finish(&mut logical, inbox).await;
     }
 
     #[tokio::test]
