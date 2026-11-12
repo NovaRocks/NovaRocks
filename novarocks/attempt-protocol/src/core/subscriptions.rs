@@ -201,6 +201,15 @@ impl Subscriptions {
             })
     }
 
+    #[cfg(test)]
+    pub(super) fn phase_for_test(
+        &self,
+        participation: ParticipationRef,
+    ) -> (SubscriptionStatus, Option<MonotonicInstant>) {
+        let original = &self.rows[&participation];
+        (original.controller.status(), original.deadline)
+    }
+
     pub(super) fn activate(
         &mut self,
         now: MonotonicInstant,

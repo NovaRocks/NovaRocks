@@ -981,6 +981,375 @@ fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control(
 }
 
 #[test]
+fn covered_exhaustion_preserves_healthy_sibling_phases_and_deadlines() {
+    use crate::{
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind, SubscriptionPhaseSnapshot},
+        observation::{
+            controller::SubscriptionStatus,
+            opening::{COVERED_LIVENESS_BUDGET, COVERED_OPENING_BUDGET},
+        },
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+    use novarocks_execution_contract::ParticipationRef;
+
+    #[derive(Clone, Copy)]
+    enum HealthyPhase {
+        Opening,
+        Live,
+        Backoff,
+    }
+
+    for connection_lost in [false, true] {
+        for healthy in [
+            HealthyPhase::Opening,
+            HealthyPhase::Live,
+            HealthyPhase::Backoff,
+        ] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 2;
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let leaf = trace
+                .core
+                .execution
+                .graph()
+                .tasks()
+                .last()
+                .unwrap()
+                .identity();
+            let participation = |trace: &TerminalTrace, task: TaskIdentity| {
+                trace
+                    .core
+                    .execution
+                    .graph()
+                    .participation_on_backend(task.backend_process_id())
+                    .unwrap()
+            };
+            let sibling = participation(&trace, root);
+            let peer = participation(&trace, leaf);
+            assert_ne!(sibling, peer);
+            let installed = TaskStatus::created(root).with_installed();
+            for status in [
+                installed.clone(),
+                TaskStatus::created(leaf).with_installed(),
+            ] {
+                let create = trace.start_create(status.identity());
+                trace
+                    .apply(Some(create_reply(create, status)), None)
+                    .unwrap();
+            }
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+
+            let drive = |trace: &mut TerminalTrace, at, source, input| {
+                let pending = trace.handle_input(at, source, input);
+                trace.finish_observation_round(at, pending)
+            };
+            let observe = |trace: &mut TerminalTrace, at, frames| {
+                drive(
+                    trace,
+                    at,
+                    sources.observation,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(frames).unwrap(),
+                    )),
+                )
+            };
+            let independent = |trace: &mut TerminalTrace, at, fact| {
+                assert_eq!(
+                    drive(
+                        trace,
+                        at,
+                        sources.subscription,
+                        AttemptInput::Executor(fact)
+                    )
+                    .0,
+                    Ok(())
+                );
+            };
+            let open = |trace: &mut TerminalTrace, at, participation| {
+                let (round, effects) = drive(trace, at, sources.actor, AttemptInput::Timer);
+                assert_eq!(round, Ok(()));
+                let mut opens = effects.into_iter().filter_map(|effect| {
+                    let EffectBody::OpenSubscription(request) = effect.body else {
+                        return None;
+                    };
+                    assert_eq!(request.participation, participation);
+                    Some((effect.id, request.generation))
+                });
+                let original = opens.next().expect("the original subscription opens");
+                assert!(opens.next().is_none());
+                original
+            };
+            let frame =
+                |participation, generation, received_at, opening, event| ReceivedObservation {
+                    participation,
+                    generation,
+                    received_at,
+                    opening,
+                    event,
+                };
+            let first_eof = |trace: &mut TerminalTrace,
+                             at,
+                             participation: ParticipationRef,
+                             (effect, generation),
+                             opening| {
+                let (round, effects) = observe(
+                    trace,
+                    at,
+                    vec![frame(
+                        participation,
+                        generation,
+                        at,
+                        opening,
+                        ObservationEvent::Closed,
+                    )],
+                );
+                assert_eq!(round, Ok(()));
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: original }
+                        if *closed == participation && *original == generation
+                )));
+                let (SubscriptionStatus::Backoff { until }, None) =
+                    trace.core.subscriptions.phase_for_test(participation)
+                else {
+                    panic!("the original Close still owes actual exit before its backoff can wake");
+                };
+                independent(
+                    trace,
+                    at,
+                    ExecutorFact::SubscriptionExited {
+                        effect,
+                        participation,
+                        generation,
+                    },
+                );
+                assert_eq!(
+                    trace.core.subscriptions.phase_for_test(participation),
+                    (SubscriptionStatus::Backoff { until }, Some(until))
+                );
+                assert!(until > at);
+                until
+            };
+
+            trace.core.subscriptions.activate(now, peer).unwrap();
+            let first_peer = open(&mut trace, now, peer);
+            let peer_retry = first_eof(
+                &mut trace,
+                now,
+                peer,
+                first_peer,
+                ObservationOpening {
+                    started_at: now,
+                    opened_at: Some(now),
+                },
+            );
+            let second_peer = open(&mut trace, peer_retry, peer);
+            assert_ne!(second_peer.0, first_peer.0);
+            assert_eq!(second_peer.1.get(), first_peer.1.get() + 1);
+            independent(
+                &mut trace,
+                peer_retry,
+                ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                    participation: peer,
+                    generation: second_peer.1,
+                    opening_started_at: peer_retry,
+                    opened_at: Some(peer_retry),
+                }),
+            );
+            let peer_deadline = peer_retry.saturating_add(COVERED_LIVENESS_BUDGET);
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(peer),
+                (SubscriptionStatus::Live, Some(peer_deadline))
+            );
+
+            let tick = Duration::from_millis(1);
+            let sibling_started = peer_retry.saturating_add(tick);
+            trace
+                .core
+                .subscriptions
+                .activate(sibling_started, sibling)
+                .unwrap();
+            let sibling_open = open(&mut trace, sibling_started, sibling);
+            let sibling_opened = sibling_started.saturating_add(tick);
+            let sibling_ready = sibling_opened.saturating_add(tick);
+            let sibling_opening = ObservationOpening {
+                started_at: sibling_started,
+                opened_at: Some(sibling_opened),
+            };
+            let sibling_phase = match healthy {
+                HealthyPhase::Opening => {
+                    independent(
+                        &mut trace,
+                        sibling_started,
+                        ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                            participation: sibling,
+                            generation: sibling_open.1,
+                            opening_started_at: sibling_started,
+                            opened_at: None,
+                        }),
+                    );
+                    (
+                        SubscriptionStatus::Opening,
+                        Some(sibling_started.saturating_add(COVERED_OPENING_BUDGET)),
+                    )
+                }
+                HealthyPhase::Live => {
+                    let (round, _) = observe(
+                        &mut trace,
+                        sibling_ready,
+                        vec![frame(
+                            sibling,
+                            sibling_open.1,
+                            sibling_ready,
+                            sibling_opening,
+                            ObservationEvent::Fact {
+                                source_revision: None,
+                                fact: ObservationFact::CatchUpComplete {
+                                    generation: sibling_open.1.get(),
+                                    initial_cut: 1,
+                                },
+                            },
+                        )],
+                    );
+                    assert_eq!(round, Ok(()));
+                    (
+                        SubscriptionStatus::Live,
+                        Some(sibling_ready.saturating_add(COVERED_LIVENESS_BUDGET)),
+                    )
+                }
+                HealthyPhase::Backoff => {
+                    let until = first_eof(
+                        &mut trace,
+                        sibling_ready,
+                        sibling,
+                        sibling_open,
+                        sibling_opening,
+                    );
+                    (SubscriptionStatus::Backoff { until }, Some(until))
+                }
+            };
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert!(trace.core.subscriptions.first_exhausted().is_none());
+            assert!(trace.core.terminal.terminal().is_none());
+            assert!(!trace.core.root.sealed());
+            for required in [sibling, peer] {
+                assert!(trace.core.execution.requires_task_observation(required));
+            }
+
+            let sibling_deadline = sibling_phase.1.unwrap();
+            let before_first_deadline = peer_deadline
+                .min(sibling_deadline)
+                .saturating_duration_since(sibling_ready)
+                .saturating_sub(tick);
+            let at = sibling_ready.saturating_add(before_first_deadline);
+            assert!(at < peer_deadline && at < sibling_deadline);
+            let (round, _) = drive(&mut trace, at, sources.actor, AttemptInput::Timer);
+            assert_eq!(round, Ok(()));
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert!(trace.core.subscriptions.first_exhausted().is_none());
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(id(second_peer.0.get())),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(peer),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let (round, mut effects) = observe(
+                &mut trace,
+                at,
+                vec![frame(
+                    peer,
+                    second_peer.1,
+                    at,
+                    ObservationOpening {
+                        started_at: peer_retry,
+                        opened_at: Some(peer_retry),
+                    },
+                    event,
+                )],
+            );
+            let exhausted = trace.core.subscriptions.first_exhausted().unwrap();
+            assert_eq!((exhausted.participation, exhausted.state), (peer, state));
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert_eq!(trace.status(root), Some(&installed));
+            assert!(!trace.core.execution.task_actual_stopped(root));
+            assert!(!trace.core.execution.task_actual_stopped(leaf));
+            assert!(effects.iter().all(|effect| !matches!(
+                &effect.body,
+                EffectBody::ConfirmReadState { participation, .. }
+                    | EffectBody::CloseSubscription { participation, .. }
+                    if *participation == sibling
+            )));
+
+            let failure = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: leaf.backend_process_id(),
+                    state,
+                },
+            ));
+            assert_eq!(round, Err(failure.clone()));
+            let terminal = AttemptTerminal::Failed(failure);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                effects.extend(
+                    trace
+                        .handle_input(at, sources.actor, AttemptInput::Timer)
+                        .effect,
+                );
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert_eq!(
+                effects.iter().filter(|effect| matches!(
+                    &effect.body,
+                    EffectBody::Port(port)
+                        if port.activation == activation && matches!(
+                            &port.body,
+                            AttemptToLogicalBody::AttemptTerminal(original) if original == &terminal
+                        )
+                )).count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
 fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
     use crate::{
         effect::Publication,
