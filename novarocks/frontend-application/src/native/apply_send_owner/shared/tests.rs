@@ -16,6 +16,8 @@
 // under the License.
 
 use super::*;
+
+mod late_abort_core;
 use crate::native::{
     data_runtime::FrontendDataRuntime,
     task_transport::{NativeCallSource, NativePhysicalOffer},
@@ -1725,11 +1727,23 @@ async fn actor_replays_same_create_without_charging_payload_bytes_twice() {
     run_actor_send(ActorSendMode::CreateReplay, None).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn late_owner_failed_abort_withdraws_the_original_paid_native_replay() {
+    run_actor_send(ActorSendMode::LateOwnerFailed, None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_terminal_abort_withdraws_the_original_paid_native_replay() {
+    run_actor_send(ActorSendMode::LateTerminal, None).await;
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
     Replay,
     CreateReplay,
+    LateOwnerFailed,
+    LateTerminal,
     WithdrawReplay,
     Withdraw,
     Release,
@@ -1795,7 +1809,12 @@ async fn run_actor_send(
     };
     use novarocks_types::FrontendProcessId;
 
-    let withdraw_replay = mode == ActorSendMode::WithdrawReplay;
+    let late_verdict = match mode {
+        ActorSendMode::LateOwnerFailed => Some(OperationOutcome::OwnerFailed),
+        ActorSendMode::LateTerminal => Some(OperationOutcome::ParticipationTerminalReceipt),
+        _ => None,
+    };
+    let withdraw_replay = mode == ActorSendMode::WithdrawReplay || late_verdict.is_some();
     let create_replay = mode == ActorSendMode::CreateReplay;
     let replay = mode == ActorSendMode::Replay || withdraw_replay || create_replay;
     let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
@@ -1810,11 +1829,15 @@ async fn run_actor_send(
         None
     };
     let creation_seed = create_replay.then(original_creation_seed);
+    let frozen = late_verdict.map(|_| crate::task_execution::host::adapter::tests::start());
+    let frozen_participation = frozen
+        .as_ref()
+        .map(|start| *start.plan.establish_material.keys().next().unwrap());
     let backend = creation_seed
         .as_ref()
-        .map_or_else(BackendProcessId::new_v7, |seed| {
-            seed.identity().backend_process_id()
-        });
+        .map(|seed| seed.identity().backend_process_id())
+        .or_else(|| frozen_participation.map(ParticipationRef::backend_process_id))
+        .unwrap_or_else(BackendProcessId::new_v7);
     let peer_endpoint = peer.as_ref().map(|peer| {
         if create_replay {
             peer.descriptor(backend).endpoint().clone()
@@ -1836,17 +1859,19 @@ async fn run_actor_send(
         .unwrap()
         .bind(WorkKind::Cleanup)
         .unwrap();
-    let participation = creation_seed.as_ref().map_or_else(
-        || {
+    let participation = creation_seed
+        .as_ref()
+        .map(|seed| seed.participation())
+        .or(frozen_participation)
+        .unwrap_or_else(|| {
             ParticipationRef::new(
                 QueryExecutionId::new(QueryId::new(0x7a5c, 6), AttemptId::new(1).unwrap()).unwrap(),
                 FrontendProcessId::new_v7(),
                 backend,
             )
-        },
-        |seed| seed.participation(),
-    );
+        });
     let execution = participation.query_execution_id();
+    let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
     let lifecycle = FailureLifecycle::freeze([participation].into_iter());
     let starts = lifecycle.starts();
     if let Some(peer) = &peer {
@@ -1871,6 +1896,9 @@ async fn run_actor_send(
     let creation_task = creation
         .as_ref()
         .map(|(_, original)| original.seed.identity());
+    let abort_request = AbortParticipation::new(operation, participation, AbortCause::QueryFailed);
+    let mut late_core =
+        frozen.map(|start| late_abort_core::LateAbortCore::new(start, activation, abort_request));
     let protocol = if let Some((quote, original)) = &creation {
         ProtocolIntent::CreateTask {
             envelope: OperationEnvelope::with_default_wait(operation, OperationKind::CreateTask),
@@ -1879,17 +1907,36 @@ async fn run_actor_send(
             queued_bytes: quote.queued_bytes,
         }
     } else {
-        ProtocolIntent::AbortParticipation(AbortParticipation::new(
-            operation,
-            participation,
-            AbortCause::QueryFailed,
-        ))
+        ProtocolIntent::AbortParticipation(abort_request)
     };
+    let reference_for = |effect: &AttemptEffect| {
+        let EffectBody::AdmitQueuedInput {
+            generation,
+            operation: exact,
+            ..
+        } = &effect.body
+        else {
+            panic!("the original Core queue request");
+        };
+        let ProtocolIntent::AbortParticipation(exact) = exact else {
+            panic!("the original Core Abort");
+        };
+        assert_eq!(exact.envelope(), abort_request.envelope());
+        assert_eq!(exact.participation(), abort_request.participation());
+        assert_eq!(exact.cause(), abort_request.cause());
+        QueuedInputGrantRef::new(NonZeroU64::new(effect.id.get()).unwrap(), *generation)
+    };
+    let core_admit = late_core.as_mut().map(|core| core.begin(1));
+    let reference = core_admit.as_ref().map(reference_for).unwrap_or_else(|| {
+        QueuedInputGrantRef::new(
+            NonZeroU64::MIN,
+            SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+        )
+    });
     let key = transport::SendKey {
         operation,
-        generation: SendGeneration::new(AttemptActionId::new(NonZeroU64::MIN)),
+        generation: reference.generation(),
     };
-    let reference = QueuedInputGrantRef::new(NonZeroU64::MIN, key.generation);
     let control = protocol.requires_control_progress();
     let (lane, kind, class) = if control {
         (
@@ -1920,6 +1967,25 @@ async fn run_actor_send(
             },
         })
     };
+    let parent_reservation = payer.id();
+    let make_queue = || {
+        roles
+            .scope
+            .reserve_child_next(
+                generation(),
+                parent_reservation,
+                transport::send_queue_resources(
+                    &roles.layout,
+                    backend,
+                    lane,
+                    1,
+                    protocol.queued_bytes(),
+                )
+                .unwrap(),
+                kind,
+            )
+            .unwrap()
+    };
     let make_send = |id: AttemptActionId, reference: QueuedInputGrantRef| {
         if release {
             return (
@@ -1931,22 +1997,7 @@ async fn run_actor_send(
                 None,
             );
         }
-        let queue = roles
-            .scope
-            .reserve_child_next(
-                generation(),
-                payer.id(),
-                transport::send_queue_resources(
-                    &roles.layout,
-                    backend,
-                    lane,
-                    1,
-                    protocol.queued_bytes(),
-                )
-                .unwrap(),
-                kind,
-            )
-            .unwrap();
+        let queue = make_queue();
         let reservation = queue.reservation_id();
         let send = AttemptEffectEnvelope::new(AttemptEffect {
             id,
@@ -1966,15 +2017,23 @@ async fn run_actor_send(
         });
         (send, Some(queue))
     };
-    let admit = make_admit(reference);
-    let send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
-    let (send, queue) = make_send(send_id, reference);
-    let reservation = queue.as_ref().map(|queue| queue.reservation_id());
-    let first_send_work = queue.as_ref().map(|queue| queue.work_id());
+    let admit = core_admit
+        .map(AttemptEffectEnvelope::new)
+        .unwrap_or_else(|| make_admit(reference));
+    let scripted_send_id = AttemptActionId::new(NonZeroU64::new(2).unwrap());
+    let scripted_send = late_core
+        .is_none()
+        .then(|| make_send(scripted_send_id, reference));
+    let scripted_send_custody = scripted_send.as_ref().and_then(|(_, queue)| {
+        queue
+            .as_ref()
+            .map(|queue| (queue.reservation_id(), queue.work_id()))
+    });
+    let scripted_send_envelope = scripted_send.as_ref().map(|(send, _)| send.clone());
     let replay_generation = SendGeneration::new(AttemptActionId::new(NonZeroU64::new(3).unwrap()));
     let replay_reference = QueuedInputGrantRef::new(NonZeroU64::new(3).unwrap(), replay_generation);
     let replay_send_id = AttemptActionId::new(NonZeroU64::new(4).unwrap());
-    let replay_commands = replay.then(|| {
+    let replay_commands = (replay && late_core.is_none()).then(|| {
         let (send, guard) = make_send(replay_send_id, replay_reference);
         let original = guard.as_ref().expect("replay's original queue guard");
         let custody = (original.work_id(), original.reservation_id());
@@ -1983,7 +2042,7 @@ async fn run_actor_send(
             custody,
         )
     });
-    let withdraw_effect = withdraw_replay.then(|| {
+    let withdraw_effect = (withdraw_replay && late_core.is_none()).then(|| {
         (
             AttemptEffectEnvelope::new(AttemptEffect {
                 id: AttemptActionId::new(NonZeroU64::new(5).unwrap()),
@@ -2205,8 +2264,9 @@ async fn run_actor_send(
     }
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
-        [(admit, None), (send.clone(), queue)]
+        [(admit, None)]
             .into_iter()
+            .chain(scripted_send)
             .chain(
                 replay_commands
                     .into_iter()
@@ -2308,7 +2368,6 @@ async fn run_actor_send(
         ))),
     );
     let receipt = Arc::new(Mutex::new(None));
-    let activation = AttemptActivationIdentity::from_parts(1, execution, 1);
     let publications = Arc::new(FailurePublications::new(
         inbox.registration().clone(),
         activation,
@@ -2493,7 +2552,7 @@ async fn run_actor_send(
                     assert_eq!(operation, key.operation);
                     assert_eq!(grant, expected);
                     actor_runtime.retire_input(actor, input).unwrap();
-                    return grant;
+                    return (grant, fact);
                 }
                 tokio::task::yield_now().await;
             }
@@ -2507,7 +2566,8 @@ async fn run_actor_send(
                               send_generation,
                               expect_unknown,
                               expect_withdrawn| {
-        let mut started = false;
+        let mut started = None;
+        let mut original_report = None;
         let observed = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 drive(&mut wc.driver);
@@ -2520,11 +2580,10 @@ async fn run_actor_send(
                         }
                         ExecutorFact::SendStarted { effect, .. } if !expect_withdrawn => {
                             assert_eq!(effect, effect_id);
-                            assert!(!started);
-                            started = true;
+                            assert!(started.replace(fact).is_none());
                         }
-                        ExecutorFact::Operation(observed) if !expect_withdrawn => {
-                            assert!(started);
+                        ExecutorFact::Operation(ref observed) if !expect_withdrawn => {
+                            assert!(started.is_some());
                             assert_eq!(observed.generation, send_generation);
                             assert_eq!(observed.reply.operation_id(), key.operation);
                             if expect_unknown {
@@ -2533,6 +2592,7 @@ async fn run_actor_send(
                             } else {
                                 assert_eq!(observed.reply.worker_outcome(), Some(OperationOutcome::Accepted));
                             }
+                            original_report = Some(fact);
                             break;
                         }
                         other => panic!("unexpected composed send fact: {other:?}"),
@@ -2543,7 +2603,8 @@ async fn run_actor_send(
         }).await;
         assert!(
             observed.is_ok(),
-            "original send stalled: effect={effect_id:?}, started={started}, wire requests={}, actor={:?}, effects={:?}",
+            "original send stalled: effect={effect_id:?}, started={}, wire requests={}, actor={:?}, effects={:?}",
+            started.is_some(),
             peer.as_ref()
                 .map_or(0, |peer| peer.applied_requests().len()),
             actor_runtime.snapshot(actor),
@@ -2560,21 +2621,39 @@ async fn run_actor_send(
             .await
             .unwrap();
         }
+        started.zip(original_report)
     };
-    let first_grant = admit_original(&mut wc, admit_command, reference).await;
+    let (first_grant, first_grant_fact) = admit_original(&mut wc, admit_command, reference).await;
+    let (send_id, send_custody) = if let Some(core) = &mut late_core {
+        let guard = make_queue();
+        let custody = (guard.reservation_id(), guard.work_id());
+        let effect = core.send(first_grant_fact, &guard);
+        let id = effect.id;
+        inbox.push_transport_command(AttemptEffectEnvelope::new(effect), Some(guard));
+        (id, Some(custody))
+    } else {
+        (scripted_send_id, scripted_send_custody)
+    };
+    let reservation = send_custody.map(|(reservation, _)| reservation);
+    let first_send_work = send_custody.map(|(_, work)| work);
     if withdraw {
         assert_eq!(
-            send.handoff().unwrap().withdraw(),
+            scripted_send_envelope
+                .unwrap()
+                .handoff()
+                .unwrap()
+                .withdraw(),
             novarocks_control_runtime::exit_work::Withdrawal::Withdrawn
         );
     }
     let send_input = submit(send_command);
-    if release {
+    let first_reports = if release {
         advance_host();
         // Handoff completes the effect. The original cleanup Join has its
         // own retirement path, and the Core receives no synthetic send fact.
         actor_runtime.retire_input(actor, send_input).unwrap();
         assert!(inbox.try_commit_next().is_none());
+        None
     } else {
         assert_eq!(
             actor_runtime
@@ -2591,8 +2670,8 @@ async fn run_actor_send(
             replay,
             withdraw,
         )
-        .await;
-    }
+        .await
+    };
     // Create reports its exact Task send through the Native receipt path.
     assert_eq!(starts.was_started(participation), sends && !create_replay);
     drop(starts);
@@ -2634,7 +2713,11 @@ async fn run_actor_send(
         );
         // The script holds the second unbound guard until its command. Only
         // that future send's capacity may remain when the first queue retires.
-        assert_transport_usage([1, u64::try_from(protocol.queued_bytes()).unwrap()]);
+        assert_transport_usage(if late_core.is_some() {
+            [0, 0]
+        } else {
+            [1, u64::try_from(protocol.queued_bytes()).unwrap()]
+        });
         let observed = history.drain(4096);
         assert!(
             observed.complete && observed.remaining == 0,
@@ -2659,7 +2742,19 @@ async fn run_actor_send(
 
         drop(original_receipt);
         let [admit_command, send_command] = replay_commands.expect("original replay commands");
-        let actual = admit_original(&mut wc, admit_command, replay_reference).await;
+        let replay_reference = if let Some(core) = &mut late_core {
+            let (started, unknown) = first_reports.expect("original first Native result");
+            core.observe_first(started, unknown, key.generation);
+            let effect = core.begin(2);
+            let reference = reference_for(&effect);
+            inbox.push_transport_command(AttemptEffectEnvelope::new(effect), None);
+            reference
+        } else {
+            replay_reference
+        };
+        let replay_generation = replay_reference.generation();
+        let (actual, replay_grant_fact) =
+            admit_original(&mut wc, admit_command, replay_reference).await;
         assert_ne!(actual.record(), first_grant.record());
         assert_ne!(actual.generation(), first_grant.generation());
         if let Some(bytes) = expected_payload {
@@ -2691,8 +2786,18 @@ async fn run_actor_send(
                 &replay_original.1
             ));
         }
+        let (replay_send_id, (replay_work, replay_reservation)) = if let Some(core) = &mut late_core
+        {
+            let guard = make_queue();
+            let custody = (guard.work_id(), guard.reservation_id());
+            let effect = core.send(replay_grant_fact, &guard);
+            let id = effect.id;
+            inbox.push_transport_command(AttemptEffectEnvelope::new(effect), Some(guard));
+            (id, custody)
+        } else {
+            (replay_send_id, replay_custody.unwrap())
+        };
         let send = submit(send_command);
-        let (replay_work, replay_reservation) = replay_custody.unwrap();
         if let Some(withdraw_command) = withdraw_command {
             use novarocks_control_runtime::actor_turn::ActorTurnError;
 
@@ -2710,14 +2815,20 @@ async fn run_actor_send(
             .await
             .unwrap();
 
-            // The test script supplies the committed withdrawal. On this
-            // current-thread runtime the accepted Tokio job cannot poll
-            // between the successful handoff above and this Host turn.
+            // On this current-thread runtime the accepted Tokio job cannot
+            // poll between the successful handoff above and this Host turn.
+            if let Some(core) = &mut late_core {
+                assert_transport_usage([1, u64::try_from(protocol.queued_bytes()).unwrap()]);
+                assert_eq!(peer.as_ref().unwrap().applied_requests().len(), 1);
+                let effect =
+                    core.resolve_older(key.generation, replay_send_id, late_verdict.unwrap());
+                inbox.push_transport_command(AttemptEffectEnvelope::new(effect), None);
+            }
             let command = submit(withdraw_command);
             advance_host();
             actor_runtime.retire_input(actor, command).unwrap();
         }
-        observe_send(
+        let _ = observe_send(
             &mut wc,
             replay_send_id,
             send,

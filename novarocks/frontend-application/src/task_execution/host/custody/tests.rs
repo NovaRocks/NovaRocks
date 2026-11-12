@@ -306,7 +306,7 @@ type TransportCommand = (
 );
 struct WithdrawalTarget {
     observed: ObservedWithdrawals,
-    commands: VecDeque<TransportCommand>,
+    commands: Arc<Mutex<VecDeque<TransportCommand>>>,
     handle_attempt_hints: bool,
 }
 impl TestActor for WithdrawalTarget {
@@ -343,6 +343,8 @@ impl TestActor for WithdrawalTarget {
             assert_ne!(value, u64::MAX, "transport fixture Core failure");
             let (effect, guard) = self
                 .commands
+                .lock()
+                .unwrap()
                 .pop_front()
                 .expect("one original transport command");
             let work = match guard {
@@ -396,6 +398,7 @@ pub(crate) struct WithdrawalInbox {
     registration: ActorRegistration,
     source: ActorId,
     observed: ObservedWithdrawals,
+    commands: Arc<Mutex<VecDeque<TransportCommand>>>,
 }
 impl WithdrawalInbox {
     pub(crate) fn new(scope: &ScopeHandle) -> Self {
@@ -484,9 +487,10 @@ impl WithdrawalInbox {
             ),
         };
         let observed: ObservedWithdrawals = Arc::default();
+        let commands = Arc::new(Mutex::new(commands.into_iter().collect()));
         let target = FrontendActor::Test(Box::new(WithdrawalTarget {
             observed: observed.clone(),
-            commands: commands.into_iter().collect(),
+            commands: commands.clone(),
             handle_attempt_hints,
         }));
         let registration = match failure {
@@ -508,8 +512,17 @@ impl WithdrawalInbox {
             registration,
             source,
             observed,
+            commands,
         }
     }
+    pub(crate) fn push_transport_command(
+        &self,
+        effect: Arc<crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope>,
+        guard: Option<novarocks_control_runtime::obligation::StepRegistration>,
+    ) {
+        self.commands.lock().unwrap().push_back((effect, guard));
+    }
+
     pub(crate) fn reserve(&self, work: &ReportedWork) -> CausalInputObligation<FrontendActor> {
         self.reserve_result(work.work())
     }

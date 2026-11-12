@@ -48,7 +48,7 @@ use novarocks_execution_contract::{AdmissionEpochCapability, OperationKind};
 use novarocks_types::NativeCompatibilityId;
 use std::num::NonZeroUsize;
 
-pub(in crate::task_execution) fn start() -> AttemptStart {
+pub(crate) fn start() -> AttemptStart {
     let legacy = crate::task_execution::tests::manifest_unstarted_regression_fixture();
     let graph = legacy.execution().graph();
     let root = graph.root_identity();
