@@ -1919,4 +1919,4 @@ fn project_cut(cut: InputSourceCut) -> AttemptSourceCut {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(in crate::task_execution) mod tests;

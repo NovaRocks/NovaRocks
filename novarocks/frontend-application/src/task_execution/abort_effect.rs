@@ -881,11 +881,47 @@ mod tests {
         exercise_registered_abort_route(RegisteredAbortCase::InvalidReceipts).await;
     }
 
+    #[tokio::test]
+    async fn original_abort_owner_failure_closes_only_the_exact_registered_issue() {
+        exercise_registered_abort_route(RegisteredAbortCase::WorkerOwnerFailed).await;
+    }
+
+    #[tokio::test]
+    async fn late_abort_failure_closes_the_original_issue_before_control_rearms() {
+        exercise_registered_abort_route(RegisteredAbortCase::LateOwnerFailed).await;
+    }
+
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum RegisteredAbortCase {
         Replay,
         OwnerFailed,
         InvalidReceipts,
+        WorkerOwnerFailed,
+        LateOwnerFailed,
+    }
+
+    async fn wait_registered_abort_closure(
+        logical: &mut LogicalExecutionTestHarness,
+        exact: ParticipationRef,
+        closure: ParticipationClosureState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+                if snapshot.closure() == closure {
+                    if closure == ParticipationClosureState::AbortIssueExhausted {
+                        assert_eq!(
+                            snapshot.issue_state(),
+                            Some(novarocks_query_application::coordination::AbortParticipationIssueState::FailedClosed)
+                        );
+                    }
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn exercise_registered_abort_route(case: RegisteredAbortCase) {
@@ -897,7 +933,11 @@ mod tests {
                     AbortReceiptSlot, AbortSettlementOwner, AbortSettlementRefusal,
                     AttemptAbortIngress,
                 },
-                host::{custody::tests::WithdrawalInbox, transport::SendKey},
+                host::{
+                    adapter::tests::{original_abort_owner_failure, start},
+                    custody::tests::WithdrawalInbox,
+                    transport::SendKey,
+                },
             },
         };
         use novarocks_attempt_protocol::input::{AttemptInput, SendGeneration};
@@ -917,14 +957,19 @@ mod tests {
         };
         use std::num::NonZeroU64;
 
-        let exact = participation(BackendProcessId::new_v7());
+        let frozen = (case == RegisteredAbortCase::WorkerOwnerFailed).then(start);
+        let exact = frozen.as_ref().map_or_else(
+            || participation(BackendProcessId::new_v7()),
+            |frozen| *frozen.plan.establish_material.keys().next().unwrap(),
+        );
+        let execution = exact.query_execution_id();
         let router = LogicalAbortRouter::new();
-        let route = router.reserve_route(execution()).unwrap();
-        assert!(router.reserve_route(execution()).is_err());
+        let route = router.reserve_route(execution).unwrap();
+        assert!(router.reserve_route(execution).is_err());
         let (work_owner, execution_stage) = governed_execution();
         let limit = NonZeroUsize::new(2).unwrap();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution(),
+            execution,
             ExecutionEffect::None,
             limit,
             vec![exact],
@@ -938,7 +983,7 @@ mod tests {
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
-            execution(),
+            execution,
             vec![exact],
         )
         .unwrap();
@@ -1193,6 +1238,42 @@ mod tests {
             return;
         }
 
+        if let Some(frozen) = frozen {
+            let (input, AttemptInput::Port(original)) = inbox.try_commit_owner_control().unwrap()
+            else {
+                panic!("original Abort Control input");
+            };
+            let failure = original_abort_owner_failure(frozen, &inbox, &scope, input, original);
+            let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+            assert_eq!(snapshot.identity(), Some(identity));
+            assert_eq!(
+                snapshot.issue_state(),
+                Some(AbortParticipationIssueState::TransportOwned)
+            );
+            let applied = settlement_owner.apply(&failure, None).unwrap();
+            applied.result.unwrap();
+            assert!(applied.retirement.unwrap().retire_ready().unwrap());
+            assert!(runtime.input_custody(actor, input).unwrap().is_none());
+            wait_registered_abort_closure(
+                &mut logical,
+                exact,
+                ParticipationClosureState::AbortIssueExhausted,
+            )
+            .await;
+            assert!(inbox.try_commit_owner_control().is_none());
+            assert!(!matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ));
+            drop(settlement_owner);
+            logical
+                .observe_worker_process_replaced(exact)
+                .await
+                .unwrap();
+            finish(&mut logical, inbox).await;
+            return;
+        }
+
         let mut capacity = port.subscribe_capacity();
         let unknown = settlement_owner
             .apply(
@@ -1213,7 +1294,8 @@ mod tests {
             AbortParticipationEffectAdmission::Backpressured
         ));
         assert!(!capacity.has_changed().unwrap());
-        let (_, AttemptInput::Port(original_input)) = inbox.try_commit_owner_control().unwrap()
+        let (original_id, AttemptInput::Port(original_input)) =
+            inbox.try_commit_owner_control().unwrap()
         else {
             panic!("original Abort Control input");
         };
@@ -1224,6 +1306,55 @@ mod tests {
         assert_eq!(action, first);
         assert_eq!(request.envelope().operation_id(), operation);
         assert_eq!(request.participation(), exact);
+        assert_eq!(request.cause(), AbortCause::QueryFailed);
+        if case == RegisteredAbortCase::LateOwnerFailed {
+            let late = settle(
+                first,
+                physical(10),
+                None,
+                AbortIssueSettlement::FailedClosed,
+            );
+            let foreign = settle(
+                first,
+                physical(11),
+                None,
+                AbortIssueSettlement::FailedClosed,
+            );
+            assert!(matches!(
+                settlement_owner.apply(&foreign, None),
+                Err(AbortSettlementRefusal::MissingOriginalSubmission)
+            ));
+            let applied = settlement_owner.apply(&late, None).unwrap();
+            applied.result.unwrap();
+            assert!(applied.retirement.is_none());
+            let custody = runtime.input_custody(actor, original_id).unwrap().unwrap();
+            assert_eq!(custody.standing_input_id, Some(standing_id));
+            assert_eq!(custody.phase, InputPhase::Committed);
+            assert!(matches!(
+                router.try_reserve(identity),
+                AbortParticipationEffectAdmission::Backpressured
+            ));
+            wait_registered_abort_closure(
+                &mut logical,
+                exact,
+                ParticipationClosureState::AbortIssueExhausted,
+            )
+            .await;
+            assert!(retirement.retire_ready().unwrap());
+            assert!(runtime.input_custody(actor, original_id).unwrap().is_none());
+            assert!(inbox.try_commit_owner_control().is_none());
+            assert!(!matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ));
+            drop(settlement_owner);
+            logical
+                .observe_worker_process_replaced(exact)
+                .await
+                .unwrap();
+            finish(&mut logical, inbox).await;
+            return;
+        }
         assert!(retirement.retire_ready().unwrap());
         capacity.changed().await.unwrap();
         drop(retirement);
@@ -1352,6 +1483,20 @@ mod tests {
                 .unwrap();
             redundant.result.unwrap();
             assert!(redundant.retirement.is_none());
+            wait_registered_abort_closure(
+                &mut logical,
+                exact,
+                ParticipationClosureState::TerminalRetained,
+            )
+            .await;
+            assert_eq!(
+                logical.actor_snapshot().await.unwrap().conclusion,
+                Some(LogicalConclusion::Cancelled)
+            );
+            assert!(!matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ));
         }
         drop(settlement_owner);
         logical

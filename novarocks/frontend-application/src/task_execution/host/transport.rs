@@ -85,6 +85,8 @@ pub(crate) use queued_job::BoundQueue;
 #[cfg(test)]
 pub(crate) use quote::original_run_for_factory;
 pub(crate) use quote::{SourceLayouts, original_run, queued_input as queued_input_quote};
+#[cfg(test)]
+pub(crate) use receipt_input::NativeReceiptError;
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(in crate::task_execution::host) use releases::TransportReleases;
 pub(crate) use send::BoundSend;

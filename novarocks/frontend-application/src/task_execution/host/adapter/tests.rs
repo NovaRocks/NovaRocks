@@ -45,7 +45,7 @@ use novarocks_execution_contract::{AdmissionEpochCapability, OperationKind};
 use novarocks_types::NativeCompatibilityId;
 use std::num::NonZeroUsize;
 
-pub(in crate::task_execution::host) fn start() -> AttemptStart {
+pub(in crate::task_execution) fn start() -> AttemptStart {
     let legacy = crate::task_execution::tests::manifest_unstarted_regression_fixture();
     let graph = legacy.execution().graph();
     let root = graph.root_identity();
@@ -147,6 +147,259 @@ pub(in crate::task_execution::host) fn start() -> AttemptStart {
         observe_dev_root: false,
         observe_lifecycle_diagnostics: false,
     }
+}
+
+pub(in crate::task_execution) fn original_abort_owner_failure(
+    mut start: AttemptStart,
+    inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
+    scope: &novarocks_control_runtime::transaction::ScopeHandle,
+    input: InputId,
+    original: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
+) -> novarocks_coordination_contract::AttemptToLogical<AttemptFailure> {
+    use crate::task_execution::{
+        host::transport::{NativeReceiptError, SendKey},
+        intent::AckPayload,
+    };
+    use novarocks_attempt_protocol::{
+        capacity::{QueueStage, ReservationToken, StepContext},
+        config::DispatchLane,
+        effect::{AttemptEffect, EffectClass},
+        error::TaskExecutionError,
+        failure::AttemptFailure,
+        input::{AttemptSourceCut, QueuedInputGrantRef},
+    };
+    use novarocks_coordination_contract::{
+        AbortIssueSettlement, AttemptToLogicalBody, LogicalToAttemptBody,
+    };
+    use novarocks_execution_contract::{OperationOutcome, TaskOperationId, status::SafeDetail};
+    use std::task::Poll;
+
+    struct ExactAbortQueueStage;
+    impl StepContext for ExactAbortQueueStage {
+        fn charge(&mut self, _: usize) -> bool {
+            true
+        }
+
+        fn reserve_queue_stage(
+            &mut self,
+            lane: DispatchLane,
+            control: bool,
+            _: BackendProcessId,
+            records: usize,
+            _: usize,
+        ) -> QueueStage {
+            assert_eq!(lane, DispatchLane::Lifecycle);
+            assert!(control);
+            assert_eq!(records, 1);
+            QueueStage::Granted(ReservationToken(positive(39)))
+        }
+    }
+
+    let LogicalToAttemptBody::Abort { action, request } = &original.body else {
+        panic!("original QA Abort Control input");
+    };
+    let action = *action;
+    let operation = request.envelope().operation_id();
+    let exact = request.participation();
+    let activation = original.activation;
+    start.activation.identity = activation;
+    start.plan.authorization_limits.activation = activation;
+    // The isolated runtime's external source owns the original Native report.
+    std::mem::swap(&mut start.sources.native, &mut start.sources.publication);
+    let sources = start.sources;
+    assert_eq!(sources.actor.0.get(), inbox.registration().actor().get());
+    assert_eq!(sources.native.0.get(), inbox.source().get());
+    let now = start.initial_now;
+    let mut core = <Core as AttemptCore>::new(start).unwrap();
+    let mut ordinal = 100;
+    let mut step = |source, input, observation_cut: bool, original_input: Option<InputId>| {
+        ordinal += 1;
+        let input_id = AttemptInputId(positive(original_input.map_or(ordinal, InputId::get)));
+        core.handle(
+            now,
+            AttemptInputClaim {
+                source,
+                input: input_id,
+                native_cut: Some(AttemptSourceCut {
+                    source: sources.native,
+                    tail: (source == sources.native).then_some(input_id),
+                }),
+                selected_cut: observation_cut.then_some(AttemptSourceCut {
+                    source: sources.observation,
+                    tail: None,
+                }),
+            },
+            input,
+            &mut ExactAbortQueueStage,
+        )
+        .unwrap()
+    };
+    step(sources.actor, AttemptInput::Bootstrap, false, None);
+    assert!(
+        step(
+            sources.actor,
+            AttemptInput::Port(original),
+            false,
+            Some(input)
+        )
+        .effect
+        .is_none()
+    );
+    step(sources.actor, AttemptInput::Timer, false, None);
+    step(sources.actor, AttemptInput::Timer, true, None);
+    step(sources.actor, AttemptInput::Timer, false, None);
+    let publication = step(sources.actor, AttemptInput::Timer, false, None)
+        .effect
+        .unwrap();
+    assert!(matches!(
+        publication.body,
+        EffectBody::Publish(Publication::ProtocolBatch(_))
+    ));
+    let admitted = step(
+        sources.publication,
+        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+            effect: publication.id,
+            result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+        }),
+        false,
+        None,
+    );
+    let Some(AttemptEffect {
+        id: admission,
+        class: EffectClass::Settlement,
+        body:
+            EffectBody::AdmitQueuedInput {
+                operation: intent,
+                generation,
+                lane: DispatchLane::Lifecycle,
+                ..
+            },
+    }) = admitted.effect
+    else {
+        panic!("exact Abort queue admission");
+    };
+    assert_eq!(intent.operation_id(), operation);
+    assert_eq!(admission, generation.admission_effect());
+    assert_eq!(
+        step(sources.actor, AttemptInput::Timer, false, None).round_result,
+        Some(Ok(()))
+    );
+
+    let grant = QueuedInputGrantRef::new(positive(70), generation);
+    step(
+        sources.transport,
+        AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+            operation,
+            grant,
+            queued_bytes: intent.queued_bytes(),
+        }),
+        false,
+        None,
+    );
+    step(sources.actor, AttemptInput::Timer, true, None);
+    step(sources.actor, AttemptInput::Timer, false, None);
+    assert!(matches!(
+        step(sources.actor, AttemptInput::Timer, false, None).effect,
+        Some(AttemptEffect {
+            class: EffectClass::Settlement,
+            body: EffectBody::SendBatch { batch, .. },
+            ..
+        }) if batch.queued_inputs.as_ref() == [grant]
+    ));
+    step(sources.actor, AttemptInput::Timer, false, None);
+
+    let key = SendKey {
+        operation,
+        generation,
+    };
+    let actor = inbox.registration().actor();
+    let runtime = inbox.runtime();
+    let control = runtime.input_custody(actor, input).unwrap().unwrap();
+    let (mut work, mut payer) = scope
+        .reserve_next(
+            Generation::new(1).unwrap(),
+            ReservationResources::work_only(),
+            WorkKind::Settlement,
+            WorkAdmission::External,
+        )
+        .unwrap()
+        .bind(WorkKind::Settlement)
+        .unwrap();
+    work.start().unwrap();
+    let mut receipt = inbox.reserve_native_receipt(&work, key, OperationKind::AbortParticipation);
+    let owner_failed = |operation, kind| {
+        OperationAcknowledgement::worker_receipt(
+            operation,
+            kind,
+            OperationOutcome::OwnerFailed,
+            AckPayload::None,
+        )
+        .with_detail(Some(SafeDetail::truncating(
+            "the original Abort owner failed",
+        )))
+    };
+    for refused in [
+        owner_failed(TaskOperationId::new_v7(), OperationKind::AbortParticipation),
+        owner_failed(operation, OperationKind::CancelTask),
+    ] {
+        let (reason, returned) = receipt
+            .record(key, refused.clone(), None, None)
+            .unwrap_err();
+        assert!(matches!(reason, NativeReceiptError::WrongSend));
+        assert_eq!(returned, refused);
+        assert!(matches!(
+            receipt.submit(),
+            Err(ActorTurnError::InputNotReserved)
+        ));
+        assert_eq!(runtime.input_custody(actor, input).unwrap(), Some(control));
+    }
+    let canonical = owner_failed(operation, OperationKind::AbortParticipation);
+    receipt.record(key, canonical.clone(), None, None).unwrap();
+    let report_input = receipt.submit().unwrap();
+    let fact = inbox.commit(report_input);
+    let failed = step(
+        sources.native,
+        AttemptInput::Executor(fact),
+        false,
+        Some(report_input),
+    );
+    assert!(failed.stop_producing);
+    let Some(AttemptEffect {
+        body: EffectBody::Port(port),
+        ..
+    }) = failed.abort_settlement
+    else {
+        panic!("the original Worker verdict must close the QA Abort issue");
+    };
+    assert_eq!(port.activation, activation);
+    assert!(matches!(port.body, AttemptToLogicalBody::AbortSettlement {
+        abort_action, generation: actual_generation, receipt_generation: None,
+        participation, operation_id, settlement: AbortIssueSettlement::FailedClosed,
+    } if abort_action == action && actual_generation == admission
+        && participation == exact && operation_id == operation));
+    let round = step(sources.actor, AttemptInput::Timer, false, None);
+    assert_eq!(
+        round.round_result,
+        Some(Err(AttemptFailure::TaskProtocol(Box::new(
+            TaskExecutionError::OperationFailed {
+                task: None,
+                participation: exact,
+                operation_id: operation,
+                kind: OperationKind::AbortParticipation,
+                rejection: canonical.worker_header().unwrap(),
+            },
+        ))))
+    );
+    runtime.retire_input(actor, report_input).unwrap();
+    work.body_exited().unwrap();
+    work.captures_exited().unwrap();
+    let Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap() else {
+        panic!("the original Native report and producer have exited");
+    };
+    assert_eq!(retained.original, canonical);
+    assert!(retained.unpublished.is_none());
+    payer.finish().unwrap();
+    port
 }
 
 #[test]
