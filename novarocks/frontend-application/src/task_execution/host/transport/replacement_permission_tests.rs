@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod create;
+
 use super::{AttemptEstablishMaterial, AttemptProcessObserver};
 use crate::{
     control_runtime::membership::FrozenMember,
@@ -171,7 +173,10 @@ impl StepContext for Turn {
         records: usize,
         _: usize,
     ) -> QueueStage {
-        assert_eq!(lane, DispatchLane::Lifecycle);
+        assert!(matches!(
+            lane,
+            DispatchLane::Lifecycle | DispatchLane::Create
+        ));
         assert!(!control);
         assert_eq!(records, 1);
         QueueStage::Granted(ReservationToken(id(55)))
@@ -337,12 +342,13 @@ impl Cut {
         let EffectBody::AdmitQueuedInput {
             operation,
             generation,
-            lane: DispatchLane::Lifecycle,
+            lane,
             ..
         } = admitted.body
         else {
-            panic!("one exact Lifecycle queue admission: {admitted:?}");
+            panic!("one exact queue admission: {admitted:?}");
         };
+        assert_eq!(lane, operation.lane());
         assert_eq!(admitted.id, generation.admission_effect());
         let grant =
             QueuedInputGrantRef::new(id(2000 + generation.admission_effect().get()), generation);
