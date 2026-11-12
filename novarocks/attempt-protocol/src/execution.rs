@@ -4046,6 +4046,104 @@ mod bounded_drain_tests {
         );
     }
     #[test]
+    fn original_create_unknown_keeps_the_same_tasks_admitted_split_out_of_dispatch() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        use crate::input::{LocalDispatchResult, OperationReplyResult};
+        use novarocks_execution_contract::{SplitOffer, SplitSequence};
+
+        let node = PlanNodeId::new(7).unwrap();
+        let mut execution = many_tasks_with_split_node(1, Some(node));
+        let target = identity(&execution, 1);
+        let participation = execution.task(target.task_id()).unwrap().participation();
+        begin_test_establish(&mut execution, participation);
+        let first = grant(1);
+        let create = enqueue_create(&mut execution, target, first);
+        let batch = execution.dispatcher.take_batch().unwrap();
+        execution.dispatcher.accept(&batch).unwrap();
+        let unknown = OperationAcknowledgement {
+            operation_id: create,
+            kind: OperationKind::CreateTask,
+            result: OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            },
+        };
+        assert!(
+            execution
+                .acknowledge_current_send(first.generation(), &unknown)
+                .unwrap()
+        );
+
+        let payload = PayloadRef(NonZeroU64::new(101).unwrap());
+        let sequence = SplitSequence::new(1).unwrap();
+        let (preparation, update) = execution
+            .prepare_task_update(
+                target,
+                TaskDomainUpdate::SplitAssignment {
+                    node,
+                    offer: SplitOffer::batch(sequence, sequence, false).unwrap(),
+                    payload,
+                    queued_bytes: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(preparation, UpdateAdmission::Preparing);
+        let update = update.unwrap();
+        let update_id = update.operation_id();
+        let update_grant = grant(2);
+        execution
+            .begin_initial_update_admission(
+                update,
+                update_grant.generation().admission_effect(),
+                QueuedInputPayload::NewTaskUpdate(payload),
+            )
+            .unwrap();
+        assert!(matches!(
+            execution
+                .observe_lifecycle_grant(update_id, update_grant)
+                .unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        assert_eq!(
+            execution.task(target.task_id()).unwrap().pending_updates(),
+            1
+        );
+
+        let replay = grant(3);
+        assert!(matches!(
+            execution.begin_create_admission(target, replay.generation().admission_effect())
+                .unwrap().unwrap().body,
+            EffectBody::AdmitQueuedInput {
+                operation,
+                generation,
+                payload: QueuedInputPayload::AlreadyRetained,
+                ..
+            } if operation.operation_id() == create && generation == replay.generation()
+        ));
+        assert!(matches!(
+            execution.observe_create_grant(create, replay).unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        assert!(matches!(
+            execution
+                .advance_update_send(target, grant(4).generation().admission_effect())
+                .unwrap(),
+            (false, None)
+        ));
+        let batch = execution.dispatcher.take_batch().unwrap();
+        assert_eq!(batch.queued_inputs.as_ref(), [replay]);
+        assert_eq!(batch.operations.len(), 1);
+        assert_eq!(batch.operations[0].operation_id(), create);
+        assert_eq!(
+            execution.task(target.task_id()).unwrap().pending_updates(),
+            1
+        );
+        assert!(execution.dispatcher.take_batch().is_none());
+    }
+
+    #[test]
     fn busy_create_arms_a_single_charged_wake_for_the_original_replay() {
         use crate::effect::{EffectBody, QueuedInputPayload};
         use novarocks_execution_contract::OperationOutcome;
@@ -4849,6 +4947,216 @@ mod bounded_drain_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn covered_installed_and_unknown_create_return_one_original_deployment_position() {
+        use crate::effect::{EffectBody, QueuedInputPayload};
+        use crate::input::{AckPayload, LocalDispatchResult, OperationReplyResult};
+        use novarocks_execution_contract::{
+            CreateTaskReceipt, OperationOutcome, operation::OperationResult,
+        };
+
+        for unknown_first in [false, true] {
+            let window = DispatchBudget::DEFAULT.create_permits();
+            let mut execution = many_tasks(u32::try_from(window + 2).unwrap());
+            let target = identity(&execution, 2);
+            let backend = target.backend_process_id();
+            let participation = execution.task(target.task_id()).unwrap().participation();
+            begin_test_establish(&mut execution, participation);
+            execution.activate_covered_observation();
+
+            let mut target_send = None;
+            for ordinal in 1..=window {
+                let task = identity(&execution, u32::try_from(ordinal).unwrap());
+                let input = grant(u64::try_from(ordinal).unwrap());
+                let EffectBody::AdmitQueuedInput {
+                    operation,
+                    payload: QueuedInputPayload::NewCreation(payload),
+                    ..
+                } = execution
+                    .begin_create_admission(task, input.generation().admission_effect())
+                    .unwrap()
+                    .unwrap()
+                    .body
+                else {
+                    panic!("each first send retains its original creation");
+                };
+                assert!(matches!(
+                    execution
+                        .observe_create_grant(operation.operation_id(), input)
+                        .unwrap(),
+                    CreateGrantProgress::Queued
+                ));
+                if task == target {
+                    target_send = Some((operation.operation_id(), input, payload));
+                }
+            }
+            let (original, input, payload) = target_send.unwrap();
+            while let Some(batch) = execution.dispatcher.take_batch() {
+                execution.dispatcher.accept(&batch).unwrap();
+                for (operation, grant) in batch.operations.iter().zip(batch.queued_inputs.iter()) {
+                    if operation.operation_id() == original {
+                        continue;
+                    }
+                    let OperationIntent::CreateTask { identity, .. } = operation else {
+                        panic!("fixture dispatches only original Creates");
+                    };
+                    let accepted = OperationAcknowledgement {
+                        operation_id: operation.operation_id(),
+                        kind: OperationKind::CreateTask,
+                        result: OperationReplyResult::Worker(OperationResult::Verdict {
+                            outcome: OperationOutcome::Accepted,
+                            detail: None,
+                            acknowledgement: Some(AckPayload::Create(Box::new(
+                                CreateTaskReceipt::new(
+                                    *identity,
+                                    Vec::new(),
+                                    TaskStatus::created(*identity),
+                                ),
+                            ))),
+                        }),
+                    };
+                    assert!(
+                        execution
+                            .acknowledge_current_send(grant.generation(), &accepted)
+                            .unwrap()
+                    );
+                }
+            }
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .lane_in_flight(backend, DispatchLane::Create),
+                1
+            );
+            let next = identity(&execution, u32::try_from(window + 1).unwrap());
+            let later = identity(&execution, u32::try_from(window + 2).unwrap());
+            let next_input = grant(101);
+            let later_input = grant(102);
+            assert!(
+                execution
+                    .begin_create_admission(next, next_input.generation().admission_effect())
+                    .unwrap()
+                    .is_none()
+            );
+            let unknown = OperationAcknowledgement {
+                operation_id: original,
+                kind: OperationKind::CreateTask,
+                result: OperationReplyResult::Local {
+                    result: LocalDispatchResult::TransportUnknown,
+                    failure: None,
+                    protocol_failure: None,
+                    detail: None,
+                },
+            };
+            if unknown_first {
+                assert!(
+                    execution
+                        .acknowledge_current_send(input.generation(), &unknown)
+                        .unwrap()
+                );
+                let task = execution.task(target.task_id()).unwrap();
+                assert!(!task.create_ownership_proven() && task.needs_deployment_window());
+                assert!(
+                    execution
+                        .begin_create_admission(next, next_input.generation().admission_effect())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+
+            let status = TaskStatus::try_new_with_installed(
+                target,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Planned,
+                None,
+                TaskOutputFacts::default(),
+                true,
+            )
+            .unwrap();
+            let mut report = StatusReport::default();
+            execution
+                .apply_covered_frame(
+                    participation,
+                    1,
+                    CoveredStatusStreamEvent {
+                        source_revision: None,
+                        fact: CoveredStatusStreamFact::Status(status),
+                    },
+                    &mut report,
+                )
+                .unwrap();
+            assert_eq!(report.accepted, 1);
+            if !unknown_first {
+                assert_eq!(
+                    execution
+                        .dispatcher
+                        .lane_in_flight(backend, DispatchLane::Create),
+                    1
+                );
+                assert!(
+                    execution
+                        .acknowledge_current_send(input.generation(), &unknown)
+                        .unwrap()
+                );
+            }
+            assert_eq!(
+                execution
+                    .dispatcher
+                    .lane_in_flight(backend, DispatchLane::Create),
+                0
+            );
+            let task = execution.task(target.task_id()).unwrap();
+            assert!(
+                task.create_ownership_proven()
+                    && task.installed()
+                    && !task.needs_deployment_window()
+            );
+            let mut released = Vec::new();
+            while let Some(effect) = execution.advance_task_input_cleanup() {
+                if let EffectBody::ReleaseCreationPayload { task, payload } = effect {
+                    released.push((task, payload));
+                }
+            }
+            assert_eq!(
+                released
+                    .iter()
+                    .filter(|&&entry| entry == (target, payload))
+                    .count(),
+                1
+            );
+            assert!(
+                execution
+                    .begin_create_admission(target, grant(100).generation().admission_effect())
+                    .unwrap()
+                    .is_none()
+            );
+
+            let EffectBody::AdmitQueuedInput { operation, .. } = execution
+                .begin_create_admission(next, next_input.generation().admission_effect())
+                .unwrap()
+                .unwrap()
+                .body
+            else {
+                panic!("the exact Installed fact returns one original deployment position");
+            };
+            assert!(matches!(
+                execution
+                    .observe_create_grant(operation.operation_id(), next_input)
+                    .unwrap(),
+                CreateGrantProgress::Queued
+            ));
+            assert!(
+                execution
+                    .begin_create_admission(later, later_input.generation().admission_effect())
+                    .unwrap()
+                    .is_none()
+            );
+            let batch = execution.dispatcher.take_batch().unwrap();
+            assert_eq!(batch.operations.len(), 1);
+            assert_eq!(batch.operations[0].operation_id(), operation.operation_id());
+        }
     }
 
     #[test]
