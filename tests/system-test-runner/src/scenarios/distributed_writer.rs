@@ -3248,28 +3248,39 @@ impl Scenario for DistributedWriterFaults {
                 delayed: statements.delayed,
             };
             context.action(format!("inject {case} and require no snapshot"));
-            // Select the original finite grants before reading their hit baseline.
-            // The SQL execution remains unbound until selected.arm below.
-            for &(index, kind) in &selected.faults {
-                context.handle().arm_selected_query_lifecycle_fault(
-                    index,
-                    kind,
-                    &selected.token,
-                )?;
-            }
-            let before_terminals = publication_terminals(context, WRITE_FAMILY)?;
-            let before = all_write_counters(context)?;
-            let before_injections = fault.injection_marker_count(context, &selected)?;
+            let run = (|| {
+                // Select the original finite grants before reading their hit baseline.
+                // The SQL execution remains unbound until selected.arm below.
+                for &(index, kind) in &selected.faults {
+                    context.handle().arm_selected_query_lifecycle_fault(
+                        index,
+                        kind,
+                        &selected.token,
+                    )?;
+                }
+                let before_terminals = publication_terminals(context, WRITE_FAMILY)?;
+                let before = all_write_counters(context)?;
+                let before_injections = fault.injection_marker_count(context, &selected)?;
 
-            let (outcome, accepted, original_window) = run_faulted_write(
-                context,
-                &fault,
-                &user,
-                port,
-                &case_statements,
-                selected.clone(),
-                capture_original_write_window,
-            )?;
+                let writer = run_faulted_write(
+                    context,
+                    &fault,
+                    &user,
+                    port,
+                    &case_statements,
+                    selected.clone(),
+                    capture_original_write_window,
+                )?;
+                Ok((before_terminals, before, before_injections, writer))
+            })();
+            let retirement = if matches!(fault, WriteFault::SealedAfterRootPrefix) {
+                // The next DELETE selects this same fault kind under its own token.
+                retire_selected_writer_faults(context, &selected)
+            } else {
+                Ok(())
+            };
+            let (before_terminals, before, before_injections, (outcome, accepted, original_window)) =
+                writer_statement_actor::combine(run, retirement)?;
             if let Some(expected) = fault.originating_connector_fact() {
                 assert_connector_failure(context, &outcome, accepted.as_ref(), expected, case)?;
             }
@@ -3421,33 +3432,39 @@ fn verify_materialization_fault(
     row_level_contract::assert_affected(&seed, 3, "seed v3 materialization fault")?;
     let snapshots = snapshot_count(control, V3_FAULT_TABLE)?;
     let terminals = publication_terminals(context, MUTATION_FAMILY)?;
-    let actor = WriterActor::start(context, &v3_fault_sql(), selected.clone(), None)?;
-    let terminal = context
-        .remaining("observe v3 materialization failure")
-        .and_then(|remaining| {
-            actor
-                .done
-                .recv_timeout(remaining)
-                .context("v3 materialization fault has no SQL terminal")
-        });
-    let failure = actor.settle(context, terminal)?;
-    anyhow::ensure!(
-        matches!(failure, Err(StatementFailure::Trino(_))),
-        "v3 materialization fault did not reach its public SQL terminal"
-    );
-    let hits = selected
-        .faults
-        .iter()
-        .try_fold(0usize, |count, &(index, kind)| {
-            context
-                .handle()
-                .selected_query_lifecycle_fault_hit(index, kind, &selected.token)
-                .map(|hit| count + usize::from(hit))
-        })?;
-    anyhow::ensure!(
-        hits > 0,
-        "v3 statement failed outside its selected root-prefix fault"
-    );
+    let fault = (|| {
+        let actor = WriterActor::start(context, &v3_fault_sql(), selected.clone(), None)?;
+        let terminal = context
+            .remaining("observe v3 materialization failure")
+            .and_then(|remaining| {
+                actor
+                    .done
+                    .recv_timeout(remaining)
+                    .context("v3 materialization fault has no SQL terminal")
+            });
+        let failure = actor.settle(context, terminal)?;
+        anyhow::ensure!(
+            matches!(failure, Err(StatementFailure::Trino(_))),
+            "v3 materialization fault did not reach its public SQL terminal"
+        );
+        let hits = selected
+            .faults
+            .iter()
+            .try_fold(0usize, |count, &(index, kind)| {
+                context
+                    .handle()
+                    .selected_query_lifecycle_fault_hit(index, kind, &selected.token)
+                    .map(|hit| count + usize::from(hit))
+            })?;
+        anyhow::ensure!(
+            hits > 0,
+            "v3 statement failed outside its selected root-prefix fault"
+        );
+        Ok(())
+    })();
+    let retirement = retire_selected_writer_faults(context, &selected);
+    writer_statement_actor::combine(fault, retirement)?;
+
     let after = publication_terminals(context, MUTATION_FAMILY)?;
     assert_commit_never_invoked(terminals, after, "v3 sealed materialization fault")?;
     let rows = |control: &mut SqlSession| -> Result<Vec<i64>> {
@@ -3465,6 +3482,29 @@ fn verify_materialization_fault(
         "v3 materialization did not recover for the next independent DELETE"
     );
     Ok(())
+}
+
+fn retire_selected_writer_faults(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+) -> Result<()> {
+    let mut retirement = Ok(());
+    for &(index, kind) in &selected.faults {
+        let handle = context.handle();
+        // Arm may have stopped before selecting every declared backend.
+        let result = match handle.armed_query_lifecycle_fault_token(index, kind) {
+            Ok(Some(token)) if token == selected.token => {
+                handle.end_selected_query_lifecycle_fault(index, kind, &selected.token)
+            }
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(anyhow::anyhow!(
+                "writer fault retirement encountered a foreign token on BE[{index}] for {kind}"
+            )),
+            Err(error) => Err(error),
+        };
+        retirement = writer_statement_actor::combine(retirement, result);
+    }
+    retirement
 }
 
 /// Exact original test controls, owned after the writer so unwind releases

@@ -106,6 +106,15 @@ def delete_key(entry: dict) -> tuple:
                  ("path", "spec_id", "referenced_data_file", "content_offset", "content_size"))
 
 
+def delete_entry_for_comparison(entry: dict) -> dict:
+    # Java can report an absent metrics map as null. Rewriting a manifest
+    # through the Rust SDK serializes its empty map with no column statistics.
+    optional_metrics = {"value_counts", "null_value_counts", "nan_value_counts",
+                        "lower_bounds_base64", "upper_bounds_base64"}
+    return {field: {} if field in optional_metrics and value is None else value
+            for field, value in entry.items()}
+
+
 def check_mutation_seed(receipt: dict, seed_path: pathlib.Path) -> None:
     seed_bytes = seed_path.read_bytes()
     seed = json.loads(seed_bytes)
@@ -159,7 +168,8 @@ def check_mutation_seed(receipt: dict, seed_path: pathlib.Path) -> None:
     if preserved != {delete_key(lower["shared"]), delete_key(lower["shadowed"]),
                      delete_key(lower["equality"]), delete_key(old_dvs[c])}:
         raise ValueError("Seed delete inventory did not contain the intended immutable peers")
-    if any(after_deletes[key] != before_deletes[key] for key in preserved):
+    if any(delete_entry_for_comparison(after_deletes[key]) != delete_entry_for_comparison(before_deletes[key])
+           for key in preserved):
         raise ValueError("Native DELETE changed a shared, suppressed, equality, or untouched entry")
 
     created = [after_deletes[key] for key in after_deletes.keys() - before_deletes.keys()]
