@@ -974,7 +974,9 @@ mod tests {
         native::data_runtime::FrontendDataRuntime,
         query_execution::{
             split_assignment::SplitAssignmentDriverError,
-            split_assignment_round::failure_observation_plan,
+            split_assignment_round::{
+                failure_observation_plan, failure_observation_plan_with_close,
+            },
         },
         task_execution::{
             blocking_io::tests::{OriginalExecutorsFixture, until},
@@ -988,7 +990,9 @@ mod tests {
     };
     use novarocks_control_runtime::transaction::RuntimeLedger;
     use novarocks_control_runtime_core::scope::WorkAdmission;
+    use novarocks_execution_contract::failure::FailureProjection;
     use novarocks_proto_codec::lifecycle::QueryExecutionId;
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use novarocks_types::{AttemptId, QueryId};
     use std::{
         collections::BTreeMap,
@@ -1009,6 +1013,24 @@ mod tests {
         }
     }
 
+    struct CloseRelease(Option<mpsc::Sender<()>>);
+    impl CloseRelease {
+        fn open(&mut self) {
+            self.0.take().unwrap().send(()).unwrap();
+        }
+    }
+    impl Drop for CloseRelease {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    fn provider_resource_fact() -> novarocks_execution_contract::failure::FailureFact {
+        ConnectorError::new(ConnectorErrorKind::ResourceExhausted, "fixture").failure_fact()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn original_source_joins_dormant_split_close_before_returning_its_roles() {
         let handle = Handle::current();
@@ -1018,6 +1040,7 @@ mod tests {
         let execution =
             QueryExecutionId::new(QueryId::new(19, 25), AttemptId::new(1).unwrap()).unwrap();
         let (release, released) = mpsc::channel();
+        let mut release = CloseRelease(Some(release));
         let (plan, enumerations, closes) =
             failure_observation_plan(execution, blocking, Some(released));
         let original = SplitPump::prepare(
@@ -1080,7 +1103,7 @@ mod tests {
         assert!(!source.is_drained());
         assert!(!scope.join_ready().unwrap());
 
-        release.send(()).unwrap();
+        release.open();
         let mut original_failure = None;
         tokio::time::timeout(Duration::from_secs(2), async {
             while !source.is_drained() {
@@ -1107,12 +1130,23 @@ mod tests {
         })
         .await
         .unwrap();
+        let original_failure = original_failure.expect("one original dormant close diagnostic");
         assert!(matches!(
             original_failure,
-            Some(TaskExecutionError::SplitAssignment(
-                SplitAssignmentDriverError::SourceClose { .. }
-            ))
+            TaskExecutionError::SplitAssignment(SplitAssignmentDriverError::SourceClose { .. })
         ));
+        let projected = original_failure.preparation_input();
+        assert_eq!(projected.fact(), provider_resource_fact());
+        assert_eq!(
+            projected.detail().as_str(),
+            "closing the connector split source failed"
+        );
+        assert!(
+            !source
+                .progress_split(false, true, true, true, &mut payloads, &handle, wake, drop)
+                .unwrap(),
+            "the drained Source cannot report the same diagnostic again"
+        );
         assert_eq!(closes.load(Ordering::SeqCst), 1);
         assert_eq!(enumerations.load(Ordering::SeqCst), 0);
         inbox.assert_no_result();
@@ -1135,5 +1169,501 @@ mod tests {
             .unwrap();
         inbox.finish();
         workers.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn original_split_enumeration_settles_before_actual_provider_close_without_recovery() {
+        use crate::{
+            query_execution::lifecycle_plan::QueryCredentialLeases,
+            task_execution::{
+                actor_gate::tests::logical_execution,
+                bridge::{
+                    qa::AttemptQaBridge,
+                    terminal::{TerminalOutbox, TerminalPublication},
+                },
+                host::{
+                    adapter::tests::start,
+                    custody::TransportRetirements,
+                    transport::{AttemptEstablishMaterial, handoff_actor_transport},
+                },
+                sources::AttemptEstablishFacts,
+            },
+        };
+        use novarocks_attempt_protocol::{
+            AttemptCore, AttemptStep, Core, InputSelection,
+            capacity::{QueueStage, StepContext},
+            config::DispatchLane,
+            effect::Publication,
+            failure::AttemptFailure,
+            input::{
+                AttemptInputClaim, AttemptInputId, AttemptSourceCut, AttemptSourceId,
+                PublicationApplied,
+            },
+            publication::SplitDiagnosticObservation,
+        };
+        use novarocks_coordination_contract::{
+            AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody, MonotonicInstant,
+        };
+        use novarocks_execution_contract::OperationKind;
+        use novarocks_query_application::{
+            api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement},
+            execution_error::QueryFailureReason,
+        };
+        use novarocks_types::BackendProcessId;
+
+        struct Units;
+        impl StepContext for Units {
+            fn charge(&mut self, _: usize) -> bool {
+                true
+            }
+            fn reserve_queue_stage(
+                &mut self,
+                _: DispatchLane,
+                _: bool,
+                _: BackendProcessId,
+                _: usize,
+                _: usize,
+            ) -> QueueStage {
+                panic!("the ordinary failure occurs before Native Admission dispatch")
+            }
+        }
+
+        let mut frozen = start();
+        let participation = *frozen.plan.establish_material.keys().next().unwrap();
+        let execution = participation.query_execution_id();
+        let (mut logical, drive, mut abort_intake) = logical_execution(participation).await;
+        let activation = drive.identity();
+        frozen.activation.identity = activation;
+        frozen.plan.authorization_limits = drive.authorization_limits();
+        // The fixture runtime's original external Source is the transport callback role.
+        std::mem::swap(
+            &mut frozen.sources.transport,
+            &mut frozen.sources.publication,
+        );
+        let sources = frozen.sources;
+        let facts = AttemptEstablishFacts::freeze(
+            Default::default(),
+            [(participation.backend_process_id(), Default::default())],
+            Default::default(),
+            &QueryCredentialLeases::empty(),
+        )
+        .unwrap();
+        let mut next_payload = NonZeroU64::new(100).unwrap();
+        let (quotes, material) =
+            AttemptEstablishMaterial::project(&facts, [participation], &mut next_payload).unwrap();
+        frozen.plan.establish_material = quotes;
+        let mut qa = AttemptQaBridge::new(
+            Arc::new(drive),
+            frozen.plan.compatibility,
+            Arc::new(material),
+        );
+        let pump_ref = PayloadRef(next_payload);
+        frozen.plan.pumps = Box::new([(pump_ref, PumpKind::SplitAssignment)]);
+        let now = frozen.initial_now;
+        assert_eq!(now, MonotonicInstant::ORIGIN);
+        let mut core = <Core as AttemptCore>::new(frozen).unwrap();
+        let mut sequence = 100;
+        let mut step = move |source: AttemptSourceId, input, original: Option<InputId>| {
+            sequence += 1;
+            let input_id =
+                AttemptInputId(NonZeroU64::new(original.map_or(sequence, InputId::get)).unwrap());
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: input_id,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: None,
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: None,
+                    }),
+                },
+                input,
+                &mut Units,
+            )
+            .unwrap()
+        };
+        type Step = dyn FnMut(AttemptSourceId, AttemptInput, Option<InputId>) -> AttemptStep;
+        let next = |step: &mut Step, mut turn: AttemptStep| {
+            for _ in 0..24 {
+                if let Some(effect) = &turn.effect {
+                    if matches!(
+                        effect.body,
+                        EffectBody::Publish(Publication::ProtocolBatch(_))
+                    ) {
+                        turn = step(
+                            sources.publication,
+                            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                effect: effect.id,
+                                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+                            }),
+                            None,
+                        );
+                        continue;
+                    }
+                    return turn;
+                }
+                if turn.round_result.as_ref().is_some_and(Result::is_err)
+                    || turn.selection == InputSelection::Prefer(sources.native)
+                {
+                    return turn;
+                }
+                assert!(matches!(turn.selection, InputSelection::Only(source)
+                    if source == sources.actor || source == sources.observation));
+                turn = step(sources.actor, AttemptInput::Timer, None);
+            }
+            panic!("original Core split cut did not advance");
+        };
+
+        step(sources.actor, AttemptInput::Bootstrap, None);
+        step(sources.actor, AttemptInput::StartProtocol, None);
+        let first = step(sources.actor, AttemptInput::Timer, None);
+        let started = next(&mut step, first).effect.unwrap();
+        let EffectBody::StartPump {
+            pump,
+            kind: PumpKind::SplitAssignment,
+        } = started.body
+        else {
+            panic!("Core must start the original split pump");
+        };
+        assert_eq!(pump, pump_ref);
+        let action = started.id;
+
+        let handle = Handle::current();
+        let data = FrontendDataRuntime::new(handle.clone());
+        let blocking = data.connector_blocking_io().clone();
+        let mut workers = OriginalExecutorsFixture::install(&blocking);
+        let (release, released) = mpsc::channel();
+        let mut release = CloseRelease(Some(release));
+        let (plan, enumerations, closes) =
+            failure_observation_plan_with_close(execution, blocking, Some(released), false);
+        let original = SplitPump::prepare(
+            pump,
+            execution,
+            plan,
+            BTreeMap::new(),
+            Arc::new(CountingWake::default()),
+            data,
+            Arc::default(),
+        )
+        .unwrap();
+
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let generation = Generation::new(1).unwrap();
+        let scope = ledger.open_scope_next(None, generation).unwrap();
+        let (mut parent, mut payer) = scope
+            .reserve_next(
+                generation,
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        parent.start().unwrap();
+        let started = AttemptEffectEnvelope::new(started);
+        let inbox = WithdrawalInbox::with_commands(&scope, [(started.clone(), None)], [16; 4]);
+        let runtime = inbox.runtime();
+        let actor = inbox.registration().actor();
+        assert_eq!(sources.transport.0.get(), inbox.source().get());
+        let mut source = AttemptPumpSource::bind(
+            runtime,
+            inbox.registration(),
+            inbox.source(),
+            &parent,
+            &payer,
+            ConsumerId::new(1).unwrap(),
+            None,
+            None,
+            Some(&original),
+        )
+        .unwrap();
+        let position = source.prepay(&started).unwrap().unwrap();
+        let ticket = inbox.command(&parent, action);
+        let command = ticket.input;
+        let mut job = source.bind_job(&ticket, position);
+        let mut retirement = TransportRetirements::new(
+            runtime.clone(),
+            inbox.registration().clone(),
+            handle.clone(),
+            source.capacity(),
+        );
+        retirement
+            .track(started, job.transport.take().unwrap())
+            .unwrap_or_else(|_| panic!("original split Join"));
+        handoff_actor_transport(&handle, job).unwrap_or_else(|_| panic!("original split handoff"));
+        runtime
+            .effect_completed(ticket)
+            .unwrap_or_else(|_| panic!("original split handoff receipt"));
+        runtime.retire_input(actor, command).unwrap();
+
+        // The original QA authority may authorize an Admission candidate, but
+        // the test holds its transport admission and supplies no Worker result.
+        let step_after_start = step(sources.actor, AttemptInput::Timer, None);
+        let authorized = next(&mut step, step_after_start).effect.unwrap();
+        let EffectBody::Port(authorization) = authorized.body else {
+            panic!("the first Native candidate must ask original QA");
+        };
+        let reply = qa.handle_port(&authorization).await.unwrap();
+        assert!(reply.failure.is_none());
+        let applied = step(sources.qa, AttemptInput::Port(reply.reply), None);
+        let queued = next(&mut step, applied).effect.unwrap();
+        let EffectBody::AdmitQueuedInput { operation, .. } = queued.body else {
+            panic!("the original Native Admission remains queued");
+        };
+        assert_eq!(
+            operation.kind(),
+            OperationKind::AcquireParticipationAdmissionTicket
+        );
+        let parked = step(sources.actor, AttemptInput::Timer, None);
+        let parked = next(&mut step, parked);
+        assert!(parked.effect.is_none());
+        assert_eq!(parked.selection, InputSelection::Prefer(sources.native));
+
+        let (failed_input, observed) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if closes.load(Ordering::SeqCst) == 1
+                    && let Some(report) = inbox.try_commit_next()
+                {
+                    break report;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ExecutorFact::PumpFailed {
+            pump: original_pump,
+            failure: first,
+        } = &observed
+        else {
+            panic!("the original executor reports enumeration before close: {observed:?}");
+        };
+        assert_eq!(*original_pump, pump);
+        let AttemptFailure::Host(first_host) = first else {
+            panic!("the provider error stays in the original host record");
+        };
+        let first = first.clone();
+        let reference = first_host.original;
+        assert_eq!(reference.0.get(), action.get());
+        assert_eq!(enumerations.load(Ordering::SeqCst), 1);
+        assert!(!retirement.is_empty());
+        assert!(!source.local_exited());
+        assert!(!original.deliveries().producer_closed());
+        let failed = step(
+            sources.transport,
+            AttemptInput::Executor(observed),
+            Some(failed_input),
+        );
+        assert!(failed.stop_producing);
+        source.core_consumed(runtime, &[failed_input]);
+        let round = next(&mut step, failed);
+        assert_eq!(round.round_result, Some(Err(first.clone())));
+        let mut effect = round.effect;
+        let terminal = (0..24)
+            .find_map(|_| {
+                if let Some(current) = effect.take() {
+                    match current.body {
+                        EffectBody::Port(port)
+                            if matches!(port.body, AttemptToLogicalBody::AttemptTerminal(_)) =>
+                        {
+                            return Some(port);
+                        }
+                        EffectBody::Withdraw { effect } if effect == queued.id => {
+                            // No fixture transport admitted this original queue effect.
+                        }
+                        EffectBody::StopPump { pump: exact } if exact == pump => {
+                            original.request_stop();
+                        }
+                        EffectBody::ReleaseCreationPayload { task, .. } => {
+                            assert_eq!(task.query_execution_id(), execution);
+                        }
+                        other => panic!(
+                            "ordinary failure must publish without backend recovery: {other:?}"
+                        ),
+                    }
+                }
+                let continued = step(sources.actor, AttemptInput::Timer, None);
+                effect = next(&mut step, continued).effect;
+                None
+            })
+            .expect("ordinary terminal must publish while the original provider close is held");
+        assert!(matches!(
+            terminal.body,
+            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(ref held)) if held == &first
+        ));
+        assert_eq!(terminal.activation, activation);
+        let selected = source.project_failure(reference).unwrap();
+        let original_error = source.take_failure(reference).unwrap();
+        assert!(matches!(
+            original_error,
+            OriginalHostFailure::Task(TaskExecutionError::SplitAssignment(
+                SplitAssignmentDriverError::SourceEnumeration { .. }
+            ))
+        ));
+        let mut terminal = TerminalPublication::new(terminal);
+        assert_eq!(terminal.host_reference(), Some(reference));
+        terminal.attach_host_failure(reference, original_error);
+        let outbox = TerminalOutbox::new(activation);
+        assert!(outbox.publish(Box::new(terminal)).is_ok());
+        let NativeAttemptTerminal::Failed(terminal) = outbox.terminal().await.unwrap() else {
+            panic!("the original enumeration is a typed failure");
+        };
+        assert_eq!(terminal.input(), &selected);
+        assert_eq!(selected.fact(), provider_resource_fact());
+        assert_ne!(
+            selected.fact(),
+            QueryFailureReason::SplitAssignmentFailed.failure_fact()
+        );
+        assert_ne!(
+            selected.fact().reason(),
+            QueryFailureReason::BackendLost.failure_fact().reason()
+        );
+        assert_eq!(
+            selected.detail().as_str(),
+            "enumerating the connector split source failed"
+        );
+        assert!(!terminal.error().message().contains("opaque provider text"));
+        assert_eq!(terminal.class(), AttemptFailureClass::ResourceGovernance);
+        assert_eq!(
+            terminal.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        assert!(terminal.pre_ready_replacement().is_none());
+        assert!(!retirement.is_empty());
+        assert!(!source.local_exited());
+        assert!(!original.deliveries().producer_closed());
+
+        let wake = retirement.host_waker();
+        let mut payloads = NoPayloads;
+        assert!(
+            source
+                .progress_split(
+                    false,
+                    true,
+                    false,
+                    true,
+                    &mut payloads,
+                    &handle,
+                    &wake,
+                    drop
+                )
+                .unwrap()
+        );
+        assert!(!source.local_exited());
+        release.open();
+        let mut profiles = 0;
+        let mut finishes = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !source.is_drained() || !retirement.is_empty() {
+                while let Some(turn) = runtime.claim_host_actor() {
+                    let original = retirement.progress(&turn, 4, |action, event| {
+                        source
+                            .transport_event(action, event)
+                            .unwrap_or_else(|error| std::panic::resume_unwind(error));
+                    });
+                    let progress = source.progress(false, true, true, 4, true, drop);
+                    turn.release(original.more || progress.more).unwrap();
+                }
+                while let Some((envelope, input)) = inbox.try_commit_envelope() {
+                    assert_eq!(envelope.source, inbox.source());
+                    match input {
+                        AttemptInput::Executor(ExecutorFact::SplitProfile {
+                            pump: exact,
+                            observation: SplitDiagnosticObservation::Failed,
+                        }) => {
+                            assert_eq!(envelope.class, InputClass::Ordinary);
+                            assert_eq!(exact, pump);
+                            profiles += 1;
+                        }
+                        AttemptInput::Executor(ExecutorFact::PumpFinished {
+                            pump: exact,
+                            result: Err(ref held),
+                        }) => {
+                            assert_eq!(envelope.class, InputClass::Lifecycle);
+                            assert_eq!(exact, pump);
+                            assert_eq!(held, &first);
+                            finishes += 1;
+                        }
+                        other => panic!(
+                            "unexpected split callback after the selected failure: {other:?}"
+                        ),
+                    }
+                    source.core_consumed(runtime, &[envelope.input]);
+                    retirement.original_input_progress();
+                }
+                if source.has_split_work() {
+                    source
+                        .progress_split(
+                            false,
+                            true,
+                            profiles == 1 && finishes == 1,
+                            true,
+                            &mut payloads,
+                            &handle,
+                            &wake,
+                            drop,
+                        )
+                        .unwrap();
+                }
+                source.progress(false, true, profiles == 1 && finishes == 1, 4, true, drop);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((profiles, finishes), (1, 1));
+        assert_eq!(enumerations.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert!(original.deliveries().producer_closed());
+        assert_eq!(
+            outbox.terminal().await.unwrap(),
+            NativeAttemptTerminal::Failed(terminal)
+        );
+
+        parent.body_exited().unwrap();
+        parent.captures_exited().unwrap();
+        payer.finish().unwrap();
+        scope.close_external().unwrap();
+        ledger.reap_scope_ready(scope.id(), 32).unwrap();
+        assert!(scope.join_ready().unwrap());
+        runtime.close_actor_admission(actor).unwrap();
+        while let Some(turn) = runtime.claim_host_actor() {
+            turn.release(false).unwrap();
+        }
+        runtime.seal_actor(actor).unwrap();
+        inbox.finish();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(ledger.is_empty());
+        drop(original);
+        workers.shutdown().await;
+
+        drop(qa);
+        logical.abandon_running_attempt();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(effect) = abort_intake.try_recv() {
+                    let crate::task_execution::intent::OperationIntent::AbortParticipation(request) = effect.intent() else {
+                        panic!("QA teardown keeps the original Abort");
+                    };
+                    assert_eq!(request.participation(), participation);
+                    effect.fail_closed().unwrap();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        logical
+            .observe_worker_process_replaced(participation)
+            .await
+            .unwrap();
+        logical
+            .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 }

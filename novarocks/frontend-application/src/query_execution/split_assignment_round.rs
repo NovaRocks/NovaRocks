@@ -1099,7 +1099,7 @@ impl Drop for SplitAssignmentRoundGuard {
 }
 
 #[cfg(test)]
-pub(crate) use tests::failure_observation_plan;
+pub(crate) use tests::{failure_observation_plan, failure_observation_plan_with_close};
 
 #[cfg(test)]
 mod tests {
@@ -1236,6 +1236,7 @@ mod tests {
 
     struct FailureObservationSource {
         release_close: Option<mpsc::Receiver<()>>,
+        fail_close: bool,
         enumerations: Arc<std::sync::atomic::AtomicUsize>,
         closes: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1261,6 +1262,8 @@ mod tests {
             self.closes.fetch_add(1, Ordering::SeqCst);
             if let Some(released) = self.release_close.take() {
                 released.recv().expect("release the original source close");
+            }
+            if self.fail_close {
                 return Err(ConnectorError::new(
                     novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
                     "original provider close diagnostics must remain private",
@@ -1282,12 +1285,27 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let fail_close = release_close.is_some();
+        failure_observation_plan_with_close(execution, supervisor, release_close, fail_close)
+    }
+
+    pub(crate) fn failure_observation_plan_with_close(
+        execution: QueryExecutionId,
+        supervisor: ConnectorBlockingIoSupervisor,
+        release_close: Option<mpsc::Receiver<()>>,
+        fail_close: bool,
+    ) -> (
+        RoundSplitAssignmentPlan,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let enumerations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = RoundSplitSource {
             scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
             source: SupervisedSplitSource::fixture(Box::new(FailureObservationSource {
                 release_close,
+                fail_close,
                 enumerations: Arc::clone(&enumerations),
                 closes: Arc::clone(&closes),
             })),
