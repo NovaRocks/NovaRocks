@@ -324,6 +324,11 @@ impl MembershipRegistry {
             .expect("frontend membership targets lock")
             .is_empty()
     }
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, revision: u64, port: &dyn BackendProcessObservationPort) {
+        self.publish(revision, port);
+    }
+
     pub(super) fn publish(&self, revision: u64, port: &dyn BackendProcessObservationPort) {
         // Clone only frozen neutral facts and the exact registration witness,
         // never an input/Source holder across an external observer call. A slow

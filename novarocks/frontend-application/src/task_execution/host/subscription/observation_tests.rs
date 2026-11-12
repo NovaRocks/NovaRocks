@@ -2436,9 +2436,34 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
         use novarocks_control_runtime_core::effect::EffectKind;
         use novarocks_coordination_contract::AttemptToLogicalBody;
 
-        let FrontendInput::Attempt(input) = input else {
-            panic!("the fixture consumes the original ordered input");
+        // The ordered observations and Seal run through Core. The fixture has
+        // already bootstrapped it and records only custody of the neutral hints.
+        let input = match input {
+            FrontendInput::AttemptStartup(_) => {
+                assert_eq!(claim.class, InputClass::Lifecycle);
+                return;
+            }
+            FrontendInput::Membership(update) => {
+                assert_eq!(claim.class, InputClass::Ordinary);
+                assert_eq!(update.0.revision, 1);
+                assert_eq!(update.0.processes.len(), 2);
+                assert!(update.0.processes.values().all(|fact| {
+                    *fact == novarocks_attempt_protocol::input::MembershipObservation::ExactOriginal
+                }));
+                return;
+            }
+            FrontendInput::CapacityReleased => {
+                assert_eq!(claim.class, InputClass::Ordinary);
+                return;
+            }
+            FrontendInput::Attempt(input) => input,
+            _ => panic!("the fixture consumes the original ordered input"),
         };
+        if let AttemptInput::Executor(ExecutorFact::ReadProgress(progress)) = input.as_ref() {
+            assert_eq!(claim.class, InputClass::Ordinary);
+            assert_eq!(progress.resume_revision, NonZeroU64::MIN);
+            return;
+        }
         let input_id = AttemptInputId(NonZeroU64::new(claim.input.get()).unwrap());
         if let AttemptInput::Executor(ExecutorFact::Observations(batch)) = input.as_ref() {
             let keys = batch
@@ -2557,6 +2582,7 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
 
 fn ordered_protocol_fixture(
     observed: Arc<Mutex<Vec<ProtocolObservation>>>,
+    sources: novarocks_attempt_protocol::start::AttemptSources,
 ) -> (
     ProtocolOrder,
     AttemptActivationIdentity,
@@ -2565,9 +2591,7 @@ fn ordered_protocol_fixture(
     [StreamKey; 2],
 ) {
     use crate::task_execution::host::adapter::tests::start;
-    use novarocks_attempt_protocol::{
-        AttemptCore, Core, input::AttemptSourceId, start::PayloadRef,
-    };
+    use novarocks_attempt_protocol::{AttemptCore, Core, start::PayloadRef};
     use novarocks_coordination_contract::AttemptActionId;
     let mut start = start();
     let root = start.plan.graph.root;
@@ -2613,10 +2637,9 @@ fn ordered_protocol_fixture(
         .plan
         .preparation_positions
         .insert(backend, start.plan.preparation_positions[&root_backend]);
-    start.sources.observation = AttemptSourceId(NonZeroU64::new(11).unwrap());
+    start.sources = sources;
 
     let activation = start.activation.identity;
-    let sources = start.sources;
     let mut core = <Core as AttemptCore>::new(start).unwrap();
     let streams = [root_task.participation, sibling_participation].map(|participation| {
         let generation = core
@@ -2656,14 +2679,53 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             EffectExecutor, EffectSource, FrontendLanePolicy, HostBinding, HostRegistry,
             PendingHandoff, PreparedEffectJob, SourceProgress,
         },
+        membership::{
+            AttemptMembershipSource, FrozenMember, MembershipRegistry, MembershipTarget,
+            membership_input,
+        },
         metrics::FrontendHostObservations,
     };
-    use crate::task_execution::host::{
-        adapter::descriptor,
-        observations::{host_turn::OrderedObservationHost, read_progress::ReadProgressInput},
+    use crate::{
+        native::transport_capacity::{
+            NativeTransportCapacity, TransportCapacityLane, TransportCapacityRefusal,
+        },
+        task_execution::host::{
+            adapter::{AttemptCapacitySource, descriptor},
+            geometry::AttemptHostGeometry,
+            observations::{host_turn::OrderedObservationHost, read_progress::ReadProgressInput},
+            startup::AttemptStartupSource,
+            transport::send_queue_resources,
+        },
     };
-    use novarocks_control_runtime::actor_turn::{ActorHostTurn, EffectTicket, ProcessClock};
-    use novarocks_control_runtime_core::effect::EffectKind;
+    use novarocks_attempt_protocol::config::CoordinationBudgets;
+    use novarocks_control_runtime::{
+        actor_turn::{ActorHostTurn, EffectTicket, InputPhase, ProcessClock},
+        coalescing_input::CoalescingInput,
+        transaction::RuntimeError,
+    };
+    use novarocks_control_runtime_core::{capacity::CapacityWaitTarget, effect::EffectKind};
+    use novarocks_execution_contract::RuntimeEndpoint;
+    use novarocks_query_application::api::{
+        BackendProcessObservation, BackendProcessObservationPort, BackendTopologyError,
+    };
+    use std::num::NonZeroUsize;
+
+    struct CurrentProcesses([(BackendProcessId, RuntimeEndpoint); 2]);
+
+    impl BackendProcessObservationPort for CurrentProcesses {
+        fn observe_process_at_endpoint(
+            &self,
+            process: BackendProcessId,
+            endpoint: &RuntimeEndpoint,
+        ) -> Result<BackendProcessObservation, BackendTopologyError> {
+            assert!(
+                self.0
+                    .iter()
+                    .any(|(expected, original)| *expected == process && original == endpoint)
+            );
+            Ok(BackendProcessObservation::Current)
+        }
+    }
 
     struct Core(Arc<Mutex<Vec<&'static str>>>);
     impl TestActor for Core {
@@ -2782,23 +2844,67 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
     use novarocks_control_runtime::history::HistoryCapture;
     use novarocks_control_runtime_core::history::{EffectHistoryPhase, HistoryFact};
     let runtime_history = HistoryCapture::new(4096);
-    let ledger = RuntimeLedger::with_history(ResourceVector::default(), runtime_history.clone());
+    let layout = finished_first.map(|_| {
+        NativeTransportCapacity::from_transport(
+            novarocks_task_codec::TransportBudget::new(
+                1,
+                128,
+                64,
+                2,
+                1024,
+                4,
+                4096,
+                1,
+                2,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    });
+    let ledger = match &layout {
+        Some(layout) => RuntimeLedger::with_keyed_families_and_observation(
+            layout.process_limits(),
+            layout.keyed_families(),
+            [],
+            Some(runtime_history.clone()),
+            Default::default(),
+        )
+        .unwrap(),
+        None => RuntimeLedger::with_history(ResourceVector::default(), runtime_history.clone()),
+    };
     let generation = Generation::new(1).unwrap();
     let scope = ledger.open_scope_next(None, generation).unwrap();
     let runtime = ActorRuntime::with_history(runtime_history.clone());
+    let sources = layout.as_ref().map(|layout| {
+        AttemptHostGeometry::derive(
+            scope.id(),
+            NonZeroUsize::new(2).unwrap(),
+            CoordinationBudgets::DEFAULT.dispatch,
+            layout,
+            &[],
+            false,
+        )
+        .unwrap()
+        .sources
+    });
+    let mailbox = sources.map_or([4; 4], |sources| sources.mailbox);
+    assert_eq!(mailbox[InputClass::Ordinary.index()], 4);
     let config = ActorConfig {
-        mailbox: [4; 4],
-        max_batches: 4,
+        mailbox,
+        // A single committed batch lets the test inspect both sides of the
+        // real Host retirement before the next actor step is admitted.
+        max_batches: if sources.is_some() { 1 } else { 4 },
         max_effects_per_step: 1,
         max_dependencies_per_effect: 0,
-        turn_budget: 8,
+        turn_budget: if sources.is_some() { 16 } else { 8 },
         max_step_work: 1,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let (test_actor, activation, root, key, sibling) = if finished_first.is_some() {
+    let (test_actor, activation, root, key, sibling) = if let Some(sources) = sources {
         let (protocol, activation, root, sibling, [first, second]) =
-            ordered_protocol_fixture(observed.clone());
+            ordered_protocol_fixture(observed.clone(), sources);
         (
             FrontendActor::Test(Box::new(protocol)),
             activation,
@@ -2824,7 +2930,11 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             None,
         )
     };
-    let source = ActorId::new(if sibling.is_some() { 11 } else { 2 }).unwrap();
+    let source_id = |source: novarocks_attempt_protocol::input::AttemptSourceId| {
+        ActorId::new(source.0.get()).unwrap()
+    };
+    let source = sources.map_or_else(|| ActorId::new(2).unwrap(), |s| source_id(s.observation));
+    let subscription_source = sources.map_or(source, |s| source_id(s.subscription));
     let registration = runtime
         .register_bound(actor(), scope.clone(), test_actor, config)
         .unwrap_or_else(|_| panic!("original ordered actor"));
@@ -2873,7 +2983,7 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
     let binding =
         RootControlBinding::for_registered_source(registration.clone(), activation, root).unwrap();
     let bank = Bank::make(budget, positions, binding.clone());
-    let standing = |class| {
+    let standing = |source, class| {
         runtime
             .reserve_admitted_input_for(&registration, source, class, &work)
             .unwrap()
@@ -2881,8 +2991,8 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             .unwrap()
     };
     let ingress = OrderedObservationInput::new(
-        standing(InputClass::Lifecycle),
-        standing(InputClass::Control),
+        standing(source, InputClass::Lifecycle),
+        standing(source, InputClass::Control),
         bank.clone(),
         binding,
         Arc::new(ManualClock::default()),
@@ -2890,11 +3000,67 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         Waker::noop().clone(),
     )
     .unwrap();
-    let read_progress = ReadProgressInput::new(
-        &registration,
-        key.participation,
-        standing(InputClass::Ordinary),
-    );
+    let streams = std::iter::once(key).chain(sibling.map(|(_, key)| key));
+    let progress_roles = streams
+        .clone()
+        .map(|key| {
+            ReadProgressInput::new(
+                &registration,
+                key.participation,
+                standing(subscription_source, InputClass::Ordinary),
+            )
+        })
+        .collect::<Vec<_>>();
+    let read_progress = &progress_roles[0];
+    let membership_registry = Arc::new(MembershipRegistry::new());
+    let endpoints = [19091, 19092].map(|port| RuntimeEndpoint::new("127.0.0.1", port).unwrap());
+    let mut startup_witness = None;
+    let mut capacity_wait = None;
+    let mut membership_slot = None;
+    let mut capacity_slot = None;
+    let (startup, capacity, membership) = if let Some(sources) = sources {
+        let (startup, witness) = AttemptStartupSource::new(
+            registration.clone(),
+            standing(source_id(sources.actor), InputClass::Lifecycle),
+        );
+        startup_witness = Some(witness);
+        let registrant = Arc::new(scope.capacity_registrant(Waker::noop().clone()).unwrap());
+        capacity_wait = Some(registrant.clone());
+        assert_eq!(source_id(sources.actor), actor());
+        let capacity_input = standing(source_id(sources.capacity), InputClass::Ordinary);
+        capacity_slot = Some(capacity_input.id());
+        let capacity = AttemptCapacitySource::new(registration.clone(), capacity_input, registrant);
+        let membership_input_slot = standing(source_id(sources.membership), InputClass::Ordinary);
+        membership_slot = Some(membership_input_slot.id());
+        let members = streams
+            .zip(endpoints.iter().cloned())
+            .map(|(key, endpoint)| FrozenMember {
+                participation: key.participation,
+                endpoint,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let member = MembershipTarget::register(
+            registration.clone(),
+            members,
+            CoalescingInput::new(membership_input_slot, membership_input),
+        );
+        (
+            Some(startup),
+            Some(capacity),
+            Some((
+                AttemptMembershipSource::new(membership_registry.clone(), member.target.clone()),
+                member,
+            )),
+        )
+    } else {
+        (None, None, None)
+    };
+    // The logical-side registration owns the original detailed membership errors.
+    let (membership, _membership_registration) = match membership {
+        Some((source, registration)) => (Some(source), Some(registration)),
+        None => (None, None),
+    };
     let host = HostRegistry::new(
         runtime.clone(),
         ledger.clone(),
@@ -2912,13 +3078,13 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             source: Box::new(Source(false)),
             executor: Arc::new(NoJobs),
             transport: None,
-            startup: None,
-            capacity: None,
-            membership: None,
+            startup,
+            capacity,
+            membership,
             owner_controls: None,
             ordered_observations: Some(
                 OrderedObservationHost::new(ingress.clone())
-                    .with_read_progress([read_progress.clone()]),
+                    .with_read_progress(progress_roles.iter().cloned()),
             ),
         })
         .unwrap_or_else(|_| panic!("original observation host"));
@@ -2930,6 +3096,15 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             host.drive(Tick(1), turn);
         }
     };
+    if let Some(witness) = startup_witness {
+        drive();
+        for _ in 0..2 {
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            drive();
+        }
+        assert!(witness.ready_for(&registration));
+        assert!(!membership_registry.is_empty());
+    }
     let open = |key| {
         ingress.register_stream(key).unwrap();
         let mut credit = Some(bank.credit(false, Some(key)).unwrap());
@@ -2949,8 +3124,11 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
     };
     open(key);
 
+    let queue_parent = reservation.id();
     let mut finish = || {
-        read_progress.close_after_exit().unwrap();
+        for role in &progress_roles {
+            role.close_after_exit().unwrap();
+        }
 
         ingress.job_closed(key).unwrap();
         ingress.retire_stream(key).unwrap();
@@ -2961,7 +3139,9 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         bank.metadata.lock().unwrap().refuse_once = true;
         assert_eq!(ingress.close_after_exit(), Err(ObservationError::Busy));
         scope.reap_ready(budget.total_positions + 8).unwrap();
-        assert!(scope.join_ready().unwrap());
+        if layout.is_none() {
+            assert!(scope.join_ready().unwrap());
+        }
         exit.request_close().unwrap();
         drive();
         assert!(!host.is_empty());
@@ -2970,6 +3150,9 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         scope.reap_ready(budget.total_positions + 8).unwrap();
         runtime.notify_host_actor(&registration).unwrap();
         drive();
+        assert!(membership_registry.is_empty());
+        assert!(ledger.try_keyed_usage_snapshot().unwrap().is_empty());
+        assert_eq!(ledger.capacity_waiter_count(), 0);
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
     };
 
@@ -3021,7 +3204,97 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             let key = if sequence % 2 == 0 { key } else { other };
             accept(key, marker(key, sequence));
         }
+        let mut progress_receipts = Vec::new();
+        for (role, key) in progress_roles.iter().zip([key, other]) {
+            progress_receipts.push(
+                role.publish(ReadProgressSnapshot {
+                    participation: key.participation,
+                    generation: key.generation,
+                    resumed_at: MonotonicInstant::ORIGIN,
+                    resume_revision: NonZeroU64::MIN,
+                })
+                .unwrap(),
+            );
+        }
+        let target = key.participation.backend_process_id();
+        let [root_endpoint, sibling_endpoint] = endpoints;
+        let membership_processes = CurrentProcesses([
+            (target, root_endpoint),
+            (other.participation.backend_process_id(), sibling_endpoint),
+        ]);
+        membership_registry.publish_for_test(1, &membership_processes);
+        let layout = layout.as_ref().unwrap();
+        let registrant = capacity_wait.as_ref().unwrap();
+        let queue_resources = |items| {
+            send_queue_resources(layout, target, TransportCapacityLane::Ordinary, items, 32)
+                .unwrap()
+        };
+        let blocker = scope
+            .reserve_next(
+                generation,
+                queue_resources(2),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let wait_target = match scope.reserve_child_next_or_wait(
+            generation,
+            queue_parent,
+            queue_resources(1),
+            WorkKind::Business,
+            registrant,
+        ) {
+            Err(RuntimeError::CapacityDenied(denial)) => {
+                assert!(matches!(
+                    NativeTransportCapacity::classify_denial(denial).unwrap(),
+                    TransportCapacityRefusal::TargetFull(backend) if backend == target
+                ));
+                denial.wait_target()
+            }
+            _ => panic!("the exact backend queue must deny a third item"),
+        };
+        assert!(matches!(wait_target, CapacityWaitTarget::Keyed { .. }));
+        assert_eq!(ledger.capacity_waiter_count(), 1);
+        drop(blocker);
+        assert_eq!(ledger.capacity_waiter_count(), 0);
+
+        let ordinary_inventory = || {
+            runtime
+                .standing_input_inventory(actor(), None, 16)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.class == InputClass::Ordinary)
+                .collect::<Vec<_>>()
+        };
+        let filled_ordinary = || {
+            let roles = ordinary_inventory();
+            let sources = sources.unwrap();
+            let expected = [
+                (progress_roles[0].standing_id(), subscription_source),
+                (progress_roles[1].standing_id(), subscription_source),
+                (membership_slot.unwrap(), source_id(sources.membership)),
+                (capacity_slot.unwrap(), source_id(sources.capacity)),
+            ];
+            assert_eq!(roles.len(), mailbox[InputClass::Ordinary.index()]);
+            for (standing, source) in expected {
+                let row = roles
+                    .iter()
+                    .find(|row| row.standing_input_id == standing)
+                    .unwrap();
+                assert_eq!(row.source, source);
+                let input = row.in_flight.expect("the original Ordinary role is filled");
+                let custody = runtime.input_custody(actor(), input).unwrap().unwrap();
+                assert_eq!(custody.standing_input_id, Some(standing));
+                assert_eq!(custody.phase, InputPhase::Filled);
+                assert_eq!(custody.class, InputClass::Ordinary);
+                assert_eq!(custody.source, source);
+                assert!(!custody.runtime_metadata);
+            }
+            roles
+        };
+        let ordinary = filled_ordinary();
         ingress.root_control(bank.seal()).unwrap();
+        assert_eq!(filled_ordinary(), ordinary);
         let status = |task, state, termination| ObservationEvent::Fact {
             source_revision: None,
             fact: ObservationFact::Status(
@@ -3079,12 +3352,17 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         let control = *control;
         drop(prefix);
         assert!(runtime.input_custody(actor(), control).unwrap().is_some());
-        assert!(
-            !runtime.poll_one(Tick(1)).unwrap(),
-            "the suffix requires actual Host retirement"
-        );
+        assert_eq!(filled_ordinary(), ordinary);
+        {
+            let writer = ingress.0.state.lock().unwrap();
+            let original = writer.in_flight.as_ref().unwrap();
+            assert_eq!(original.input, control);
+            assert!(original.control && !original.finished());
+            assert_eq!(writer.queue.len(), 2);
+        }
         drive();
         assert!(runtime.input_custody(actor(), control).unwrap().is_none());
+        assert_eq!(filled_ordinary(), ordinary);
         assert!(
             runtime.poll_one(Tick(1)).unwrap(),
             "pending Seal cannot block its evidence"
@@ -3102,6 +3380,28 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         assert_eq!(*success, finished_first);
         expected_inputs.push(*suffix_id);
         drop(history);
+        assert_eq!(filled_ordinary(), ordinary);
+        for _ in &ordinary {
+            assert!(runtime.poll_one(Tick(1)).unwrap());
+            drive();
+        }
+        assert!(progress_receipts.iter().all(|receipt| receipt.retired()));
+        let idle_roles = ordinary
+            .iter()
+            .copied()
+            .map(|mut role| {
+                role.in_flight = None;
+                role
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary_inventory(), idle_roles);
+        let ordinary_inputs = ordinary
+            .iter()
+            .map(|row| row.in_flight.unwrap())
+            .collect::<Vec<_>>();
+        for input in &ordinary_inputs {
+            assert!(runtime.input_custody(actor(), *input).unwrap().is_none());
+        }
         let history = runtime_history.drain(4096);
         assert!(
             history.complete && history.remaining == 0,
@@ -3146,7 +3446,59 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         let [completed] = control_completion.as_slice() else {
             panic!("the Host must consume the first-processing notice once");
         };
-        assert!(*completed < suffix_consumption);
+        let control_consumption = history
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.fact {
+                HistoryFact::InputConsumed { input, .. } if *input == control => {
+                    Some(entry.ordinal)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(control_consumption < *completed && *completed < suffix_consumption);
+        let mut ordinary_consumed = history
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.fact {
+                HistoryFact::InputConsumed { input, target } if ordinary_inputs.contains(input) => {
+                    assert_eq!(target.actor, actor());
+                    assert_eq!(target.scope_origin, scope.id());
+                    assert!(entry.ordinal > suffix_consumption);
+                    Some(*input)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ordinary_consumed.sort_unstable();
+        let mut expected_ordinary = ordinary_inputs;
+        expected_ordinary.sort_unstable();
+        assert_eq!(ordinary_consumed, expected_ordinary);
+        let wait_history = history
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.fact {
+                HistoryFact::CapacityWaitRegistered {
+                    registrant: original,
+                    target,
+                } if *original == registrant.id() => {
+                    assert_eq!(*target, wait_target);
+                    Some((entry.ordinal, true))
+                }
+                HistoryFact::CapacityWaitNotified {
+                    registrant: original,
+                    target,
+                } if *original == registrant.id() => {
+                    assert_eq!(*target, wait_target);
+                    Some((entry.ordinal, false))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(registered, true), (released, false)] = wait_history.as_slice() else {
+            panic!("the original keyed wait must be registered and notified once");
+        };
+        assert!(registered < released && *released < control_consumption);
         ingress.job_closed(other).unwrap();
         ingress.retire_stream(other).unwrap();
         finish();
