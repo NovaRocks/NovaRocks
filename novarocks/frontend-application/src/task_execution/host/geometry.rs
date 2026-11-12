@@ -345,15 +345,17 @@ mod tests {
     }
 
     #[test]
-    fn tight_process_window_and_exact_scope_bound_original_host_roles() {
+    fn tight_process_item_window_and_exact_scope_bound_original_host_roles() {
+        // Item limits bound the original role counts; bytes still fit the
+        // actual method requests and the queue author's Q-hat windows.
         let transport = TransportBudget::new(
             2,
             10,
-            5,
+            novarocks_task_codec::TransportMessageLimits::DEFAULT,
             3,
-            20,
+            TransportBudget::DEFAULT.max_query_backend_queued_bytes(),
             6,
-            40,
+            TransportBudget::DEFAULT.max_backend_queued_bytes(),
             1,
             2,
             std::time::Duration::from_secs(1),

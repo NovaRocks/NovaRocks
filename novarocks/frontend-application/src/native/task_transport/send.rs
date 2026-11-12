@@ -417,8 +417,8 @@ pub(super) async fn send_operations_in(
 }
 
 #[cfg(test)]
-async fn fixture_apply_request<T: prost::Message + Send + 'static>(
-    grpc: &mut super::transport::AuthenticatedOperationTestGrpc,
+pub(super) async fn fixture_apply_request<T: prost::Message + Send + 'static>(
+    grpc: &mut crate::native::transport::AuthenticatedOperationTestGrpc,
     request: tonic::Request<T>,
     method: NativeRpcMethod,
     original_count: usize,

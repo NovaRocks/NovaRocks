@@ -120,6 +120,9 @@ pub(crate) struct TransportCapacityFacts {
     pub(crate) target_retained_bytes: usize,
     pub(crate) control_reserved_items: usize,
     pub(crate) control_reserved_bytes: usize,
+    pub(crate) batch_target_encoded_bytes: usize,
+    pub(crate) ordinary_request_max_bytes: usize,
+    pub(crate) control_request_max_bytes: usize,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct NativeTransportCapacity {
@@ -175,6 +178,9 @@ impl NativeTransportCapacity {
                 target_retained_bytes: target_bytes,
                 control_reserved_items: batch_items,
                 control_reserved_bytes: control_bytes,
+                batch_target_encoded_bytes: source.batch_target_encoded_bytes(),
+                ordinary_request_max_bytes: ordinary_request_bytes,
+                control_request_max_bytes: control_request_bytes,
             },
             process_limits,
             target_limits,
@@ -497,6 +503,18 @@ mod tests {
         assert_eq!(
             layout.facts.control_reserved_bytes,
             windows.control_reserved_bytes
+        );
+        assert_eq!(
+            layout.facts.batch_target_encoded_bytes,
+            source.batch_target_encoded_bytes()
+        );
+        assert_eq!(
+            layout.facts.ordinary_request_max_bytes,
+            windows.ordinary_request_max_bytes
+        );
+        assert_eq!(
+            layout.facts.control_request_max_bytes,
+            windows.control_request_max_bytes
         );
         let backend = backend(1);
         let above_target = source.batch_target_encoded_bytes() + 1;

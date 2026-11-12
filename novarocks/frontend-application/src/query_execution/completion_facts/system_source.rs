@@ -30,7 +30,7 @@ use crate::system_tables::{
     MaterializedViewInventory, PinnedCatalogListing, RowStage, StatementSystemTableSource,
     repository_error,
 };
-use crate::task_execution::status_intake::NotifyWake;
+use crate::wake::NotifyWake;
 use novarocks_mv_application::{
     freshness::{MvSourceObservation, MvSourceState},
     persistence::codec::RelationOccurrence,
