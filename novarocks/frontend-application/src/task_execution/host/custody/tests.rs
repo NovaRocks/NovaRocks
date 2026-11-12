@@ -603,6 +603,18 @@ impl WithdrawalInbox {
             self.reserve_standing(work),
         )
     }
+    pub(crate) fn retire_native_receipt_for_test(
+        &self,
+        receipt: &mut crate::task_execution::host::transport::NativeReceiptInput,
+    ) -> crate::task_execution::intent::OperationAcknowledgement {
+        let std::task::Poll::Ready(Some(retained)) = receipt.retire_ready_after_exit().unwrap()
+        else {
+            panic!("the original Native receipt and its reporter must have retired");
+        };
+        assert!(retained.unpublished.is_none());
+        retained.original
+    }
+
     pub(crate) fn assert_no_result(&self) {
         assert_eq!(
             self.runtime

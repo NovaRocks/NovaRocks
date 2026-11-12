@@ -17,7 +17,7 @@
 
 use super::tests::logical_execution_with_abort_port;
 use crate::{
-    control_runtime::transport_withdrawal::AttemptEffectEnvelope,
+    control_runtime::{actor::FrontendInput, transport_withdrawal::AttemptEffectEnvelope},
     native::task_transport::wire::{AttemptWireFacts, encode_operation},
     query_execution::{
         lifecycle_plan::QueryCredentialLeases, native_execution_adapter::LogicalAbortRouter,
@@ -26,11 +26,19 @@ use crate::{
         bridge::{
             abort::{AbortSettlementOwner, AttemptAbortIngress},
             qa::{AttemptQaBridge, AttemptQaReply},
+            terminal::{TerminalOutbox, TerminalPublication},
         },
+        error::TaskExecutionError as FrontendError,
         host::{
             adapter::tests::start,
             custody::tests::WithdrawalInbox,
-            transport::{AttemptEstablishMaterial, FrozenSendRequests, PreparedSendBatch},
+            publication::OriginalHostFailure,
+            transport::{AttemptEstablishMaterial, FrozenSendRequests, PreparedSendBatch, SendKey},
+        },
+        intent::{AckPayload, OperationAcknowledgement},
+        operation::{
+            IngressRejection as NativeIngressRejection,
+            OperationDispatchResult as NativeDispatchResult,
         },
         sources::AttemptEstablishFacts,
     },
@@ -43,35 +51,55 @@ use novarocks_attempt_protocol::{
     error::TaskExecutionError as ProtocolError,
     failure::AttemptFailure,
     input::{
-        AckPayload, AttemptInput, AttemptInputClaim, AttemptInputId, AttemptSourceCut,
-        AttemptSourceId, ExecutorFact, LocalDispatchResult, OperationObservation, OperationReply,
-        OperationReplyResult, PublicationApplied, QueuedInputGrantRef, SendGeneration,
+        AttemptInput, AttemptInputClaim, AttemptInputId, AttemptSourceCut, AttemptSourceId,
+        ExecutorFact, MembershipObservation, PublicationApplied, QueuedInputGrantRef,
+        SendGeneration,
     },
     operation::{IngressRejection, OperationDispatchResult},
     start::{AttemptSources, AttemptStart},
 };
-use novarocks_control_runtime::{actor_turn::InputPhase, transaction::RuntimeLedger};
+use novarocks_control_runtime::{
+    actor_turn::InputPhase,
+    transaction::{RuntimeLedger, ScopeHandle},
+};
 use novarocks_control_runtime_core::{
     capacity::{ReservationResources, ResourceVector},
-    identity::Generation,
+    identity::{Generation, InputId},
     mailbox::InputClass,
     scope::{WorkAdmission, WorkKind},
 };
 use novarocks_coordination_contract::{
-    AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision, AttemptIssueSettlement,
-    AttemptToLogicalBody, LogicalToAttemptBody, MonotonicInstant,
+    AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
+    AttemptAuthorizationFailure, AttemptAuthorizationRef, AttemptIssueSettlement,
+    AttemptRequestToken, AttemptTerminal, AttemptToLogicalBody, LogicalToAttemptBody,
+    MonotonicInstant,
 };
 use novarocks_execution_contract::{
     AbortCause, AdmissionTicketId, LeaseReceipt, OperationKind, OperationOutcome,
     ParticipationAdmissionTicketReceipt, ParticipationReceipt, ParticipationRef,
-    ParticipationState, TaskOperationId, operation::OperationResult,
+    ParticipationState, SafeDetail, TaskOperationId,
 };
-use novarocks_query_application::coordination::{
-    EstablishIssueError, EstablishIssueState, EstablishWorkerSettlement,
-    LogicalExecutionActorError, LogicalExecutionJoinReadiness,
+use novarocks_query_application::{
+    api::{NativeAttemptTerminal, ResultRowCarrier, ResultSchema},
+    coordination::{
+        EstablishIssueError, EstablishIssueState, EstablishWorkerSettlement,
+        LogicalExecutionActorConfig, LogicalExecutionActorError, LogicalExecutionJoinReadiness,
+        NativeAttemptDrive, ReplacementQualificationEffectAdmission,
+        ReplacementQualificationEffectPort, ReplacementQualificationRequest,
+    },
+    execution_error::ExecutionFailureSite,
+    test_support::LogicalExecutionTestHarness,
 };
+use novarocks_result_contract::{ClientRowProfile, RootOutputKind, RootProfileV1};
 use novarocks_types::BackendProcessId;
-use std::{num::NonZeroU64, sync::Arc, time::Duration};
+use novarocks_workload_control::{
+    ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+};
+use std::{
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 
 fn positive(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap()
@@ -119,26 +147,27 @@ impl Trace {
     }
 
     fn step(&mut self, source: AttemptSourceId, input: AttemptInput) -> AttemptStep {
-        let tail = (source == self.sources.native).then_some(self.sequence + 1);
-        self.step_with_native_tail(source, input, tail)
+        assert_ne!(source, self.sources.native);
+        self.sequence += 1;
+        self.step_at(source, input, AttemptInputId(positive(self.sequence)), None)
     }
 
-    fn step_with_native_tail(
+    fn step_at(
         &mut self,
         source: AttemptSourceId,
         input: AttemptInput,
-        tail: Option<u64>,
+        input_id: AttemptInputId,
+        tail: Option<AttemptInputId>,
     ) -> AttemptStep {
-        self.sequence += 1;
         self.core
             .handle(
                 self.now,
                 AttemptInputClaim {
                     source,
-                    input: AttemptInputId(positive(self.sequence)),
+                    input: input_id,
                     native_cut: Some(AttemptSourceCut {
                         source: self.sources.native,
-                        tail: tail.map(|id| AttemptInputId(positive(id))),
+                        tail,
                     }),
                     selected_cut: Some(AttemptSourceCut {
                         source: self.sources.observation,
@@ -149,6 +178,15 @@ impl Trace {
                 &mut Turn,
             )
             .unwrap()
+    }
+
+    fn native(&mut self, input: InputId, tail: InputId, fact: ExecutorFact) -> AttemptStep {
+        self.step_at(
+            self.sources.native,
+            AttemptInput::Executor(fact),
+            AttemptInputId(positive(input.get())),
+            Some(AttemptInputId(positive(tail.get()))),
+        )
     }
 
     fn drive(&mut self) -> AttemptStep {
@@ -242,14 +280,25 @@ impl Trace {
 
     fn observation(
         &mut self,
+        inbox: &WithdrawalInbox,
+        scope: &ScopeHandle,
         send: AttemptActionId,
         generation: SendGeneration,
-        operation: TaskOperationId,
-        kind: OperationKind,
         establish_started: Option<ParticipationRef>,
-        result: OperationReplyResult,
+        raw: OperationAcknowledgement,
     ) {
-        let tail = Some(self.sequence + if establish_started.is_some() { 3 } else { 2 });
+        let operation = raw.operation_id();
+        let (mut work, mut payer) = scope
+            .reserve_next(
+                Generation::new(1).unwrap(),
+                ReservationResources::work_only(),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
         let mut started = vec![ExecutorFact::SendStarted {
             effect: send,
             started_at: self.now,
@@ -262,24 +311,77 @@ impl Trace {
                 started_at: self.now,
             });
         }
-        for fact in started {
-            let turn =
-                self.step_with_native_tail(self.sources.native, AttemptInput::Executor(fact), tail);
+        let starters: Vec<_> = started
+            .into_iter()
+            .map(|fact| {
+                inbox
+                    .reserve_command(&work)
+                    .fill(FrontendInput::Attempt(Box::new(AttemptInput::Executor(
+                        fact,
+                    ))))
+                    .unwrap()
+            })
+            .collect();
+        let key = SendKey {
+            operation,
+            generation,
+        };
+        let mut receipt = inbox.reserve_native_receipt(&work, key, raw.kind());
+        receipt.record(key, raw.clone(), None, None).unwrap();
+        let report = receipt.submit().unwrap();
+        let runtime = inbox.runtime();
+        let actor = inbox.registration().actor();
+        let custody = runtime.input_custody(actor, report).unwrap().unwrap();
+        assert_eq!(custody.source, inbox.source());
+        assert_eq!(custody.class, InputClass::Lifecycle);
+        assert_eq!(custody.phase, InputPhase::Filled);
+        assert!(custody.standing_input_id.is_some());
+        for input in starters {
+            let turn = self.native(input, report, inbox.commit(input));
             assert!(turn.effect.is_none(), "{turn:?}");
             assert_eq!(turn.selection, InputSelection::Only(self.sources.native));
+            runtime.retire_input(actor, input).unwrap();
         }
         assert!(self.pending.is_none());
-        self.pending = Some(self.step(
-            self.sources.native,
-            AttemptInput::Executor(ExecutorFact::Operation(OperationObservation {
-                generation,
-                reply: OperationReply {
-                    operation_id: operation,
-                    kind,
-                    result,
-                },
-            })),
-        ));
+        let fact = inbox.commit(report);
+        assert_eq!(
+            runtime.input_custody(actor, report).unwrap().unwrap().phase,
+            InputPhase::Committed,
+        );
+        self.pending = Some(self.native(report, report, fact));
+        runtime.retire_input(actor, report).unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        let retained = inbox.retire_native_receipt_for_test(&mut receipt);
+        assert_eq!(retained, raw);
+        payer.finish().unwrap();
+        assert!(runtime.input_custody(actor, report).unwrap().is_none());
+    }
+
+    fn process_sample(
+        &mut self,
+        effect: AttemptEffect,
+        participation: ParticipationRef,
+        observation: MembershipObservation,
+    ) -> (AttemptRequestToken, AttemptStep) {
+        let EffectBody::ObserveProcess {
+            request,
+            participation: original,
+        } = effect.body
+        else {
+            panic!("expected an exact original process observation: {effect:?}");
+        };
+        assert_eq!(original, participation);
+        let step = self.step(
+            self.sources.process,
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request,
+                participation,
+                sampled_at: self.now,
+                observation,
+            }),
+        );
+        (request, step)
     }
 
     fn assert_dispatch_rejected(&mut self, kind: OperationKind) {
@@ -299,28 +401,92 @@ impl Trace {
     }
 }
 
-fn local(result: LocalDispatchResult) -> OperationReplyResult {
-    OperationReplyResult::Local {
-        result,
-        failure: None,
-        protocol_failure: None,
-        detail: None,
+fn waiting_capacity(operation: TaskOperationId, kind: OperationKind) -> OperationAcknowledgement {
+    OperationAcknowledgement::from_dispatch_result(
+        operation,
+        kind,
+        NativeDispatchResult::IngressRejected(NativeIngressRejection::WaitingCapacity),
+        AckPayload::None,
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Case {
+    EstablishIdempotentReplay,
+    EstablishReplayIdentityMismatch,
+    EstablishReplayBudgetExhausted,
+    EstablishWaitingCapacity,
+    AdmissionUnknownThenWaitingCapacity,
+}
+
+#[derive(Debug)]
+struct NoSuccessor(tokio::sync::watch::Sender<u64>);
+
+impl ReplacementQualificationEffectPort for NoSuccessor {
+    fn subscribe_capacity(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.0.subscribe()
+    }
+
+    fn try_reserve(
+        &self,
+        _: &ReplacementQualificationRequest,
+    ) -> ReplacementQualificationEffectAdmission {
+        panic!("these Native observation cuts must not start a successor")
     }
 }
 
-fn applied(outcome: OperationOutcome, acknowledgement: AckPayload) -> OperationReplyResult {
-    OperationReplyResult::Worker(OperationResult::Verdict {
-        outcome,
-        detail: None,
-        acknowledgement: Some(acknowledgement),
-    })
-}
-
-#[derive(Clone, Copy)]
-enum Case {
-    EstablishIdempotentReplay,
-    EstablishWaitingCapacity,
-    AdmissionUnknownThenWaitingCapacity,
+async fn recovery_actor(
+    participation: ParticipationRef,
+    router: Arc<LogicalAbortRouter>,
+) -> (LogicalExecutionTestHarness, NativeAttemptDrive) {
+    let workload = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 20,
+            control_bytes: 1 << 12,
+            per_scope_bytes: 1 << 18,
+        },
+    )
+    .unwrap();
+    workload.mark_ready().unwrap();
+    let work = workload
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let stage = work.owner.scope().try_acquire(Stage::Execution).unwrap();
+    let profile = ClientRowProfile::try_new(
+        RootProfileV1::SEGMENT_BYTES,
+        RootProfileV1::ROW_PAYLOAD_BYTES,
+    )
+    .unwrap();
+    let execution = participation.query_execution_id();
+    let two = NonZeroUsize::new(2).unwrap();
+    let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
+        execution,
+        two,
+        vec![participation],
+        two,
+        two,
+        NonZeroU32::new(2).unwrap(),
+        Arc::new(NoSuccessor(tokio::sync::watch::channel(0).0)),
+        work.owner,
+        stage,
+        Duration::from_secs(30),
+        ResultSchema::new(Vec::new()),
+        NonZeroUsize::MIN,
+        ResultRowCarrier::relayed(RootOutputKind::ClientRows, Some(profile)).unwrap(),
+    )
+    .unwrap()
+    .with_abort_participation_effect_port(router, two);
+    let mut logical = LogicalExecutionTestHarness::install(
+        tokio::runtime::Handle::current(),
+        config,
+        execution,
+        vec![participation],
+    )
+    .unwrap();
+    logical.activate_initial().await.unwrap();
+    let drive = logical.native_attempt_drive();
+    (logical, drive)
 }
 
 async fn run_original_authority(case: Case) {
@@ -330,8 +496,21 @@ async fn run_original_authority(case: Case) {
     let route = router
         .reserve_route(participation.query_execution_id())
         .unwrap();
-    let (mut logical, drive) =
-        logical_execution_with_abort_port(participation, router.clone()).await;
+    let (mut logical, drive) = if matches!(
+        case,
+        Case::EstablishReplayIdentityMismatch | Case::EstablishReplayBudgetExhausted
+    ) {
+        recovery_actor(participation, router.clone()).await
+    } else {
+        logical_execution_with_abort_port(participation, router.clone()).await
+    };
+    let generation = Generation::new(1).unwrap();
+    let ledger = RuntimeLedger::new(ResourceVector::default());
+    let scope = ledger.open_scope_next(None, generation).unwrap();
+    let inbox = WithdrawalInbox::new(&scope);
+    // Align the paid reporter Source with this Core's Native role.
+    std::mem::swap(&mut frozen.sources.native, &mut frozen.sources.publication);
+    assert_eq!(frozen.sources.native.0.get(), inbox.source().get());
     let activation = drive.identity();
     frozen.activation.identity = activation;
     frozen.plan.authorization_limits = drive.authorization_limits();
@@ -380,11 +559,6 @@ async fn run_original_authority(case: Case) {
     let (first, first_generation) = trace.dispatch(queue, 71);
     let admission_operation = admission.envelope().operation_id();
     let admission_kind = OperationKind::AcquireParticipationAdmissionTicket;
-    let refusal = || {
-        local(LocalDispatchResult::IngressRejected(
-            IngressRejection::WaitingCapacity,
-        ))
-    };
     let prepared_wire = |send| {
         let prepared =
             PreparedSendBatch::resolve(AttemptEffectEnvelope::new(send), &requests).unwrap();
@@ -398,16 +572,19 @@ async fn run_original_authority(case: Case) {
         participation,
         admission.valid_for(),
     );
+    let ticket_horizon = trace.now.saturating_add(ticket.valid_for().get());
     trace.observation(
+        &inbox,
+        &scope,
         first.id,
         first_generation,
-        admission_operation,
-        admission_kind,
         None,
         if replay_admission {
-            local(LocalDispatchResult::TransportUnknown)
+            OperationAcknowledgement::transport_unknown(admission_operation, admission_kind)
         } else {
-            applied(
+            OperationAcknowledgement::worker_receipt(
+                admission_operation,
+                admission_kind,
                 OperationOutcome::Accepted,
                 AckPayload::AdmissionTicket(ticket),
             )
@@ -419,12 +596,12 @@ async fn run_original_authority(case: Case) {
         assert!(second_generation > first_generation);
         assert_eq!(prepared_wire(first), prepared_wire(second.clone()));
         trace.observation(
+            &inbox,
+            &scope,
             second.id,
             second_generation,
-            admission_operation,
-            admission_kind,
             None,
-            refusal(),
+            waiting_capacity(admission_operation, admission_kind),
         );
     }
     let EffectBody::Port(settlement) = trace.effect().body else {
@@ -498,17 +675,17 @@ async fn run_original_authority(case: Case) {
         assert!(reply.failure.is_none());
         let queue = trace.reply(reply).effect.unwrap();
         let (first, generation) = trace.dispatch(queue, 73);
-        let replay_establish = matches!(case, Case::EstablishIdempotentReplay);
+        let replay_establish = case != Case::EstablishWaitingCapacity;
         trace.observation(
+            &inbox,
+            &scope,
             first.id,
             generation,
-            operation_id,
-            kind,
             Some(participation),
             if replay_establish {
-                local(LocalDispatchResult::TransportUnknown)
+                OperationAcknowledgement::transport_unknown(operation_id, kind)
             } else {
-                refusal()
+                waiting_capacity(operation_id, kind)
             },
         );
         let settle = async |trace: &mut Trace, bridge: &mut AttemptQaBridge, guard, expected| {
@@ -570,44 +747,113 @@ async fn run_original_authority(case: Case) {
             let (second, second_generation) = trace.dispatch(queue, 74);
             assert!(second_generation > generation);
             assert_eq!(prepared_wire(first), prepared_wire(second.clone()));
-            let ProtocolIntent::EstablishParticipation {
-                initial_lease_sequence,
-                initial_lease_valid_for,
-                ..
-            } = operation
-            else {
-                panic!("expected frozen Establish lease");
+            trace.now = trace.now.saturating_add(Duration::from_secs(1));
+            let settlement = match case {
+                Case::EstablishReplayBudgetExhausted => {
+                    trace.observation(
+                        &inbox,
+                        &scope,
+                        second.id,
+                        second_generation,
+                        Some(participation),
+                        OperationAcknowledgement::transport_unknown(operation_id, kind),
+                    );
+                    let unknown = settle(
+                        &mut trace,
+                        &mut bridge,
+                        second_guard,
+                        AttemptIssueSettlement::TransportUnknown,
+                    )
+                    .await;
+                    assert!(unknown.effect.is_none());
+                    finish_exhausted_replay(
+                        &mut trace,
+                        &mut bridge,
+                        participation,
+                        operation_id,
+                        ticket_horizon,
+                        [first_guard, second_guard],
+                    )
+                    .await;
+                    None
+                }
+                Case::EstablishReplayIdentityMismatch => {
+                    let raw = OperationAcknowledgement::worker_receipt(
+                        operation_id,
+                        kind,
+                        OperationOutcome::IdentityMismatch,
+                        AckPayload::None,
+                    )
+                    .with_detail(Some(SafeDetail::truncating(
+                        "original Establish replay identity mismatch",
+                    )));
+                    let rejection = raw.worker_header().unwrap();
+                    trace.observation(
+                        &inbox,
+                        &scope,
+                        second.id,
+                        second_generation,
+                        Some(participation),
+                        raw,
+                    );
+                    Some((OperationOutcome::IdentityMismatch, Some(rejection)))
+                }
+                Case::EstablishIdempotentReplay => {
+                    let ProtocolIntent::EstablishParticipation {
+                        initial_lease_sequence,
+                        initial_lease_valid_for,
+                        ..
+                    } = operation
+                    else {
+                        panic!("expected frozen Establish lease");
+                    };
+                    let receipt =
+                        ParticipationReceipt::new(participation, ParticipationState::Active)
+                            .with_lease(LeaseReceipt::new(
+                                initial_lease_sequence,
+                                initial_lease_valid_for,
+                                initial_lease_valid_for.get(),
+                            ));
+                    trace.observation(
+                        &inbox,
+                        &scope,
+                        second.id,
+                        second_generation,
+                        Some(participation),
+                        OperationAcknowledgement::worker_receipt(
+                            operation_id,
+                            kind,
+                            OperationOutcome::Idempotent,
+                            AckPayload::Participation(receipt),
+                        ),
+                    );
+                    // Applied Establish opens this Source before the original QA settlements.
+                    assert!(matches!(
+                        trace.effect().body,
+                        EffectBody::OpenSubscription(request) if request.participation == participation
+                    ));
+                    Some((OperationOutcome::Idempotent, None))
+                }
+                _ => unreachable!("the original Establish replay cases"),
             };
-            let receipt = ParticipationReceipt::new(participation, ParticipationState::Active)
-                .with_lease(LeaseReceipt::new(
-                    initial_lease_sequence,
-                    initial_lease_valid_for,
-                    initial_lease_valid_for.get(),
-                ));
-            trace.observation(
-                second.id,
-                second_generation,
-                operation_id,
-                kind,
-                Some(participation),
-                applied(
-                    OperationOutcome::Idempotent,
-                    AckPayload::Participation(receipt),
-                ),
-            );
-            // The applied Establish opens the original observation source
-            // before the round settles QA. Leave that request pending here.
-            assert!(matches!(
-                trace.effect().body,
-                EffectBody::OpenSubscription(request) if request.participation == participation
-            ));
-            // The one definitive operation receipt settles both retained QA
-            // guards, in original observer order. It is not a second receipt.
-            let settlement = AttemptIssueSettlement::Worker(OperationOutcome::Idempotent);
-            let late = settle(&mut trace, &mut bridge, first_guard, settlement).await;
-            assert_eq!(late.retired_authorization, None);
-            let current = settle(&mut trace, &mut bridge, second_guard, settlement).await;
-            assert_eq!(current.retired_authorization, Some(operation_id));
+            if let Some((outcome, rejection)) = settlement {
+                // One definitive receipt settles the original late guard and current guard.
+                let settlement = AttemptIssueSettlement::Worker(outcome);
+                let late = settle(&mut trace, &mut bridge, first_guard, settlement).await;
+                assert_eq!(late.retired_authorization, None);
+                let current = settle(&mut trace, &mut bridge, second_guard, settlement).await;
+                assert_eq!(current.retired_authorization, Some(operation_id));
+                if let Some(rejection) = rejection {
+                    finish_fenced_replay(
+                        &mut trace,
+                        &mut bridge,
+                        participation,
+                        operation_id,
+                        rejection,
+                    )
+                    .await;
+                }
+            }
         } else {
             let refused = settle(
                 &mut trace,
@@ -619,17 +865,27 @@ async fn run_original_authority(case: Case) {
             assert_eq!(refused.retired_authorization, Some(operation_id));
             trace.assert_dispatch_rejected(kind);
         }
-        let expected = if replay_establish {
-            EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
-        } else {
-            EstablishIssueState::PreWorkerRejected
+        let expected = match case {
+            Case::EstablishIdempotentReplay => {
+                EstablishIssueState::WorkerSettled(EstablishWorkerSettlement::Applied)
+            }
+            Case::EstablishReplayIdentityMismatch => EstablishIssueState::WorkerSettled(
+                EstablishWorkerSettlement::Rejected(OperationOutcome::IdentityMismatch),
+            ),
+            Case::EstablishReplayBudgetExhausted => EstablishIssueState::TransportUnknown,
+            Case::EstablishWaitingCapacity => EstablishIssueState::PreWorkerRejected,
+            Case::AdmissionUnknownThenWaitingCapacity => unreachable!("no Establish was attempted"),
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(snapshot) = logical.establish_snapshot(participation).await.unwrap()
                     && snapshot.state() == expected
                 {
-                    assert_eq!(snapshot.identity().unwrap().operation_id(), operation_id);
+                    let exact = snapshot.identity().unwrap();
+                    assert_eq!(exact.operation_id(), operation_id);
+                    assert_eq!(exact.participation(), participation);
+                    assert_eq!(exact.activation(), activation);
+                    assert_eq!(snapshot.ticket(), ticket);
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -640,10 +896,6 @@ async fn run_original_authority(case: Case) {
     }
 
     drop(bridge);
-    let generation = Generation::new(1).unwrap();
-    let ledger = RuntimeLedger::new(ResourceVector::default());
-    let scope = ledger.open_scope_next(None, generation).unwrap();
-    let inbox = WithdrawalInbox::new(&scope);
     let (mut work, mut payer) = scope
         .reserve_next(
             generation,
@@ -740,6 +992,195 @@ async fn run_original_authority(case: Case) {
     inbox.finish();
     ledger.remove_scope(scope.id()).unwrap();
     assert!(ledger.is_empty());
+}
+
+async fn publish_failure(
+    trace: &mut Trace,
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    original: Option<(
+        novarocks_attempt_protocol::failure::HostFailureRef,
+        FrontendError,
+    )>,
+) -> novarocks_query_application::api::NativeAttemptPreparationFailure {
+    let EffectBody::Port(port) = trace.effect().body else {
+        panic!("the original terminal follows the completed recovery observation");
+    };
+    assert_eq!(port.activation, activation);
+    assert!(matches!(
+        port.body,
+        AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(_))
+    ));
+    let outbox = TerminalOutbox::new(activation);
+    let mut publication = TerminalPublication::new(port);
+    if let Some((reference, failure)) = original {
+        assert_eq!(publication.host_reference(), Some(reference));
+        publication.attach_host_failure(reference, OriginalHostFailure::Task(failure));
+    } else {
+        assert!(publication.host_reference().is_none());
+    }
+    assert!(outbox.publish(Box::new(publication)).is_ok());
+    let NativeAttemptTerminal::Failed(failure) = outbox.terminal().await.unwrap() else {
+        panic!("replay recovery cannot become success");
+    };
+    failure
+}
+
+async fn finish_fenced_replay(
+    trace: &mut Trace,
+    bridge: &mut AttemptQaBridge,
+    participation: ParticipationRef,
+    operation_id: TaskOperationId,
+    rejection: novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>,
+) {
+    let original =
+        AttemptFailure::TaskProtocol(Box::new(ProtocolError::PreReadyEstablishRejected {
+            participation,
+            operation_id,
+            rejection: rejection.clone(),
+        }));
+    let expected = FrontendError::PreReadyEstablishRejected {
+        participation,
+        operation_id,
+        rejection,
+    }
+    .preparation_input();
+    let round = trace.drive();
+    assert_eq!(round.round_result, Some(Err(original.clone())));
+    let effect = round.effect.unwrap_or_else(|| trace.effect());
+    let EffectBody::Port(permission) = effect.body else {
+        panic!("the exact replay refusal requests QA replacement permission");
+    };
+    assert!(matches!(
+        &permission.body,
+        AttemptToLogicalBody::PreReadyReplacementQuery { refusal, .. } if refusal == &original
+    ));
+    let reply = bridge.handle_port(&permission).await.unwrap();
+    assert!(reply.failure.is_none());
+    assert!(matches!(
+        reply.reply.body,
+        LogicalToAttemptBody::PreReadyReplacementReply {
+            may_observe: true,
+            ..
+        }
+    ));
+    let sample = trace
+        .reply(reply)
+        .effect
+        .expect("positive QA permission opens the exact process sample");
+    let replacement = BackendProcessId::new_v7();
+    assert_ne!(replacement, participation.backend_process_id());
+    let (_, observed) = trace.process_sample(
+        sample,
+        participation,
+        MembershipObservation::ExactReplacement(replacement),
+    );
+    assert!(trace.pending.is_none());
+    trace.pending = Some(observed);
+    let failure = publish_failure(trace, permission.activation, None).await;
+    assert_eq!(failure.input(), &expected);
+    let witness = failure.pre_ready_replacement().unwrap();
+    assert_eq!(witness.participation(), participation);
+    assert_eq!(witness.operation_id(), operation_id);
+    assert_eq!(witness.replacement_process(), replacement);
+}
+
+async fn finish_exhausted_replay(
+    trace: &mut Trace,
+    bridge: &mut AttemptQaBridge,
+    participation: ParticipationRef,
+    operation_id: TaskOperationId,
+    horizon: MonotonicInstant,
+    guards: [AttemptAuthorizationRef; 2],
+) {
+    let EffectBody::Port(port) = trace.effect().body else {
+        panic!("the third carrier must ask the original QA budget before admission");
+    };
+    assert!(matches!(
+        port.body,
+        AttemptToLogicalBody::AuthorizationRequest {
+            request: AttemptAuthorization::ReauthorizeEstablish { participation: exact, operation_id: operation },
+            ..
+        } if (exact, operation) == (participation, operation_id)
+    ));
+    let mut reply = bridge.handle_port(&port).await.unwrap();
+    let original = reply.failure.take().expect("original QA budget failure");
+    assert!(matches!(
+        original.1,
+        FrontendError::Actor(LogicalExecutionActorError::Establish(
+            EstablishIssueError::AuthorizationBudgetExhausted,
+        ))
+    ));
+    let LogicalToAttemptBody::AuthorizationReply {
+        decision:
+            Err(AttemptAuthorizationFailure::EstablishBudgetExhausted(AttemptFailure::Host(projected))),
+        ..
+    } = &reply.reply.body
+    else {
+        panic!("real QA budget refusal retains its original Host error");
+    };
+    assert_eq!(projected.original, original.0);
+    let exhausted = trace.reply(reply);
+    assert!(exhausted.effect.is_none());
+    let first = trace.effect();
+    let (earlier, waiting) =
+        trace.process_sample(first, participation, MembershipObservation::Unobserved);
+    assert!(waiting.effect.is_none() && !waiting.stop_producing);
+    assert_eq!(
+        waiting.selection,
+        InputSelection::Prefer(trace.sources.native)
+    );
+    assert!(trace.now < horizon);
+    assert_eq!(trace.core.next_deadline(), Some(horizon));
+
+    trace.now = horizon;
+    let final_sample = trace.effect();
+    let (actual, observed) = trace.process_sample(
+        final_sample,
+        participation,
+        MembershipObservation::ExactOriginal,
+    );
+    assert_ne!(actual, earlier);
+    assert!(observed.effect.is_none());
+
+    for guard in guards {
+        let EffectBody::Port(detach) = trace.effect().body else {
+            panic!("the same original late guards must detach before terminal");
+        };
+        assert!(
+            matches!(detach.body, AttemptToLogicalBody::DetachEstablish {
+            authorization, participation: exact, operation_id: operation, ..
+        } if (authorization, exact, operation) == (guard, participation, operation_id))
+        );
+        let reply = bridge.handle_port(&detach).await.unwrap();
+        assert!(reply.failure.is_none());
+        assert!(matches!(reply.reply.body,
+            LogicalToAttemptBody::EstablishDetachReply { authorization, result: Ok(()), .. }
+            if authorization == guard));
+        let applied = trace.reply(reply);
+        assert!(applied.effect.is_none());
+    }
+
+    let failure = publish_failure(trace, port.activation, Some(original)).await;
+    let backend = participation.backend_process_id();
+    assert_eq!(
+        failure.input(),
+        &FrontendError::PreReadyEstablishTransportUnknown { backend }.preparation_input()
+    );
+    assert_eq!(
+        failure.input().site(),
+        ExecutionFailureSite::Backend { process: backend }
+    );
+    assert!(failure.pre_ready_replacement().is_none());
+}
+
+#[tokio::test]
+async fn original_establish_replay_identity_mismatch_keeps_exact_replacement_fence() {
+    run_original_authority(Case::EstablishReplayIdentityMismatch).await;
+}
+
+#[tokio::test]
+async fn original_establish_unknown_replay_exhausts_real_qa_budget_at_original_ticket_horizon() {
+    run_original_authority(Case::EstablishReplayBudgetExhausted).await;
 }
 
 #[tokio::test]
