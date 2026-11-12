@@ -224,6 +224,61 @@ async fn fe_without_state_store_fails_before_durable_services_open() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_metrics_sample_the_installed_control_ledger_and_omit_it_after_exit() {
+    use crate::{
+        metrics::{FrontendMetricsRegistry, render_metrics},
+        task_execution::host::observations::{
+            ObservationBudget,
+            backing::{OBSERVATION_BACKING_BYTES, ObservationBackingQuote},
+            credits::OBSERVATION_WINDOW_BYTES,
+        },
+    };
+
+    let mut host = open_host(Some(state_store_input())).await.unwrap();
+    let registry = {
+        let runtime = host.attempt_runtime();
+        let capacity = runtime
+            .ledger()
+            .try_capacity_dimensions([OBSERVATION_WINDOW_BYTES, OBSERVATION_BACKING_BYTES])
+            .unwrap()
+            .unwrap();
+        let scope_limit = host
+            .execution_runtime_owner
+            .native_capacity_profile
+            .policy()
+            .scope_limit();
+        let budget = ObservationBudget::for_task_attempt();
+        assert_eq!(
+            capacity.limits[0],
+            scope_limit as u64 * budget.total_bytes as u64
+        );
+        let backing_limit = ObservationBackingQuote::process_limit(
+            budget,
+            std::num::NonZeroUsize::new(scope_limit).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            capacity.limits[1],
+            backing_limit.get(OBSERVATION_BACKING_BYTES)
+        );
+        assert_eq!(capacity.used, [0, 0]);
+        FrontendMetricsRegistry::with_role_observations(None, Some(&runtime)).unwrap()
+    };
+    let running = render_metrics(&registry).unwrap();
+    host.shutdown().await.unwrap();
+    drop(host);
+    let exited = render_metrics(&registry).unwrap();
+    let availability =
+        r#"novarocks_frontend_control_runtime_observation_available{source="transport_process"}"#;
+    assert!(running.contains(&format!("{availability} 1")));
+    assert!(running.contains(
+        r#"novarocks_frontend_control_runtime_transport_process{dimension="1",resource="used"} 0"#
+    ));
+    assert!(exited.contains(&format!("{availability} 0")));
+    assert!(!exited.contains("novarocks_frontend_control_runtime_transport_process{"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn original_process_health_blocks_ready_and_triggers_running_host_observation() {
     #[derive(Debug)]
     struct OriginalCause;
@@ -265,6 +320,14 @@ async fn original_process_health_blocks_ready_and_triggers_running_host_observat
 async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_drain() {
     use novarocks_workload_control::{WorkClass, WorkRequest};
     let mut host = open_host(Some(state_store_input())).await.unwrap();
+    let scope_limit = host
+        .execution_runtime_owner
+        .native_capacity_profile
+        .policy()
+        .scope_limit();
+    host.data_runtime
+        .install_original_subscription_reaper(scope_limit)
+        .unwrap();
     host.install_statement_control_for_test();
     host.mark_ready().unwrap();
     let root = host
@@ -277,6 +340,7 @@ async fn failed_original_subscription_reaper_cannot_strand_the_host_workload_dra
     let lease = host
         .data_runtime
         .subscription_port()
+        .unwrap()
         .reserve(&root.owner.scope(), None, None)
         .unwrap()
         .start(std::future::pending())
@@ -369,6 +433,14 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     let mut host = open_host(Some(state_store_input()))
         .await
         .expect("test StateStore host must open");
+    let control = host.control_runtime.as_ref().expect("role control runtime");
+    let running = control.shutdown_snapshot();
+    assert!(!running.pollers_joined && !running.membership_joined);
+    let attempts = control.attempts();
+    assert_eq!(
+        attempts.transport_capacity().transport_budget(),
+        host.data_runtime.transport_capacity().transport_budget()
+    );
 
     let store = host
         .state_store()
@@ -386,6 +458,8 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
     host.shutdown()
         .await
         .expect("SQLite host shutdown must succeed");
+    assert!(host.control_runtime.is_none());
+    assert!(attempts.actor_runtime().is_empty() && attempts.ledger().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

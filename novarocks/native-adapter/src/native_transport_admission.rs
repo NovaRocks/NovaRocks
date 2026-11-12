@@ -561,7 +561,10 @@ impl NativeTransportAdmission {
             .closed
     }
 
-    pub(crate) fn frontend_outgoing_notified(&self) -> tokio::sync::futures::OwnedNotified {
+    /// Read-only readiness hint from actual original outgoing permit exits or
+    /// close. Notification grants no dial/call position; callers retry the
+    /// same typed admission transaction after registering before its attempt.
+    pub fn frontend_outgoing_notified(&self) -> tokio::sync::futures::OwnedNotified {
         Arc::clone(&self.core.frontend_outgoing_changed).notified_owned()
     }
 

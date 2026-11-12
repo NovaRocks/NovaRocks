@@ -731,6 +731,7 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
 /// The running permit remains private to the Supervisor. This capability has
 /// no terminal or result-delivery authority and becomes stale when that permit
 /// is consumed.
+#[derive(Clone)]
 pub struct NativeAttemptDrive {
     authority: RunningAttemptDriveAuthority,
 }
@@ -755,6 +756,14 @@ impl NativeAttemptDrive {
         self.authority.identity()
     }
 
+    /// Original activation-time configuration for metadata pricing. This
+    /// historical fact needs no actor query and grants no live/retry authority.
+    pub fn authorization_limits(
+        &self,
+    ) -> novarocks_coordination_contract::AttemptAuthorizationLimits {
+        self.authority.authorization_limits()
+    }
+
     /// Ask the current logical owner whether this exact refusal may wait for
     /// independent process-replacement evidence within its ORIGINAL horizon.
     /// A positive answer grants no retry, topology, terminal, or exit authority;
@@ -767,6 +776,16 @@ impl NativeAttemptDrive {
         self.authority
             .may_observe_pre_ready_replacement(refusal)
             .await
+    }
+
+    /// Atomically observe the same current QA policy and register its changes.
+    /// The receiver carries hints only; callers re-query before each continued
+    /// process observation. Only original predicate changes notify it.
+    pub async fn observe_pre_ready_replacement(
+        &self,
+        refusal: &crate::execution_error::ExecutionFailureInput,
+    ) -> Result<super::PreReadyReplacementObservation, LogicalExecutionActorError> {
+        self.authority.observe_pre_ready_replacement(refusal).await
     }
 
     pub async fn begin_admission_issue(

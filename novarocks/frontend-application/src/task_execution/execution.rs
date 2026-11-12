@@ -33,7 +33,7 @@ use crate::task_execution::completion_facts::parent_released_children;
 use crate::task_execution::conclusion::{LatchOutcome, TerminationLatch};
 use crate::task_execution::operation::OperationDispatchResult;
 use crate::task_execution::status_validation::GoneObservation;
-use crate::task_protocol_config::DispatchBudget;
+use novarocks_attempt_protocol::config::DispatchBudget;
 use novarocks_coordination_contract::{MonotonicInstant, StatusObservation};
 use novarocks_execution::task_execution::{
     AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind, ParticipationRef,
@@ -44,7 +44,6 @@ use novarocks_execution::task_execution::{
     ParticipationConvergenceCursor, ParticipationConvergenceReceipt, QuiesceParticipationReceipt,
     TaskConvergenceCursor, TaskConvergenceReceipt,
 };
-use novarocks_query_application::coordination::ReplacementWorkerAdmissionEvidence;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
@@ -54,7 +53,6 @@ use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
 use novarocks_coordination_contract::MonotonicClock;
-use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::AcceptedRootControlRequest;
 use novarocks_types::identity::BackendProcessId;
 
@@ -68,6 +66,7 @@ use super::intent::{
 use super::participation_owner::{
     ParticipationEstablishSource, ParticipationOwner, ReleaseSettlement,
 };
+use super::profile_diagnostics::ReleasedRuntimeFilterContributions;
 use super::remote_task::{
     CreateSettlement, RemoteTask, TaskTerminalReport, UpdateAdmission, UpdateSettlement,
 };
@@ -294,38 +293,6 @@ pub struct StatusReport {
     /// The first success-seal request in the same intake order. Entries after
     /// it remain queued as residual status work.
     pub root_control: Option<AcceptedRootControlRequest>,
-}
-
-/// The release-carried runtime-filter contributions of one attempt.
-///
-/// The observable supply point of this loop: `contributions().len()` against
-/// `participations()` says whether the carrier is being fed at all. A query that ran
-/// runtime filters and reports zero contributions over three participations is a
-/// carrier that is not wired, which no per-part test can show.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReleasedRuntimeFilterContributions {
-    contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
-    complete: bool,
-    #[cfg(test)]
-    participations: usize,
-}
-
-impl ReleasedRuntimeFilterContributions {
-    pub fn contributions(
-        &self,
-    ) -> &[(BackendProcessId, QueryTerminalProfileContributionTelemetry)] {
-        &self.contributions
-    }
-
-    /// Whether every participation this attempt placed has answered its release.
-    pub const fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    #[cfg(test)]
-    pub const fn participations(&self) -> usize {
-        self.participations
-    }
 }
 
 /// The task protocol of one query execution attempt.
@@ -639,34 +606,6 @@ impl QueryTaskExecution {
         })
     }
 
-    /// Installs the complete admission set acquired by a qualified
-    /// replacement. Missing, duplicate, or foreign evidence is rejected
-    /// before the first Task-protocol turn.
-    pub(crate) fn adopt_replacement_admissions(
-        &mut self,
-        admissions: &[ReplacementWorkerAdmissionEvidence],
-    ) -> Result<(), TaskExecutionError> {
-        let expected = self.owners.keys().copied().collect::<BTreeSet<_>>();
-        let actual = admissions
-            .iter()
-            .map(ReplacementWorkerAdmissionEvidence::participation)
-            .collect::<BTreeSet<_>>();
-        if admissions.len() != actual.len() || actual != expected {
-            return Err(TaskExecutionError::Schedule(
-                "qualified replacement admission set differs from the Task manifest participations"
-                    .to_owned(),
-            ));
-        }
-        let now = self.clock.now();
-        for admission in admissions.iter() {
-            self.owners
-                .get_mut(&admission.participation())
-                .expect("the complete replacement admission set was validated")
-                .adopt_replacement_admission(admission.receipt(), now)?;
-        }
-        Ok(())
-    }
-
     pub const fn graph(&self) -> &TaskGraph {
         &self.graph
     }
@@ -767,9 +706,8 @@ impl QueryTaskExecution {
     /// it is what stops an outstanding release from reading as an absent
     /// filter.
     pub fn released_runtime_filter_contributions(&self) -> ReleasedRuntimeFilterContributions {
-        ReleasedRuntimeFilterContributions {
-            contributions: self
-                .owners
+        ReleasedRuntimeFilterContributions::from_selected_diagnostics(
+            self.owners
                 .iter()
                 .filter_map(|(participation, owner)| {
                     owner
@@ -777,10 +715,9 @@ impl QueryTaskExecution {
                         .map(|telemetry| (participation.backend_process_id(), telemetry.clone()))
                 })
                 .collect(),
-            complete: self.owners.values().all(ParticipationOwner::is_released),
-            #[cfg(test)]
-            participations: self.owners.len(),
-        }
+            self.owners.values().all(ParticipationOwner::is_released),
+            self.owners.len(),
+        )
     }
 
     pub(crate) const fn accepted_protocol_revision(&self) -> u64 {

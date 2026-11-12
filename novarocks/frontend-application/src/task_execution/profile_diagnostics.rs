@@ -17,24 +17,28 @@
 
 //! The original asynchronous final-info collector, independent of business readiness.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+#[cfg(test)]
 use crate::query_execution::split_assignment_round::{
     SplitAssignmentProfileRead, SplitAssignmentProfileSource,
 };
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
-use super::{
-    completion::accept_final_info, graph::TaskNode, round::TaskRound,
-    status_intake::StatusIntakeWake,
-};
-use crate::native::task_result_transport::{FinalTaskInfoRead, TaskResultTransport};
+use super::graph::{TaskGraph, TaskNode};
+#[cfg(test)]
+use super::{completion::accept_final_info, round::TaskRound};
+#[cfg(test)]
+use crate::native::task_result_transport::FinalTaskInfoRead;
+use crate::native::task_result_transport::TaskResultTransport;
+use crate::wake::StatusIntakeWake;
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution_contract::{FinalTaskInfo, OperationOutcome, TaskIdentity};
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::api::ComputationReadyToken;
+use novarocks_types::BackendProcessId;
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,11 +76,63 @@ pub(crate) enum ProfileSplitDiagnostic {
     Missing(ProfileSplitDiagnosticMissing),
 }
 
+/// The release-carried runtime-filter contributions of one attempt.
+///
+/// The observable supply point of this loop: `contributions().len()` against
+/// `participations()` says whether the carrier is being fed at all. A query that ran
+/// runtime filters and reports zero contributions over three participations is a
+/// carrier that is not wired, which no per-part test can show.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReleasedRuntimeFilterContributions {
+    contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
+    complete: bool,
+    #[cfg(test)]
+    participations: usize,
+}
+
+impl ReleasedRuntimeFilterContributions {
+    /// Assemble only previously selected canonical diagnostic rows. The caller
+    /// resolves them under the original Source's admitted publication work.
+    pub(crate) fn from_selected_diagnostics(
+        contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
+        complete: bool,
+        _participations: usize,
+    ) -> Self {
+        Self {
+            contributions,
+            complete,
+            #[cfg(test)]
+            participations: _participations,
+        }
+    }
+
+    pub fn contributions(
+        &self,
+    ) -> &[(BackendProcessId, QueryTerminalProfileContributionTelemetry)] {
+        &self.contributions
+    }
+
+    /// Whether every participation this attempt placed has answered its release.
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    #[cfg(test)]
+    pub const fn participations(&self) -> usize {
+        self.participations
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ProfileDiagnosticSnapshot {
     pub(crate) ready: ComputationReadyToken,
     pub(crate) closure: ProfileDiagnosticClosure,
-    pub(crate) runtime_filters: super::execution::ReleasedRuntimeFilterContributions,
+    #[allow(
+        dead_code,
+        reason = "The frozen profile records the original observation cutoff with its evidence."
+    )]
+    pub(crate) selected_at: MonotonicInstant,
+    pub(crate) runtime_filters: ReleasedRuntimeFilterContributions,
     pub(crate) split: ProfileSplitDiagnostic,
     pub(crate) tasks: Box<[(TaskIdentity, ProfileTaskDiagnostic)]>,
     /// Actual graph attribution, in the same original expected Task order.
@@ -137,21 +193,33 @@ struct ProfileDiagnosticPublication {
 /// nothing else. That is why a failed read is logged and skipped rather than
 /// failing a query that already completed.
 pub(crate) struct TaskFinalInfoCollector {
+    #[cfg(test)]
     transport: Arc<dyn TaskResultTransport>,
     pub(crate) collected: Vec<Arc<FinalTaskInfo>>,
+    #[cfg(test)]
     pub(crate) unread: BTreeSet<TaskIdentity>,
+    #[cfg(test)]
     terminal_cursor: usize,
     expected: Arc<[TaskIdentity]>,
+    expected_fragments: Arc<[(TaskIdentity, crate::query_execution::artifact::FragmentId)]>,
+    expected_participations: Arc<[novarocks_execution_contract::ParticipationRef]>,
     root: TaskIdentity,
+    #[cfg(test)]
     missing: BTreeMap<TaskIdentity, ProfileDiagnosticMissing>,
     publication: Option<ProfileDiagnosticPublication>,
+    #[cfg(test)]
     final_info_closure: Option<ProfileDiagnosticClosure>,
+    #[cfg(test)]
     split_source: Option<SplitAssignmentProfileSource>,
+    #[cfg(test)]
     pending: Option<FinalTaskInfoReadJob>,
     enabled: bool,
+    #[cfg(test)]
     accepting: bool,
+    #[cfg(test)]
     wake: Arc<dyn StatusIntakeWake>,
 }
+#[cfg(test)]
 struct FinalTaskInfoReadJob {
     observed: novarocks_execution_contract::TaskStatus,
     future: std::pin::Pin<
@@ -159,36 +227,57 @@ struct FinalTaskInfoReadJob {
     >,
 }
 impl TaskFinalInfoCollector {
+    #[cfg(test)]
     pub(crate) fn new(
         transport: Arc<dyn TaskResultTransport>,
         enabled: bool,
         round: &TaskRound,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Self {
+        Self::from_graph(transport, enabled, round.execution().graph(), wake)
+    }
+
+    pub(crate) fn from_graph(
+        transport: Arc<dyn TaskResultTransport>,
+        enabled: bool,
+        graph: &TaskGraph,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = (transport, wake);
         let expected: Arc<[TaskIdentity]> = if enabled {
-            round
-                .execution()
-                .graph()
-                .tasks()
-                .map(TaskNode::identity)
-                .collect()
+            graph.tasks().map(TaskNode::identity).collect()
         } else {
             Arc::from([])
         };
         Self {
+            #[cfg(test)]
             transport,
             collected: Vec::new(),
+            #[cfg(test)]
             unread: expected.iter().copied().collect(),
+            #[cfg(test)]
             terminal_cursor: 0,
             expected,
-            root: round.root_task(),
+            expected_fragments: graph
+                .tasks()
+                .map(|task| (task.identity(), task.fragment_id()))
+                .collect(),
+            expected_participations: graph.participations().copied().collect(),
+            root: graph.root_identity(),
+            #[cfg(test)]
             missing: BTreeMap::new(),
             publication: None,
+            #[cfg(test)]
             final_info_closure: None,
+            #[cfg(test)]
             split_source: None,
+            #[cfg(test)]
             pending: None,
             enabled,
+            #[cfg(test)]
             accepting: true,
+            #[cfg(test)]
             wake,
         }
     }
@@ -233,6 +322,7 @@ impl TaskFinalInfoCollector {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_split_profile_source(
         &mut self,
         source: Option<SplitAssignmentProfileSource>,
@@ -246,10 +336,12 @@ impl TaskFinalInfoCollector {
 
     /// Final-info completion releases the remote hold independently of the
     /// final user snapshot, whose RF facts arrive on that very Release ACK.
+    #[cfg(test)]
     pub(crate) fn final_info_closed(&self) -> bool {
         !self.accepting
     }
 
+    #[cfg(test)]
     fn split_diagnostic(&self) -> ProfileSplitDiagnostic {
         use ProfileSplitDiagnostic as D;
         use ProfileSplitDiagnosticMissing as M;
@@ -266,6 +358,7 @@ impl TaskFinalInfoCollector {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn observation_deadline(&self) -> Option<MonotonicInstant> {
         self.publication.as_ref().and_then(|publication| {
             publication
@@ -280,6 +373,7 @@ impl TaskFinalInfoCollector {
 
     /// Stop new reads before polling at an expired/cancelled cut. The same
     /// pending future still receives every poll until its actual return.
+    #[cfg(test)]
     pub(crate) fn poll_profile_observation(
         &mut self,
         round: &TaskRound,
@@ -345,6 +439,7 @@ impl TaskFinalInfoCollector {
         }
     }
 
+    #[cfg(test)]
     fn publish_snapshot(&mut self, round: &TaskRound, closure: ProfileDiagnosticClosure) {
         let Some(publication) = self.publication.as_ref() else {
             return;
@@ -390,6 +485,7 @@ impl TaskFinalInfoCollector {
             .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
                 ready,
                 closure,
+                selected_at: round.execution().monotonic_now(),
                 runtime_filters: round.execution().released_runtime_filter_contributions(),
                 split: self.split_diagnostic(),
                 tasks,
@@ -401,12 +497,124 @@ impl TaskFinalInfoCollector {
                     .collect(),
             })));
     }
+    /// Publish the already selected immutable core cut. Observation-window
+    /// policy and final-info validation belong to the core, not this owner seam.
+    /// RF/split were selected at the core boundary and resolved exclusively
+    /// from retained original immutable rows, never from later live Sources.
+    pub(crate) fn publish_core_cut(
+        &mut self,
+        ready: ComputationReadyToken,
+        cut: &novarocks_attempt_protocol::publication::DiagnosticPublication,
+        sources: super::host::publication::DiagnosticSourceSnapshot,
+        mut resolve: impl FnMut(
+            novarocks_attempt_protocol::input::FinalTaskInfoRef,
+        ) -> Result<Box<FinalTaskInfo>, super::error::TaskExecutionError>,
+    ) -> Result<bool, super::error::TaskExecutionError> {
+        use novarocks_attempt_protocol::publication as core;
+        let exact = cut.ready.activation == ready.activation()
+            && cut.ready.root == ready.root()
+            && cut.ready.cut == ready.cut()
+            && cut.ready.diagnostic_deadline == ready.diagnostic_deadline()
+            && cut.ready.convergence_deadline == ready.convergence_deadline()
+            && cut.ready.end == ready.end();
+        if !exact || cut.tasks.len() != self.expected.len() {
+            return Err(super::error::TaskExecutionError::Schedule(
+                "core diagnostic cut differs from its original computation/Task binding".to_owned(),
+            ));
+        }
+        if cut
+            .tasks
+            .iter()
+            .zip(self.expected.iter())
+            .any(|((task, _), expected)| task != expected)
+        {
+            return Err(super::error::TaskExecutionError::Schedule(
+                "core diagnostic publication differs from its exact frozen Task order".to_owned(),
+            ));
+        }
+        let (runtime_filters, split) =
+            sources.into_selected(cut, &self.expected_participations, &self.expected_fragments)?;
+        self.begin_profile_observation(ready)?;
+        let publication = self
+            .publication
+            .as_ref()
+            .expect("original diagnostic observer was validated");
+        if publication.snapshot.borrow().is_some() {
+            return Ok(false);
+        }
+        let mut tasks = Vec::with_capacity(cut.tasks.len());
+        for &(task, observation) in &cut.tasks {
+            let observation = match observation {
+                core::DiagnosticTaskObservation::Available(reference) => {
+                    if reference.task() != task {
+                        return Err(super::error::TaskExecutionError::Schedule(
+                            "core diagnostic reference names a foreign Task".to_owned(),
+                        ));
+                    }
+                    let info = resolve(reference)?;
+                    if info.final_status().identity() != task {
+                        return Err(super::error::TaskExecutionError::Schedule(
+                            "core diagnostic payload names a foreign Task".to_owned(),
+                        ));
+                    }
+                    ProfileTaskDiagnostic::Available(Arc::from(info))
+                }
+                core::DiagnosticTaskObservation::Missing(missing) => {
+                    ProfileTaskDiagnostic::Missing(match missing {
+                        core::DiagnosticMissing::Unavailable(outcome) => {
+                            ProfileDiagnosticMissing::Unavailable(outcome)
+                        }
+                        core::DiagnosticMissing::ReadFailed => ProfileDiagnosticMissing::ReadFailed,
+                        core::DiagnosticMissing::TerminalMismatch => {
+                            ProfileDiagnosticMissing::TerminalMismatch
+                        }
+                        core::DiagnosticMissing::ReadPending => {
+                            ProfileDiagnosticMissing::ReadPending
+                        }
+                        core::DiagnosticMissing::TaskNotTerminal => {
+                            ProfileDiagnosticMissing::TaskNotTerminal
+                        }
+                        core::DiagnosticMissing::NotRead => ProfileDiagnosticMissing::NotRead,
+                    })
+                }
+            };
+            tasks.push((task, observation));
+        }
+        let closure = match cut.closure {
+            core::DiagnosticClosure::FrontierSettled => ProfileDiagnosticClosure::FrontierSettled,
+            core::DiagnosticClosure::ObservationDeadline => {
+                ProfileDiagnosticClosure::ObservationDeadline
+            }
+            core::DiagnosticClosure::Cancelled => ProfileDiagnosticClosure::Cancelled,
+        };
+        #[cfg(test)]
+        {
+            self.accepting = false;
+            self.final_info_closure = Some(closure);
+        }
+        publication
+            .snapshot
+            .send_replace(Some(Arc::new(ProfileDiagnosticSnapshot {
+                ready,
+                closure,
+                selected_at: cut.sources.selected_at,
+                runtime_filters,
+                split,
+                tasks: tasks.into_boxed_slice(),
+                fragments: self.expected_fragments.as_ref().into(),
+            })));
+        Ok(true)
+    }
+
+    #[cfg(test)]
     pub(crate) fn stop_starting(&mut self) {
         self.accepting = false;
     }
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.pending.is_none()
     }
+    #[cfg(test)]
     pub(crate) fn all_terminal_observed(&self) -> bool {
         // Only the exact frozen Tasks whose terminal was observed can leave
         // this frontier. Disabled diagnostics do not manufacture that proof.
@@ -414,6 +622,7 @@ impl TaskFinalInfoCollector {
     }
     /// At most one bounded final-info read is in flight. Starting it records
     /// its exact observed Task and original transport in self before Pending.
+    #[cfg(test)]
     pub(crate) fn poll_observe(&mut self, round: &TaskRound, cx: &mut std::task::Context<'_>) {
         use std::task::Poll;
         if !self.enabled {
@@ -495,3 +704,6 @@ impl TaskFinalInfoCollector {
 #[cfg(test)]
 #[path = "profile_diagnostics/property_tests.rs"]
 mod property_tests;
+
+#[cfg(all(test, novarocks_dev_controls))]
+mod core_publication_tests;

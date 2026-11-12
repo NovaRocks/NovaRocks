@@ -240,10 +240,10 @@ impl StorageNeed {
     }
     pub fn causal_cut_storage(reply: bool) -> Self {
         Self {
-            inputs: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
-            batches: crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
+            inputs: novarocks_control_runtime::causal_input::CAUSAL_INPUT_POSITIONS,
+            batches: novarocks_control_runtime::causal_input::CAUSAL_INPUT_POSITIONS,
             effects: crate::control_runtime::actors::ParticipationActor::MAX_STEP_ACTIONS
-                * crate::task_causal_input::CAUSAL_INPUT_POSITIONS,
+                * novarocks_control_runtime::causal_input::CAUSAL_INPUT_POSITIONS,
             cuts: 1,
             replies: usize::from(reply),
             requests: usize::from(reply),

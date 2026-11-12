@@ -57,6 +57,7 @@ fn vector(n: u64) -> ResourceVector {
 }
 fn work_resources(quota: ResourceVector) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota,
         owned_slots: OwnedSlotNeed {
             work_headers: 1,
@@ -308,6 +309,7 @@ fn capacity_refusal_keeps_the_same_transaction_snapshot_and_no_partial_charge() 
     assert_eq!(
         denied.err(),
         Some(RuntimeError::CapacityDenied(CapacityDenial {
+            keyed: None,
             dimension: second,
             requested: 5,
             committed: 0,

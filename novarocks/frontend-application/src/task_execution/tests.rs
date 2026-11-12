@@ -35,7 +35,7 @@ use crate::query_execution::artifact::{
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use crate::task_execution::completion_facts::StageState;
 use crate::task_execution::lease::RenewSchedule;
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
@@ -840,6 +840,378 @@ fn a_fragment_is_frozen_once_however_many_instances_it_has() {
             "the static plan is held once per leaf task and by nothing else"
         );
     }
+}
+
+#[tokio::test]
+async fn original_manifest_and_qa_drive_form_one_attempt_host_projection() {
+    use super::host::{geometry::AttemptHostGeometry, publication::PublicationRecord};
+    use super::manifest_projection::{
+        AttemptActivationInputs, AttemptManifestProjection, AttemptPlanPolicy,
+        ManifestAttemptInputs,
+    };
+    use novarocks_attempt_protocol::{
+        AttemptCore, Core,
+        config::CoordinationBudgets,
+        effect::Publication,
+        ids::IdSeed,
+        input::PublicationApplied,
+        publication::{ProtocolMembership, ProtocolPublication},
+    };
+    use novarocks_control_runtime_core::identity::ScopeId;
+    use novarocks_coordination_contract::{
+        AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision, AttemptRequestToken,
+        AttemptToLogical, AttemptToLogicalBody, ExecutionEffect, LogicalToAttemptBody,
+    };
+    use novarocks_execution_contract::AcquireParticipationAdmissionTicket;
+    use novarocks_query_application::{
+        coordination::LogicalExecutionActorConfig, test_support::LogicalExecutionTestHarness,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    let schedule = chain_schedule(&[0, 1], &[1]);
+    let edges = chain_edges();
+    let processes = backends(2);
+    let mut plans = FakePlans::new(&schedule, &edges, 64);
+    let fragments = protocol_frozen_fragments(&schedule, &mut plans).unwrap();
+    let manifest = TaskManifestBinding::protocol_fixture_for_test(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        &schedule,
+        &edges,
+        &processes,
+        fragments,
+    )
+    .unwrap();
+    let participants = manifest
+        .participations()
+        .iter()
+        .map(|member| member.participation())
+        .collect::<Vec<_>>();
+    let compatibility = manifest.participations()[0]
+        .backend()
+        .native_compatibility_id();
+
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 1 << 30,
+            control_bytes: 1 << 20,
+            per_scope_bytes: 1 << 28,
+        },
+    )
+    .unwrap();
+    control.mark_ready().unwrap();
+    let governed = control
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let stage = governed
+        .owner
+        .scope()
+        .try_acquire(Stage::Execution)
+        .unwrap();
+    let establish_limit = NonZeroUsize::new(3).unwrap();
+    let abort_limit = NonZeroUsize::new(5).unwrap();
+    let abort_wake = Arc::new(tokio::sync::Notify::new());
+    let abort_wake = Arc::new(super::status_intake::NotifyWake::new(abort_wake));
+    let (abort, _abort_intake) = super::abort_effect::NativeAbortEffectAdapter::bounded(
+        NonZeroUsize::new(2).unwrap(),
+        abort_wake,
+    );
+    let config = LogicalExecutionActorConfig::single_attempt_completion(
+        manifest.execution(),
+        ExecutionEffect::None,
+        NonZeroUsize::new(8).unwrap(),
+        participants.clone(),
+        NonZeroUsize::new(2).unwrap(),
+        establish_limit,
+        governed.owner,
+        stage,
+    )
+    .unwrap()
+    .with_abort_participation_effect_port(abort, abort_limit);
+    let mut logical = LogicalExecutionTestHarness::install(
+        tokio::runtime::Handle::current(),
+        config,
+        manifest.execution(),
+        participants,
+    )
+    .unwrap();
+    let root = manifest.root();
+    let plan_seal = manifest.plan();
+    let task_count = manifest.tasks().len();
+    let roster = manifest
+        .participations()
+        .iter()
+        .map(|member| {
+            let backend = member.backend();
+            (
+                member.participation(),
+                backend.target().descriptor().clone(),
+                backend.admission_epoch_capability(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut next = NonZeroU64::new(10).unwrap();
+    let mut prepared = ManifestAttemptInputs::freeze(
+        &manifest,
+        &mut plans,
+        compatibility,
+        TransportBudget::DEFAULT,
+    )
+    .unwrap()
+    .prepare_publications()
+    .unwrap();
+    let root_status = prepared.publications.root_status.take().unwrap();
+    let mut protocol_facts = prepared.publications.protocol_facts.take().unwrap();
+    assert!(root_status.begin_terminal_control_request().is_err());
+    drop(manifest);
+
+    let activation = logical.activate_initial().await.unwrap();
+    let drive = logical.native_attempt_drive();
+    let authorization_limits = drive.authorization_limits();
+    assert_eq!(
+        authorization_limits.establish_per_participation,
+        establish_limit
+    );
+    assert_eq!(authorization_limits.abort_per_participation, abort_limit);
+    let layout = crate::native::transport_capacity::NativeTransportCapacity::from_transport(
+        TransportBudget::DEFAULT,
+    )
+    .unwrap();
+    let geometry = AttemptHostGeometry::derive(
+        ScopeId::new(1).unwrap(),
+        NonZeroUsize::new(roster.len()).unwrap(),
+        CoordinationBudgets::DEFAULT.dispatch,
+        &layout,
+        &[],
+        true,
+    )
+    .unwrap();
+    let lease = super::lease::RequestedLeaseDurations::DEFAULT;
+    let mut projected = AttemptManifestProjection::from_prepared_manifest(
+        prepared,
+        &FakeEstablish,
+        AttemptActivationInputs {
+            drive: &drive,
+            replacement_admissions: None,
+            ids: IdSeed::new(1, 100),
+            initial_now: MonotonicInstant::from_origin(Duration::from_secs(2)),
+            sources: geometry.sources,
+            retain_diagnostics: true,
+            observe_dev_root: false,
+            observe_lifecycle_diagnostics: false,
+        },
+        AttemptPlanPolicy {
+            coordination: CoordinationBudgets::DEFAULT,
+            retry: Default::default(),
+            initial_lease: lease.initial(),
+            steady_lease: lease.steady(),
+        },
+        Box::new([]),
+        &mut next,
+    )
+    .unwrap();
+    assert_eq!(
+        geometry.actor_config(&projected.start).unwrap().mailbox,
+        geometry.sources.mailbox,
+    );
+    drop(drive);
+    let plan = &projected.start.plan;
+    assert_eq!(projected.start.activation.identity, activation);
+    assert_eq!(plan.authorization_limits, authorization_limits);
+    assert_eq!(plan.graph.root, root);
+    assert_eq!(plan.graph.tasks.len(), task_count);
+    assert_eq!(plan.graph.edges.len(), edges.len());
+    assert_eq!(plan.establish_material.len(), roster.len());
+    assert!(
+        projected
+            .backends
+            .iter()
+            .eq(roster.iter().map(|entry| &entry.1))
+    );
+    assert_eq!(
+        next.get() as usize,
+        10 + projected.creations.len() + plan.establish_material.len()
+    );
+    assert!(
+        projected
+            .members
+            .iter()
+            .map(|member| &member.participation)
+            .eq(plan.establish_material.keys())
+    );
+    for (participation, backend, admission_epoch) in roster {
+        let member = projected
+            .members
+            .iter()
+            .find(|member| member.participation == participation)
+            .unwrap();
+        assert_eq!(&member.endpoint, backend.endpoint());
+        assert_eq!(
+            plan.admission_epochs[&backend.process_id()],
+            admission_epoch
+        );
+        assert_eq!(
+            plan.preparation_positions[&backend.process_id()].get(),
+            backend.preparing_positions()
+        );
+        assert!(
+            !projected
+                .creations
+                .contains_key(&plan.establish_material[&participation].material)
+        );
+    }
+    for task in plan.graph.tasks.values() {
+        assert_eq!(
+            projected.creations[&task.creation.resource].seed.identity(),
+            task.identity
+        );
+    }
+    let initial = ProtocolPublication {
+        owner_revision: 0,
+        initial_membership: Some(Arc::new(ProtocolMembership {
+            writers: plan.writers.clone(),
+            summary_sources: plan.summary_sources.clone(),
+        })),
+        changes: Vec::new(),
+        selected_failure: None,
+        root_success_sealed: false,
+    };
+    let mut publication = PublicationRecord::new(
+        activation,
+        projected.publications.root_sender,
+        projected.publications.protocol,
+        None,
+        None,
+    );
+    assert_eq!(
+        publication
+            .publish(&Publication::ProtocolBatch(initial), None)
+            .unwrap(),
+        PublicationApplied::ProtocolBatch { published: true },
+    );
+    assert!(
+        protocol_facts
+            .take_changes(activation, root, plan_seal)
+            .unwrap()
+            .unwrap()
+            .is_initial()
+    );
+
+    let participant = projected.members[0].participation;
+    let admission = AcquireParticipationAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        participant,
+        LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        compatibility,
+        plan.admission_epochs[&participant.backend_process_id()],
+    );
+    let authorization_request = |number, request| {
+        let id = NonZeroU64::new(number).unwrap();
+        AttemptToLogical {
+            activation,
+            action: AttemptActionId::new(id),
+            body: AttemptToLogicalBody::AuthorizationRequest {
+                token: AttemptRequestToken::new(id),
+                request,
+            },
+        }
+    };
+    let reply = projected
+        .qa
+        .handle_port(&authorization_request(
+            1,
+            AttemptAuthorization::BeginAdmission(admission),
+        ))
+        .await
+        .unwrap();
+    let LogicalToAttemptBody::AuthorizationReply {
+        decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(issue)),
+        ..
+    } = reply.reply.body
+    else {
+        panic!("the same logical actor must authorize its manifest member");
+    };
+    let reply = projected
+        .qa
+        .handle_port(&authorization_request(
+            2,
+            AttemptAuthorization::SettleAdmission {
+                issue,
+                participation: participant,
+                operation_id: admission.envelope().operation_id(),
+                outcome: Some(OperationOutcome::ResourceExhausted),
+                receipt: None,
+                prior_transport_unknown: false,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reply.reply.body,
+        LogicalToAttemptBody::AuthorizationReply {
+            decision: Ok(AttemptAuthorizationDecision::AdmissionRetryable),
+            ..
+        }
+    ));
+    <Core as AttemptCore>::new(projected.start)
+        .expect("Core accepts the original QA limits and the exact manifest projection");
+    drop(projected.qa);
+    logical
+        .finish_until(std::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn manifest_projection_keeps_creation_seeds_with_their_exact_quotes() {
+    use novarocks_execution_contract::operation::OperationEnvelope;
+
+    let schedule = chain_schedule(&[0, 1], &[1]);
+    let graph = build_graph(&schedule, &chain_edges(), &backends(2), 64).expect("manifest graph");
+    let root = graph.root_identity();
+    let edges = graph.edges().cloned().collect::<Vec<_>>();
+    let mut next = NonZeroU64::new(10).unwrap();
+    let (frozen, mut originals) = graph
+        .into_attempt_graph(&mut next)
+        .expect("Core projection");
+    assert_eq!(frozen.root, root);
+    assert_eq!(frozen.edges.len(), edges.len());
+    assert_eq!(next.get(), 10 + frozen.tasks.len() as u64);
+    for edge in edges {
+        let projected = &frozen.edges[&edge.edge_id()];
+        assert_eq!(projected.destination_node, edge.destination_node_id());
+        assert_eq!(&*projected.producers, edge.producers());
+        assert_eq!(&*projected.destinations, edge.destinations());
+        assert_eq!(projected.delivery, edge.delivery());
+    }
+    for task in frozen.tasks.values() {
+        let original = originals
+            .remove(&task.creation.resource)
+            .expect("one original per Task");
+        assert_eq!(original.seed.identity(), task.identity);
+        assert_eq!(original.seed.participation(), task.participation);
+        assert_eq!(original.seed.split_plan_nodes(), &*task.split_plan_nodes);
+        assert_eq!(
+            original.sizing.descriptor_encoded_bytes,
+            encode_task_descriptor(&original.seed.descriptor().unwrap()).encoded_len()
+        );
+        let parts = original
+            .seed
+            .freeze(original.sizing.lengths)
+            .expect("same priced creation");
+        let envelope = OperationEnvelope::with_default_wait(
+            TaskOperationId::new_v7(),
+            OperationKind::CreateTask,
+        );
+        let intent = super::creation::CreateTaskIntent::new(envelope, task.identity, parts, None);
+        assert_eq!(task.creation.queued_bytes, intent.queued_bytes());
+    }
+    assert!(originals.is_empty());
+    novarocks_attempt_protocol::graph::TaskGraph::from_frozen(frozen)
+        .expect("Core accepts the exact manifest topology");
 }
 
 #[test]
@@ -3865,15 +4237,19 @@ fn a_union_node_counts_every_producer_of_every_edge_that_feeds_it() {
 fn delivery_chain_harness(
     delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
 ) -> Harness {
+    Harness::from_graph(delivery_chain_graph(delivery))
+}
+
+pub(crate) fn delivery_chain_graph(
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+) -> TaskGraph {
     let schedule = chain_schedule(&[0], &[1]);
     let mut edges = chain_edges();
     for edge in &mut edges {
         edge.delivery = delivery;
     }
-    Harness::from_graph(
-        build_graph(&schedule, &edges, &backends(2), 512)
-            .expect("the delivery contract forms the original chain"),
-    )
+    build_graph(&schedule, &edges, &backends(2), 512)
+        .expect("the delivery contract forms the original chain")
 }
 
 /// The original required-input chain with a real Finished root status and

@@ -53,7 +53,6 @@ fn original_runtime() -> FrontendDataRuntime {
         Arc::new(trust),
         FrontendNativeTransport::plaintext(),
         novarocks_task_codec::TransportBudget::DEFAULT,
-        8,
     )
     .unwrap()
 }
@@ -627,4 +626,221 @@ async fn actual_cold_handoff_bootstraps_endpoint_h2_and_reuses_exact_ready_gener
     // The Rust test harness receives this whole concrete custody packet.
     // No replacement assert unwinds across the original opaque causes here.
     std::panic::panic_any(failure);
+}
+
+struct ReadyWakeCount(AtomicUsize);
+impl std::task::Wake for ReadyWakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+fn ready_context() -> (Arc<ReadyWakeCount>, std::task::Waker) {
+    let count = Arc::new(ReadyWakeCount(AtomicUsize::new(0)));
+    let wake = std::task::Waker::from(count.clone());
+    (count, wake)
+}
+#[tokio::test]
+async fn async_follower_wakes_from_original_leader_exit_and_keeps_same_generation() {
+    let (runtime, client, socket, _) = local_case(NativeEndpointDomain::BackendControl);
+    let mut leader = Some(
+        client
+            .prepare_channel_source(NativeRpcMethod::Heartbeat)
+            .unwrap(),
+    );
+    let identity = observed(&leader);
+    let mut follower = Some(
+        client
+            .prepare_channel_source(NativeRpcMethod::Heartbeat)
+            .unwrap(),
+    );
+    let (count, wake) = ready_context();
+    let mut cx = Context::from_waker(&wake);
+    let mut target = None;
+    assert!(NativeChannelSource::poll_reserve_in(&mut follower, &mut target, &mut cx).is_pending());
+    for _ in 0..32 {
+        assert!(NativeChannelSource::poll_selected_ready(&mut follower, &mut cx).is_pending());
+    }
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        0,
+        "blocked state alone cannot self-wake"
+    );
+    original_source(&follower, &identity, false);
+    drop(leader.take());
+    assert!(count.0.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        NativeChannelSource::poll_selected_ready(&mut follower, &mut cx),
+        Poll::Ready(Err(ChannelAcquisitionError::RetryableNetwork(_)))
+    ));
+    original_source(&follower, &identity, false);
+    assert!(target.is_none());
+    no_io(&socket);
+    drop(follower);
+    runtime.close_native_outgoing().unwrap();
+}
+#[tokio::test]
+async fn async_lane_refusal_parks_without_wc_or_partial_release_pingpong() {
+    let (runtime, client, socket, _) = local_case(NativeEndpointDomain::BackendControl);
+    let mut source = Some(
+        client
+            .prepare_channel_source(NativeRpcMethod::Heartbeat)
+            .unwrap(),
+    );
+    let identity = observed(&source);
+    let held = runtime
+        .try_dial_lane(FrontendNativeLane::LifecycleControl)
+        .unwrap();
+    let (count, wake) = ready_context();
+    let mut cx = Context::from_waker(&wake);
+    let mut target = None;
+    assert!(NativeChannelSource::poll_reserve_in(&mut source, &mut target, &mut cx).is_pending());
+    for _ in 0..32 {
+        assert!(NativeChannelSource::poll_selected_ready(&mut source, &mut cx).is_pending());
+    }
+    assert_eq!(count.0.load(Ordering::SeqCst), 0);
+    original_source(&source, &identity, true);
+    drop(held);
+    assert!(count.0.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        NativeChannelSource::poll_selected_ready(&mut source, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(matches!(
+        NativeChannelSource::poll_reserve_in(&mut source, &mut target, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    no_io(&socket);
+    drop(target);
+    runtime.close_native_outgoing().unwrap();
+    assert!(
+        runtime
+            .transport_admission()
+            .frontend_outgoing_snapshot()
+            .unwrap()
+            .is_drained()
+    );
+}
+#[tokio::test]
+async fn async_handshake_refusal_ignores_its_own_partial_exit_until_real_ready() {
+    let (runtime, client, socket, _) = local_case(NativeEndpointDomain::BackendData);
+    let admission = runtime.transport_admission();
+    let count = admission.handshake_positions(TransportClass::Data);
+    let mut holders = Vec::with_capacity(count);
+    for _ in 0..count {
+        holders.push(
+            admission
+                .try_reserve_frontend_dial(FrontendNativeLane::Observation)
+                .unwrap(),
+        );
+    }
+    let mut source = Some(
+        client
+            .prepare_channel_source(NativeRpcMethod::SubscribeTaskStatus)
+            .unwrap(),
+    );
+    let identity = observed(&source);
+    let (wakes, wake) = ready_context();
+    let mut cx = Context::from_waker(&wake);
+    let mut target = None;
+    assert!(NativeChannelSource::poll_reserve_in(&mut source, &mut target, &mut cx).is_pending());
+    let refused = admission.refused_connections(TransportClass::Data);
+    for _ in 0..32 {
+        assert!(NativeChannelSource::poll_selected_ready(&mut source, &mut cx).is_pending());
+    }
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "its partial physical Drop cannot wake this waiter"
+    );
+    assert_eq!(
+        admission.refused_connections(TransportClass::Data),
+        refused,
+        "no physical try while the actual author is still full"
+    );
+    original_source(&source, &identity, true);
+    drop(holders.pop());
+    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        NativeChannelSource::poll_selected_ready(&mut source, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(matches!(
+        NativeChannelSource::poll_reserve_in(&mut source, &mut target, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    no_io(&socket);
+    drop(target);
+    drop(holders);
+    runtime.close_native_outgoing().unwrap();
+    assert!(admission.frontend_outgoing_snapshot().unwrap().is_drained());
+}
+
+struct ActualLaneReleaseWake {
+    runtime: FrontendDataRuntime,
+    released: std::sync::atomic::AtomicBool,
+    wakes: AtomicUsize,
+}
+impl std::task::Wake for ActualLaneReleaseWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.released.store(
+            self.runtime
+                .native_physical_ready(FrontendNativeLane::LifecycleControl)
+                .unwrap(),
+            Ordering::SeqCst,
+        );
+    }
+}
+
+#[tokio::test]
+async fn readiness_probe_release_wakes_another_source_after_actual_lane_exit() {
+    let (runtime, client, socket, _) = local_case(NativeEndpointDomain::BackendControl);
+    let mut selected = Some(
+        client
+            .prepare_channel_source(NativeRpcMethod::Heartbeat)
+            .unwrap(),
+    );
+    let observer = Arc::new(ActualLaneReleaseWake {
+        runtime: runtime.clone(),
+        released: std::sync::atomic::AtomicBool::new(false),
+        wakes: AtomicUsize::new(0),
+    });
+    let wake = std::task::Waker::from(Arc::clone(&observer));
+    let mut cx = Context::from_waker(&wake);
+    let mut notified = Box::pin(runtime.native_ready_notified());
+    notified.as_mut().enable();
+    assert!(notified.as_mut().poll(&mut cx).is_pending());
+    // A different observation can briefly own this SAME mutex. Its exit must
+    // notify a source that happened to see the position held at that instant.
+    assert!(
+        runtime
+            .native_physical_ready(FrontendNativeLane::LifecycleControl)
+            .unwrap()
+    );
+    assert!(observer.wakes.load(Ordering::SeqCst) > 0);
+    assert!(observer.released.load(Ordering::SeqCst));
+    let mut target = None;
+    assert!(matches!(
+        NativeChannelSource::poll_reserve_in(&mut selected, &mut target, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    no_io(&socket);
+    drop(target);
+    drop(selected);
+    drop(notified);
+    drop(observer);
+    runtime.close_native_outgoing().unwrap();
+    assert!(
+        runtime
+            .transport_admission()
+            .frontend_outgoing_snapshot()
+            .unwrap()
+            .is_drained()
+    );
 }

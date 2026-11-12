@@ -1375,3 +1375,234 @@ fn original_retained_request_flow(failed_source: bool) {
         .collect();
     assert_eq!(fixed_publications.len(), usize::from(failed_source));
 }
+
+mod metadata_tail_readiness {
+    use super::*;
+    use novarocks_control_runtime::causal_input::CausalInputObligation;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum Input {
+        Tick,
+        Forwarded,
+        Continuation,
+        CleanupWake,
+    }
+    struct Controller {
+        deadline: Option<Tick>,
+        publication_work: Option<ScopedWorkRef>,
+        consumed: Arc<AtomicBool>,
+    }
+    impl Actor for Controller {
+        type Input = Input;
+        type Effect = u64;
+        fn timer_input(_: Tick) -> Input {
+            Input::Tick
+        }
+        fn handle(
+            &mut self,
+            _: Tick,
+            _: InputEnvelope,
+            input: Input,
+            step: &mut ActorStep<'_, u64>,
+        ) {
+            match input {
+                Input::Tick => {
+                    step.metadata(73).unwrap();
+                    self.deadline = None;
+                }
+                Input::Forwarded => {
+                    assert!(step.is_runtime_metadata());
+                    step.effect(
+                        EffectDescriptor {
+                            id: ActionId::new(1).unwrap(),
+                            work: self.publication_work.unwrap(),
+                            kind: EffectKind::Publication,
+                            dependencies: vec![],
+                        },
+                        73,
+                    )
+                    .unwrap();
+                }
+                Input::Continuation => self.consumed.store(true, Ordering::SeqCst),
+                Input::CleanupWake => {}
+            }
+        }
+        fn next_deadline(&self) -> Option<Tick> {
+            self.deadline
+        }
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, u64>) {
+            panic!("metadata readiness fixture does not fail its pure owner");
+        }
+    }
+
+    #[test]
+    fn automatic_metadata_tail_retirement_requeues_a_paid_continuation_after_batch_full() {
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let process = ledger.open_scope_next(None, generation()).unwrap();
+        let execution = ledger.open_scope_next(None, generation()).unwrap();
+        let runtime = ActorRuntime::new();
+        let consumed = Arc::new(AtomicBool::new(false));
+        let source_id = ActorId::new(10).unwrap();
+        let target_id = ActorId::new(20).unwrap();
+        let config = ActorConfig {
+            mailbox: [4; 4],
+            max_batches: 1,
+            max_effects_per_step: 1,
+            max_dependencies_per_effect: 0,
+            turn_budget: 8,
+            max_step_work: 1,
+        };
+        let source = runtime
+            .register_bound(
+                source_id,
+                execution.clone(),
+                Controller {
+                    deadline: Some(Tick(1)),
+                    publication_work: None,
+                    consumed: consumed.clone(),
+                },
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original metadata source: {error:?}"));
+        execution.close_external().unwrap();
+        runtime.notify_host_actor(&source).unwrap();
+        let mut source_host = runtime.claim_host_actor().unwrap();
+        source_host.detach_execution(&process).unwrap();
+        source_host.release(false).unwrap();
+        ledger.remove_scope(execution.id()).unwrap();
+
+        let (mut work, mut funding) = process
+            .reserve_next(
+                generation(),
+                ReservationResources::for_work(ResourceVector::default()),
+                WorkKind::Settlement,
+                WorkAdmission::External,
+            )
+            .unwrap()
+            .bind(WorkKind::Settlement)
+            .unwrap();
+        work.start().unwrap();
+        let target = runtime
+            .register_bound(
+                target_id,
+                process.clone(),
+                Controller {
+                    deadline: None,
+                    publication_work: Some(work.reference()),
+                    consumed: consumed.clone(),
+                },
+                config,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original metadata target: {error:?}"));
+        let mut continuation = CausalInputObligation::reserve_admitted(
+            &runtime,
+            &target,
+            ActorId::new(30).unwrap(),
+            InputClass::Lifecycle,
+            &work,
+        )
+        .unwrap();
+        runtime.advance_time(Tick(1), 1).unwrap();
+        runtime.poll_one(Tick(1)).unwrap();
+        let tick = runtime.pending_timer_input(source_id).unwrap().unwrap();
+        let mut source_host = runtime.claim_host_actor().unwrap();
+        let notice = source_host.take_metadata(tick).unwrap().unwrap();
+        let delivery = runtime
+            .forward_metadata_for(
+                &source,
+                &target,
+                &notice,
+                InputClass::Control,
+                Input::Forwarded,
+            )
+            .unwrap_or_else(|(error, _)| panic!("original forwarded fact: {error:?}"));
+        source_host.release(false).unwrap();
+        runtime.poll_one(Tick(1)).unwrap();
+        let target_tail = runtime
+            .take_effect(target_id, delivery.input(), ActionId::new(1).unwrap())
+            .unwrap();
+        let continuation_input = continuation
+            .fill_with_receipt(None, Input::Continuation)
+            .unwrap_or_else(|error| panic!("same paid continuation: {:?}", error.error))
+            .1;
+        // Consume its real readiness mark while the metadata tail still owns
+        // the target's sole batch. No periodic timer or new fact is involved.
+        runtime.poll_one(Tick(1)).unwrap();
+        let parked_without_spin = !runtime.poll_one(Tick(1)).unwrap();
+        let still_paid = runtime
+            .input_custody(target_id, continuation_input)
+            .unwrap()
+            .is_some_and(|input| {
+                input.phase == novarocks_control_runtime::actor_turn::InputPhase::Filled
+            });
+        let snapshot = PublishedSnapshot::new_for_actor(&target, Arc::new(0));
+        runtime
+            .commit_snapshot(&target_tail, &snapshot, Arc::new(73))
+            .unwrap();
+        runtime.effect_completed_for(&target, target_tail).unwrap();
+        let metadata_retired = runtime
+            .input_custody(target_id, delivery.input())
+            .unwrap()
+            .is_none();
+        let resumed_without_new_fact = runtime.poll_one(Tick(2)).unwrap();
+        let continuation_consumed_without_new_fact = consumed.load(Ordering::SeqCst);
+
+        // Capture the oracle before recovery. On a regression, an additional
+        // genuinely paid input wakes the target ONLY to finish its originals;
+        // it cannot make the already captured readiness assertion pass. All
+        // expected red assertions run after this deterministic cleanup, so an
+        // obligation Drop panic cannot replace the actual failure evidence.
+        if !continuation_consumed_without_new_fact {
+            let wake = runtime
+                .reserve_admitted_input_for(&target, target_id, InputClass::Control, &work)
+                .unwrap()
+                .fill(Input::CleanupWake)
+                .unwrap_or_else(|(error, _)| panic!("paid fixture cleanup wake: {error:?}"));
+            runtime.poll_one(Tick(2)).unwrap();
+            runtime.retire_input(target_id, continuation_input).unwrap();
+            runtime.poll_one(Tick(2)).unwrap();
+            runtime.retire_input(target_id, wake).unwrap();
+        } else {
+            runtime.retire_input(target_id, continuation_input).unwrap();
+        }
+        runtime
+            .metadata_completed_for(&source, notice)
+            .unwrap_or_else(|(error, _)| panic!("original source metadata completion: {error:?}"));
+        runtime.retire_input(source_id, tick).unwrap();
+        runtime.close_actor_admission(source_id).unwrap();
+        runtime.close_actor_admission(target_id).unwrap();
+        process.close_external().unwrap();
+        work.body_exited().unwrap();
+        work.captures_exited().unwrap();
+        continuation.close_after_exit().unwrap();
+        ledger.reap_scope_ready(process.id(), 1).unwrap();
+        funding.finish().unwrap();
+        while let Some(host) = runtime.claim_host_actor() {
+            host.release(false).unwrap();
+        }
+        runtime.seal_actor(source_id).unwrap();
+        runtime.seal_actor(target_id).unwrap();
+        runtime.remove_actor(source_id).unwrap();
+        runtime.remove_actor(target_id).unwrap();
+        ledger.remove_scope(process.id()).unwrap();
+        assert!(ledger.is_empty());
+        assert!(runtime.is_empty());
+        assert!(
+            parked_without_spin,
+            "a full batch cannot busy-poll the actor"
+        );
+        assert!(
+            still_paid,
+            "the queued continuation retains its original input"
+        );
+        assert!(
+            metadata_retired,
+            "the actual publication tail retired its input"
+        );
+        assert!(
+            resumed_without_new_fact && continuation_consumed_without_new_fact,
+            "automatic metadata tail retirement must wake the already paid continuation without a new input or timer"
+        );
+    }
+}

@@ -5,6 +5,7 @@ paths = [
     "novarocks/value-arrays/**",
     "novarocks/worker/src/task_registry.rs",
     "novarocks/frontend-application/src/task_execution/**",
+    "novarocks/attempt-protocol/**",
 ]
 
 [reuse]

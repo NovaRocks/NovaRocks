@@ -16,6 +16,12 @@
 // under the License.
 
 //! Scope gates and capacity reservations use the same short transaction.
+//! Process and one keyed-family quota commit atomically; process exhaustion is
+//! reported first. The `_or_wait` methods register that exact denial under the
+//! same ledger lock. Each registrant merges the denied process/family dimension
+//! domains until their first real release. Another key in the same domain may
+//! cause one spurious wake; retry must repeat the original ledger transaction.
+//! Registrant Drop cancels the logical wait; a wake grants no quota.
 
 use crate::{
     notify::Notify,
@@ -24,11 +30,15 @@ use crate::{
 };
 use novarocks_control_runtime_core::{
     capacity::{
-        CapacityError, CapacityLedger, ReservationRequest, ReservationResources, ResourceVector,
+        CapacityError, CapacityLedger, CapacityWaitTarget, KeyedUsageSnapshot, ReservationRequest,
+        ReservationResources, ResourceVector,
     },
     completion::CompletionError,
     history::{CapacityHistoryRefusal, CapacityHistoryRequest, HistoryFact},
-    identity::{DimensionId, Generation, ReservationId, ScopeId, ScopedWorkRef, SlotId, WorkId},
+    identity::{
+        CapacityKey, DimensionId, FamilyId, Generation, ReservationId, ScopeId, ScopedWorkRef,
+        SlotId, WorkId,
+    },
     owned_storage::{OwnedSlotKind, OwnedStorageError},
     scope::{ScopeError, ScopeState, WorkAdmission, WorkKind},
 };
@@ -37,11 +47,24 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapacityDenial {
     pub dimension: DimensionId,
+    pub keyed: Option<(FamilyId, CapacityKey)>,
     pub requested: u64,
     pub committed: u64,
     pub limit: u64,
 }
 
+impl CapacityDenial {
+    pub fn wait_target(self) -> CapacityWaitTarget {
+        match self.keyed {
+            Some((family, key)) => CapacityWaitTarget::Keyed {
+                family,
+                key,
+                dimension: self.dimension,
+            },
+            None => CapacityWaitTarget::Process(self.dimension),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     Capacity(CapacityError),
@@ -86,6 +109,7 @@ impl std::error::Error for RuntimeError {}
 
 pub(crate) struct LedgerState {
     pub(crate) ledger: CapacityLedger,
+    pub(crate) capacity_waiters: crate::capacity_notification::CapacityWaiters,
     pub(crate) scopes: BTreeMap<ScopeId, ScopeState>,
     pub(crate) slots: BTreeMap<SlotId, crate::completion::ReportRecord>,
     pub(crate) unresolved: BTreeSet<(ScopeId, WorkId)>,
@@ -224,6 +248,7 @@ impl LedgerState {
 pub(crate) struct LedgerShared {
     pub(crate) state: crate::observation::ObservedMutex<LedgerState>,
     pub(crate) changed: Notify,
+    pub(crate) pending_capacity_wakes: Arc<crate::capacity_notification::PendingCapacityWakes>,
     pub(crate) history: Option<crate::history::HistoryCapture>,
     pub(crate) observation: crate::observation::RuntimeObservation,
     pub(crate) inventory: Option<Mutex<crate::observation::InventoryCursor>>,
@@ -243,6 +268,7 @@ impl LedgerShared {
                 RuntimeError::Capacity(error) => CapacityHistoryRefusal::Capacity(error),
                 RuntimeError::CapacityDenied(d) => CapacityHistoryRefusal::CapacityDenied {
                     dimension: d.dimension,
+                    keyed: d.keyed,
                     requested: d.requested,
                     committed: d.committed,
                     limit: d.limit,
@@ -331,6 +357,12 @@ pub struct CapacityUsageSnapshot<const N: usize> {
     pub limits: [u64; N],
     pub max_owner_usage: u64,
 }
+/// Exact process dimension values, with no optional owner statistic invented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityDimensionsSnapshot<const N: usize> {
+    pub used: [u64; N],
+    pub limits: [u64; N],
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapacityObservationError {
     OwnerIndexNotConfigured(DimensionId),
@@ -376,6 +408,31 @@ impl RuntimeLedger {
         let ledger = CapacityLedger::with_owner_usage_dimensions(limits, dimensions)?;
         Ok(Self::build(ledger, history, observation))
     }
+    pub fn with_keyed_families(
+        limits: ResourceVector,
+        families: impl IntoIterator<Item = (FamilyId, ResourceVector)>,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_keyed_families_and_observation(limits, families, [], None, Default::default())
+    }
+    pub fn with_keyed_families_and_observation(
+        limits: ResourceVector,
+        families: impl IntoIterator<Item = (FamilyId, ResourceVector)>,
+        owner_dimensions: impl IntoIterator<Item = DimensionId>,
+        history: Option<crate::history::HistoryCapture>,
+        observation: crate::observation::RuntimeObservation,
+    ) -> Result<Self, RuntimeError> {
+        let mut ledger = CapacityLedger::with_owner_usage_dimensions(limits, owner_dimensions)?;
+        ledger.configure_keyed_families(families)?;
+        Ok(Self::build(ledger, history, observation))
+    }
+    /// Busy is absence, never a fabricated zero. Rows exist only for live keys.
+    pub fn try_keyed_usage_snapshot(&self) -> Option<Vec<KeyedUsageSnapshot>> {
+        self.shared
+            .state
+            .try_lock()
+            .ok()
+            .map(|state| state.ledger.keyed_usage_snapshot())
+    }
     fn build(
         ledger: CapacityLedger,
         history: Option<crate::history::HistoryCapture>,
@@ -386,6 +443,7 @@ impl RuntimeLedger {
                 state: crate::observation::ObservedMutex::new(
                     LedgerState {
                         ledger,
+                        capacity_waiters: Default::default(),
                         scopes: BTreeMap::new(),
                         slots: BTreeMap::new(),
                         unresolved: BTreeSet::new(),
@@ -402,6 +460,7 @@ impl RuntimeLedger {
                     observation.clone(),
                 ),
                 changed: Notify::default(),
+                pending_capacity_wakes: Arc::new(Default::default()),
                 history,
                 inventory: observation
                     .is_enabled()
@@ -728,6 +787,31 @@ impl RuntimeLedger {
             max_owner_usage,
         }))
     }
+    /// Nonblocking process observations without an owner-usage index. Busy is
+    /// unavailable, and an unknown dimension remains an explicit typed error.
+    pub fn try_capacity_dimensions<const N: usize>(
+        &self,
+        dimensions: [DimensionId; N],
+    ) -> Result<Option<CapacityDimensionsSnapshot<N>>, CapacityObservationError> {
+        let state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CapacityObservationError::Poisoned);
+            }
+        };
+        let mut used = [0; N];
+        let mut limits = [0; N];
+        for (index, dimension) in dimensions.into_iter().enumerate() {
+            let (value, limit) = state
+                .ledger
+                .dimension_usage(dimension)
+                .ok_or(CapacityObservationError::UnknownDimension(dimension))?;
+            used[index] = value;
+            limits[index] = limit;
+        }
+        Ok(Some(CapacityDimensionsSnapshot { used, limits }))
+    }
     pub fn owner_usage_metadata_entries(&self, dimension: DimensionId) -> Option<usize> {
         self.shared
             .state
@@ -994,6 +1078,19 @@ impl ScopeHandle {
     pub fn reap_ready(&self, budget: usize) -> Result<usize, RuntimeError> {
         self.runtime.reap_scope_ready(self.id, budget)
     }
+    /// Reap the observed original header only within this same Scope.
+    pub fn reap_observed_header(
+        &self,
+        observer: &crate::obligation::WorkRetirementObserver,
+    ) -> Result<bool, RuntimeError> {
+        if !observer
+            .for_ledger(&self.runtime)
+            .is_some_and(|(scope, _)| scope == self.id)
+        {
+            return Err(ScopeError::InvalidTransition.into());
+        }
+        self.runtime.reap_observed_header(observer)
+    }
     /// Observe one original Work record through its actual owning Scope.
     /// This neither recreates a retired header nor authorizes new input/work.
     pub fn work_lifecycle(
@@ -1040,6 +1137,10 @@ impl ScopeHandle {
     /// resource, publication, lifecycle or cross-scope access authority.
     pub fn same_ledger(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.runtime.shared, &other.runtime.shared)
+    }
+
+    pub fn belongs_to_ledger(&self, ledger: &RuntimeLedger) -> bool {
+        Arc::ptr_eq(&self.runtime.shared, &ledger.shared)
     }
 
     pub(crate) fn attach_actor(&self, slot: SlotId) -> Result<(), RuntimeError> {
@@ -1400,7 +1501,7 @@ impl ScopeHandle {
         kind: WorkKind,
         admission: WorkAdmission,
     ) -> Result<StepRegistration, RuntimeError> {
-        self.reserve_next_parent(generation, resources, kind, admission, None)
+        self.reserve_next_parent(generation, resources, kind, admission, None, None)
     }
     /// Derives from the actual work holding an existing bound reservation.
     /// Owner lookup, parent liveness, stop/generation checks, identity issuance
@@ -1420,6 +1521,41 @@ impl ScopeHandle {
             kind,
             WorkAdmission::External,
             Some(parent),
+            None,
+        )
+    }
+    pub fn reserve_next_or_wait(
+        &self,
+        generation: Generation,
+        resources: ReservationResources,
+        kind: WorkKind,
+        admission: WorkAdmission,
+        registrant: &crate::capacity_notification::CapacityRegistrant,
+    ) -> Result<StepRegistration, RuntimeError> {
+        self.reserve_next_parent(
+            generation,
+            resources,
+            kind,
+            admission,
+            None,
+            Some(registrant),
+        )
+    }
+    pub fn reserve_child_next_or_wait(
+        &self,
+        generation: Generation,
+        parent: ReservationId,
+        resources: ReservationResources,
+        kind: WorkKind,
+        registrant: &crate::capacity_notification::CapacityRegistrant,
+    ) -> Result<StepRegistration, RuntimeError> {
+        self.reserve_next_parent(
+            generation,
+            resources,
+            kind,
+            WorkAdmission::External,
+            Some(parent),
+            Some(registrant),
         )
     }
     fn reserve_next_parent(
@@ -1429,7 +1565,11 @@ impl ScopeHandle {
         kind: WorkKind,
         admission: WorkAdmission,
         parent: Option<ReservationId>,
+        registrant: Option<&crate::capacity_notification::CapacityRegistrant>,
     ) -> Result<StepRegistration, RuntimeError> {
+        if registrant.is_some_and(|registrant| !registrant.belongs_to(&self.runtime)) {
+            return Err(CapacityError::WrongOwner.into());
+        }
         let mut state = self
             .runtime
             .shared
@@ -1489,15 +1629,41 @@ impl ScopeHandle {
                     kind,
                 },
             );
-            if let Err(CapacityError::Exhausted(dimension)) = reserved {
-                return Err(RuntimeError::CapacityDenied(CapacityDenial {
+            match reserved {
+                Err(CapacityError::Exhausted(dimension)) => {
+                    return Err(RuntimeError::CapacityDenied(CapacityDenial {
+                        dimension,
+                        keyed: None,
+                        requested: requested.quota.get(dimension),
+                        committed: ledger.used(dimension),
+                        limit: ledger.limit(dimension),
+                    }));
+                }
+                Err(CapacityError::ExhaustedKeyed {
+                    family,
+                    key,
                     dimension,
-                    requested: requested.quota.get(dimension),
-                    committed: ledger.used(dimension),
-                    limit: ledger.limit(dimension),
-                }));
+                }) => {
+                    let (committed, limit) = ledger
+                        .keyed_dimension_usage(family, key, dimension)
+                        .expect("denied configured keyed dimension");
+                    return Err(RuntimeError::CapacityDenied(CapacityDenial {
+                        dimension,
+                        keyed: Some((family, key)),
+                        requested: requested
+                            .keyed
+                            .as_ref()
+                            .expect("denied requested keyed quota")
+                            .quota
+                            .get(dimension),
+                        committed,
+                        limit,
+                    }));
+                }
+                result => {
+                    result?;
+                }
             }
-            reserved?;
             self.runtime.shared.record(|| HistoryFact::Admitted {
                 scope: self.id,
                 work,
@@ -1509,6 +1675,25 @@ impl ScopeHandle {
         self.runtime.shared.record_capacity_refusal(&result, || {
             refusal_intent.expect("enabled history retains the original capacity intent")
         });
+        if let Some(registrant) = registrant
+            && let Err(RuntimeError::CapacityDenied(denial)) = &result
+            && let Some(new_logical) = state.capacity_waiters.register(registrant, *denial)
+        {
+            self.runtime
+                .shared
+                .observation
+                .capacity_wait_registered(new_logical);
+            self.runtime
+                .shared
+                .record(|| HistoryFact::CapacityWaitRegistered {
+                    registrant: registrant.id(),
+                    target: denial.wait_target(),
+                });
+        }
+        // A successful different candidate must retain an earlier wait:
+        // the same actor may still have a refused target to revisit.
+        // New denials merge bounded process/family dimension domains;
+        // the first matching release or cancellation consumes all of them.
         drop(state);
         self.runtime.shared.observation.capacity_runtime(&result);
         result
@@ -1647,5 +1832,50 @@ impl ScopeHandle {
             parent: state.history_parent(self.id, id),
         });
         Ok(crate::obligation::WorkObligation::new(self.clone(), id))
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod capacity_dimensions_tests {
+    use super::*;
+    #[test]
+    fn dimension_observation_busy_is_unavailable_without_owner_index_or_zero_fallback() {
+        let dimension = DimensionId::new(1).unwrap();
+        let ledger = RuntimeLedger::new(ResourceVector::new([(dimension, 3)]).unwrap());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let held = scope
+            .reserve_next(
+                Generation::new(1).unwrap(),
+                ReservationResources::for_work(ResourceVector::new([(dimension, 2)]).unwrap()),
+                WorkKind::Business,
+                WorkAdmission::External,
+            )
+            .unwrap();
+        let lock = ledger.shared.state.lock().unwrap();
+        assert_eq!(ledger.try_capacity_dimensions([dimension]).unwrap(), None);
+        drop(lock);
+        let sample = ledger
+            .try_capacity_dimensions([dimension])
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.used, [2]);
+        assert_eq!(sample.limits, [3]);
+        assert_eq!(
+            ledger.try_capacity_dimensions([DimensionId::new(2).unwrap()]),
+            Err(CapacityObservationError::UnknownDimension(
+                DimensionId::new(2).unwrap()
+            ))
+        );
+        drop(held);
+        assert_eq!(
+            ledger
+                .try_capacity_dimensions([dimension])
+                .unwrap()
+                .unwrap()
+                .used,
+            [0]
+        );
     }
 }

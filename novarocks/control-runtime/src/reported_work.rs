@@ -225,6 +225,10 @@ impl ReportedWork {
     pub fn report(&self) -> &ReportSlot {
         &self.report
     }
+    /// The reservation of this same bound Work. This grants no new funding.
+    pub fn reservation_id(&self) -> novarocks_control_runtime_core::identity::ReservationId {
+        self.capacity.id()
+    }
     pub fn into_parts(self) -> (WorkObligation, ReservationObligation, ReportSlot) {
         (self.work, self.capacity, self.report)
     }

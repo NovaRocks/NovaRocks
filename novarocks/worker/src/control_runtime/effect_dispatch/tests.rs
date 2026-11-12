@@ -17,7 +17,10 @@
 
 use super::*;
 use crate::control_runtime::actors::tests::{Fixture, actor, initial_establishment, operation};
-use novarocks_control_runtime_core::{identity::Tick, mailbox::InputClass};
+use novarocks_control_runtime_core::{
+    identity::{InputId, Tick},
+    mailbox::InputClass,
+};
 use novarocks_worker_protocol::{
     creation::RequestReplyTag,
     lease::MonotonicInstant,

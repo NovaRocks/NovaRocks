@@ -30,19 +30,26 @@
 //! operation that has already been released: an immutable request that is
 //! already on its way keeps its position and converges on its own receipt.
 
+#[cfg(test)]
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+#[cfg(test)]
+use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
 use novarocks_coordination_contract::MonotonicInstant;
+#[cfg(test)]
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
+#[cfg(test)]
 use novarocks_task_codec::TransportBudget;
+#[cfg(test)]
 use novarocks_types::identity::BackendProcessId;
 
+#[cfg(test)]
 use super::error::{CapacityBound, TaskExecutionError};
-use super::intent::{
-    DispatchAcceptance, DispatchBatch, OperationIntent, TaskOperationQueueRequest,
-};
+use super::intent::OperationIntent;
+#[cfg(test)]
+use super::intent::{DispatchAcceptance, DispatchBatch, TaskOperationQueueRequest};
 
+#[cfg(test)]
 /// Every lane, in rotation order.
 const LANES: [DispatchLane; 4] = [
     DispatchLane::Create,
@@ -51,6 +58,7 @@ const LANES: [DispatchLane; 4] = [
     DispatchLane::Control,
 ];
 
+#[cfg(test)]
 const fn lane_index(lane: DispatchLane) -> usize {
     match lane {
         DispatchLane::Create => 0,
@@ -60,7 +68,11 @@ const fn lane_index(lane: DispatchLane) -> usize {
     }
 }
 
-/// One intent waiting in a bounded queue.
+/// The original row used to price the passive Native queue quote.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production observes only the exact row layout")
+)]
 #[derive(Debug)]
 struct QueuedOperation {
     native_pending: Option<crate::native::task_transport::NativeBatchAdmission>,
@@ -74,6 +86,7 @@ pub(crate) fn queued_operation_layout() -> std::alloc::Layout {
     std::alloc::Layout::new::<QueuedOperation>()
 }
 
+#[cfg(test)]
 /// One operation that waited past the frontend queue-residence bound.
 ///
 /// It is reported rather than sent late: the backend would time it out on its
@@ -88,6 +101,7 @@ pub struct ExpiredOperation {
     _queue_permit: Box<dyn super::intent::TaskOperationQueuePermit>,
 }
 
+#[cfg(test)]
 impl ExpiredOperation {
     pub fn operation_id(&self) -> TaskOperationId {
         self.intent.operation_id()
@@ -102,6 +116,7 @@ impl ExpiredOperation {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct BackendQueues {
     lanes: [VecDeque<QueuedOperation>; 4],
@@ -113,6 +128,7 @@ struct BackendQueues {
     active_tasks: usize,
 }
 
+#[cfg(test)]
 impl BackendQueues {
     fn new(budget: DispatchBudget) -> Self {
         Self {
@@ -141,6 +157,7 @@ impl BackendQueues {
     }
 }
 
+#[cfg(test)]
 /// Where one released operation went, so its acknowledgement can free its
 /// permit again.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -149,6 +166,7 @@ struct InFlightSlot {
     lane: DispatchLane,
 }
 
+#[cfg(test)]
 /// Exact carrier ownership for one operation inside the attempt dispatcher.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum DispatchOperationState {
@@ -157,6 +175,7 @@ pub(super) enum DispatchOperationState {
     Absent,
 }
 
+#[cfg(test)]
 /// Whether one request fits an attempt's own queue bounds.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum LocalQueueCapacity {
@@ -167,6 +186,7 @@ pub(super) enum LocalQueueCapacity {
     AttemptFull,
 }
 
+#[cfg(test)]
 /// The per-attempt dispatcher.
 ///
 /// It is scoped to one query execution, so its per-backend queues are exactly
@@ -185,6 +205,7 @@ pub struct OperationDispatcher {
     in_flight: BTreeMap<TaskOperationId, InFlightSlot>,
 }
 
+#[cfg(test)]
 impl OperationDispatcher {
     pub fn new(budget: DispatchBudget, transport: TransportBudget) -> Self {
         Self {

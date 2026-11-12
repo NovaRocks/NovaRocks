@@ -25,8 +25,11 @@
 use novarocks_result_contract::{PerKind, SummaryKind};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use crate::task_execution::status_validation::verify_final_info;
-use novarocks_execution::task_execution::{FinalTaskInfo, TaskIdentity, TaskState, TaskStatus};
+#[cfg(test)]
+use novarocks_execution::task_execution::FinalTaskInfo;
+use novarocks_execution::task_execution::{TaskIdentity, TaskState, TaskStatus};
 
 use super::error::TaskExecutionError;
 
@@ -262,6 +265,7 @@ impl WriteCompletionTracker {
 /// else, which is why there is no verdict for absence here. One that
 /// contradicts the terminal is a protocol conflict, because it would mean two
 /// answers exist to a question with one answer.
+#[cfg(test)]
 pub fn accept_final_info(
     observed_terminal: &TaskStatus,
     info: &FinalTaskInfo,

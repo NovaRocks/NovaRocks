@@ -156,6 +156,32 @@ async fn unstarted_original_owner_has_no_child_and_empty_drop_needs_no_spawn_or_
 }
 
 #[tokio::test]
+async fn shared_bank_drain_retries_until_the_original_reserved_row_exits() {
+    let (mut owner, port) =
+        ApplySendOwner::new(Handle::current(), TransportBudget::DEFAULT).unwrap();
+    let before = storage(&owner);
+    owner.open_shared_bank().unwrap();
+    assert!(owner.reaper.is_none());
+    let slot = port.reserve_shared_slot(1).unwrap();
+
+    assert_eq!(
+        owner.drain_until(Instant::now()).await,
+        DrainObservation::Deadline
+    );
+    assert!(!owner.is_joined());
+    assert_eq!(storage(&owner), (before.0, before.1, 1));
+
+    drop(slot);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        owner.drain_until(deadline).await,
+        DrainObservation::Complete
+    );
+    assert!(owner.is_joined());
+    assert_eq!(storage(&owner), before);
+}
+
+#[tokio::test]
 async fn continuous_reaper_returns_capacity_without_next_submit_and_keeps_original_storage() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let (mut owner, port, supervisor) = setup();

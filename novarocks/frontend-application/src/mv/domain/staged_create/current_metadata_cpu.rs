@@ -19,7 +19,7 @@
 use crate::query_execution::{
     internal_result_cpu::InternalResultCpu, maintenance::io_admission::MetadataIoAdmission,
 };
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_query_application::{
     api::StatementNativeHealthFailure, cancellation::QueryCancellationView,
 };

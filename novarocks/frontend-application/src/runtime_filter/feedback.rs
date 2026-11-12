@@ -322,7 +322,7 @@ pub(crate) enum TaskFeedbackOutcome {
 /// and retains for a `FetchTaskDynamicFilters`. It is parsed here, beside the
 /// admission that consumes it, so the wire shape has exactly one reader.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TaskRuntimeFilterFeedback {
+pub struct TaskRuntimeFilterFeedback {
     query_id: QueryId,
     channel_id: u32,
     deployment_epoch: u64,

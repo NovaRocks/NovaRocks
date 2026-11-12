@@ -3169,6 +3169,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-attempt-protocol"
+version = "0.1.0"
+dependencies = [
+ "novarocks-coordination-contract",
+ "novarocks-execution-contract",
+ "novarocks-result-contract",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
@@ -3490,8 +3500,11 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "novarocks-arrow-batch-codec",
+ "novarocks-attempt-protocol",
  "novarocks-catalog-application",
  "novarocks-connector-contract",
+ "novarocks-control-runtime",
+ "novarocks-control-runtime-core",
  "novarocks-coordination-contract",
  "novarocks-execution",
  "novarocks-execution-contract",
@@ -3978,6 +3991,7 @@ dependencies = [
  "chrono",
  "hex",
  "libc",
+ "novarocks-attempt-protocol",
  "novarocks-catalog-application",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg",

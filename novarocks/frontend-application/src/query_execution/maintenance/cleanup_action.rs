@@ -75,7 +75,7 @@ impl std::fmt::Debug for Wake {
         f.write_str("CleanupWake")
     }
 }
-impl crate::task_execution::status_intake::StatusIntakeWake for Wake {
+impl crate::wake::StatusIntakeWake for Wake {
     fn wake(&self) {
         self.waker.wake()
     }

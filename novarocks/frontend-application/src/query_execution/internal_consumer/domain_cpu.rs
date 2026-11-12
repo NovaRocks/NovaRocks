@@ -36,7 +36,7 @@ use crate::query_execution::internal_result_cpu::{
     InternalResultCpu, InternalResultCpuJob, InternalResultOperation as Operation,
     InternalResultValue,
 };
-use crate::task_execution::status_intake::NotifyWake;
+use crate::wake::NotifyWake;
 
 type Job = InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>>;
 

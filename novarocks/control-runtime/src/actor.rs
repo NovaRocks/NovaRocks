@@ -19,7 +19,9 @@
 
 use novarocks_control_runtime_core::{
     effect::{EffectBatchState, EffectDescriptor, EffectError, EffectKind},
-    identity::{BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, Tick},
+    identity::{
+        ActorId, BatchId, Generation, InputId, ReservationId, ScopeId, ScopedWorkRef, Tick,
+    },
     mailbox::InputEnvelope,
     scheduler::TurnBudget,
 };
@@ -57,6 +59,32 @@ pub trait Actor: Send + 'static {
     );
 }
 
+/// Passive tail of one source sampled under the original inbox lock before
+/// this input was popped. Later fills do not change this cut. An empty tail
+/// proves neither producer closure nor actual exit; InputId is not a sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputSourceCut {
+    pub source: ActorId,
+    pub tail: Option<InputId>,
+}
+
+// A staged selection changes only the original mailbox's eligible heads.
+// It neither registers a Source nor changes resource ownership or lock order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputSourceMode {
+    All,
+    Only(ActorId),
+    Prefer(ActorId),
+}
+impl InputSourceMode {
+    pub(crate) fn contending_source(self) -> Option<ActorId> {
+        match self {
+            Self::All => None,
+            Self::Only(source) | Self::Prefer(source) => Some(source),
+        }
+    }
+}
+
 pub struct ActorStep<'a, E> {
     scope: &'a crate::transaction::ScopeHandle,
     turn: &'a mut TurnBudget,
@@ -75,6 +103,9 @@ pub struct ActorStep<'a, E> {
     >,
     metadata: Vec<MetadataEffect<E>>,
     stop_producing: bool,
+    input_source: Option<InputSourceMode>,
+    input_source_cut: Option<InputSourceCut>,
+    selected_source_cut: Option<InputSourceCut>,
 }
 impl<'a, E> ActorStep<'a, E> {
     pub(crate) fn new(
@@ -100,6 +131,9 @@ impl<'a, E> ActorStep<'a, E> {
             authors: std::collections::BTreeMap::new(),
             metadata: Vec::new(),
             stop_producing: false,
+            input_source: None,
+            input_source_cut: None,
+            selected_source_cut: None,
             batch: EffectBatchState::new(
                 scope.id(),
                 generation,
@@ -108,6 +142,24 @@ impl<'a, E> ActorStep<'a, E> {
                 max_dependencies,
             ),
         }
+    }
+    /// None means this registration did not request a source observation.
+    /// Some with tail=None is this claim's empty-source sample only. It grants
+    /// no input, scheduling, resource, producer-liveness or exit authority.
+    pub fn input_source_cut(&self) -> Option<InputSourceCut> {
+        self.input_source_cut
+    }
+    pub(crate) fn set_input_source_cut(&mut self, cut: Option<InputSourceCut>) {
+        self.input_source_cut = cut;
+    }
+    /// The selected continuation Source sampled before the claim was popped.
+    /// An empty selected Source allows the owner's timer to advance a phase;
+    /// a ready continuation remains owned by the original mailbox.
+    pub fn selected_source_cut(&self) -> Option<InputSourceCut> {
+        self.selected_source_cut
+    }
+    pub(crate) fn set_selected_source_cut(&mut self, cut: Option<InputSourceCut>) {
+        self.selected_source_cut = cut;
     }
     pub(crate) fn set_input_author(&mut self, author: Option<crate::actor_turn::InputAuthor>) {
         self.input_author = author;
@@ -173,6 +225,25 @@ impl<'a, E> ActorStep<'a, E> {
             "retained state cannot stop its process payer"
         );
         self.stop_producing = true;
+    }
+    /// Select only the original continuation Source and this actor's own
+    /// source (including its timer). Other sources retain their paid queued
+    /// heads and within-source FIFO. None reopens all sources. This changes
+    /// selection at atomic step commitment, never admission or resource rights.
+    /// Callers keep protocol ingress distinct from these continuation sources;
+    /// changing a Source identity to bypass its earlier input is invalid.
+    pub fn select_input_source(&mut self, source: Option<ActorId>) {
+        self.input_source = Some(source.map_or(InputSourceMode::All, InputSourceMode::Only));
+    }
+    /// Prefer this original source and the actor's own source while it has a
+    /// current queued head; otherwise retain normal all-source selection.
+    /// This is a staged idle/start choice, not a frozen drain boundary. A
+    /// caller freezes its finite prefix and switches to `select_input_source`
+    /// before continuing that phase. A real bootstrap step must install this
+    /// choice before competing protocol inputs; registration still defaults
+    /// to All. No Source identity, input, Work or capacity is created here.
+    pub fn prefer_input_source(&mut self, source: ActorId) {
+        self.input_source = Some(InputSourceMode::Prefer(source));
     }
     /// Transfer a still-unbound synchronous reservation into the same atomic
     /// handoff as its neutral effect. No queue/capture may bind it beforehand.
@@ -280,6 +351,7 @@ impl<'a, E> ActorStep<'a, E> {
             metadata: self.metadata,
             authors: self.authors,
             stop_producing: self.stop_producing,
+            input_source: self.input_source,
         }
     }
 }
@@ -292,6 +364,7 @@ pub(crate) struct MetadataEffect<E> {
 pub(crate) struct StepEnvelope<E> {
     pub(crate) ordinal: Option<BatchId>,
     pub(crate) stop_producing: bool,
+    pub(crate) input_source: Option<InputSourceMode>,
     pub(crate) state: EffectBatchState,
     pub(crate) payloads:
         std::collections::BTreeMap<novarocks_control_runtime_core::identity::ActionId, E>,

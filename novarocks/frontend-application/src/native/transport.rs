@@ -1,6 +1,9 @@
 //! Narrow FE-to-BE native transport adapters.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
@@ -28,7 +31,9 @@ use novarocks_native_adapter::native_lane::{
 };
 
 mod cold_dial;
-pub(super) use cold_dial::{NativeChannelSource, NativeDialAttempt, NativeDialHandoff};
+#[cfg(test)]
+pub(crate) use cold_dial::NativeDialAttempt;
+pub(crate) use cold_dial::{NativeChannelSource, NativeDialHandoff};
 
 /// One best-effort response from a Backend catalog reachability prune.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,7 +83,7 @@ pub(crate) fn prune_catalogs(
 /// Every call takes one of its lane connection's stream positions before it
 /// reaches Tonic, and the response body holds it until the body ends or is
 /// dropped.
-pub(super) type AuthenticatedNovaRocksGrpcClient =
+pub(crate) type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
 /// The Root-only client keeps the original authenticated ResultData channel.
@@ -94,17 +99,17 @@ pub(super) type AuthenticatedOperationTestGrpc =
 /// that distinction: the latter has an unknown remote outcome, while the
 /// former cannot be repaired by resending an immutable request.
 #[derive(Debug)]
-pub(super) enum ChannelAcquisitionError {
+pub(crate) enum ChannelAcquisitionError {
     Fatal(String),
     RetryableNetwork(ChannelEstablishmentFailure),
 }
 
 impl ChannelAcquisitionError {
-    pub(super) fn fatal(detail: impl Into<String>) -> Self {
+    pub(crate) fn fatal(detail: impl Into<String>) -> Self {
         Self::Fatal(detail.into())
     }
 
-    pub(super) fn retryable_network(detail: impl Into<String>) -> Self {
+    pub(crate) fn retryable_network(detail: impl Into<String>) -> Self {
         Self::RetryableNetwork(ChannelEstablishmentFailure {
             detail: detail.into(),
             connection_lost: false,
@@ -126,12 +131,12 @@ impl std::error::Error for ChannelAcquisitionError {}
 /// Establishment may fail in a local admission/cache owner without observing a
 /// broken backend connection. Keep that distinction before rendering text.
 #[derive(Debug)]
-pub(super) struct ChannelEstablishmentFailure {
+pub(crate) struct ChannelEstablishmentFailure {
     detail: String,
     connection_lost: bool,
 }
 impl ChannelAcquisitionError {
-    pub(super) fn observed_connection_loss(&self) -> bool {
+    pub(crate) fn observed_connection_loss(&self) -> bool {
         matches!(self, Self::RetryableNetwork(error) if error.connection_lost)
     }
     fn failed_connection(error: tonic::transport::Error) -> Self {
@@ -185,7 +190,7 @@ fn observed_io_loss(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::NotConnected
     )
 }
-pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     for _ in 0..16 {
         let Some(error) = current else {
@@ -225,7 +230,10 @@ pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'stat
 
 #[derive(Clone)]
 enum FrozenClientEndpoints {
-    Backend(Box<FrozenBackendDescriptor>),
+    Backend {
+        roster: Arc<[FrozenBackendDescriptor]>,
+        index: usize,
+    },
     Single {
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
@@ -234,18 +242,36 @@ enum FrozenClientEndpoints {
 }
 
 #[derive(Clone)]
-pub(super) struct Client {
+pub(crate) struct Client {
     endpoints: FrozenClientEndpoints,
     data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    pub(super) fn for_backend(
+    /// Read-only original cache/generation/dial-lane progress. This observes
+    /// no pool or authority other than the original selected role runtime.
+    pub(crate) fn original_ready_notified(&self) -> tokio::sync::futures::OwnedNotified {
+        self.data_runtime.native_ready_notified()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_backend(
         descriptor: FrozenBackendDescriptor,
         data_runtime: FrontendDataRuntime,
     ) -> Self {
+        Self::for_backend_in(Arc::from([descriptor]), 0, data_runtime)
+    }
+
+    /// Select one descriptor from the actual frozen Native manifest roster.
+    /// Cloning a Client retains the same address and backing.
+    pub(crate) fn for_backend_in(
+        roster: Arc<[FrozenBackendDescriptor]>,
+        index: usize,
+        data_runtime: FrontendDataRuntime,
+    ) -> Self {
+        assert!(index < roster.len());
         Self {
-            endpoints: FrozenClientEndpoints::Backend(Box::new(descriptor)),
+            endpoints: FrozenClientEndpoints::Backend { roster, index },
             data_runtime,
         }
     }
@@ -277,10 +303,12 @@ impl Client {
             ));
         }
         match &self.endpoints {
-            FrozenClientEndpoints::Backend(descriptor) => match domain {
-                NativeEndpointDomain::BackendData => Ok(descriptor.endpoint().native_endpoint()),
+            FrozenClientEndpoints::Backend { roster, index } => match domain {
+                NativeEndpointDomain::BackendData => {
+                    Ok(roster[*index].endpoint().native_endpoint())
+                }
                 NativeEndpointDomain::BackendControl => {
-                    Ok(descriptor.control_endpoint().native_endpoint())
+                    Ok(roster[*index].control_endpoint().native_endpoint())
                 }
                 NativeEndpointDomain::FrontendMembership => Err(ChannelAcquisitionError::fatal(
                     "backend descriptor cannot address frontend membership",
@@ -306,15 +334,27 @@ impl Client {
                 "method is not a Frontend Native lane",
             ));
         };
-        let peer = match &self.endpoints {
-            FrozenClientEndpoints::Backend(descriptor) => descriptor.process_id(),
-            FrozenClientEndpoints::Single { peer, .. } => *peer,
-        };
         Ok(NativeChannelKey {
             endpoint: self.endpoint_for(method)?.clone(),
-            peer,
+            peer: self.backend_process_id(),
             lane,
         })
+    }
+
+    pub(crate) fn backend_process_id(&self) -> BackendProcessId {
+        match &self.endpoints {
+            FrozenClientEndpoints::Backend { roster, index } => roster[*index].process_id(),
+            FrozenClientEndpoints::Single { peer, .. } => *peer,
+        }
+    }
+
+    /// The admitted covered subscription uses the original authenticated
+    /// status lane. Its generation and lifetime stay with the caller.
+    pub(crate) async fn grpc_for_covered_subscription(
+        &self,
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
+        self.grpc_with_channel_error(NativeRpcMethod::SubscribeTaskStatus)
+            .await
     }
 
     async fn grpc(
@@ -335,7 +375,7 @@ impl Client {
             .map(|(grpc, _)| grpc)
     }
 
-    pub(in crate::native) fn grpc_for_reserved_call(
+    pub(crate) fn grpc_for_reserved_call(
         &self,
         call: novarocks_native_adapter::native_lane::ReservedNativeCall,
         method: NativeRpcMethod,
@@ -415,7 +455,7 @@ impl Client {
         Ok((grpc, acquired))
     }
 
-    pub(super) fn invalidate_channel_if_current(
+    pub(crate) fn invalidate_channel_if_current(
         &self,
         method: NativeRpcMethod,
         acquired: &CachedNativeChannel,

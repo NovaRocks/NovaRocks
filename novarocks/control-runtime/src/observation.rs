@@ -90,9 +90,41 @@ pub struct RuntimeObservationSnapshot {
     pub inputs: [InputClassObservation; 4],
     pub ledger: LedgerContentionObservation,
     pub capacity_operations: u64,
+    /// New logical waits, excluding repeated/additional domain registration.
+    pub capacity_wait_registrations: u64,
+    /// Newly indexed configured domains, excluding duplicate domain waits.
+    pub capacity_wait_domains_registered: u64,
+    /// Actual Waker invocations. Release claims later canceled before delivery
+    /// or merged in the pending queue are not counted as callback deliveries.
+    pub capacity_wait_deliveries: u64,
     pub capacity_refusals: [u64; 8],
     pub scope_failures: u64,
     pub invalid_clock_observations: u64,
+}
+/// Current original wait registry values under one nonblocking ledger read.
+/// Counters are observations, never registration/dispatch or quota authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapacityWaiterSnapshot {
+    pub logical_waiters: usize,
+    pub domain_registrations: usize,
+    pub distinct_domains: usize,
+}
+/// Per-actor original committed effect states under one inbox transaction.
+/// Unindexed means a batch ordinal after the dispatcher's original cursor;
+/// lane heads/tails are both counted directly from the runtime records.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EffectInventoryObservation {
+    pub states: novarocks_control_runtime_core::effect::EffectStateObservation,
+    pub unindexed_states: novarocks_control_runtime_core::effect::EffectStateObservation,
+    pub batches: usize,
+    pub unindexed_batches: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectObservationError {
+    Runtime(crate::actor_turn::ActorTurnError),
+    WrongActor,
+    Poisoned,
+    InventoryOverflow,
 }
 /// A completed bounded traversal observes an interval, not a coherent instant.
 /// Work phases are the canonical lease phases, not physical executor queues.
@@ -229,6 +261,9 @@ struct ObservationState {
     poisoned_locks: AtomicU64,
     unavailable_try_locks: AtomicU64,
     capacity_operations: AtomicU64,
+    capacity_wait_registrations: AtomicU64,
+    capacity_wait_domains_registered: AtomicU64,
+    capacity_wait_deliveries: AtomicU64,
     capacity_refusals: [AtomicU64; 8],
     scope_failures: AtomicU64,
     invalid_time: AtomicU64,
@@ -259,6 +294,9 @@ impl RuntimeObservation {
             poisoned_locks: AtomicU64::new(0),
             unavailable_try_locks: AtomicU64::new(0),
             capacity_operations: AtomicU64::new(0),
+            capacity_wait_registrations: AtomicU64::new(0),
+            capacity_wait_domains_registered: AtomicU64::new(0),
+            capacity_wait_deliveries: AtomicU64::new(0),
             capacity_refusals: std::array::from_fn(|_| AtomicU64::new(0)),
             scope_failures: AtomicU64::new(0),
             invalid_time: AtomicU64::new(0),
@@ -298,6 +336,11 @@ impl RuntimeObservation {
                 unavailable_try_locks: state.unavailable_try_locks.load(Ordering::Relaxed),
             },
             capacity_operations: state.capacity_operations.load(Ordering::Relaxed),
+            capacity_wait_registrations: state.capacity_wait_registrations.load(Ordering::Relaxed),
+            capacity_wait_domains_registered: state
+                .capacity_wait_domains_registered
+                .load(Ordering::Relaxed),
+            capacity_wait_deliveries: state.capacity_wait_deliveries.load(Ordering::Relaxed),
             capacity_refusals: std::array::from_fn(|i| {
                 state.capacity_refusals[i].load(Ordering::Relaxed)
             }),
@@ -359,6 +402,19 @@ impl RuntimeObservation {
             s.add(&s.scope_failures, 1);
         }
     }
+    pub(crate) fn capacity_wait_registered(&self, new_logical: bool) {
+        if let Some(state) = &self.0 {
+            state.add(&state.capacity_wait_domains_registered, 1);
+            if new_logical {
+                state.add(&state.capacity_wait_registrations, 1);
+            }
+        }
+    }
+    pub(crate) fn capacity_wait_delivered(&self) {
+        if let Some(state) = &self.0 {
+            state.add(&state.capacity_wait_deliveries, 1);
+        }
+    }
     pub(crate) fn capacity_runtime<T>(&self, result: &Result<T, crate::transaction::RuntimeError>) {
         use crate::transaction::RuntimeError;
         let result = result.as_ref().map(|_| ()).map_err(|error| match error {
@@ -377,7 +433,9 @@ impl RuntimeObservation {
         if let Err(error) = result {
             use novarocks_control_runtime_core::scope::ScopeError;
             let kind = match error {
-                CapacityError::Exhausted(_) => CapacityRefusalKind::Exhausted,
+                CapacityError::Exhausted(_) | CapacityError::ExhaustedKeyed { .. } => {
+                    CapacityRefusalKind::Exhausted
+                }
                 CapacityError::Scope(ScopeError::Closed) => CapacityRefusalKind::ScopeClosed,
                 CapacityError::Scope(ScopeError::Stopped) => CapacityRefusalKind::ScopeStopped,
                 CapacityError::Scope(ScopeError::Failed) => CapacityRefusalKind::ScopeFailed,

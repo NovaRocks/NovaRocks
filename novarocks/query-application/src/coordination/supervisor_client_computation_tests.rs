@@ -239,6 +239,8 @@ mod client_computation_tests {
                     Active {
                         participations,
                         signals,
+                        drive_activation: None,
+                        count_only,
                         _control: control,
                         _native_tail_window: window,
                     },
@@ -264,6 +266,8 @@ mod client_computation_tests {
     struct Active {
         participations: Vec<ParticipationRef>,
         signals: Arc<Signals>,
+        drive_activation: Option<novarocks_coordination_contract::AttemptActivationIdentity>,
+        count_only: bool,
         _control: Arc<SealPort>,
         _native_tail_window: TestWindow,
     }
@@ -277,6 +281,7 @@ mod client_computation_tests {
             let frame = RunFrame(Arc::clone(&self.signals));
             Box::pin(async move {
                 let _frame = frame;
+                self.drive_activation = Some(drive.identity());
                 let mut admissions = SuccessfulCompletionActiveOwner {
                     participations: self.participations.clone(),
                 };
@@ -291,10 +296,23 @@ mod client_computation_tests {
         }
         fn converge<'a>(
             &'a mut self,
-            _: NativeActiveConvergenceRequest,
+            request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
                 assert!(self.signals.local_run_exited.load(Ordering::SeqCst));
+                let activation = self
+                    .drive_activation
+                    .expect("the original Native run was polled");
+                if self.count_only {
+                    assert_eq!(request.streamed_success(), None);
+                    assert_eq!(
+                        request.computation_ready().unwrap().activation(),
+                        activation
+                    );
+                } else {
+                    assert_eq!(request.streamed_success(), Some(activation));
+                    assert_eq!(request.computation_ready(), None);
+                }
                 self.signals.cleanup_entered.store(true, Ordering::SeqCst);
                 self.signals.release_cleanup.notified().await;
                 self.signals.cleanup_exited.store(true, Ordering::SeqCst);

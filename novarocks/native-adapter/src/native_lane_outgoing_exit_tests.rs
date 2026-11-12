@@ -1207,3 +1207,278 @@ async fn selected_call_role_close_refuses_an_already_ready_carrier() {
         [0; 4]
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_waiter_transfers_same_qualification_without_actual_rpc_or_observer_pingpong() {
+    let lane = lazy_selected_lane(16);
+    let legacy = lane.select_local_call();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        match reserve_once(&legacy).await {
+            Poll::Ready(Ok(call)) => held.push(call),
+            other => panic!("actual original Buffer qualification: {other:?}"),
+        }
+    }
+    let mut a = Some(lane.select_local_call());
+    let mut b = Some(lane.select_local_call());
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(a.as_mut().unwrap().poll_sdk_ready(cx)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(b.as_mut().unwrap().poll_sdk_ready(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(lane.available_streams(), 8, "SDK wait holds no stream");
+    drop(held.pop());
+    std::future::poll_fn(|cx| a.as_mut().unwrap().poll_sdk_ready(cx))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reserve_once(&legacy).await, Poll::Pending),
+        "A retains its exact SDK qualification; nobody steals it between Ready and Native acceptance"
+    );
+    let mut target = None;
+    std::future::poll_fn(|cx| {
+        SelectedNativeCall::try_reserve_qualified_in(&mut a, &mut target, cx)
+    })
+    .await
+    .unwrap();
+    assert!(a.is_none());
+    assert!(target.is_some());
+    assert_eq!(lane.available_streams(), 8);
+    drop(target.take());
+    std::future::poll_fn(|cx| b.as_mut().unwrap().poll_sdk_ready(cx))
+        .await
+        .unwrap();
+    std::future::poll_fn(|cx| {
+        SelectedNativeCall::try_reserve_qualified_in(&mut b, &mut target, cx)
+    })
+    .await
+    .unwrap();
+    drop(target);
+    drop(held);
+    assert_eq!(lane.available_streams(), 16);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_sdk_waiter_releases_assigned_qualification_and_other_backend_progresses() {
+    let slow = lazy_selected_lane(16);
+    let fast = lazy_selected_lane(1);
+    let legacy = slow.select_local_call();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        match reserve_once(&legacy).await {
+            Poll::Ready(Ok(call)) => held.push(call),
+            other => panic!("original Buffer qualification: {other:?}"),
+        }
+    }
+    let mut cancelled = Some(slow.select_local_call());
+    let mut next = Some(slow.select_local_call());
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(cancelled.as_mut().unwrap().poll_sdk_ready(cx)))
+            .await
+            .is_pending()
+    );
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().unwrap().poll_sdk_ready(cx)))
+            .await
+            .is_pending()
+    );
+    let mut healthy = Some(fast.select_local_call());
+    let mut ready = None;
+    std::future::poll_fn(|cx| healthy.as_mut().unwrap().poll_sdk_ready(cx))
+        .await
+        .unwrap();
+    std::future::poll_fn(|cx| {
+        SelectedNativeCall::try_reserve_qualified_in(&mut healthy, &mut ready, cx)
+    })
+    .await
+    .unwrap();
+    assert!(ready.is_some());
+    assert_eq!(slow.available_streams(), 8);
+    drop(ready.take());
+    drop(held.pop()); // SDK assigns this qualification to cancelled before its next poll.
+    drop(cancelled.take()); // The SAME assigned qualification must leave, not a synthetic cancellation marker.
+    std::future::poll_fn(|cx| next.as_mut().unwrap().poll_sdk_ready(cx))
+        .await
+        .unwrap();
+    std::future::poll_fn(|cx| {
+        SelectedNativeCall::try_reserve_qualified_in(&mut next, &mut ready, cx)
+    })
+    .await
+    .unwrap();
+    drop(ready);
+    drop(held);
+    assert_eq!(slow.available_streams(), 16);
+    assert_eq!(fast.available_streams(), 1);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn stream_wait_is_notification_only_and_retains_same_sdk_qualification() {
+    let lane = lazy_selected_lane(1);
+    let legacy = lane.select_local_call();
+    let held = match reserve_once(&legacy).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("original stream: {other:?}"),
+    };
+    let mut selected = Some(lane.select_local_call());
+    std::future::poll_fn(|cx| selected.as_mut().unwrap().poll_sdk_ready(cx))
+        .await
+        .unwrap();
+    let changed = lane.stream_ready_notified();
+    tokio::pin!(changed);
+    changed.as_mut().enable();
+    let mut ready = None;
+    assert!(
+        std::future::poll_fn(
+            |cx| Poll::Ready(SelectedNativeCall::try_reserve_qualified_in(
+                &mut selected,
+                &mut ready,
+                cx
+            ))
+        )
+        .await
+        .is_pending()
+    );
+    assert!(selected.is_some());
+    assert!(ready.is_none());
+    assert_eq!(lane.available_streams(), 0);
+    drop(held);
+    changed.await;
+    std::future::poll_fn(|cx| {
+        SelectedNativeCall::try_reserve_qualified_in(&mut selected, &mut ready, cx)
+    })
+    .await
+    .unwrap();
+    assert_eq!(lane.available_streams(), 0);
+    drop(ready);
+    assert_eq!(lane.available_streams(), 1);
+}
+
+struct StreamReleaseReentry {
+    original: NativeLaneStreamGate,
+    seen: std::sync::Mutex<Vec<usize>>,
+}
+impl std::task::Wake for StreamReleaseReentry {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.seen.lock().unwrap().push(self.original.available());
+    }
+}
+fn arm_stream_reentry(
+    lane: &NativeLaneChannel,
+) -> (
+    Arc<StreamReleaseReentry>,
+    Pin<Box<tokio::sync::futures::OwnedNotified>>,
+) {
+    let wake = Arc::new(StreamReleaseReentry {
+        original: lane.gate.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let waker = std::task::Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut changed = Box::pin(lane.stream_ready_notified());
+    changed.as_mut().enable();
+    assert!(changed.as_mut().poll(&mut cx).is_pending());
+    (wake, changed)
+}
+fn assert_stream_reentry_after_release(wake: &StreamReleaseReentry, expected: usize) {
+    let seen = wake.seen.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "real original holder teardown must wake the registered source"
+    );
+    assert!(
+        seen.iter().all(|actual| *actual == expected),
+        "synchronous Waker reentry must see the already released original stream: {seen:?}"
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn reserved_call_notification_reenters_only_after_original_fields_exit() {
+    let lane = lazy_selected_lane(1);
+    let selected = lane.select_local_call();
+    let held = match reserve_once(&selected).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("original local qualification: {other:?}"),
+    };
+    assert_eq!(lane.available_streams(), 0);
+    let (wake, _changed) = arm_stream_reentry(&lane);
+    drop(held);
+    assert_stream_reentry_after_release(&wake, 1);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn sdk_pending_temporary_clone_release_wakes_without_successful_call_exit() {
+    let lane = lazy_selected_lane(8);
+    let mut b = Some(lane.select_local_call());
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        b.as_mut().unwrap().poll_sdk_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let legacy = lane.select_local_call();
+    let mut held = Vec::new();
+    for _ in 0..7 {
+        match reserve_once(&legacy).await {
+            Poll::Ready(Ok(call)) => held.push(call),
+            other => panic!("original Buffer qualification: {other:?}"),
+        }
+    }
+    assert_eq!(lane.available_streams(), 1);
+    // Stage the exact two original author operations of try_reserve_local at
+    // their intervening boundary so B deterministically observes A's partial.
+    let mut partial = lane.clone();
+    partial.reserved = Some(lane.gate.semaphore.clone().try_acquire_owned().unwrap());
+    assert!(Service::poll_ready(&mut partial.channel, &mut cx).is_pending());
+    let (wake, _changed) = arm_stream_reentry(&lane);
+    let mut ready = None;
+    assert!(SelectedNativeCall::try_reserve_qualified_in(&mut b, &mut ready, &mut cx).is_pending());
+    assert_eq!(lane.available_streams(), 0);
+    // No successful call exits at this cut: only A's SDK-Pending temporary.
+    drop(partial);
+    assert_stream_reentry_after_release(&wake, 1);
+    assert!(matches!(
+        SelectedNativeCall::try_reserve_qualified_in(&mut b, &mut ready, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(ready);
+    drop(held);
+    assert_eq!(lane.available_streams(), 8);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn assigned_stream_waiter_cancel_wakes_after_pollsemaphore_releases() {
+    let lane = lazy_selected_lane(1);
+    let legacy = lane.select_local_call();
+    let held = match reserve_once(&legacy).await {
+        Poll::Ready(Ok(call)) => call,
+        other => panic!("original stream qualification: {other:?}"),
+    };
+    let mut assigned = lane.clone();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(Service::poll_ready(&mut assigned, &mut cx).is_pending());
+    assert!(assigned.reserved.is_none());
+    drop(held);
+    assert_eq!(
+        lane.available_streams(),
+        0,
+        "original PollSemaphore owns an assigned but not returned qualification"
+    );
+    let mut b = Some(lane.select_local_call());
+    assert!(matches!(
+        b.as_mut().unwrap().poll_sdk_ready(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    let (wake, _changed) = arm_stream_reentry(&lane);
+    let mut ready = None;
+    assert!(SelectedNativeCall::try_reserve_qualified_in(&mut b, &mut ready, &mut cx).is_pending());
+    drop(assigned);
+    assert_stream_reentry_after_release(&wake, 1);
+    assert!(matches!(
+        SelectedNativeCall::try_reserve_qualified_in(&mut b, &mut ready, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(ready);
+    assert_eq!(lane.available_streams(), 1);
+}

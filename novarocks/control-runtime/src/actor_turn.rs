@@ -28,7 +28,10 @@ pub use poller_observation::{
 };
 
 use crate::{
-    actor::{Actor, ActorConfig, ActorFailurePolicy, ActorStep, StepEnvelope},
+    actor::{
+        Actor, ActorConfig, ActorFailurePolicy, ActorStep, InputSourceCut, InputSourceMode,
+        StepEnvelope,
+    },
     notify::Notify,
     sync::{Arc, Mutex},
     transaction::{RuntimeError, ScopeHandle},
@@ -158,6 +161,10 @@ impl ActorRegistration {
             && self.attachment == other.attachment
             && Arc::ptr_eq(&self.scope, &other.scope)
             && Arc::ptr_eq(&self.origin, &other.origin)
+    }
+    /// An already admitted role can lend its author only to this original actor.
+    pub fn matches_input_author(&self, author: &InputAuthor) -> bool {
+        self.actor == author.actor && Arc::ptr_eq(&self.origin, &author.origin)
     }
     /// Match only a still-attached execution scope. After detachment the
     /// historical scope_id remains, but no execution scope is owned here.
@@ -381,6 +388,7 @@ pub enum InputPhase {
     Consuming,
     Committed,
     AbandonedByOwnerFailure,
+    DisposingByOwnerFailure,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputCustody {
@@ -459,6 +467,8 @@ struct Inbox<A: Actor> {
     sealed: bool,
     payloads: BTreeMap<InputId, A::Input>,
     mailbox: MailboxState,
+    input_source: InputSourceMode,
+    prefer_actor_source: bool,
     inputs: BTreeMap<InputId, InputRecord>,
     standing_inputs: BTreeMap<StandingInputId, StandingInputRecord>,
     counts: [usize; 4],
@@ -485,6 +495,51 @@ struct Inbox<A: Actor> {
     failure_action_watermark: u64,
 }
 impl<A: Actor> Inbox<A> {
+    fn selected_source(&self) -> Option<ActorId> {
+        match self.input_source {
+            InputSourceMode::All => None,
+            InputSourceMode::Only(source) => Some(source),
+            InputSourceMode::Prefer(source) => self.mailbox.tail_from(source).map(|_| source),
+        }
+    }
+    fn ready_classes(&self, actor: ActorId) -> [bool; 4] {
+        let selected = self.selected_source();
+        std::array::from_fn(|index| {
+            let class = InputClass::ALL[index];
+            selected.map_or_else(
+                || self.mailbox.has_ready(class),
+                |source| {
+                    self.mailbox.has_ready_from(class, source)
+                        || self.mailbox.has_ready_from(class, actor)
+                },
+            )
+        })
+    }
+    fn has_selectable_input(&self, actor: ActorId) -> bool {
+        self.ready_classes(actor).into_iter().any(|ready| ready)
+    }
+    fn pop_selected(&mut self, actor: ActorId, class: InputClass) -> Option<InputEnvelope> {
+        let Some(source) = self.selected_source() else {
+            return self.mailbox.pop(class);
+        };
+        let continuation = self.mailbox.has_ready_from(class, source);
+        let own = self.mailbox.has_ready_from(class, actor);
+        let chosen = match (continuation, own) {
+            (true, true) if source != actor => {
+                let chosen = if self.prefer_actor_source {
+                    actor
+                } else {
+                    source
+                };
+                self.prefer_actor_source = !self.prefer_actor_source;
+                chosen
+            }
+            (true, _) => source,
+            (_, true) => actor,
+            _ => return None,
+        };
+        self.mailbox.pop_from(class, chosen)
+    }
     /// The single paid standing-input fill algorithm shared by direct and effect-backed
     /// handoff. The caller holds this inbox and qualifies the scope failure gate.
     fn fill_standing_input(
@@ -705,6 +760,14 @@ impl<A: Actor> Drop for Inbox<A> {
         );
     }
 }
+// Immutable registration choices share the original admission transaction.
+// Optional observation adds no source, resource owner, or synchronization gate.
+#[derive(Default)]
+struct RegistrationBinding {
+    attachment: Option<SlotId>,
+    failure_work: Option<WorkId>,
+    observed_source: Option<ActorId>,
+}
 struct ActorCell<A: Actor> {
     // Fresh for every registration, including reuse of the same public ActorId.
     origin: Arc<()>,
@@ -713,6 +776,7 @@ struct ActorCell<A: Actor> {
     attachment: SlotId,
     config: ActorConfig,
     failure_policy: ActorFailurePolicy,
+    observed_source: Option<ActorId>,
     core: Mutex<Option<A>>,
     inbox: Mutex<Inbox<A>>,
 }
@@ -737,6 +801,8 @@ struct ActorRuntimeShared<A: Actor> {
     state: Mutex<ActorRuntimeState<A>>,
     changed: Arc<Notify>,
     header_readiness: Arc<crate::header_readiness::HeaderReadyHub>,
+    capacity_wakes: Mutex<Vec<Arc<crate::capacity_notification::PendingCapacityWakes>>>,
+    capacity_notifier: std::sync::Arc<crate::capacity_notification::CapacityWakeNotifier>,
     history: Option<crate::history::HistoryCapture>,
     observation: crate::observation::RuntimeObservation,
 }
@@ -765,6 +831,7 @@ impl<A: Actor> Clone for ActorRuntime<A> {
 pub struct ActorHostTurn<A: Actor> {
     runtime: ActorRuntime<A>,
     node: Arc<ActorCell<A>>,
+    notified: bool,
     active: bool,
 }
 impl<A: Actor> std::fmt::Debug for ActorHostTurn<A> {
@@ -777,6 +844,11 @@ impl<A: Actor> std::fmt::Debug for ActorHostTurn<A> {
     }
 }
 impl<A: Actor> ActorHostTurn<A> {
+    /// An original notification can coincide with a scheduled continuation.
+    pub fn was_notified(&self) -> bool {
+        self.notified
+    }
+
     pub fn actor(&self) -> ActorId {
         self.node.id
     }
@@ -812,6 +884,11 @@ impl<A: Actor> ActorHostTurn<A> {
             && self.node.attachment == registration.attachment
             && Arc::ptr_eq(&self.node.scope, &registration.scope)
             && Arc::ptr_eq(&self.node.origin, &registration.origin)
+    }
+    /// Seal drained ingress while this original host still holds its turn.
+    /// The Core scheduler must be idle, including any concurrent claim.
+    pub fn seal_drained(&self) -> Result<(), ActorTurnError> {
+        self.runtime.seal_actor_node(&self.node, true)
     }
     /// Unload execution only after its actual custody retires. The same
     /// actor registration, scheduler address and builtin timer survive.
@@ -1142,6 +1219,54 @@ pub struct StandingInputObligation<A: Actor> {
     standing_input_id: StandingInputId,
     active: bool,
 }
+/// The failed Source's original queued payload. Only explicit disposal
+/// makes its input eligible for retirement. An unconsumed carrier retains
+/// unresolved custody and must never drop rich input on the host poller.
+#[must_use = "Dispose the original payload before retiring its input"]
+pub struct FailedSourcePayload<A: Actor> {
+    runtime: ActorRuntime<A>,
+    node: Arc<ActorCell<A>>,
+    input: InputId,
+    standing: StandingInputId,
+    value: ManuallyDrop<A::Input>,
+}
+
+impl<A: Actor> FailedSourcePayload<A> {
+    pub fn standing_id(&self) -> StandingInputId {
+        self.standing
+    }
+
+    /// A destructor panic preserves the original runtime input as unresolved.
+    pub fn dispose(self) -> Result<InputId, ActorTurnError> {
+        drop(ManuallyDrop::into_inner(self.value));
+        let mut inbox = self.node.inbox.lock().expect("failed payload inbox lock");
+        let record = inbox
+            .inputs
+            .get_mut(&self.input)
+            .ok_or(ActorTurnError::UnknownInput)?;
+        assert_eq!(record.phase, InputPhase::DisposingByOwnerFailure);
+        record.phase = InputPhase::AbandonedByOwnerFailure;
+        self.runtime.resolve_metadata_delivery(
+            &inbox,
+            self.input,
+            MetadataConsumption::AbandonedByOwnerFailure,
+        );
+        self.runtime.shared.record(|| HistoryFact::InputAbandoned {
+            target: self.node.history_target(),
+            input: self.input,
+        });
+        drop(inbox);
+        let registration = ActorRegistration {
+            actor: self.node.id,
+            attachment: self.node.attachment,
+            scope: self.node.scope.clone(),
+            origin: self.node.origin.clone(),
+        };
+        let _ = self.runtime.notify_host_actor(&registration);
+        Ok(self.input)
+    }
+}
+
 impl<A: Actor> std::fmt::Debug for StandingInputObligation<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StandingInputObligation")
@@ -1152,12 +1277,18 @@ impl<A: Actor> std::fmt::Debug for StandingInputObligation<A> {
     }
 }
 impl<A: Actor> StandingInputObligation<A> {
+    pub fn matches_registration(&self, registration: &ActorRegistration) -> bool {
+        self.actor == registration.actor && Arc::ptr_eq(&self.origin, &registration.origin)
+    }
     fn original_node(&self) -> Result<Arc<ActorCell<A>>, ActorTurnError> {
         let node = self.runtime.node(self.actor)?;
         if !Arc::ptr_eq(&self.origin, &node.origin) {
             return Err(ActorTurnError::EffectTicketOriginMismatch);
         }
         Ok(node)
+    }
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
     }
     pub const fn id(&self) -> StandingInputId {
         self.standing_input_id
@@ -1197,6 +1328,81 @@ impl<A: Actor> StandingInputObligation<A> {
             .ok_or(ActorTurnError::UnknownStandingInput)?
             .in_flight)
     }
+    /// The original producer's owner may retire its submitted occurrence
+    /// after its captures have exited. A Core commit alone is insufficient:
+    /// the same occurrence's effects and reservations must also be terminal.
+    pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        let Some(input) = self.in_flight()? else {
+            return Ok(true);
+        };
+        match self.runtime.retire_input(self.actor, input) {
+            Ok(()) => Ok(true),
+            Err(
+                ActorTurnError::InputStillQueued
+                | ActorTurnError::EffectsRemain
+                | ActorTurnError::ReservationsRemain
+                | ActorTurnError::MetadataStillPending,
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    /// Move only a permitted standing role at this original Source's FIFO
+    /// head. The failure custodian may not take another Source's payload or
+    /// jump past an earlier occurrence of a different role.
+    pub fn take_failed_source_payload(
+        &self,
+        roles: &std::collections::BTreeSet<StandingInputId>,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.take_failed_source_payload_matching(|id| roles.contains(&id))
+    }
+    /// Claim only this standing role, subject to the original Source FIFO.
+    pub fn take_failed_role_payload(
+        &self,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        self.take_failed_source_payload_matching(|id| id == self.id())
+    }
+    pub(crate) fn take_failed_source_payload_matching(
+        &self,
+        matches_role: impl FnOnce(StandingInputId) -> bool,
+    ) -> Result<Option<FailedSourcePayload<A>>, ActorTurnError> {
+        let node = self.original_node()?;
+        let mut inbox = node.inbox.lock().expect("failed Source inbox lock");
+        if !inbox.failed {
+            return Err(ActorTurnError::ActorNotRetired);
+        }
+        let source = inbox
+            .standing_inputs
+            .get(&self.standing_input_id)
+            .ok_or(ActorTurnError::UnknownStandingInput)?
+            .source;
+        let Some(head) = inbox.mailbox.head_from(source) else {
+            return Ok(None);
+        };
+        let original = inbox
+            .inputs
+            .get(&head.input)
+            .expect("original failed Source head");
+        let standing = original
+            .standing_input_id
+            .filter(|id| matches_role(*id))
+            .ok_or(ActorTurnError::InputAuthorMismatch)?;
+        assert_eq!(original.phase, InputPhase::Filled);
+        assert_eq!(inbox.mailbox.pop_from(head.class, source), Some(head));
+        inbox.inputs.get_mut(&head.input).unwrap().phase = InputPhase::DisposingByOwnerFailure;
+        let value = inbox
+            .payloads
+            .remove(&head.input)
+            .expect("original failed Source payload");
+        drop(inbox);
+        Ok(Some(FailedSourcePayload {
+            runtime: self.runtime.clone(),
+            node,
+            input: head.input,
+            standing,
+            value: ManuallyDrop::new(value),
+        }))
+    }
+
     /// Fills only an idle, already paid position, including during process drain.
     /// Every occurrence receives a fresh monotonic InputId; a prior effect ticket
     /// can never identify this new batch. Error returns the original neutral value.
@@ -1532,6 +1738,7 @@ pub struct EffectTicketView<E> {
 pub struct EffectTicket<E> {
     view: EffectTicketView<E>,
     origin: Arc<()>,
+    withdrawn: bool,
 }
 impl<E> std::ops::Deref for EffectTicket<E> {
     type Target = EffectTicketView<E>;
@@ -1857,6 +2064,7 @@ impl<A: Actor> FailurePublicationSession<A> {
                     .clone(),
             },
             origin: self.origin.clone(),
+            withdrawn: false,
         })
     }
     pub fn commit_snapshot<T>(
@@ -2067,11 +2275,42 @@ impl<A: Actor> ActorRuntime<A> {
                     open: true,
                     now: Tick(0),
                 }),
+                capacity_notifier: std::sync::Arc::new(
+                    crate::capacity_notification::CapacityWakeNotifier {
+                        changed: changed.clone(),
+                    },
+                ),
+                capacity_wakes: Mutex::new(Vec::new()),
                 changed,
                 header_readiness,
                 history,
                 observation,
             }),
+        }
+    }
+    fn attach_capacity_ledger(&self, ledger: &crate::transaction::RuntimeLedger) {
+        let queue = &ledger.shared.pending_capacity_wakes;
+        let mut queues = self
+            .shared
+            .capacity_wakes
+            .lock()
+            .expect("actor capacity notification queues lock");
+        if !queues.iter().any(|old| Arc::ptr_eq(old, queue)) {
+            queue.attach(&self.shared.capacity_notifier);
+            queues.push(queue.clone());
+        }
+    }
+    /// Take queue snapshots without retaining any runtime lock across a Waker.
+    /// A queue is shared by all attached runtimes and outlives removed Scopes.
+    fn flush_capacity_notifications(&self) {
+        let queues = self
+            .shared
+            .capacity_wakes
+            .lock()
+            .expect("actor capacity notification queues lock")
+            .clone();
+        for queue in queues {
+            queue.flush();
         }
     }
     fn node(&self, id: ActorId) -> Result<Arc<ActorCell<A>>, ActorTurnError> {
@@ -2095,7 +2334,10 @@ impl<A: Actor> ActorRuntime<A> {
         self.register_inner(
             id,
             scope,
-            (Some(attachment), None),
+            RegistrationBinding {
+                attachment: Some(attachment),
+                ..Default::default()
+            },
             actor,
             config,
             ActorFailurePolicy::IsolateScope,
@@ -2111,15 +2353,69 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
     ) -> Result<SlotId, (ActorTurnError, A)> {
+        self.register_bound(id, scope, actor, config)
+            .map(|registration| registration.attachment)
+    }
+    /// Install an unsupervised actor and return its original admission witness
+    /// atomically. Retaining this witness cannot bind an owner to a replacement.
+    pub fn register_bound(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
         self.register_inner(
             id,
             scope,
-            (None, None),
+            RegistrationBinding::default(),
             actor,
             config,
             ActorFailurePolicy::IsolateScope,
         )
-        .map(|registration| registration.attachment)
+    }
+    /// Register the same actor while observing one original mailbox source.
+    /// Every Core input receives that source's pre-pop tail sample. This
+    /// observation creates no source role, input, selection or capacity grant.
+    pub fn register_bound_with_source_cut(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        source: ActorId,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        self.register_inner(
+            id,
+            scope,
+            RegistrationBinding {
+                observed_source: Some(source),
+                ..Default::default()
+            },
+            actor,
+            config,
+            ActorFailurePolicy::IsolateScope,
+        )
+    }
+    /// The supervised registration and its optional source observation bind
+    /// atomically to this original incarnation, without a later setter race.
+    pub fn register_supervised_bound_with_source_cut(
+        &self,
+        id: ActorId,
+        scope: ScopeHandle,
+        actor: A,
+        config: ActorConfig,
+        failure_work: &crate::obligation::WorkObligation,
+        source: ActorId,
+    ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        self.register_supervised_inner(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            (ActorFailurePolicy::IsolateScope, Some(source)),
+        )
     }
     /// Bind the original failure-cleanup role outside the actor's mutable
     /// state. Its pure failure hook receives only the role identity, even if
@@ -2195,7 +2491,14 @@ impl<A: Actor> ActorRuntime<A> {
         failure_work: &crate::obligation::WorkObligation,
         failure_policy: ActorFailurePolicy,
     ) -> Result<ActorRegistration, (ActorTurnError, A)> {
-        self.register_supervised_inner(id, scope, actor, config, failure_work, failure_policy)
+        self.register_supervised_inner(
+            id,
+            scope,
+            actor,
+            config,
+            failure_work,
+            (failure_policy, None),
+        )
     }
     fn register_supervised_inner(
         &self,
@@ -2204,8 +2507,9 @@ impl<A: Actor> ActorRuntime<A> {
         actor: A,
         config: ActorConfig,
         failure_work: &crate::obligation::WorkObligation,
-        failure_policy: ActorFailurePolicy,
+        registration: (ActorFailurePolicy, Option<ActorId>),
     ) -> Result<ActorRegistration, (ActorTurnError, A)> {
+        let (failure_policy, observed_source) = registration;
         if scope.id() != failure_work.scope().id()
             || !Arc::ptr_eq(&scope.runtime.shared, &failure_work.scope().runtime.shared)
         {
@@ -2239,7 +2543,11 @@ impl<A: Actor> ActorRuntime<A> {
         self.register_inner(
             id,
             scope,
-            (None, Some(failure_work.id())),
+            RegistrationBinding {
+                failure_work: Some(failure_work.id()),
+                observed_source,
+                ..Default::default()
+            },
             actor,
             config,
             failure_policy,
@@ -2249,7 +2557,7 @@ impl<A: Actor> ActorRuntime<A> {
         &self,
         id: ActorId,
         scope: ScopeHandle,
-        binding: (Option<SlotId>, Option<WorkId>),
+        binding: RegistrationBinding,
         actor: A,
         config: ActorConfig,
         failure_policy: ActorFailurePolicy,
@@ -2263,7 +2571,11 @@ impl<A: Actor> ActorRuntime<A> {
             Err(e) => return Err((e.into(), actor)),
         };
         let deadline = actor.next_deadline();
-        let (attachment, failure_work) = binding;
+        let RegistrationBinding {
+            attachment,
+            failure_work,
+            observed_source,
+        } = binding;
         let attachment = match attachment {
             Some(slot) => match scope.attach_actor(slot) {
                 Ok(()) => slot,
@@ -2302,6 +2614,7 @@ impl<A: Actor> ActorRuntime<A> {
                 .set(id, deadline)
                 .expect("one timer per registered actor");
         }
+        self.attach_capacity_ledger(&scope.runtime);
         let registration = ActorRegistration {
             actor: id,
             attachment,
@@ -2324,6 +2637,7 @@ impl<A: Actor> ActorRuntime<A> {
                 attachment,
                 config,
                 failure_policy,
+                observed_source,
                 core: Mutex::new(Some(actor)),
                 inbox: Mutex::new(Inbox {
                     observation: self.shared.observation.clone(),
@@ -2331,6 +2645,8 @@ impl<A: Actor> ActorRuntime<A> {
                     sealed: false,
                     payloads: BTreeMap::new(),
                     mailbox: MailboxState::new(config.mailbox),
+                    input_source: InputSourceMode::All,
+                    prefer_actor_source: false,
                     inputs: BTreeMap::new(),
                     standing_inputs: BTreeMap::new(),
                     counts: [0; 4],
@@ -2750,6 +3066,14 @@ impl<A: Actor> ActorRuntime<A> {
     /// Work remains counted and remove_actor still independently requires join.
     pub fn seal_actor(&self, actor: ActorId) -> Result<(), ActorTurnError> {
         let node = self.node(actor)?;
+        self.seal_actor_node(&node, false)
+    }
+    fn seal_actor_node(
+        &self,
+        node: &ActorCell<A>,
+        host_claimed: bool,
+    ) -> Result<(), ActorTurnError> {
+        let actor = node.id;
         let mut inbox = node.inbox.lock().expect("actor inbox lock");
         if inbox.external_open
             || !inbox.inputs.is_empty()
@@ -2759,18 +3083,30 @@ impl<A: Actor> ActorRuntime<A> {
         {
             return Err(ActorTurnError::ActorNotRetired);
         }
-        if self.close_metadata_waiters_locked(&node, &mut inbox) {
+        if self.close_metadata_waiters_locked(node, &mut inbox) {
             return Err(ActorTurnError::ActorNotRetired);
         }
         let mut state = self.shared.state.lock().expect("runtime scheduler lock");
-        if !state.ready.is_idle(actor)? || !state.effect_ready.is_idle(actor)? {
+        if !state
+            .actors
+            .get(&actor)
+            .is_some_and(|actual| std::ptr::eq(actual.as_ref(), node))
+        {
+            return Err(ActorTurnError::EffectTicketOriginMismatch);
+        }
+        let host_ready = if host_claimed {
+            state.effect_ready.is_claimed(actor)?
+        } else {
+            state.effect_ready.is_idle(actor)?
+        };
+        if !state.ready.is_idle(actor)? || !host_ready {
             return Err(SchedulerError::Busy.into());
         }
         inbox.sealed = true;
         inbox.timer_closed = true;
         inbox.failed_custodian_timer = None;
-        // All actual inputs and scheduler claims are empty under these same
-        // locks. Withdrawing the unused builtin cannot race a later Core turn.
+        // Input custody and the Core queue are empty under these same locks.
+        // Withdrawing the unused builtin cannot race a later Core turn.
         inbox.failure_position = None;
         state.timers.cancel(actor);
         state.timers.acknowledge_tick(actor);
@@ -2786,6 +3122,7 @@ impl<A: Actor> ActorRuntime<A> {
             .expect("runtime scheduler lock")
             .open = false;
         self.shared.changed.notify();
+        self.flush_capacity_notifications();
     }
     pub fn next_deadline(&self) -> Option<Tick> {
         self.shared
@@ -2908,13 +3245,26 @@ impl<A: Actor> ActorRuntime<A> {
     /// Executes one finite actor turn using an explicit simulation time. Every
     /// input still clamps this value against the shared scheduler's latest time.
     pub fn poll_one(&self, observed: Tick) -> Result<bool, ActorTurnError> {
-        self.poll_one_inner(observed, None)
+        self.poll_one_deferred(observed, None)
     }
     /// Production input steps observe time independently. Clock sampling occurs
     /// after removing the input and outside inbox, ledger, scheduler and core
     /// locks; only the clamped Tick value enters the pure actor.
     pub fn poll_one_with_clock(&self, clock: &dyn Clock) -> Result<bool, ActorTurnError> {
-        self.poll_one_inner(clock.now(), Some(clock))
+        self.poll_one_deferred(clock.now(), Some(clock))
+    }
+    fn poll_one_deferred(
+        &self,
+        observed: Tick,
+        clock: Option<&dyn Clock>,
+    ) -> Result<bool, ActorTurnError> {
+        self.flush_capacity_notifications();
+        let result = {
+            let _deferral = crate::capacity_notification::CapacityWakeDeferral::enter();
+            self.poll_one_inner(observed, clock)
+        };
+        self.flush_capacity_notifications();
+        result
     }
     fn poll_one_inner(
         &self,
@@ -2941,6 +3291,7 @@ impl<A: Actor> ActorRuntime<A> {
             node
         };
         let execution_scope = node.scope.current_scope();
+        self.attach_capacity_ledger(&execution_scope.runtime);
         let mut budget = TurnBudget::new(node.config.turn_budget)?;
         loop {
             let next = {
@@ -2948,17 +3299,29 @@ impl<A: Actor> ActorRuntime<A> {
                 if inbox.failed || inbox.sealed || inbox.batches.len() >= node.config.max_batches {
                     None
                 } else {
-                    let ready =
-                        std::array::from_fn(|i| inbox.mailbox.has_ready(InputClass::ALL[i]));
+                    let ready = inbox.ready_classes(node.id);
                     let mut candidate = budget.clone();
                     let class = candidate.next(ready);
                     class
                         .filter(|_| candidate.charge(node.config.max_step_work))
                         .and_then(|class| {
                             budget = candidate;
-                            inbox.mailbox.pop(class)
+                            let source_cut = node.observed_source.map(|source| InputSourceCut {
+                                source,
+                                tail: inbox.mailbox.tail_from(source),
+                            });
+                            let selected_cut =
+                                inbox.input_source.contending_source().map(|source| {
+                                    InputSourceCut {
+                                        source,
+                                        tail: inbox.mailbox.tail_from(source),
+                                    }
+                                });
+                            inbox
+                                .pop_selected(node.id, class)
+                                .map(|input| (input, source_cut, selected_cut))
                         })
-                        .map(|input| {
+                        .map(|(input, source_cut, selected_cut)| {
                             let original =
                                 inbox.inputs.get_mut(&input.input).expect("filled input");
                             original.phase = InputPhase::Consuming;
@@ -2967,11 +3330,11 @@ impl<A: Actor> ActorRuntime<A> {
                                 .payloads
                                 .remove(&input.input)
                                 .expect("filled input owns its neutral payload");
-                            (input, value, handoff_at)
+                            (input, value, handoff_at, source_cut, selected_cut)
                         })
                 }
             };
-            let Some((input, value, handoff_at)) = next else {
+            let Some((input, value, handoff_at, source_cut, selected_cut)) = next else {
                 break;
             };
             let observed = clock.map_or(observed, Clock::now);
@@ -2993,6 +3356,8 @@ impl<A: Actor> ActorRuntime<A> {
                 node.config.max_dependencies_per_effect,
                 node.config.max_step_work,
             );
+            step.set_input_source_cut(source_cut);
+            step.set_selected_source_cut(selected_cut);
             step.set_failure_work(node.scope.failure_work());
             let input_author = node
                 .inbox
@@ -3039,6 +3404,7 @@ impl<A: Actor> ActorRuntime<A> {
                 Ok(deadline) => {
                     let batch = step.finish();
                     let stop_producing = batch.stop_producing;
+                    let input_source = batch.input_source;
                     let mut inbox = node.inbox.lock().expect("actor inbox lock");
                     // Preflight every fallible batch boundary before changing
                     // the scope gate. The same inbox stays locked through commit.
@@ -3073,6 +3439,14 @@ impl<A: Actor> ActorRuntime<A> {
                     inbox
                         .commit_batch(input.input, batch)
                         .expect("preflighted atomic batch commitment");
+                    if let Some(source) = input_source
+                        && inbox.input_source != source
+                    {
+                        if inbox.input_source.contending_source() != source.contending_source() {
+                            inbox.prefer_actor_source = false;
+                        }
+                        inbox.input_source = source;
+                    }
                     inbox
                         .inputs
                         .get_mut(&input.input)
@@ -3083,8 +3457,11 @@ impl<A: Actor> ActorRuntime<A> {
                         input.input,
                         MetadataConsumption::Consumed,
                     );
-                    self.notify_metadata_credit_sources(
-                        inbox.retire_metadata_input_if_ready(input.input, &mut ledger),
+                    self.retire_metadata_input_and_wake(
+                        &node,
+                        &mut inbox,
+                        input.input,
+                        &mut ledger,
                     );
                     if stop_producing {
                         ledger
@@ -3281,7 +3658,7 @@ impl<A: Actor> ActorRuntime<A> {
         {
             let inbox = node.inbox.lock().expect("actor inbox lock");
             let pending = !inbox.failed
-                && !inbox.mailbox.is_empty()
+                && inbox.has_selectable_input(node.id)
                 && inbox.batches.len() < node.config.max_batches;
             self.shared
                 .state
@@ -3308,6 +3685,71 @@ impl<A: Actor> ActorRuntime<A> {
             .ok_or(ActorTurnError::UnknownInput)?
             .state
             .poll_ready(budget, generation)?)
+    }
+    /// Nonblocking observation of original committed batches. The caller's
+    /// original registration is qualified under the scheduler gate; the inbox
+    /// snapshot includes lane tails and batches after the supplied real cursor.
+    /// No ready/dispatch cursor is advanced and no payload is cloned.
+    pub fn try_effect_inventory_observation(
+        &self,
+        registration: &ActorRegistration,
+        indexed_through: Option<BatchId>,
+    ) -> Result<
+        Option<crate::observation::EffectInventoryObservation>,
+        crate::observation::EffectObservationError,
+    > {
+        use crate::observation::{EffectInventoryObservation, EffectObservationError};
+        let node = {
+            let state = match self.shared.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(EffectObservationError::Poisoned);
+                }
+            };
+            Self::validate_registration_in_state(&state, registration)
+                .map_err(EffectObservationError::Runtime)?;
+            state
+                .actors
+                .get(&registration.actor())
+                .expect("qualified original actor registration")
+                .clone()
+        };
+        let inbox = match node.inbox.try_lock() {
+            Ok(inbox) => inbox,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(EffectObservationError::Poisoned);
+            }
+        };
+        let mut sample = EffectInventoryObservation::default();
+        for (ordinal, input) in &inbox.batch_order {
+            let states = inbox
+                .batches
+                .get(input)
+                .expect("original committed batch order index")
+                .state
+                .observed_states();
+            sample.states = sample
+                .states
+                .checked_add(states)
+                .ok_or(EffectObservationError::InventoryOverflow)?;
+            sample.batches = sample
+                .batches
+                .checked_add(1)
+                .ok_or(EffectObservationError::InventoryOverflow)?;
+            if indexed_through.is_none_or(|cursor| *ordinal > cursor) {
+                sample.unindexed_states = sample
+                    .unindexed_states
+                    .checked_add(states)
+                    .ok_or(EffectObservationError::InventoryOverflow)?;
+                sample.unindexed_batches = sample
+                    .unindexed_batches
+                    .checked_add(1)
+                    .ok_or(EffectObservationError::InventoryOverflow)?;
+            }
+        }
+        Ok(Some(sample))
     }
     /// Actual bounded dependency metadata, also available to failed-owner
     /// cleanup. Payload custody stays exclusively in the original batch.
@@ -3353,15 +3795,31 @@ impl<A: Actor> ActorRuntime<A> {
         }
         Ok(batch.payloads.get(&action).cloned())
     }
-    /// Start is synchronized with the same failure fence as batch commitment.
-    pub fn take_effect(
+    /// Observe only this original host's exact effect start gate. This shares
+    /// the same inbox -> ledger predicate as `take_effect`, without advancing
+    /// a pending cursor, cloning a payload, or claiming a ticket/Work. A later
+    /// claim must still revalidate because stop/failure may race this sample.
+    pub fn effect_ready_for(
         &self,
-        actor: ActorId,
+        host: &ActorHostTurn<A>,
         input: InputId,
         action: ActionId,
-    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
-        let node = self.node(actor)?;
-        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+    ) -> Result<bool, ActorTurnError> {
+        self.effect_ready_for_dispatch(host, input, action, false)
+    }
+    pub(crate) fn effect_ready_for_dispatch(
+        &self,
+        host: &ActorHostTurn<A>,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<bool, ActorTurnError> {
+        if !host.active || !self.same_runtime(&host.runtime) {
+            return Err(ActorTurnError::EffectTicketOriginMismatch);
+        }
+        self.validate_registration(&host.registration())?;
+        let node = &host.node;
+        let inbox = node.inbox.lock().expect("actor inbox lock");
         let execution_scope = node.scope.current_scope();
         let ledger = execution_scope
             .runtime
@@ -3369,18 +3827,37 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        let descriptor = inbox
+        Self::effect_start_status(
+            node,
+            &inbox,
+            &ledger,
+            &execution_scope,
+            input,
+            action,
+            withdrawn,
+        )
+        .map(|(ready, _)| ready)
+    }
+    fn effect_start_status(
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        execution_scope: &ScopeHandle,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<(bool, Generation), ActorTurnError> {
+        let batch = inbox
             .batches
             .get(&input)
-            .ok_or(ActorTurnError::UnknownInput)?
+            .ok_or(ActorTurnError::UnknownInput)?;
+        let descriptor = batch
             .state
             .record(action)
             .ok_or(EffectError::UnknownAction)?
-            .descriptor()
-            .clone();
+            .descriptor();
         let author_generation =
-            Self::action_author_generation(&node, &inbox, &ledger, input, &descriptor)?;
-        let generation = inbox.generation;
+            Self::action_author_generation(node, inbox, ledger, input, descriptor)?;
         if !node.scope.retained()
             && ledger
                 .scopes
@@ -3405,18 +3882,67 @@ impl<A: Actor> ActorRuntime<A> {
         if inbox.failed && inbox.failure_input != Some(input) {
             return Err(ActorTurnError::ActorFailed);
         }
+        // A withdrawn carrier may transfer metadata to run the existing
+        // unused teardown. Its original Work start gate remains closed.
+        if stopped
+            && !withdrawn
+            && descriptor.kind == novarocks_control_runtime_core::effect::EffectKind::Business
+        {
+            return Ok((false, author_generation));
+        }
+        Ok((
+            batch.state.ready(action, inbox.generation)?,
+            author_generation,
+        ))
+    }
+    /// Start is synchronized with the same failure fence as batch commitment.
+    pub fn take_effect(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        action: ActionId,
+    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
+        self.take_effect_for_dispatch(actor, input, action, false)
+    }
+    pub(crate) fn take_effect_for_dispatch(
+        &self,
+        actor: ActorId,
+        input: InputId,
+        action: ActionId,
+        withdrawn: bool,
+    ) -> Result<EffectTicket<A::Effect>, ActorTurnError> {
+        let node = self.node(actor)?;
+        let mut inbox = node.inbox.lock().expect("actor inbox lock");
+        let execution_scope = node.scope.current_scope();
+        let ledger = execution_scope
+            .runtime
+            .shared
+            .state
+            .lock()
+            .expect("runtime ledger lock");
+        let (ready, author_generation) = Self::effect_start_status(
+            &node,
+            &inbox,
+            &ledger,
+            &execution_scope,
+            input,
+            action,
+            withdrawn,
+        )?;
+        if !ready {
+            return Err(EffectError::NotReady.into());
+        }
+        let generation = inbox.generation;
         let batch = inbox
             .batches
             .get_mut(&input)
-            .ok_or(ActorTurnError::UnknownInput)?;
-        if stopped
-            && batch.state.record(action).is_some_and(|effect| {
-                effect.descriptor().kind
-                    == novarocks_control_runtime_core::effect::EffectKind::Business
-            })
-        {
-            return Err(EffectError::NotReady.into());
-        }
+            .expect("the qualified original batch remains locked");
+        let descriptor = batch
+            .state
+            .record(action)
+            .expect("the qualified original action remains locked")
+            .descriptor()
+            .clone();
         batch.state.start(action, generation)?;
         self.shared.record(|| HistoryFact::Effect {
             target: node.history_target(),
@@ -3446,6 +3972,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .clone(),
             },
             origin: node.origin.clone(),
+            withdrawn,
         })
     }
     /// Read-only validation of this original ticket's current publication
@@ -3725,7 +4252,7 @@ impl<A: Actor> ActorRuntime<A> {
             .state
             .lock()
             .expect("runtime ledger lock");
-        self.validate_publication(&node, &inbox, &ledger, ticket, &execution_scope)?;
+        self.validate_started_ticket(&node, &inbox, &ledger, ticket, &execution_scope)?;
         let batch = inbox
             .batches
             .get_mut(&ticket.input)
@@ -3746,9 +4273,10 @@ impl<A: Actor> ActorRuntime<A> {
             .reservations
             .remove(&reservation)
             .expect("validated original reservation");
-        self.notify_metadata_credit_sources(
-            inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-        );
+        self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
+        drop(ledger);
+        drop(inbox);
+        self.shared.changed.notify();
         Ok(guard)
     }
     /// Bounded inventory of the actual guards retained by one committed step.
@@ -4150,6 +4678,21 @@ impl<A: Actor> ActorRuntime<A> {
         Ok(scope.generation())
     }
     fn validate_publication(
+        &self,
+        node: &ActorCell<A>,
+        inbox: &Inbox<A>,
+        ledger: &crate::transaction::LedgerState,
+        ticket: &EffectTicket<A::Effect>,
+        target: &ScopeHandle,
+    ) -> Result<(), ActorTurnError> {
+        if ticket.withdrawn {
+            return Err(EffectError::NotReady.into());
+        }
+        self.validate_started_ticket(node, inbox, ledger, ticket, target)
+    }
+    /// Includes a withdrawn carrier's claim on its still-unbound original
+    /// guard. Such a ticket cannot authorize Work start or publication.
+    fn validate_started_ticket(
         &self,
         node: &ActorCell<A>,
         inbox: &Inbox<A>,
@@ -4606,9 +5149,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state
@@ -4735,7 +5276,10 @@ impl<A: Actor> ActorRuntime<A> {
             .inputs
             .get_mut(&input)
             .ok_or(ActorTurnError::UnknownInput)?;
-        if record.phase == InputPhase::Filled {
+        if matches!(
+            record.phase,
+            InputPhase::Filled | InputPhase::DisposingByOwnerFailure
+        ) {
             return Err(ActorTurnError::InputStillQueued);
         }
         if record.phase == InputPhase::Committed {
@@ -4916,7 +5460,7 @@ impl<A: Actor> ActorRuntime<A> {
                 .timers
                 .acknowledge_tick(actor);
         }
-        if !inbox.failed && !inbox.mailbox.is_empty() {
+        if !inbox.failed && inbox.has_selectable_input(actor) {
             self.shared
                 .state
                 .lock()
@@ -5066,7 +5610,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .expect("actual registered header owner");
             }
         }
-        let actor = state.effect_ready.claim()?;
+        let (actor, notified) = state.effect_ready.claim_with_notification()?;
         let node = state
             .actors
             .get(&actor)
@@ -5075,6 +5619,7 @@ impl<A: Actor> ActorRuntime<A> {
         Some(ActorHostTurn {
             runtime: self.clone(),
             node,
+            notified,
             active: true,
         })
     }
@@ -5354,6 +5899,7 @@ impl<A: Actor> ActorRuntime<A> {
             .expect("one core owner");
         drop(inbox);
         self.shared.changed.notify();
+        self.flush_capacity_notifications();
         Ok(actor)
     }
     fn detach_execution_node(
@@ -5788,6 +6334,35 @@ impl<A: Actor> ActorRuntime<A> {
         inbox.observation.input_credit_taken(class);
         Ok(delivery)
     }
+    /// The original input's last tail may free max_batches without a new
+    /// message. Restore eligible Core readiness as well as producer credit;
+    /// the caller wakes pollers only after dropping inbox/ledger locks.
+    fn retire_metadata_input_and_wake(
+        &self,
+        node: &ActorCell<A>,
+        inbox: &mut Inbox<A>,
+        input: InputId,
+        ledger: &mut crate::transaction::LedgerState,
+    ) {
+        let existed = inbox.inputs.contains_key(&input);
+        let credit = inbox.retire_metadata_input_if_ready(input, ledger);
+        self.notify_metadata_credit_sources(credit);
+        if existed
+            && !inbox.inputs.contains_key(&input)
+            && !inbox.failed
+            && !inbox.sealed
+            && inbox.batches.len() < node.config.max_batches
+            && inbox.has_selectable_input(node.id)
+        {
+            self.shared
+                .state
+                .lock()
+                .expect("runtime scheduler lock")
+                .ready
+                .notify(node.id)
+                .expect("the locked original actor remains registered");
+        }
+    }
     fn notify_metadata_credit_sources(&self, sources: Vec<ActorRegistration>) {
         for source in sources {
             self.notify_metadata_source(&source);
@@ -6117,9 +6692,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state
@@ -6184,9 +6757,7 @@ impl<A: Actor> ActorRuntime<A> {
                     .state
                     .lock()
                     .expect("original metadata tail header custody");
-                self.notify_metadata_credit_sources(
-                    inbox.retire_metadata_input_if_ready(ticket.input, &mut ledger),
-                );
+                self.retire_metadata_input_and_wake(&node, &mut inbox, ticket.input, &mut ledger);
             }
             self.shared
                 .state
@@ -6503,6 +7074,7 @@ mod effect_ticket_incarnation_tests {
                 .reserve_next(
                     generation,
                     ReservationResources {
+                        keyed: None,
                         quota: ResourceVector::new([]).unwrap(),
                         owned_slots: OwnedSlotNeed {
                             work_headers: 1,
@@ -6602,5 +7174,127 @@ mod effect_ticket_incarnation_tests {
             fresh,
             "the same public ActorId cannot inherit an old ticket origin"
         );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod effect_observation_tests {
+    use super::*;
+    use crate::observation::EffectObservationError;
+    use crate::transaction::RuntimeLedger;
+    use novarocks_control_runtime_core::capacity::ResourceVector;
+    struct Empty;
+    impl Actor for Empty {
+        type Input = ();
+        type Effect = ();
+        fn timer_input(_: Tick) {}
+        fn next_deadline(&self) -> Option<Tick> {
+            None
+        }
+        fn handle(&mut self, _: Tick, _: InputEnvelope, _: (), _: &mut ActorStep<'_, ()>) {}
+        fn owner_failed(_: ScopeId, _: Generation, _: InputEnvelope, _: &mut ActorStep<'_, ()>) {}
+    }
+    #[test]
+    fn pending_observation_is_unavailable_on_scheduler_or_inbox_contention() {
+        let ledger = RuntimeLedger::new(ResourceVector::default());
+        let scope = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        let runtime = ActorRuntime::new();
+        let registration = runtime
+            .register_bound(
+                ActorId::new(1).unwrap(),
+                scope.clone(),
+                Empty,
+                ActorConfig {
+                    mailbox: [1; 4],
+                    max_batches: 1,
+                    max_effects_per_step: 1,
+                    max_dependencies_per_effect: 0,
+                    turn_budget: 8,
+                    max_step_work: 1,
+                },
+            )
+            .unwrap_or_else(|_| panic!("original actor admission"));
+        let before = scope.snapshot().unwrap();
+        let refused = runtime.register_bound(
+            registration.actor(),
+            scope.clone(),
+            Empty,
+            ActorConfig {
+                mailbox: [1; 4],
+                max_batches: 1,
+                max_effects_per_step: 1,
+                max_dependencies_per_effect: 0,
+                turn_budget: 8,
+                max_step_work: 1,
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "duplicate admission returns only its original actor"
+        );
+        assert_eq!(
+            scope.snapshot().unwrap().storage,
+            before.storage,
+            "failed admission rolls back its actual attachment"
+        );
+        let lock = runtime.shared.state.lock().unwrap();
+        assert_eq!(
+            runtime
+                .try_effect_inventory_observation(&registration, None)
+                .unwrap(),
+            None
+        );
+        drop(lock);
+        let node = runtime.node(registration.actor()).unwrap();
+        let lock = node.inbox.lock().unwrap();
+        assert_eq!(
+            runtime
+                .try_effect_inventory_observation(&registration, None)
+                .unwrap(),
+            None
+        );
+        drop(lock);
+        let sample = runtime
+            .try_effect_inventory_observation(&registration, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sample.batches, 0);
+        assert_eq!(sample.states.pending, 0);
+        scope.close_external().unwrap();
+        assert!(runtime.remove_actor(registration.actor()).is_ok());
+        assert_eq!(scope.snapshot().unwrap().storage, 0);
+        runtime.close_admission();
+        let other = ledger
+            .open_scope_next(None, Generation::new(1).unwrap())
+            .unwrap();
+        assert!(
+            runtime
+                .register_bound(
+                    registration.actor(),
+                    other.clone(),
+                    Empty,
+                    ActorConfig {
+                        mailbox: [1; 4],
+                        max_batches: 1,
+                        max_effects_per_step: 1,
+                        max_dependencies_per_effect: 0,
+                        turn_budget: 8,
+                        max_step_work: 1
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(other.snapshot().unwrap().storage, 0);
+        other.close_external().unwrap();
+        ledger.remove_scope(other.id()).unwrap();
+        ledger.remove_scope(scope.id()).unwrap();
+        assert!(matches!(
+            runtime.try_effect_inventory_observation(&registration, None),
+            Err(EffectObservationError::Runtime(
+                ActorTurnError::UnknownActor
+            ))
+        ));
     }
 }

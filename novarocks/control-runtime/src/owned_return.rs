@@ -184,6 +184,11 @@ impl<T: Send + 'static> Shared<T> {
     }
 }
 impl<T: Send + 'static> OwnedReturnSender<T> {
+    /// Payload layout of the single Arc backing both original handles.
+    pub fn backing_payload_layout() -> std::alloc::Layout {
+        std::alloc::Layout::new::<Shared<T>>()
+    }
+
     pub fn report_slot(&self) -> &ReportSlot {
         &self.shared.report
     }

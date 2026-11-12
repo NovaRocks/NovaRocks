@@ -51,6 +51,7 @@ fn reservation(
     captures: usize,
 ) -> ReservationResources {
     ReservationResources {
+        keyed: None,
         quota: resources(units),
         owned_slots: OwnedSlotNeed {
             work_headers: headers,

@@ -44,7 +44,9 @@ use crate::coordination::{
     ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
 };
 use crate::preparation::FrozenExecutionDescription;
-use novarocks_coordination_contract::{AttemptFailureClass, RecoveryMode};
+use novarocks_coordination_contract::{
+    AttemptActivationIdentity, AttemptFailureClass, RecoveryMode,
+};
 
 /// Runtime failure while opening the role-local Native execution session.
 ///
@@ -517,6 +519,7 @@ pub struct NativeActiveConvergenceRequest {
     cancellation: CancellationView,
     absolute_remote_deadline: std::time::Instant,
     computation_ready: Option<super::ComputationReadyToken>,
+    streamed_success: Option<AttemptActivationIdentity>,
 }
 impl NativeActiveConvergenceRequest {
     pub fn new(
@@ -527,6 +530,7 @@ impl NativeActiveConvergenceRequest {
             cancellation,
             absolute_remote_deadline,
             computation_ready: None,
+            streamed_success: None,
         }
     }
     pub fn cancellation(&self) -> &CancellationView {
@@ -540,6 +544,19 @@ impl NativeActiveConvergenceRequest {
     /// Native Task success declaration nor permission to publish output.
     pub const fn computation_ready(&self) -> Option<super::ComputationReadyToken> {
         self.computation_ready
+    }
+
+    /// The original logical actor accepted the streamed result for this activation.
+    pub const fn streamed_success(&self) -> Option<AttemptActivationIdentity> {
+        self.streamed_success
+    }
+
+    pub(crate) fn with_streamed_success(
+        mut self,
+        activation: Option<AttemptActivationIdentity>,
+    ) -> Self {
+        self.streamed_success = activation;
+        self
     }
 
     pub(crate) fn with_computation_ready(

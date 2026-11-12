@@ -988,3 +988,156 @@ fn indexed_owner_usage_survives_refused_transactions_and_real_unbound_rollback()
         (0, Some(0))
     );
 }
+
+#[test]
+fn keyed_families_preflight_process_first_and_retire_only_after_last_charge() {
+    use novarocks_control_runtime_core::capacity::KeyedQuota;
+    let family = FamilyId::new(1).unwrap();
+    let key = CapacityKey(7);
+    let keyed = |amount| KeyedQuota {
+        family,
+        key,
+        quota: vector(&[(2, amount)]),
+    };
+    let mut ledger =
+        CapacityLedger::with_keyed_families(vector(&[(1, 2)]), [(family, vector(&[(2, 3)]))])
+            .unwrap();
+    let mut owner = scope(1);
+    let mut first = request(1, &[(1, 1)]);
+    first.resources = first.resources.with_keyed(keyed(2));
+    ledger.try_reserve_bundle(&mut owner, first).unwrap();
+    let mut rejected = request(2, &[(1, 2)]);
+    rejected.resources = rejected.resources.with_keyed(keyed(2));
+    assert_eq!(
+        ledger.try_reserve_bundle(&mut owner, rejected),
+        Err(CapacityError::Exhausted(dimension(1)))
+    );
+    let mut rejected = request(2, &[(1, 1)]);
+    rejected.resources = rejected.resources.with_keyed(keyed(2));
+    assert_eq!(
+        ledger.try_reserve_bundle(&mut owner, rejected),
+        Err(CapacityError::ExhaustedKeyed {
+            family,
+            key,
+            dimension: dimension(2)
+        })
+    );
+    assert_eq!(ledger.used(dimension(1)), 1);
+    assert_eq!(owner.work_count(), 1);
+    let id = ReservationId::new(1).unwrap();
+    ledger.bind(&mut owner, id, WorkKind::Business).unwrap();
+    ledger
+        .release_quota_with_keyed(id, &vector(&[]), Some(&keyed(1)))
+        .unwrap();
+    assert_eq!(ledger.keyed_usage_snapshot()[0].used.get(dimension(2)), 1);
+    let wrong = KeyedQuota {
+        key: CapacityKey(8),
+        ..keyed(1)
+    };
+    assert_eq!(
+        ledger.release_quota_with_keyed(id, &vector(&[(1, 1)]), Some(&wrong)),
+        Err(CapacityError::WrongKey)
+    );
+    assert_eq!(
+        ledger.used(dimension(1)),
+        1,
+        "invalid keyed release must not refund process quota"
+    );
+    ledger
+        .release_quota_with_keyed(id, &vector(&[(1, 1)]), Some(&keyed(1)))
+        .unwrap();
+    assert!(ledger.keyed_usage_snapshot().is_empty());
+    finish(&mut owner, work(1));
+    ledger.finish(&owner, id).unwrap();
+}
+
+#[test]
+fn keyed_split_transfer_reserve_from_and_rollback_preserve_original_key() {
+    use novarocks_control_runtime_core::capacity::KeyedQuota;
+    let family = FamilyId::new(1).unwrap();
+    let key = CapacityKey(99);
+    let keyed = |amount| KeyedQuota {
+        family,
+        key,
+        quota: vector(&[(2, amount)]),
+    };
+    let mut ledger =
+        CapacityLedger::with_keyed_families(vector(&[(1, 8)]), [(family, vector(&[(2, 8)]))])
+            .unwrap();
+    let mut source = scope(1);
+    let mut first = request(1, &[(1, 4)]);
+    first.resources.owned_slots.work_headers = 2;
+    first.resources = first.resources.with_keyed(keyed(4));
+    ledger.try_reserve_bundle(&mut source, first).unwrap();
+    let original = ReservationId::new(1).unwrap();
+    ledger
+        .bind(&mut source, original, WorkKind::Business)
+        .unwrap();
+    let partition =
+        ReservationResources::new(vector(&[(1, 1)]), OwnedSlotNeed::default()).with_keyed(keyed(1));
+    let split = ReservationId::new(2).unwrap();
+    ledger.split(original, split, &partition).unwrap();
+    let mut target = scope(2);
+    ledger
+        .try_reserve_bundle(&mut target, request(3, &[]))
+        .unwrap();
+    ledger
+        .bind(
+            &mut target,
+            ReservationId::new(3).unwrap(),
+            WorkKind::Business,
+        )
+        .unwrap();
+    ledger.transfer(split, &target, work(3)).unwrap();
+    assert_eq!(
+        ledger
+            .reservation(split)
+            .unwrap()
+            .keyed
+            .as_ref()
+            .unwrap()
+            .key,
+        key
+    );
+    let mut child = request(4, &[(1, 1)]);
+    child.admission = WorkAdmission::Derived(work(1));
+    child.resources = child.resources.with_keyed(keyed(1));
+    ledger.reserve_from(&mut source, original, child).unwrap();
+    assert_eq!(
+        ledger.keyed_dimension_usage(family, key, dimension(2)),
+        Some((4, 8))
+    );
+    ledger
+        .rollback_unbound(&mut source, ReservationId::new(4).unwrap())
+        .unwrap();
+    assert_eq!(
+        ledger.keyed_dimension_usage(family, key, dimension(2)),
+        Some((3, 8))
+    );
+    assert_eq!(
+        ledger
+            .reservation(original)
+            .unwrap()
+            .keyed
+            .as_ref()
+            .unwrap()
+            .quota
+            .get(dimension(2)),
+        2
+    );
+    ledger
+        .release_quota_with_keyed(split, &partition.quota, partition.keyed.as_ref())
+        .unwrap();
+    ledger.finish(&target, split).unwrap();
+    let remainder = ledger.reservation(original).unwrap().resources();
+    ledger
+        .release_quota_with_keyed(original, &remainder.quota, remainder.keyed.as_ref())
+        .unwrap();
+    finish(&mut source, work(1));
+    ledger.finish(&source, original).unwrap();
+    finish(&mut target, work(3));
+    ledger
+        .finish(&target, ReservationId::new(3).unwrap())
+        .unwrap();
+    assert!(ledger.keyed_usage_snapshot().is_empty());
+}

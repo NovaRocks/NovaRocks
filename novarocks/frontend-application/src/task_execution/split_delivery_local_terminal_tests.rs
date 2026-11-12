@@ -94,7 +94,7 @@ mod split_delivery_local_terminal_tests {
                 scan,
                 Arc::new(TerminalOnlyEncoder) as Arc<dyn ConnectorReadWireEncoder>,
             )]),
-            crate::task_protocol_config::TaskUpdateRetryPolicy::default(),
+            novarocks_attempt_protocol::config::TaskUpdateRetryPolicy::default(),
             SplitAssignmentStop::default(),
         );
         driver.start_delivery(scan, BTreeMap::new(), true).unwrap();
@@ -382,7 +382,7 @@ mod split_delivery_local_terminal_tests {
                     scan,
                     Arc::new(TerminalOnlyEncoder) as Arc<dyn ConnectorReadWireEncoder>,
                 )]),
-                crate::task_protocol_config::TaskUpdateRetryPolicy::default(),
+                novarocks_attempt_protocol::config::TaskUpdateRetryPolicy::default(),
                 SplitAssignmentStop::default(),
             );
             driver.start_delivery(scan, BTreeMap::new(), true).unwrap();

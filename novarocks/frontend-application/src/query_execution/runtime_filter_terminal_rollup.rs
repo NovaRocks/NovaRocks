@@ -136,76 +136,62 @@ pub(crate) struct RuntimeFilterTerminalConsumerTotals {
     pub(crate) output_rows: u64,
 }
 
-/// Folds one participant's telemetry at a time into the query rollup.
-///
-/// Both carriers of these facts fold through this: the retired lifecycle's
-/// terminal set and the task protocol's release acknowledgements. Two folds
-/// would be two chances for the same counters to be summed differently, and
-/// the rollup is what every structured assertion reads.
-struct RuntimeFilterTerminalRollupBuilder {
-    participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
-    totals: RuntimeFilterTerminalTotals,
-    totals_unavailable: Option<RuntimeFilterTerminalTotalsUnavailable>,
+/// Project the original validated Native release while its paid reply is
+/// borrowed. The developer observation holds only the diagnostic value.
+pub(crate) fn project_release_contribution(
+    process_id: BackendProcessId,
+    telemetry: &novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry,
+) -> RuntimeFilterParticipantTerminalTelemetry {
+    let telemetry = if let Some(contribution) = telemetry.available_ref() {
+        RuntimeFilterParticipantTerminalTelemetryValue::Available(
+            RuntimeFilterParticipantTerminalDetails {
+                channels: contribution.channels().to_vec(),
+                producer_streams: contribution.producer_streams().to_vec(),
+                transport_routes: contribution.transport_routes().to_vec(),
+                consumers: contribution.consumers().to_vec(),
+            },
+        )
+    } else {
+        let unavailable = telemetry
+            .unavailable()
+            .expect("validated telemetry is available or unavailable");
+        RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(
+            RuntimeFilterTerminalUnavailable {
+                stage: unavailable.stage().to_owned(),
+                code: unavailable.code().to_owned(),
+            },
+        )
+    };
+    RuntimeFilterParticipantTerminalTelemetry {
+        participant: RuntimeFilterTerminalParticipant { process_id },
+        telemetry,
+    }
 }
 
-impl RuntimeFilterTerminalRollupBuilder {
-    fn with_capacity(participants: usize) -> Self {
-        Self {
-            participants: Vec::with_capacity(participants),
-            totals: RuntimeFilterTerminalTotals::default(),
-            totals_unavailable: None,
-        }
-    }
-
-    fn absorb(
-        &mut self,
-        process_id: BackendProcessId,
-        telemetry: &novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry,
-    ) {
-        let participant = RuntimeFilterTerminalParticipant { process_id };
-        let telemetry = if let Some(contribution) = telemetry.available() {
-            if self.totals_unavailable.is_none()
-                && add_contribution_totals(&mut self.totals, &contribution).is_err()
-            {
-                self.totals_unavailable =
-                    Some(RuntimeFilterTerminalTotalsUnavailable::CounterOverflow);
+pub(crate) fn rollup_projected_release_contributions(
+    participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
+) -> RuntimeFilterTerminalRollup {
+    let mut totals = RuntimeFilterTerminalTotals::default();
+    let mut unavailable = None;
+    for participant in &participants {
+        match &participant.telemetry {
+            RuntimeFilterParticipantTerminalTelemetryValue::Available(details) => {
+                if unavailable.is_none() && add_contribution_totals(&mut totals, details).is_err() {
+                    unavailable = Some(RuntimeFilterTerminalTotalsUnavailable::CounterOverflow);
+                }
             }
-            RuntimeFilterParticipantTerminalTelemetryValue::Available(
-                RuntimeFilterParticipantTerminalDetails {
-                    channels: contribution.channels().to_vec(),
-                    producer_streams: contribution.producer_streams().to_vec(),
-                    transport_routes: contribution.transport_routes().to_vec(),
-                    consumers: contribution.consumers().to_vec(),
-                },
-            )
-        } else {
-            let unavailable = telemetry
-                .unavailable()
-                .expect("validated telemetry is available or unavailable");
-            self.totals_unavailable =
-                Some(RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable);
-            RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(
-                RuntimeFilterTerminalUnavailable {
-                    stage: unavailable.stage().to_owned(),
-                    code: unavailable.code().to_owned(),
-                },
-            )
-        };
-        self.participants
-            .push(RuntimeFilterParticipantTerminalTelemetry {
-                participant,
-                telemetry,
-            });
-    }
-
-    fn finish(self) -> RuntimeFilterTerminalRollup {
-        RuntimeFilterTerminalRollup {
-            participants: self.participants,
-            totals: match self.totals_unavailable {
-                Some(reason) => RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason),
-                None => RuntimeFilterTerminalTotalsTelemetry::Available(self.totals),
-            },
+            RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(_) => {
+                unavailable =
+                    Some(RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable);
+            }
         }
+    }
+    RuntimeFilterTerminalRollup {
+        participants,
+        totals: match unavailable {
+            Some(reason) => RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason),
+            None => RuntimeFilterTerminalTotalsTelemetry::Available(totals),
+        },
     }
 }
 
@@ -215,24 +201,26 @@ impl RuntimeFilterTerminalRollupBuilder {
 /// The caller owns completeness: this reports exactly the participants it was
 /// given, in the order it was given them, and never substitutes an empty
 /// contribution for a backend whose release did not answer.
+#[cfg(test)]
 pub(crate) fn rollup_from_release_contributions(
     contributions: &[(
         BackendProcessId,
         novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry,
     )],
 ) -> RuntimeFilterTerminalRollup {
-    let mut builder = RuntimeFilterTerminalRollupBuilder::with_capacity(contributions.len());
-    for (process_id, telemetry) in contributions {
-        builder.absorb(*process_id, telemetry);
-    }
-    builder.finish()
+    rollup_projected_release_contributions(
+        contributions
+            .iter()
+            .map(|(process_id, telemetry)| project_release_contribution(*process_id, telemetry))
+            .collect(),
+    )
 }
 
 fn add_contribution_totals(
     totals: &mut RuntimeFilterTerminalTotals,
-    contribution: &novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionV1,
+    contribution: &RuntimeFilterParticipantTerminalDetails,
 ) -> Result<(), ()> {
-    for channel in contribution.channels() {
+    for channel in &contribution.channels {
         checked_add(&mut totals.channels.count, 1)?;
         checked_add(
             &mut totals.channels.published_count,
@@ -251,7 +239,7 @@ fn add_contribution_totals(
             channel.cancelled_count,
         )?;
     }
-    for stream in contribution.producer_streams() {
+    for stream in &contribution.producer_streams {
         checked_add(&mut totals.producer_streams.count, 1)?;
         checked_add(
             &mut totals.producer_streams.accepted_count,
@@ -271,7 +259,7 @@ fn add_contribution_totals(
             stream.resource_limit_count,
         )?;
     }
-    for route in contribution.transport_routes() {
+    for route in &contribution.transport_routes {
         checked_add(&mut totals.transport_routes.count, 1)?;
         checked_add(&mut totals.transport_routes.sent_count, route.sent_count)?;
         checked_add(&mut totals.transport_routes.sent_bytes, route.sent_bytes)?;
@@ -294,7 +282,7 @@ fn add_contribution_totals(
             route.fail_open_bytes,
         )?;
     }
-    for consumer in contribution.consumers() {
+    for consumer in &contribution.consumers {
         checked_add(&mut totals.consumers.count, 1)?;
         checked_add(
             &mut totals.consumers.row_evaluations,

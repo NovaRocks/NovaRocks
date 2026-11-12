@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use novarocks_coordination_contract::MonotonicInstant;
 
 /// Lease durations requested by query coordination.
@@ -41,12 +42,14 @@ impl RequestedLeaseDurations {
     }
 }
 
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct RenewSchedule {
     conservative_expiry: MonotonicInstant,
     next_renew_at: MonotonicInstant,
 }
 
+#[cfg(test)]
 impl RenewSchedule {
     pub const SAFETY_MARGIN: Duration = Duration::from_secs(2);
 

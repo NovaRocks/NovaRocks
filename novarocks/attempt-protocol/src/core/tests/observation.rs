@@ -1,0 +1,2879 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::{
+    AttemptCore,
+    capacity::ReservationToken,
+    execution::{
+        CreateGrantProgress,
+        ack_phase::{admission_intent, dispatch_admission, queue_establish},
+    },
+    input::{
+        AckPayload, AttemptInput, AttemptInputClaim, DiagnosticRead, OperationReply,
+        OperationReplyResult, QueuedInputGrantRef, SendGeneration,
+    },
+};
+use novarocks_coordination_contract::{
+    AttemptComputationCut, SelectedTaskTermination, StatusObservation,
+};
+use novarocks_execution_contract::{
+    CancelReason, CreateTaskReceipt, ExchangeDeliveryRequirement, LeaseReceipt, OperationKind,
+    OperationOutcome, ParticipationReceipt, ParticipationState, SafeDetail, TaskConvergenceReceipt,
+    TaskConvergenceVersion, TaskFailure, TaskFailurePhase, TaskResourceFacts,
+    failure::{FailureClass, FailureFact, FailureReason},
+    operation::OperationResult,
+    root_result::RootResultEnd,
+};
+use std::num::NonZeroU16;
+
+struct OriginalSend(BackendProcessId, DispatchLane);
+
+impl StepContext for OriginalSend {
+    fn charge(&mut self, _: usize) -> bool {
+        true
+    }
+
+    fn reserve_queue_stage(
+        &mut self,
+        lane: DispatchLane,
+        control: bool,
+        backend: BackendProcessId,
+        records: usize,
+        _: usize,
+    ) -> QueueStage {
+        assert_eq!(
+            (backend, lane, control, records),
+            (self.0, self.1, false, 1)
+        );
+        QueueStage::Granted(ReservationToken(id(1)))
+    }
+}
+
+struct TerminalTrace {
+    core: Core,
+    next: u64,
+}
+
+impl TerminalTrace {
+    fn new() -> Self {
+        Self {
+            core: Core::new(start()).unwrap(),
+            next: 100,
+        }
+    }
+
+    fn next_id(&mut self) -> NonZeroU64 {
+        self.next += 1;
+        id(self.next)
+    }
+
+    fn dispatch(
+        &mut self,
+        operation: &OperationIntent,
+        grant: QueuedInputGrantRef,
+        backend: BackendProcessId,
+        lane: DispatchLane,
+    ) {
+        let effect = AttemptActionId::new(self.next_id());
+        let BatchDispatch::Ready(AttemptEffect {
+            body: EffectBody::SendBatch { batch, .. },
+            ..
+        }) = self
+            .core
+            .execution
+            .advance_send_batch(
+                &mut self.core.dispatch,
+                effect,
+                &mut OriginalSend(backend, lane),
+                |_| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("expected original {lane:?} dispatch");
+        };
+        assert_eq!(batch.operations.len(), 1);
+        assert_eq!(batch.operations[0].operation_id(), operation.operation_id());
+        assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+        self.core.execution.observe_send_started(effect);
+    }
+
+    fn start_create(&mut self, identity: TaskIdentity) -> (TaskOperationId, SendGeneration) {
+        let participation = self
+            .core
+            .execution
+            .graph()
+            .task(identity.task_id())
+            .unwrap()
+            .participation();
+        let backend = participation.backend_process_id();
+        let record = self.next_id();
+        let request = admission_intent(&mut self.core.execution, participation);
+        let ticket = dispatch_admission(
+            &mut self.core.execution,
+            request,
+            record.get(),
+            OperationOutcome::Accepted,
+        );
+        self.core
+            .execution
+            .apply_dispatched_reply(&ticket)
+            .1
+            .unwrap();
+
+        let record = self.next_id();
+        let establish_grant = QueuedInputGrantRef::new(
+            record,
+            SendGeneration::new(AttemptActionId::new(record)),
+            64,
+        );
+        let establish = queue_establish(&mut self.core.execution, participation, establish_grant);
+        self.dispatch(
+            &establish,
+            establish_grant,
+            backend,
+            DispatchLane::Lifecycle,
+        );
+        self.core
+            .execution
+            .establish_send_started(participation, establish.operation_id())
+            .unwrap();
+
+        let OperationIntent::EstablishParticipation {
+            initial_lease_sequence,
+            initial_lease_valid_for,
+            ..
+        } = &establish
+        else {
+            panic!("expected original Establish");
+        };
+        let active = ParticipationReceipt::new(participation, ParticipationState::Active)
+            .with_lease(LeaseReceipt::new(
+                *initial_lease_sequence,
+                *initial_lease_valid_for,
+                Duration::from_secs(30),
+            ));
+        let reply = OperationObservation {
+            generation: establish_grant.generation(),
+            reply: OperationReply {
+                operation_id: establish.operation_id(),
+                kind: establish.kind(),
+                result: OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::Accepted,
+                    detail: None,
+                    acknowledgement: Some(AckPayload::Participation(active)),
+                }),
+            },
+        };
+        self.core
+            .execution
+            .apply_dispatched_reply(&reply)
+            .1
+            .unwrap();
+
+        let record = self.next_id();
+        let Some(AttemptEffect {
+            body:
+                EffectBody::AdmitQueuedInput {
+                    operation,
+                    generation,
+                    ..
+                },
+            ..
+        }) = self
+            .core
+            .execution
+            .begin_create_admission(identity, AttemptActionId::new(record))
+            .unwrap()
+        else {
+            panic!("expected original Create admission");
+        };
+        let grant = QueuedInputGrantRef::new(record, generation, 64);
+        assert!(matches!(
+            self.core
+                .execution
+                .observe_create_grant(operation.operation_id(), grant)
+                .unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        self.dispatch(&operation, grant, backend, DispatchLane::Create);
+        (operation.operation_id(), generation)
+    }
+
+    fn handle_input(
+        &mut self,
+        now: MonotonicInstant,
+        source: AttemptSourceId,
+        input: AttemptInput,
+    ) -> AttemptStep {
+        self.handle_with_context(now, source, input, &mut Units(128))
+    }
+
+    fn handle_with_context(
+        &mut self,
+        now: MonotonicInstant,
+        source: AttemptSourceId,
+        input: AttemptInput,
+        context: &mut dyn StepContext,
+    ) -> AttemptStep {
+        let id = AttemptInputId(self.next_id());
+        let sources = self.core.sources;
+        self.core
+            .handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: id,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: (source == sources.native).then_some(id),
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: (source == sources.observation).then_some(id),
+                    }),
+                },
+                input,
+                context,
+            )
+            .unwrap()
+    }
+
+    fn applied_observation_publication(body: &EffectBody) -> Option<PublicationApplied> {
+        use crate::effect::Publication;
+        match body {
+            EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                Some(PublicationApplied::ProtocolBatch { published: true })
+            }
+            EffectBody::Publish(Publication::RootStatus(_)) => Some(PublicationApplied::RootStatus),
+            EffectBody::Port(port)
+                if matches!(
+                    port.body,
+                    novarocks_coordination_contract::AttemptToLogicalBody::SealResult { .. }
+                ) =>
+            {
+                Some(PublicationApplied::SealResult)
+            }
+            _ => None,
+        }
+    }
+
+    fn finish_observation_round(
+        &mut self,
+        now: MonotonicInstant,
+        mut pending: AttemptStep,
+    ) -> (Result<(), AttemptFailure>, Vec<AttemptEffect>) {
+        let sources = self.core.sources;
+        let mut effects = Vec::new();
+        for _ in 0..32 {
+            let applied = pending.effect.take().and_then(|effect| {
+                let applied = Self::applied_observation_publication(&effect.body);
+                let id = effect.id;
+                effects.push(effect);
+                applied.map(|applied| (id, applied))
+            });
+            if let Some(result) = pending.round_result {
+                return (result, effects);
+            }
+            let (source, input) = match (pending.selection, applied) {
+                (InputSelection::Only(source), Some((effect, applied)))
+                    if source == sources.publication =>
+                {
+                    (
+                        source,
+                        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                            effect,
+                            result: Ok(applied),
+                        }),
+                    )
+                }
+                (InputSelection::Only(source), None)
+                    if source == sources.actor || source == sources.observation =>
+                {
+                    (sources.actor, AttemptInput::Timer)
+                }
+                selection => panic!("unexpected observation continuation: {selection:?}"),
+            };
+            pending = self.handle_input(now, source, input);
+        }
+        panic!("the original observation round did not finish");
+    }
+
+    fn status(&self, task: TaskIdentity) -> Option<&TaskStatus> {
+        self.core.execution.task(task.task_id()).unwrap().status()
+    }
+
+    fn apply(
+        &mut self,
+        receipt: Option<OperationObservation>,
+        observation: Option<ReceivedObservation>,
+    ) -> Result<(), AttemptFailure> {
+        let input = AttemptInputId(self.next_id());
+        let now = self.core.execution.monotonic_now();
+        let source = self.core.sources.native;
+        self.core
+            .begin_native_prefix(
+                now,
+                AttemptSourceCut {
+                    source,
+                    tail: receipt.as_ref().map(|_| input),
+                },
+            )
+            .unwrap();
+        if let Some(receipt) = receipt {
+            assert!(
+                self.core
+                    .apply_native(
+                        now,
+                        source,
+                        input,
+                        &ExecutorFact::Operation(receipt),
+                        |_, _| { panic!("a Task Create never invokes the actor Abort observer") }
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if let Some(observation) = observation {
+            assert!(
+                self.core
+                    .apply_observations(
+                        now,
+                        self.core.sources.observation,
+                        ObservationBatch::new(vec![observation]).unwrap()
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        self.core.begin_ack_settlement(None).unwrap();
+        match self
+            .core
+            .advance_ack_settlement(
+                AttemptRequestToken::new(input.0),
+                AttemptActionId::new(input.0),
+                &mut Units(1),
+            )
+            .unwrap()
+        {
+            AckSettlementProgress::Complete(result) => result,
+            other => panic!("expected a settled Task observation cut, got {other:?}"),
+        }
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        stream: &ReceivedObservation,
+        status: &TaskStatus,
+    ) -> Result<(), AttemptFailure> {
+        let mut observation = stream.clone();
+        let ObservationEvent::Fact {
+            fact: ObservationFact::Status(snapshot),
+            ..
+        } = &mut observation.event
+        else {
+            panic!("expected the original Task status stream");
+        };
+        assert_eq!(snapshot.identity(), status.identity());
+        *snapshot = status.clone();
+        self.apply(None, Some(observation))
+    }
+
+    fn open_diagnostic_window(&mut self) {
+        let now = self.core.execution.monotonic_now();
+        let deadline = now.saturating_add(Duration::from_secs(1));
+        let ready = AttemptComputationCut {
+            activation: self.core.activation,
+            root: self.core.execution.graph().root_identity(),
+            cut: now,
+            diagnostic_deadline: deadline,
+            convergence_deadline: now.saturating_add(Duration::from_secs(10)),
+            end: RootResultEnd {
+                sequence: id(1),
+                output_rows: 1,
+            },
+        };
+        self.core
+            .execution
+            .with_diagnostics(|collector, _| collector.begin(ready))
+            .unwrap();
+        assert!(!self.core.execution.diagnostics().read_ready());
+    }
+
+    fn expect_diagnostic_reads(&mut self, expected: &[TaskIdentity]) {
+        for &task in expected {
+            let request = AttemptRequestToken::new(self.next_id());
+            self.core.execution.with_diagnostics(|collector, _| {
+                let read = collector
+                    .next_read(request, &mut Units(1))
+                    .expect("one original terminal candidate");
+                assert_eq!(read.task, task);
+                assert_eq!(read.request, request);
+                assert!(
+                    collector
+                        .result(
+                            request,
+                            task,
+                            DiagnosticRead::Unavailable(OperationOutcome::Gone)
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                collector.actual_exit(request).unwrap();
+            });
+        }
+        assert!(!self.core.execution.diagnostics().read_ready());
+    }
+}
+
+fn create_reply(
+    (operation_id, generation): (TaskOperationId, SendGeneration),
+    status: TaskStatus,
+) -> OperationObservation {
+    OperationObservation {
+        generation,
+        reply: OperationReply {
+            operation_id,
+            kind: OperationKind::CreateTask,
+            result: OperationReplyResult::Worker(OperationResult::Verdict {
+                outcome: OperationOutcome::Accepted,
+                detail: None,
+                acknowledgement: Some(AckPayload::Create(Box::new(CreateTaskReceipt::new(
+                    status.identity(),
+                    Vec::new(),
+                    status,
+                )))),
+            }),
+        },
+    }
+}
+
+fn status_frame(trace: &mut TerminalTrace, status: TaskStatus) -> ReceivedObservation {
+    let participation = trace
+        .core
+        .execution
+        .graph()
+        .task(status.identity().task_id())
+        .unwrap()
+        .participation();
+    let now = trace.core.execution.monotonic_now();
+    trace
+        .core
+        .subscriptions
+        .activate(now, participation)
+        .unwrap();
+    let next = trace.next_id();
+    let SubscriptionStep::Effect(AttemptEffect {
+        body: EffectBody::OpenSubscription(request),
+        ..
+    }) = trace
+        .core
+        .subscriptions
+        .advance(
+            &trace.core.execution,
+            now,
+            AttemptActionId::new(next),
+            AttemptRequestToken::new(next),
+            &mut Units(10),
+        )
+        .unwrap()
+    else {
+        panic!("expected the original subscription opening");
+    };
+    assert_eq!(request.participation, participation);
+    ReceivedObservation {
+        participation,
+        generation: request.generation,
+        received_at: now,
+        opening: ObservationOpening {
+            started_at: now,
+            opened_at: Some(now),
+        },
+        event: ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Status(status),
+        },
+    }
+}
+
+fn originating_failure(detail: &str, phase: TaskFailurePhase) -> TerminationDetail {
+    TerminationDetail::Failed(TaskFailure::new_in_phase(
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(
+                NonZeroU16::new(u16::MAX).unwrap(),
+                NonZeroU16::new(1).unwrap(),
+            ),
+        ),
+        SafeDetail::new(detail).unwrap(),
+        phase,
+    ))
+}
+
+#[test]
+fn first_terminal_create_reply_and_stream_duplicate_queue_one_diagnostic_read() {
+    for preparation_failure in [false, true] {
+        let mut trace = TerminalTrace::new();
+        let task = trace
+            .core
+            .execution
+            .graph()
+            .tasks()
+            .last()
+            .unwrap()
+            .identity();
+        let create = trace.start_create(task);
+        let (state, cause, installed) = if preparation_failure {
+            (
+                TaskState::Failed,
+                Some(originating_failure(
+                    "original preparation failure",
+                    TaskFailurePhase::Preparation,
+                )),
+                false,
+            )
+        } else {
+            (TaskState::Finished, None, true)
+        };
+        let output = TaskOutputFacts::new(!preparation_failure);
+        let terminal = TaskStatus::try_new_with_installed(
+            task,
+            TaskStatusVersion::FIRST,
+            state,
+            cause.clone(),
+            output,
+            installed,
+        )
+        .unwrap();
+        let mut observation = status_frame(&mut trace, terminal.clone());
+        let receipt = create_reply(create, terminal.clone());
+        let prior = trace.core.execution.accepted_protocol_revision();
+        trace.open_diagnostic_window();
+
+        trace.apply(Some(receipt.clone()), None).unwrap();
+        assert!(trace.core.execution.diagnostics().read_ready());
+        let revision = trace.core.execution.accepted_protocol_revision();
+        assert!(revision > prior);
+        assert_eq!(trace.status(task), Some(&terminal));
+
+        // The current Core consumes physical generations. A repeated result
+        // for the retired send is stale and cannot act as a second author.
+        trace.apply(Some(receipt), None).unwrap();
+        trace.apply(None, Some(observation.clone())).unwrap();
+        assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+
+        let changed_metrics = TaskStatus::try_new_with_installed(
+            task,
+            TaskStatusVersion::new(2).unwrap(),
+            state,
+            cause,
+            output,
+            installed,
+        )
+        .unwrap()
+        .with_resources(TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(7)));
+        observation.event = ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Status(changed_metrics),
+        };
+        assert!(matches!(
+            trace.apply(None, Some(observation)),
+            Err(AttemptFailure::TaskProtocol(error))
+                if matches!(*error, TaskExecutionError::Observation(StatusObservation::TerminalOverwrite))
+        ));
+        assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+        assert_eq!(trace.status(task), Some(&terminal));
+        trace.expect_diagnostic_reads(&[task]);
+    }
+}
+
+#[test]
+fn fatal_current_subscription_fails_the_attempt_with_its_original_participation() {
+    for root_finished in [false, true] {
+        current_identity_violation_remains_fatal(root_finished);
+    }
+}
+
+fn current_identity_violation_remains_fatal(root_finished: bool) {
+    use crate::{
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    let mut trace = TerminalTrace::new();
+    let now = trace.core.execution.monotonic_now();
+    let sources = trace.core.sources;
+    let root = trace.core.execution.graph().root_identity();
+    let peer = trace
+        .core
+        .execution
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .find(|task| task.backend_process_id() != root.backend_process_id())
+        .expect("the original non-root backend");
+    let participation = trace
+        .core
+        .execution
+        .graph()
+        .participation_on_backend(peer.backend_process_id())
+        .unwrap();
+    let create = trace.start_create(peer);
+    let installed = TaskStatus::created(peer).with_installed();
+    trace
+        .apply(Some(create_reply(create, installed.clone())), None)
+        .unwrap();
+    assert!(
+        trace
+            .core
+            .execution
+            .owner(participation)
+            .unwrap()
+            .establish_acknowledged()
+    );
+
+    // Keep the original installed participation and its real subscription
+    // controller, while driving each subsequent input through the Core.
+    trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+    trace
+        .core
+        .subscriptions
+        .activate(now, participation)
+        .unwrap();
+    let open = |trace: &mut TerminalTrace, at| {
+        let step = trace.handle_input(at, sources.actor, AttemptInput::Timer);
+        let (result, effects) = trace.finish_observation_round(at, step);
+        assert_eq!(result, Ok(()));
+        let mut opens = effects.into_iter().filter_map(|effect| {
+            let EffectBody::OpenSubscription(request) = effect.body else {
+                return None;
+            };
+            assert_eq!(request.participation, participation);
+            Some((effect.id, request.generation))
+        });
+        let original = opens.next().expect("one original Open effect");
+        assert!(opens.next().is_none());
+        original
+    };
+    let observe = |trace: &mut TerminalTrace, at, frame| {
+        let input = AttemptInput::Executor(ExecutorFact::Observations(
+            ObservationBatch::new(vec![frame]).unwrap(),
+        ));
+        let step = trace.handle_input(at, sources.observation, input);
+        trace.finish_observation_round(at, step)
+    };
+    let failure = |open: AttemptActionId, kind, class| ObservationFailure {
+        kind,
+        cause: HostProjectedFailure {
+            original: HostFailureRef(id(open.get())),
+            kind: HostFailureKind::NativeTransport,
+            class,
+            site: AttemptFailureSite::Participation(participation),
+        },
+    };
+    let frame = |at, opened_at, generation, failure| ReceivedObservation {
+        participation,
+        generation,
+        received_at: at,
+        opening: ObservationOpening {
+            started_at: opened_at,
+            opened_at: Some(opened_at),
+        },
+        event: ObservationEvent::Failed(failure),
+    };
+
+    let (original_open, original_generation) = open(&mut trace, now);
+    let recoverable = failure(
+        original_open,
+        ObservationFailureKind::RecoverableTransport {
+            observed_connection_loss: true,
+        },
+        AttemptFailureClass::ExecutionFailure,
+    );
+    let (result, effects) = observe(
+        &mut trace,
+        now,
+        frame(now, now, original_generation, recoverable),
+    );
+    assert_eq!(result, Ok(()));
+    assert!(trace.core.terminal.terminal().is_none());
+    assert!(effects.iter().any(|effect| matches!(
+        &effect.body,
+        EffectBody::CloseSubscription { participation: original, generation }
+            if *original == participation && *generation == original_generation
+    )));
+    assert!(trace.core.next_subscription_deadline().is_none());
+
+    let exited = trace.handle_input(
+        now,
+        sources.subscription,
+        AttemptInput::Executor(ExecutorFact::SubscriptionExited {
+            effect: original_open,
+            participation,
+            generation: original_generation,
+        }),
+    );
+    assert_eq!(trace.finish_observation_round(now, exited).0, Ok(()));
+    let reopen_at = trace
+        .core
+        .next_subscription_deadline()
+        .expect("the original retry deadline");
+    assert!(reopen_at > now);
+    let (current_open, current_generation) = open(&mut trace, reopen_at);
+    assert_eq!(current_generation.get(), original_generation.get() + 1);
+    assert_ne!(current_open, original_open);
+
+    // A late copy from the retired generation cannot decide this attempt.
+    assert_eq!(
+        observe(
+            &mut trace,
+            reopen_at,
+            frame(reopen_at, now, original_generation, recoverable)
+        )
+        .0,
+        Ok(())
+    );
+    assert!(trace.core.terminal.terminal().is_none());
+
+    let finished = root_finished.then(|| {
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap()
+    });
+    if let Some(finished) = &finished {
+        let root_frame = status_frame(&mut trace, finished.clone());
+        assert_eq!(observe(&mut trace, reopen_at, root_frame).0, Ok(()));
+        assert_eq!(trace.status(root), Some(finished));
+        assert_eq!(
+            trace.core.seal_facts().root,
+            crate::root_control::RootCompletion::ExactFinished
+        );
+        assert!(!trace.core.root.sealed());
+        assert!(trace.core.terminal.terminal().is_none());
+    }
+
+    let fatal = failure(
+        current_open,
+        ObservationFailureKind::ProcessMismatch,
+        AttemptFailureClass::ContractViolation,
+    );
+    let expected =
+        AttemptFailure::TaskProtocol(Box::new(TaskExecutionError::NativeTransport(fatal.cause)));
+    let (result, mut effects) = observe(
+        &mut trace,
+        reopen_at,
+        frame(reopen_at, reopen_at, current_generation, fatal),
+    );
+    assert_eq!(result, Err(expected.clone()));
+    let terminal = AttemptTerminal::Failed(expected);
+    for _ in 0..4 {
+        if trace.core.terminal.terminal().is_some() {
+            break;
+        }
+        let next = trace.handle_input(reopen_at, sources.actor, AttemptInput::Timer);
+        effects.extend(next.effect);
+    }
+    assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(
+                &effect.body,
+                EffectBody::Port(port)
+                    if port.activation == trace.core.activation
+                        && matches!(&port.body, AttemptToLogicalBody::AttemptTerminal(original)
+                            if original == &terminal)
+            ))
+            .count(),
+        1
+    );
+    assert!(effects.iter().all(|effect| !matches!(
+        &effect.body,
+        EffectBody::SendBatch { .. } | EffectBody::ObserveProcess { .. }
+    )));
+    if let Some(finished) = &finished {
+        assert_eq!(trace.status(root), Some(finished));
+        assert!(!trace.core.root.sealed());
+    }
+    assert_eq!(trace.status(peer), Some(&installed));
+    assert!(!trace.core.execution.task_actual_stopped(peer));
+    assert!(
+        trace
+            .core
+            .execution
+            .participation_convergence_receipt(participation)
+            .is_none()
+    );
+}
+
+#[test]
+fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control() {
+    use crate::{
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    for connection_lost in [false, true] {
+        for stood_down in [false, true] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            for edge in start.plan.graph.edges.values_mut() {
+                edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+            }
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let leaf = trace
+                .core
+                .execution
+                .graph()
+                .tasks()
+                .last()
+                .unwrap()
+                .identity();
+            assert_ne!(leaf.backend_process_id(), root.backend_process_id());
+            let participation = trace
+                .core
+                .execution
+                .graph()
+                .participation_on_backend(leaf.backend_process_id())
+                .unwrap();
+            let root_participation = trace
+                .core
+                .execution
+                .graph()
+                .participation_on_backend(root.backend_process_id())
+                .unwrap();
+            trace.start_create(leaf);
+            if stood_down {
+                trace.core.execution.stand_down_task_normally(leaf).unwrap();
+                trace.core.execution.stand_down_task_normally(leaf).unwrap();
+            }
+            let task = trace.core.execution.task(leaf.task_id()).unwrap();
+            assert!(!task.create_ownership_proven());
+            assert!(!task.is_terminal());
+            assert_eq!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(participation),
+                !stood_down
+            );
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(root_participation)
+            );
+
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+            trace
+                .core
+                .subscriptions
+                .activate(now, participation)
+                .unwrap();
+            let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+            let (round, effects) = trace.finish_observation_round(now, step);
+            assert_eq!(round, Ok(()));
+            let (open, generation) = effects
+                .into_iter()
+                .find_map(|effect| {
+                    let EffectBody::OpenSubscription(request) = effect.body else {
+                        return None;
+                    };
+                    assert_eq!(request.participation, participation);
+                    Some((effect.id, request.generation))
+                })
+                .expect("the original leaf subscription opens");
+
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(id(open.get())),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(participation),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let input = AttemptInput::Executor(ExecutorFact::Observations(
+                ObservationBatch::new(vec![ReceivedObservation {
+                    participation,
+                    generation,
+                    received_at: now,
+                    opening: ObservationOpening {
+                        started_at: now,
+                        opened_at: Some(now),
+                    },
+                    event,
+                }])
+                .unwrap(),
+            ));
+            let expected = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: leaf.backend_process_id(),
+                    state,
+                },
+            ));
+            let step = trace.handle_input(now, sources.observation, input);
+            let (mut round, mut effects) = trace.finish_observation_round(now, step);
+            assert!(!trace.core.execution.covered_gap_pending(participation));
+            if stood_down {
+                assert_eq!(round, Ok(()));
+                assert!(trace.core.terminal.terminal().is_none());
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: closing }
+                        if *closed == participation && *closing == generation
+                )));
+
+                // The earlier exhausted row matters again if this exact
+                // attempt now needs authoritative root terminal control.
+                let token = AttemptRequestToken::new(trace.next_id());
+                let demand = trace.handle_input(
+                    now,
+                    sources.observation,
+                    AttemptInput::Port(LogicalToAttempt {
+                        activation,
+                        body: LogicalToAttemptBody::TerminalControlDemand { token, root },
+                    }),
+                );
+                assert!(demand.root_control_processed.is_some());
+                assert!(matches!(
+                    demand.effect.as_ref(),
+                    Some(AttemptEffect { body: EffectBody::Port(port), .. })
+                        if port.activation == activation && matches!(
+                            &port.body, AttemptToLogicalBody::TerminalControlResult {
+                                token: original, result: Ok(()),
+                            } if *original == token
+                        )
+                ));
+                (round, effects) = trace.finish_observation_round(now, demand);
+            }
+            assert_eq!(round, Err(expected.clone()));
+            let terminal = AttemptTerminal::Failed(expected);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+                effects.extend(step.effect);
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert!(effects.iter().any(|effect| matches!(
+                &effect.body,
+                EffectBody::Port(port)
+                    if port.activation == activation && matches!(
+                        &port.body, AttemptToLogicalBody::AttemptTerminal(original)
+                            if original == &terminal
+                    )
+            )));
+            let task = trace.core.execution.task(leaf.task_id()).unwrap();
+            assert!(!task.create_ownership_proven());
+            assert!(!task.is_terminal());
+            assert!(!trace.core.execution.task_actual_stopped(leaf));
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .participation_convergence_receipt(participation)
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn covered_exhaustion_preserves_healthy_sibling_phases_and_deadlines() {
+    use crate::{
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind, SubscriptionPhaseSnapshot},
+        observation::{
+            controller::SubscriptionStatus,
+            opening::{COVERED_LIVENESS_BUDGET, COVERED_OPENING_BUDGET},
+        },
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+    use novarocks_execution_contract::ParticipationRef;
+
+    #[derive(Clone, Copy)]
+    enum HealthyPhase {
+        Opening,
+        Live,
+        Backoff,
+    }
+
+    for connection_lost in [false, true] {
+        for healthy in [
+            HealthyPhase::Opening,
+            HealthyPhase::Live,
+            HealthyPhase::Backoff,
+        ] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 2;
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let leaf = trace
+                .core
+                .execution
+                .graph()
+                .tasks()
+                .last()
+                .unwrap()
+                .identity();
+            let participation = |trace: &TerminalTrace, task: TaskIdentity| {
+                trace
+                    .core
+                    .execution
+                    .graph()
+                    .participation_on_backend(task.backend_process_id())
+                    .unwrap()
+            };
+            let sibling = participation(&trace, root);
+            let peer = participation(&trace, leaf);
+            assert_ne!(sibling, peer);
+            let installed = TaskStatus::created(root).with_installed();
+            for status in [
+                installed.clone(),
+                TaskStatus::created(leaf).with_installed(),
+            ] {
+                let create = trace.start_create(status.identity());
+                trace
+                    .apply(Some(create_reply(create, status)), None)
+                    .unwrap();
+            }
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+
+            let drive = |trace: &mut TerminalTrace, at, source, input| {
+                let pending = trace.handle_input(at, source, input);
+                trace.finish_observation_round(at, pending)
+            };
+            let observe = |trace: &mut TerminalTrace, at, frames| {
+                drive(
+                    trace,
+                    at,
+                    sources.observation,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(frames).unwrap(),
+                    )),
+                )
+            };
+            let independent = |trace: &mut TerminalTrace, at, fact| {
+                assert_eq!(
+                    drive(
+                        trace,
+                        at,
+                        sources.subscription,
+                        AttemptInput::Executor(fact)
+                    )
+                    .0,
+                    Ok(())
+                );
+            };
+            let open = |trace: &mut TerminalTrace, at, participation| {
+                let (round, effects) = drive(trace, at, sources.actor, AttemptInput::Timer);
+                assert_eq!(round, Ok(()));
+                let mut opens = effects.into_iter().filter_map(|effect| {
+                    let EffectBody::OpenSubscription(request) = effect.body else {
+                        return None;
+                    };
+                    assert_eq!(request.participation, participation);
+                    Some((effect.id, request.generation))
+                });
+                let original = opens.next().expect("the original subscription opens");
+                assert!(opens.next().is_none());
+                original
+            };
+            let frame =
+                |participation, generation, received_at, opening, event| ReceivedObservation {
+                    participation,
+                    generation,
+                    received_at,
+                    opening,
+                    event,
+                };
+            let first_eof = |trace: &mut TerminalTrace,
+                             at,
+                             participation: ParticipationRef,
+                             (effect, generation),
+                             opening| {
+                let (round, effects) = observe(
+                    trace,
+                    at,
+                    vec![frame(
+                        participation,
+                        generation,
+                        at,
+                        opening,
+                        ObservationEvent::Closed,
+                    )],
+                );
+                assert_eq!(round, Ok(()));
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: original }
+                        if *closed == participation && *original == generation
+                )));
+                let (SubscriptionStatus::Backoff { until }, None) =
+                    trace.core.subscriptions.phase_for_test(participation)
+                else {
+                    panic!("the original Close still owes actual exit before its backoff can wake");
+                };
+                independent(
+                    trace,
+                    at,
+                    ExecutorFact::SubscriptionExited {
+                        effect,
+                        participation,
+                        generation,
+                    },
+                );
+                assert_eq!(
+                    trace.core.subscriptions.phase_for_test(participation),
+                    (SubscriptionStatus::Backoff { until }, Some(until))
+                );
+                assert!(until > at);
+                until
+            };
+
+            trace.core.subscriptions.activate(now, peer).unwrap();
+            let first_peer = open(&mut trace, now, peer);
+            let peer_retry = first_eof(
+                &mut trace,
+                now,
+                peer,
+                first_peer,
+                ObservationOpening {
+                    started_at: now,
+                    opened_at: Some(now),
+                },
+            );
+            let second_peer = open(&mut trace, peer_retry, peer);
+            assert_ne!(second_peer.0, first_peer.0);
+            assert_eq!(second_peer.1.get(), first_peer.1.get() + 1);
+            independent(
+                &mut trace,
+                peer_retry,
+                ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                    participation: peer,
+                    generation: second_peer.1,
+                    opening_started_at: peer_retry,
+                    opened_at: Some(peer_retry),
+                }),
+            );
+            let peer_deadline = peer_retry.saturating_add(COVERED_LIVENESS_BUDGET);
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(peer),
+                (SubscriptionStatus::Live, Some(peer_deadline))
+            );
+
+            let tick = Duration::from_millis(1);
+            let sibling_started = peer_retry.saturating_add(tick);
+            trace
+                .core
+                .subscriptions
+                .activate(sibling_started, sibling)
+                .unwrap();
+            let sibling_open = open(&mut trace, sibling_started, sibling);
+            let sibling_opened = sibling_started.saturating_add(tick);
+            let sibling_ready = sibling_opened.saturating_add(tick);
+            let sibling_opening = ObservationOpening {
+                started_at: sibling_started,
+                opened_at: Some(sibling_opened),
+            };
+            let sibling_phase = match healthy {
+                HealthyPhase::Opening => {
+                    independent(
+                        &mut trace,
+                        sibling_started,
+                        ExecutorFact::SubscriptionProgress(SubscriptionPhaseSnapshot {
+                            participation: sibling,
+                            generation: sibling_open.1,
+                            opening_started_at: sibling_started,
+                            opened_at: None,
+                        }),
+                    );
+                    (
+                        SubscriptionStatus::Opening,
+                        Some(sibling_started.saturating_add(COVERED_OPENING_BUDGET)),
+                    )
+                }
+                HealthyPhase::Live => {
+                    let (round, _) = observe(
+                        &mut trace,
+                        sibling_ready,
+                        vec![frame(
+                            sibling,
+                            sibling_open.1,
+                            sibling_ready,
+                            sibling_opening,
+                            ObservationEvent::Fact {
+                                source_revision: None,
+                                fact: ObservationFact::CatchUpComplete {
+                                    generation: sibling_open.1.get(),
+                                    initial_cut: 1,
+                                },
+                            },
+                        )],
+                    );
+                    assert_eq!(round, Ok(()));
+                    (
+                        SubscriptionStatus::Live,
+                        Some(sibling_ready.saturating_add(COVERED_LIVENESS_BUDGET)),
+                    )
+                }
+                HealthyPhase::Backoff => {
+                    let until = first_eof(
+                        &mut trace,
+                        sibling_ready,
+                        sibling,
+                        sibling_open,
+                        sibling_opening,
+                    );
+                    (SubscriptionStatus::Backoff { until }, Some(until))
+                }
+            };
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert!(trace.core.subscriptions.first_exhausted().is_none());
+            assert!(trace.core.terminal.terminal().is_none());
+            assert!(!trace.core.root.sealed());
+            for required in [sibling, peer] {
+                assert!(trace.core.execution.requires_task_observation(required));
+            }
+
+            let sibling_deadline = sibling_phase.1.unwrap();
+            let before_first_deadline = peer_deadline
+                .min(sibling_deadline)
+                .saturating_duration_since(sibling_ready)
+                .saturating_sub(tick);
+            let at = sibling_ready.saturating_add(before_first_deadline);
+            assert!(at < peer_deadline && at < sibling_deadline);
+            let (round, _) = drive(&mut trace, at, sources.actor, AttemptInput::Timer);
+            assert_eq!(round, Ok(()));
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert!(trace.core.subscriptions.first_exhausted().is_none());
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(id(second_peer.0.get())),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(peer),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let (round, mut effects) = observe(
+                &mut trace,
+                at,
+                vec![frame(
+                    peer,
+                    second_peer.1,
+                    at,
+                    ObservationOpening {
+                        started_at: peer_retry,
+                        opened_at: Some(peer_retry),
+                    },
+                    event,
+                )],
+            );
+            let exhausted = trace.core.subscriptions.first_exhausted().unwrap();
+            assert_eq!((exhausted.participation, exhausted.state), (peer, state));
+            assert_eq!(
+                trace.core.subscriptions.phase_for_test(sibling),
+                sibling_phase
+            );
+            assert_eq!(trace.status(root), Some(&installed));
+            assert!(!trace.core.execution.task_actual_stopped(root));
+            assert!(!trace.core.execution.task_actual_stopped(leaf));
+            assert!(effects.iter().all(|effect| !matches!(
+                &effect.body,
+                EffectBody::ConfirmReadState { participation, .. }
+                    | EffectBody::CloseSubscription { participation, .. }
+                    if *participation == sibling
+            )));
+
+            let failure = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: leaf.backend_process_id(),
+                    state,
+                },
+            ));
+            assert_eq!(round, Err(failure.clone()));
+            let terminal = AttemptTerminal::Failed(failure);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                effects.extend(
+                    trace
+                        .handle_input(at, sources.actor, AttemptInput::Timer)
+                        .effect,
+                );
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert_eq!(
+                effects.iter().filter(|effect| matches!(
+                    &effect.body,
+                    EffectBody::Port(port)
+                        if port.activation == activation && matches!(
+                            &port.body,
+                            AttemptToLogicalBody::AttemptTerminal(original) if original == &terminal
+                        )
+                )).count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
+    use crate::{
+        effect::Publication,
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    let progression = [
+        (2, TaskState::Running),
+        (3, TaskState::Flushing),
+        (4, TaskState::Finished),
+    ];
+    for connection_lost in [false, true] {
+        for last in 0..progression.len() {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let create = trace.start_create(root);
+            trace
+                .apply(
+                    Some(create_reply(
+                        create,
+                        TaskStatus::created(root).with_installed(),
+                    )),
+                    None,
+                )
+                .unwrap();
+            let statuses: Vec<_> = progression[..=last]
+                .iter()
+                .map(|&(version, state)| {
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        None,
+                        TaskOutputFacts::new(state == TaskState::Finished),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let expected_status = statuses.last().unwrap().clone();
+            let finished = expected_status.state() == TaskState::Finished;
+            let stream = status_frame(&mut trace, statuses[0].clone());
+            let participation = stream.participation;
+            let generation = stream.generation;
+            let observe = |trace: &mut TerminalTrace, at, frames| {
+                let step = trace.handle_input(
+                    at,
+                    sources.observation,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(frames).unwrap(),
+                    )),
+                );
+                trace.finish_observation_round(at, step)
+            };
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+            let mut frames = vec![
+                stream.clone(),
+                ReceivedObservation {
+                    event: ObservationEvent::Fact {
+                        source_revision: None,
+                        fact: ObservationFact::CatchUpComplete {
+                            generation: generation.get(),
+                            initial_cut: 1,
+                        },
+                    },
+                    ..stream.clone()
+                },
+            ];
+            frames.extend(statuses.into_iter().skip(1).zip(2..).map(
+                |(status, source_revision)| ReceivedObservation {
+                    event: ObservationEvent::Fact {
+                        source_revision: Some(source_revision),
+                        fact: ObservationFact::Status(status),
+                    },
+                    ..stream.clone()
+                },
+            ));
+            let (round, effects) = observe(&mut trace, now, frames);
+            assert_eq!(round, Ok(()));
+            assert!(effects.iter().any(|effect| matches!(
+                &effect.body,
+                EffectBody::Publish(Publication::RootStatus(projection))
+                    if projection.status == expected_status
+                        && projection.failure == AttemptRootFailure::None
+            )));
+            assert_eq!(trace.status(root), Some(&expected_status));
+            assert_eq!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(participation),
+                !finished
+            );
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .needs_covered_subscription(participation)
+            );
+            assert!(!trace.core.root.sealed());
+
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(trace.next_id()),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(participation),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let at = now.saturating_add(Duration::from_millis(1));
+            let (round, mut effects) = observe(
+                &mut trace,
+                at,
+                vec![ReceivedObservation {
+                    received_at: at,
+                    event,
+                    ..stream
+                }],
+            );
+            let exhausted = trace
+                .core
+                .subscriptions
+                .first_exhausted()
+                .expect("the original Root generation spent its actual retry budget");
+            assert_eq!(
+                (exhausted.participation, exhausted.state),
+                (participation, state)
+            );
+            assert_eq!(trace.status(root), Some(&expected_status));
+            assert!(!trace.core.root.sealed());
+            assert!(trace.core.execution.selected_task_failure().is_none());
+            assert!(!trace.core.execution.task_actual_stopped(root));
+            assert!(!trace.core.execution.covered_gap_pending(participation));
+            if finished {
+                assert_eq!(round, Ok(()));
+                assert!(trace.core.terminal.terminal().is_none());
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: original }
+                        if *closed == participation && *original == generation
+                )));
+                continue;
+            }
+
+            let failure = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: root.backend_process_id(),
+                    state,
+                },
+            ));
+            assert_eq!(round, Err(failure.clone()));
+            let terminal = AttemptTerminal::Failed(failure);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                effects.extend(
+                    trace
+                        .handle_input(at, sources.actor, AttemptInput::Timer)
+                        .effect,
+                );
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert_eq!(
+                effects.iter().filter(|effect| matches!(
+                    &effect.body,
+                    EffectBody::Port(port)
+                        if port.activation == activation && matches!(
+                            &port.body,
+                            AttemptToLogicalBody::AttemptTerminal(original) if original == &terminal
+                        )
+                )).count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn accepted_failing_task_takes_precedence_over_its_covered_exhaustion() {
+    use crate::{
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+        root_control::{FailureReadiness, RootCompletion},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    for connection_lost in [false, true] {
+        for failing in [false, true] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            for edge in start.plan.graph.edges.values_mut() {
+                edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+            }
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let leaf = trace
+                .core
+                .execution
+                .graph()
+                .tasks()
+                .last()
+                .unwrap()
+                .identity();
+            assert_ne!(root.backend_process_id(), leaf.backend_process_id());
+            let create = trace.start_create(leaf);
+            trace
+                .apply(
+                    Some(create_reply(
+                        create,
+                        TaskStatus::created(leaf).with_installed(),
+                    )),
+                    None,
+                )
+                .unwrap();
+            let finished = TaskStatus::try_new(
+                root,
+                TaskStatusVersion::new(1).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap();
+            let running = TaskStatus::try_new(
+                leaf,
+                TaskStatusVersion::new(2).unwrap(),
+                TaskState::Running,
+                None,
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let root_frame = status_frame(&mut trace, finished.clone());
+            let leaf_frame = status_frame(&mut trace, running.clone());
+            let participation = leaf_frame.participation;
+            let generation = leaf_frame.generation;
+            let observe = |trace: &mut TerminalTrace, frames| {
+                let step = trace.handle_input(
+                    now,
+                    sources.observation,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(frames).unwrap(),
+                    )),
+                );
+                trace.finish_observation_round(now, step)
+            };
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+            assert_eq!(observe(&mut trace, vec![root_frame]).0, Ok(()));
+            assert_eq!(trace.status(root), Some(&finished));
+            assert_eq!(trace.core.seal_facts().root, RootCompletion::ExactFinished);
+            assert_eq!(trace.core.seal_facts().failure, FailureReadiness::Empty);
+            assert!(!trace.core.root.sealed());
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(participation),
+                "the deep leaf still owes work before the original result seal"
+            );
+
+            let original_failure =
+                originating_failure("accepted deep-leaf failure", TaskFailurePhase::Execution);
+            let failing_status = TaskStatus::try_new(
+                leaf,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Failing,
+                Some(original_failure.clone()),
+                TaskOutputFacts::default(),
+            )
+            .unwrap();
+            let mut batch = vec![leaf_frame.clone()];
+            if failing {
+                batch.push(ReceivedObservation {
+                    event: ObservationEvent::Fact {
+                        source_revision: None,
+                        fact: ObservationFact::Status(failing_status.clone()),
+                    },
+                    ..leaf_frame.clone()
+                });
+            }
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(trace.next_id()),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(participation),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            // The exact generation exhausts after the earlier status in this
+            // ordered cut and before the terminal decision can stop business.
+            batch.push(ReceivedObservation {
+                event,
+                ..leaf_frame
+            });
+            let (round, mut effects) = observe(&mut trace, batch);
+            assert_eq!(trace.status(root), Some(&finished));
+            assert!(!trace.core.execution.task_actual_stopped(leaf));
+            assert!(!trace.core.root.sealed());
+            if !failing {
+                assert_eq!(round, Ok(()));
+                assert_eq!(trace.status(leaf), Some(&running));
+                assert!(trace.core.terminal.terminal().is_none());
+                assert!(effects.iter().any(|effect| matches!(
+                    effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: original }
+                        if closed == participation && original == generation
+                )));
+                continue;
+            }
+
+            let exhausted = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: leaf.backend_process_id(),
+                    state,
+                },
+            ));
+            assert_eq!(round, Err(exhausted));
+            assert_eq!(trace.status(leaf), Some(&failing_status));
+            assert_eq!(
+                trace.core.seal_facts().failure,
+                FailureReadiness::Authoritative
+            );
+            let selected = SelectedTaskTermination::new(leaf, original_failure);
+            assert_eq!(
+                trace.core.execution.selected_task_failure(),
+                Some(&selected)
+            );
+            let terminal = AttemptTerminal::Failed(AttemptFailure::SelectedTask(selected));
+            let mut next = (sources.actor, AttemptInput::Timer);
+            let mut control_ready = false;
+            for _ in 0..24 {
+                let step = trace.handle_input(now, next.0, next.1);
+                let applied = step.effect.as_ref().and_then(|effect| {
+                    TerminalTrace::applied_observation_publication(&effect.body)
+                        .map(|applied| (effect.id, applied))
+                });
+                effects.extend(step.effect);
+                next = match (step.selection, applied) {
+                    (InputSelection::Only(source), Some((effect, applied)))
+                        if source == sources.publication =>
+                    {
+                        (
+                            source,
+                            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                effect,
+                                result: Ok(applied),
+                            }),
+                        )
+                    }
+                    (InputSelection::Only(source), None)
+                        if source == sources.actor || source == sources.observation =>
+                    {
+                        (sources.actor, AttemptInput::Timer)
+                    }
+                    (InputSelection::Prefer(source), None) if source == sources.native => {
+                        control_ready = true;
+                        break;
+                    }
+                    selection => panic!("unexpected terminal continuation: {selection:?}"),
+                };
+            }
+            assert!(
+                control_ready,
+                "terminal cleanup left the original control cut blocked"
+            );
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert_eq!(
+                effects.iter().filter(|effect| matches!(
+                    &effect.body,
+                    EffectBody::Port(port)
+                        if port.activation == activation && matches!(
+                            &port.body,
+                            AttemptToLogicalBody::AttemptTerminal(original) if original == &terminal
+                        )
+                )).count(),
+                1
+            );
+
+            let token = AttemptRequestToken::new(trace.next_id());
+            let seal = trace.handle_input(
+                now,
+                sources.observation,
+                AttemptInput::Port(LogicalToAttempt {
+                    activation,
+                    body: LogicalToAttemptBody::SealRequest { token },
+                }),
+            );
+            assert!(seal.root_control_processed.is_some());
+            let (_, effects) = trace.finish_observation_round(now, seal);
+            assert!(effects.iter().any(|effect| matches!(
+                &effect.body,
+                EffectBody::Port(port)
+                    if port.activation == activation && matches!(
+                        &port.body, AttemptToLogicalBody::SealResult {
+                            token: reply,
+                            result: Err(AttemptFailure::TaskProtocol(error)),
+                        } if *reply == token && error.as_ref()
+                            == &schedule(RootSealRefusal::AttemptCleanup.message())
+                    )
+            )));
+            assert!(!trace.core.root.sealed());
+        }
+    }
+}
+
+#[test]
+fn successful_seal_releases_queued_startup_without_native_dispatch() {
+    use novarocks_coordination_contract::{
+        AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptIssueSettlement,
+        AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    for establish in [false, true] {
+        let mut frozen = start();
+        for edge in frozen.plan.graph.edges.values_mut() {
+            edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+        }
+        let now = frozen.initial_now;
+        let sources = frozen.sources;
+        let activation = frozen.activation.identity;
+        let mut trace = TerminalTrace {
+            core: Core::new(frozen).unwrap(),
+            next: 100,
+        };
+        let root = trace.core.execution.graph().root_identity();
+        let target = trace
+            .core
+            .execution
+            .graph()
+            .participations()
+            .copied()
+            .find(|part| part.backend_process_id() != root.backend_process_id())
+            .unwrap();
+        trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+        let finished = TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap();
+        let frame = status_frame(&mut trace, finished);
+        let observed = trace.handle_input(
+            now,
+            sources.observation,
+            AttemptInput::Executor(ExecutorFact::Observations(
+                ObservationBatch::new(vec![frame]).unwrap(),
+            )),
+        );
+        assert_eq!(trace.finish_observation_round(now, observed).0, Ok(()));
+
+        let action = AttemptActionId::new(trace.next_id());
+        let grant = QueuedInputGrantRef::new(trace.next_id(), SendGeneration::new(action), 64);
+        let request = admission_intent(&mut trace.core.execution, target);
+        let guard = AttemptAuthorizationRef::new(trace.next_id());
+        let (intent, decision) = if establish {
+            let admission = dispatch_admission(
+                &mut trace.core.execution,
+                request,
+                11,
+                OperationOutcome::Accepted,
+            );
+            trace
+                .core
+                .execution
+                .apply_dispatched_reply(&admission)
+                .1
+                .unwrap();
+            let intent = queue_establish(&mut trace.core.execution, target, grant);
+            (
+                intent,
+                AttemptAuthorizationDecision::EstablishAuthorized(guard),
+            )
+        } else {
+            let intent = OperationIntent::AcquireParticipationAdmissionTicket(request);
+            trace
+                .core
+                .execution
+                .begin_lifecycle_admission(intent.clone(), action)
+                .unwrap();
+            assert!(matches!(
+                trace
+                    .core
+                    .execution
+                    .observe_lifecycle_grant(intent.operation_id(), grant)
+                    .unwrap(),
+                CreateGrantProgress::Queued
+            ));
+            (
+                intent,
+                AttemptAuthorizationDecision::AdmissionStarted(guard),
+            )
+        };
+        let request_token = AttemptRequestToken::new(trace.next_id());
+        let request_action = AttemptActionId::new(trace.next_id());
+        assert!(matches!(
+            trace
+                .core
+                .authorize_candidate(&intent, request_token, request_action)
+                .unwrap(),
+            AuthorizationStep::Request(_)
+        ));
+        trace
+            .core
+            .apply_qa_reply(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token: request_token,
+                    decision: Ok(decision),
+                },
+            })
+            .unwrap();
+        assert_eq!(trace.core.execution.dispatcher().queued_items(), 1);
+
+        let token = AttemptRequestToken::new(trace.next_id());
+        let mut next = trace.handle_input(
+            now,
+            sources.observation,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::SealRequest { token },
+            }),
+        );
+        assert!(next.root_control_processed.is_some());
+        let mut seal = false;
+        let mut releases = 0;
+        let mut round_finished = false;
+        for _ in 0..24 {
+            let mut source = sources.actor;
+            let mut input = AttemptInput::Timer;
+            if let Some(effect) = next.effect {
+                match &effect.body {
+                    EffectBody::Port(port)
+                        if matches!(&port.body, AttemptToLogicalBody::SealResult {
+                        token: original, result: Ok(_),
+                    } if *original == token) =>
+                    {
+                        seal = true
+                    }
+                    EffectBody::ReleaseQueuedInput { grant: original } => {
+                        assert_eq!(*original, grant);
+                        releases += 1;
+                    }
+                    EffectBody::SendBatch { batch, .. } => {
+                        panic!(
+                            "sealed attempt emitted queued startup: {:?}",
+                            batch.operations
+                        );
+                    }
+                    _ => {}
+                }
+                if let Some(applied) = TerminalTrace::applied_observation_publication(&effect.body)
+                {
+                    source = sources.publication;
+                    input = AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                        effect: effect.id,
+                        result: Ok(applied),
+                    });
+                }
+            }
+            if let Some(round) = next.round_result {
+                assert_eq!(round, Ok(()));
+                round_finished = true;
+                assert!(seal);
+                assert_eq!(releases, 1);
+                assert_eq!(trace.core.execution.dispatcher().queued_items(), 0);
+                assert_eq!(trace.core.execution.dispatcher().in_flight_operations(), 0);
+                break;
+            }
+            next = trace.handle_with_context(
+                now,
+                source,
+                input,
+                &mut OriginalSend(target.backend_process_id(), DispatchLane::Lifecycle),
+            );
+        }
+        assert!(round_finished && seal);
+        assert_eq!(releases, 1);
+
+        let mut unused_establish = establish.then_some(guard);
+        let mut terminal = false;
+        for _ in 0..24 {
+            let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+            let Some(AttemptEffect {
+                body: EffectBody::Port(port),
+                ..
+            }) = step.effect
+            else {
+                assert!(step.effect.is_none(), "{step:?}");
+                continue;
+            };
+            match port.body {
+                AttemptToLogicalBody::EstablishSettlement {
+                    token,
+                    authorization,
+                    participation,
+                    operation_id,
+                    settlement,
+                } => {
+                    assert_eq!(unused_establish.take(), Some(authorization));
+                    assert_eq!(participation, target);
+                    assert_eq!(operation_id, intent.operation_id());
+                    assert_eq!(settlement, AttemptIssueSettlement::DefinitelyUnsent);
+                    let applied = trace.handle_input(
+                        now,
+                        sources.qa,
+                        AttemptInput::Port(LogicalToAttempt {
+                            activation,
+                            body: LogicalToAttemptBody::EstablishSettlementReply {
+                                token,
+                                authorization,
+                                result: Ok(()),
+                            },
+                        }),
+                    );
+                    assert!(applied.effect.is_none());
+                }
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Completed) => {
+                    terminal = true;
+                    break;
+                }
+                other => panic!("unexpected original authorization close: {other:?}"),
+            }
+        }
+        assert!(terminal);
+        assert!(unused_establish.is_none());
+    }
+}
+
+#[test]
+fn stream_first_terminal_order_survives_duplicates_and_late_create_reply() {
+    let mut trace = TerminalTrace::new();
+    let mut order: Vec<_> = trace
+        .core
+        .execution
+        .graph()
+        .tasks()
+        .map(|task| task.identity())
+        .collect();
+    order.reverse();
+    assert!(order[0].task_id() > order[1].task_id());
+    let creates: Vec<_> = order.iter().map(|&task| trace.start_create(task)).collect();
+    for (&task, &create) in order.iter().zip(&creates).skip(1) {
+        trace
+            .apply(
+                Some(create_reply(
+                    create,
+                    TaskStatus::created(task).with_installed(),
+                )),
+                None,
+            )
+            .unwrap();
+    }
+    trace.open_diagnostic_window();
+    let stream_first = order[0];
+    for (&task, &create) in order.iter().zip(&creates) {
+        let terminal = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(3).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap();
+        let observation = status_frame(&mut trace, terminal.clone());
+        let prior = trace.core.execution.accepted_protocol_revision();
+        trace.apply(None, Some(observation.clone())).unwrap();
+        let revision = trace.core.execution.accepted_protocol_revision();
+        assert_eq!(revision, prior + 1);
+        trace.apply(None, Some(observation)).unwrap();
+        assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+
+        if task == stream_first {
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .task(task.task_id())
+                    .unwrap()
+                    .has_released_operation()
+            );
+            let reply = create_reply(create, TaskStatus::created(task).with_installed());
+            trace.apply(Some(reply.clone()), None).unwrap();
+            assert!(
+                !trace
+                    .core
+                    .execution
+                    .task(task.task_id())
+                    .unwrap()
+                    .has_released_operation()
+            );
+            trace.apply(Some(reply), None).unwrap();
+            assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+            assert_eq!(trace.status(task), Some(&terminal));
+        }
+    }
+    let revision = trace.core.execution.accepted_protocol_revision();
+    trace.apply(None, None).unwrap();
+    assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+    trace.expect_diagnostic_reads(&order);
+}
+
+#[test]
+fn live_metrics_and_derived_refinement_queue_only_the_first_terminal() {
+    let mut trace = TerminalTrace::new();
+    let task = trace
+        .core
+        .execution
+        .graph()
+        .tasks()
+        .last()
+        .unwrap()
+        .identity();
+    let derived = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+    let live_status = |version| {
+        TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(version).unwrap(),
+            TaskState::Aborting,
+            Some(derived.clone()),
+            TaskOutputFacts::default(),
+        )
+        .unwrap()
+        .with_resources(TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(version)))
+    };
+    let stream = status_frame(&mut trace, live_status(2));
+    trace.open_diagnostic_window();
+    for version in [2, 3] {
+        let live = live_status(version);
+        let revision = trace.core.execution.accepted_protocol_revision();
+        trace.apply_snapshot(&stream, &live).unwrap();
+        assert_eq!(trace.status(task), Some(&live));
+        assert!(trace.core.execution.accepted_protocol_revision() > revision);
+        assert!(!trace.core.execution.diagnostics().read_ready());
+    }
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&SelectedTaskTermination::new(task, derived)),
+    );
+
+    let failure = originating_failure("original runtime failure", TaskFailurePhase::Execution);
+    let terminal = TaskStatus::try_new(
+        task,
+        TaskStatusVersion::new(9).unwrap(),
+        TaskState::Failed,
+        Some(failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    trace.apply_snapshot(&stream, &terminal).unwrap();
+    assert_eq!(trace.status(task), Some(&terminal));
+    assert!(trace.core.execution.diagnostics().read_ready());
+    let selected = SelectedTaskTermination::new(task, failure);
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    let revision = trace.core.execution.accepted_protocol_revision();
+
+    trace.apply_snapshot(&stream, &terminal).unwrap();
+    assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+    let overwrite = TaskStatus::try_new(
+        task,
+        TaskStatusVersion::new(10).unwrap(),
+        TaskState::Failed,
+        Some(originating_failure(
+            "replacement runtime failure",
+            TaskFailurePhase::Execution,
+        )),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        trace.apply_snapshot(&stream, &overwrite),
+        Err(AttemptFailure::TaskProtocol(error))
+            if matches!(*error, TaskExecutionError::Observation(StatusObservation::TerminalOverwrite))
+    ));
+    assert_eq!(trace.core.execution.accepted_protocol_revision(), revision);
+    assert_eq!(trace.status(task), Some(&terminal));
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    trace.expect_diagnostic_reads(&[task]);
+}
+
+#[test]
+fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
+    let mut trace = TerminalTrace::new();
+    let (peer, origin) = {
+        let mut tasks = trace.core.execution.graph().tasks();
+        let _root = tasks.next().unwrap();
+        let origin = tasks.next().unwrap().identity();
+        let peer = tasks.next().unwrap().identity();
+        (peer, origin)
+    };
+    let peer_failure = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+    let peer_terminal = TaskStatus::try_new(
+        peer,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Aborted,
+        Some(peer_failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    let original_failure =
+        originating_failure("different task origin", TaskFailurePhase::Execution);
+    let origin_terminal = TaskStatus::try_new(
+        origin,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Failed,
+        Some(original_failure.clone()),
+        TaskOutputFacts::default(),
+    )
+    .unwrap();
+    let peer_stream = status_frame(&mut trace, peer_terminal.clone());
+    let origin_stream = status_frame(&mut trace, origin_terminal.clone());
+    trace.open_diagnostic_window();
+
+    trace.apply_snapshot(&peer_stream, &peer_terminal).unwrap();
+    assert_eq!(trace.status(peer), Some(&peer_terminal));
+    assert_eq!(trace.status(origin), None);
+    assert!(trace.core.execution.diagnostics().read_ready());
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&SelectedTaskTermination::new(peer, peer_failure)),
+    );
+    let first_revision = trace.core.execution.accepted_protocol_revision();
+
+    trace
+        .apply_snapshot(&origin_stream, &origin_terminal)
+        .unwrap();
+    assert_eq!(trace.status(origin), Some(&origin_terminal));
+    let selected = SelectedTaskTermination::new(origin, original_failure);
+    assert_eq!(
+        trace.core.execution.selected_task_failure(),
+        Some(&selected)
+    );
+    let selected_revision = trace.core.execution.accepted_protocol_revision();
+    assert!(selected_revision > first_revision);
+
+    for (stream, terminal) in [
+        (&peer_stream, &peer_terminal),
+        (&origin_stream, &origin_terminal),
+    ] {
+        trace.apply_snapshot(stream, terminal).unwrap();
+        assert_eq!(trace.status(terminal.identity()), Some(terminal));
+        assert_eq!(
+            trace.core.execution.accepted_protocol_revision(),
+            selected_revision
+        );
+        assert_eq!(
+            trace.core.execution.selected_task_failure(),
+            Some(&selected)
+        );
+    }
+    trace.expect_diagnostic_reads(&[peer, origin]);
+}
+
+#[test]
+fn create_identity_mismatch_asks_qa_about_original_process_replacement() {
+    use crate::input::MembershipObservation;
+    use novarocks_coordination_contract::{AttemptTerminal, AttemptToLogicalBody};
+
+    let replacement = crate::test_support::backend(99);
+    let positive = MembershipObservation::ExactReplacement(replacement);
+    for sample in [
+        None,
+        Some((positive, false)),
+        Some((MembershipObservation::ExactOriginal, true)),
+        Some((MembershipObservation::Unobserved, true)),
+        Some((positive, true)),
+    ] {
+        let mut trace = TerminalTrace::new();
+        let task = trace.core.execution.graph().root_identity();
+        let participation = trace
+            .core
+            .execution
+            .task(task.task_id())
+            .unwrap()
+            .participation();
+        let sources = trace.core.sources;
+        let activation = trace.core.activation;
+        let now = trace.core.execution.monotonic_now();
+        // TerminalTrace starts Establish and receives a 30-second effective lease.
+        let lease = Duration::from_secs(30);
+        let (operation_id, generation) = trace.start_create(task);
+        trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+
+        let rejection = OperationResult::Verdict {
+            outcome: OperationOutcome::IdentityMismatch,
+            detail: Some(SafeDetail::new("original Worker refusal").unwrap()),
+            acknowledgement: None,
+        };
+        let refusal = AttemptFailure::TaskProtocol(Box::new(TaskExecutionError::OperationFailed {
+            task: Some(task),
+            participation,
+            operation_id,
+            kind: OperationKind::CreateTask,
+            rejection: rejection.clone(),
+        }));
+        let step = trace.handle_input(
+            now,
+            sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(OperationObservation {
+                generation,
+                reply: OperationReply {
+                    operation_id,
+                    kind: OperationKind::CreateTask,
+                    result: OperationReplyResult::Worker(rejection.map_ack(|never| match never {})),
+                },
+            })),
+        );
+        let (round, effects) = trace.finish_observation_round(now, step);
+        assert_eq!(round, Err(refusal.clone()));
+        let [
+            AttemptEffect {
+                body: EffectBody::Port(port),
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("the failed Native prefix must issue the original QA replacement question");
+        };
+        let AttemptToLogicalBody::PreReadyReplacementQuery {
+            token,
+            refusal: asked,
+        } = &port.body
+        else {
+            panic!("expected the original QA replacement question");
+        };
+        assert_eq!(port.activation, activation);
+        assert_eq!(asked, &refusal);
+        assert_eq!(
+            trace.core.execution.rejected_create_observation_remaining(
+                task,
+                participation,
+                operation_id
+            ),
+            Some(lease)
+        );
+        assert!(trace.core.terminal.terminal().is_none());
+
+        let permission = trace.handle_input(
+            now,
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::PreReadyReplacementReply {
+                    token: *token,
+                    may_observe: sample.is_some(),
+                },
+            }),
+        );
+        let mut expected = refusal.clone();
+        let (mut step, at) = if let Some((observation, at_horizon)) = sample {
+            let Some(AttemptEffect {
+                body:
+                    EffectBody::ObserveProcess {
+                        request,
+                        participation: observed,
+                    },
+                ..
+            }) = permission.effect
+            else {
+                panic!("allowed replacement must ask for the exact process")
+            };
+            assert_eq!(observed, participation);
+            assert_eq!(permission.selection, InputSelection::Only(sources.process));
+            assert!(trace.core.terminal.terminal().is_none());
+            let elapsed = if at_horizon {
+                lease
+            } else {
+                lease - Duration::from_secs(1)
+            };
+            let at = now.saturating_add(elapsed);
+            if !at_horizon {
+                expected = AttemptFailure::PreReadyReplacement {
+                    refusal: Box::new(refusal),
+                    participation,
+                    operation_id,
+                    kind: OperationKind::CreateTask,
+                    replacement,
+                };
+            }
+            let step = trace.handle_input(
+                at,
+                sources.process,
+                AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                    request,
+                    participation,
+                    sampled_at: at,
+                    observation,
+                }),
+            );
+            (step, at)
+        } else {
+            assert!(permission.effect.is_none());
+            (permission, now)
+        };
+
+        let terminal = (0..8)
+            .find_map(|_| {
+                if let Some(AttemptEffect {
+                    body: EffectBody::Port(port),
+                    ..
+                }) = step.effect.take()
+                {
+                    return Some(port);
+                }
+                assert_eq!(step.selection, InputSelection::Only(sources.actor));
+                step = trace.handle_input(at, sources.actor, AttemptInput::Timer);
+                None
+            })
+            .expect("the original attempt must publish its terminal refusal");
+        assert_eq!(terminal.activation, activation);
+        assert!(matches!(
+            terminal.body,
+            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(failure)) if failure == expected
+        ));
+    }
+}
+
+#[test]
+fn root_read_projection_waits_for_exact_installation_not_create_reply() {
+    use crate::{
+        AttemptCore,
+        effect::Publication,
+        input::{AttemptInput, AttemptInputClaim, LocalDispatchResult},
+    };
+    use std::cell::Cell;
+
+    for (accepted_first, finished_before_reply) in [(true, false), (false, false), (false, true)] {
+        let mut trace = TerminalTrace::new();
+        let root = trace.core.execution.graph().root_identity();
+        let create = trace.start_create(root);
+        let uninstalled = TaskStatus::created(root);
+        let stream = status_frame(&mut trace, uninstalled.clone());
+        let core = &mut trace.core;
+        let now = core.execution.monotonic_now();
+        let sources = core.sources;
+        let next = Cell::new(1);
+        let step = |core: &mut Core, source, input| {
+            let current = AttemptInputId(id(next.get()));
+            next.set(next.get() + 1);
+            core.handle(
+                now,
+                AttemptInputClaim {
+                    source,
+                    input: current,
+                    native_cut: Some(AttemptSourceCut {
+                        source: sources.native,
+                        tail: (source == sources.native).then_some(current),
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: sources.observation,
+                        tail: (source == sources.observation).then_some(current),
+                    }),
+                },
+                input,
+                &mut Units(128),
+            )
+            .unwrap()
+        };
+        let finish = |core: &mut Core, mut pending: AttemptStep| {
+            let mut roots = Vec::new();
+            for _ in 0..24 {
+                let publication = pending.effect.take().and_then(|effect| {
+                    let applied = match effect.body {
+                        EffectBody::Publish(Publication::RootStatus(projection)) => {
+                            assert_eq!(projection.failure, AttemptRootFailure::None);
+                            roots.push(projection.status);
+                            PublicationApplied::RootStatus
+                        }
+                        EffectBody::Publish(Publication::ProtocolBatch(_)) => {
+                            PublicationApplied::ProtocolBatch { published: true }
+                        }
+                        EffectBody::ReleaseQueuedInput { .. }
+                        | EffectBody::ReleaseCreationPayload { .. } => return None,
+                        EffectBody::AdjustReadWindow(request) => {
+                            assert_eq!(request.generation, stream.generation);
+                            return None;
+                        }
+                        other => {
+                            panic!("unexpected effect in root-read readiness round: {other:?}")
+                        }
+                    };
+                    Some((effect.id, applied))
+                });
+                let (source, input) = match (pending.selection, publication) {
+                    (InputSelection::Only(source), Some((effect, applied)))
+                        if source == sources.publication =>
+                    {
+                        (
+                            source,
+                            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                                effect,
+                                result: Ok(applied),
+                            }),
+                        )
+                    }
+                    (InputSelection::Only(source), None)
+                        if source == sources.actor || source == sources.observation =>
+                    {
+                        (sources.actor, AttemptInput::Timer)
+                    }
+                    (InputSelection::Prefer(source), None) if source == sources.native => {
+                        assert_eq!(pending.round_result, Some(Ok(())));
+                        return roots;
+                    }
+                    selection => panic!("unexpected root-read readiness selection: {selection:?}"),
+                };
+                pending = step(core, source, input);
+            }
+            panic!("root-read readiness round did not complete");
+        };
+        let observe = |core: &mut Core, status: TaskStatus| {
+            let frame = ReceivedObservation {
+                event: ObservationEvent::Fact {
+                    source_revision: None,
+                    fact: ObservationFact::Status(status),
+                },
+                ..stream.clone()
+            };
+            let pending = step(
+                core,
+                sources.observation,
+                AttemptInput::Executor(ExecutorFact::Observations(
+                    ObservationBatch::new(vec![frame]).unwrap(),
+                )),
+            );
+            finish(core, pending)
+        };
+        let reply = |core: &mut Core, reply| {
+            let pending = step(
+                core,
+                sources.native,
+                AttemptInput::Executor(ExecutorFact::Operation(reply)),
+            );
+            finish(core, pending)
+        };
+        step(core, sources.actor, AttemptInput::Bootstrap);
+
+        // Neither a Create Accepted receipt nor an uninstalled stream
+        // snapshot can release the production root projection to the reader.
+        let before = if accepted_first {
+            reply(core, create_reply(create, uninstalled.clone()))
+        } else {
+            observe(core, uninstalled.clone())
+        };
+        assert!(before.is_empty());
+        let task = core.execution.task(root.task_id()).unwrap();
+        assert_eq!(task.status(), Some(&uninstalled));
+        assert_eq!(task.create_ownership_proven(), accepted_first);
+        assert!(!task.installed());
+
+        // A covered snapshot can carry Finished across skipped versions.
+        // Both that and an Installed Planned root make the original result
+        // capability visible, including while the original Create is in flight.
+        let installed = TaskStatus::try_new_with_installed(
+            root,
+            TaskStatusVersion::new(if finished_before_reply { 3 } else { 2 }).unwrap(),
+            if finished_before_reply {
+                TaskState::Finished
+            } else {
+                TaskState::Planned
+            },
+            None,
+            TaskOutputFacts::new(finished_before_reply),
+            true,
+        )
+        .unwrap();
+        let projected = observe(core, installed.clone());
+        assert_eq!(projected.as_slice(), std::slice::from_ref(&installed));
+        let task = core.execution.task(root.task_id()).unwrap();
+        assert!(task.create_ownership_proven());
+        assert!(task.installed());
+        assert_eq!(task.has_released_operation(), !accepted_first);
+
+        if !accepted_first {
+            let late = if finished_before_reply {
+                create_reply(create, uninstalled)
+            } else {
+                OperationObservation {
+                    generation: create.1,
+                    reply: OperationReply {
+                        operation_id: create.0,
+                        kind: OperationKind::CreateTask,
+                        result: OperationReplyResult::Local {
+                            result: LocalDispatchResult::TransportUnknown,
+                            failure: None,
+                            protocol_failure: None,
+                            detail: None,
+                        },
+                    },
+                }
+            };
+            let after = reply(core, late);
+            assert!(after.iter().all(|status| status == &installed));
+            let task = core.execution.task(root.task_id()).unwrap();
+            assert_eq!(task.status(), Some(&installed));
+            assert!(!task.has_released_operation());
+            assert!(task.create_ownership_proven());
+            assert!(!task.create_result_is_unresolved());
+            assert_eq!(core.root_projection().unwrap().status, installed);
+        }
+    }
+}
+
+#[test]
+fn pending_seal_recovers_only_after_exact_terminal_and_new_catch_up() {
+    let mut trace = TerminalTrace::new();
+    let root = trace.core.execution.graph().root_identity();
+    let leaf = trace
+        .core
+        .execution
+        .graph()
+        .edges()
+        .find(|edge| edge.delivery() == ExchangeDeliveryRequirement::MustDrain)
+        .unwrap()
+        .producers()[0];
+    let create = trace.start_create(leaf);
+    trace
+        .apply(
+            Some(create_reply(
+                create,
+                TaskStatus::created(leaf).with_installed(),
+            )),
+            None,
+        )
+        .unwrap();
+    let core = &mut trace.core;
+    let start = core.execution.monotonic_now();
+    let at = |seconds| start.saturating_add(Duration::from_secs(seconds));
+    let source = core.observation_source;
+    core.begin_native_prefix(
+        start,
+        AttemptSourceCut {
+            source: core.sources.native,
+            tail: None,
+        },
+    )
+    .unwrap();
+    let root_finished = frame(core, root, TaskState::Finished, None);
+    let participation = core
+        .execution
+        .graph()
+        .task(leaf.task_id())
+        .unwrap()
+        .participation();
+    core.subscriptions.activate(start, participation).unwrap();
+
+    let advance = |core: &mut Core, now, action: AttemptActionId| {
+        core.advance_subscription(
+            now,
+            action,
+            AttemptRequestToken::new(id(200)),
+            &mut Units(16),
+        )
+        .unwrap()
+    };
+    let open = |core: &mut Core, now, action| {
+        let SubscriptionStep::Effect(AttemptEffect {
+            body: EffectBody::OpenSubscription(request),
+            ..
+        }) = advance(core, now, action)
+        else {
+            panic!("expected the original leaf subscription to open");
+        };
+        assert_eq!(request.participation, participation);
+        request
+    };
+    let observe = |core: &mut Core, now, items| {
+        core.apply_observations(now, source, ObservationBatch::new(items).unwrap())
+            .unwrap()
+    };
+    let stream = |opened, generation| {
+        move |received_at, event| ReceivedObservation {
+            participation,
+            generation,
+            received_at,
+            opening: ObservationOpening {
+                started_at: opened,
+                opened_at: Some(opened),
+            },
+            event,
+        }
+    };
+    let fact = |fact| ObservationEvent::Fact {
+        source_revision: None,
+        fact,
+    };
+    let complete = |generation: NonZeroU64, initial_cut| {
+        fact(ObservationFact::CatchUpComplete {
+            generation: generation.get(),
+            initial_cut,
+        })
+    };
+    let close = |core: &mut Core, now, action, opened, generation| {
+        assert!(matches!(
+            advance(core, now, action),
+            SubscriptionStep::Effect(AttemptEffect {
+                body: EffectBody::CloseSubscription { participation: closed, generation: closing },
+                ..
+            }) if closed == participation && closing == generation
+        ));
+        core.apply_subscription_input(
+            now,
+            &ExecutorFact::SubscriptionExited {
+                effect: opened,
+                participation,
+                generation,
+            },
+        )
+        .unwrap();
+    };
+
+    let action = |value| AttemptActionId::new(id(value));
+    let first = open(core, start, action(201));
+    let initial = stream(start, first.generation);
+    assert!(
+        observe(
+            core,
+            start,
+            vec![
+                root_finished,
+                initial(start, fact(ObservationFact::Gone(leaf))),
+                initial(start, complete(first.generation, 1)),
+            ],
+        )
+        .is_none()
+    );
+    let deadline = Some(at(30));
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(seal(core).unwrap().seal.is_none());
+    assert!(core.root.pending());
+
+    // The gap schedules reconciliation of the original subscription. Only
+    // its actual exit permits the next generation to open.
+    close(core, start, action(202), action(201), first.generation);
+    let second = open(core, start, action(203));
+    assert_eq!(second.generation.get(), first.generation.get() + 1);
+    let negative = stream(start, second.generation);
+    assert!(
+        observe(
+            core,
+            at(1),
+            vec![
+                negative(at(1), fact(ObservationFact::Unknown(leaf))),
+                negative(
+                    at(1),
+                    fact(ObservationFact::TaskConvergence(
+                        TaskConvergenceReceipt::actual_stopped(leaf, TaskConvergenceVersion::FIRST),
+                    )),
+                ),
+                negative(at(1), complete(second.generation, 2)),
+                negative(
+                    at(1),
+                    fact(ObservationFact::Bookmark {
+                        generation: second.generation.get(),
+                        sequence: 1,
+                        covered_prefix: 2,
+                        source_cut: 2,
+                    }),
+                ),
+                negative(at(1), ObservationEvent::Closed),
+            ],
+        )
+        .is_none()
+    );
+    assert!(core.execution.task_actual_stopped(leaf));
+    assert!(!core.execution.covered_observation_ready());
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(core.root.pending());
+
+    close(core, at(1), action(204), action(203), second.generation);
+    let third = open(core, at(2), action(205));
+    assert_eq!(third.generation.get(), second.generation.get() + 1);
+    assert!(third.task_convergence_cursors.iter().any(|cursor| {
+        cursor.identity() == leaf && cursor.current_version() == Some(TaskConvergenceVersion::FIRST)
+    }));
+    let recovered = stream(at(2), third.generation);
+    let canceled = |version, state| {
+        TaskStatus::try_new(
+            leaf,
+            TaskStatusVersion::new(version).unwrap(),
+            state,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::default(),
+        )
+        .unwrap()
+    };
+    let terminal = canceled(3, TaskState::Canceled);
+    assert!(
+        observe(
+            core,
+            at(29),
+            vec![
+                recovered(
+                    at(29),
+                    fact(ObservationFact::Status(canceled(2, TaskState::Canceling))),
+                ),
+                recovered(at(29), fact(ObservationFact::Status(terminal.clone()))),
+            ],
+        )
+        .is_none()
+    );
+    assert_eq!(
+        core.execution.task(leaf.task_id()).unwrap().status(),
+        Some(&terminal)
+    );
+    assert_eq!(core.execution.covered_recovery_deadline(), deadline);
+    assert!(core.root.pending());
+
+    let cut = observe(
+        core,
+        at(29),
+        vec![recovered(at(29), complete(third.generation, 3))],
+    )
+    .expect("the newer complete catch-up settles the original seal");
+    assert_eq!(cut.settlement.token, AttemptRequestToken::new(id(90)));
+    assert!(cut.settlement.result.is_ok());
+    let projection = cut.root_before_seal.expect("the original root projection");
+    assert_eq!(projection.status.identity(), root);
+    assert_eq!(projection.status.state(), TaskState::Finished);
+    assert!(projection.status.output().responsibility_complete());
+    assert_eq!(projection.failure, AttemptRootFailure::None);
+    assert!(core.execution.covered_observation_ready());
+    assert_eq!(core.execution.covered_recovery_deadline(), None);
+    assert!(!core.root.pending());
+    assert!(core.root.sealed());
+    assert!(!core.execution.normal_drain_started());
+}

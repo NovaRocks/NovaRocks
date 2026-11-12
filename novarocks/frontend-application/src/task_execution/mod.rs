@@ -32,38 +32,63 @@
 // Design: ADR-0161 (docs/adr/ADR-0161-pure-local-programs-and-supervised-task-lifecycle.md)
 
 pub(crate) mod abort_effect;
+#[cfg(test)]
 pub(crate) mod actor_gate;
+#[cfg(test)]
 pub(crate) mod attempt_convergence;
+#[cfg(test)]
 pub(crate) mod attempt_pumps;
 pub(crate) mod blocking_io;
 pub(crate) mod clock;
 pub(crate) mod completion;
+#[cfg(test)]
 pub(crate) mod completion_facts;
+#[cfg(test)]
 pub(crate) mod conclusion;
 pub(crate) mod creation;
+#[cfg(test)]
 pub(crate) mod dispatch;
+#[cfg(test)]
 pub(crate) mod domain_tracker;
 pub(crate) mod error;
+#[cfg(test)]
 pub(crate) mod execution;
+#[cfg(test)]
 pub(crate) mod feedback_pump;
 pub(crate) mod graph;
 pub(crate) mod intent;
 pub(crate) mod lease;
+pub(crate) mod manifest_projection;
+#[cfg(test)]
 pub(crate) mod manifest_round;
 pub(crate) mod operation;
+#[cfg(test)]
 pub(crate) mod participation_convergence;
+#[cfg(test)]
 pub(crate) mod participation_owner;
+#[cfg(test)]
 pub(crate) mod participation_state;
 pub(crate) mod profile_diagnostics;
 pub(crate) mod protocol_facts;
+pub(crate) mod pump_health;
+#[cfg(test)]
 pub(crate) mod remote_task;
+#[cfg(test)]
 pub(crate) mod round;
 pub(crate) mod sources;
+#[cfg(test)]
 mod split_domain;
+#[cfg(test)]
 pub(crate) mod split_transport;
+#[cfg(test)]
 pub(crate) mod stage;
+#[cfg(test)]
 pub(crate) mod status_intake;
+#[cfg(test)]
 pub(crate) mod status_validation;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) mod bridge;
+pub(crate) mod host;

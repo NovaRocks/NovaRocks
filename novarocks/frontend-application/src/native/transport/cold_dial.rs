@@ -25,28 +25,28 @@
 use super::*;
 use novarocks_native_adapter::native_lane::FrontendDialReservation;
 use novarocks_native_trust::NativeEndpointConnector;
-use tokio::sync::OwnedMutexGuard;
 
 use super::super::data_runtime::NativeDialReservation;
 
-pub(in crate::native) enum NativeChannelSource {
+pub(crate) enum NativeChannelSource {
     Ready(CachedNativeChannel),
     Cold(Box<SelectedNativeDial>),
 }
 
-pub(in crate::native) struct SelectedNativeDial {
+pub(crate) struct SelectedNativeDial {
     reservation: NativeDialReservation,
     connector: Option<NativeEndpointConnector>,
     endpoint: tonic::transport::Endpoint,
+    readiness: Option<NativePhysicalReadyWait>,
 }
 
-pub(in crate::native) enum NativeDialHandoff {
+pub(crate) enum NativeDialHandoff {
     Ready(CachedNativeChannel),
     Reserved(Box<ReservedNativeDial>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::native) enum NativeDialAttempt {
+pub(crate) enum NativeDialAttempt {
     Pending,
     Installed,
 }
@@ -54,11 +54,11 @@ pub(in crate::native) enum NativeDialAttempt {
 /// All initial local positions, retained before the first network poll.
 /// Physical/connector fields precede the original lane/cache custody, so an
 /// unused handoff drops original physical positions before releasing its lane.
-pub(in crate::native) struct ReservedNativeDial {
+pub(crate) struct ReservedNativeDial {
     dial: Option<FrontendDialReservation>,
     connector: Option<NativeEndpointConnector>,
     endpoint: tonic::transport::Endpoint,
-    _lane: OwnedMutexGuard<()>,
+    _lane: crate::native::data_runtime::NativeDialLane,
     reservation: Option<NativeDialReservation>,
 }
 
@@ -66,7 +66,7 @@ impl Client {
     /// Select once using the existing rotation/election, before a local offer.
     /// Configuration is from this same original Native transport; no network,
     /// trust fallback, new pool, or stage authority is created here.
-    pub(in crate::native) fn prepare_channel_source(
+    pub(crate) fn prepare_channel_source(
         &self,
         method: NativeRpcMethod,
     ) -> Result<NativeChannelSource, ChannelAcquisitionError> {
@@ -106,16 +106,134 @@ impl Client {
             reservation,
             connector: Some(connector),
             endpoint,
+            readiness: None,
         })))
     }
 }
 
+/// Two original readiness sources. Register after own partial exit and before
+/// rechecking the same physical predicates, so a concurrent release cannot be
+/// lost between that inspection and Pending.
+/// This contains no authorization, retry policy, timer or shadow capacity.
+struct NativePhysicalReadyWait {
+    cache: std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>,
+    outgoing: std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>,
+}
+impl NativePhysicalReadyWait {
+    fn new(runtime: &crate::native::data_runtime::FrontendDataRuntime) -> Self {
+        let mut cache = Box::pin(runtime.native_ready_notified());
+        cache.as_mut().enable();
+        let mut outgoing = Box::pin(runtime.transport_admission().frontend_outgoing_notified());
+        outgoing.as_mut().enable();
+        Self { cache, outgoing }
+    }
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        use std::future::Future;
+        if self.cache.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(());
+        }
+        self.outgoing.as_mut().poll(cx)
+    }
+}
+
 impl NativeChannelSource {
+    /// First-party allocations retained by the selected cold source and its
+    /// handoff. Include both carrier boxes across the ownership transition;
+    /// the two readiness futures are pinned in their own original boxes.
+    /// Shared process services and third-party task internals are not invoiced
+    /// here. This layout observation allocates no source or physical position.
+    pub(crate) fn owned_source_layouts() -> [std::alloc::Layout; 4] {
+        use std::alloc::Layout;
+        [
+            Layout::new::<SelectedNativeDial>(),
+            Layout::new::<ReservedNativeDial>(),
+            Layout::new::<tokio::sync::futures::OwnedNotified>(),
+            Layout::new::<tokio::sync::futures::OwnedNotified>(),
+        ]
+    }
+
+    /// Gate a previously blocked cold source without taking another physical
+    /// position. Spurious events are absorbed here, not converted into another
+    /// failed admission whose temporary drops would wake other blocked jobs.
+    pub(crate) fn poll_selected_ready(
+        source: &mut Option<Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ChannelAcquisitionError>> {
+        let Some(Self::Cold(selected)) = source.as_mut() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        loop {
+            if selected.readiness.is_none() {
+                selected.readiness = Some(NativePhysicalReadyWait::new(
+                    selected.reservation.data_runtime(),
+                ));
+            }
+            let ready = match selected.reservation.ready_channel() {
+                Err(error) => {
+                    return std::task::Poll::Ready(Err(
+                        ChannelAcquisitionError::retryable_network(error),
+                    ));
+                }
+                Ok(Some(_)) => true,
+                Ok(None) => {
+                    selected.reservation.is_leader()
+                        && match selected
+                            .reservation
+                            .data_runtime()
+                            .native_physical_ready(selected.reservation.lane())
+                        {
+                            Ok(ready) => ready,
+                            Err(error) => {
+                                return std::task::Poll::Ready(Err(
+                                    ChannelAcquisitionError::retryable_network(error),
+                                ));
+                            }
+                        }
+                }
+            };
+            if ready {
+                drop(selected.readiness.take());
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if selected.readiness.as_mut().unwrap().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            drop(selected.readiness.take());
+            // Re-arm BEFORE the same-author state recheck. This loop consumes
+            // real notifications but performs no physical try or WC refund.
+        }
+    }
+    /// Same original physical/election author as try_reserve_in. Its OWN
+    /// partial releases occur before arming fresh observers. The caller must
+    /// poll_selected_ready before another WC offer/encoding attempt after
+    /// Pending, so WC reobserve cannot turn into a native busy loop.
+    pub(crate) fn poll_reserve_in(
+        source: &mut Option<Self>,
+        target: &mut Option<NativeDialHandoff>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), ChannelAcquisitionError>> {
+        loop {
+            if let Some(Self::Cold(selected)) = source.as_mut() {
+                drop(selected.readiness.take());
+            }
+            match Self::try_reserve_in(source, target) {
+                Err(error) => return std::task::Poll::Ready(Err(error)),
+                Ok(NativeDialAttempt::Installed) => return std::task::Poll::Ready(Ok(())),
+                Ok(NativeDialAttempt::Pending) => match Self::poll_selected_ready(source, cx) {
+                    std::task::Poll::Ready(Err(error)) => {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    std::task::Poll::Ready(Ok(())) => continue,
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                },
+            }
+        }
+    }
     /// Original stable slots are borrowed. No source is removed until the
     /// matching receiver can own it; every foreign try/Drop is lock-free with
     /// respect to workload State, cache, subscription Core and owner locks.
     /// `Pending` installs no durable waiter: the same finite service rechecks.
-    pub(in crate::native) fn try_reserve_in(
+    pub(crate) fn try_reserve_in(
         source: &mut Option<Self>,
         target: &mut Option<NativeDialHandoff>,
     ) -> Result<NativeDialAttempt, ChannelAcquisitionError> {
@@ -196,6 +314,7 @@ impl NativeChannelSource {
                     reservation,
                     connector,
                     endpoint,
+                    readiness: _,
                 } = *selected;
                 *target = Some(NativeDialHandoff::Reserved(Box::new(ReservedNativeDial {
                     dial: Some(dial),
@@ -215,7 +334,7 @@ impl ReservedNativeDial {
     /// have entered the original stable input. Keep this actual F through
     /// cancellation/cleanup; its Drop does not prove a spawned driver exit.
     /// The target is filled before releasing the original lane guard (wake).
-    pub(in crate::native) async fn connect_in(
+    pub(crate) async fn connect_in(
         mut self: Box<Self>,
         target: &mut Option<CachedNativeChannel>,
     ) -> Result<(), ChannelAcquisitionError> {

@@ -192,6 +192,7 @@ pub(crate) type SharedObserver = Option<Arc<dyn NativeTransportObserver>>;
 #[derive(Clone)]
 pub struct NativeLaneStreamGate {
     semaphore: Arc<Semaphore>,
+    ready: Arc<tokio::sync::Notify>,
     lane: NativeLane,
     direction: StreamDirection,
     limit: usize,
@@ -221,6 +222,7 @@ impl NativeLaneStreamGate {
         }
         Self {
             semaphore: Arc::new(Semaphore::new(limit)),
+            ready: Arc::new(tokio::sync::Notify::new()),
             lane,
             direction,
             limit,
@@ -266,6 +268,7 @@ impl NativeLaneStreamGate {
             direction: self.direction,
             observer: self.observer.clone(),
             _outgoing_exit: outgoing_exit,
+            ready: Arc::clone(&self.ready),
         }
     }
 }
@@ -273,6 +276,7 @@ impl NativeLaneStreamGate {
 /// One held stream position. Dropping it is the stream's exit.
 pub struct NativeLaneStreamPermit {
     permit: Option<OwnedSemaphorePermit>,
+    ready: Arc<tokio::sync::Notify>,
     lane: NativeLane,
     direction: StreamDirection,
     observer: SharedObserver,
@@ -292,6 +296,7 @@ impl fmt::Debug for NativeLaneStreamPermit {
 impl Drop for NativeLaneStreamPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
+        self.ready.notify_waiters();
         if let Some(observer) = &self.observer {
             observer.lane_streams(self.lane, self.direction, -1);
         }
@@ -382,6 +387,19 @@ struct NativeStreamDropFailure {
 /// `poll_ready` takes a position before the request reaches Tonic's queue,
 /// and the response body carries it to its exit. Clones share the positions;
 /// a position reserved by `poll_ready` belongs to that clone only.
+// This is the LAST field of NativeLaneChannel. Rust destroys struct fields in
+// declaration order: the real SDK clone/waiter, PollSemaphore assigned holder
+// and raw reserved stream all exit before this notification. It has no grant,
+// counter, or alternate limit. Empty-clone drops may emit a spurious hint;
+// receivers must arm after their own partial Drop and recheck the real gate.
+// No NativeLaneChannel Drop implementation may notify before these fields.
+struct ChannelReleaseNotification(Arc<tokio::sync::Notify>);
+impl Drop for ChannelReleaseNotification {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
 pub struct NativeLaneChannel {
     channel: Channel,
     gate: NativeLaneStreamGate,
@@ -389,6 +407,8 @@ pub struct NativeLaneChannel {
     reserved: Option<OwnedSemaphorePermit>,
     outgoing_admission: Option<NativeTransportAdmission>,
     outgoing_changed: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
+    // Keep last; see ChannelReleaseNotification.
+    _release_notification: ChannelReleaseNotification,
 }
 
 impl fmt::Debug for NativeLaneChannel {
@@ -408,6 +428,7 @@ impl Clone for NativeLaneChannel {
             reserved: None,
             outgoing_admission: self.outgoing_admission.clone(),
             outgoing_changed: None,
+            _release_notification: ChannelReleaseNotification(Arc::clone(&self.gate.ready)),
         }
     }
 }
@@ -439,6 +460,7 @@ impl NativeLaneChannel {
         observer: SharedObserver,
     ) -> Self {
         let gate = NativeLaneStreamGate::new(lane, StreamDirection::Outgoing, streams, observer);
+        let release_notification = ChannelReleaseNotification(Arc::clone(&gate.ready));
         Self {
             channel,
             poll: PollSemaphore::new(Arc::clone(&gate.semaphore)),
@@ -446,6 +468,7 @@ impl NativeLaneChannel {
             reserved: None,
             outgoing_admission: None,
             outgoing_changed: None,
+            _release_notification: release_notification,
         }
     }
 
@@ -459,6 +482,14 @@ impl NativeLaneChannel {
 
     pub fn available_streams(&self) -> usize {
         self.gate.available()
+    }
+    /// Observation of original stream/SDK holder teardown, including cancelled
+    /// partial qualifications. It may be a spurious hint. An acquire
+    /// observer would compete with the actual nonholding admission and can
+    /// livelock by assigning positions only to other observers. No position is
+    /// issued or held by this notification future.
+    pub fn stream_ready_notified(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.gate.ready).notified_owned()
     }
 }
 

@@ -24,15 +24,15 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
+use novarocks_attempt_protocol::config::{
+    CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
+};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStoragePartitionTransform,
 };
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
-use novarocks_frontend_application::task_protocol_config::{
-    CoordinationBudgets, DispatchBudget, TaskUpdateRetryPolicy,
-};
 use novarocks_frontend_application::{
     ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendNativeCapacityInputs,
@@ -1180,8 +1180,8 @@ mod tests {
         compose_task_execution_budgets,
     };
 
+    use novarocks_attempt_protocol::config::DispatchBudget;
     use novarocks_execution_contract::{MaxWait, OperationKind};
-    use novarocks_frontend_application::task_protocol_config::DispatchBudget;
     use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;

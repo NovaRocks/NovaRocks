@@ -1,0 +1,1712 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::{
+    AttemptCore,
+    capacity::ReservationToken,
+    effect::{EffectClass, Publication},
+    execution::{
+        CreateGrantProgress, ReleaseCheck, ReleaseProgress,
+        ack_phase::{admission_intent, dispatch_admission, emit_quiesce},
+    },
+    input::{
+        AckPayload, AttemptInput, AttemptInputClaim, LocalDispatchResult, OperationReply,
+        OperationReplyResult, QueuedInputGrantRef, SendGeneration,
+    },
+};
+use novarocks_coordination_contract::{
+    AbortIssueSettlement, AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptStopReason,
+    AttemptTerminal, AttemptToLogicalBody,
+};
+use novarocks_execution_contract::{
+    AbortParticipation, AcquireParticipationAdmissionTicket, LeaseReceipt, OperationOutcome,
+    ParticipationReceipt, ParticipationState, QuiesceParticipationReceipt, ReleaseOutcome,
+    operation::OperationResult,
+};
+use std::sync::Arc;
+
+#[test]
+fn next_qa_settlement_is_authored_by_a_separate_timer_input() {
+    use novarocks_coordination_contract::{
+        AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
+    };
+
+    let frozen = start();
+    let sources = frozen.sources;
+    let activation = frozen.activation.identity;
+    let now = frozen.initial_now;
+    let mut core = Core::new(frozen).unwrap();
+    let participants: Vec<_> = core.execution.graph().participations().copied().collect();
+    let mut receipts = Vec::new();
+    for (sequence, participation) in (1..=2).zip(participants) {
+        let request = admission_intent(&mut core.execution, participation);
+        let token = AttemptRequestToken::new(id(sequence));
+        assert!(matches!(
+            core.authorize_candidate(
+                &OperationIntent::AcquireParticipationAdmissionTicket(request),
+                token,
+                AttemptActionId::new(id(sequence)),
+            )
+            .unwrap(),
+            AuthorizationStep::Request(_)
+        ));
+        core.apply_qa_reply(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(AttemptAuthorizationDecision::AdmissionStarted(
+                    AttemptAuthorizationRef::new(id(sequence)),
+                )),
+            },
+        })
+        .unwrap();
+        receipts.push(dispatch_admission(
+            &mut core.execution,
+            request,
+            sequence,
+            OperationOutcome::Accepted,
+        ));
+    }
+    assert_eq!(receipts.len(), 2);
+    let operations: Vec<_> = receipts
+        .iter()
+        .map(|receipt| receipt.reply.operation_id())
+        .collect();
+    let mut next_input = 1;
+    let mut step = |source, input, native_tail| {
+        let claim = AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(next_input)),
+            native_cut: Some(AttemptSourceCut {
+                source: sources.native,
+                tail: native_tail,
+            }),
+            selected_cut: Some(AttemptSourceCut {
+                source: sources.observation,
+                tail: None,
+            }),
+        };
+        next_input += 1;
+        core.handle(now, claim, input, &mut Units(128)).unwrap()
+    };
+    step(sources.actor, AttemptInput::Bootstrap, None);
+    for receipt in receipts {
+        step(
+            sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(receipt)),
+            Some(AttemptInputId(id(3))),
+        );
+    }
+    let publication = (0..8)
+        .find_map(|_| step(sources.actor, AttemptInput::Timer, None).effect)
+        .expect("original protocol publication");
+    assert!(matches!(
+        publication.body,
+        EffectBody::Publish(Publication::ProtocolBatch(_))
+    ));
+    let mut request = step(
+        sources.publication,
+        AttemptInput::Executor(ExecutorFact::PublicationApplied {
+            effect: publication.id,
+            result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+        }),
+        None,
+    );
+
+    for operation in operations {
+        let Some(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = request.effect
+        else {
+            panic!("expected the next original settlement");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request: AttemptAuthorization::SettleAdmission { operation_id, .. },
+        } = port.body
+        else {
+            panic!("expected original admission settlement");
+        };
+        assert_eq!(operation_id, operation);
+        let reply = step(
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::AuthorizationReply {
+                    token,
+                    decision: Ok(AttemptAuthorizationDecision::AdmissionGranted),
+                },
+            }),
+            None,
+        );
+        assert_eq!(reply.retired_authorization, Some(operation));
+        assert!(reply.effect.is_none() && reply.round_result.is_none());
+        assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+        request = step(sources.actor, AttemptInput::Timer, None);
+    }
+    assert_eq!(request.round_result, Some(Ok(())));
+    assert_eq!(request.selection, InputSelection::Prefer(sources.native));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BeforeStop {
+    Pristine,
+    Ticket,
+    EstablishUnknown,
+    Active,
+    Quiescing,
+    ReleaseInFlight,
+    Released,
+}
+
+impl BeforeStop {
+    fn state(self) -> ParticipationState {
+        match self {
+            Self::Pristine | Self::Ticket => ParticipationState::Absent,
+            Self::EstablishUnknown => ParticipationState::Establishing,
+            Self::Active => ParticipationState::Active,
+            Self::Quiescing | Self::ReleaseInFlight => ParticipationState::Quiescing,
+            Self::Released => ParticipationState::TerminalRetained,
+        }
+    }
+
+    fn owes_abort(self) -> bool {
+        !matches!(self, Self::Pristine | Self::Released)
+    }
+}
+
+struct Turn {
+    units: Units,
+    control: bool,
+}
+
+impl StepContext for Turn {
+    fn charge(&mut self, units: usize) -> bool {
+        self.units.charge(units)
+    }
+
+    fn reserve_queue_stage(
+        &mut self,
+        lane: DispatchLane,
+        control: bool,
+        _: BackendProcessId,
+        records: usize,
+        _: usize,
+    ) -> QueueStage {
+        assert_eq!(lane, DispatchLane::Lifecycle);
+        assert_eq!(records, 1);
+        assert_eq!(control, self.control);
+        QueueStage::Granted(ReservationToken(id(900)))
+    }
+}
+
+struct Fixture {
+    core: Core,
+    sources: AttemptSources,
+    activation: AttemptActivationIdentity,
+    now: MonotonicInstant,
+    participation: ParticipationRef,
+    inputs: u64,
+    units: usize,
+    queue_control: bool,
+}
+
+impl Fixture {
+    fn new(state: BeforeStop, units: usize) -> Self {
+        let mut start = start();
+        // The only task never acquired Worker ownership. Its original empty
+        // Quiesce fence is sufficient for the normal Release candidate.
+        let root = start.plan.graph.root;
+        start
+            .plan
+            .graph
+            .tasks
+            .retain(|task, _| *task == root.task_id());
+        start
+            .plan
+            .graph
+            .stages
+            .retain(|stage, _| *stage == root.stage_id());
+        start.plan.graph.edges.clear();
+        let participation = start.plan.graph.tasks[&root.task_id()].participation;
+        start
+            .plan
+            .establish_material
+            .retain(|part, _| *part == participation);
+        start
+            .plan
+            .admission_epochs
+            .retain(|process, _| *process == root.backend_process_id());
+        start
+            .plan
+            .preparation_positions
+            .retain(|process, _| *process == root.backend_process_id());
+        let mut fixture = Self {
+            sources: start.sources,
+            activation: start.activation.identity,
+            now: start.initial_now,
+            participation,
+            core: Core::new(start).unwrap(),
+            inputs: 0,
+            units,
+            queue_control: true,
+        };
+        fixture.prepare(state);
+        let owner = fixture.core.execution.owner(participation).unwrap();
+        assert_eq!(owner.state(), state.state(), "{state:?}");
+        assert_eq!(owner.is_released(), matches!(state, BeforeStop::Released));
+        assert_eq!(
+            fixture
+                .core
+                .execution
+                .participation_never_established(participation),
+            matches!(state, BeforeStop::Pristine),
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            usize::from(matches!(state, BeforeStop::ReleaseInFlight)),
+        );
+        fixture.step(fixture.sources.actor, AttemptInput::Bootstrap);
+        fixture
+    }
+
+    // Prepare exact participation facts with the same owners and dispatcher
+    // used by the existing Core tests. The Stop and every later input use
+    // AttemptCore::handle.
+    fn prepare(&mut self, state: BeforeStop) {
+        use BeforeStop::*;
+        if matches!(state, Pristine) {
+            return;
+        }
+        let execution = &mut self.core.execution;
+        let part = self.participation;
+        let admission = admission_intent(execution, part);
+        let ticket = dispatch_admission(execution, admission, 701, OperationOutcome::Accepted);
+        execution.apply_dispatched_reply(&ticket).1.unwrap();
+        if matches!(state, Ticket) {
+            return;
+        }
+        let establish = execution
+            .next_authorization_intent(part, self.core.establish_material[&part])
+            .unwrap()
+            .unwrap();
+        let OperationIntent::EstablishParticipation {
+            initial_lease_sequence,
+            initial_lease_valid_for,
+            ..
+        } = establish
+        else {
+            panic!("expected Establish for the original ticket");
+        };
+        let generation = self.emit_fixture_send(&establish, 710);
+        let execution = &mut self.core.execution;
+        execution
+            .establish_send_started(part, establish.operation_id())
+            .unwrap();
+        let result = if matches!(state, EstablishUnknown) {
+            OperationReplyResult::Local {
+                result: LocalDispatchResult::TransportUnknown,
+                failure: None,
+                protocol_failure: None,
+                detail: None,
+            }
+        } else {
+            worker(AckPayload::Participation(
+                ParticipationReceipt::new(part, ParticipationState::Active).with_lease(
+                    LeaseReceipt::new(
+                        initial_lease_sequence,
+                        initial_lease_valid_for,
+                        Duration::from_secs(9),
+                    ),
+                ),
+            ))
+        };
+        execution
+            .apply_dispatched_reply(&reply(&establish, generation, result))
+            .1
+            .unwrap();
+        if matches!(state, EstablishUnknown | Active) {
+            return;
+        }
+
+        execution.begin_normal_drain();
+        assert!(execution.normal_drain_started());
+        let quiesce = emit_quiesce(
+            execution,
+            Arc::new(QuiesceParticipationReceipt::new(
+                part,
+                1,
+                vec![],
+                ParticipationState::Quiescing,
+            )),
+        );
+        execution.apply_dispatched_reply(&quiesce).1.unwrap();
+        execution.advance_quiesce(&mut Units(32)).unwrap().unwrap();
+        if matches!(state, Quiescing) {
+            return;
+        }
+        let ReleaseProgress::Done(Some(release)) = execution
+            .advance_release_candidate(part, &mut ReleaseCheck::default(), &mut Units(32))
+            .unwrap()
+        else {
+            panic!("original empty Quiesce fence makes Release eligible");
+        };
+        assert!(matches!(release, OperationIntent::ReleaseParticipation(_)));
+        let generation = self.emit_fixture_send(&release, 720);
+        if matches!(state, Released) {
+            let closed = worker(AckPayload::Release {
+                receipt: ParticipationReceipt::new(part, ParticipationState::TerminalRetained),
+                outcome: ReleaseOutcome::Released,
+                runtime_filter: None,
+            });
+            self.core
+                .execution
+                .apply_dispatched_reply(&reply(&release, generation, closed))
+                .1
+                .unwrap();
+        }
+    }
+
+    fn emit_fixture_send(&mut self, operation: &OperationIntent, sequence: u64) -> SendGeneration {
+        let effect = AttemptActionId::new(id(sequence));
+        let generation = SendGeneration::new(effect);
+        let grant = QueuedInputGrantRef::new(id(sequence + 1), generation, 64);
+        let execution = &mut self.core.execution;
+        execution
+            .begin_lifecycle_admission(operation.clone(), effect)
+            .unwrap();
+        assert!(matches!(
+            execution
+                .observe_lifecycle_grant(operation.operation_id(), grant)
+                .unwrap(),
+            CreateGrantProgress::Queued
+        ));
+        let send = AttemptActionId::new(id(sequence + 2));
+        let BatchDispatch::Ready(AttemptEffect {
+            body: EffectBody::SendBatch { batch, .. },
+            ..
+        }) = execution
+            .advance_send_batch(
+                &mut self.core.dispatch,
+                send,
+                &mut Turn {
+                    units: Units(128),
+                    control: operation.requires_control_progress(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!("expected exact original fixture dispatch");
+        };
+        assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+        assert_eq!(batch.operations[0].operation_id(), operation.operation_id());
+        execution.observe_send_started(send);
+        generation
+    }
+
+    fn step(&mut self, source: AttemptSourceId, input: AttemptInput) -> AttemptStep {
+        self.inputs += 1;
+        let input_id = AttemptInputId(id(self.inputs));
+        self.core
+            .handle(
+                self.now,
+                AttemptInputClaim {
+                    source,
+                    input: input_id,
+                    native_cut: Some(AttemptSourceCut {
+                        source: self.sources.native,
+                        tail: (source == self.sources.native).then_some(input_id),
+                    }),
+                    selected_cut: Some(AttemptSourceCut {
+                        source: self.sources.observation,
+                        tail: None,
+                    }),
+                },
+                input,
+                &mut Turn {
+                    units: Units(self.units),
+                    control: self.queue_control,
+                },
+            )
+            .unwrap()
+    }
+
+    fn stop(&mut self, reason: AttemptStopReason) {
+        let stop = self.step(
+            self.sources.actor,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: self.activation,
+                body: LogicalToAttemptBody::Stop {
+                    reason,
+                    failure: AttemptFailure::TaskProtocol(Box::new(schedule("original stop"))),
+                },
+            }),
+        );
+        assert!(stop.stop_producing);
+        assert!(stop.effect.is_none());
+    }
+
+    fn expect_effect(&mut self) -> AttemptEffect {
+        let mut found = None;
+        self.drain(|effect| {
+            assert!(
+                found.replace(effect).is_none(),
+                "unexpected additional effect"
+            );
+        });
+        found.expect("expected one protocol effect")
+    }
+
+    fn drain(&mut self, mut observe: impl FnMut(AttemptEffect)) {
+        let mut next = None;
+        for _ in 0..128 {
+            let turn = if let Some(effect) = next.take() {
+                self.step(
+                    self.sources.publication,
+                    AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                        effect,
+                        result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+                    }),
+                )
+            } else if self.core.next_deadline() == Some(self.now) {
+                self.step(self.sources.actor, AttemptInput::Timer)
+            } else {
+                return;
+            };
+            assert!(turn.abort_settlement.is_none(), "{turn:?}");
+            assert!(
+                turn.round_result.as_ref().is_none_or(Result::is_ok),
+                "{turn:?}"
+            );
+            match turn.effect {
+                Some(AttemptEffect {
+                    id,
+                    body: EffectBody::Publish(Publication::ProtocolBatch(_)),
+                    ..
+                }) => next = Some(id),
+                Some(effect) => observe(effect),
+                None => {}
+            }
+        }
+        panic!("original bounded turn did not settle");
+    }
+}
+
+fn worker(acknowledgement: AckPayload) -> OperationReplyResult {
+    OperationReplyResult::Worker(OperationResult::Verdict {
+        outcome: OperationOutcome::Accepted,
+        detail: None,
+        acknowledgement: Some(acknowledgement),
+    })
+}
+
+fn reply(
+    operation: &OperationIntent,
+    generation: SendGeneration,
+    result: OperationReplyResult,
+) -> OperationObservation {
+    OperationObservation {
+        generation,
+        reply: OperationReply {
+            operation_id: operation.operation_id(),
+            kind: operation.kind(),
+            result,
+        },
+    }
+}
+
+fn take_abort_admission(effect: AttemptEffect) -> (AbortParticipation, SendGeneration) {
+    let AttemptEffect {
+        id,
+        class: EffectClass::Settlement,
+        body:
+            EffectBody::AdmitQueuedInput {
+                operation: OperationIntent::AbortParticipation(request),
+                generation,
+                lane: DispatchLane::Lifecycle,
+                ..
+            },
+    } = effect
+    else {
+        panic!("expected exact Lifecycle Abort admission, got {effect:?}");
+    };
+    assert_eq!(generation.admission_effect(), id);
+    (request, generation)
+}
+
+#[test]
+fn logical_failure_stands_down_every_potential_participation_without_claiming_exit() {
+    use BeforeStop::*;
+    for state in [
+        Pristine,
+        Ticket,
+        EstablishUnknown,
+        Active,
+        Quiescing,
+        ReleaseInFlight,
+        Released,
+    ] {
+        for reason in [
+            AttemptStopReason::LogicalExecutionFailed,
+            AttemptStopReason::Client,
+        ] {
+            for units in [4, 128] {
+                let mut fixture = Fixture::new(state, units);
+                fixture.stop(reason);
+                let mut abort = None;
+                let mut terminal = false;
+                fixture.drain(|effect| match effect.body {
+                    EffectBody::ReleaseCreationPayload { .. } => {}
+                    EffectBody::Port(port) => {
+                        assert!(matches!(
+                            port.body,
+                            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                                AttemptFailure::TaskProtocol(ref error)
+                            )) if **error == schedule("original stop")
+                        ));
+                        assert!(!std::mem::replace(&mut terminal, true));
+                    }
+                    _ => assert!(abort.replace(take_abort_admission(effect)).is_none()),
+                });
+                assert!(terminal, "{state:?}, {reason:?}, budget {units}");
+                assert_eq!(
+                    abort.map(|(request, _)| (request.participation(), request.cause())),
+                    (reason == AttemptStopReason::LogicalExecutionFailed && state.owes_abort())
+                        .then_some((fixture.participation, AbortCause::QueryFailed)),
+                    "{state:?}, {reason:?}, budget {units}"
+                );
+                assert!(
+                    fixture
+                        .core
+                        .execution
+                        .participation_convergence_receipt(fixture.participation)
+                        .is_none()
+                );
+                assert_eq!(
+                    fixture
+                        .core
+                        .execution
+                        .owner(fixture.participation)
+                        .unwrap()
+                        .is_released(),
+                    matches!(state, Released)
+                );
+                assert_eq!(
+                    fixture.core.execution.dispatcher().in_flight_operations(),
+                    usize::from(matches!(state, ReleaseInFlight))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stop_dispatches_the_original_actor_abort_after_terminal_cleanup() {
+    for reason in [
+        AttemptStopReason::LogicalExecutionFailed,
+        AttemptStopReason::Client,
+    ] {
+        let mut fixture = Fixture::new(BeforeStop::Active, 128);
+        let actor_action = AttemptActionId::new(id(801));
+        let operation_id = fixture.core.execution.issue_operation_id();
+        let request =
+            AbortParticipation::new(operation_id, fixture.participation, AbortCause::QueryFailed);
+        fixture.step(
+            fixture.sources.actor,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: fixture.activation,
+                body: LogicalToAttemptBody::Abort {
+                    action: actor_action,
+                    request,
+                },
+            }),
+        );
+        let mut admission = None;
+        fixture.drain(|effect| {
+            assert!(admission.replace(take_abort_admission(effect)).is_none());
+        });
+        let (admitted, generation) = admission.unwrap();
+        assert_eq!(admitted.envelope(), request.envelope());
+        fixture.stop(reason);
+        fixture.drain(|effect| {
+            assert!(matches!(
+                effect.body,
+                EffectBody::ReleaseCreationPayload { .. } | EffectBody::Port(_)
+            ));
+        });
+        assert!(!fixture.core.execution.has_pending_terminal_cleanup());
+
+        let operation = OperationIntent::AbortParticipation(request);
+        let grant = QueuedInputGrantRef::new(id(802), generation, 64);
+        let granted = fixture.step(
+            fixture.sources.transport,
+            AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                operation: operation_id,
+                grant,
+                queued_bytes: operation.queued_bytes(),
+            }),
+        );
+        assert!(granted.effect.is_none());
+        let mut sent = false;
+        fixture.drain(|effect| {
+            let AttemptEffect {
+                class: EffectClass::Settlement,
+                body: EffectBody::SendBatch { batch, .. },
+                ..
+            } = effect
+            else {
+                panic!("unexpected post-cleanup effect {effect:?}");
+            };
+            assert!(!std::mem::replace(&mut sent, true));
+            assert_eq!(batch.lane, DispatchLane::Lifecycle);
+            assert!(batch.control_progress);
+            assert_eq!(batch.backend, request.participation().backend_process_id());
+            assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+            let [OperationIntent::AbortParticipation(dispatched)] = batch.operations.as_ref()
+            else {
+                panic!("expected just the original actor Abort");
+            };
+            assert_eq!(dispatched.envelope(), request.envelope());
+            assert_eq!(dispatched.participation(), request.participation());
+            assert_eq!(dispatched.cause(), request.cause());
+        });
+        assert!(sent, "{reason:?}");
+        let receipt = worker(AckPayload::Participation(ParticipationReceipt::new(
+            request.participation(),
+            ParticipationState::Aborting,
+        )));
+        let done = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(reply(
+                &operation, generation, receipt,
+            ))),
+        );
+        assert!(matches!(
+            done.abort_settlement,
+            Some(AttemptEffect { body: EffectBody::Port(port), .. })
+                if matches!(port.body, AttemptToLogicalBody::AbortSettlement {
+                    abort_action, generation: settled, receipt_generation: Some(receipt),
+                    operation_id: actual, participation, settlement: AbortIssueSettlement::Worker(OperationOutcome::Accepted)
+                } if abort_action == actor_action
+                    && settled == generation.admission_effect()
+                    && receipt == generation.admission_effect()
+                    && actual == operation_id
+                    && participation == request.participation())
+        ));
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            0
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .owner(fixture.participation)
+                .unwrap()
+                .is_released()
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .participation_convergence_receipt(fixture.participation)
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn late_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
+    admission_ticket_waits_for_worker_expiry(Duration::from_secs(11), Duration::from_secs(11));
+}
+
+#[test]
+fn timely_unused_admission_ticket_waits_for_the_worker_expiry_before_fresh_admission() {
+    admission_ticket_waits_for_worker_expiry(Duration::from_secs(1), Duration::from_secs(10));
+}
+
+struct SentAdmission {
+    request: AcquireParticipationAdmissionTicket,
+    issue: AttemptAuthorizationRef,
+    generation: SendGeneration,
+    begin: AttemptRequestToken,
+    send: AttemptActionId,
+}
+
+fn reply_fixture_authorization(
+    fixture: &mut Fixture,
+    token: AttemptRequestToken,
+    decision: AttemptAuthorizationDecision,
+) -> AttemptStep {
+    fixture.step(
+        fixture.sources.qa,
+        AttemptInput::Port(LogicalToAttempt {
+            activation: fixture.activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(decision),
+            },
+        }),
+    )
+}
+
+fn emit_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
+    use novarocks_coordination_contract::AttemptAuthorization;
+
+    fixture.queue_control = false;
+    let sources = fixture.sources;
+    assert!(
+        fixture
+            .step(sources.actor, AttemptInput::StartProtocol)
+            .effect
+            .is_none()
+    );
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("expected the first QA admission request");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: begin,
+        request: AttemptAuthorization::BeginAdmission(first),
+    } = port.body
+    else {
+        panic!("expected QA BeginAdmission for the original participation");
+    };
+    let operation_id = first.envelope().operation_id();
+    assert_eq!(first.participation(), fixture.participation);
+    assert_eq!(first.valid_for().get(), Duration::from_secs(10));
+    let issue = AttemptAuthorizationRef::new(id(830));
+    let Some(AttemptEffect {
+        id: admit,
+        body:
+            EffectBody::AdmitQueuedInput {
+                operation,
+                generation,
+                lane: DispatchLane::Lifecycle,
+                ..
+            },
+        ..
+    }) = reply_fixture_authorization(
+        fixture,
+        begin,
+        AttemptAuthorizationDecision::AdmissionStarted(issue),
+    )
+    .effect
+    else {
+        panic!("expected Lifecycle admission for the original request");
+    };
+    assert_eq!(operation.operation_id(), operation_id);
+    assert_eq!(generation.admission_effect(), admit);
+    fixture.drain(|effect| panic!("admission has no WC grant yet: {effect:?}"));
+
+    let grant = QueuedInputGrantRef::new(id(831), generation, 64);
+    assert!(
+        fixture
+            .step(
+                sources.transport,
+                AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                    operation: operation_id,
+                    grant,
+                    queued_bytes: operation.queued_bytes(),
+                }),
+            )
+            .effect
+            .is_none()
+    );
+    let AttemptEffect {
+        id: send,
+        body: EffectBody::SendBatch { batch, .. },
+        ..
+    } = fixture.expect_effect()
+    else {
+        panic!("expected the original Admission dispatch");
+    };
+    assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+    assert_eq!(batch.operations.len(), 1);
+    assert_eq!(batch.operations[0].operation_id(), operation_id);
+    fixture.drain(|effect| panic!("admission still awaits Worker: {effect:?}"));
+    SentAdmission {
+        request: first,
+        issue,
+        generation,
+        begin,
+        send,
+    }
+}
+
+fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
+    let admission = emit_fixture_admission(fixture);
+    assert!(
+        fixture
+            .step(
+                fixture.sources.native,
+                AttemptInput::Executor(ExecutorFact::SendStarted {
+                    effect: admission.send,
+                    started_at: fixture.now,
+                }),
+            )
+            .effect
+            .is_none()
+    );
+    fixture.drain(|effect| panic!("send start does not produce a ticket: {effect:?}"));
+
+    admission
+}
+
+#[test]
+fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort() {
+    use novarocks_coordination_contract::AttemptAuthorization;
+    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+
+    for units in [4, 128] {
+        let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+        let SentAdmission {
+            request: admission,
+            issue,
+            generation: admission_generation,
+            ..
+        } = send_fixture_admission(&mut fixture);
+        let operation = OperationIntent::AcquireParticipationAdmissionTicket(admission);
+        let admission_id = operation.operation_id();
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+        assert!(
+            !fixture
+                .core
+                .execution
+                .participation_never_established(fixture.participation)
+        );
+
+        fixture.units = units;
+        fixture.queue_control = true;
+        fixture.stop(AttemptStopReason::LogicalExecutionFailed);
+        let mut abort = None;
+        fixture.drain(|effect| match effect.body {
+            EffectBody::ReleaseCreationPayload { .. } => {}
+            _ => assert!(abort.replace(take_abort_admission(effect)).is_none()),
+        });
+        let (request, generation) = abort.expect("the started admission already requires Abort");
+        assert!(fixture.core.terminal.terminal().is_none());
+        assert_eq!(request.participation(), fixture.participation);
+        assert_eq!(request.cause(), AbortCause::QueryFailed);
+        assert!(
+            fixture
+                .core
+                .aborts
+                .stand_down_deadline(fixture.now)
+                .is_none(),
+            "the charged scan must pass the original Participation before its ticket arrives"
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+
+        let ticket = ParticipationAdmissionTicketReceipt::new(
+            AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+            fixture.participation,
+            admission.valid_for(),
+        );
+        fixture.now = fixture.now.saturating_add(Duration::from_secs(1));
+        let received = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(reply(
+                &operation,
+                admission_generation,
+                worker(AckPayload::AdmissionTicket(ticket)),
+            ))),
+        );
+        assert!(received.effect.is_none());
+        let EffectBody::Port(port) = fixture.expect_effect().body else {
+            panic!("the late ticket must settle its original QA issue");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request:
+                AttemptAuthorization::SettleAdmission {
+                    issue: settled_issue,
+                    participation,
+                    operation_id,
+                    outcome: Some(OperationOutcome::Accepted),
+                    receipt: Some(settled_ticket),
+                    prior_transport_unknown: false,
+                },
+        } = port.body
+        else {
+            panic!("expected the exact positive Admission settlement");
+        };
+        assert_eq!(settled_issue, issue);
+        assert_eq!(operation_id, admission_id);
+        assert_eq!(participation, fixture.participation);
+        assert_eq!(settled_ticket, ticket);
+        let settled = reply_fixture_authorization(
+            &mut fixture,
+            token,
+            AttemptAuthorizationDecision::AdmissionGranted,
+        );
+        assert_eq!(settled.retired_authorization, Some(admission_id));
+        assert!(settled.effect.is_none());
+        let mut terminal = false;
+        let mut observe_terminal = |effect: AttemptEffect| {
+            assert!(matches!(
+                effect.body,
+                EffectBody::Port(port) if matches!(
+                    port.body,
+                    AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                        AttemptFailure::TaskProtocol(ref error)
+                    )) if **error == schedule("original stop")
+                )
+            ));
+            assert!(!std::mem::replace(&mut terminal, true));
+        };
+        fixture.drain(&mut observe_terminal);
+        let owner = fixture.core.execution.owner(participation).unwrap();
+        assert_eq!(owner.state(), ParticipationState::Absent);
+        assert!(!owner.is_released());
+        assert!(
+            !fixture
+                .core
+                .execution
+                .participation_never_established(participation)
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            0
+        );
+
+        // The minimum dispatch quote is larger than the four-unit scan turn.
+        fixture.units = 128;
+        let abort = OperationIntent::AbortParticipation(request);
+        let grant = QueuedInputGrantRef::new(id(832), generation, 64);
+        let granted = fixture.step(
+            fixture.sources.transport,
+            AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                operation: abort.operation_id(),
+                grant,
+                queued_bytes: abort.queued_bytes(),
+            }),
+        );
+        assert!(granted.effect.is_none());
+        let mut dispatched = None;
+        fixture.drain(|effect| match effect {
+            AttemptEffect {
+                id,
+                class: EffectClass::Settlement,
+                body: EffectBody::SendBatch { batch, .. },
+            } => assert!(dispatched.replace((id, batch)).is_none()),
+            other => observe_terminal(other),
+        });
+        let (send, batch) = dispatched.expect("the original stand-down Abort dispatch");
+        assert_eq!(batch.lane, DispatchLane::Lifecycle);
+        assert!(batch.control_progress);
+        assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+        let [OperationIntent::AbortParticipation(sent)] = batch.operations.as_ref() else {
+            panic!("expected exactly the original stand-down Abort");
+        };
+        assert_eq!(sent.envelope(), request.envelope());
+        assert_eq!(sent.participation(), participation);
+        assert_eq!(sent.cause(), request.cause());
+        let started = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::SendStarted {
+                effect: send,
+                started_at: fixture.now,
+            }),
+        );
+        assert!(started.effect.is_none());
+        fixture.drain(&mut observe_terminal);
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+        assert!(
+            !fixture
+                .core
+                .execution
+                .owner(participation)
+                .unwrap()
+                .is_released()
+        );
+        let closed = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(reply(
+                &abort,
+                generation,
+                worker(AckPayload::Participation(ParticipationReceipt::new(
+                    participation,
+                    ParticipationState::Aborting,
+                ))),
+            ))),
+        );
+        assert!(
+            closed.abort_settlement.is_none(),
+            "the attempt authored this Abort"
+        );
+        assert!(closed.effect.is_none());
+        fixture.drain(observe_terminal);
+        assert!(
+            fixture
+                .core
+                .execution
+                .owner(participation)
+                .unwrap()
+                .is_released()
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            0
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+    }
+}
+
+fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_delay: Duration) {
+    use novarocks_coordination_contract::AttemptAuthorization;
+    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+
+    let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+    let sent_at = fixture.now;
+    let SentAdmission {
+        request: first,
+        issue,
+        generation,
+        begin,
+        ..
+    } = send_fixture_admission(&mut fixture);
+    let sources = fixture.sources;
+    let operation = OperationIntent::AcquireParticipationAdmissionTicket(first);
+    let operation_id = operation.operation_id();
+    let ticket_valid_for = first.valid_for().get();
+    let conservative_expiry = sent_at.saturating_add(ticket_valid_for);
+    let received_at = sent_at.saturating_add(receipt_delay);
+    fixture.now = received_at;
+    let ticket = ParticipationAdmissionTicketReceipt::new(
+        AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+        fixture.participation,
+        first.valid_for(),
+    );
+    assert!(
+        fixture
+            .step(
+                sources.native,
+                AttemptInput::Executor(ExecutorFact::Operation(reply(
+                    &operation,
+                    generation,
+                    worker(AckPayload::AdmissionTicket(ticket)),
+                ))),
+            )
+            .effect
+            .is_none()
+    );
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("the original QA issue must settle even with an expired ticket");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: settle,
+        request:
+            AttemptAuthorization::SettleAdmission {
+                issue: settled_issue,
+                participation,
+                operation_id: settled_operation,
+                outcome: Some(OperationOutcome::Accepted),
+                receipt: Some(settled_ticket),
+                prior_transport_unknown: false,
+            },
+    } = port.body
+    else {
+        panic!("expected the original positive Worker receipt at QA settlement");
+    };
+    assert_eq!(settled_issue, issue);
+    assert_eq!(settled_operation, operation_id);
+    assert_eq!(participation, fixture.participation);
+    assert_eq!(settled_ticket, ticket);
+    let owner = fixture.core.execution.owner(participation).unwrap();
+    assert_eq!(owner.state(), ParticipationState::Absent);
+    assert!(!owner.is_released());
+    assert_eq!(
+        owner.needs_admission_ticket(),
+        received_at.has_reached(conservative_expiry),
+        "the timely receipt must still be held while the original QA settlement is pending"
+    );
+    fixture.drain(|effect| panic!("the original QA settlement is still pending: {effect:?}"));
+
+    // The timely receipt is still unused at its conservative deadline.
+    // Answer the original settlement, then let the original candidate scan run.
+    fixture.now = sent_at.saturating_add(settlement_delay);
+    assert!(fixture.now.has_reached(conservative_expiry));
+    assert!(
+        reply_fixture_authorization(
+            &mut fixture,
+            settle,
+            AttemptAuthorizationDecision::AdmissionGranted,
+        )
+        .effect
+        .is_none()
+    );
+    fixture.drain(|effect| panic!("an expired ticket cannot authorize Establish: {effect:?}"));
+    let owner = fixture.core.execution.owner(participation).unwrap();
+    assert_eq!(owner.state(), ParticipationState::Absent);
+    assert!(!owner.is_released());
+    assert!(owner.needs_admission_ticket());
+
+    let reissue_at = received_at.saturating_add(ticket_valid_for);
+    assert_eq!(fixture.core.next_deadline(), Some(reissue_at));
+    fixture.now = received_at.saturating_add(Duration::from_millis(9_999));
+    assert!(
+        fixture
+            .step(sources.capacity, AttemptInput::CapacityReleased)
+            .effect
+            .is_none()
+    );
+    fixture.drain(|effect| panic!("the Worker may still hold the original ticket: {effect:?}"));
+    assert_eq!(fixture.core.next_deadline(), Some(reissue_at));
+
+    fixture.now = reissue_at;
+    let EffectBody::Port(port) = fixture.expect_effect().body else {
+        panic!("the original Worker expiry must wake fresh QA admission");
+    };
+    let AttemptToLogicalBody::AuthorizationRequest {
+        token: fresh_token,
+        request: AttemptAuthorization::BeginAdmission(fresh),
+    } = port.body
+    else {
+        panic!("expected a fresh admission once the original ticket must be gone");
+    };
+    assert_ne!(fresh_token, begin);
+    assert_ne!(fresh.envelope().operation_id(), operation_id);
+    assert_eq!(fresh.participation(), participation);
+    assert_eq!(fresh.valid_for(), first.valid_for());
+    assert_eq!(
+        fresh.native_compatibility_id(),
+        first.native_compatibility_id()
+    );
+    assert_eq!(
+        fresh.admission_epoch_capability(),
+        first.admission_epoch_capability()
+    );
+}
+
+fn call_source_step(
+    core: &mut Core,
+    source: AttemptSourceId,
+    number: u64,
+    input: AttemptInput,
+) -> AttemptStep {
+    core.handle(
+        core.execution.monotonic_now(),
+        AttemptInputClaim {
+            source,
+            input: AttemptInputId(id(number)),
+            native_cut: Some(AttemptSourceCut {
+                source: core.sources.native,
+                tail: None,
+            }),
+            selected_cut: Some(AttemptSourceCut {
+                source: core.sources.observation,
+                tail: None,
+            }),
+        },
+        input,
+        &mut Units(64),
+    )
+    .unwrap()
+}
+
+#[test]
+fn computation_ready_starts_normal_drain_without_a_root_seal() {
+    use novarocks_coordination_contract::{AttemptComputationCut, AttemptConvergenceMode};
+    use novarocks_execution_contract::root_result::RootResultEnd;
+
+    let mut fixture = Fixture::new(BeforeStop::Active, 64);
+    fixture
+        .core
+        .begin_native_prefix(
+            fixture.now,
+            AttemptSourceCut {
+                source: fixture.sources.native,
+                tail: None,
+            },
+        )
+        .unwrap();
+    let root = fixture.core.execution.graph().root_identity();
+    let finished = frame(&mut fixture.core, root, TaskState::Finished, None);
+    fixture
+        .core
+        .apply_observations(
+            fixture.now,
+            fixture.sources.observation,
+            ObservationBatch::new(vec![finished]).unwrap(),
+        )
+        .unwrap();
+    let diagnostic_deadline = fixture.now.saturating_add(Duration::from_secs(1));
+    let remote_deadline = fixture.now.saturating_add(Duration::from_secs(3));
+    let begun = fixture.step(
+        fixture.sources.actor,
+        AttemptInput::Port(LogicalToAttempt {
+            activation: fixture.activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Normal,
+                remote_deadline,
+                computation_ready: Some(AttemptComputationCut {
+                    activation: fixture.activation,
+                    root,
+                    cut: fixture.now,
+                    diagnostic_deadline,
+                    convergence_deadline: remote_deadline,
+                    end: RootResultEnd {
+                        sequence: id(1),
+                        output_rows: 1,
+                    },
+                }),
+                retain_diagnostics: true,
+            },
+        }),
+    );
+    assert!(!begun.stop_producing);
+    assert!(!fixture.core.root.sealed());
+    assert!(fixture.core.execution.normal_drain_started());
+    assert_eq!(
+        fixture.core.execution.diagnostics().deadline(),
+        Some(diagnostic_deadline)
+    );
+    assert!(matches!(
+        fixture
+            .core
+            .execution
+            .next_quiesce_intent(fixture.participation),
+        Some(OperationIntent::QuiesceParticipation(request))
+            if request.participation() == fixture.participation
+    ));
+}
+
+#[test]
+fn remote_convergence_distinguishes_unused_admission_from_uncertain_or_held_participation() {
+    use crate::input::{MembershipObservation, WithdrawalOutcome};
+    use novarocks_coordination_contract::{
+        AttemptConvergenceClosure, AttemptConvergenceMode, AttemptParticipationConvergence,
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Admission {
+        Pristine,
+        Unsent,
+        Unknown,
+        Held,
+        EstablishUnknown,
+    }
+
+    let collect_convergence = |fixture: &mut Fixture, first: Option<AttemptEffect>| {
+        let mut read = None;
+        let mut closure = None;
+        let mut observe = |effect: AttemptEffect| match effect.body {
+            EffectBody::ObserveProcess {
+                request,
+                participation,
+            } => assert!(read.replace((request, participation)).is_none()),
+            EffectBody::Port(port) => match port.body {
+                AttemptToLogicalBody::ConvergenceProgress {
+                    local_exited: false,
+                    closure: Some(original),
+                    lifecycle_runtime_filters: None,
+                } => assert!(closure.replace(original).is_none()),
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                    AttemptFailure::TaskProtocol(ref error),
+                )) if **error == schedule("original stop") => {}
+                other => panic!("expected remote-only convergence, got {other:?}"),
+            },
+            EffectBody::PrepareLocalConvergence | EffectBody::ReleaseCreationPayload { .. } => {}
+            _ => panic!("unexpected convergence effect: {effect:?}"),
+        };
+        if let Some(effect) = first {
+            observe(effect);
+        }
+        fixture.drain(observe);
+        (read, closure)
+    };
+    let original_process = |fixture: &mut Fixture, request, participation| {
+        fixture
+            .step(
+                fixture.sources.process,
+                AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                    request,
+                    participation,
+                    sampled_at: fixture.now,
+                    observation: MembershipObservation::ExactOriginal,
+                }),
+            )
+            .effect
+    };
+
+    for case in [
+        Admission::Pristine,
+        Admission::Unsent,
+        Admission::Unknown,
+        Admission::Held,
+        Admission::EstablishUnknown,
+    ] {
+        let before = match case {
+            Admission::Held => BeforeStop::Ticket,
+            Admission::EstablishUnknown => BeforeStop::EstablishUnknown,
+            _ => BeforeStop::Pristine,
+        };
+        let mut fixture = Fixture::new(before, 128);
+        let sent = match case {
+            Admission::Unsent => Some(emit_fixture_admission(&mut fixture)),
+            Admission::Unknown => Some(send_fixture_admission(&mut fixture)),
+            _ => None,
+        };
+        let participation = fixture.participation;
+        fixture.stop(AttemptStopReason::Client);
+        let mut withdraw = None;
+        let observe_cleanup = |effect: AttemptEffect| match effect.body {
+            EffectBody::ReleaseCreationPayload { .. } => {}
+            EffectBody::Port(port) => assert!(matches!(
+                port.body,
+                AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                    AttemptFailure::TaskProtocol(ref error)
+                )) if **error == schedule("original stop")
+            )),
+            _ => panic!("unexpected stop effect: {effect:?}"),
+        };
+        fixture.drain(|effect| {
+            if let EffectBody::Withdraw { effect } = effect.body {
+                assert!(withdraw.replace(effect).is_none());
+            } else {
+                observe_cleanup(effect);
+            }
+        });
+
+        if let Some(sent) = sent {
+            assert_eq!(
+                fixture.core.execution.dispatcher().in_flight_operations(),
+                1
+            );
+            assert!(
+                !fixture
+                    .core
+                    .execution
+                    .participation_never_established(participation)
+            );
+            let settled = if case == Admission::Unsent {
+                assert_eq!(withdraw, Some(sent.send));
+                fixture.step(
+                    fixture.sources.transport,
+                    AttemptInput::Executor(ExecutorFact::Withdrawn {
+                        effect: sent.send,
+                        outcome: WithdrawalOutcome::DefinitelyUnsent,
+                    }),
+                )
+            } else {
+                assert!(withdraw.is_none());
+                let operation = OperationIntent::AcquireParticipationAdmissionTicket(sent.request);
+                fixture.step(
+                    fixture.sources.native,
+                    AttemptInput::Executor(ExecutorFact::Operation(reply(
+                        &operation,
+                        sent.generation,
+                        OperationReplyResult::Local {
+                            result: LocalDispatchResult::TransportUnknown,
+                            failure: None,
+                            protocol_failure: None,
+                            detail: None,
+                        },
+                    ))),
+                )
+            };
+            assert!(settled.effect.is_none());
+            fixture.drain(observe_cleanup);
+            assert_eq!(
+                fixture.core.execution.dispatcher().in_flight_operations(),
+                0
+            );
+        } else {
+            assert!(withdraw.is_none());
+        }
+
+        let is_never_established = matches!(case, Admission::Pristine | Admission::Unsent);
+        assert_eq!(
+            fixture
+                .core
+                .execution
+                .participation_never_established(participation),
+            is_never_established,
+            "{case:?}"
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+        let deadline = fixture.now.saturating_add(Duration::from_secs(3));
+        let begun = fixture.step(
+            fixture.sources.actor,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: fixture.activation,
+                body: LogicalToAttemptBody::BeginConvergence {
+                    mode: AttemptConvergenceMode::Cleanup,
+                    remote_deadline: deadline,
+                    computation_ready: None,
+                    retain_diagnostics: false,
+                },
+            }),
+        );
+        let (read, closure) = collect_convergence(&mut fixture, begun.effect);
+        if is_never_established {
+            assert!(read.is_none(), "{case:?}");
+            assert!(
+                matches!(
+                    closure.as_deref(),
+                    Some(AttemptConvergenceClosure::Evidence(rows))
+                        if rows.as_slice() == [(participation, AttemptParticipationConvergence::NeverEstablished)]
+                ),
+                "{case:?}"
+            );
+        } else {
+            assert!(closure.is_none(), "{case:?}");
+            let (first, original) = read.expect("unresolved participation needs a process read");
+            assert_eq!(original, participation);
+            let effect = original_process(&mut fixture, first, original);
+            let (read, closure) = collect_convergence(&mut fixture, effect);
+            assert!(read.is_none() && closure.is_none(), "{case:?}");
+            assert_eq!(fixture.core.next_deadline(), Some(deadline));
+
+            fixture.now = deadline;
+            let (read, closure) = collect_convergence(&mut fixture, None);
+            assert!(closure.is_none(), "{case:?}");
+            let (last, original) =
+                read.expect("the deadline still needs the original process read");
+            assert_eq!(original, participation);
+            assert_ne!(first, last);
+            let effect = original_process(&mut fixture, last, original);
+            let (read, closure) = collect_convergence(&mut fixture, effect);
+            assert!(read.is_none(), "{case:?}");
+            assert!(
+                matches!(
+                    closure.as_deref(),
+                    Some(AttemptConvergenceClosure::RemoteTrackingEnded { exact_participations })
+                        if exact_participations.as_ref() == [participation]
+                ),
+                "{case:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn next_convergence_read_is_authored_by_a_separate_timer_input() {
+    use crate::input::MembershipObservation;
+    use novarocks_coordination_contract::AttemptConvergenceMode;
+
+    let original = start();
+    let sources = original.sources;
+    let activation = original.activation.identity;
+    let now = original.initial_now;
+    let mut core = Core::new(original).unwrap();
+    let participants: Vec<_> = core.execution.graph().participations().copied().collect();
+    for (sequence, &participation) in (1..=2).zip(&participants) {
+        let request = admission_intent(&mut core.execution, participation);
+        let accepted = dispatch_admission(
+            &mut core.execution,
+            request,
+            sequence,
+            OperationOutcome::Accepted,
+        );
+        core.execution.apply_dispatched_reply(&accepted).1.unwrap();
+    }
+    call_source_step(&mut core, sources.actor, 1, AttemptInput::Bootstrap);
+    call_source_step(
+        &mut core,
+        sources.actor,
+        2,
+        AttemptInput::Port(LogicalToAttempt {
+            activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Normal,
+                remote_deadline: now.saturating_add(Duration::from_secs(3)),
+                computation_ready: None,
+                retain_diagnostics: false,
+            },
+        }),
+    );
+
+    let mut next = call_source_step(&mut core, sources.actor, 3, AttemptInput::Timer);
+    let mut previous = None;
+    for (number, &original) in (0..2).zip(&participants) {
+        let Some(AttemptEffect {
+            body:
+                EffectBody::ObserveProcess {
+                    request,
+                    participation,
+                },
+            ..
+        }) = next.effect
+        else {
+            panic!("expected the next original convergence row");
+        };
+        assert_eq!(participation, original);
+        assert_ne!(Some(request), previous);
+        assert_eq!(next.selection, InputSelection::Only(sources.process));
+        assert_eq!(core.next_deadline(), None);
+
+        let reply = call_source_step(
+            &mut core,
+            sources.process,
+            4 + 2 * number,
+            AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                request,
+                participation,
+                sampled_at: now,
+                observation: MembershipObservation::ExactReplacement(crate::test_support::backend(
+                    99,
+                )),
+            }),
+        );
+        assert!(reply.effect.is_none());
+        assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+        assert_eq!(core.next_deadline(), Some(now));
+        previous = Some(request);
+        next = call_source_step(
+            &mut core,
+            sources.actor,
+            5 + 2 * number,
+            AttemptInput::Timer,
+        );
+    }
+    assert!(matches!(next.effect, Some(AttemptEffect {
+        body: EffectBody::Port(port), ..
+    }) if matches!(port.body, AttemptToLogicalBody::ConvergenceProgress {
+        local_exited: false, closure: Some(_), ..
+    })));
+}
+
+#[test]
+fn replacement_permission_reply_defers_only_same_lane_terminal_publication() {
+    for may_observe in [false, true] {
+        let mut fixture = Fixture::new(BeforeStop::Ticket, 64);
+        let sources = fixture.sources;
+        let participation = fixture.participation;
+        let intent = fixture
+            .core
+            .execution
+            .next_authorization_intent(
+                participation,
+                fixture.core.establish_material[&participation],
+            )
+            .unwrap()
+            .unwrap();
+        let generation = fixture.emit_fixture_send(&intent, 710);
+        let execution = &mut fixture.core.execution;
+        execution
+            .establish_send_started(participation, intent.operation_id())
+            .unwrap();
+        let error = execution
+            .apply_dispatched_reply(&reply(
+                &intent,
+                generation,
+                OperationReplyResult::Worker(OperationResult::Verdict {
+                    outcome: OperationOutcome::IdentityMismatch,
+                    detail: None,
+                    acknowledgement: None,
+                }),
+            ))
+            .1
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TaskExecutionError::PreReadyEstablishRejected { .. }
+        ));
+        assert!(
+            fixture
+                .core
+                .terminal
+                .record_execution_failure(error.clone(), execution)
+                .unwrap()
+        );
+
+        let publication = (0..8)
+            .find_map(|_| fixture.step(sources.actor, AttemptInput::Timer).effect)
+            .expect("original protocol publication");
+        assert!(matches!(
+            publication.body,
+            EffectBody::Publish(Publication::ProtocolBatch(_))
+        ));
+        let asked = fixture.step(
+            sources.publication,
+            AttemptInput::Executor(ExecutorFact::PublicationApplied {
+                effect: publication.id,
+                result: Ok(PublicationApplied::ProtocolBatch { published: true }),
+            }),
+        );
+        let Some(AttemptEffect {
+            body: EffectBody::Port(port),
+            ..
+        }) = asked.effect
+        else {
+            panic!("expected the original replacement permission query");
+        };
+        let AttemptToLogicalBody::PreReadyReplacementQuery { token, refusal } = port.body else {
+            panic!("expected replacement permission, got {:?}", port.body);
+        };
+        assert_eq!(refusal, AttemptFailure::TaskProtocol(Box::new(error)));
+        assert_eq!(asked.selection, InputSelection::Only(sources.qa));
+        if !may_observe {
+            fixture.stop(AttemptStopReason::Client);
+            assert_eq!(
+                fixture.core.authorizations.preparation(),
+                crate::terminal::GatePreparation::Applied { ready: true },
+            );
+        }
+        let reply = fixture.step(
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation: fixture.activation,
+                body: LogicalToAttemptBody::PreReadyReplacementReply { token, may_observe },
+            }),
+        );
+        if may_observe {
+            assert!(matches!(reply.effect, Some(AttemptEffect {
+                body: EffectBody::ObserveProcess { participation: exact, .. }, ..
+            }) if exact == participation));
+            assert_eq!(reply.selection, InputSelection::Only(sources.process));
+        } else {
+            assert!(reply.effect.is_none());
+            assert_eq!(reply.selection, InputSelection::Only(sources.actor));
+            assert_eq!(fixture.core.next_deadline(), Some(fixture.now));
+            assert_eq!(
+                fixture.core.terminal.terminal(),
+                Some(&AttemptTerminal::Failed(refusal.clone()))
+            );
+            let publication = fixture.step(sources.actor, AttemptInput::Timer);
+            assert!(matches!(publication.effect, Some(AttemptEffect {
+                body: EffectBody::Port(port), ..
+            }) if matches!(&port.body, AttemptToLogicalBody::AttemptTerminal(
+                AttemptTerminal::Failed(original)) if original == &refusal)));
+        }
+    }
+}

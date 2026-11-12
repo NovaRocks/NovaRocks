@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned configuration for native Task protocol coordination.
+pub(crate) mod abort;
+pub(crate) mod control;
+pub(super) mod qa;
+pub(crate) mod root_control;
+pub(crate) mod terminal;
 
-mod dispatch;
-mod retry;
-
-pub use dispatch::*;
-pub use retry::*;
+#[cfg(all(test, novarocks_dev_controls))]
+mod tests;

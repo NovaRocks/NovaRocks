@@ -23,10 +23,13 @@
 //! transport outcome, so a retry can never be a different request wearing the
 //! same operation id. Nothing here touches a wire.
 
+pub(super) mod attempt_receipt;
+
 use std::sync::Arc;
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
-use crate::task_protocol_config::{DispatchBudget, DispatchLane};
+use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
+#[cfg(test)]
 use novarocks_coordination_contract::MonotonicInstant;
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
@@ -35,8 +38,8 @@ use novarocks_execution::task_execution::{
     EstablishParticipation, OperationKind, OperationOutcome, OperationShape,
     ParticipationAdmissionTicketReceipt, ParticipationDomainUpdate, ParticipationReceipt,
     QuiesceParticipation, QuiesceParticipationReceipt, ReleaseOutcome, ReleaseParticipation,
-    TaskDomainUpdate, TaskOperationId, UpdateParticipation, UpdateTask, UpdateTaskReceipt,
-    status::SafeDetail,
+    RenewParticipationLease, TaskDomainUpdate, TaskOperationId, UpdateParticipation, UpdateTask,
+    UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_types::identity::BackendProcessId;
@@ -142,6 +145,7 @@ pub enum OperationIntent {
     CreateTask(super::creation::CreateTaskIntent),
     UpdateTask(Arc<UpdateTask>),
     UpdateParticipation(Arc<UpdateParticipation>),
+    RenewParticipationLease(RenewParticipationLease),
     CancelTask(CancelTask),
     QuiesceParticipation(QuiesceParticipation),
     AbortParticipation(AbortParticipation),
@@ -158,6 +162,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().kind(),
             Self::UpdateTask(request) => request.envelope().kind(),
             Self::UpdateParticipation(request) => request.envelope().kind(),
+            Self::RenewParticipationLease(request) => request.envelope().kind(),
             Self::CancelTask(request) => request.envelope().kind(),
             Self::QuiesceParticipation(request) => request.envelope().kind(),
             Self::AbortParticipation(request) => request.envelope().kind(),
@@ -174,6 +179,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().operation_id(),
             Self::UpdateTask(request) => request.envelope().operation_id(),
             Self::UpdateParticipation(request) => request.envelope().operation_id(),
+            Self::RenewParticipationLease(request) => request.envelope().operation_id(),
             Self::CancelTask(request) => request.envelope().operation_id(),
             Self::QuiesceParticipation(request) => request.envelope().operation_id(),
             Self::AbortParticipation(request) => request.envelope().operation_id(),
@@ -196,6 +202,7 @@ impl OperationIntent {
             Self::CreateTask(_) => OperationShape::CreateTask,
             Self::UpdateTask(_) => OperationShape::UpdateTask,
             Self::UpdateParticipation(request) => request.shape(),
+            Self::RenewParticipationLease(_) => OperationShape::RenewParticipationLease,
             Self::CancelTask(_) => OperationShape::CancelTask,
             Self::QuiesceParticipation(_) => OperationShape::QuiesceParticipation,
             Self::AbortParticipation(_) => OperationShape::AbortParticipation,
@@ -237,6 +244,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.envelope().max_wait().get(),
             Self::UpdateTask(request) => request.envelope().max_wait().get(),
             Self::UpdateParticipation(request) => request.envelope().max_wait().get(),
+            Self::RenewParticipationLease(request) => request.envelope().max_wait().get(),
             Self::CancelTask(request) => request.envelope().max_wait().get(),
             Self::QuiesceParticipation(request) => request.envelope().max_wait().get(),
             Self::AbortParticipation(request) => request.envelope().max_wait().get(),
@@ -262,6 +270,7 @@ impl OperationIntent {
             Self::CreateTask(request) => request.identity().backend_process_id(),
             Self::UpdateTask(request) => request.identity().backend_process_id(),
             Self::UpdateParticipation(request) => request.participation().backend_process_id(),
+            Self::RenewParticipationLease(request) => request.participation().backend_process_id(),
             Self::CancelTask(request) => request.identity().backend_process_id(),
             Self::QuiesceParticipation(request) => request.participation().backend_process_id(),
             Self::AbortParticipation(request) => request.participation().backend_process_id(),
@@ -292,6 +301,7 @@ impl OperationIntent {
                 UpdateParticipation::AdvanceDomain(value) => size::advance(value),
                 UpdateParticipation::RenewLease(value) => size::renew(value, control),
             },
+            OperationIntent::RenewParticipationLease(value) => size::renew(value, control),
             OperationIntent::CancelTask(value) => size::cancel(*value, control),
             OperationIntent::QuiesceParticipation(value) => size::quiesce(*value, control),
             OperationIntent::AbortParticipation(value) => size::abort(*value, control),
@@ -331,7 +341,8 @@ impl OperationIntent {
                 }
                 UpdateParticipation::RenewLease(_) => 0,
             },
-            Self::CancelTask(_)
+            Self::RenewParticipationLease(_)
+            | Self::CancelTask(_)
             | Self::QuiesceParticipation(_)
             | Self::AbortParticipation(_)
             | Self::ReleaseParticipation(_) => 0,
@@ -343,6 +354,7 @@ impl OperationIntent {
 
     /// The process reservation this exact operation needs before any owner
     /// retains it as queued or in flight.
+    #[cfg(test)]
     pub fn queue_request(&self) -> TaskOperationQueueRequest {
         TaskOperationQueueRequest {
             backend: self.backend_process_id(),
@@ -384,6 +396,7 @@ fn participation_domain_bytes(domain: &ParticipationDomainUpdate) -> usize {
 /// not an attempt-owned request. Producers reserve before mutating a
 /// `RemoteTask` or participation owner, so one slow target cannot bypass process
 /// admission by entering a different attempt's queue.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TaskOperationQueueRequest {
     backend: BackendProcessId,
@@ -395,7 +408,9 @@ pub struct TaskOperationQueueRequest {
         Option<novarocks_workload_control::joint_admission::NativeQueuedInputQuote>,
 }
 
+#[cfg(test)]
 impl TaskOperationQueueRequest {
+    #[cfg(test)]
     /// The reservation for one task create, priced before the create is
     /// frozen. `queued_bytes` is the create's exact queued size.
     pub(crate) const fn create_task(
@@ -413,6 +428,7 @@ impl TaskOperationQueueRequest {
         }
     }
 
+    #[cfg(test)]
     /// The reservation for one task-domain update before it enters a
     /// `RemoteTask`'s pending queue.
     pub(crate) fn task_update(
@@ -431,6 +447,7 @@ impl TaskOperationQueueRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_native_input(
         mut self,
         quote: novarocks_workload_control::joint_admission::NativeQueuedInputQuote,
@@ -463,6 +480,7 @@ impl TaskOperationQueueRequest {
     }
 }
 
+#[cfg(test)]
 /// Inline preparation state in the original request producer. It owns only
 /// the original paid ticket/receipt; it is not a second queue or capacity.
 #[derive(Default)]
@@ -474,6 +492,7 @@ pub struct TaskOperationQueuePreparation {
     pub(crate) grant: Option<novarocks_workload_control::joint_admission::NativeQueuedInputGrant>,
     pub(crate) failure: Option<novarocks_workload_control::WorkError>,
 }
+#[cfg(test)]
 impl std::fmt::Debug for TaskOperationQueuePreparation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OriginalNativeQueuePreparation")
@@ -484,6 +503,7 @@ impl std::fmt::Debug for TaskOperationQueuePreparation {
             .finish()
     }
 }
+#[cfg(test)]
 impl TaskOperationQueuePreparation {
     pub const fn new() -> Self {
         Self {
@@ -533,6 +553,7 @@ impl TaskOperationQueuePreparation {
     }
 }
 
+#[cfg(test)]
 struct UnpublishedQueueCleanupFailure {
     // Same original grant remains queued if cleanup did not prove exit.
     _cause: Box<dyn std::any::Any + Send>,
@@ -887,6 +908,7 @@ impl OperationAcknowledgement {
     }
 }
 
+#[cfg(test)]
 /// One batch of intents the dispatcher released for one backend and lane.
 #[derive(Debug)]
 pub struct DispatchBatch {
@@ -904,6 +926,7 @@ pub struct DispatchBatch {
     queued_at: MonotonicInstant,
 }
 
+#[cfg(test)]
 impl DispatchBatch {
     #[cfg(test)]
     pub(super) fn test_fixture(
@@ -1014,6 +1037,7 @@ impl DispatchBatch {
     }
 }
 
+#[cfg(test)]
 /// The immutable identity of a batch the transport accepted.
 ///
 /// Payload ownership remains with the transport. The dispatcher needs only
@@ -1026,6 +1050,7 @@ pub(crate) struct DispatchAcceptance {
     pub(super) operation_ids: Vec<TaskOperationId>,
 }
 
+#[cfg(test)]
 /// The result of one non-blocking transport admission attempt.
 #[derive(Debug)]
 pub enum TaskOperationSubmit {
@@ -1052,6 +1077,7 @@ pub enum TaskOperationSubmit {
 /// The reservation moves with the exact operation through dequeue, transport
 /// backpressure and replay. Once the transport accepts the batch it becomes an
 /// in-flight reservation and remains held until that send settles or drops.
+#[cfg(test)]
 pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     fn mark_in_flight(&mut self);
     /// Borrow the original Native queue capability for the same batch's
@@ -1072,6 +1098,7 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     }
 }
 
+#[cfg(test)]
 /// Result of reserving process capacity before an operation enters an attempt
 /// queue.
 ///
@@ -1105,6 +1132,7 @@ pub(super) fn test_queue_permit() -> Box<dyn TaskOperationQueuePermit> {
     Box::new(TestQueuePermit)
 }
 
+#[cfg(test)]
 /// The seam a later transport owner implements.
 ///
 /// A submission must not block on a wire round trip: acknowledgements come

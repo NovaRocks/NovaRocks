@@ -166,7 +166,8 @@ code-anchors:
 - [ADR-0213](ADR-0213-iceberg-read-interpretation-and-current-write-authority.md) — Iceberg 读取为何先选 Parquet 解释政策、分开原始与解释缓存，并把历史只读事实与当前写权限分离（active；经验物理深度推导由 ADR-0214 部分替代，读取政策与 Current/Historical 责任保留，运行验证状态独立核对）
 - [ADR-0204](ADR-0204-upstream-iceberg-backports-and-provider-suspension.md) — Iceberg 为何仅允许有界的原样上游依赖移植，实验性 Provider 为何保留注册并明确暂停能力（active；部分替代 ADR-0138/0139/0170/0174，授权读取、唯一 manifest、禁止计量 fork 与同源基线责任保留）
 - [ADR-0207](ADR-0207-single-prepared-change-window-and-frozen-source-endpoints.md) — 增量刷新为何每 attempt 只准备一次 typed 窗口、允许源越过冻结 To，并在执行期重新观察对象与端点（active；单次准备与执行观察已接线，验证范围与验收资格另核）
-- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
+- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）
+- [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。
 - [ADR-0196](ADR-0196-hadoop-test-catalog-complete-version-installation.md) — Hadoop 测试 catalog 为何共用完整不替换安装、只读版本发现与完整清单建删表，普通回收为何保护发现根（active；部分替代 ADR-0077/0118/0179 的 Hadoop 发现、存在性、DROP 与旧 UPDATE 协议，其余 owner 和生命周期保留；固定65,536项清单拒绝由 ADR-0227 部分替代，完整发现/安装与生命周期保留）
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
 - [ADR-0182](ADR-0182-iceberg-recursive-nominal-field-identities.md) — Iceberg 递归名义领域为何由 Provider 按稳定 field ID 持久声明，并在当前、历史与所选 schema 上严格验证（active）
@@ -261,7 +262,8 @@ code-anchors:
 - [ADR-0211](ADR-0211-deterministic-control-runtime-and-task-ownership.md) — 控制面为何共用确定性运行时、同步资源准入与真实工作保管，Context为何热执行退出后仍由原核心保留（active；部分替代 ADR-0193 的同步实现与无角色结算登记、ADR-0161 的注册表与保留容量承载，既有身份、裁决与真实退出语义保留）
 - [ADR-0203](ADR-0203-client-result-presentation-and-trino-paged-delivery.md) — 客户端结果为何由 FE 冻结呈现族、BE 根任务编码，并以页确认决定 Trino 送达、重放与唯一结算；会话值、变化与查询身份归原应用 owner（active；实现与验证状态独立核对；双族过渡与完成投影由 ADR-0217 部分替代，原查询期限与实际退出规则保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
-- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
+- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）
+- [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据；同步 Worker/就地结算通知与无角色凭证登记由 ADR-0211 部分替代，提议全序、裁决、最新退役读取与原来源保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
@@ -465,7 +467,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - [ADR-0219](ADR-0219-iceberg-v3-lineage-and-planned-duplicate-match-errors.md) — Iceberg lineage 为何只认格式版本、MV为何观察所选快照范围、重复匹配为何按物理行与子句判重并由规划声明Trino错误（active；部分替代ADR-0055的属性准入历史，Provider策略与SQL谓词所有权保留）
 - [ADR-0217](ADR-0217-sole-trino-entry-and-application-owned-completion.md) — 客户端为何只保留 Trino，命令形状、领域计数与协议投影为何各有原作者，计数数据页为何仍须终页确认（active；部分替代 ADR-0102/0172/0095/0203，原授权、查询期限、typed 事实与实际退出保留）
 - [ADR-0206](ADR-0206-frozen-write-placement-and-task-completion-assembly.md) — change-stream 写入为何从同一冻结图独立绑定放置、实际 driver、准确 summary 来源和 strict 成功尾部，再交原 FE publication（active；补充 ADR-0208 与 ADR-0198，不替代 Provider 或发布 owner）
-- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
+- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）
+- [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
@@ -514,7 +517,8 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 领域哲学：表维护的 application/lifecycle 与 execution port 由 frontend host 统一拥有；connector 保留 catalog、snapshot、file 与 commit 等外部事实。job 是 ProcessRuntime，GC first-observation 是可重建 Accelerator；观察记录不赋予跨重启删除权。必要 finalize 与可延后维护分别监督，扫描回收的 SQL/自动入口共用 Provider 证明准入，缺证明确限制；不以 SPI、service locator、双写或内存 fallback 模糊 owner。
 
-- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对）
+- [ADR-0198](ADR-0198-one-logical-execution-owner-for-every-distributed-intent.md) — 各分布式意图为何共用逻辑执行 owner，分离计算就绪、累计效果、publication 与真实收敛，并复用唯一实际资源预算和可取消背压（active；部分替代 lake publication ADR-0110、后端自注册 ADR-0111、ADR-0133/0161/0171；不承诺永久阻塞隔离；架构已实施，验证范围、失败处置与验收资格独立核对；FE Native attempt 的决定 owner 由 ADR-0230 部分替代）
+- [ADR-0230](ADR-0230-frontend-attempt-decisions-and-transport-custody.md) — FE Native attempt 使用同一共用控制运行时推进纯协议决定，宿主负责原传输与退出。按物理发送代次准入，进程及后端键的配额统一入账。
 - [ADR-0196](ADR-0196-hadoop-test-catalog-complete-version-installation.md) — Hadoop 测试 catalog 为何共用完整不替换安装、只读版本发现与完整清单建删表，普通回收为何保护发现根（active；部分替代 ADR-0077/0118/0179 的 Hadoop 发现、存在性、DROP 与旧 UPDATE 协议，其余 owner 和生命周期保留；固定65,536项清单拒绝由 ADR-0227 部分替代，完整发现/安装与生命周期保留）
 - [ADR-0179](ADR-0179-iceberg-publication-lifecycle-and-evidence.md) — Iceberg 发布为何由冻结请求、唯一 journal 与独立证据期限拥有，正面核查为何只追加准确归属与收尾事实（active；部分替代 ADR-0118/0171 的 Transaction 与 late carrier、ADR-0175 的会话/生命周期、ADR-0174 的 P2/U4 退出路由；保留认证/路由及 IRU-6b/6c 边界；永久依赖图守卫由 ADR-0190 部分替代，发布生命周期裁决保留）
 - ADR-0083 — 表维护 execution port 为何必须随 query assembly 归 Frontend，不能以 Core cohort bridge 留存（active）

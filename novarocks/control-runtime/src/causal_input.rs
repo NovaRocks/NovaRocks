@@ -19,8 +19,8 @@
 //! while the predecessor's host effects still retain their original batch.
 
 #[cfg(test)]
-use novarocks_control_runtime::actor_turn::StandingInputId;
-use novarocks_control_runtime::{
+use crate::actor_turn::StandingInputId;
+use crate::{
     actor::Actor,
     actor_turn::{
         ActorRegistration, ActorRuntime, ActorTurnError, InputAuthor, StandingInputObligation,
@@ -35,10 +35,10 @@ use novarocks_control_runtime_core::{
 /// The original role's worst case is two distinct bounded Core steps. Combining
 /// them would exceed the fixed step budget, while reusing one position would
 /// make event progress wait for the predecessor's actual capture/source exit.
-pub(crate) const CAUSAL_INPUT_POSITIONS: usize = 2;
+pub const CAUSAL_INPUT_POSITIONS: usize = 2;
 #[cfg(test)]
 type FillResult<T> = Result<(Option<InputId>, InputId), (ActorTurnError, Option<T>, T)>;
-pub(crate) struct CausalFillFailure<T> {
+pub struct CausalFillFailure<T> {
     pub error: ActorTurnError,
     pub predecessor: Option<T>,
     pub event: T,
@@ -48,14 +48,14 @@ pub(crate) struct CausalFillFailure<T> {
     pub predecessor_input: Option<InputId>,
 }
 
-pub(crate) struct CausalInputObligation<A: Actor> {
+pub struct CausalInputObligation<A: Actor> {
     predecessor: StandingInputObligation<A>,
     event: StandingInputObligation<A>,
 }
 impl<A: Actor> CausalInputObligation<A> {
     /// Both positions are issued for the original target incarnation and the
     /// actual already admitted producer Work, including a process-scope R.
-    pub(crate) fn reserve_admitted(
+    pub fn reserve_admitted(
         runtime: &ActorRuntime<A>,
         target: &ActorRegistration,
         source: ActorId,
@@ -101,11 +101,11 @@ impl<A: Actor> CausalInputObligation<A> {
     }
     /// Read only the original event position's actual producer/financial
     /// binding. It grants no additional Work, reply cell or consumed fact.
-    pub(crate) fn event_author(&self) -> Result<InputAuthor, ActorTurnError> {
+    pub fn event_author(&self) -> Result<InputAuthor, ActorTurnError> {
         self.event.author()
     }
     #[cfg(test)]
-    pub(crate) fn positions(&self) -> [StandingInputId; CAUSAL_INPUT_POSITIONS] {
+    fn positions(&self) -> [StandingInputId; CAUSAL_INPUT_POSITIONS] {
         [self.predecessor.id(), self.event.id()]
     }
     /// The per-Task handoff owner calls this in sealed-cut order, before filling
@@ -120,18 +120,31 @@ impl<A: Actor> CausalInputObligation<A> {
     /// means it was absent or is already real runtime custody; failure teardown
     /// must use that actual inventory instead of rolling back published input.
     #[cfg(test)]
-    pub(crate) fn fill(
-        &mut self,
-        predecessor: Option<A::Input>,
-        event: A::Input,
-    ) -> FillResult<A::Input> {
+    fn fill(&mut self, predecessor: Option<A::Input>, event: A::Input) -> FillResult<A::Input> {
         self.fill_with_receipt(predecessor, event)
             .map_err(|failure| (failure.error, failure.predecessor, failure.event))
     }
-    pub(crate) fn in_flight(&self) -> Result<[Option<InputId>; 2], ActorTurnError> {
+    pub fn in_flight(&self) -> Result<[Option<InputId>; 2], ActorTurnError> {
         Ok([self.predecessor.in_flight()?, self.event.in_flight()?])
     }
-    pub(crate) fn fill_with_receipt(
+    /// Called by the original result owner after actual producer exit.
+    /// A busy predecessor does not authorize closing either paid position.
+    pub fn retire_ready_after_exit(&self) -> Result<bool, ActorTurnError> {
+        let predecessor = self.predecessor.retire_ready_after_exit()?;
+        let event = self.event.retire_ready_after_exit()?;
+        Ok(predecessor && event)
+    }
+    /// After a failure fence, the original owner may take only this causal
+    /// role's actual Source head. The returned payload must actually exit.
+    pub fn take_failed_payload(
+        &self,
+    ) -> Result<Option<crate::actor_turn::FailedSourcePayload<A>>, ActorTurnError> {
+        self.predecessor
+            .take_failed_source_payload_matching(|role| {
+                role == self.predecessor.id() || role == self.event.id()
+            })
+    }
+    pub fn fill_with_receipt(
         &mut self,
         predecessor: Option<A::Input>,
         event: A::Input,
@@ -192,7 +205,7 @@ impl<A: Actor> CausalInputObligation<A> {
     }
     /// The higher-level owner has proved actual holder/capture/report exit.
     /// Neither an expired RPC nor an unprocessed event supplies that proof.
-    pub(crate) fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
+    pub fn close_after_exit(&mut self) -> Result<(), ActorTurnError> {
         if self.predecessor.in_flight()?.is_some() || self.event.in_flight()?.is_some() {
             return Err(ActorTurnError::StandingInputBusy);
         }
@@ -204,7 +217,7 @@ impl<A: Actor> CausalInputObligation<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_control_runtime::{
+    use crate::{
         actor::{ActorConfig, ActorStep},
         obligation::{ReservationObligation, WorkObligation},
         transaction::{RuntimeLedger, ScopeHandle},
@@ -260,7 +273,7 @@ mod tests {
         work: WorkObligation,
         capacity: ReservationObligation,
         runtime: ActorRuntime<Receiver>,
-        registration: novarocks_control_runtime::actor_turn::ActorRegistration,
+        registration: crate::actor_turn::ActorRegistration,
     }
     fn fixture(control: usize) -> Fixture {
         let resources = ResourceVector::new([(DimensionId::new(1).unwrap(), 3)]).unwrap();

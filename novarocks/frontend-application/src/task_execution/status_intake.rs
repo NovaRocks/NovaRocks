@@ -15,28 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Status and observation intake: bounded queues and serial runners.
+//! Bounded intake for the original covered Native subscription adapter.
 //!
-//! A status callback holds a [`StatusIntakeHandle`] and nothing else. It can
-//! enqueue one immutable snapshot and wake the runner; it has no path to a
-//! task, a stage, or a lease, so it cannot create a task or complete a stage
-//! on the transport's thread.
-//!
-//! The legacy status queue reports overflow as observation loss. The unified
-//! observation queue below reserves capacity before reading a frame and
-//! applies bounded backpressure instead; ordinary queue fullness cannot
-//! counterfeit a gap in the accepted observation stream.
+//! The observation queue reserves capacity before reading a frame and
+//! applies bounded backpressure. Test fixtures also retain the original
+//! status queue and its overflow reports.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use crate::wake::StatusIntakeWake;
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+pub use crate::wake::{CountingWake, NotifyWake, TestIntakeWake};
 
 use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity, TaskStatus};
+#[cfg(test)]
+use novarocks_execution::task_execution::TaskStatus;
+use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity};
 use novarocks_query_application::coordination::{
     AcceptedRootControlPort, AcceptedRootControlRequest,
 };
@@ -45,6 +42,7 @@ use novarocks_query_application::coordination::{
 use super::clock::ProcessMonotonicClock;
 use novarocks_coordination_contract::MonotonicClock;
 
+#[cfg(test)]
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusEvent {
@@ -54,83 +52,7 @@ pub enum StatusEvent {
     Gone(TaskIdentity),
 }
 
-/// How the runner is woken.
-pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
-    fn wake(&self);
-}
-
-/// Test wake retaining the same asynchronous notification as its caller.
-/// Register before observing retained state so a racing wake is not lost.
-#[derive(Debug, Default)]
 #[cfg(test)]
-pub struct TestIntakeWake {
-    async_signal: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl TestIntakeWake {
-    /// The same original wake also follows its owner into async residual
-    /// supervision. Register before inspecting state to retain a racing wake.
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.async_signal.notified()
-    }
-}
-
-#[cfg(test)]
-impl StatusIntakeWake for TestIntakeWake {
-    fn wake(&self) {
-        self.async_signal.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl std::task::Wake for TestIntakeWake {
-    fn wake(self: Arc<Self>) {
-        StatusIntakeWake::wake(self.as_ref());
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        StatusIntakeWake::wake(self.as_ref());
-    }
-}
-
-/// Wakes a runner parked on a `Notify`.
-#[derive(Debug)]
-pub struct NotifyWake(Arc<tokio::sync::Notify>);
-
-impl NotifyWake {
-    pub fn new(notify: Arc<tokio::sync::Notify>) -> Self {
-        Self(notify)
-    }
-}
-
-impl StatusIntakeWake for NotifyWake {
-    fn wake(&self) {
-        self.0.notify_one();
-    }
-}
-
-/// Counts wakes instead of parking anything.
-///
-/// It exists so a test can assert that a callback woke the runner exactly
-/// once per publish without waiting on a task scheduler.
-#[derive(Debug, Default)]
-#[cfg(test)]
-pub struct CountingWake(AtomicUsize);
-
-#[cfg(test)]
-impl CountingWake {
-    pub fn count(&self) -> usize {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-#[cfg(test)]
-impl StatusIntakeWake for CountingWake {
-    fn wake(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
 #[derive(Debug)]
 struct StatusIntakeInner {
     queue: Mutex<StatusIntakeQueue>,
@@ -139,6 +61,7 @@ struct StatusIntakeInner {
     wake: Arc<dyn StatusIntakeWake>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct StatusIntakeQueue {
     entries: VecDeque<StatusIntakeEntry>,
@@ -147,6 +70,7 @@ struct StatusIntakeQueue {
     root_control_queued: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) enum StatusIntakeEntry {
     Status(StatusEvent),
@@ -154,6 +78,7 @@ pub(super) enum StatusIntakeEntry {
     RootControl(AcceptedRootControlRequest),
 }
 
+#[cfg(test)]
 impl StatusIntakeQueue {
     fn enqueue_observation_loss(&mut self) {
         if !self.observation_loss_queued {
@@ -164,6 +89,7 @@ impl StatusIntakeQueue {
 }
 
 /// Whether a published snapshot was admitted.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatusIntakeAdmission {
     Enqueued,
@@ -173,11 +99,13 @@ pub enum StatusIntakeAdmission {
 }
 
 /// The only handle a transport callback holds.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct StatusIntakeHandle {
     inner: Arc<StatusIntakeInner>,
 }
 
+#[cfg(test)]
 impl StatusIntakeHandle {
     /// Enqueues one immutable snapshot and wakes the runner.
     ///
@@ -219,6 +147,7 @@ impl StatusIntakeHandle {
     }
 }
 
+#[cfg(test)]
 impl AcceptedRootControlPort for StatusIntakeHandle {
     fn enqueue_root_control(
         &self,
@@ -243,11 +172,13 @@ impl AcceptedRootControlPort for StatusIntakeHandle {
 }
 
 /// The runner side of the intake.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct StatusIntake {
     inner: Arc<StatusIntakeInner>,
 }
 
+#[cfg(test)]
 impl StatusIntake {
     pub fn new(capacity: usize, wake: Arc<dyn StatusIntakeWake>) -> Self {
         Self {
@@ -293,11 +224,13 @@ impl StatusIntake {
 }
 
 /// The exclusive right to apply intake.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct StatusIntakeRunner<'a> {
     intake: &'a StatusIntake,
 }
 
+#[cfg(test)]
 impl StatusIntakeRunner<'_> {
     /// Takes at most `max` queued snapshots and reports any observation-loss
     /// marker ordered before the next success-seal request.
@@ -350,6 +283,7 @@ impl StatusIntakeRunner<'_> {
     }
 }
 
+#[cfg(test)]
 impl Drop for StatusIntakeRunner<'_> {
     fn drop(&mut self) {
         self.intake
@@ -460,13 +394,12 @@ impl ObservationIntake {
         wake: Arc<dyn StatusIntakeWake>,
         clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
-        let max_frame =
-            novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES + 4096;
+        let budget = super::host::observations::ObservationBudget::for_task_attempt();
         Self::new_with_clock(
-            4096,
-            4098,
-            max_frame * 4 + std::mem::size_of::<AcceptedRootControlRequest>(),
-            max_frame,
+            budget.queued_frames,
+            budget.total_positions,
+            budget.total_bytes,
+            budget.max_frame_bytes,
             wake,
             clock,
         )

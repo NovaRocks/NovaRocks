@@ -1372,7 +1372,7 @@ mod original_stage_tests {
             MvRefreshPreparationIo, MvRefreshPreparationServices,
         },
     };
-    use crate::task_execution::status_intake::StatusIntakeWake;
+    use crate::wake::StatusIntakeWake;
     use bytes::Bytes;
     use novarocks_mv_application::management::{
         DeploymentOwner, MvManagementPhase, ProcessIncarnation,

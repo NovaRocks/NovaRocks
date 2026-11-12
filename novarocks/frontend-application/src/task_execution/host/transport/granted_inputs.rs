@@ -1,0 +1,80 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::{OriginalQueuedInput, SendKey};
+use novarocks_attempt_protocol::input::QueuedInputGrantRef;
+use std::{collections::BTreeMap, num::NonZeroU64};
+
+/// Original Source custody of admitted WC inputs. Each row is backed by
+/// that live admission and retains its exact operation and send generation.
+#[derive(Default)]
+pub(crate) struct GrantedInputs {
+    originals: BTreeMap<NonZeroU64, OriginalQueuedInput>,
+}
+impl GrantedInputs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.originals.is_empty()
+    }
+
+    pub(crate) fn contains(&self, grant: QueuedInputGrantRef) -> bool {
+        self.originals.contains_key(&grant.record())
+    }
+
+    pub(crate) fn install(&mut self, grant: QueuedInputGrantRef, input: OriginalQueuedInput) {
+        assert_eq!(input.key().generation, grant.generation());
+        let std::collections::btree_map::Entry::Vacant(position) =
+            self.originals.entry(grant.record())
+        else {
+            unreachable!("original Source prechecked the grant position");
+        };
+        position.insert(input);
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        grant: QueuedInputGrantRef,
+        expected: SendKey,
+    ) -> Option<OriginalQueuedInput> {
+        if !self.matches(grant, expected) {
+            return None;
+        }
+        self.originals.remove(&grant.record())
+    }
+
+    pub(super) fn matches(&self, grant: QueuedInputGrantRef, expected: SendKey) -> bool {
+        expected.generation == grant.generation()
+            && self
+                .originals
+                .get(&grant.record())
+                .is_some_and(|input| input.key() == expected)
+    }
+
+    /// During Source close, only still-unbound grants remain here.
+    pub(super) fn take_unclaimed(&mut self) -> Option<OriginalQueuedInput> {
+        self.originals.pop_first().map(|(_, original)| original)
+    }
+
+    /// ReleaseQueuedInput carries only the reference. Return the original
+    /// unbound grant to the Source's credentialed disposal carrier.
+    pub(crate) fn take_for_release(
+        &mut self,
+        grant: QueuedInputGrantRef,
+    ) -> Option<OriginalQueuedInput> {
+        let key = self.originals.get(&grant.record())?.key();
+        self.take(grant, key)
+    }
+}

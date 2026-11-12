@@ -19,7 +19,7 @@
 //! boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -30,10 +30,12 @@ use control_binding::NativeControlBinding;
 use source_cohort::NativeSourceCohortAdmission;
 pub(crate) use source_cohort::source_count as native_source_count;
 
-use crate::task_protocol_config::CoordinationBudgets;
+use novarocks_attempt_protocol::config::CoordinationBudgets;
+use novarocks_attempt_protocol::input::SendGeneration;
+use novarocks_control_runtime_core::identity::ConsumerId;
 #[cfg(test)]
 use novarocks_coordination_contract::AttemptFailureClass;
-use novarocks_coordination_contract::RecoveryMode;
+use novarocks_coordination_contract::{AttemptActionId, RecoveryMode};
 use novarocks_execution_contract::{
     AcquireParticipationAdmissionTicket, LeaseValidFor, OperationOutcome, ParticipationRef,
     TaskOperationId,
@@ -47,10 +49,11 @@ use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenRequest, NativeActiveAttemptConvergenceFuture,
     NativeActiveConvergenceClosure, NativeActiveConvergenceRequest, NativeAttemptActivationFailure,
-    NativeAttemptActivationFuture, NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
-    NativeAttemptPreparationFailure, NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
-    NativeAttemptPreparationRequest, NativeAttemptPreparationWork, NativeAttemptRunFuture,
-    NativeAttemptTerminal, QueryExecutionClient, QueryExecutionError, QueryExecutionRequest,
+    NativeAttemptActivationFuture, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
+    NativeAttemptPreparationError, NativeAttemptPreparationFailure, NativeAttemptPreparationFuture,
+    NativeAttemptPreparationPort, NativeAttemptPreparationRequest, NativeAttemptPreparationWork,
+    NativeAttemptRunFuture, NativeAttemptTerminal, NativeParticipationConvergence,
+    QueryExecutionClient, QueryExecutionError, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
     AbortParticipationEffectAdmission, AbortParticipationEffectPort,
@@ -71,15 +74,15 @@ use novarocks_types::NativeCompatibilityId;
 use novarocks_workload_control::WorkOwner;
 use tokio::sync::watch;
 
+use crate::control_runtime::{ReplacementQualificationScope, ReplacementQualificationScopeError};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_result_transport::{
     NativeBoundedRootReadPort, NativeTaskResultTransport, TaskReadGrace,
 };
-use crate::native::task_transport::{
-    AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskOperationIntakeEvent,
-};
+use crate::native::task_transport::wire::AttemptWireFacts;
+use crate::native::transport::Client;
 use crate::query_execution::artifact::{
     ManifestBoundNativeAttemptInputs, PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
     SnapshotBoundDormantAttemptInputs, TaskExecutionPreparedQuery, TaskManifestBinding,
@@ -97,36 +100,44 @@ use crate::query_execution::logical_execution::{
     ComputationDiagnostics, InitialComputationCredentials, LogicalExecutionLauncher,
     PreparedLogicalComputation, validate_initial_computation_start,
 };
-use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
-use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
-use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
-use crate::task_execution::intent::{
-    AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
-    TaskOperationSubmit,
+use crate::task_execution::host::{
+    install::{InstallAttemptHost, InstalledAttemptHost},
+    pumps::DynamicFilterRecords,
+    replacement_client::{
+        ReplacementSendError, ReplacementSendStop, send_replacement_admission, wait_for_stop,
+    },
+    transport::{
+        FrozenSubscriptionStageInputs, PreparationFailure, SendKey, SingleSendContext,
+        SingleSendError, StagedSubscriptionEndpoints, stage_subscription_endpoints,
+    },
 };
-use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
-use crate::task_execution::sources::AttemptEstablishFacts;
-use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use crate::task_execution::manifest_projection::{
+    AttemptPlanPolicy, ManifestAttemptInputs, PreparedManifestAttempt,
+};
+use crate::task_execution::profile_diagnostics::TaskFinalInfoCollector;
+use crate::task_execution::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
+use crate::wake::NotifyWake;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::{BackendProcessObservationService, BackendTopologyService};
 
 /// One logical execution's Abort port. Every physical attempt installs one
 /// exact route and retains its registration through residual convergence.
 #[derive(Debug)]
-struct LogicalAbortRouter {
-    routes: Mutex<BTreeMap<novarocks_types::QueryExecutionId, Arc<NativeAbortEffectAdapter>>>,
+pub(crate) struct LogicalAbortRouter {
+    routes: Mutex<
+        BTreeMap<novarocks_types::QueryExecutionId, Option<Arc<dyn AbortParticipationEffectPort>>>,
+    >,
     capacity_epoch: watch::Sender<u64>,
     worker_closed_participations: Arc<Mutex<BTreeSet<ParticipationRef>>>,
     closure_epoch: watch::Sender<u64>,
 }
 
 impl LogicalAbortRouter {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         let (capacity_epoch, _) = watch::channel(0);
         let (closure_epoch, _) = watch::channel(0);
         Arc::new(Self {
@@ -137,46 +148,61 @@ impl LogicalAbortRouter {
         })
     }
 
-    fn install(
+    pub(crate) fn reserve_route(
         self: &Arc<Self>,
         execution: novarocks_types::QueryExecutionId,
-        capacity: NonZeroUsize,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<(LogicalAbortRoute, NativeAbortEffectIntake), NativeAttemptActivationFailure> {
-        let closed = Arc::clone(&self.worker_closed_participations);
-        let closure_epoch = self.closure_epoch.clone();
-        let observer = Arc::new(move |participation| {
-            closed
-                .lock()
-                .expect("logical Abort closed-participation facts")
-                .insert(participation);
-            closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
-        });
-        let (adapter, intake) = NativeAbortEffectAdapter::bounded_with_observer(
-            capacity,
-            wake,
-            self.capacity_epoch.clone(),
-            Some(observer),
-        );
+    ) -> Result<LogicalAbortRoute, NativeAttemptActivationFailure> {
         let mut routes = self.routes.lock().expect("logical Abort route table");
-        if routes.insert(execution, adapter).is_some() {
+        let std::collections::btree_map::Entry::Vacant(route) = routes.entry(execution) else {
             return Err(NativeAttemptActivationFailure::new(
                 attempt_runtime_failure(
                     QueryFailureReason::PreparationProtocol,
                     "logical execution installed the same Native Abort route twice",
                 ),
             ));
-        }
-        drop(routes);
-        self.capacity_epoch
-            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
-        Ok((
-            LogicalAbortRoute {
-                execution,
-                router: Arc::clone(self),
-            },
-            intake,
-        ))
+        };
+        route.insert(None);
+        Ok(LogicalAbortRoute {
+            execution,
+            router: self.clone(),
+        })
+    }
+
+    pub(crate) fn capacity_author(&self) -> watch::Sender<u64> {
+        self.capacity_epoch.clone()
+    }
+
+    fn closure_observer(&self) -> Arc<dyn Fn(ParticipationRef) + Send + Sync> {
+        let closed = self.worker_closed_participations.clone();
+        let closure_epoch = self.closure_epoch.clone();
+        Arc::new(move |participation| {
+            closed
+                .lock()
+                .expect("logical Abort closed-participation facts")
+                .insert(participation);
+            closure_epoch.send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_registered_attempt(
+        self: &Arc<Self>,
+        attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
+            crate::control_runtime::actor::FrontendActor,
+        >,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> Result<
+        (
+            LogicalAbortRoute,
+            Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
+            Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
+        ),
+        NativeAttemptActivationFailure,
+    > {
+        let route = self.reserve_route(attempt.root_control_binding().activation().execution())?;
+        let (ingress, settlement) = route.bind_attempt_ingress(attempt, runtime, work)?;
+        Ok((route, ingress, settlement))
     }
 
     fn worker_closed_participations(&self) -> Arc<Mutex<BTreeSet<ParticipationRef>>> {
@@ -185,6 +211,46 @@ impl LogicalAbortRouter {
 
     fn closure_epoch(&self) -> watch::Sender<u64> {
         self.closure_epoch.clone()
+    }
+}
+
+impl LogicalAbortRoute {
+    pub(crate) fn bind_attempt_ingress(
+        &self,
+        attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,
+        runtime: &novarocks_control_runtime::actor_turn::ActorRuntime<
+            crate::control_runtime::actor::FrontendActor,
+        >,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+    ) -> Result<
+        (
+            Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
+            Arc<crate::task_execution::bridge::abort::AbortSettlementOwner>,
+        ),
+        NativeAttemptActivationFailure,
+    > {
+        assert_eq!(
+            self.execution,
+            attempt.root_control_binding().activation().execution()
+        );
+        let ingress = attempt
+            .prepare_abort_ingress(
+                runtime,
+                work,
+                self.router.capacity_author(),
+                Some(self.router.closure_observer()),
+            )
+            .map(Arc::new)
+            .map_err(|error| {
+                NativeAttemptActivationFailure::new(attempt_runtime_failure(
+                    QueryFailureReason::PreparationProtocol,
+                    error.to_string(),
+                ))
+            })?;
+        let settlement = Arc::new(
+            crate::task_execution::bridge::abort::AbortSettlementOwner::new(ingress.clone()),
+        );
+        Ok((ingress, settlement))
     }
 }
 
@@ -202,6 +268,7 @@ impl AbortParticipationEffectPort for LogicalAbortRouter {
             .lock()
             .expect("logical Abort route table")
             .get(&execution)
+            .and_then(Option::as_ref)
             .map_or(AbortParticipationEffectAdmission::Backpressured, |route| {
                 route.try_reserve(identity)
             })
@@ -209,18 +276,53 @@ impl AbortParticipationEffectPort for LogicalAbortRouter {
 }
 
 #[derive(Debug)]
-struct LogicalAbortRoute {
+pub(crate) struct LogicalAbortRoute {
     execution: novarocks_types::QueryExecutionId,
     router: Arc<LogicalAbortRouter>,
 }
 
+impl LogicalAbortRoute {
+    pub(crate) fn publish_registered(
+        &self,
+        startup: &crate::task_execution::host::startup::AttemptStartup,
+        endpoint: Arc<crate::task_execution::bridge::abort::AttemptAbortIngress>,
+    ) -> Result<(), novarocks_control_runtime::actor_turn::ActorTurnError> {
+        use novarocks_control_runtime::actor_turn::ActorTurnError;
+        if !endpoint.ready_for_route(startup, self.execution) {
+            return Err(ActorTurnError::InputAuthorMismatch);
+        }
+        self.publish(endpoint);
+        Ok(())
+    }
+
+    pub(crate) fn publish(&self, endpoint: Arc<dyn AbortParticipationEffectPort>) {
+        {
+            let mut routes = self
+                .router
+                .routes
+                .lock()
+                .expect("logical Abort route table");
+            let original = routes
+                .get_mut(&self.execution)
+                .expect("reserved original Abort route");
+            assert!(original.is_none());
+            *original = Some(endpoint);
+        }
+        self.router
+            .capacity_epoch
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+    }
+}
+
 impl Drop for LogicalAbortRoute {
     fn drop(&mut self) {
-        self.router
+        let original = self
+            .router
             .routes
             .lock()
             .expect("logical Abort route table")
             .remove(&self.execution);
+        drop(original);
         self.router
             .capacity_epoch
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
@@ -310,22 +412,32 @@ impl LogicalReplacementQualificationPort {
     }
 
     async fn qualify(self, submission: ReplacementQualificationEffectSubmission) {
-        let cancellation = submission.subscribe_cancellation();
-        let result = self
-            .qualify_request(submission.request(), cancellation)
-            .await;
-        match result {
-            Ok(reservation) => match QualifiedReplacementReservation::try_new(
-                submission.request(),
-                Box::new(reservation),
-            ) {
-                Ok(reservation) => {
-                    let _ = submission.qualified(reservation);
-                }
+        let request = submission.request().clone();
+        let mut cancellation = submission.subscribe_cancellation();
+        let expiry = tokio::time::Instant::from_std(request.absolute_expiry());
+        let qualification = self.qualify_request(&request, cancellation.clone());
+        tokio::pin!(qualification);
+        tokio::select! {
+            biased;
+            result = &mut qualification => match result {
+                Ok(reservation) => match QualifiedReplacementReservation::try_new(
+                    submission.request(),
+                    Box::new(reservation),
+                ) {
+                    Ok(reservation) => {
+                        let _ = submission.qualified(reservation);
+                    }
+                    Err(error) => submission.refused(error),
+                },
                 Err(error) => submission.refused(error),
             },
-            Err(error) => {
-                submission.refused(error);
+            stop = wait_for_stop(&mut cancellation, expiry) => {
+                // The original QA result may settle before transport exits.
+                // Keep driving the same qualification and its physical Join.
+                submission.refused(replacement_send_stopped(stop));
+                if let Ok(reservation) = qualification.await {
+                    Box::new(reservation).abandon();
+                }
             }
         }
         self.inner.busy.store(false, Ordering::Release);
@@ -640,29 +752,39 @@ async fn acquire_replacement_admissions(
         }
         backends.push(target.descriptor().clone());
     }
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    let acks = TaskAckIntake::new(wake);
-    let sink = NativeTaskOperationSink::new(
-        &backends,
-        runtime.transport_budget,
-        AttemptWireFacts {
-            native_compatibility_id: runtime.native_compatibility_id,
-        },
-        acks.handle(),
-        runtime.data_runtime.clone(),
-        qualification
-            .native_action_authority()
-            .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?
-            .clone(),
-    )
-    .map_err(|error| ReplacementQualificationFailure::DomainRefused(error.failure_fact()))?;
-    let valid_for =
-        LeaseValidFor::new(crate::task_execution::participation_owner::ADMISSION_TICKET_VALID_FOR)
-            .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
+    let backends: Arc<[_]> = backends.into();
+    let authority = qualification
+        .native_action_authority()
+        .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
+    let valid_for = LeaseValidFor::new(crate::task_execution::sources::ADMISSION_TICKET_VALID_FOR)
+        .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
+    let attempt_runtime = &runtime.attempt_runtime;
+    let scope = attempt_runtime
+        .open_replacement_qualification()
+        .map_err(|error| match error {
+            ReplacementQualificationScopeError::Closed => {
+                ReplacementQualificationFailure::EffectOwnerClosed
+            }
+            ReplacementQualificationScopeError::Runtime(error) => {
+                tracing::warn!(?error, "replacement qualification scope admission failed");
+                ReplacementQualificationFailure::InvalidReservation
+            }
+        })?;
+    let parent = scope.parent();
+    let layout = attempt_runtime.transport_capacity();
+    let executor = runtime.data_runtime.handle();
+    let expiry = tokio::time::Instant::from_std(qualification.absolute_expiry());
+    let wire = AttemptWireFacts {
+        native_compatibility_id: runtime.native_compatibility_id,
+    };
+    let mut admissions = PendingReplacementAdmissions::new(runtime.data_runtime.clone());
+    let mut unresolved = None;
     let acquire = async {
-        let mut admissions = PendingReplacementAdmissions::new(runtime.data_runtime.clone());
-        for participation in qualification.replacement_participations() {
+        for (index, participation) in qualification
+            .replacement_participations()
+            .iter()
+            .enumerate()
+        {
             if *cancellation.borrow() {
                 return Err(ReplacementQualificationFailure::Rejected);
             }
@@ -677,157 +799,143 @@ async fn acquire_replacement_admissions(
                     .expect("replacement participation target checked above")
                     .admission_epoch_capability(),
             );
-            let intent = OperationIntent::AcquireParticipationAdmissionTicket(request);
+            let client =
+                Client::for_backend_in(backends.clone(), index, runtime.data_runtime.clone());
             let mut retry_delay = runtime.task_update_retry_policy.initial_backoff();
-            // These are fields of the same original qualification future,
-            // already held by its stable QA owner. Local backpressure never
-            // recreates this request, paid ticket, or queue source.
-            let mut queue_preparation =
-                crate::task_execution::intent::TaskOperationQueuePreparation::new();
-            let mut pending_batch = None;
+            let mut send_generation = NonZeroU64::MIN;
             loop {
-                if *cancellation.borrow() {
-                    return Err(ReplacementQualificationFailure::Rejected);
-                }
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if pending_batch.is_none() {
-                    let permit = match sink
-                        .try_reserve_queue(intent.queue_request(), &mut queue_preparation)
-                    {
-                        TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
-                        TaskOperationQueueAdmission::TargetFull
-                        | TaskOperationQueueAdmission::ProcessFull => None,
-                        TaskOperationQueueAdmission::Rejected(error) => {
-                            return Err(ReplacementQualificationFailure::DomainRefused(
-                                error.failure_fact(),
-                            ));
-                        }
-                    };
-                    if let Some(permit) = permit {
-                        pending_batch = Some(DispatchBatch::with_queued_at(
-                            participation.backend_process_id(),
-                            crate::task_protocol_config::DispatchLane::Lifecycle,
-                            vec![intent.clone()],
-                            vec![permit],
-                            intent.queued_bytes(),
-                            qualification.issued_at(),
-                        ));
-                    } else {
-                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
-                        continue;
+                let key = SendKey {
+                    operation: request.envelope().operation_id(),
+                    generation: SendGeneration::new(AttemptActionId::new(send_generation)),
+                };
+                let context = SingleSendContext {
+                    ledger: attempt_runtime.ledger(),
+                    scope: parent.scope(),
+                    layout,
+                    transport: layout.transport_budget(),
+                    authority,
+                    wire: &wire,
+                    client: &client,
+                    apply: runtime.data_runtime.apply_send_port(),
+                    clock: &runtime.clock,
+                    observer: ConsumerId::new(1).unwrap(),
+                    executor,
+                };
+                let sent = match send_replacement_admission(
+                    context,
+                    parent,
+                    ReplacementQualificationScope::GENERATION,
+                    request,
+                    key,
+                    &mut cancellation,
+                    expiry,
+                )
+                .await
+                {
+                    Ok(sent) => sent,
+                    Err(ReplacementSendError::StoppedBeforeHandoff(stop)) => {
+                        return Err(replacement_send_stopped(stop));
                     }
-                }
-                let batch = pending_batch
-                    .take()
-                    .expect("same original replacement batch");
-                match sink.try_submit(batch) {
-                    TaskOperationSubmit::Accepted => {}
-                    TaskOperationSubmit::Backpressured(batch) => {
-                        pending_batch = Some(batch);
-                        tokio::select! {_=&mut notified=>{},_ = cancellation.changed()=>return Err(ReplacementQualificationFailure::Rejected)}
-                        continue;
-                    }
-                    TaskOperationSubmit::AdmissionFailed { error, .. } => {
+                    Err(ReplacementSendError::Send(SingleSendError::Governance(error))) => {
                         return Err(ReplacementQualificationFailure::DomainRefused(
                             error.failure_fact(),
                         ));
                     }
-                    TaskOperationSubmit::Rejected { .. } => {
-                        return Err(ReplacementQualificationFailure::Rejected);
-                    }
-                }
-                let acknowledgement = wait_for_replacement_acknowledgement(
-                    &acks,
-                    &notify,
-                    notified.as_mut(),
-                    &mut cancellation,
-                    request.envelope().operation_id(),
-                )
-                .await?;
-                match (acknowledgement.worker_outcome(), acknowledgement.payload()) {
-                    (
-                        Some(OperationOutcome::Accepted | OperationOutcome::Idempotent),
-                        AckPayload::AdmissionTicket(receipt),
-                    ) => {
-                        admissions.push(QualifiedWorkerAdmission::try_new(
-                            qualification.identity().replacement(),
-                            request,
-                            *receipt,
-                        )?);
-                        break;
-                    }
-                    (None, _) => {
-                        // Replay the exact admission without turning immediate
-                        // transport refusal into an unbounded RPC spin. The
-                        // qualification's outer expiry still bounds this wait.
-                        tokio::select! {
-                            _ = tokio::time::sleep(retry_delay) => {},
-                            _ = cancellation.changed() => {
-                                return Err(ReplacementQualificationFailure::Rejected);
-                            }
+                    Err(error) => {
+                        tracing::warn!(?error, "replacement admission transport failed");
+                        if matches!(&error, ReplacementSendError::Send(original) if original.exit_unproven())
+                        {
+                            unresolved = Some(error);
+                            return Err(ReplacementQualificationFailure::OutcomeUnknown);
                         }
-                        retry_delay = retry_delay
-                            .saturating_mul(2)
-                            .min(runtime.task_update_retry_policy.max_backoff());
-                        continue;
+                        return Err(ReplacementQualificationFailure::InvalidReservation);
                     }
-                    _ => {
-                        return Err(ReplacementQualificationFailure::Rejected);
+                };
+                let receipt = sent.original.receipt.as_ref();
+                if let Some((OperationOutcome::Accepted | OperationOutcome::Idempotent, receipt)) =
+                    receipt.and_then(|ack| ack.worker_outcome.zip(ack.ticket))
+                {
+                    admissions.push(QualifiedWorkerAdmission::try_new(
+                        qualification.identity().replacement(),
+                        request,
+                        receipt,
+                    )?);
+                    if let Some(stop) = sent.stopped {
+                        return Err(replacement_send_stopped(stop));
                     }
+                    break;
                 }
+                if let Some(stop) = sent.stopped {
+                    return Err(replacement_send_stopped(stop));
+                }
+                if receipt.is_some_and(|ack| ack.worker_outcome.is_some())
+                    || sent.original.rejected_attachment.is_some()
+                {
+                    return Err(ReplacementQualificationFailure::Rejected);
+                }
+                match sent.original.preparation_failure() {
+                    Some(PreparationFailure::Governance(error)) => {
+                        return Err(ReplacementQualificationFailure::DomainRefused(
+                            error.failure_fact(),
+                        ));
+                    }
+                    Some(PreparationFailure::Runtime(_) | PreparationFailure::Layout(_)) => {
+                        return Err(ReplacementQualificationFailure::InvalidReservation);
+                    }
+                    Some(_) => return Err(ReplacementQualificationFailure::Rejected),
+                    None => {}
+                }
+                if let Some(receipt) = receipt {
+                    tracing::debug!(
+                        dispatch = ?receipt.dispatch,
+                        governance = ?receipt.governance,
+                        "replacement dispatch completed without a Worker verdict"
+                    );
+                }
+                // Replay the immutable request with a fresh original WC input
+                // and a new send generation. Backpressure within one send never
+                // reissues a ticket or advances this logical replay counter.
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Err(ReplacementQualificationFailure::Rejected),
+                    _ = tokio::time::sleep_until(expiry) => return Err(ReplacementQualificationFailure::Expired),
+                    _ = tokio::time::sleep(retry_delay) => {},
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(runtime.task_update_retry_policy.max_backoff());
+                send_generation = send_generation
+                    .checked_add(1)
+                    .ok_or(ReplacementQualificationFailure::InvalidReservation)?;
             }
         }
-        Ok(admissions.finish())
+        Ok(())
     };
-    tokio::time::timeout_at(
-        tokio::time::Instant::from_std(qualification.absolute_expiry()),
-        acquire,
-    )
-    .await
-    .map_err(|_| {
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(acquire)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(panic) => {
+            attempt_runtime.retain_replacement_failure(scope, panic);
+            return Err(ReplacementQualificationFailure::OutcomeUnknown);
+        }
+    };
+    if let Some(failure) = unresolved {
+        attempt_runtime.retain_replacement_failure(scope, failure);
+    } else if let Err(error) = attempt_runtime.finish_replacement_qualification(scope) {
+        tracing::warn!(?error, "replacement qualification scope exit is unresolved");
+        return Err(ReplacementQualificationFailure::OutcomeUnknown);
+    }
+    if result == Err(ReplacementQualificationFailure::Expired) {
         tracing::warn!(identity = ?qualification.identity(), "replacement admission acquisition expired");
-        ReplacementQualificationFailure::Expired
-    })?
+    }
+    result?;
+    Ok(admissions.finish())
 }
 
-/// Reuse the qualification's original registered waiter. A second waiter
-/// would allow notify_one to wake the older dormant registration while this
-/// consumer sleeps with its real acknowledgement already in the intake.
-async fn wait_for_replacement_acknowledgement<'a>(
-    acks: &TaskAckIntake,
-    notify: &'a tokio::sync::Notify,
-    mut notified: std::pin::Pin<&mut tokio::sync::futures::Notified<'a>>,
-    cancellation: &mut watch::Receiver<bool>,
-    operation: TaskOperationId,
-) -> Result<crate::task_execution::intent::OperationAcknowledgement, ReplacementQualificationFailure>
-{
-    loop {
-        // Retire the same previous registration, then register before reading
-        // the level-triggered intake. Both early and racing ACKs are retained.
-        notified.as_mut().set(notify.notified());
-        notified.as_mut().enable();
-        if *cancellation.borrow() {
-            return Err(ReplacementQualificationFailure::Rejected);
-        }
-        if let Some(ack) = acks
-            .drain_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
-                TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
-            })
-            .find(|ack| ack.operation_id() == operation)
-        {
-            return Ok(ack);
-        }
-        tokio::select! {
-            _ = &mut notified => {},
-            _ = cancellation.changed() => {
-                return Err(ReplacementQualificationFailure::Rejected);
-            }
-        }
+fn replacement_send_stopped(stop: ReplacementSendStop) -> ReplacementQualificationFailure {
+    match stop {
+        ReplacementSendStop::Cancelled => ReplacementQualificationFailure::Rejected,
+        ReplacementSendStop::Expired => ReplacementQualificationFailure::Expired,
     }
 }
 
@@ -906,12 +1014,12 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
+    attempt_runtime: Arc<crate::control_runtime::FrontendAttemptRuntime>,
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    transport_budget: TransportBudget,
     abort_capacity: NonZeroUsize,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
@@ -927,13 +1035,17 @@ impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
                 &self.runtime_filter_worker_count,
             )
             .field("coordination_budgets", &self.coordination_budgets)
-            .field("transport_budget", &self.transport_budget)
+            .field("transport_budget", &self.transport_budget())
             .field("abort_capacity", &self.abort_capacity)
             .finish_non_exhaustive()
     }
 }
 
 impl FrontendNativeLogicalExecutionRuntime {
+    fn transport_budget(&self) -> TransportBudget {
+        self.attempt_runtime.transport_capacity().transport_budget()
+    }
+
     #[cfg(novarocks_dev_controls)]
     pub(crate) fn with_test_controls(
         mut self,
@@ -959,12 +1071,12 @@ impl FrontendNativeLogicalExecutionRuntime {
         topology: BackendTopologyService,
         process_observation: BackendProcessObservationService,
         data_runtime: FrontendDataRuntime,
+        attempt_runtime: Arc<crate::control_runtime::FrontendAttemptRuntime>,
         native_compatibility_id: NativeCompatibilityId,
         runtime_filter_worker_count: NonZeroUsize,
         task_update_retry_policy: TaskUpdateRetryPolicy,
         split_initial_wait_cap: Duration,
         coordination_budgets: CoordinationBudgets,
-        transport_budget: TransportBudget,
         abort_capacity: NonZeroUsize,
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
@@ -982,12 +1094,12 @@ impl FrontendNativeLogicalExecutionRuntime {
             topology,
             process_observation,
             data_runtime,
+            attempt_runtime,
             native_compatibility_id,
             runtime_filter_worker_count,
             task_update_retry_policy,
             split_initial_wait_cap,
             coordination_budgets,
-            transport_budget,
             abort_capacity,
             lifecycle_diagnostics,
         }
@@ -1513,40 +1625,137 @@ pub(crate) trait FrontendManifestAttemptProjection:
 
 /// One exact Task round and its move-only root result owners.
 pub(crate) struct ProjectedManifestAttempt {
-    round: ManifestAssembledRound,
+    host: DormantManifestHost,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _credential_storage:
         Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
-    _split_assignment: Option<SplitAssignmentRoundGuard>,
-    _abort_route: Option<LogicalAbortRoute>,
     handoff: Option<AttemptHandoffProducer>,
     profile_observer: Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
 }
 
-impl ProjectedManifestAttempt {
-    fn production_rows(
-        round: ManifestAssembledRound,
-        binding: FrontendRootRowsRuntime,
-        statuses: AcceptedRootStatusSource,
-        prepared: TaskExecutionPreparedQuery,
-        credential_storage: Option<
-            Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>,
-        >,
-        split_assignment: Option<SplitAssignmentRoundGuard>,
-        abort_route: LogicalAbortRoute,
-    ) -> Self {
-        Self {
-            round,
-            rows: Some((binding, statuses)),
-            _prepared: Some(prepared),
-            _credential_storage: credential_storage,
-            _split_assignment: split_assignment,
-            _abort_route: Some(abort_route),
-            handoff: None,
-            profile_observer: None,
-        }
+struct DormantManifestHost {
+    runtime: FrontendNativeLogicalExecutionRuntime,
+    prepared: Option<PreparedManifestAttempt>,
+    ready: AttemptReady,
+    establish: AttemptEstablishFacts,
+    replacements: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+    participations: Box<[ParticipationRef]>,
+    subscriptions: Option<StagedSubscriptionEndpoints>,
+    authority: novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
+    abort_route: Arc<LogicalAbortRoute>,
+    result_transport: Arc<NativeTaskResultTransport>,
+    profile: Option<TaskFinalInfoCollector>,
+    dynamic: Option<Arc<DynamicFilterRecords>>,
+    retain_diagnostics: bool,
+}
+
+impl DormantManifestHost {
+    fn root(&self) -> novarocks_execution_contract::TaskIdentity {
+        self.prepared
+            .as_ref()
+            .expect("original dormant host")
+            .graph()
+            .root_identity()
     }
+
+    fn take_protocol_facts(
+        &mut self,
+    ) -> Option<crate::task_execution::protocol_facts::AttemptProtocolFactsReceiver> {
+        self.prepared.as_mut()?.publications.protocol_facts.take()
+    }
+
+    fn install(
+        &mut self,
+        drive: &NativeAttemptDrive,
+    ) -> Result<InstalledAttemptHost, NativeAttemptPreparationFailure> {
+        let prepared = self
+            .prepared
+            .take()
+            .expect("one original Native host installation");
+        let leases = crate::task_execution::lease::RequestedLeaseDurations::DEFAULT;
+        #[cfg(novarocks_dev_controls)]
+        let root_observer = self
+            .runtime
+            .lifecycle_diagnostics
+            .root_observer_for_execution(drive.identity().execution());
+        #[cfg(novarocks_dev_controls)]
+        let observe_dev_root = root_observer.is_some();
+        #[cfg(not(novarocks_dev_controls))]
+        let observe_dev_root = false;
+        InstallAttemptHost {
+            process: &self.runtime.attempt_runtime,
+            data: &self.runtime.data_runtime,
+            clock: self.runtime.clock.clone(),
+            drive,
+            prepared,
+            establish: &self.establish,
+            replacements: self.replacements.as_deref(),
+            subscriptions: self
+                .subscriptions
+                .take()
+                .expect("original staged WC Sources"),
+            authority: self.authority.clone(),
+            route: self.abort_route.clone(),
+            results: self.result_transport.clone(),
+            profile: self.profile.take(),
+            dynamic: self.dynamic.take(),
+            split: self.ready.split_plan_mut(),
+            policy: AttemptPlanPolicy {
+                coordination: self.runtime.coordination_budgets,
+                retry: self.runtime.task_update_retry_policy,
+                initial_lease: leases.initial(),
+                steady_lease: leases.steady(),
+            },
+            ids: attempt_id_seed(),
+            retain_diagnostics: self.retain_diagnostics,
+            observe_dev_root,
+            observe_lifecycle: self.runtime.lifecycle_diagnostics.is_enabled(),
+            #[cfg(novarocks_dev_controls)]
+            root_observer,
+        }
+        .install()
+    }
+
+    async fn converge_unstarted(
+        &mut self,
+    ) -> Result<(), novarocks_query_application::api::StatementNativeHealthFailure> {
+        drop(self.subscriptions.take());
+        self.ready.close().await
+    }
+
+    async fn never_established(
+        &mut self,
+    ) -> Result<
+        NativeActiveConvergenceClosure,
+        novarocks_query_application::api::StatementNativeHealthFailure,
+    > {
+        self.converge_unstarted().await?;
+        Ok(NativeActiveConvergenceClosure::Evidence(
+            NativeAttemptConvergence::participations(
+                self.participations
+                    .iter()
+                    .copied()
+                    .map(NativeParticipationConvergence::never_established)
+                    .collect::<Box<[_]>>(),
+            ),
+        ))
+    }
+}
+
+fn attempt_id_seed() -> novarocks_attempt_protocol::ids::IdSeed {
+    use uuid::{NoContext, Timestamp, Uuid};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host wall time after Unix epoch");
+    let uuid = Uuid::new_v7(Timestamp::from_unix(
+        NoContext,
+        now.as_secs(),
+        now.subsec_nanos(),
+    ))
+    .as_u128();
+    let counter = (((uuid >> 64) & 0x07ff) << 62) | (uuid & ((1u128 << 62) - 1));
+    novarocks_attempt_protocol::ids::IdSeed::new(counter, (uuid >> 80) as u64)
 }
 
 struct ProductionDormantAttemptFactory {
@@ -1629,7 +1838,6 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
                 handoff: self.pending_handoff.take(),
                 pending_projected: None,
             },
-            ManifestAttemptCompletion::AcceptedRootSuccessSeal,
             Arc::clone(&self.runtime.lifecycle_diagnostics),
         ))
     }
@@ -1696,7 +1904,7 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
             );
             let projected = self.pending_projected.as_mut().unwrap();
             if let Some(handoff) = self.handoff.as_mut() {
-                let protocol = projected.round.take_protocol_facts().ok_or_else(|| {
+                let protocol = projected.host.take_protocol_facts().ok_or_else(|| {
                     projection_message(
                         "internal Native attempt lost its original protocol receiver",
                     )
@@ -1704,7 +1912,7 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
                 handoff
                     .stage(
                         manifest.execution(),
-                        projected.round.round.root_task(),
+                        projected.host.root(),
                         manifest.plan(),
                         AttemptHandoffResources::new(
                             protocol,
@@ -1724,7 +1932,7 @@ impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
                 if let Some(handoff) = projected.handoff.as_mut() {
                     handoff.retire_unclaimed();
                 }
-                projected.round.converge_unstarted().await?;
+                projected.host.converge_unstarted().await?;
                 // Only after actual original close may the synchronously
                 // drop-safe return leave its stable receiving field.
                 drop(self.pending_projected.take());
@@ -1797,7 +2005,7 @@ impl FrontendManifestAttemptProjection for ProductionManifestAttemptProjection {
             // original preparation source; no Task RPC can precede this phase.
             self.control_binding.close();
             if let Some(projected) = self.pending_projected.as_mut() {
-                projected.round.converge_unstarted().await?;
+                projected.host.converge_unstarted().await?;
                 drop(self.pending_projected.take());
             }
             if let Some(ready) = self.pending_ready.as_mut() {
@@ -2089,63 +2297,41 @@ impl ProductionManifestAttemptProjection {
         }
         // Even an empty table carries the original collector's transfer fact.
         let credential_storage = Some(storage);
-        let backends = manifest
-            .participations()
-            .iter()
-            .map(|participation| participation.backend().target().descriptor().clone())
-            .collect::<Vec<_>>();
-        let mut round = crate::task_execution::manifest_round::assemble_manifest_round(
-            manifest,
-            submissions,
-            establish,
-            replacement_admissions,
-            crate::task_execution::manifest_round::ManifestAttemptTransport {
-                clock: Arc::clone(&self.runtime.clock),
-                dispatch_budget: self.runtime.coordination_budgets.dispatch,
-                transport_budget: self.runtime.transport_budget,
-                status_subscription_error_budget: self
-                    .runtime
-                    .coordination_budgets
-                    .status_subscription_error_budget,
-                wire: AttemptWireFacts {
-                    native_compatibility_id: self.runtime.native_compatibility_id,
-                },
-                data_runtime: self.runtime.data_runtime.clone(),
-                subscription_scope: self.work_scope.clone(),
-                source_cohort: self
-                    .source_cohort
-                    .borrowed()
-                    .map_err(|error| projection_message(error.to_string()))?,
-                native_actions: self.native_actions.clone(),
-                convergence_source: Arc::clone(&self.runtime.process_observation),
-            },
-        )
-        .map_err(|error| projection_message(error.to_string()))?;
+        let inputs = {
+            let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)
+                .map_err(|error| projection_message(error.to_string()))?;
+            ManifestAttemptInputs::freeze(
+                manifest,
+                &mut plans,
+                self.runtime.native_compatibility_id,
+                self.runtime.transport_budget(),
+            )
+            .map_err(|error| projection_message(error.to_string()))?
+        };
+        if let Some(admissions) = replacement_admissions.as_deref() {
+            crate::task_execution::manifest_projection::validate_replacement_admissions(
+                inputs.graph.participations().copied(),
+                admissions,
+            )
+            .map_err(|error| projection_message(error.to_string()))?;
+        }
+        let root = inputs.graph.root_identity();
+        let participations = inputs.graph.participations().copied().collect::<Box<[_]>>();
+        let cohort = self
+            .source_cohort
+            .borrowed()
+            .map_err(|error| projection_message(error.to_string()))?;
         let result_transport = Arc::new(
             NativeTaskResultTransport::new(
-                &backends,
+                inputs.backends.clone(),
                 self.runtime.data_runtime.clone(),
-                TaskReadGrace::new(self.runtime.transport_budget.frontend_queue_residence()),
+                TaskReadGrace::new(self.runtime.transport_budget().frontend_queue_residence()),
             )
             .map_err(projection_message)?,
         );
-        install_attempt_pumps(
-            &mut round.round,
-            AttemptPumps {
-                feedback_state: feedback,
-                declared_feedback_channels: feedback_declaration.channels().len(),
-                reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
-            },
-        );
-        let (abort_route, abort_intake) =
-            self.aborts
-                .install(execution, self.runtime.abort_capacity, round.abort_wake())?;
-        round.install_abort_effect_intake(abort_intake);
-        let root_status = round.take_root_status_source().ok_or_else(|| {
-            projection_message("logical execution Task round has no accepted root status source")
-        })?;
-        let result_transport_for_diagnostics = Arc::clone(&result_transport)
-            as Arc<dyn crate::native::task_result_transport::TaskResultTransport>;
+        let dynamic = (feedback_declaration.channels().len() != 0)
+            .then(|| DynamicFilterRecords::new(result_transport.clone(), feedback));
+        let abort_route = Arc::new(self.aborts.reserve_route(execution)?);
         let root_binding = match &self.delivery {
             ProductionRootDelivery::Relayed {
                 kind,
@@ -2153,49 +2339,86 @@ impl ProductionManifestAttemptProjection {
                 window,
             } => {
                 let frontier = RootRelayFrontier::new(
-                    round.round.root_task(),
+                    root,
                     novarocks_result_contract::RootProfileId::V1,
                     *kind,
                     *client_rows,
                 )
                 .map_err(|error| projection_message(error.to_string()))?;
+                let port = NativeBoundedRootReadPort::new(result_transport.clone());
+                #[cfg(novarocks_dev_controls)]
+                let port = port.with_root_observer(
+                    self.runtime
+                        .lifecycle_diagnostics
+                        .root_observer_for_execution(execution),
+                );
                 RootRelayBinding {
-                    port: Arc::new(NativeBoundedRootReadPort::new(result_transport)),
+                    port: Arc::new(port),
                     frontier,
                     window: window.clone(),
                     max_wait: Duration::from_millis(250),
                 }
             }
         };
-        let profile_observer = match self.diagnostics {
-            ComputationDiagnostics::None => None,
-            ComputationDiagnostics::Profile => Some(
-                round
-                    .install_profile_diagnostics(result_transport_for_diagnostics)
-                    .map_err(|error| projection_message(error.to_string()))?,
-            ),
-        };
-        self.pending_projected = Some(ProjectedManifestAttempt::production_rows(
-            round,
-            root_binding,
-            root_status,
-            task_prepared,
-            credential_storage,
-            None,
-            abort_route,
-        ));
-        let attempt = self.pending_projected.as_mut().unwrap();
-        attempt.profile_observer = profile_observer;
-        // Every fallible preparation step completed while the initializer's
-        // original Ready field still owned all source handles. Publish the
-        // complete original round before the sole plan-to-pump transfer.
-        if let Some(plan) = self.pending_ready.as_mut().unwrap().take_split_plan() {
-            attempt._split_assignment = attempt.round.install_split_assignment(
-                execution,
-                plan,
-                self.runtime.data_runtime.clone(),
+        let retain_diagnostics = matches!(self.diagnostics, ComputationDiagnostics::Profile);
+        let (profile, profile_observer) = if retain_diagnostics {
+            let mut original = TaskFinalInfoCollector::from_graph(
+                result_transport.clone(),
+                true,
+                &inputs.graph,
+                Arc::new(NotifyWake::new(Arc::new(tokio::sync::Notify::new()))),
             );
-        }
+            let observer = original
+                .enable_profile_observation()
+                .map_err(|error| projection_message(error.to_string()))?;
+            (Some(original), Some(observer))
+        } else {
+            (None, None)
+        };
+        let subscriptions = stage_subscription_endpoints(
+            &inputs.members,
+            FrozenSubscriptionStageInputs {
+                backends: &inputs.backends,
+                compatibility: self.runtime.native_compatibility_id,
+                data: &self.runtime.data_runtime,
+                scope: &self.work_scope,
+                cohort: &cohort,
+                execution,
+            },
+        )
+        .map_err(|error| {
+            projection_message(format!("stage original Native subscriptions: {error:?}"))
+        })?;
+        let mut prepared = inputs
+            .prepare_publications()
+            .map_err(|error| projection_message(error.to_string()))?;
+        let root_status = prepared
+            .publications
+            .root_status
+            .take()
+            .expect("original root status Source");
+        self.pending_projected = Some(ProjectedManifestAttempt {
+            host: DormantManifestHost {
+                runtime: self.runtime.clone(),
+                prepared: Some(prepared),
+                ready: self.pending_ready.take().expect("original opened Sources"),
+                establish,
+                replacements: replacement_admissions,
+                participations,
+                subscriptions: Some(subscriptions),
+                authority: self.native_actions.clone(),
+                abort_route,
+                result_transport,
+                profile,
+                dynamic,
+                retain_diagnostics,
+            },
+            rows: Some((root_binding, root_status)),
+            _prepared: Some(task_prepared),
+            _credential_storage: credential_storage,
+            handoff: None,
+            profile_observer,
+        });
         Ok(self.pending_projected.take().unwrap())
     }
 }
@@ -2238,7 +2461,6 @@ fn projection_message(message: impl Into<String>) -> NativeAttemptActivationFail
 /// Dormant half of the concrete manifest-only Task protocol behavior.
 pub(crate) struct FrontendTaskProtocolDormantBehavior<P> {
     projection: P,
-    completion: ManifestAttemptCompletion,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
@@ -2251,7 +2473,6 @@ where
         formatter
             .debug_struct("FrontendTaskProtocolDormantBehavior")
             .field("projection", &self.projection)
-            .field("completion", &self.completion)
             .finish()
     }
 }
@@ -2259,14 +2480,12 @@ where
 impl<P> FrontendTaskProtocolDormantBehavior<P> {
     pub(crate) fn new(
         projection: P,
-        completion: ManifestAttemptCompletion,
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
     ) -> Self {
         Self {
             projection,
-            completion,
             lifecycle_diagnostics,
         }
     }
@@ -2319,7 +2538,6 @@ where
             };
             Ok(FrontendTaskProtocolActiveBehavior::new(
                 attempt,
-                self.completion,
                 Arc::clone(&self.lifecycle_diagnostics),
             ))
         })
@@ -2340,14 +2558,13 @@ where
 /// This type receives no compiler, topology reader, scheduling plan or backend
 /// ordinal map; its only execution authority is the already assembled round.
 pub(crate) struct FrontendTaskProtocolActiveBehavior {
-    attempt: ManifestAssembledRound,
-    completion: ManifestAttemptCompletion,
+    attempt: DormantManifestHost,
+    registered: Option<InstalledAttemptHost>,
+    observed_failure: Option<ExecutionFailureInput>,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _credential_storage:
         Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
-    _split_assignment: Option<SplitAssignmentRoundGuard>,
-    _abort_route: Option<LogicalAbortRoute>,
     handoff: Option<AttemptHandoffProducer>,
     _profile_observer:
         Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
@@ -2359,7 +2576,7 @@ impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FrontendTaskProtocolActiveBehavior")
-            .field("completion", &self.completion)
+            .field("registered", &self.registered.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -2367,43 +2584,25 @@ impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
 impl FrontendTaskProtocolActiveBehavior {
     pub(crate) fn new(
         attempt: ProjectedManifestAttempt,
-        completion: ManifestAttemptCompletion,
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
     ) -> Self {
         let ProjectedManifestAttempt {
-            round,
+            host,
             rows,
             _prepared: prepared,
             _credential_storage: credential_storage,
-            _split_assignment: split_assignment,
-            _abort_route: abort_route,
             handoff,
             profile_observer,
         } = attempt;
-        #[cfg(novarocks_dev_controls)]
-        let round = {
-            let mut round = round;
-            let execution = round
-                .round
-                .execution()
-                .graph()
-                .root_identity()
-                .query_execution_id();
-            if let Some(observer) = lifecycle_diagnostics.root_observer_for_execution(execution) {
-                round.round.install_root_observer(observer);
-            }
-            round
-        };
         Self {
-            attempt: round,
-            completion,
+            attempt: host,
+            registered: None,
+            observed_failure: None,
             rows,
             _prepared: prepared,
             _credential_storage: credential_storage,
-            _split_assignment: split_assignment,
-            _abort_route: abort_route,
             handoff,
             _profile_observer: profile_observer,
             lifecycle_diagnostics,
@@ -2435,15 +2634,31 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         cancellation: CancellationView,
     ) -> NativeAttemptRunFuture<'a> {
         Box::pin(async move {
-            if let Err(error) = self.attempt.round.bind_protocol_drive(drive) {
-                return crate::task_execution::manifest_round::task_protocol_failure(error);
-            }
             if let Some(handoff) = self.handoff.as_mut()
                 && let Err(error) = handoff.bind(drive)
             {
                 return NativeAttemptTerminal::Failed(handoff_failure(error));
             }
-            self.attempt.run(drive, cancellation, self.completion).await
+            if self.registered.is_none() {
+                match self.attempt.install(drive) {
+                    Ok(original) => self.registered = Some(original),
+                    Err(error) => {
+                        self.observed_failure = Some(error.input().clone());
+                        return NativeAttemptTerminal::Failed(error);
+                    }
+                }
+            }
+            let original = self
+                .registered
+                .as_mut()
+                .unwrap()
+                .bridge
+                .run(cancellation)
+                .await;
+            if let NativeAttemptTerminal::Failed(failure) = &original {
+                self.observed_failure = Some(failure.input().clone());
+            }
+            original
         })
     }
 
@@ -2457,34 +2672,26 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
             if let Some(handoff) = self.handoff.as_mut() {
                 handoff.retire_unclaimed();
             }
-            let convergence = self.attempt.converge(request).await?;
-            if self.lifecycle_diagnostics.is_enabled() {
-                let observed_failure = self.attempt.observed_failure();
-                let contributions = self
-                    .attempt
-                    .round
-                    .execution()
-                    .released_runtime_filter_contributions();
-                let runtime_filter = if contributions.is_complete() {
-                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Available(
-                    crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions(
-                        contributions.contributions(),
-                    ),
-                )
-                } else {
-                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Unavailable(
-                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
-                )
-                };
+            let Some(original) = self.registered.as_mut() else {
+                return self.attempt.never_established().await;
+            };
+            let retain = self.attempt.retain_diagnostics;
+            if retain && let Some(ready) = request.computation_ready() {
+                original.register_cut(ready).await?;
+            }
+            let convergence = original.bridge.converge(request, retain, || Ok(())).await?;
+            if self.lifecycle_diagnostics.is_enabled()
+                && let Some(runtime_filter) = original.take_lifecycle_rollup()
+            {
                 self.lifecycle_diagnostics.publish(
-                crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
-                    execution_id,
-                    primary_error: None,
-                failure: observed_failure,
-                worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
-                    runtime_filter,
-                },
-            );
+                    crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+                        execution_id,
+                        primary_error: None,
+                        failure: self.observed_failure.clone(),
+                        worker_participations_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
+                        runtime_filter,
+                    },
+                );
             }
             Ok(convergence)
         })
@@ -3206,76 +3413,6 @@ fn attempt_runtime_failure(
         SafeDetail::truncating(safe),
         ExecutionFailureSite::Coordinator,
     ))
-}
-
-#[cfg(test)]
-mod replacement_ack_tests {
-    use super::*;
-    use std::future::Future;
-    use std::sync::atomic::AtomicUsize;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct AckWake(AtomicUsize);
-    impl Wake for AckWake {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn replacement_ack_reuses_its_registered_waiter_for_early_and_late_real_intake_facts() {
-        for early in [false, true] {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-            let acks = TaskAckIntake::new(wake);
-            let operation = TaskOperationId::new_v7();
-            // This is the same still-live registration made before the real
-            // queue/submit stage. It must not steal the sole ACK notification.
-            let original_waiter = notify.notified();
-            tokio::pin!(original_waiter);
-            original_waiter.as_mut().enable();
-            let publish = || {
-                acks.handle().publish(crate::task_execution::intent::OperationAcknowledgement::new(
-                    operation,
-                    novarocks_execution_contract::OperationKind::AcquireParticipationAdmissionTicket,
-                    OperationOutcome::ResourceExhausted,
-                    AckPayload::None,
-                ));
-            };
-            if early {
-                publish();
-            }
-            let (_cancellation, mut cancellation) = watch::channel(false);
-            let wait = wait_for_replacement_acknowledgement(
-                &acks,
-                &notify,
-                original_waiter.as_mut(),
-                &mut cancellation,
-                operation,
-            );
-            tokio::pin!(wait);
-            let wake = Arc::new(AckWake(AtomicUsize::new(0)));
-            let waker = Waker::from(Arc::clone(&wake));
-            let mut cx = Context::from_waker(&waker);
-            if !early {
-                assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
-                publish();
-                assert!(
-                    wake.0.load(Ordering::SeqCst) > 0,
-                    "the real ACK must wake the actively awaited original registration"
-                );
-            }
-            let Poll::Ready(Ok(ack)) = wait.as_mut().poll(&mut cx) else {
-                panic!("a published ACK must not remain stranded behind a dormant waiter");
-            };
-            assert_eq!(ack.operation_id(), operation);
-            assert_eq!(
-                ack.worker_outcome(),
-                Some(OperationOutcome::ResourceExhausted)
-            );
-            assert_eq!(acks.queued(), 0);
-        }
-    }
 }
 
 #[cfg(test)]

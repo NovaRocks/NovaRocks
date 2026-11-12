@@ -26,9 +26,6 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
     )
 }
 
-/// Native Task protocol bounds frozen by frontend process composition.
-pub mod task_protocol_config;
-
 mod native_workload;
 pub use native_workload::{
     FrontendNativeCapacityInputs, FrontendWorkloadCapacityConfig, FrontendWorkloadCapacityProfile,
@@ -86,6 +83,7 @@ pub(crate) mod topology;
 mod topology_metrics;
 pub use topology::ClusterBackendOpenConfig;
 mod view;
+mod wake;
 pub(crate) mod workload_lifecycle;
 
 #[cfg(novarocks_dev_controls)]
@@ -99,3 +97,7 @@ pub mod test_session;
 compile_error!("novarocks_dev_controls must match debug_assertions");
 
 pub use query_execution::required_constant_eval::RequiredConstantInterpreter;
+
+pub(crate) mod control_runtime;
+
+pub mod task_wire;

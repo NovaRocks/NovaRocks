@@ -708,7 +708,7 @@ struct StatisticsSubmitInput {
 }
 #[derive(Debug, Default)]
 struct StatisticsSubmitWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for StatisticsSubmitWake {
+impl crate::wake::StatusIntakeWake for StatisticsSubmitWake {
     fn wake(&self) {
         self.0.wake();
     }

@@ -18,6 +18,7 @@ use crate::scenarios::native_create_hold::{HeldCreate, HoldListener};
 use std::time::Instant;
 
 const FAULT: &str = "create-task-before-worker-hold";
+const CREATE_ACK_DROP: &str = "create-task-ack-drop";
 const QUERY: &str = "SELECT v FROM cbw_catalog.cbw_db.cbw_data LIMIT 0";
 
 #[derive(Default)]
@@ -63,6 +64,9 @@ impl Scenario for LimitZeroUnknownSender {
         deadline: Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
         let mut statement = fault_statement(QUERY, FAULT);
+        statement
+            .faults
+            .extend((0..REQUIRED_BACKENDS).map(|index| (index, CREATE_ACK_DROP)));
         statement.observations = (0..REQUIRED_BACKENDS)
             .map(|index| {
                 (
@@ -154,10 +158,22 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
                     .min(RESOURCE_POLL_INTERVAL),
             );
         };
-        let root = held
+        let root_index = held
             .iter()
-            .find(|create| create.backend == root_backend && create.outbound_edges == 0)
+            .position(|create| create.backend == root_backend && create.outbound_edges == 0)
             .expect("the root Create was required above");
+        let root = &held[root_index];
+        let root_identity = root.identity_marker();
+        let first_read_fields = [
+            format!("stage={}", root.stage),
+            format!("task={}", root.task),
+            format!("backend={}", root.process),
+        ];
+        ensure!(
+            first_frontend_root_read(&context.handle().fe_log_contents()?, &root.execution)?
+                .is_none(),
+            "FE attempted a Root read while its exact Create was held before Worker"
+        );
         let root_execution_parts = root.execution.split(':').collect::<Vec<_>>();
         ensure!(
             root_execution_parts.len() == 3,
@@ -195,10 +211,12 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
         context.action(format!(
             "partitioned live BE[{target}] process={process} with {identity} still held before Worker; root BE[{root_backend}] remains reachable"
         ));
-        // Root creation is released only after the target partition is active,
-        // so neither exact root Finished nor EOS can precede the disconnect.
+        // Let only the first Root Create reach its Worker on that process.
+        // The ACK drop then belongs to that operation, and a replay cannot
+        // answer through the Worker before the first Root read.
+        held[root_index].release()?;
         for create in &mut held {
-            if create.backend != target {
+            if create.backend != target && create.backend != root_backend {
                 create.release()?;
             }
         }
@@ -216,7 +234,7 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
             while let Some(mut create) =
                 listener.try_receive(&selected.token, context.deadline())?
             {
-                if create.backend != target {
+                if create.backend != target && create.backend != root_backend {
                     create.release()?;
                 }
                 held.push(create);
@@ -255,7 +273,60 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
                 && line.contains(&format!("{identity} "))),
             "held Create unexpectedly reached Worker before root success: {identity}"
         );
-        let root_log = context.handle().be_log_contents(root_backend)?;
+        let frontend_log = context.handle().fe_log_contents()?;
+        let first_read = first_frontend_root_read(&frontend_log, &execution)?
+            .context("the original FE root relay omitted its first-read observation")?;
+        let fields = first_read.split_whitespace().collect::<Vec<_>>();
+        ensure!(
+            first_read_fields
+                .iter()
+                .all(|field| fields.contains(&field.as_str()))
+                && fields.contains(&"wanted=1")
+                && fields.contains(&"consumed=0"),
+            "the first FE read differs from the exact frozen Root or initial frontier: {first_read}"
+        );
+        let installed_version = fields
+            .iter()
+            .find_map(|field| field.strip_prefix("installed_status_version="))
+            .context("first FE Root read omitted the original Installed observation")?;
+        ensure!(
+            installed_version
+                .parse::<u64>()
+                .is_ok_and(|version| version > 0),
+            "first FE Root read overtook its exact Host Installed observation: {first_read}"
+        );
+        context.action(format!(
+            "first FE Root read used the installed original task: {first_read}"
+        ));
+        let root_marker_fields = format!("{root_identity} ");
+        let root_log = loop {
+            let log = context.handle().be_log_contents(root_backend)?;
+            let ack_dropped = log.lines().any(|line| {
+                line.contains(novarocks_failpoint::observation_marker::TASK_CREATE_ACK_DROPPED)
+                    && line.contains(&root_marker_fields)
+                    && line
+                        .split_whitespace()
+                        .any(|field| field.strip_prefix("token=") == Some(selected.token.as_str()))
+            });
+            if ack_dropped {
+                break log;
+            }
+            thread::sleep(
+                context
+                    .remaining("observe the exact dropped Root Create ACK")?
+                    .min(RESOURCE_POLL_INTERVAL),
+            );
+        };
+        ensure!(
+            !root_log.lines().any(|line| {
+                line.contains(novarocks_failpoint::observation_marker::TASK_CREATE_IDEMPOTENT)
+                    && line.contains(&root_marker_fields)
+            }),
+            "the Worker answered a replay of the exact Root Create before root success: {root_identity}"
+        );
+        context.action(format!(
+            "the original Worker dropped the exact Root Create ACK while any replay remained held: {root_identity}"
+        ));
         ensure!(
             root_log.lines().any(|line| line
                 .contains(novarocks_failpoint::observation_marker::GRPC_FETCH_TYPED)
@@ -304,6 +375,25 @@ fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> R
     );
     await_resource_convergence(context, &baseline)?;
     Ok(())
+}
+
+fn first_frontend_root_read<'a>(log: &'a str, execution: &str) -> Result<Option<&'a str>> {
+    let execution = format!("execution_id={execution}");
+    let mut matching = log.lines().filter_map(|line| {
+        let (_, fields) =
+            line.split_once(novarocks_failpoint::observation_marker::FRONTEND_ROOT_FIRST_READ)?;
+        let fields = fields.strip_prefix(' ')?;
+        fields
+            .split_whitespace()
+            .any(|field| field == execution)
+            .then_some(fields)
+    });
+    let first = matching.next();
+    ensure!(
+        matching.next().is_none(),
+        "more than one first FE Root read was observed for {execution}"
+    );
+    Ok(first)
 }
 
 fn release_observed_then_clear(

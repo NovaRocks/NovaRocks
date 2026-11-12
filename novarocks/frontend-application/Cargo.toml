@@ -13,6 +13,9 @@ doctest = false
 [features]
 
 [dependencies]
+novarocks-control-runtime.workspace = true
+novarocks-control-runtime-core.workspace = true
+novarocks-attempt-protocol.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-arrow-batch-codec.workspace = true
@@ -76,6 +79,7 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
+novarocks-attempt-protocol = { workspace = true, features = ["test-support"] }
 novarocks-plan-codec = { workspace = true }
 novarocks-mv-application = { workspace = true }
 novarocks-catalog-application = { workspace = true }

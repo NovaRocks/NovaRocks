@@ -22,23 +22,27 @@
 //! protocol values and creation seeds that retain those same frozen facts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticSinkTarget};
 use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::artifact::NativePlacementAssignment;
+use novarocks_attempt_protocol::start::{
+    FrozenExchangeEdge, FrozenTask, FrozenTaskGraph, PayloadRef,
+};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::task_execution::{
-    ExchangeEdgeId, ParticipationRef, PlanNodeId, StageRef, TaskIdentity,
+    ExchangeEdgeId, ParticipationRef, PlanNodeId, TaskIdentity,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{QueryExecutionId, StageId, TaskId};
 
 use super::creation::{
-    AttemptTopology, EdgeDestination, EdgeProducer, SharedEdge, TaskCreationFacts,
-    TaskCreationSeed, TaskTopologyView,
+    AttemptTopology, EdgeDestination, EdgeProducer, PricedTaskCreation, SharedEdge,
+    TaskCreationFacts, TaskCreationSeed, TaskTopologyView,
 };
 use super::error::{CapacityBound, TaskExecutionError};
 use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestBinding};
@@ -162,6 +166,7 @@ impl TaskNode {
         self.identity
     }
 
+    #[cfg(test)]
     pub const fn participation(&self) -> ParticipationRef {
         self.participation
     }
@@ -190,23 +195,26 @@ impl TaskNode {
     }
 
     /// The plan nodes of this task that accept split assignments.
+    #[cfg(test)]
     pub fn split_plan_nodes(&self) -> &[PlanNodeId] {
         &self.split_plan_nodes
     }
 }
 
 /// One stage: the complete, frozen task set of one fragment.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StageNode {
-    stage: StageRef,
+    stage: novarocks_execution_contract::StageRef,
     #[cfg(test)]
     fragment_id: FragmentId,
     #[cfg(test)]
     tasks: Vec<TaskId>,
 }
 
+#[cfg(test)]
 impl StageNode {
-    pub const fn stage(&self) -> StageRef {
+    pub const fn stage(&self) -> novarocks_execution_contract::StageRef {
         self.stage
     }
 
@@ -243,6 +251,7 @@ impl EdgeNode {
         self.edge_id
     }
 
+    #[cfg(test)]
     pub const fn producer_stage(&self) -> StageId {
         self.producer_stage
     }
@@ -259,12 +268,14 @@ impl EdgeNode {
         self.delivery
     }
 
+    #[cfg(test)]
     pub fn producers(&self) -> &[TaskIdentity] {
         &self.producers
     }
 
     /// Every destination whose creation must be acknowledged before this edge
     /// may be opened.
+    #[cfg(test)]
     pub fn destinations(&self) -> &[TaskIdentity] {
         &self.destinations
     }
@@ -276,8 +287,10 @@ pub struct TaskGraph {
     execution_id: QueryExecutionId,
     root_task: TaskId,
     tasks: BTreeMap<TaskId, TaskNode>,
+    #[cfg(test)]
     stages: BTreeMap<StageId, StageNode>,
     edges: BTreeMap<ExchangeEdgeId, EdgeNode>,
+    #[cfg(test)]
     producer_stages: BTreeMap<StageId, BTreeSet<StageId>>,
     participations: BTreeSet<ParticipationRef>,
     seeds: BTreeMap<TaskId, TaskCreationSeed>,
@@ -288,6 +301,7 @@ impl TaskGraph {
         self.execution_id
     }
 
+    #[cfg(test)]
     pub const fn root_task(&self) -> TaskId {
         self.root_task
     }
@@ -299,6 +313,7 @@ impl TaskGraph {
             .identity()
     }
 
+    #[cfg(test)]
     pub fn task(&self, task_id: TaskId) -> Option<&TaskNode> {
         self.tasks.get(&task_id)
     }
@@ -307,20 +322,24 @@ impl TaskGraph {
         self.tasks.values()
     }
 
+    #[cfg(test)]
     pub fn stage(&self, stage_id: StageId) -> Option<&StageNode> {
         self.stages.get(&stage_id)
     }
 
+    #[cfg(test)]
     pub fn stages(&self) -> impl ExactSizeIterator<Item = &StageNode> + '_ {
         self.stages.values()
     }
 
+    #[cfg(test)]
     pub fn edges(&self) -> impl ExactSizeIterator<Item = &EdgeNode> + '_ {
         self.edges.values()
     }
 
     /// The stages that feed `stage_id`, which are exactly the stages this one
     /// releases when it stops consuming.
+    #[cfg(test)]
     pub fn producer_stages(&self, stage_id: StageId) -> impl Iterator<Item = StageId> + '_ {
         self.producer_stages
             .get(&stage_id)
@@ -337,9 +356,83 @@ impl TaskGraph {
 
     /// Takes the creation seeds out so each one is owned by exactly one task
     /// from here on.
+    #[cfg(test)]
     pub(crate) fn into_seeds(mut self) -> (Self, BTreeMap<TaskId, TaskCreationSeed>) {
         let seeds = std::mem::take(&mut self.seeds);
         (self, seeds)
+    }
+
+    /// Move the exact manifest-derived creation seeds to the host payload
+    /// store. Core receives only the topology and allocation-free quotes.
+    pub(crate) fn into_attempt_graph(
+        mut self,
+        next_payload: &mut NonZeroU64,
+    ) -> Result<(FrozenTaskGraph, BTreeMap<PayloadRef, PricedTaskCreation>), TaskExecutionError>
+    {
+        let root = self.root_identity();
+        let mut next = *next_payload;
+        let mut creations = BTreeMap::new();
+        let mut tasks = BTreeMap::new();
+        let mut stages = BTreeMap::<StageId, Vec<TaskIdentity>>::new();
+        for (id, node) in self.tasks {
+            let seed = self
+                .seeds
+                .remove(&id)
+                .expect("original manifest creation seed");
+            let resource = PayloadRef(next);
+            next = next.checked_add(1).ok_or_else(|| {
+                TaskExecutionError::Schedule("attempt payload identity space exhausted".into())
+            })?;
+            let (creation, original) = PricedTaskCreation::quote(seed, resource)?;
+            creations.insert(resource, original);
+            stages
+                .entry(node.stage_id())
+                .or_default()
+                .push(node.identity);
+            tasks.insert(
+                id,
+                FrozenTask {
+                    identity: node.identity,
+                    participation: node.participation,
+                    task_key: node.task_key,
+                    fragment_id: node.fragment_id,
+                    split_plan_nodes: node.split_plan_nodes.into_boxed_slice(),
+                    creation,
+                },
+            );
+        }
+        let stages = stages
+            .into_iter()
+            .map(|(stage, tasks)| (stage, tasks.into_boxed_slice()))
+            .collect();
+        let edges = self
+            .edges
+            .into_iter()
+            .map(|(id, edge)| {
+                (
+                    id,
+                    FrozenExchangeEdge {
+                        edge: edge.edge_id,
+                        producer_stage: edge.producer_stage,
+                        consumer_stage: edge.consumer_stage,
+                        destination_node: edge.destination_node_id,
+                        delivery: edge.delivery,
+                        producers: edge.producers.into_boxed_slice(),
+                        destinations: edge.destinations.into_boxed_slice(),
+                    },
+                )
+            })
+            .collect();
+        *next_payload = next;
+        Ok((
+            FrozenTaskGraph {
+                root,
+                tasks,
+                stages,
+                edges,
+            },
+            creations,
+        ))
     }
 
     /// The creation seed of one task, while the graph still owns it.
@@ -719,13 +812,17 @@ pub(crate) fn build_task_graph_from_manifest(
         seeds.insert(task_id, seed);
     }
 
+    #[cfg(test)]
     let stages = stage_fragments
         .keys()
         .map(|&stage_id| {
             (
                 stage_id,
                 StageNode {
-                    stage: StageRef::new(manifest.execution(), stage_id),
+                    stage: novarocks_execution_contract::StageRef::new(
+                        manifest.execution(),
+                        stage_id,
+                    ),
                     #[cfg(test)]
                     fragment_id: stage_fragments[&stage_id],
                     #[cfg(test)]
@@ -739,7 +836,9 @@ pub(crate) fn build_task_graph_from_manifest(
             )
         })
         .collect();
+    #[cfg(test)]
     let mut producer_stages = BTreeMap::<StageId, BTreeSet<StageId>>::new();
+    #[cfg(test)]
     for edge in edges.values() {
         producer_stages
             .entry(edge.consumer_stage)
@@ -750,8 +849,10 @@ pub(crate) fn build_task_graph_from_manifest(
         execution_id: manifest.execution(),
         root_task,
         tasks,
+        #[cfg(test)]
         stages,
         edges,
+        #[cfg(test)]
         producer_stages,
         participations,
         seeds,

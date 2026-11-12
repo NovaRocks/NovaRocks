@@ -238,6 +238,7 @@ fn slow_host_destructor_keeps_its_work_but_does_not_occupy_the_only_poller() {
             generation: generation(),
             guard: WorkId::new(1).unwrap(),
             resources: ReservationResources {
+                keyed: None,
                 quota: vector(1),
                 owned_slots: OwnedSlotNeed {
                     work_headers: 1,
@@ -344,6 +345,7 @@ fn concurrent_production_admission_mints_and_binds_ids_in_one_transaction() {
                     .reserve_next(
                         generation(),
                         ReservationResources {
+                            keyed: None,
                             quota: vector(1),
                             owned_slots: OwnedSlotNeed {
                                 work_headers: 1,

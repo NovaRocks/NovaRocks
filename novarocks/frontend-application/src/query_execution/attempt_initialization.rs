@@ -50,7 +50,7 @@ use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoError, ConnectorBlockingIoResponsibility,
     ConnectorBlockingIoSupervisor, ConnectorOperationJob as ConnectorBlockingIoJob,
 };
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_query_application::api::StatementNativeHealthFailure;
 use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
@@ -471,7 +471,7 @@ struct ProductionSourceRecipe {
 
 #[derive(Debug, Default)]
 struct SourcePreparationWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for SourcePreparationWake {
+impl crate::wake::StatusIntakeWake for SourcePreparationWake {
     fn wake(&self) {
         self.0.wake();
     }
@@ -1071,8 +1071,8 @@ impl AttemptReady {
         )
     }
 
-    pub(crate) fn take_split_plan(&mut self) -> Option<RoundSplitAssignmentPlan> {
-        self.split_assignment_plan.take()
+    pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {
+        &mut self.split_assignment_plan
     }
 
     pub(crate) async fn close(&mut self) -> Result<(), StatementNativeHealthFailure> {

@@ -36,7 +36,7 @@ use crate::query_execution::{
     },
 };
 use crate::state_store::execution::{StateStoreOriginalBinding, StateStoreOriginalOwner};
-use crate::task_execution::status_intake::StatusIntakeWake;
+use crate::wake::StatusIntakeWake;
 use novarocks_failure_contract::SharedFailureCause;
 use novarocks_mv_application::{
     management::ManagementEntrance,

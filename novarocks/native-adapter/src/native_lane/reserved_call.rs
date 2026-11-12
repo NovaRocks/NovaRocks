@@ -49,6 +49,74 @@ impl SelectedNativeCall {
         self.channel.try_reserve_local(cx)
     }
 
+    /// Keep this SAME Tonic clone/waiter through Pending and keep its actual
+    /// Buffer qualification through Ready. This returns no sending authority,
+    /// acquires no stream/Class/dial position and polls no RPC. The caller may
+    /// only carry it between physical attempts of the SAME original WC ticket.
+    /// Cancellation must destroy this source before reporting DefinitelyUnsent.
+    pub fn poll_sdk_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StdError>> {
+        if let Some(admission) = &self.channel.outgoing_admission {
+            loop {
+                let changed = self
+                    .channel
+                    .outgoing_changed
+                    .get_or_insert_with(|| Box::pin(admission.frontend_outgoing_notified()));
+                if changed.as_mut().poll(cx).is_pending() {
+                    break;
+                }
+                drop(self.channel.outgoing_changed.take());
+                // A completed notifier is never polled again. Re-arm before
+                // the closed/source check; actual events justify each pass.
+            }
+            if admission.frontend_outgoing_is_closed() {
+                return Poll::Ready(Err("frontend outgoing native transport closed".into()));
+            }
+        }
+        Service::poll_ready(&mut self.channel.channel, cx).map_err(Into::into)
+    }
+    /// Transfer the SAME SDK-ready clone into a local physical quote, never
+    /// Drop/reacquire its Buffer qualification. A stream refusal retains only
+    /// that selected SDK state; it holds no stream, Class, dial or Joint grant.
+    /// Register stream_ready_notified BEFORE retrying this author.
+    pub fn try_reserve_qualified_in(
+        source: &mut Option<Self>,
+        target: &mut Option<ReservedNativeCall>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StdError>> {
+        if target.is_some() {
+            return Poll::Ready(Err("native qualified call receiver is occupied".into()));
+        }
+        let Some(selected) = source.as_mut() else {
+            return Poll::Ready(Err("native SDK source is absent".into()));
+        };
+        match selected.poll_sdk_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        let permit = match Arc::clone(&selected.channel.gate.semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Poll::Pending,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Poll::Ready(Err("native lane stream gate closed".into()));
+            }
+        };
+        if selected
+            .channel
+            .outgoing_admission
+            .as_ref()
+            .is_some_and(NativeTransportAdmission::frontend_outgoing_is_closed)
+        {
+            drop(permit);
+            return Poll::Ready(Err("frontend outgoing native transport closed".into()));
+        }
+        selected.channel.reserved = Some(permit);
+        let selected = source.take().expect("same original SDK-qualified source");
+        *target = Some(ReservedNativeCall {
+            channel: Some(selected.channel),
+        });
+        Poll::Ready(Ok(()))
+    }
     pub fn lane(&self) -> NativeLane {
         self.channel.lane()
     }

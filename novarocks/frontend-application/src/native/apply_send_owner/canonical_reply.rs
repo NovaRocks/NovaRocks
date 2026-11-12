@@ -21,7 +21,7 @@ use crate::task_execution::intent::{AckPayload, OperationAcknowledgement};
 use novarocks_proto_codec::lifecycle::terminal::CanonicalTerminalTelemetry;
 use novarocks_workload_control::joint_admission::{
     JointClaim, JointGrantedClaims, JointLocalGrant, JointLocalOffer, NativeAsyncActionAdmission,
-    NativeAsyncActionGrant, NativeDispatchFrozen, NativeDispatchSource, NativeReplyGrant,
+    NativeAsyncActionGrant, NativeDispatchFrozen, NativeReplyGrant,
 };
 use std::sync::{
     OnceLock, Weak,
@@ -78,7 +78,7 @@ impl ReservationBacking {
         let core = self.core.clone();
         drop(self); // Actual Arc exit precedes the original source wake.
         if let Some(core) = core.upgrade() {
-            core.changed.notify_one();
+            core.notify_change();
         }
     }
 }
@@ -180,13 +180,9 @@ impl OriginalReplyPublisher {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let physical = physical.as_ref().ok_or(WorkError::Released)?;
-            NativeDispatchSource::capture(
+            physical.capture_dispatch(
                 action.as_ref().ok_or(WorkError::Released)?,
                 reply.as_ref().ok_or(WorkError::Released)?,
-                physical
-                    ._queue
-                    .iter()
-                    .map(|permit| permit.native_dispatch_input()),
             )
         })();
         let source = match source {
@@ -376,7 +372,9 @@ impl ApplySlot {
         let record = state.records[self.index]
             .as_mut()
             .ok_or(WorkError::Released)?;
-        if !matches!(record.state, OriginalState::Reserved) {
+        if !matches!(record.state, OriginalState::Reserved)
+            && !matches!(&record.state, OriginalState::Shared(shared) if shared.permits_preparation())
+        {
             return Err(WorkError::Conflict);
         }
         // Header has independent fixed process custody before any claim is
@@ -413,6 +411,7 @@ impl ApplySlot {
             &mut row.original.as_mut().unwrap().native.accepted,
         )
     }
+    #[cfg(test)]
     pub(crate) fn shrink_native_encoding(
         &self,
         bytes: usize,

@@ -806,7 +806,7 @@ impl NativeActiveCustodyRegistry {
         }
         changed.await;
     }
-    #[cfg(test)]
+    #[cfg(any(test, novarocks_dev_controls))]
     pub(crate) async fn root_ack_tail_progress(&self) {
         let changed = self.root_ack_ready.changed.notified();
         tokio::pin!(changed);
@@ -1129,6 +1129,7 @@ impl NativeActiveCustodyReservation {
             terminal_cut: None,
             remote_deadline: None,
             computation_ready: None,
+            streamed_success: None,
             closed: false,
         };
         Ok((original, rows))
@@ -1148,6 +1149,7 @@ impl NativeActiveCustodyReservation {
             terminal_cut: None,
             remote_deadline: None,
             computation_ready: None,
+            streamed_success: None,
             closed: false,
         }
     }
@@ -1178,6 +1180,7 @@ pub(crate) struct SupervisedActiveNativeOwner {
     terminal_cut: Option<Instant>,
     remote_deadline: Option<Instant>,
     computation_ready: Option<crate::api::ComputationReadyToken>,
+    streamed_success: Option<AttemptActivationIdentity>,
     closed: bool,
 }
 impl fmt::Debug for SupervisedActiveNativeOwner {
@@ -1237,6 +1240,24 @@ impl SupervisedActiveNativeOwner {
         let deadline = *self.remote_deadline.get_or_insert_with(|| cut + budget);
         NativeActiveConvergenceRequest::new(cancellation, deadline)
             .with_computation_ready(self.computation_ready)
+            .with_streamed_success(self.streamed_success)
+    }
+    pub(crate) fn retain_streamed_success(
+        &mut self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<(), QueryExecutionError> {
+        if activation.execution() != self.custody.key.execution
+            || self
+                .streamed_success
+                .is_some_and(|original| original != activation)
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "streamed success does not belong to the original Native owner",
+            ));
+        }
+        self.streamed_success = Some(activation);
+        Ok(())
     }
     pub(crate) fn retain_computation_ready(
         &mut self,
@@ -1448,19 +1469,21 @@ fn convergence_panic(payload: Box<dyn std::any::Any + Send>) -> StatementNativeH
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) struct RootAckTestOwner {
     registry: NativeActiveCustodyRegistry,
     key: NativeActiveCustodyKey,
     slot: Arc<ActiveSlot>,
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 impl RootAckTestOwner {
+    #[cfg(test)]
     pub(super) fn start_consumer_in(&self, input: &mut Option<OriginalConsumerStart>) {
         self.registry
             .start_consumer_in(self.key, &self.slot, input)
             .unwrap();
     }
+    #[cfg(test)]
     pub(crate) async fn join_consumer(&self) {
         loop {
             let pending = self.slot.consumer.lock().unwrap().pending();
@@ -1470,12 +1493,15 @@ impl RootAckTestOwner {
             self.registry.root_ack_tail_progress().await;
         }
     }
+    #[cfg(test)]
     pub(crate) fn consumer_pending(&self) -> bool {
         self.slot.consumer.lock().unwrap().pending()
     }
+    #[cfg(test)]
     pub(crate) fn consumer_failed(&self) -> bool {
         self.slot.consumer.lock().unwrap().failed()
     }
+    #[cfg(test)]
     pub(crate) fn consumer_join_panicked(&self) -> bool {
         self.slot
             .consumer
@@ -1485,10 +1511,12 @@ impl RootAckTestOwner {
             .as_ref()
             .is_some_and(|e| e.is_panic())
     }
+    #[cfg(test)]
     pub(crate) fn live_registration(&self) -> bool {
         self.registry
             .blocks_registration(self.key.initial, self.key.generation)
     }
+    #[cfg(test)]
     pub(crate) fn dispose_for_process_exit(self) {
         self.registry.abandon_for_process_exit();
     }
@@ -1500,12 +1528,13 @@ impl RootAckTestOwner {
             self.registry.root_ack_tail_progress().await;
         }
     }
+    #[cfg(test)]
     pub(crate) fn retained(&self) -> bool {
         self.registry
             .contains_registration(self.key.initial, self.key.generation)
     }
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 pub(crate) fn root_ack_test_fixture(
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
@@ -1516,7 +1545,7 @@ pub(crate) fn root_ack_test_fixture(
     );
     root_ack_test_fixture_in(registry, activation, root)
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 fn root_ack_test_fixture_in(
     registry: NativeActiveCustodyRegistry,
     activation: AttemptActivationIdentity,
@@ -1550,7 +1579,7 @@ pub(crate) fn root_ack_successor_fixture(
         root,
     )
 }
-#[cfg(test)]
+#[cfg(any(test, novarocks_dev_controls))]
 fn root_ack_test_fixture_for_key(
     registry: NativeActiveCustodyRegistry,
     key: NativeActiveCustodyKey,

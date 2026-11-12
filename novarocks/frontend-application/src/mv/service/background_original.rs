@@ -84,7 +84,7 @@ pub(super) fn protocol(message: &'static str) -> QueryServiceError {
 }
 #[derive(Debug, Default)]
 struct BackgroundWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for BackgroundWake {
+impl crate::wake::StatusIntakeWake for BackgroundWake {
     fn wake(&self) {
         self.0.wake();
     }

@@ -140,7 +140,6 @@ async fn original_eager_tls_reconnect(retire_before_bracket: bool) -> Result<Out
         Arc::new(trust),
         FrontendNativeTransport::automatic(material),
         novarocks_task_codec::TransportBudget::DEFAULT,
-        novarocks_workload_control::WorkloadConfig::default().scope_records_limit,
     )?;
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(

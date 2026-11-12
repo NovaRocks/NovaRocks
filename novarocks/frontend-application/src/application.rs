@@ -35,7 +35,7 @@ pub(crate) mod workload_progress;
 use workload_progress::{FrontendWorkloadDeadlineSupervisor, FrontendWorkloadProgressPolicy};
 
 use crate::query_execution::internal_result_cpu::{InternalResultCpu, InternalResultCpuOwner};
-use crate::task_protocol_config::CoordinationBudgets;
+use novarocks_attempt_protocol::config::CoordinationBudgets;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::QueryExecutionClient;
 #[cfg(test)]
@@ -54,7 +54,7 @@ use novarocks_workload_control::{
 };
 
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
@@ -70,6 +70,10 @@ use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessName
 use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
+use crate::control_runtime::{
+    FrontendAttemptRuntime, FrontendControlRuntime, FrontendControlRuntimeConfig,
+    FrontendShutdownError, membership::MembershipShutdownError,
+};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceReader,
@@ -168,6 +172,7 @@ pub struct FrontendApplicationError {
     message: String,
     original: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
     original_cleanup: Option<novarocks_state_store_api::StateStoreExecutionFailure>,
+    original_membership_exit: Option<Arc<MembershipShutdownError>>,
 
     #[cfg(novarocks_dev_controls)]
     root_observation_io: Option<Box<RootObservationIoSource>>,
@@ -180,6 +185,7 @@ impl FrontendApplicationError {
             message: error.to_string(),
             original: None,
             original_cleanup: None,
+            original_membership_exit: None,
 
             #[cfg(novarocks_dev_controls)]
             root_observation_io: None,
@@ -204,6 +210,9 @@ impl FrontendApplicationError {
     }
 
     fn preserve_original_cleanup(&mut self, cleanup: &Self) {
+        if self.original_membership_exit.is_none() {
+            self.original_membership_exit = cleanup.original_membership_exit.clone();
+        }
         if self.original.is_none() {
             self.original = cleanup.original.clone();
         } else if self.original_cleanup.is_none() {
@@ -269,6 +278,9 @@ impl std::error::Error for FrontendApplicationError {
         if let Some(cause) = self.original.as_ref().or(self.original_cleanup.as_ref()) {
             return Some(cause);
         }
+        if let Some(cause) = &self.original_membership_exit {
+            return Some(cause.as_ref());
+        }
         #[cfg(novarocks_dev_controls)]
         if let Some(error) = &self.root_observation_io {
             return Some(&error.0);
@@ -332,7 +344,6 @@ struct FrontendQueryRuntimeConfig {
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
-    transport_budget: FrontendTaskTransportBudget,
     abort_capacity: NonZeroUsize,
 }
 
@@ -870,6 +881,8 @@ pub struct FrontendApplicationHost {
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
+    control_runtime: Option<FrontendControlRuntime>,
+    control_membership_failure: Option<Arc<MembershipShutdownError>>,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
@@ -1485,7 +1498,6 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             execution.transport_budget.into_codec(),
-            execution.workload.scope_records_limit,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
@@ -1539,12 +1551,13 @@ impl FrontendApplicationHost {
                 task_update_retry_policy: execution.task_update_retry_policy,
                 split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
                 coordination_budgets: execution.coordination_budgets,
-                transport_budget: execution.transport_budget,
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
             execution_runtime_owner,
             execution_role,
             data_runtime,
+            control_runtime: None,
+            control_membership_failure: None,
             topology: None,
             optimizer_query_mem_limit_bytes: execution.optimizer_query_mem_limit_bytes(),
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
@@ -1624,13 +1637,9 @@ impl FrontendApplicationHost {
                 .await);
         }
 
-        // Unique original Apply owner is now in Host. No Native caller has
-        // received a projection yet; early try_new failure had no reaper.
-        if let Err(error) = host
-            .data_runtime
-            .start_original_apply_reaper()
-            .and_then(|()| host.data_runtime.start_original_subscription_reaper())
-        {
+        // Open the original Shared Apply bank after Host takes its owner and
+        // before Native callers receive projections.
+        if let Err(error) = host.data_runtime.open_shared_apply_bank() {
             return Err(host
                 .cleanup_open_error(FrontendApplicationError::new(
                     FrontendApplicationErrorKind::CoordinatorOpen,
@@ -1859,6 +1868,36 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
+        let process_observation = Arc::clone(host.topology())
+            as novarocks_query_application::api::BackendProcessObservationService;
+        let pollers = NonZeroUsize::new(host.data_runtime.handle().metrics().num_workers())
+            .expect("the role data runtime has at least one worker");
+        match FrontendControlRuntime::start(
+            FrontendControlRuntimeConfig {
+                pollers,
+                clock: Arc::clone(&host.execution_runtime_owner.clock),
+                workload_scope_limit: NonZeroUsize::new(
+                    host.execution_runtime_owner
+                        .native_capacity_profile
+                        .policy()
+                        .scope_limit(),
+                )
+                .expect("the installed workload scope inventory is nonempty"),
+                history: None,
+            },
+            &host.data_runtime,
+            process_observation,
+        ) {
+            Ok(runtime) => host.control_runtime = Some(runtime),
+            Err(error) => {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        format!("start frontend control runtime: {error:?}"),
+                    ))
+                    .await);
+            }
+        }
         Ok(())
     }
 
@@ -1963,9 +2002,13 @@ impl FrontendApplicationHost {
 
     /// Pure level observation; original joins and causes stay with their owners.
     pub(crate) fn workload_progress_has_failed(&self) -> bool {
-        self.execution_runtime_owner
-            .deadline_supervisor
-            .has_exited()
+        self.control_runtime
+            .as_ref()
+            .is_some_and(FrontendControlRuntime::membership_has_exited)
+            || self
+                .execution_runtime_owner
+                .deadline_supervisor
+                .has_exited()
             || self.execution_runtime_owner.supervisor.service_has_exited()
             || self
                 .execution_runtime_owner
@@ -2021,6 +2064,16 @@ impl FrontendApplicationHost {
             self.execution_runtime_owner.close_admission();
             return Err(FrontendApplicationError::server(
                 "original statement control was not installed",
+            ));
+        }
+        if self
+            .control_runtime
+            .as_ref()
+            .is_some_and(FrontendControlRuntime::membership_has_exited)
+        {
+            self.execution_runtime_owner.close_admission();
+            return Err(FrontendApplicationError::server(
+                "frontend control membership observer exited before readiness",
             ));
         }
         self.execution_runtime_owner.mark_ready().map_err(|error| {
@@ -2226,6 +2279,13 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.logical_execution_client()
     }
 
+    pub(crate) fn attempt_runtime(&self) -> Arc<FrontendAttemptRuntime> {
+        self.control_runtime
+            .as_ref()
+            .expect("frontend control runtime is installed before host open returns")
+            .attempts()
+    }
+
     /// Materializes the native-read launcher while Server constructs its
     /// immutable role products. The returned launcher owns no process
     /// lifecycle state; it only joins the Host-owned execution runtime with
@@ -2237,12 +2297,12 @@ impl FrontendApplicationHost {
             Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
             topology as novarocks_query_application::api::BackendProcessObservationService,
             self.data_runtime.clone(),
+            self.attempt_runtime(),
             config.native_compatibility_id,
             config.runtime_filter_worker_count,
             config.task_update_retry_policy,
             config.split_initial_wait_cap,
             config.coordination_budgets,
-            config.transport_budget.into_codec(),
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
             Arc::clone(&self.execution_runtime_owner.clock),
@@ -2391,6 +2451,7 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .and_then(FrontendStateStoreOpening::original_failure)
                 .cloned();
+            result.original_membership_exit = self.control_membership_failure.clone();
             result
         })
     }
@@ -2403,6 +2464,9 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
+        if let Some(runtime) = self.control_runtime.take() {
+            runtime.retain_until_process_exit();
+        }
         if let Some(topology) = self.topology.as_ref()
             && let Err(error) = topology.request_heartbeat_stop_for_process_exit()
         {
@@ -2541,6 +2605,9 @@ impl FrontendApplicationHost {
     async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
+        if let Some(runtime) = &self.control_runtime {
+            runtime.close_registration();
+        }
         let mut primary_error: Option<String> = None;
         // Stop and physically settle the current Management round before WC
         // drain waits for that same Root. Keep both receivers on timeout.
@@ -2558,12 +2625,14 @@ impl FrontendApplicationHost {
             trace_shutdown_stage("catalog_controller_joined");
         }
         trace_shutdown_stage("workload_join_started");
-        let execution_result = {
-            let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
+        let shutdown = self.execution_runtime_owner.drain_workload_until(deadline);
+        #[cfg(not(test))]
+        let execution_result = shutdown.await;
+        #[cfg(test)]
+        let execution_result = if self.data_runtime.has_original_subscription_owner() {
+            // Legacy fixtures explicitly install the original reaper. Recover
+            // that same failed owner so its children cannot strand WC drain.
             tokio::pin!(shutdown);
-            // The healthy continuous reaper stays active throughout logical
-            // teardown. If it fails, borrow the SAME owner here so its original
-            // children cannot strand the Workload drain that precedes the tail.
             tokio::select! {
                 result = &mut shutdown => result,
                 recovery = self.data_runtime.recover_failed_subscription_reaper_until(deadline) => {
@@ -2571,6 +2640,8 @@ impl FrontendApplicationHost {
                     shutdown.await
                 }
             }
+        } else {
+            shutdown.await
         };
         trace_shutdown_stage("workload_join_returned");
         if let Err(error) = execution_result {
@@ -2585,6 +2656,30 @@ impl FrontendApplicationHost {
             } else {
                 primary_error = Some(error);
             }
+        }
+        if let Some(runtime) = &mut self.control_runtime {
+            trace_shutdown_stage("frontend_control_join_started");
+            match runtime.shutdown_until(deadline).await {
+                Ok(()) => {}
+                Err(FrontendShutdownError::Pending(snapshot)) => {
+                    let error = format!("frontend control runtime shutdown pending: {snapshot:?}");
+                    return Err(match primary_error {
+                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                        None => error,
+                    });
+                }
+                Err(FrontendShutdownError::Membership(error)) => {
+                    let detail = error.to_string();
+                    self.control_membership_failure = Some(Arc::new(error));
+                    if let Some(primary) = primary_error.as_mut() {
+                        primary.push_str(&format!("; cleanup failed: {detail}"));
+                    } else {
+                        primary_error = Some(detail);
+                    }
+                }
+            }
+            self.control_runtime.take();
+            trace_shutdown_stage("frontend_control_join_returned");
         }
         trace_shutdown_stage("heartbeat_join_started");
         let heartbeat_error = match self.topology.as_ref() {
@@ -2645,25 +2740,28 @@ impl FrontendApplicationHost {
             }
         }
         trace_shutdown_stage("native_apply_join_returned");
-        trace_shutdown_stage("native_subscriptions_join_started");
-        if let Err(error) = self
-            .data_runtime
-            .drain_original_subscriptions_until(deadline)
-            .await
-        {
-            if !self.data_runtime.original_subscriptions_joined() {
-                return Err(match primary_error {
-                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
-                    None => error,
-                });
+        #[cfg(test)]
+        if self.data_runtime.has_original_subscription_owner() {
+            trace_shutdown_stage("native_subscriptions_join_started");
+            if let Err(error) = self
+                .data_runtime
+                .drain_original_subscriptions_until(deadline)
+                .await
+            {
+                if !self.data_runtime.original_subscriptions_joined() {
+                    return Err(match primary_error {
+                        Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                        None => error,
+                    });
+                }
+                if let Some(primary) = primary_error.as_mut() {
+                    primary.push_str(&format!("; cleanup failed: {error}"));
+                } else {
+                    primary_error = Some(error);
+                }
             }
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {error}"));
-            } else {
-                primary_error = Some(error);
-            }
+            trace_shutdown_stage("native_subscriptions_join_returned");
         }
-        trace_shutdown_stage("native_subscriptions_join_returned");
         // Role-owned callers have reached the Native tail. Close future calls,
         // retire cache aliases and wait for the original public IO/body exits
         // before StateStore, using the same absolute Host deadline.

@@ -1260,7 +1260,7 @@ impl CurrentCpuFixture {
             window,
             cancel.view(),
             tokio::runtime::Handle::current(),
-            Arc::new(crate::task_execution::status_intake::TestIntakeWake::default()),
+            Arc::new(crate::wake::TestIntakeWake::default()),
         );
         Self {
             owner,

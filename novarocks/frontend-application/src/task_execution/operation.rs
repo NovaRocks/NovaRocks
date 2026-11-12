@@ -59,6 +59,7 @@ pub enum OperationDispatchResult {
     TransportUnknown,
 }
 
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FrontendAction {
     Settled,
@@ -69,6 +70,7 @@ pub enum FrontendAction {
     StopSendingAndReconcile,
 }
 
+#[cfg(test)]
 pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
     let receipt = match result {
         OperationDispatchResult::WorkerReceipt(receipt) => receipt,

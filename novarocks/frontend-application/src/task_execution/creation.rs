@@ -353,6 +353,8 @@ impl CreationLengths {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreationSizing {
     pub(crate) lengths: CreationLengths,
+    #[cfg(test)]
+    pub(crate) descriptor_encoded_bytes: usize,
     /// All newly requested descriptor/projection buffers plus the final
     /// encoded metadata buffer; original borrowed source backing is excluded.
     pub(crate) new_backing_bytes: usize,
@@ -431,15 +433,18 @@ impl TaskCreationSeed {
         self.identity
     }
 
+    #[cfg(test)]
     pub(crate) const fn participation(&self) -> ParticipationRef {
         self.participation
     }
 
+    #[cfg(test)]
     pub(crate) fn split_plan_nodes(&self) -> &[PlanNodeId] {
         &self.split_plan_nodes
     }
 
     /// The edges this task produces on, which all start closed.
+    #[cfg(test)]
     pub(crate) fn outbound_edges(&self) -> &[ExchangeEdgeId] {
         self.view.outbound()
     }
@@ -476,6 +481,7 @@ impl TaskCreationSeed {
     /// The metadata message is built once to be measured and dropped at once;
     /// only the lengths survive. The caller keeps them, so a creation that
     /// waits behind backpressure is never measured twice.
+    #[cfg(test)]
     pub(crate) fn lengths(&self) -> Result<CreationLengths, TaskExecutionError> {
         #[cfg(test)]
         tests::record_pricing();
@@ -668,6 +674,8 @@ impl TaskCreationSeed {
                 metadata,
                 assignment,
             },
+            #[cfg(test)]
+            descriptor_encoded_bytes: descriptor,
             new_backing_bytes: requested,
         })
     }
@@ -718,6 +726,32 @@ impl TaskCreationSeed {
             assignment_len,
             _retained: retained,
         }))
+    }
+}
+
+/// A host-owned Create seed and the invoice fixed before admission.
+pub(crate) struct PricedTaskCreation {
+    pub(crate) seed: TaskCreationSeed,
+    pub(crate) sizing: CreationSizing,
+}
+
+impl PricedTaskCreation {
+    pub(crate) fn quote(
+        seed: TaskCreationSeed,
+        resource: novarocks_attempt_protocol::start::PayloadRef,
+    ) -> Result<(novarocks_attempt_protocol::start::FrozenCreation, Self), TaskExecutionError> {
+        let sizing = seed.size_without_projection()?;
+        let fragment = seed.fragment();
+        let metadata = novarocks_attempt_protocol::start::FrozenCreation {
+            resource,
+            queued_bytes:
+                novarocks_task_codec::creation::default_create_task_operation_encoded_len(
+                    fragment.content().len(),
+                    sizing.lengths.metadata,
+                )
+                .saturating_add(OPERATION_FIXED_BYTES),
+        };
+        Ok((metadata, Self { seed, sizing }))
     }
 }
 
@@ -795,7 +829,7 @@ struct CreateTaskBody {
 /// The by-value handle drops the actual shared body/header before its paid
 /// input lease. No grant is embedded in the allocation whose header it pays.
 #[derive(Debug)]
-pub(crate) struct CreateTaskIntent {
+pub struct CreateTaskIntent {
     original: Arc<CreateTaskBody>,
     retention: Option<novarocks_resource_contract::ExistingOwnerRetentionPin>,
 }
@@ -844,6 +878,14 @@ impl CreateTaskIntent {
             &self.original.parts.fragment,
             self.original.parts.lengths(),
         )
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_payload_bytes_for_test(&self) -> u64 {
+        self.retention
+            .as_ref()
+            .expect("original Create has its actual WC payload pin")
+            .capacity_bytes()
+            .unwrap()
     }
     #[cfg(test)]
     pub(crate) fn same_original(&self, other: &Self) -> bool {
@@ -1205,6 +1247,10 @@ pub(crate) mod tests {
                 initial_scan_ranges: BTreeMap::from([(7, vec![scan_range()]), (9, Vec::new())]),
             },
         )
+    }
+
+    pub(crate) fn original_creation_seed() -> TaskCreationSeed {
+        seed(&fixture(), 0)
     }
 
     #[test]

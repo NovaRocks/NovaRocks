@@ -39,6 +39,8 @@ identity!(
     ActionId,
     ActorId,
     DimensionId,
+    FamilyId,
+    CapacityRegistrantId,
     ReservationId,
     ConsumerId,
     InputId,
@@ -61,3 +63,7 @@ impl Generation {
 /// Driver-provided monotonic logical time; zero is a valid initial instant.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Tick(pub u64);
+
+/// An opaque host-provided key. It grants no capacity or process authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapacityKey(pub u128);

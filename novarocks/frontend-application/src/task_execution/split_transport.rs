@@ -788,7 +788,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use crate::task_protocol_config::DispatchLane;
+    use novarocks_attempt_protocol::config::DispatchLane;
     use novarocks_execution::task_execution::{
         DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitWatermark,
         TaskIdentity, UpdateTask,

@@ -89,13 +89,33 @@ impl ReadyQueue {
         Ok(())
     }
     pub fn claim(&mut self) -> Option<ActorId> {
-        let actor = self.head?;
+        self.claim_with_notification().map(|(actor, _)| actor)
+    }
+    /// The flag records a producer notification, including one delivered
+    /// while a continuation was queued or its preceding turn was claimed.
+    pub fn claim_with_notification(&mut self) -> Option<(ActorId, bool)> {
+        self.claim_queued(self.head?)
+    }
+    /// Claim only this registered actor's queued position, leaving every
+    /// other ready actor in its original order. Unknown, idle or already
+    /// claimed actors have no selectable position and leave the queue intact.
+    pub fn claim_exact(&mut self, actor: ActorId) -> Option<ActorId> {
+        self.claim_queued(actor).map(|(actor, _)| actor)
+    }
+    fn claim_queued(&mut self, actor: ActorId) -> Option<(ActorId, bool)> {
+        if !self.is_ready(actor) {
+            return None;
+        }
         self.unlink_ready(actor);
         let state = self.actors.get_mut(&actor).expect("queued actor exists");
         assert!(!state.claimed, "one poller owns an actor");
         state.claimed = true;
-        state.pending = false;
-        Some(actor)
+        Some((actor, std::mem::take(&mut state.pending)))
+    }
+    /// A queued position is ready only while no caller holds its claim.
+    /// An unknown actor has no position; this query never registers one.
+    pub fn is_ready(&self, actor: ActorId) -> bool {
+        self.actors.get(&actor).is_some_and(|state| state.queued)
     }
     /// Notification racing the end of a turn remains pending under the driver's lock.
     pub fn release(&mut self, actor: ActorId, has_pending: bool) -> Result<(), SchedulerError> {
@@ -107,8 +127,7 @@ impl ReadyQueue {
             return Err(SchedulerError::NotClaimed);
         }
         state.claimed = false;
-        state.pending |= has_pending;
-        if state.pending && !state.queued {
+        if (state.pending || has_pending) && !state.queued {
             self.append_ready(actor);
         }
         Ok(())

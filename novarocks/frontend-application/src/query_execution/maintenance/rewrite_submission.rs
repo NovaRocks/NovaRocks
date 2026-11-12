@@ -55,7 +55,7 @@ type ObservedEffect = Option<novarocks_coordination_contract::ExecutionEffect>;
 type ObserveFuture = Pin<Box<dyn Future<Output = Result<ObservedEffect, TerminalError>> + Send>>;
 #[derive(Debug, Default)]
 struct SubmitWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for SubmitWake {
+impl crate::wake::StatusIntakeWake for SubmitWake {
     fn wake(&self) {
         self.0.wake()
     }

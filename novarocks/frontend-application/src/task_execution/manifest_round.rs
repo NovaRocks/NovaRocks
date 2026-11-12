@@ -17,73 +17,35 @@
 
 //! TaskRound assembly from one exact application-bound Task manifest.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::task_protocol_config::DispatchBudget;
 use novarocks_query_application::api::{
-    NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
 };
-use novarocks_query_application::coordination::{
-    AcceptedRootStatusSource, NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
-};
-use novarocks_task_codec::TransportBudget;
+use novarocks_query_application::coordination::NativeAttemptDrive;
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
-use super::abort_effect::NativeAbortEffectIntake;
-use super::actor_gate::{ActorGateOwner, ActorGatedTaskOperationSink};
+use super::actor_gate::ActorGateOwner;
 use super::attempt_convergence::{
-    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
-    advance_task_round,
+    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, advance_task_round,
 };
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
-use super::execution::QueryTaskExecution;
-use super::graph::build_task_graph_from_manifest;
-use super::intent::TaskOperationSink;
-use super::round::{AcknowledgementObserver, TaskRound};
-use super::sources::{AttemptEstablishFacts, SubmissionTaskPlans};
+use super::round::TaskRound;
 use super::split_transport::SplitDeliveryBridge;
-use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
+use super::status_intake::{NotifyWake, StatusIntakeWake};
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::native::task_transport::{
-    AttemptWireFacts, CoveredTaskStatusSubscriber, NativeTaskOperationSink, TaskAckIntake,
-};
-use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentFailureSource, SplitAssignmentRoundGuard,
 };
-use novarocks_coordination_contract::MonotonicClock;
-use novarocks_query_application::api::BackendProcessObservationService;
 
-const STATUS_INTAKE_CAPACITY: usize = 4096;
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
-
-/// Process-owned runtime policy used to instantiate one exact manifest.
-pub(crate) struct ManifestAttemptTransport {
-    pub(crate) clock: Arc<dyn MonotonicClock>,
-    pub(crate) dispatch_budget: DispatchBudget,
-    pub(crate) transport_budget: TransportBudget,
-    pub(crate) status_subscription_error_budget: u32,
-    pub(crate) wire: AttemptWireFacts,
-    pub(crate) data_runtime: FrontendDataRuntime,
-    pub(crate) subscription_scope: novarocks_workload_control::WorkScope,
-    pub(crate) source_cohort:
-        crate::query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
-    pub(crate) native_actions:
-        novarocks_workload_control::joint_admission::NativeAsyncActionAuthority,
-    /// Exact process evidence bounds active pre-ready observation and residual
-    /// convergence. It cannot change the frozen manifest or schedule a successor.
-    pub(crate) convergence_source: BackendProcessObservationService,
-}
 
 /// One active Task protocol owner assembled without a scheduling capability.
 pub(crate) struct ManifestAssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
     pub(crate) actor_gate: ActorGateOwner,
-    protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
     convergence: NativeAttemptConvergenceOwner,
     notify: Arc<tokio::sync::Notify>,
     terminal: Option<NativeAttemptTerminal>,
@@ -125,164 +87,7 @@ pub(crate) enum ManifestAttemptCompletion {
     AcceptedRootSuccessSeal,
 }
 
-pub(crate) fn assemble_manifest_round(
-    manifest: &TaskManifestBinding,
-    submissions: Vec<ValidatedNativeSubmission>,
-    establish: AttemptEstablishFacts,
-    replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
-    transport: ManifestAttemptTransport,
-) -> Result<ManifestAssembledRound, TaskExecutionError> {
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    // Freeze declaration before submissions are consumed; never infer writers
-    // from the subset of Task statuses that happens to report writer facts.
-    let writers = manifest
-        .writer_cohorts()
-        .map(|cohort| cohort.task())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut summary_sources = novarocks_result_contract::PerKind::empty();
-    for (kind, task, _) in manifest.summary_sources() {
-        if summary_sources.get(kind).is_none() {
-            summary_sources.insert(kind, std::collections::BTreeSet::new());
-        }
-        summary_sources
-            .get_mut(kind)
-            .expect("declared kind")
-            .insert(task);
-    }
-    let mut plans = SubmissionTaskPlans::index_manifest(submissions, manifest)?;
-    let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
-    let split_delivery = SplitDeliveryBridge::for_graph(&graph);
-    let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
-    let convergence_source = Arc::clone(&transport.convergence_source);
-
-    let mut backends = Vec::with_capacity(manifest.participations().len());
-    let mut admission_epochs = BTreeMap::new();
-    let mut preparing_positions = BTreeMap::new();
-    let mut convergence_targets = Vec::with_capacity(manifest.participations().len());
-    for participation in manifest.participations() {
-        let backend = participation.backend();
-        if backend.native_compatibility_id() != transport.wire.native_compatibility_id {
-            return Err(TaskExecutionError::Schedule(format!(
-                "manifest backend {} compatibility differs from the attempt wire identity",
-                backend.process_id()
-            )));
-        }
-        backends.push(backend.target().descriptor().clone());
-        preparing_positions.insert(
-            backend.process_id(),
-            backend.target().descriptor().preparing_positions(),
-        );
-        convergence_targets.push(NativeAttemptConvergenceTarget::new(
-            participation.participation(),
-            backend.endpoint().clone(),
-        ));
-        if admission_epochs
-            .insert(backend.process_id(), backend.admission_epoch_capability())
-            .is_some()
-        {
-            return Err(TaskExecutionError::Schedule(format!(
-                "manifest repeats admission authority for backend {}",
-                backend.process_id()
-            )));
-        }
-    }
-
-    let acks = TaskAckIntake::new(Arc::clone(&wake));
-    let native = Arc::new(
-        NativeTaskOperationSink::new(
-            &backends,
-            transport.transport_budget,
-            transport.wire.clone(),
-            acks.handle(),
-            transport.data_runtime.clone(),
-            transport.native_actions,
-        )
-        .map_err(TaskExecutionError::NativeTransport)?,
-    ) as Arc<dyn TaskOperationSink>;
-    let (actor_sink, actor_gate, actor_observer) = ActorGatedTaskOperationSink::pair(
-        native,
-        Arc::clone(&wake),
-        transport.wire.native_compatibility_id,
-    );
-    let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
-
-    let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let clock = Arc::clone(&transport.clock);
-    let observation = Arc::new(
-        ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
-            |error| {
-                TaskExecutionError::Schedule(format!(
-                    "covered observation capacity is invalid: {error:?}"
-                ))
-            },
-        )?,
-    );
-    let covered_subscriber = Arc::new(
-        CoveredTaskStatusSubscriber::new_with_source_cohort(
-            &backends,
-            Arc::clone(&observation),
-            transport.status_subscription_error_budget,
-            transport.data_runtime,
-            transport.subscription_scope,
-            transport.source_cohort,
-        )
-        .map_err(TaskExecutionError::NativeTransport)?,
-    );
-    let mut execution = QueryTaskExecution::new(
-        graph,
-        transport.dispatch_budget,
-        transport.transport_budget,
-        transport.wire.native_compatibility_id,
-        &admission_epochs,
-        &preparing_positions,
-        clock,
-        sink,
-        intake,
-    )?;
-    if let Some(admissions) = replacement_admissions {
-        execution.adopt_replacement_admissions(&admissions)?;
-    }
-    let mut round = TaskRound::new_covered(
-        execution,
-        acks,
-        Box::new(establish),
-        covered_subscriber,
-        observation,
-    )
-    .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
-    .observing(actor_observer)
-    .with_connector_blocking_io(connector_blocking_io);
-    let protocol_facts =
-        round.install_protocol_facts(manifest.plan(), &writers, &summary_sources)?;
-    let convergence =
-        NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
-    Ok(ManifestAssembledRound {
-        round,
-        split_delivery,
-        actor_gate,
-        protocol_facts: Some(protocol_facts),
-        convergence,
-        notify,
-        terminal: None,
-        pending_terminal: None,
-        pending_pre_ready: None,
-        split_failure: None,
-        profile_diagnostics: None,
-    })
-}
-
 impl ManifestAssembledRound {
-    /// Read only the terminal selected by this original attempt owner.
-    pub(crate) fn observed_failure(
-        &self,
-    ) -> Option<novarocks_query_application::execution_error::ExecutionFailureInput> {
-        match self.terminal.as_ref() {
-            Some(NativeAttemptTerminal::Failed(failure)) => Some(failure.input().clone()),
-            _ => None,
-        }
-    }
-
     pub(crate) fn install_split_assignment(
         &mut self,
         execution: novarocks_types::QueryExecutionId,
@@ -310,49 +115,6 @@ impl ManifestAssembledRound {
             );
         }
         guard
-    }
-
-    pub(crate) fn install_profile_diagnostics(
-        &mut self,
-        transport: Arc<dyn crate::native::task_result_transport::TaskResultTransport>,
-    ) -> Result<super::profile_diagnostics::ProfileDiagnosticObserver, TaskExecutionError> {
-        if self.profile_diagnostics.is_some() {
-            return Err(TaskExecutionError::Schedule(
-                "profile diagnostics are already installed".to_owned(),
-            ));
-        }
-        let mut collector = super::profile_diagnostics::TaskFinalInfoCollector::new(
-            transport,
-            true,
-            &self.round,
-            Arc::new(NotifyWake::new(Arc::clone(&self.notify))),
-        );
-        let observer = collector.enable_profile_observation()?;
-        self.profile_diagnostics = Some(collector);
-        Ok(observer)
-    }
-
-    pub(crate) fn abort_wake(&self) -> Arc<dyn StatusIntakeWake> {
-        Arc::new(NotifyWake::new(Arc::clone(&self.notify)))
-    }
-
-    /// Installs the actor's one bounded Abort-effect intake before the attempt
-    /// starts. The intake is part of C3's manifest-validated runtime resource
-    /// projection; this owner never constructs a second actor port.
-    pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
-        self.round.install_abort_effect_intake(intake);
-    }
-
-    /// Transfer only this attempt's original receiver to its fixed FA consumer.
-    /// A replacement owns a distinct pair, not a shared "latest" projection.
-    pub(crate) fn take_protocol_facts(
-        &mut self,
-    ) -> Option<super::protocol_facts::AttemptProtocolFactsReceiver> {
-        self.protocol_facts.take()
-    }
-
-    pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
-        self.round.take_root_status_source()
     }
 
     /// Drives one fair Task-protocol turn and then releases at most one batch
@@ -756,63 +518,6 @@ impl ManifestAssembledRound {
         }
     }
 
-    /// Keeps the original local pumps until their real close/join exits. The
-    /// original remote deadline only ends remote tracking; it never supplies a
-    /// Worker stop fact or substitutes for a local pump exit.
-    pub(crate) async fn converge(
-        &mut self,
-        request: NativeActiveConvergenceRequest,
-    ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
-        if let Some(ready) = request.computation_ready() {
-            self.round
-                .verify_computation_ready(ready)
-                .map_err(|error| {
-                    StatementNativeHealthFailure::actual_exit_unproven(
-                        "Native convergence rejected a foreign computation cut",
-                        Arc::new(error),
-                    )
-                })?;
-            if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
-                diagnostics
-                    .begin_profile_observation(ready)
-                    .map_err(|error| {
-                        StatementNativeHealthFailure::actual_exit_unproven(
-                            "Native convergence could not bind its original diagnostic observation",
-                            Arc::new(error),
-                        )
-                    })?;
-                if let Some(deadline) = diagnostics.observation_deadline() {
-                    self.round
-                        .execution_mut()
-                        .retain_profile_diagnostics_until(deadline);
-                }
-            }
-        } else if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
-            // Initialization or execution failed before computation readiness.
-            // There is no diagnostic window to invent or extend.
-            diagnostics.stop_starting();
-        }
-        let mode = if matches!(self.terminal, Some(NativeAttemptTerminal::Failed(_))) {
-            NativeAttemptConvergenceMode::Cleanup
-        } else if request.computation_ready().is_some()
-            || matches!(self.terminal, Some(NativeAttemptTerminal::Completed))
-        {
-            NativeAttemptConvergenceMode::Normal
-        } else {
-            NativeAttemptConvergenceMode::Cleanup
-        };
-        self.convergence
-            .drive(
-                &mut self.round,
-                &self.split_delivery,
-                mode,
-                request,
-                &self.notify,
-                self.profile_diagnostics.as_mut(),
-            )
-            .await
-    }
-
     /// Only the stable pre-run owner may use this local close author. It
     /// closes normal dispatch before touching the same original round sources.
     pub(crate) async fn converge_unstarted(&mut self) -> Result<(), StatementNativeHealthFailure> {
@@ -882,6 +587,10 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_execution::{
+        actor_gate::ActorGatedTaskOperationSink,
+        attempt_convergence::NativeAttemptConvergenceTarget, intent::TaskOperationSink,
+    };
     use novarocks_coordination_contract::AttemptFailureClass;
     use novarocks_query_application::api::{BackendProcessObservation, QueryExecutionErrorKind};
 
@@ -998,7 +707,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -1422,7 +1130,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -1520,7 +1227,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: Some(NativeAttemptTerminal::Completed),
@@ -1765,7 +1471,7 @@ mod tests {
             );
             let cancellation_after_gate_closes = if cancel_with_pending_gate {
                 use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
-                use crate::task_protocol_config::DispatchLane;
+                use novarocks_attempt_protocol::config::DispatchLane;
                 use novarocks_execution::task_execution::{
                     AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
                 };
@@ -1833,7 +1539,6 @@ mod tests {
                 round,
                 split_delivery,
                 actor_gate,
-                protocol_facts: None,
                 convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
@@ -2081,7 +1786,6 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
-            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
@@ -3349,9 +3053,8 @@ mod tests {
     #[tokio::test]
     async fn same_cut_task_cause_does_not_wait_for_the_original_held_gate_carrier() {
         use super::super::intent::{DispatchBatch, OperationIntent, TaskOperationSubmit};
-        use crate::{
-            native::task_transport::SubscriptionState, task_protocol_config::DispatchLane,
-        };
+        use crate::native::task_transport::SubscriptionState;
+        use novarocks_attempt_protocol::config::DispatchLane;
         use novarocks_execution_contract::{
             AcquireParticipationAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
             TaskOperationId,
@@ -3645,6 +3348,7 @@ mod tests {
         use novarocks_execution_contract::{
             OperationKind, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
         };
+        use novarocks_query_application::coordination::EstablishIssueState;
         for (mode, cancel_before_startup, late_after_handoff) in [
             (0, false, false),
             (1, false, false),
@@ -3710,7 +3414,6 @@ mod tests {
                 round,
                 split_delivery,
                 actor_gate,
-                protocol_facts: None,
                 convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
@@ -3780,6 +3483,31 @@ mod tests {
                         .retained_late_establish_for_test(held.operation_id())
                 );
             }
+            let replay_issue = if late_after_handoff {
+                Some(
+                    tokio::time::timeout_at(deadline, async {
+                        loop {
+                            if let Some(snapshot) =
+                                logical.establish_snapshot(target).await.unwrap()
+                                && let (generation, EstablishIssueState::TransportOwned) =
+                                    snapshot.latest_authorization()
+                                && generation > 1
+                            {
+                                assert_eq!(generation, 2, "the original guard and one replay");
+                                let identity = snapshot.identity().unwrap();
+                                assert_eq!(identity.operation_id(), held.operation_id());
+                                assert_eq!(identity.participation(), target);
+                                break (identity, generation);
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the original gate owns the newer submission before sealing"),
+                )
+            } else {
+                None
+            };
             if mode == 2 && !late_after_handoff {
                 // Before handoff the original round and actor-gate owner still
                 // own this late receipt. Feed only its actual intake: advance
@@ -3866,31 +3594,35 @@ mod tests {
                 .owner(target)
                 .unwrap()
                 .is_released();
-            if late_after_handoff {
-                // The snapshot names the latest replay, captured by the gate
-                // but never sent by its inner transport. Convergence marks
-                // that replay DefinitelyUnsent; the older unknown send still
-                // requires the original ticket/participation Abort responsibility.
-                tokio::time::timeout_at(deadline, async {
+            if let Some((identity, generation)) = replay_issue {
+                let unsent = (generation, EstablishIssueState::DefinitelyUnsent);
+                let snapshot = tokio::time::timeout_at(deadline, async {
                     loop {
-                        if logical.establish_snapshot(target).await.unwrap().is_some_and(|snapshot| {
-                            snapshot.state() == novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent
-                        }) { break; }
+                        let snapshot = logical.establish_snapshot(target).await.unwrap().unwrap();
+                        assert_eq!(snapshot.identity(), Some(identity));
+                        assert_eq!(snapshot.latest_authorization().0, generation);
+                        if snapshot.latest_authorization() == unsent {
+                            break snapshot;
+                        }
                         tokio::task::yield_now().await;
                     }
-                }).await.unwrap();
-            }
-            // Do not make the result seal or run wait for a later receipt.
-            // Its publisher is released only after the original local handoff.
-            if late_after_handoff {
+                })
+                .await
+                .expect("the original latest submission settles as definitely unsent");
+                assert_eq!(snapshot.state(), EstablishIssueState::TransportUnknown);
+
+                // Release the late publisher only after the original local
+                // handoff and the actor's exact latest-generation settlement.
                 publish_late.send(()).unwrap();
                 tokio::time::timeout_at(deadline, late_worker.unwrap())
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(logical.establish_snapshot(target).await.unwrap().unwrap().state(),
-                    novarocks_query_application::coordination::EstablishIssueState::DefinitelyUnsent,
-                    "publishing into the original intake is not an applied actor settlement");
+                let after = logical.establish_snapshot(target).await.unwrap().unwrap();
+                assert_eq!(
+                    after, snapshot,
+                    "publishing into the original intake does not settle the actor's original issue"
+                );
             } else {
                 assert!(late_worker.is_none());
             }

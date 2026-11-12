@@ -88,7 +88,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         evidence = self.evidence()
         self.assertTrue(evidence['complete'])
         self.assertTrue(evidence['sources_stable'])
-        targets = ['concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom']
+        targets = ['concurrency_loom', 'continuation_loom', 'exit_custody_loom', 'failure_publication_loom', 'read_resource_loom', 'coalescing_input_loom']
         self.assertEqual([item['target'] for item in evidence['targets']], targets)
         commands = [json.loads(line) for line in (self.root / 'commands.jsonl').read_text().splitlines()]
         self.assertEqual(len(commands), len(targets))
@@ -137,7 +137,7 @@ print(f'test result: ok. {count} passed; 0 failed; 0 ignored; 0 measured; 0 filt
         repeated = self.invoke()
         self.assertNotEqual(repeated.returncode, 0)
         self.assertEqual((self.root / 'evidence/result.json').read_bytes(), previous)
-        self.assertEqual(len((self.root / 'commands.jsonl').read_text().splitlines()), 5)
+        self.assertEqual(len((self.root / 'commands.jsonl').read_text().splitlines()), 6)
 
     def test_encoded_flags_and_external_loom_early_stop_cannot_hide_configuration(self):
         result = self.invoke(environment={'CARGO_ENCODED_RUSTFLAGS': '--cfg\x1fnot_loom'})

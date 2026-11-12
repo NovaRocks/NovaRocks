@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The coordinator's per-round split-assignment pump.
+//! Split-assignment source preparation and original driver.
 //!
-//! The pump advances as part of `TaskRound`. Each synchronous Connector call
-//! moves one source into supervised blocking-I/O work; TaskUpdate
-//! submission, acknowledgement, retry delay, and source-owner bookkeeping stay
-//! on the serial round without occupying a blocking worker. The guard only signals
-//! stop, so cancellation and drop never join or block an OS thread.
+//! The admitted executor advances the driver. Each synchronous Connector call
+//! moves one source into supervised blocking-I/O work. TaskUpdate submission,
+//! acknowledgement, retry delay, and source custody stay with the driver.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -44,10 +42,14 @@ use crate::task_execution::blocking_io::{
     ConnectorOperationJob as ConnectorBlockingIoJob, ConnectorSourceCloseResult,
 };
 use crate::task_execution::error::TaskExecutionError;
+#[cfg(test)]
 use crate::task_execution::execution::QueryTaskExecution;
-use crate::task_execution::round::{PumpCloseUnresolved, TaskRound, TurnPump};
-use crate::task_execution::status_intake::StatusIntakeWake;
-use crate::task_protocol_config::TaskUpdateRetryPolicy;
+#[cfg(test)]
+use crate::task_execution::pump_health::PumpCloseUnresolved;
+#[cfg(test)]
+use crate::task_execution::round::{TaskRound, TurnPump};
+use crate::wake::StatusIntakeWake;
+use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
 /// How many splits one task may hold before the driver stops pulling for it.
 const DEFAULT_MAX_QUEUED_SPLITS_PER_TASK: u64 = 4096;
@@ -383,13 +385,15 @@ fn start_source_close_in(
 }
 
 impl RoundSplitAssignmentPlan {
+    pub(crate) fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     /// Everything but the delivery transport.
     ///
-    /// The transport arrives at [`SplitAssignmentRoundGuard::install`] because
-    /// the two are frozen at different moments: sources must be open before
-    /// the attempt's credential leases are sealed, while the task substrate's
-    /// delivery bridge cannot exist until the task graph does -- and the graph
-    /// is built from the encoder output, which comes later.
+    /// The admitted executor binds delivery after the task graph is frozen.
+    /// Sources open before the attempt seals its credentials, while the task
+    /// graph requires the later encoder output.
     pub(crate) fn new(
         targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
@@ -450,9 +454,12 @@ struct SplitAssignmentPump {
     outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
     closing: bool,
     close_joined: bool,
+    #[cfg(test)]
     cleanup_failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
+    #[cfg(test)]
     cleanup_failure_reported: bool,
     unresolved: Arc<Mutex<SplitUnresolved>>,
+    #[cfg(test)]
     unresolved_reported: bool,
 }
 
@@ -493,16 +500,31 @@ fn enumerate_input(
 impl SplitAssignmentPump {
     const PUMP_NAME: &'static str = "split_assignment";
     fn arm_wake(&mut self, deadline: Instant) {
+        use std::{future::Future, task::Context};
+
         if self.timer_at.is_some_and(|armed| armed <= deadline) {
             return;
         }
         self.timer_at = Some(deadline);
         let deadline = tokio::time::Instant::from_std(deadline);
-        if let Some(timer) = &mut self.timer {
+        let timer = if let Some(timer) = &mut self.timer {
             timer.as_mut().reset(deadline);
+            timer
         } else {
             let _entered = self.data_runtime.handle().enter();
-            self.timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+            self.timer
+                .insert(Box::pin(tokio::time::sleep_until(deadline)))
+        };
+        // The executor can park as soon as this visit returns. Poll the
+        // original timer here so it can wake that executor on its own.
+        if timer
+            .as_mut()
+            .poll(&mut Context::from_waker(&self.source_waker))
+            .is_ready()
+        {
+            self.timer = None;
+            self.timer_at = None;
+            self.wake.wake();
         }
     }
     fn start_close(&mut self, error: Option<SplitAssignmentDriverError>) {
@@ -634,6 +656,7 @@ impl SplitAssignmentPump {
                             .provider_close = Some(primary);
                     }
                     let result = self.closing_reason.clone().map_or(closed, Err);
+                    #[cfg(test)]
                     if let Err(error) = &result {
                         *self
                             .cleanup_failure
@@ -679,6 +702,7 @@ impl SplitAssignmentPump {
                                 SplitAssignmentDriverError::SplitSource { scan: None, detail },
                             )),
                         };
+                        #[cfg(test)]
                         if let Err(error) = &result {
                             *self
                                 .cleanup_failure
@@ -818,6 +842,7 @@ impl SplitAssignmentPump {
     }
 }
 
+#[cfg(test)]
 impl TurnPump for SplitAssignmentPump {
     fn name(&self) -> &'static str {
         Self::PUMP_NAME
@@ -897,6 +922,7 @@ impl Drop for SplitAssignmentPump {
 }
 
 /// A nonblocking observation handle for the round-owned split pump.
+#[cfg(test)]
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
@@ -906,17 +932,13 @@ pub(crate) struct SplitAssignmentRoundGuard {
 
 /// Read-only observation of the original close result. A weak view cannot
 /// keep a source alive or manufacture its actual-exit proof.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SplitAssignmentProfileSource {
     outcome: std::sync::Weak<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
 }
 
-pub(crate) enum SplitAssignmentProfileRead {
-    Pending,
-    Available(SplitSourceProfile),
-    Failed,
-    SourceGone,
-}
+#[cfg(test)]
 impl SplitAssignmentProfileSource {
     pub(crate) fn current(&self) -> SplitAssignmentProfileRead {
         let Some(outcome) = self.outcome.upgrade() else {
@@ -932,11 +954,13 @@ impl SplitAssignmentProfileSource {
 
 /// Read-only projection of the original pump's selected failure. This grants
 /// no source, close, retry, or actual-exit authority.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SplitAssignmentFailureSource {
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
 }
 
+#[cfg(test)]
 impl SplitAssignmentFailureSource {
     pub(crate) fn failure(&self) -> Option<SplitAssignmentDriverError> {
         self.failure
@@ -946,6 +970,7 @@ impl SplitAssignmentFailureSource {
     }
 }
 
+#[cfg(test)]
 impl SplitAssignmentRoundGuard {
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
         SplitAssignmentProfileSource {
@@ -1066,6 +1091,7 @@ impl SplitAssignmentRoundGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for SplitAssignmentRoundGuard {
     fn drop(&mut self) {
         self.request_stop();
@@ -1073,7 +1099,7 @@ impl Drop for SplitAssignmentRoundGuard {
 }
 
 #[cfg(test)]
-pub(crate) use tests::failure_observation_plan;
+pub(crate) use tests::{failure_observation_plan, failure_observation_plan_with_close};
 
 #[cfg(test)]
 mod tests {
@@ -1210,6 +1236,7 @@ mod tests {
 
     struct FailureObservationSource {
         release_close: Option<mpsc::Receiver<()>>,
+        fail_close: bool,
         enumerations: Arc<std::sync::atomic::AtomicUsize>,
         closes: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1235,6 +1262,8 @@ mod tests {
             self.closes.fetch_add(1, Ordering::SeqCst);
             if let Some(released) = self.release_close.take() {
                 released.recv().expect("release the original source close");
+            }
+            if self.fail_close {
                 return Err(ConnectorError::new(
                     novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
                     "original provider close diagnostics must remain private",
@@ -1256,12 +1285,27 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        let fail_close = release_close.is_some();
+        failure_observation_plan_with_close(execution, supervisor, release_close, fail_close)
+    }
+
+    pub(crate) fn failure_observation_plan_with_close(
+        execution: QueryExecutionId,
+        supervisor: ConnectorBlockingIoSupervisor,
+        release_close: Option<mpsc::Receiver<()>>,
+        fail_close: bool,
+    ) -> (
+        RoundSplitAssignmentPlan,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let enumerations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let source = RoundSplitSource {
             scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
             source: SupervisedSplitSource::fixture(Box::new(FailureObservationSource {
                 release_close,
+                fail_close,
                 enumerations: Arc::clone(&enumerations),
                 closes: Arc::clone(&closes),
             })),
@@ -2127,7 +2171,7 @@ mod tests {
             stop: stop.clone(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(None)),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
 
         let profile = guard.profile_source().current();
@@ -2161,7 +2205,7 @@ mod tests {
                     scan: ScanNodeKey::new(FragmentId::from(1u32), 4),
                 },
             )))),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
         let detail = failed
             .failure()
@@ -2185,7 +2229,7 @@ mod tests {
             stop: RoundSplitAssignmentStop::default(),
             failure: Arc::new(Mutex::new(None)),
             outcome: Arc::new(Mutex::new(Some(Ok(SplitSourceProfile::default())))),
-            wake: Arc::new(crate::task_execution::status_intake::CountingWake::default()),
+            wake: Arc::new(crate::wake::CountingWake::default()),
         };
         assert!(
             healthy.failure().is_none(),
@@ -2570,7 +2614,7 @@ mod tests {
     fn a_source_drop_panic_retains_original_backing_and_reports_health_once() {
         use crate::task_execution::blocking_io::ConnectorBlockingIoError;
         use crate::task_execution::blocking_io::tests::{admitted, until};
-        use crate::task_execution::status_intake::CountingWake;
+        use crate::wake::CountingWake;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2713,7 +2757,7 @@ mod tests {
     #[test]
     fn closing_waits_for_the_original_enumeration_before_its_gated_source_close() {
         use crate::task_execution::blocking_io::tests::{admitted, until};
-        use crate::task_execution::status_intake::CountingWake;
+        use crate::wake::CountingWake;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2836,3 +2880,7 @@ mod tests {
         runtime.block_on(executors.shutdown());
     }
 }
+
+pub(crate) mod executor;
+#[cfg(test)]
+pub(crate) use executor::SplitAssignmentProfileRead;

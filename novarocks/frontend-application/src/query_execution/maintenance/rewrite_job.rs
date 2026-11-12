@@ -58,7 +58,7 @@ type ProductFuture =
 type CloseFuture = Pin<Box<dyn Future<Output = Result<(), StatementNativeHealthFailure>> + Send>>;
 #[derive(Debug, Default)]
 struct RewriteWake(futures::task::AtomicWaker);
-impl crate::task_execution::status_intake::StatusIntakeWake for RewriteWake {
+impl crate::wake::StatusIntakeWake for RewriteWake {
     fn wake(&self) {
         self.0.wake();
     }
