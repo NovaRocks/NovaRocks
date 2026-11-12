@@ -9,6 +9,7 @@ pub(crate) mod fragment_encoder;
 mod original_retirement;
 pub(crate) mod report_server;
 mod root_result_codec;
+#[cfg(test)]
 mod subscription_owner;
 pub(crate) mod task_result_transport;
 #[cfg(test)]

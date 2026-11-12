@@ -758,9 +758,6 @@ pub(crate) struct SharedApplyLayouts {
     pub(crate) physical_value: std::alloc::Layout,
     pub(crate) action_value: std::alloc::Layout,
     pub(crate) reply_value: std::alloc::Layout,
-    pub(crate) preparation: std::alloc::Layout,
-    pub(crate) join: std::alloc::Layout,
-    pub(crate) retirement: std::alloc::Layout,
 }
 pub(crate) fn shared_apply_layouts()
 -> Result<SharedApplyLayouts, novarocks_workload_control::WorkError> {
@@ -782,9 +779,6 @@ pub(crate) fn shared_apply_layouts()
             novarocks_workload_control::joint_admission::NativeAsyncActionGrant,
         >(),
         reply_value: Layout::new::<Arc<ReservationBacking>>(),
-        preparation: Layout::new::<SharedApplyPreparation>(),
-        join: Layout::new::<SharedApplyJoinObligation>(),
-        retirement: Layout::new::<SharedApplyRetirement>(),
     })
 }
 

@@ -147,6 +147,7 @@ pub(super) fn original_run_with_reports(
 /// different. That author supplies its own additional pointees in `source`;
 /// the standard send's unrelated GatedWork/wait allocations are not added.
 /// Geometry remains an observation; it issues no Work or capacity.
+#[cfg(test)]
 pub(crate) fn original_run_for_factory(
     operations: &[OperationIntent],
     budget: TransportBudget,

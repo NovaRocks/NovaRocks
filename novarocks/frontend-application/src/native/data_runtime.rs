@@ -16,8 +16,9 @@ use tokio::runtime::Handle;
 
 use super::apply_send_owner::{ApplySendOwner, ApplySendPort, DrainObservation};
 #[cfg(test)]
-use super::subscription_owner::NativeSubscriptionOwner;
-use super::subscription_owner::{NativeSubscriptionPort, RegistrationError};
+use super::subscription_owner::{
+    NativeSubscriptionOwner, NativeSubscriptionPort, RegistrationError,
+};
 use super::transport_capacity::NativeTransportCapacity;
 #[cfg(test)]
 use super::transport_supervisor::NativeTransportSupervisor;
@@ -342,6 +343,7 @@ pub(crate) struct FrontendDataRuntime {
     apply_send_port: ApplySendPort,
     // Only the original runtime owns joins. Clones are capability projections.
     original_apply_owner: Option<Mutex<ApplySendOwner>>,
+    #[cfg(test)]
     subscription_port: Option<NativeSubscriptionPort>,
     #[cfg(test)]
     original_subscription_owner: Option<Mutex<NativeSubscriptionOwner>>,
@@ -363,6 +365,7 @@ impl Clone for FrontendDataRuntime {
             connector_blocking_io: self.connector_blocking_io.clone(),
             apply_send_port: self.apply_send_port.clone(),
             original_apply_owner: None,
+            #[cfg(test)]
             subscription_port: self.subscription_port.clone(),
             #[cfg(test)]
             original_subscription_owner: None,
@@ -443,6 +446,7 @@ impl FrontendDataRuntime {
             connector_blocking_io,
             apply_send_port,
             original_apply_owner: Some(Mutex::new(original_apply_owner)),
+            #[cfg(test)]
             subscription_port: None,
             #[cfg(test)]
             original_subscription_owner: None,
@@ -603,6 +607,7 @@ impl FrontendDataRuntime {
         self.original_subscription_owner.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn subscription_port(&self) -> Result<&NativeSubscriptionPort, RegistrationError> {
         self.subscription_port
             .as_ref()

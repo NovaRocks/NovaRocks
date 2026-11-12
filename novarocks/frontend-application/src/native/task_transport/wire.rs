@@ -717,6 +717,7 @@ pub enum CoveredEventValidationError {
     Protocol(&'static str),
 }
 
+#[cfg(test)]
 impl CoveredEventValidationError {
     pub(super) const fn subscription_state(self) -> SubscriptionState {
         match self {

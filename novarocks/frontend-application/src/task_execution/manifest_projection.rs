@@ -168,7 +168,7 @@ pub(crate) struct ManifestPublications {
     pub(crate) root_sender: AcceptedRootStatusSender,
     pub(crate) root_status: Option<AcceptedRootStatusSource>,
     pub(crate) root_controls: Arc<PendingRootControls>,
-    pub(crate) protocol: AttemptProtocolFactsPublisher,
+    pub(in crate::task_execution) protocol: AttemptProtocolFactsPublisher,
     pub(crate) protocol_facts: Option<AttemptProtocolFactsReceiver>,
 }
 

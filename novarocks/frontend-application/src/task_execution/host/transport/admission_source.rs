@@ -234,6 +234,7 @@ impl AdmissionSource {
             .map(|(_, seed)| seed)
     }
 
+    #[cfg(test)]
     pub(crate) fn take_grant(
         &mut self,
         grant: QueuedInputGrantRef,

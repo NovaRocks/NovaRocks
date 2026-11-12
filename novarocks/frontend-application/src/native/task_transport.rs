@@ -17,25 +17,29 @@
 
 //! Native Task wire projection for the frontend attempt host.
 //!
-//! The legacy TaskRound receipt intake and observation adapters remain during
-//! fixture migration. Both carriers use the role-owned Native client stack.
+//! The attempt host and legacy TaskRound fixtures share the Native wire projection.
 #![allow(
     dead_code,
     reason = "The old TaskRound carrier remains compiled during fixture migration."
 )]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(test)]
 use std::future::Future;
+#[cfg(test)]
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::task::Poll;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
 #[cfg(test)]
-use prometheus::Registry;
-use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts};
+use prometheus::{IntCounter, Registry};
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
 use novarocks_attempt_protocol::config::DispatchLane;
@@ -43,11 +47,11 @@ use novarocks_attempt_protocol::config::DispatchLane;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AcquireParticipationAdmissionTicket, OperationKind, OperationOutcome, ParticipationRef,
-    TaskIdentity, TaskOperationId, TaskStatusCursor, UpdateParticipation,
+    TaskIdentity, TaskOperationId, UpdateParticipation,
 };
 #[cfg(test)]
 use novarocks_execution::task_execution::{
-    ParticipationConvergenceCursor, ParticipationConvergenceReceipt,
+    ParticipationConvergenceCursor, ParticipationConvergenceReceipt, TaskStatusCursor,
 };
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
@@ -60,15 +64,16 @@ use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
     CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription, ReceiptHeader,
-    decode_covered_status_event, decode_receipt_batch, encode_abort_participation,
+    decode_receipt_batch, encode_abort_participation,
     encode_acquire_participation_admission_ticket, encode_advance_participation_domain,
-    encode_cancel_task, encode_control_operation_batch, encode_covered_subscribe_task_status,
-    encode_create_task, encode_establish_participation, encode_operation_batch,
-    encode_release_participation, encode_renew_lease, encode_update_task,
+    encode_cancel_task, encode_control_operation_batch, encode_create_task,
+    encode_establish_participation, encode_operation_batch, encode_release_participation,
+    encode_renew_lease, encode_update_task,
 };
 #[cfg(test)]
 use novarocks_task_codec::operation::{
-    ParticipationAwareStatusStreamEvent, decode_participation_aware_status_event,
+    ParticipationAwareStatusStreamEvent, decode_covered_status_event,
+    decode_participation_aware_status_event, encode_covered_subscribe_task_status,
     encode_participation_aware_subscribe_task_status,
 };
 use novarocks_task_codec::{TransportBudget, domain as codec_domain};
@@ -85,12 +90,10 @@ use crate::task_execution::intent::{
 use crate::task_execution::participation_convergence::{
     ParticipationConvergenceIntakeHandle, ParticipationConvergencePublishError,
 };
-use crate::task_execution::status_intake::{
-    ObservationFrame, ObservationIntake, ObservationPublisher,
-};
 #[cfg(test)]
 use crate::task_execution::status_intake::{
-    StatusEvent, StatusIntakeAdmission, StatusIntakeHandle,
+    ObservationFrame, ObservationIntake, ObservationPublisher, StatusEvent, StatusIntakeAdmission,
+    StatusIntakeHandle,
 };
 use crate::wake::StatusIntakeWake;
 
@@ -114,6 +117,7 @@ pub(crate) use queue_input::queued_intent_quote;
 #[cfg(test)]
 pub(crate) use queue_input::{queued_creation_quote, queued_update_quote};
 
+#[cfg(test)]
 mod covered;
 #[cfg(test)]
 mod legacy;
@@ -122,6 +126,7 @@ mod metrics;
 mod send;
 mod sink;
 pub(crate) mod wire;
+#[cfg(test)]
 use covered::*;
 #[cfg(test)]
 use legacy::*;
@@ -133,6 +138,7 @@ use wire::*;
 
 #[cfg(test)]
 pub(crate) use covered::covered_subscription_future_layout;
+#[cfg(test)]
 pub(crate) use covered::{CoveredTaskStatusSubscriber, SubscriptionState};
 #[cfg(test)]
 pub(crate) use legacy::TaskStatusSubscriber;
@@ -140,10 +146,9 @@ pub(crate) use legacy::TaskStatusSubscriber;
 pub(crate) use metrics::observe_attempt_pump_installed;
 #[cfg(test)]
 pub(crate) use sink::NativeTaskOperationSink;
-pub(crate) use sink::{
-    NativeTaskTransportCreationError, TaskAckIntake, TaskAckIntakeHandle, TaskOperationIntakeEvent,
-};
-pub(crate) use wire::AttemptWireFacts;
+pub(crate) use sink::NativeTaskTransportCreationError;
+#[cfg(test)]
+pub(crate) use sink::{TaskAckIntake, TaskAckIntakeHandle, TaskOperationIntakeEvent};
 
 fn is_small_control(intent: &OperationIntent) -> bool {
     intent.native_method() == NativeRpcMethod::ApplyTaskControlOperations

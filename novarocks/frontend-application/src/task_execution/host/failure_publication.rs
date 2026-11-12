@@ -105,6 +105,7 @@ impl FailurePublications {
         assert!(self.root_requests.set(Arc::downgrade(original)).is_ok());
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_reply(
         &self,
         runtime: &ActorRuntime<FrontendActor>,

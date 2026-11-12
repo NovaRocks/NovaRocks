@@ -21,6 +21,8 @@ use super::{
     ActorTransportWork, AttemptCallOwner, AttemptCallSource, BodyOutcome,
     call_source::AttemptCallReply, releases::ReleaseCapture,
 };
+#[cfg(test)]
+use crate::task_execution::host::custody::TransportSourceEvent;
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendEffect, FrontendInput},
@@ -32,7 +34,7 @@ use crate::{
     query_execution::native_execution_adapter::source_cohort::NativeSourceCohort,
     task_execution::host::{
         RetirementScan,
-        custody::{ReturnedActorTransportResult, TransportSourceEvent},
+        custody::ReturnedActorTransportResult,
         observations::{ObservationError, OrderedObservationInput, RootControlBinding, StreamKey},
         publication::OriginalHostFailure,
         subscriptions::{
@@ -52,8 +54,10 @@ use novarocks_control_runtime::{
     causal_input::CausalInputObligation,
     obligation::{ReservationObligation, WorkObligation},
 };
+#[cfg(test)]
+use novarocks_control_runtime_core::identity::Generation;
 use novarocks_control_runtime_core::{
-    identity::{ActorId, ConsumerId, Generation, InputId},
+    identity::{ActorId, ConsumerId, InputId},
     mailbox::InputClass,
 };
 use novarocks_coordination_contract::AttemptActionId;

@@ -741,7 +741,7 @@ pub(crate) struct PublicationRecord {
     root_observer: Option<crate::preparation_diagnostics::StatementObservationHandle>,
 }
 impl PublicationRecord {
-    pub(crate) fn new(
+    pub(in crate::task_execution) fn new(
         activation: AttemptActivationIdentity,
         root: AcceptedRootStatusSender,
         protocol: AttemptProtocolFactsPublisher,

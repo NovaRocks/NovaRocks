@@ -81,6 +81,7 @@ mod split_domain;
 pub(crate) mod split_transport;
 #[cfg(test)]
 pub(crate) mod stage;
+#[cfg(test)]
 pub(crate) mod status_intake;
 pub(crate) mod status_validation;
 

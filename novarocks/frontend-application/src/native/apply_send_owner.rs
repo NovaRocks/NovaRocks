@@ -41,8 +41,8 @@ type RawValue = Box<dyn Any + Send>;
 mod shared;
 pub(crate) use shared::{
     NativeDisposalBody, NativeDisposalRequest, NativeDisposalReturn, SharedApplyFunding,
-    SharedApplyJoinObligation, SharedApplyLayouts, SharedApplyPreparation, SharedApplyRetirement,
-    SharedPhysicalReturn, complete_shared_join, shared_apply_layouts,
+    SharedApplyJoinObligation, SharedApplyPreparation, SharedApplyRetirement, SharedPhysicalReturn,
+    complete_shared_join, shared_apply_layouts,
 };
 
 pub(crate) enum ApplyReservations {

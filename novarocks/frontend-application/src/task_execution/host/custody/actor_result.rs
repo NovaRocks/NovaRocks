@@ -172,6 +172,7 @@ impl ReturnedActorTransportResult {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn close_result_after_exit(&mut self) -> Result<bool, ActorTurnError> {
         if !self.original.retire_ready_after_exit()? {
             return Ok(false);

@@ -1071,10 +1071,6 @@ impl AttemptReady {
         )
     }
 
-    pub(crate) fn take_split_plan(&mut self) -> Option<RoundSplitAssignmentPlan> {
-        self.split_assignment_plan.take()
-    }
-
     pub(crate) fn split_plan_mut(&mut self) -> &mut Option<RoundSplitAssignmentPlan> {
         &mut self.split_assignment_plan
     }

@@ -54,23 +54,21 @@ mod source_ports;
 
 // Only these controlled original-object entry points are exposed to the host.
 pub(crate) use actor_adapter::{
-    ActorTransportExecutor, ActorTransportHandoff, ActorTransportWork, BoundActorTransport,
-    actor_transport_layouts, handoff_actor_transport, prepare_actor_pump, prepare_actor_transport,
+    ActorTransportExecutor, ActorTransportWork, BoundActorTransport, actor_transport_layouts,
+    handoff_actor_transport, prepare_actor_pump, prepare_actor_transport,
 };
-pub(crate) use admission_source::{AdmissionResultRefusal, AdmissionSource};
+pub(crate) use admission_source::AdmissionSource;
 pub(crate) use call_source::{AttemptCallOwner, AttemptCallSource};
 #[cfg(test)]
 pub(crate) use capacity::EncodingCustody;
 pub(crate) use capacity::{EncodingWindow, QueueCustody, QueueWindow, ReturnedQuota};
 pub(crate) use covered::{
-    AttemptSubscriptions, FrozenSubscriptionInputs, FrozenSubscriptionStageInputs,
-    StagedSubscriptionEndpoints, SubscriptionEndpoint, SubscriptionEndpointError,
-    SubscriptionEndpoints, bind_subscription_endpoints, retire_unpublished_endpoints,
+    AttemptSubscriptions, FrozenSubscriptionStageInputs, StagedSubscriptionEndpoints,
+    SubscriptionEndpointError, SubscriptionEndpoints, retire_unpublished_endpoints,
     stage_subscription_endpoints,
 };
 pub(crate) use effect_source::{
     AttemptFailureBinding, AttemptSendSource, AttemptTransportExecutor, AttemptTransportSource,
-    FailedSendResult,
 };
 pub(crate) use establish_material::AttemptEstablishMaterial;
 pub(crate) use failure_abort::{
@@ -83,19 +81,21 @@ pub(crate) use process_observation::AttemptProcessObserver;
 #[cfg(test)]
 pub(crate) use queue_input::tests::Governed as GovernedQueuedInputFixture;
 pub(crate) use queue_input::{OriginalQueuedInput, ReturnedQueuedInput, SendInputLoan, SendKey};
-pub(crate) use queued_job::{BoundQueue, QueueJob, run as run_queue};
-pub(crate) use quote::{
-    SourceLayouts, original_run, original_run_for_factory, queued_input as queued_input_quote,
-};
+pub(crate) use queued_job::BoundQueue;
+#[cfg(test)]
+pub(crate) use quote::original_run_for_factory;
+pub(crate) use quote::{SourceLayouts, original_run, queued_input as queued_input_quote};
 pub(crate) use receipt_input::NativeReceiptInput;
 pub(in crate::task_execution::host) use releases::TransportReleases;
-pub(crate) use send::{BoundSend, SendJob, run as run_send};
+pub(crate) use send::BoundSend;
 pub(crate) use send_binding::{
     FrozenSendRequests, PreparedSendBatch, ResolvedBatch, SendBindingError, SendBindingRefusal,
 };
+#[cfg(test)]
+pub(crate) use send_reports::actor_send_report_layouts;
 pub(crate) use send_reports::{
     ActorSendReports, NativeProgressInput, SendMemberReport, SendReportRetirement,
-    SendReportRetirementStep, SendReportReturn, SendReportRows, actor_send_report_layouts,
+    SendReportRetirementStep, SendReportReturn, SendReportRows,
 };
 pub(crate) use send_source::{PreparedActorSend, SendContext, send_queue_resources};
-pub(crate) use source_ports::{BodyOutcome, TransportCompletionObligation, TransportLeg};
+pub(crate) use source_ports::BodyOutcome;

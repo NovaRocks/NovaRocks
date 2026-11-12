@@ -184,6 +184,7 @@ impl LogicalAbortRouter {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_registered_attempt(
         self: &Arc<Self>,
         attempt: &mut crate::task_execution::host::adapter::AttemptActorRegistration,

@@ -33,7 +33,6 @@ use super::observations::{
 use super::pumps::{AttemptPumpSource, DiagnosticRecords, DynamicFilterRecords, split::SplitPump};
 use super::startup::{AttemptStartup, AttemptStartupSource, StartupInput};
 use super::transport::{NativeProgressInput, NativeReceiptInput, SendKey};
-use crate::control_runtime::transport_withdrawal::AttemptEffectEnvelope;
 use crate::{
     control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput},

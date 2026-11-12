@@ -127,6 +127,7 @@ pub(super) static TASK_OPERATION_REFUSALS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("register novarocks_task_operation_refused_total")
 });
 
+#[cfg(test)]
 pub(super) static TASK_STATUS_SUBSCRIPTION_STATE: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -138,6 +139,7 @@ pub(super) static TASK_STATUS_SUBSCRIPTION_STATE: Lazy<IntCounterVec> = Lazy::ne
     .expect("register novarocks_task_status_subscription_state_total")
 });
 
+#[cfg(test)]
 pub(super) static TASK_STATUS_RESUBSCRIPTIONS: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
         "novarocks_task_status_resubscribe_total",
@@ -279,12 +281,14 @@ pub(super) fn observe_refusal(reason: &str, operations: usize) {
         .inc_by(operations as u64);
 }
 
+#[cfg(test)]
 pub(super) fn observe_subscription_state(state: SubscriptionState) {
     TASK_STATUS_SUBSCRIPTION_STATE
         .with_label_values(&[state.as_str()])
         .inc();
 }
 
+#[cfg(test)]
 pub(super) fn observe_resubscribe() {
     TASK_STATUS_RESUBSCRIPTIONS.inc();
 }
