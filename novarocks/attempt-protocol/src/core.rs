@@ -720,6 +720,16 @@ impl Core {
         }
     }
 
+    /// Observe the demand latch and its live recovery deadline in a fixture.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn terminal_control_state_for_test(&self) -> (bool, Option<MonotonicInstant>) {
+        (
+            self.execution.result_terminal_control_required(),
+            self.execution.result_terminal_control_recovery_deadline(),
+        )
+    }
+
     /// A host may acknowledge the original root-control claim only after
     /// this first decision, including when the same seal remains pending.
     pub(crate) fn apply_root_control(
