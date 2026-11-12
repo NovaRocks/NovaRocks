@@ -30,11 +30,13 @@ use crate::{
     },
 };
 use novarocks_coordination_contract::{
-    AbortIssueSettlement, AttemptStopReason, AttemptTerminal, AttemptToLogicalBody,
+    AbortIssueSettlement, AttemptAuthorizationDecision, AttemptAuthorizationRef, AttemptStopReason,
+    AttemptTerminal, AttemptToLogicalBody,
 };
 use novarocks_execution_contract::{
-    AbortParticipation, LeaseReceipt, OperationOutcome, ParticipationReceipt, ParticipationState,
-    QuiesceParticipationReceipt, ReleaseOutcome, operation::OperationResult,
+    AbortParticipation, AcquireParticipationAdmissionTicket, LeaseReceipt, OperationOutcome,
+    ParticipationReceipt, ParticipationState, QuiesceParticipationReceipt, ReleaseOutcome,
+    operation::OperationResult,
 };
 use std::sync::Arc;
 
@@ -740,29 +742,35 @@ fn timely_unused_admission_ticket_waits_for_the_worker_expiry_before_fresh_admis
     admission_ticket_waits_for_worker_expiry(Duration::from_secs(1), Duration::from_secs(10));
 }
 
-fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_delay: Duration) {
-    use novarocks_coordination_contract::{
-        AttemptAuthorization, AttemptAuthorizationDecision, AttemptAuthorizationRef,
-    };
-    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+struct SentAdmission {
+    request: AcquireParticipationAdmissionTicket,
+    issue: AttemptAuthorizationRef,
+    generation: SendGeneration,
+    begin: AttemptRequestToken,
+}
 
-    let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+fn reply_fixture_authorization(
+    fixture: &mut Fixture,
+    token: AttemptRequestToken,
+    decision: AttemptAuthorizationDecision,
+) -> AttemptStep {
+    fixture.step(
+        fixture.sources.qa,
+        AttemptInput::Port(LogicalToAttempt {
+            activation: fixture.activation,
+            body: LogicalToAttemptBody::AuthorizationReply {
+                token,
+                decision: Ok(decision),
+            },
+        }),
+    )
+}
+
+fn send_fixture_admission(fixture: &mut Fixture) -> SentAdmission {
+    use novarocks_coordination_contract::AttemptAuthorization;
+
     fixture.queue_control = false;
     let sources = fixture.sources;
-    let activation = fixture.activation;
-    let qa_reply = |fixture: &mut Fixture, token, decision| {
-        fixture.step(
-            sources.qa,
-            AttemptInput::Port(LogicalToAttempt {
-                activation,
-                body: LogicalToAttemptBody::AuthorizationReply {
-                    token,
-                    decision: Ok(decision),
-                },
-            }),
-        )
-    };
-
     let sent_at = fixture.now;
     assert!(
         fixture
@@ -781,9 +789,8 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
         panic!("expected QA BeginAdmission for the original participation");
     };
     let operation_id = first.envelope().operation_id();
-    let ticket_valid_for = Duration::from_secs(10);
     assert_eq!(first.participation(), fixture.participation);
-    assert_eq!(first.valid_for().get(), ticket_valid_for);
+    assert_eq!(first.valid_for().get(), Duration::from_secs(10));
     let issue = AttemptAuthorizationRef::new(id(830));
     let Some(AttemptEffect {
         id: admit,
@@ -795,8 +802,8 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
                 ..
             },
         ..
-    }) = qa_reply(
-        &mut fixture,
+    }) = reply_fixture_authorization(
+        fixture,
         begin,
         AttemptAuthorizationDecision::AdmissionStarted(issue),
     )
@@ -848,6 +855,245 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
     );
     fixture.drain(|effect| panic!("send start does not produce a ticket: {effect:?}"));
 
+    SentAdmission {
+        request: first,
+        issue,
+        generation,
+        begin,
+    }
+}
+
+#[test]
+fn ticket_after_logical_failure_stand_down_scan_settles_without_reissuing_abort() {
+    use novarocks_coordination_contract::AttemptAuthorization;
+    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+
+    for units in [4, 128] {
+        let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+        let SentAdmission {
+            request: admission,
+            issue,
+            generation: admission_generation,
+            ..
+        } = send_fixture_admission(&mut fixture);
+        let operation = OperationIntent::AcquireParticipationAdmissionTicket(admission);
+        let admission_id = operation.operation_id();
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+        assert!(
+            !fixture
+                .core
+                .execution
+                .participation_never_established(fixture.participation)
+        );
+
+        fixture.units = units;
+        fixture.queue_control = true;
+        fixture.stop(AttemptStopReason::LogicalExecutionFailed);
+        let mut abort = None;
+        fixture.drain(|effect| match effect.body {
+            EffectBody::ReleaseCreationPayload { .. } => {}
+            _ => assert!(abort.replace(take_abort_admission(effect)).is_none()),
+        });
+        let (request, generation) = abort.expect("the started admission already requires Abort");
+        assert!(fixture.core.terminal.terminal().is_none());
+        assert_eq!(request.participation(), fixture.participation);
+        assert_eq!(request.cause(), AbortCause::QueryFailed);
+        assert!(
+            fixture
+                .core
+                .aborts
+                .stand_down_deadline(fixture.now)
+                .is_none(),
+            "the charged scan must pass the original Participation before its ticket arrives"
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+
+        let ticket = ParticipationAdmissionTicketReceipt::new(
+            AdmissionTicketId::try_from_bytes([0x71; 16]).unwrap(),
+            fixture.participation,
+            admission.valid_for(),
+        );
+        fixture.now = fixture.now.saturating_add(Duration::from_secs(1));
+        let received = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(reply(
+                &operation,
+                admission_generation,
+                worker(AckPayload::AdmissionTicket(ticket)),
+            ))),
+        );
+        assert!(received.effect.is_none());
+        let EffectBody::Port(port) = fixture.expect_effect().body else {
+            panic!("the late ticket must settle its original QA issue");
+        };
+        let AttemptToLogicalBody::AuthorizationRequest {
+            token,
+            request:
+                AttemptAuthorization::SettleAdmission {
+                    issue: settled_issue,
+                    participation,
+                    operation_id,
+                    outcome: Some(OperationOutcome::Accepted),
+                    receipt: Some(settled_ticket),
+                    prior_transport_unknown: false,
+                },
+        } = port.body
+        else {
+            panic!("expected the exact positive Admission settlement");
+        };
+        assert_eq!(settled_issue, issue);
+        assert_eq!(operation_id, admission_id);
+        assert_eq!(participation, fixture.participation);
+        assert_eq!(settled_ticket, ticket);
+        let settled = reply_fixture_authorization(
+            &mut fixture,
+            token,
+            AttemptAuthorizationDecision::AdmissionGranted,
+        );
+        assert_eq!(settled.retired_authorization, Some(admission_id));
+        assert!(settled.effect.is_none());
+        let mut terminal = false;
+        let mut observe_terminal = |effect: AttemptEffect| {
+            assert!(matches!(
+                effect.body,
+                EffectBody::Port(port) if matches!(
+                    port.body,
+                    AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(
+                        AttemptFailure::TaskProtocol(ref error)
+                    )) if **error == schedule("original stop")
+                )
+            ));
+            assert!(!std::mem::replace(&mut terminal, true));
+        };
+        fixture.drain(&mut observe_terminal);
+        let owner = fixture.core.execution.owner(participation).unwrap();
+        assert_eq!(owner.state(), ParticipationState::Absent);
+        assert!(!owner.is_released());
+        assert!(
+            !fixture
+                .core
+                .execution
+                .participation_never_established(participation)
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            0
+        );
+
+        // The minimum dispatch quote is larger than the four-unit scan turn.
+        fixture.units = 128;
+        let abort = OperationIntent::AbortParticipation(request);
+        let grant = QueuedInputGrantRef::new(id(832), generation);
+        let granted = fixture.step(
+            fixture.sources.transport,
+            AttemptInput::Executor(ExecutorFact::QueuedInputGranted {
+                operation: abort.operation_id(),
+                grant,
+                queued_bytes: abort.queued_bytes(),
+            }),
+        );
+        assert!(granted.effect.is_none());
+        let mut dispatched = None;
+        fixture.drain(|effect| match effect {
+            AttemptEffect {
+                id,
+                class: EffectClass::Settlement,
+                body: EffectBody::SendBatch { batch, .. },
+            } => assert!(dispatched.replace((id, batch)).is_none()),
+            other => observe_terminal(other),
+        });
+        let (send, batch) = dispatched.expect("the original stand-down Abort dispatch");
+        assert_eq!(batch.lane, DispatchLane::Lifecycle);
+        assert!(batch.control_progress);
+        assert_eq!(batch.queued_inputs.as_ref(), [grant]);
+        let [OperationIntent::AbortParticipation(sent)] = batch.operations.as_ref() else {
+            panic!("expected exactly the original stand-down Abort");
+        };
+        assert_eq!(sent.envelope(), request.envelope());
+        assert_eq!(sent.participation(), participation);
+        assert_eq!(sent.cause(), request.cause());
+        let started = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::SendStarted {
+                effect: send,
+                started_at: fixture.now,
+            }),
+        );
+        assert!(started.effect.is_none());
+        fixture.drain(&mut observe_terminal);
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            1
+        );
+        assert!(
+            !fixture
+                .core
+                .execution
+                .owner(participation)
+                .unwrap()
+                .is_released()
+        );
+        let closed = fixture.step(
+            fixture.sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(reply(
+                &abort,
+                generation,
+                worker(AckPayload::Participation(ParticipationReceipt::new(
+                    participation,
+                    ParticipationState::Aborting,
+                ))),
+            ))),
+        );
+        assert!(
+            closed.abort_settlement.is_none(),
+            "the attempt authored this Abort"
+        );
+        assert!(closed.effect.is_none());
+        fixture.drain(observe_terminal);
+        assert!(
+            fixture
+                .core
+                .execution
+                .owner(participation)
+                .unwrap()
+                .is_released()
+        );
+        assert_eq!(
+            fixture.core.execution.dispatcher().in_flight_operations(),
+            0
+        );
+        assert!(
+            fixture
+                .core
+                .execution
+                .participation_convergence_receipt(participation)
+                .is_none()
+        );
+    }
+}
+
+fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_delay: Duration) {
+    use novarocks_coordination_contract::AttemptAuthorization;
+    use novarocks_execution_contract::{AdmissionTicketId, ParticipationAdmissionTicketReceipt};
+
+    let mut fixture = Fixture::new(BeforeStop::Pristine, 128);
+    let sent_at = fixture.now;
+    let SentAdmission {
+        request: first,
+        issue,
+        generation,
+        begin,
+    } = send_fixture_admission(&mut fixture);
+    let sources = fixture.sources;
+    let operation = OperationIntent::AcquireParticipationAdmissionTicket(first);
+    let operation_id = operation.operation_id();
+    let ticket_valid_for = first.valid_for().get();
     let conservative_expiry = sent_at.saturating_add(ticket_valid_for);
     let received_at = sent_at.saturating_add(receipt_delay);
     fixture.now = received_at;
@@ -906,7 +1152,7 @@ fn admission_ticket_waits_for_worker_expiry(receipt_delay: Duration, settlement_
     fixture.now = sent_at.saturating_add(settlement_delay);
     assert!(fixture.now.has_reached(conservative_expiry));
     assert!(
-        qa_reply(
+        reply_fixture_authorization(
             &mut fixture,
             settle,
             AttemptAuthorizationDecision::AdmissionGranted,
