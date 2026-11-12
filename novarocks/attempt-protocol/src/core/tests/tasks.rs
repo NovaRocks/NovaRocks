@@ -47,6 +47,25 @@ use novarocks_execution_contract::{
 use novarocks_types::{TaskId, UniqueId};
 use std::num::NonZeroU16;
 
+#[test]
+fn original_backend_preparation_capacity_must_cover_the_configured_deployment_window() {
+    let mut start = start();
+    let window = start.plan.deployment_window.get();
+    let positions = start
+        .plan
+        .preparation_positions
+        .values_mut()
+        .next()
+        .unwrap();
+    *positions = std::num::NonZeroUsize::new(window - 1).unwrap();
+    assert!(matches!(
+        Core::new(start),
+        Err(AttemptFailure::TaskProtocol(error))
+            if matches!(error.as_ref(), TaskExecutionError::Schedule(message)
+                if message == "frozen backend preparation capacities must cover the configured deployment window for every exact participant")
+    ));
+}
+
 struct DispatchTurn<'a> {
     budget: Units,
     reservation_target: &'a mut Option<BackendProcessId>,

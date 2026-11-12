@@ -390,23 +390,6 @@ impl RemoteTask {
         self.participation
     }
 
-    /// Whether this task still holds a create payload: a seed it has not
-    /// frozen, or frozen parts a resend may still need.
-    #[cfg(test)]
-    pub(crate) const fn holds_create_payload(&self) -> bool {
-        matches!(
-            self.creation,
-            CreationReplay::Unfrozen(_) | CreationReplay::Frozen(_)
-        )
-    }
-
-    /// Whether this task's create was frozen, settled or closed, i.e. has
-    /// left its seed.
-    #[cfg(test)]
-    pub(crate) const fn create_frozen(&self) -> bool {
-        !matches!(self.creation, CreationReplay::Unfrozen(_))
-    }
-
     pub(crate) const fn create_operation(&self) -> TaskOperationId {
         self.create_envelope.operation_id()
     }
@@ -621,13 +604,6 @@ impl RemoteTask {
     #[cfg(test)]
     pub fn pending_updates(&self) -> usize {
         self.pending_ordinary.len() + self.pending_control.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn preparing_update(&self) -> Option<&TaskDomainUpdate> {
-        self.pending_input
-            .as_ref()
-            .map(|input| &input.request.domains()[0])
     }
 
     #[cfg(test)]

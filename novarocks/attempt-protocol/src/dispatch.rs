@@ -1010,6 +1010,139 @@ mod indexed_queue_tests {
         }
     }
     #[test]
+    fn oversized_operation_is_refused_before_it_enters_the_queue() {
+        let transport = TransportBudget {
+            max_batch_encoded_bytes: 255,
+            ..limits()
+        };
+        let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
+        let oversized = operation(1);
+        let id = oversized.operation_id();
+        assert_eq!(
+            dispatcher.enqueue_reserved(oversized, at(0), grant(1)),
+            Err(TaskExecutionError::Capacity(
+                CapacityBound::OperationBytes {
+                    limit: 255,
+                    actual: 256,
+                }
+            ))
+        );
+        assert_eq!(
+            dispatcher.operation_state(id).unwrap(),
+            DispatchOperationState::Absent
+        );
+        assert_eq!(dispatcher.queued_items(), 0);
+        assert_eq!(dispatcher.queue_deadline(), None);
+        assert_eq!(dispatcher.take_released_grant(), None);
+    }
+
+    #[test]
+    fn bounded_dispatch_sends_a_whole_configured_control_batch() {
+        use crate::capacity::{QueueStage, ReservationToken, StepContext};
+        use crate::effect::EffectBody;
+        use novarocks_execution_contract::{CancelReason, CancelTask};
+
+        struct Turn {
+            left: usize,
+            quote: Option<(DispatchLane, bool, BackendProcessId, usize, usize)>,
+        }
+
+        impl StepContext for Turn {
+            fn charge(&mut self, units: usize) -> bool {
+                let Some(left) = self.left.checked_sub(units) else {
+                    return false;
+                };
+                self.left = left;
+                true
+            }
+
+            fn reserve_queue_stage(
+                &mut self,
+                lane: DispatchLane,
+                control: bool,
+                backend: BackendProcessId,
+                items: usize,
+                bytes: usize,
+            ) -> QueueStage {
+                assert!(
+                    self.quote
+                        .replace((lane, control, backend, items, bytes))
+                        .is_none()
+                );
+                QueueStage::Granted(ReservationToken(NonZeroU64::MIN))
+            }
+        }
+
+        let count = 32;
+        let mut dispatcher = OperationDispatcher::new(
+            DispatchBudget::new(count, count, count, count).unwrap(),
+            TransportBudget {
+                max_batch_items: count,
+                max_batch_encoded_bytes: 32_768,
+                ..limits()
+            },
+        );
+        let identity = crate::test_support::remote(1).identity();
+        let mut operations = Vec::new();
+        let mut inputs = Vec::new();
+        let mut bytes = 0;
+        for index in 1..=count {
+            let input = grant(index as u64);
+            let mut ids = OperationIds::new(IdSeed::new(index as u128, 1));
+            let cancel = OperationIntent::CancelTask(CancelTask::new(
+                ids.issue(),
+                novarocks_execution_contract::TaskIdentity::new(
+                    identity.query_execution_id(),
+                    identity.stage_id(),
+                    novarocks_types::TaskId::new(index as u32).unwrap(),
+                    identity.backend_process_id(),
+                ),
+                CancelReason::UpstreamNoLongerNeeded,
+            ));
+            bytes += cancel.queued_bytes();
+            operations.push(cancel.operation_id());
+            inputs.push(input);
+            dispatcher.enqueue_reserved(cancel, at(0), input).unwrap();
+        }
+        let mut turn = Turn {
+            left: BatchDispatchPass::max_batch_units(count).unwrap(),
+            quote: None,
+        };
+        let effect = grant(100).generation().admission_effect();
+        let BatchDispatch::Ready(emitted) = BatchDispatchPass::new()
+            .advance(&mut dispatcher, effect, &mut turn, |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("the configured atomic step must emit the whole Native batch");
+        };
+        let EffectBody::SendBatch { batch, reservation } = emitted.body else {
+            panic!("expected the exact Native send batch");
+        };
+        assert_eq!(reservation, ReservationToken(NonZeroU64::MIN));
+        assert_eq!(
+            turn.quote,
+            Some((
+                DispatchLane::Control,
+                true,
+                identity.backend_process_id(),
+                count,
+                bytes
+            ))
+        );
+        assert_eq!(
+            batch
+                .operations
+                .iter()
+                .map(OperationIntent::operation_id)
+                .collect::<Vec<_>>(),
+            operations,
+        );
+        assert_eq!(batch.queued_inputs.as_ref(), inputs);
+        assert_eq!(dispatcher.queued_items(), 0);
+        assert_eq!(dispatcher.in_flight_operations(), count);
+    }
+
+    #[test]
     fn exact_cancellation_keeps_surrounding_fifo_and_returns_only_original_grant() {
         let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, limits());
         for value in 1..=100 {

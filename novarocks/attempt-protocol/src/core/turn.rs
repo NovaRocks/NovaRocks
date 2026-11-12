@@ -1202,7 +1202,13 @@ impl Core {
                 | ExecutorFact::ReadProgress(_)
                 | ExecutorFact::SubscriptionExited { .. } => {
                     self.verify_source(claim.source, self.sources.subscription)?;
-                    self.apply_subscription_input(now, &fact)?
+                    if let Some(exhaustion) = self.apply_subscription_input(now, &fact)?
+                        && let Some(error) = self.required_subscription_failure(exhaustion)
+                    {
+                        let seal = self.seal_refusal_at_subscription_failure();
+                        self.fail_observation_round(error)?;
+                        return self.finish_common(seal);
+                    }
                 }
                 ExecutorFact::Withdrawn { .. } | ExecutorFact::QueuedInputWithdrawn { .. } => {
                     self.verify_source(claim.source, self.sources.transport)?;

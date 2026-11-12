@@ -104,6 +104,7 @@ struct CoveredStatusStreamEvent {
 
 #[derive(Debug, Default)]
 struct CoveredParticipationObservation {
+    required_tasks: usize,
     generation: u64,
     initial_complete: bool,
     bookmark_sequence: u64,
@@ -301,6 +302,7 @@ pub struct QueryTaskExecution {
     covered_observation: BTreeMap<ParticipationRef, CoveredParticipationObservation>,
     covered_gaps: BTreeSet<ParticipationRef>,
     covered_gap_deadlines: BTreeSet<(MonotonicInstant, ParticipationRef)>,
+    retired_observation_tasks: BTreeSet<TaskId>,
     strict_pending: BTreeSet<TaskIdentity>,
     inbound_producers: BTreeMap<ParticipationRef, BTreeSet<TaskIdentity>>,
     tasks_by_participation: BTreeMap<ParticipationRef, Vec<TaskIdentity>>,
@@ -540,10 +542,17 @@ impl QueryTaskExecution {
             .map(|task| task.identity())
             .filter(|&identity| edges.requires_drain(identity))
             .collect();
-        let covered_observation = graph
-            .participations()
-            .copied()
-            .map(|participation| (participation, CoveredParticipationObservation::default()))
+        let covered_observation = tasks_by_participation
+            .iter()
+            .map(|(&participation, tasks)| {
+                (
+                    participation,
+                    CoveredParticipationObservation {
+                        required_tasks: tasks.len(),
+                        ..Default::default()
+                    },
+                )
+            })
             .collect();
         let stage_demand = crate::stage::demand::StageDemandObservations::new(&graph);
         Ok(Self {
@@ -566,6 +575,7 @@ impl QueryTaskExecution {
             covered_observation,
             covered_gaps: BTreeSet::new(),
             covered_gap_deadlines: BTreeSet::new(),
+            retired_observation_tasks: BTreeSet::new(),
             strict_pending,
             inbound_producers,
             tasks_by_participation,
@@ -1972,6 +1982,12 @@ impl QueryTaskExecution {
         self.covered_gaps.is_empty()
     }
 
+    pub(crate) fn requires_task_observation(&self, participation: ParticipationRef) -> bool {
+        self.covered_observation
+            .get(&participation)
+            .is_some_and(|observation| observation.required_tasks != 0)
+    }
+
     pub(crate) fn covered_gap_pending(&self, participation: ParticipationRef) -> bool {
         self.covered_gaps.contains(&participation)
     }
@@ -2386,6 +2402,18 @@ impl QueryTaskExecution {
         }
         let participation = task.participation();
         let terminal = task.is_terminal();
+        if (terminal || task.normally_stood_down() || task.fenced_out())
+            && self.retired_observation_tasks.insert(task_id)
+        {
+            let observation = self
+                .covered_observation
+                .get_mut(&participation)
+                .expect("the original Task has a frozen observation row");
+            observation.required_tasks = observation
+                .required_tasks
+                .checked_sub(1)
+                .expect("one retirement per frozen Task");
+        }
         if !task.needs_deployment_window() {
             let backend = task.identity().backend_process_id();
             if let Some(positions) = self.deployment_window.get_mut(&backend) {
@@ -2783,14 +2811,6 @@ impl QueryTaskExecution {
         self.covered_observation
             .get(&participation)?
             .participation_convergence
-    }
-
-    #[cfg(test)]
-    pub(crate) fn worker_participations_stopped(&self) -> bool {
-        self.graph.participations().all(|&participation| {
-            self.participation_convergence_receipt(participation)
-                .is_some()
-        })
     }
 
     /// A participation absent from the Worker for the entire attempt can close
@@ -4742,10 +4762,64 @@ mod bounded_drain_tests {
             Some(queued_at.saturating_add(Duration::from_secs(5)))
         );
 
+        use crate::input::{AckPayload, OperationObservation, OperationReplyResult};
+        use novarocks_execution_contract::{
+            CreateTaskReceipt, OperationOutcome, operation::OperationResult,
+        };
+
         while let Some(batch) = execution.dispatcher.take_batch() {
             execution.dispatcher.accept(&batch).unwrap();
+            for (intent, input) in batch.operations.iter().zip(batch.queued_inputs.iter()) {
+                let OperationIntent::CreateTask { identity, .. } = intent else {
+                    panic!("expected a preparing Create");
+                };
+                let reply = OperationObservation {
+                    generation: input.generation(),
+                    reply: OperationAcknowledgement {
+                        operation_id: intent.operation_id(),
+                        kind: OperationKind::CreateTask,
+                        result: OperationReplyResult::Worker(OperationResult::Verdict {
+                            outcome: OperationOutcome::Accepted,
+                            detail: None,
+                            acknowledgement: Some(AckPayload::Create(Box::new(
+                                CreateTaskReceipt::new(
+                                    *identity,
+                                    Vec::new(),
+                                    TaskStatus::created(*identity),
+                                ),
+                            ))),
+                        }),
+                    },
+                };
+                assert!(matches!(
+                    execution.apply_dispatched_reply(&reply),
+                    (None, Ok(()))
+                ));
+            }
         }
-        finish(&mut execution, first);
+        assert_eq!(execution.dispatcher.in_flight_operations(), 0);
+        assert!(matches!(
+            execution.advance_create_grant(waiting_operation).unwrap(),
+            CreateGrantProgress::Waiting
+        ));
+        assert!(
+            execution
+                .begin_create_admission(last, grant(100).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
+        let installed = TaskStatus::try_new(
+            first,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap()
+        .with_installed();
+        execution
+            .apply_published(&installed, &mut StatusReport::default())
+            .unwrap();
         assert!(matches!(
             execution.advance_create_grant(waiting_operation).unwrap(),
             CreateGrantProgress::Queued
@@ -4755,6 +4829,21 @@ mod bounded_drain_tests {
             execution
                 .dispatcher
                 .tracks_input(waiting_operation, waiting_grant)
+        );
+        assert!(
+            execution
+                .begin_create_admission(last, grant(100).generation().admission_effect())
+                .unwrap()
+                .is_none()
+        );
+        execution
+            .stand_down_task_normally(identity(&execution, 2))
+            .unwrap();
+        assert!(
+            execution
+                .begin_create_admission(last, grant(100).generation().admission_effect())
+                .unwrap()
+                .is_some()
         );
     }
 

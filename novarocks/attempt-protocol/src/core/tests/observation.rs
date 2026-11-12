@@ -774,6 +774,203 @@ fn fatal_current_subscription_fails_the_attempt_with_its_original_participation(
 }
 
 #[test]
+fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control() {
+    use crate::{
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    for connection_lost in [false, true] {
+        for stood_down in [false, true] {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            for edge in start.plan.graph.edges.values_mut() {
+                edge.delivery = ExchangeDeliveryRequirement::DemandDriven;
+            }
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let leaf = trace
+                .core
+                .execution
+                .graph()
+                .tasks()
+                .last()
+                .unwrap()
+                .identity();
+            assert_ne!(leaf.backend_process_id(), root.backend_process_id());
+            let participation = trace
+                .core
+                .execution
+                .graph()
+                .participation_on_backend(leaf.backend_process_id())
+                .unwrap();
+            let root_participation = trace
+                .core
+                .execution
+                .graph()
+                .participation_on_backend(root.backend_process_id())
+                .unwrap();
+            trace.start_create(leaf);
+            if stood_down {
+                trace.core.execution.stand_down_task_normally(leaf).unwrap();
+                trace.core.execution.stand_down_task_normally(leaf).unwrap();
+            }
+            let task = trace.core.execution.task(leaf.task_id()).unwrap();
+            assert!(!task.create_ownership_proven());
+            assert!(!task.is_terminal());
+            assert_eq!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(participation),
+                !stood_down
+            );
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(root_participation)
+            );
+
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+            trace
+                .core
+                .subscriptions
+                .activate(now, participation)
+                .unwrap();
+            let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+            let (round, effects) = trace.finish_observation_round(now, step);
+            assert_eq!(round, Ok(()));
+            let (open, generation) = effects
+                .into_iter()
+                .find_map(|effect| {
+                    let EffectBody::OpenSubscription(request) = effect.body else {
+                        return None;
+                    };
+                    assert_eq!(request.participation, participation);
+                    Some((effect.id, request.generation))
+                })
+                .expect("the original leaf subscription opens");
+
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(id(open.get())),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(participation),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let input = AttemptInput::Executor(ExecutorFact::Observations(
+                ObservationBatch::new(vec![ReceivedObservation {
+                    participation,
+                    generation,
+                    received_at: now,
+                    opening: ObservationOpening {
+                        started_at: now,
+                        opened_at: Some(now),
+                    },
+                    event,
+                }])
+                .unwrap(),
+            ));
+            let expected = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: leaf.backend_process_id(),
+                    state,
+                },
+            ));
+            let step = trace.handle_input(now, sources.observation, input);
+            let (mut round, mut effects) = trace.finish_observation_round(now, step);
+            assert!(!trace.core.execution.covered_gap_pending(participation));
+            if stood_down {
+                assert_eq!(round, Ok(()));
+                assert!(trace.core.terminal.terminal().is_none());
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: closing }
+                        if *closed == participation && *closing == generation
+                )));
+
+                // The earlier exhausted row matters again if this exact
+                // attempt now needs authoritative root terminal control.
+                let token = AttemptRequestToken::new(trace.next_id());
+                let demand = trace.handle_input(
+                    now,
+                    sources.observation,
+                    AttemptInput::Port(LogicalToAttempt {
+                        activation,
+                        body: LogicalToAttemptBody::TerminalControlDemand { token, root },
+                    }),
+                );
+                assert!(demand.root_control_processed.is_some());
+                assert!(matches!(
+                    demand.effect.as_ref(),
+                    Some(AttemptEffect { body: EffectBody::Port(port), .. })
+                        if port.activation == activation && matches!(
+                            &port.body, AttemptToLogicalBody::TerminalControlResult {
+                                token: original, result: Ok(()),
+                            } if *original == token
+                        )
+                ));
+                (round, effects) = trace.finish_observation_round(now, demand);
+            }
+            assert_eq!(round, Err(expected.clone()));
+            let terminal = AttemptTerminal::Failed(expected);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                let step = trace.handle_input(now, sources.actor, AttemptInput::Timer);
+                effects.extend(step.effect);
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert!(effects.iter().any(|effect| matches!(
+                &effect.body,
+                EffectBody::Port(port)
+                    if port.activation == activation && matches!(
+                        &port.body, AttemptToLogicalBody::AttemptTerminal(original)
+                            if original == &terminal
+                    )
+            )));
+            let task = trace.core.execution.task(leaf.task_id()).unwrap();
+            assert!(!task.create_ownership_proven());
+            assert!(!task.is_terminal());
+            assert!(!trace.core.execution.task_actual_stopped(leaf));
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .participation_convergence_receipt(participation)
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn stream_first_terminal_order_survives_duplicates_and_late_create_reply() {
     let mut trace = TerminalTrace::new();
     let mut order: Vec<_> = trace

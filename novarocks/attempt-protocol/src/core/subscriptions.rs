@@ -20,7 +20,7 @@
 use crate::{
     capacity::StepContext,
     effect::{AttemptEffect, EffectBody, EffectClass},
-    error::TaskExecutionError,
+    error::{ParticipantObservationFailure, TaskExecutionError},
     execution::{QueryTaskExecution, SubscriptionRequestBuild},
     ids::IdSeed,
     input::{ExecutorFact, ReceivedObservation},
@@ -42,13 +42,27 @@ struct Row {
 }
 
 impl Row {
-    fn coverage_recovery_exhausted(&self) -> bool {
-        self.missing_coverage
-            && matches!(
-                self.controller.status(),
-                SubscriptionStatus::BudgetExhausted | SubscriptionStatus::ConnectionLossExhausted
-            )
+    fn exhaustion(&self) -> Option<ParticipantObservationFailure> {
+        match self.controller.status() {
+            SubscriptionStatus::BudgetExhausted => {
+                Some(ParticipantObservationFailure::Transport("budget_exhausted"))
+            }
+            SubscriptionStatus::ConnectionLossExhausted => {
+                Some(ParticipantObservationFailure::ConnectionLost)
+            }
+            _ => None,
+        }
     }
+
+    fn coverage_recovery_exhausted(&self) -> bool {
+        self.missing_coverage && self.exhaustion().is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SubscriptionExhaustion {
+    pub(super) participation: ParticipationRef,
+    pub(super) state: ParticipantObservationFailure,
 }
 
 #[derive(Debug)]
@@ -64,6 +78,7 @@ pub(super) struct Subscriptions {
     adjust: BTreeSet<ParticipationRef>,
     request: Option<Request>,
     exhausted_coverage: usize,
+    exhausted: BTreeMap<ParticipationRef, ParticipantObservationFailure>,
 }
 
 #[derive(Debug)]
@@ -98,6 +113,7 @@ impl Subscriptions {
             adjust: BTreeSet::new(),
             request: None,
             exhausted_coverage: 0,
+            exhausted: BTreeMap::new(),
         })
     }
 
@@ -106,12 +122,13 @@ impl Subscriptions {
         now: MonotonicInstant,
         participation: ParticipationRef,
         apply: impl FnOnce(&mut Row) -> Result<R, TaskExecutionError>,
-    ) -> Result<R, TaskExecutionError> {
+    ) -> Result<(R, Option<SubscriptionExhaustion>), TaskExecutionError> {
         let row = self
             .rows
             .get_mut(&participation)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         let was_exhausted = row.coverage_recovery_exhausted();
+        let prior_exhaustion = row.exhaustion();
         let result = apply(row);
         let deadline = row.controller.next_deadline(now);
         if row.deadline != deadline {
@@ -127,8 +144,21 @@ impl Subscriptions {
             self.adjust.remove(&participation);
         }
         let exhausted = row.coverage_recovery_exhausted();
+        let exhaustion = row.exhaustion();
         self.update_coverage_exhaustion(was_exhausted, exhausted);
-        result
+        let mut newly_exhausted = None;
+        if exhaustion != prior_exhaustion {
+            if let Some(state) = exhaustion {
+                self.exhausted.insert(participation, state);
+                newly_exhausted = Some(SubscriptionExhaustion {
+                    participation,
+                    state,
+                });
+            } else {
+                self.exhausted.remove(&participation);
+            }
+        }
+        result.map(|value| (value, newly_exhausted))
     }
 
     pub(super) fn coverage_changed(&mut self, participation: ParticipationRef, missing: bool) {
@@ -156,6 +186,17 @@ impl Subscriptions {
         self.exhausted_coverage != 0
     }
 
+    /// The frozen roster order also selects previously exhausted rows when
+    /// the original root starts waiting for terminal control.
+    pub(super) fn first_exhausted(&self) -> Option<SubscriptionExhaustion> {
+        self.exhausted
+            .first_key_value()
+            .map(|(&participation, &state)| SubscriptionExhaustion {
+                participation,
+                state,
+            })
+    }
+
     pub(super) fn activate(
         &mut self,
         now: MonotonicInstant,
@@ -165,6 +206,7 @@ impl Subscriptions {
             row.controller.activate();
             Ok(())
         })
+        .map(|((), _)| ())
     }
 
     pub(super) fn stop(
@@ -177,6 +219,7 @@ impl Subscriptions {
             row.controller.stop();
             Ok(())
         })
+        .map(|((), _)| ())
     }
 
     pub(super) fn reconcile(
@@ -188,13 +231,14 @@ impl Subscriptions {
             row.controller.reconcile(now);
             Ok(())
         })
+        .map(|((), _)| ())
     }
 
     pub(super) fn observe(
         &mut self,
         now: MonotonicInstant,
         observation: ReceivedObservation,
-    ) -> Result<ObservationDisposition, TaskExecutionError> {
+    ) -> Result<(ObservationDisposition, Option<SubscriptionExhaustion>), TaskExecutionError> {
         self.update(now, observation.participation, |row| {
             let previous = row.controller.status();
             let disposition = row.controller.observe(observation)?;
@@ -219,8 +263,8 @@ impl Subscriptions {
         &mut self,
         now: MonotonicInstant,
         fact: &ExecutorFact,
-    ) -> Result<(), TaskExecutionError> {
-        match *fact {
+    ) -> Result<Option<SubscriptionExhaustion>, TaskExecutionError> {
+        let ((), exhaustion) = match *fact {
             ExecutorFact::SubscriptionProgress(phase) => {
                 self.update(now, phase.participation, |row| {
                     row.controller.observe_phase(phase)
@@ -246,7 +290,8 @@ impl Subscriptions {
                 Ok(())
             }),
             _ => Err(TaskExecutionError::UnknownOperation),
-        }
+        }?;
+        Ok(exhaustion)
     }
 
     pub(super) fn assembling(&self) -> bool {
@@ -280,6 +325,7 @@ impl Subscriptions {
                     .update(now, participation, |row| {
                         row.controller.drive(now, minimum, Some(token))
                     })?
+                    .0
                     .expect("indexed deadline has a real directive");
                 let body = match directive {
                     SubscriptionDirective::Open { generation } => {

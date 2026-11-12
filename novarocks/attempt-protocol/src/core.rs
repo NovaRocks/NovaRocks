@@ -25,7 +25,7 @@ mod stop;
 mod subscriptions;
 mod turn;
 use round_tail::RoundTail;
-use subscriptions::{SubscriptionStep, Subscriptions};
+use subscriptions::{SubscriptionExhaustion, SubscriptionStep, Subscriptions};
 pub use turn::{AttemptStep, InputSelection};
 
 use crate::{
@@ -53,7 +53,7 @@ use crate::{
             ProtocolPublicationCursor, PublicationApplyDisposition, PublicationProgress,
         },
     },
-    root_control::{RootControl, SealSettlement},
+    root_control::{FailureReadiness, RootCompletion, RootControl, SealFacts, SealSettlement},
     start::{AttemptSources, AttemptStart, FrozenAttemptPlan},
     terminal::TerminalController,
 };
@@ -508,7 +508,9 @@ impl Core {
             let result = if let Some(participation) = pass.pending_quiesce {
                 let completed = self.execution.advance_quiesce(context)?;
                 pass.pending_quiesce = None;
-                completed.and_then(|()| self.finish_observation(now, participation, true))
+                completed
+                    .and_then(|()| self.finish_observation(now, participation, true))
+                    .map(|()| None)
             } else {
                 if pass.items.len() == 0 {
                     break;
@@ -519,15 +521,26 @@ impl Core {
                 let observation = pass.items.next().expect("original observation frame");
                 let participation = observation.participation;
                 match self.apply_observation_item(now, observation) {
-                    Ok(()) if self.execution.has_pending_quiesce() => {
+                    Ok(None) if self.execution.has_pending_quiesce() => {
                         pass.pending_quiesce = Some(participation);
                         continue;
                     }
                     result => result,
                 }
             };
-            if let Err(error) = result {
-                pass.first_error.get_or_insert(error);
+            match result {
+                Err(error) => {
+                    pass.first_error.get_or_insert(error);
+                }
+                Ok(Some(exhaustion)) if pass.first_error.is_none() => {
+                    if let Some(error) = self.required_subscription_failure(exhaustion) {
+                        if let Some(seal) = self.seal_refusal_at_subscription_failure() {
+                            pass.sealed = Some(seal);
+                        }
+                        pass.first_error = Some(error);
+                    }
+                }
+                Ok(_) => {}
             }
             if pass.first_error.is_none()
                 && let Some(seal) = self.evaluate_pending_seal()
@@ -536,8 +549,7 @@ impl Core {
             }
         }
         if let Some(error) = pass.first_error.take() {
-            self.acknowledgements
-                .fail_round_tail(error)
+            self.fail_observation_round(error)
                 .expect("an observation batch was admitted at the round tail");
         }
         Some(pass.sealed.take())
@@ -547,7 +559,7 @@ impl Core {
         &mut self,
         now: MonotonicInstant,
         observation: ReceivedObservation,
-    ) -> Result<(), TaskExecutionError> {
+    ) -> Result<Option<SubscriptionExhaustion>, TaskExecutionError> {
         let participation = observation.participation;
         let convergence_changed = matches!(
             &observation.event,
@@ -557,9 +569,8 @@ impl Core {
                 ..
             }
         );
-        if let ObservationDisposition::ApplyEntity(accepted) =
-            self.subscriptions.observe(now, observation)?
-        {
+        let (disposition, exhaustion) = self.subscriptions.observe(now, observation)?;
+        if let ObservationDisposition::ApplyEntity(accepted) = disposition {
             let report = self.execution.apply_covered_observation(accepted)?;
             if !self.execution.has_pending_quiesce() {
                 self.finish_observation(
@@ -569,7 +580,7 @@ impl Core {
                 )?;
             }
         }
-        Ok(())
+        Ok(exhaustion)
     }
 
     fn finish_observation(
@@ -627,11 +638,11 @@ impl Core {
 
     /// Read confirmation has its own prepaid source, independent of the
     /// ordered frame and root-control intake.
-    pub(crate) fn apply_subscription_input(
+    fn apply_subscription_input(
         &mut self,
         now: MonotonicInstant,
         fact: &ExecutorFact,
-    ) -> Result<(), TaskExecutionError> {
+    ) -> Result<Option<SubscriptionExhaustion>, TaskExecutionError> {
         self.execution.set_now(now)?;
         self.subscriptions.apply_independent(now, fact)
     }
@@ -706,8 +717,23 @@ impl Core {
                 ));
             }
         };
+        let seal = self.evaluate_pending_seal();
+        if terminal_control
+            .as_ref()
+            .is_some_and(|(_, result)| result.is_ok())
+            && self
+                .execution
+                .result_terminal_control_recovery_deadline()
+                .is_some()
+            && let Some(exhaustion) = self.subscriptions.first_exhausted()
+            && let Some(error) = self.required_subscription_failure(exhaustion)
+        {
+            // Register the exact demand even if an earlier exhaustion makes
+            // its required terminal evidence unobservable.
+            self.fail_observation_round(error)?;
+        }
         Ok(RootControlApplication {
-            seal: self.evaluate_pending_seal(),
+            seal,
             terminal_control,
         })
     }
@@ -860,6 +886,66 @@ impl Core {
             .map_err(|_| schedule("QA completed without a selected original acknowledgement"))
     }
 
+    fn required_subscription_failure(
+        &self,
+        exhaustion: SubscriptionExhaustion,
+    ) -> Option<TaskExecutionError> {
+        if self.root.sealed() || self.stop.business_closed() || self.terminal.terminal().is_some() {
+            return None;
+        }
+        if self
+            .execution
+            .result_terminal_control_recovery_deadline()
+            .is_none()
+        {
+            // This attempt's original result owner can finish from an exact
+            // Finished root. Residual observation then belongs to drain.
+            let root = self.execution.root_seal_facts(false);
+            if (!root.terminal_control_required
+                && root.root == RootCompletion::ExactFinished
+                && root.failure == FailureReadiness::Empty)
+                || !self
+                    .execution
+                    .requires_task_observation(exhaustion.participation)
+            {
+                return None;
+            }
+        }
+        Some(TaskExecutionError::ParticipantUnobservable {
+            backend: exhaustion.participation.backend_process_id(),
+            state: exhaustion.state,
+        })
+    }
+
+    fn fail_observation_round(
+        &mut self,
+        error: TaskExecutionError,
+    ) -> Result<(), TaskExecutionError> {
+        self.acknowledgements
+            .fail_round_tail(error)
+            .map_err(|_| schedule("subscription exhaustion crossed the original observation cut"))
+    }
+
+    fn seal_facts(&self) -> SealFacts {
+        let mut facts = self.execution.root_seal_facts(false);
+        facts.coverage_exhausted |= self.subscriptions.coverage_recovery_exhausted();
+        facts
+    }
+
+    /// A pending seal can retain its original control or coverage refusal at
+    /// this same cut even when the ordinary exhaustion fails the round.
+    fn seal_refusal_at_subscription_failure(&mut self) -> Option<SealedRootCut> {
+        let facts = self.seal_facts();
+        if facts.terminal_control_required || (!facts.coverage_ready && facts.coverage_exhausted) {
+            self.root.evaluate(facts).map(|settlement| SealedRootCut {
+                root_before_seal: None,
+                settlement,
+            })
+        } else {
+            None
+        }
+    }
+
     fn evaluate_pending_seal(&mut self) -> Option<SealedRootCut> {
         if self.stop.business_closed() {
             return self
@@ -870,8 +956,7 @@ impl Core {
                     settlement,
                 });
         }
-        let mut facts = self.execution.root_seal_facts(false);
-        facts.coverage_exhausted |= self.subscriptions.coverage_recovery_exhausted();
+        let facts = self.seal_facts();
         let settlement = self.root.evaluate(facts)?;
         let root_before_seal = if settlement.result.is_ok() {
             let projection = self.root_projection();
