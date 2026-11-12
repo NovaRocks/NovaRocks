@@ -38,6 +38,7 @@ use crate::{
         subscriptions::{
             SubscriptionFailureRecord, SubscriptionGeneration, SubscriptionPhasePublisher,
             SubscriptionRunError, SubscriptionSource, SubscriptionSourceError,
+            native_subscription_io_backing_bytes,
         },
     },
 };
@@ -472,6 +473,12 @@ impl AttemptSubscriptions {
             sized(backing::array::<AttemptActionId>(generations)?, 2)?,
             backing::array::<ParticipationRef>(participants)?,
             sized(generation_bytes, generations)?,
+            // Each participant has one original open position, even when
+            // records for older generations still await metadata retirement.
+            sized(
+                native_subscription_io_backing_bytes()?,
+                participants.min(generations),
+            )?,
             sized(
                 failure_bytes,
                 generations

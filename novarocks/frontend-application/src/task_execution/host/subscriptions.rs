@@ -67,9 +67,8 @@ pub(crate) use failure::{OriginalSubscriptionFailure, SubscriptionFailureRecord}
 #[path = "subscription/native_io.rs"]
 mod native_io;
 
-pub(crate) use native_io::{
-    NativeSubscriptionFailure, NativeSubscriptionFailureCustody, native_subscription_io_layouts,
-};
+pub(in crate::task_execution::host) use native_io::native_subscription_io_backing_bytes;
+pub(crate) use native_io::{NativeSubscriptionFailure, NativeSubscriptionFailureCustody};
 
 pub(crate) type SubscriptionIoFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The native owner implements this thin port with its SAME cached channel,

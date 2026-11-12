@@ -21,9 +21,12 @@ use super::{
     CoveredSubscriptionIo, CoveredSubscriptionStream, StreamKey, SubscriptionEnd,
     SubscriptionFailureCustody, SubscriptionGeneration, SubscriptionIoFuture, SubscriptionRunError,
 };
-use crate::native::{
-    task_transport::wire::subscription_rejection_is_fatal,
-    transport::{ChannelAcquisitionError, Client, is_observed_connection_loss},
+use crate::{
+    native::{
+        task_transport::wire::subscription_rejection_is_fatal,
+        transport::{ChannelAcquisitionError, Client, is_observed_connection_loss},
+    },
+    task_execution::host::observations::{ObservationError, backing},
 };
 use novarocks_attempt_protocol::{
     failure::HostProjectedFailure,
@@ -212,11 +215,11 @@ impl<A: Actor> SubscriptionGeneration<A> {
     }
 }
 
-/// First-party allocations introduced by this adapter. The original Source
-/// also prices its own generation carrier and the existing Native allocations
-/// through their respective owners.
-pub(crate) fn native_subscription_io_layouts()
--> Result<[Layout; 4], novarocks_type_contract::owned_resources::layout::LayoutResourceError> {
+/// First-party backing for one live Native stream. Open creates the stream
+/// box before its future is destroyed. The read loop holds one future at a
+/// time and starts after open is destroyed.
+pub(in crate::task_execution::host) fn native_subscription_io_backing_bytes()
+-> Result<usize, ObservationError> {
     fn open_layout<F: Future>(
         _: fn(&'static NativeCoveredSubscriptionIo, DecodedCoveredSubscription) -> F,
     ) -> Layout {
@@ -226,13 +229,12 @@ pub(crate) fn native_subscription_io_layouts()
         Layout::new::<F>()
     }
 
-    Ok([
-        novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
-            NativeCoveredSubscriptionIo,
-        >())?,
-        open_layout(NativeCoveredSubscriptionIo::open_original),
-        Layout::new::<NativeCoveredSubscriptionStream>(),
-        next_layout(NativeCoveredSubscriptionStream::next_original),
+    let opening = open_layout(NativeCoveredSubscriptionIo::open_original).size();
+    let reading = next_layout(NativeCoveredSubscriptionStream::next_original).size();
+    backing::sum([
+        backing::arc::<NativeCoveredSubscriptionIo>()?.size(),
+        Layout::new::<NativeCoveredSubscriptionStream>().size(),
+        opening.max(reading),
     ])
 }
 
