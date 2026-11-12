@@ -31,6 +31,7 @@ use std::fmt;
 use std::future::Future;
 #[cfg(test)]
 use std::num::NonZeroU64;
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -99,6 +100,7 @@ use crate::task_execution::status_intake::{
     ObservationFrame, ObservationIntake, ObservationPublisher, StatusEvent, StatusIntakeAdmission,
     StatusIntakeHandle,
 };
+#[cfg(test)]
 use crate::wake::StatusIntakeWake;
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ fn original_runtime_wakes_capacity_and_projects_isolated_failure() {
     )
     .unwrap();
     let author = original.event_author().unwrap();
-    let mut capacity_source = registered
+    let capacity_source = registered
         .bind(
             &runtime,
             AttemptEffectAuthors {

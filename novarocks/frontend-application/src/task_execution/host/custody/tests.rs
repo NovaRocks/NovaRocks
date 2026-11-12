@@ -1046,12 +1046,13 @@ async fn publication_host_returns_original_result_and_typed_failure() {
             .unwrap();
         drive_host();
     }
-    let mut original = source.lock().unwrap();
-    assert!(original.close_idle().unwrap());
-    let publisher = original
-        .take_drained_owner()
-        .expect("original publication role retired");
-    drop(original);
+    let publisher = {
+        let mut original = source.lock().unwrap();
+        assert!(original.close_idle().unwrap());
+        original
+            .take_drained_owner()
+            .expect("original publication role retired")
+    };
     drop(publisher);
     parent.body_exited().unwrap();
     parent.captures_exited().unwrap();
@@ -1305,10 +1306,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use crate::{
         control_runtime::{
             actor::FrontendActorKind,
-            host::{
-                EffectSource, FrontendLanePolicy, HostBinding, HostRegistry, PendingHandoff,
-                PreparedEffectJob, SourceProgress,
-            },
+            host::{FrontendLanePolicy, HostBinding, HostRegistry},
             membership::FrozenMember,
             metrics::FrontendHostObservations,
             transport_withdrawal::AttemptEffectEnvelope,
@@ -1333,7 +1331,7 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     use novarocks_attempt_protocol::effect::{
         AttemptEffect, EffectBody, EffectClass, OperationIntent,
     };
-    use novarocks_control_runtime::actor_turn::{ActorHostTurn, Clock, EffectTicket, ProcessClock};
+    use novarocks_control_runtime::actor_turn::{Clock, ProcessClock};
     use novarocks_coordination_contract::{
         AttemptActionId, AttemptAuthorization, AttemptAuthorizationDecision,
         AttemptAuthorizationRef, AttemptConvergenceClosure, AttemptIssueSettlement,
@@ -1828,17 +1826,19 @@ async fn qa_host_serializes_admission_and_establish_through_one_reply_credit() {
     retire_commands(&[local_command]);
     drive_host();
     inbox.assert_no_result();
-    let mut sample_owner = process.lock().unwrap();
-    assert!(sample_owner.close_idle().unwrap());
-    let process_owner = sample_owner
-        .take_drained_owner()
-        .expect("original Process owner retired");
-    drop(sample_owner);
+    let process_owner = {
+        let mut sample_owner = process.lock().unwrap();
+        assert!(sample_owner.close_idle().unwrap());
+        sample_owner
+            .take_drained_owner()
+            .expect("original Process owner retired")
+    };
     drop(process_owner);
-    let mut qa = source.lock().unwrap();
-    assert!(qa.close_idle().unwrap());
-    let bridge = qa.take_drained_owner().expect("original QA bridge retired");
-    drop(qa);
+    let bridge = {
+        let mut qa = source.lock().unwrap();
+        assert!(qa.close_idle().unwrap());
+        qa.take_drained_owner().expect("original QA bridge retired")
+    };
     drop(bridge);
     use crate::query_execution::native_execution_adapter::source_cohort::tests as wc;
     let (workload, driver, _capacity) = wc::fixture();

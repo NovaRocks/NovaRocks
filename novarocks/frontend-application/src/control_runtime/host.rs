@@ -2473,19 +2473,20 @@ mod tests {
         assert_eq!(membership.target.input.in_flight().unwrap(), Some(second));
         registry.publish(3, &current);
         poll();
-        let views = seen.lock().unwrap();
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[0].revision, 1);
-        assert_eq!(
-            views[0].processes[&participant],
-            MembershipObservation::ExactOriginal
-        );
-        assert_eq!(views[1].revision, 2);
-        assert_eq!(
-            views[1].processes[&participant],
-            MembershipObservation::Unobserved
-        );
-        drop(views);
+        {
+            let views = seen.lock().unwrap();
+            assert_eq!(views.len(), 2);
+            assert_eq!(views[0].revision, 1);
+            assert_eq!(
+                views[0].processes[&participant],
+                MembershipObservation::ExactOriginal
+            );
+            assert_eq!(views[1].revision, 2);
+            assert_eq!(
+                views[1].processes[&participant],
+                MembershipObservation::Unobserved
+            );
+        }
 
         for _ in 0..8 {
             let Some(turn) = runtime.claim_host_actor() else {
