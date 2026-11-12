@@ -984,6 +984,73 @@ fn call_source_step(
 }
 
 #[test]
+fn computation_ready_starts_normal_drain_without_a_root_seal() {
+    use novarocks_coordination_contract::{AttemptComputationCut, AttemptConvergenceMode};
+    use novarocks_execution_contract::root_result::RootResultEnd;
+
+    let mut fixture = Fixture::new(BeforeStop::Active, 64);
+    fixture
+        .core
+        .begin_native_prefix(
+            fixture.now,
+            AttemptSourceCut {
+                source: fixture.sources.native,
+                tail: None,
+            },
+        )
+        .unwrap();
+    let root = fixture.core.execution.graph().root_identity();
+    let finished = frame(&mut fixture.core, root, TaskState::Finished, None);
+    fixture
+        .core
+        .apply_observations(
+            fixture.now,
+            fixture.sources.observation,
+            ObservationBatch::new(vec![finished]).unwrap(),
+        )
+        .unwrap();
+    let diagnostic_deadline = fixture.now.saturating_add(Duration::from_secs(1));
+    let remote_deadline = fixture.now.saturating_add(Duration::from_secs(3));
+    let begun = fixture.step(
+        fixture.sources.actor,
+        AttemptInput::Port(LogicalToAttempt {
+            activation: fixture.activation,
+            body: LogicalToAttemptBody::BeginConvergence {
+                mode: AttemptConvergenceMode::Normal,
+                remote_deadline,
+                computation_ready: Some(AttemptComputationCut {
+                    activation: fixture.activation,
+                    root,
+                    cut: fixture.now,
+                    diagnostic_deadline,
+                    convergence_deadline: remote_deadline,
+                    end: RootResultEnd {
+                        sequence: id(1),
+                        output_rows: 1,
+                    },
+                }),
+                retain_diagnostics: true,
+            },
+        }),
+    );
+    assert!(!begun.stop_producing);
+    assert!(!fixture.core.root.sealed());
+    assert!(fixture.core.execution.normal_drain_started());
+    assert_eq!(
+        fixture.core.execution.diagnostics().deadline(),
+        Some(diagnostic_deadline)
+    );
+    assert!(matches!(
+        fixture
+            .core
+            .execution
+            .next_quiesce_intent(fixture.participation),
+        Some(OperationIntent::QuiesceParticipation(request))
+            if request.participation() == fixture.participation
+    ));
+}
+
+#[test]
 fn next_convergence_read_is_authored_by_a_separate_timer_input() {
     use crate::input::MembershipObservation;
     use novarocks_coordination_contract::AttemptConvergenceMode;

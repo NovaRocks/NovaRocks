@@ -278,6 +278,7 @@ impl AttemptCore for Core {
             }
             Phase::Idle
                 if self.execution.has_pending_terminal_cleanup()
+                    || self.execution.has_pending_normal_drain()
                     || self.execution.has_task_input_cleanup()
                     || self.execution.has_released_native_input()
                     || (self.stop.business_closed()
@@ -769,8 +770,13 @@ impl Core {
                     };
                     self.convergence.begin(mode, *remote_deadline);
                     self.turn.convergence_changed = true;
-                    if mode == AttemptConvergenceMode::Cleanup {
+                    if self.convergence.mode() == Some(AttemptConvergenceMode::Cleanup) {
                         self.request_stop(result);
+                    } else if !self.stop.business_closed() {
+                        // Internal computation reaches convergence directly.
+                        // Request the same strict drain used by the streamed
+                        // success seal before issuing Quiesce and Release.
+                        self.execution.begin_normal_drain();
                     }
                     if self.turn.phase == Phase::Idle
                         && !self.stop.pending()
