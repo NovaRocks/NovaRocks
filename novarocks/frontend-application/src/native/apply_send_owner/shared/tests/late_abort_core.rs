@@ -186,10 +186,12 @@ impl LateAbortCore {
         expected: impl Fn(&EffectBody) -> bool,
     ) -> AttemptEffect {
         for _ in 0..16 {
-            if let Some(effect) = &step.effect {
-                if expected(&effect.body) {
-                    return step.effect.unwrap();
-                }
+            if step
+                .effect
+                .as_ref()
+                .is_some_and(|effect| expected(&effect.body))
+            {
+                return step.effect.unwrap();
             }
             step = self.continue_turn(step, queue);
         }
