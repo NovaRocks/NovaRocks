@@ -892,6 +892,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_abort_expiry_settles_the_exact_unsent_replay_and_rearms() {
+        exercise_registered_abort_route(RegisteredAbortCase::QueueExpiry).await;
+    }
+
+    #[tokio::test]
     async fn late_abort_failure_closes_the_original_issue_before_control_rearms() {
         exercise_registered_abort_route(RegisteredAbortCase::LateOwnerFailed).await;
     }
@@ -903,6 +908,7 @@ mod tests {
         InvalidReceipts,
         WorkerOwnerFailed,
         LocalDispatchRefusal,
+        QueueExpiry,
         LateOwnerFailed,
     }
 
@@ -930,6 +936,30 @@ mod tests {
         .unwrap();
     }
 
+    async fn next_registered_abort(
+        inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
+    ) -> (
+        novarocks_control_runtime_core::identity::InputId,
+        novarocks_coordination_contract::LogicalToAttempt<
+            novarocks_attempt_protocol::failure::AttemptFailure,
+        >,
+    ) {
+        use novarocks_attempt_protocol::input::AttemptInput;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some((input, attempt)) = inbox.try_commit_owner_control() {
+                    let AttemptInput::Port(abort) = attempt else {
+                        panic!("the exact registered Abort Control port");
+                    };
+                    return (input, abort);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
     async fn exercise_registered_abort_route(case: RegisteredAbortCase) {
         use crate::{
             control_runtime::actor::FrontendActor,
@@ -940,7 +970,9 @@ mod tests {
                     AttemptAbortIngress,
                 },
                 host::{
-                    adapter::tests::{OriginalAbortRefusal, original_abort_refusal, start},
+                    adapter::tests::{
+                        OriginalAbortCore, OriginalAbortRefusal, original_abort_refusal, start,
+                    },
                     custody::tests::WithdrawalInbox,
                     transport::SendKey,
                 },
@@ -968,10 +1000,11 @@ mod tests {
             RegisteredAbortCase::LocalDispatchRefusal => Some(OriginalAbortRefusal::LocalDispatch),
             _ => None,
         };
-        let frozen = refusal.map(|refusal| (start(), refusal));
+        let expiry = case == RegisteredAbortCase::QueueExpiry;
+        let mut frozen = (refusal.is_some() || expiry).then(start);
         let exact = frozen.as_ref().map_or_else(
             || participation(BackendProcessId::new_v7()),
-            |(frozen, _)| *frozen.plan.establish_material.keys().next().unwrap(),
+            |frozen| *frozen.plan.establish_material.keys().next().unwrap(),
         );
         let execution = exact.query_execution_id();
         let router = LogicalAbortRouter::new();
@@ -990,7 +1023,14 @@ mod tests {
             execution_stage,
         )
         .unwrap()
-        .with_abort_participation_effect_port(router.clone(), limit);
+        .with_abort_participation_effect_port(
+            router.clone(),
+            if expiry {
+                NonZeroUsize::new(3).unwrap()
+            } else {
+                limit
+            },
+        );
         let mut logical = LogicalExecutionTestHarness::install(
             tokio::runtime::Handle::current(),
             config,
@@ -999,6 +1039,10 @@ mod tests {
         )
         .unwrap();
         let activation = logical.activate_initial().await.unwrap();
+        if expiry {
+            frozen.as_mut().unwrap().plan.authorization_limits =
+                logical.native_attempt_drive().authorization_limits();
+        }
 
         let generation = Generation::new(1).unwrap();
         let ledger = RuntimeLedger::new(ResourceVector::default());
@@ -1249,14 +1293,15 @@ mod tests {
             return;
         }
 
-        if let Some((frozen, refusal)) = frozen {
+        if let Some(refusal) = refusal {
             let (input, AttemptInput::Port(original)) = inbox.try_commit_owner_control().unwrap()
             else {
                 panic!("original Abort Control input");
             };
             let before = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
             let failure =
-                original_abort_refusal(frozen, &inbox, &scope, input, original, refusal).await;
+                original_abort_refusal(frozen.unwrap(), &inbox, &scope, input, original, refusal)
+                    .await;
             assert_eq!(
                 logical
                     .stand_down_snapshot(exact)
@@ -1282,6 +1327,143 @@ mod tests {
                 ParticipationClosureState::AbortIssueExhausted,
             )
             .await;
+            assert!(inbox.try_commit_owner_control().is_none());
+            assert!(!matches!(
+                logical.join_readiness().await.unwrap(),
+                LogicalExecutionJoinReadiness::Ready
+            ));
+            drop(settlement_owner);
+            logical
+                .observe_worker_process_replaced(exact)
+                .await
+                .unwrap();
+            finish(&mut logical, inbox).await;
+            return;
+        }
+
+        if expiry {
+            let mut core = OriginalAbortCore::new(frozen.unwrap(), &inbox, activation);
+            let (first_input, AttemptInput::Port(original)) =
+                inbox.try_commit_owner_control().unwrap()
+            else {
+                panic!("original Abort Control input");
+            };
+            let LogicalToAttemptBody::Abort { action, request } = &original.body else {
+                panic!("original Abort request");
+            };
+            assert_eq!(*action, first);
+            let request = *request;
+            assert_eq!(request.envelope().operation_id(), operation);
+            assert_eq!(request.participation(), exact);
+            assert_eq!(request.cause(), AbortCause::QueryFailed);
+            let first_send = core.admit(first_input, original, 70, false);
+            let unknown = core.transport_unknown(&inbox, &scope, first_send);
+            let applied = settlement_owner.apply(&unknown, None).unwrap();
+            applied.result.unwrap();
+            assert!(applied.retirement.unwrap().retire_ready().unwrap());
+            assert!(runtime.input_custody(actor, first_input).unwrap().is_none());
+
+            let (replay_input, replay) = next_registered_abort(&inbox).await;
+            let LogicalToAttemptBody::Abort {
+                action,
+                request: replay_request,
+            } = &replay.body
+            else {
+                panic!("first replay is the same original Abort");
+            };
+            assert_eq!(*action, second);
+            assert_eq!(replay_request.envelope(), request.envelope());
+            assert_eq!(replay_request.participation(), exact);
+            assert_eq!(replay_request.cause(), request.cause());
+            let replay_send = core.admit(replay_input, replay, 71, true);
+            assert_eq!(replay_send.operation, operation);
+            assert_ne!(replay_send.generation, first_send.generation);
+
+            let expired = core.expire_queued_abort(replay_send, second);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+                    assert_eq!(snapshot.identity(), Some(identity));
+                    assert_eq!(snapshot.closure(), ParticipationClosureState::AbortPending);
+                    if snapshot.issue_state() == Some(AbortParticipationIssueState::TransportOwned)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut applied = settlement_owner.apply(&expired, None).unwrap();
+            applied.result.unwrap();
+            let mut retirement = applied.retirement.take().unwrap();
+            assert!(matches!(
+                router.try_reserve(identity),
+                AbortParticipationEffectAdmission::Backpressured
+            ));
+            assert_eq!(
+                runtime
+                    .input_custody(actor, replay_input)
+                    .unwrap()
+                    .unwrap()
+                    .standing_input_id,
+                Some(standing_id)
+            );
+            assert!(retirement.retire_ready().unwrap());
+            assert!(
+                runtime
+                    .input_custody(actor, replay_input)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(retirement);
+
+            let (retry_input, retry) = next_registered_abort(&inbox).await;
+            let LogicalToAttemptBody::Abort {
+                action,
+                request: retry_request,
+            } = retry.body
+            else {
+                panic!("next replay is the same original Abort");
+            };
+            assert_eq!(action, physical(3));
+            assert_eq!(retry_request.envelope(), request.envelope());
+            assert_eq!(retry_request.participation(), exact);
+            assert_eq!(retry_request.cause(), request.cause());
+            // Dispose the final test carrier through the same bridge. This
+            // cleanup does not claim a third physical dispatch or expiry.
+            let cleanup = settlement_owner
+                .apply(
+                    &settle(
+                        action,
+                        physical(200),
+                        None,
+                        AbortIssueSettlement::DefinitelyUnsent,
+                    ),
+                    None,
+                )
+                .unwrap();
+            cleanup.result.unwrap();
+            assert!(cleanup.retirement.unwrap().retire_ready().unwrap());
+            assert!(runtime.input_custody(actor, retry_input).unwrap().is_none());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+                    if snapshot.issue_state()
+                        == Some(AbortParticipationIssueState::AuthorizationExhausted)
+                    {
+                        assert_eq!(snapshot.identity(), Some(identity));
+                        assert_eq!(
+                            snapshot.closure(),
+                            ParticipationClosureState::AbortIssueExhausted
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
             assert!(inbox.try_commit_owner_control().is_none());
             assert!(!matches!(
                 logical.join_readiness().await.unwrap(),
@@ -1380,20 +1562,7 @@ mod tests {
         assert!(retirement.retire_ready().unwrap());
         capacity.changed().await.unwrap();
         drop(retirement);
-        let (_, AttemptInput::Port(replay_input)) =
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    if let Some(input) = inbox.try_commit_owner_control() {
-                        break input;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("original Abort replay Control input");
-        };
+        let (_, replay_input) = next_registered_abort(&inbox).await;
         let LogicalToAttemptBody::Abort {
             action,
             request: replay_request,
