@@ -552,6 +552,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### crate-boundary
 
+- [ADR-0229](ADR-0229-rust-test-placement-dependency-direction-and-fixture-ownership.md) — Rust 测试为何按断言 owner 放置、测试依赖为何不越出生产依赖闭包、无生产边的组合为何进接缝测试 package，以及 fixture 与增长规则（active；沿用 ADR-0056/0069/0140/0190，不替代其中任何一条）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）
 - [ADR-0218](ADR-0218-work-credentials-and-credentialed-entries.md) — 查询工作为何把原义务留在 join owner，由身份 owner 签发窄入口，并分开捕获析构、报告退休与真实收敛（active；补充 ADR-0211/0216/0194，第三方内部作业与监督覆盖边界另列）
 - [ADR-0216](ADR-0216-hms-uses-upstream-catalog-with-read-fallbacks.md) — HMS 只读入口为何直接依赖未修改的上游 catalog crate，并接受缺表报为不可用、metadata 读取不计入请求、列表含库中全部名称三项回退（active；部分替代 ADR-0174 的 HMS H3/H4 保留行与 ADR-0215 的 HMS 继续 vendor；固定列举额度由 ADR-0227 部分替代，只读及三项读取回退保留）
