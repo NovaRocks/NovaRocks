@@ -821,6 +821,7 @@ async fn prepare_observation(
         materialization,
         original_source,
         snapshot_id,
+        ..
     } = &opening.admitted
     {
         K::RowMutationMatch {
