@@ -876,14 +876,28 @@ mod tests {
                 let projected = requests.resolve(&passive).unwrap();
                 assert_eq!(projected.operation_id(), operation);
                 assert_eq!(projected.queued_bytes(), passive.queued_bytes());
-                assert_eq!(
-                    requests.encoded_protobuf_bytes(&passive).unwrap(),
-                    novarocks_task_codec::operation::wire_size::batch_item(
-                        prost::Message::encoded_len(&original)
-                    )
-                    .unwrap()
-                );
                 assert_eq!(encode_operation(&projected, &wire).unwrap(), original);
+                // The ordinary DTO is an intermediate carrier. Control closes
+                // lose its domain oneof wrapper in the final method request.
+                let mut batches = crate::native::task_transport::wire::encode_method_batches(
+                    vec![(passive.requires_control_progress(), original.clone())],
+                    novarocks_task_codec::TransportBudget::DEFAULT,
+                )
+                .unwrap();
+                assert_eq!(batches.len(), 1);
+                let actual = match batches.pop().unwrap().request {
+                    crate::native::task_transport::wire::EncodedMethodRequest::Ordinary(
+                        request,
+                    ) => {
+                        assert!(!passive.requires_control_progress());
+                        prost::Message::encoded_len(&request)
+                    }
+                    crate::native::task_transport::wire::EncodedMethodRequest::Control(request) => {
+                        assert!(passive.requires_control_progress());
+                        prost::Message::encoded_len(&request)
+                    }
+                };
+                assert_eq!(requests.encoded_protobuf_bytes(&passive).unwrap(), actual);
             }
         }
     }
