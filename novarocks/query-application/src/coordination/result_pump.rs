@@ -502,6 +502,10 @@ impl AcceptedRootStatusSource {
 
 #[doc(hidden)]
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the pending decision moves the original running permit and typed fetch failure together without another allocation"
+)]
 pub enum ResultPumpFailure {
     DecisionPending(ResultPumpDecision),
     Concluded(ConcludedResultPumpFailure),
