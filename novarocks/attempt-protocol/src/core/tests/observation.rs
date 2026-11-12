@@ -227,7 +227,7 @@ impl TerminalTrace {
                     input: id,
                     native_cut: Some(AttemptSourceCut {
                         source: sources.native,
-                        tail: None,
+                        tail: (source == sources.native).then_some(id),
                     }),
                     selected_cut: Some(AttemptSourceCut {
                         source: sources.observation,
@@ -1198,6 +1198,170 @@ fn attempt_failure_refinement_queues_only_the_new_terminal_task() {
         );
     }
     trace.expect_diagnostic_reads(&[peer, origin]);
+}
+
+#[test]
+fn create_identity_mismatch_asks_qa_about_original_process_replacement() {
+    use crate::input::MembershipObservation;
+    use novarocks_coordination_contract::{AttemptTerminal, AttemptToLogicalBody};
+
+    let replacement = crate::test_support::backend(99);
+    let positive = MembershipObservation::ExactReplacement(replacement);
+    for sample in [
+        None,
+        Some((positive, false)),
+        Some((MembershipObservation::ExactOriginal, true)),
+        Some((MembershipObservation::Unobserved, true)),
+        Some((positive, true)),
+    ] {
+        let mut trace = TerminalTrace::new();
+        let task = trace.core.execution.graph().root_identity();
+        let participation = trace
+            .core
+            .execution
+            .task(task.task_id())
+            .unwrap()
+            .participation();
+        let sources = trace.core.sources;
+        let activation = trace.core.activation;
+        let now = trace.core.execution.monotonic_now();
+        // TerminalTrace starts Establish and receives a 30-second effective lease.
+        let lease = Duration::from_secs(30);
+        let (operation_id, generation) = trace.start_create(task);
+        trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+
+        let rejection = OperationResult::Verdict {
+            outcome: OperationOutcome::IdentityMismatch,
+            detail: Some(SafeDetail::new("original Worker refusal").unwrap()),
+            acknowledgement: None,
+        };
+        let refusal = AttemptFailure::TaskProtocol(Box::new(TaskExecutionError::OperationFailed {
+            task: Some(task),
+            participation,
+            operation_id,
+            kind: OperationKind::CreateTask,
+            rejection: rejection.clone(),
+        }));
+        let step = trace.handle_input(
+            now,
+            sources.native,
+            AttemptInput::Executor(ExecutorFact::Operation(OperationObservation {
+                generation,
+                reply: OperationReply {
+                    operation_id,
+                    kind: OperationKind::CreateTask,
+                    result: OperationReplyResult::Worker(rejection.map_ack(|never| match never {})),
+                },
+            })),
+        );
+        let (round, effects) = trace.finish_observation_round(now, step);
+        assert_eq!(round, Err(refusal.clone()));
+        let [
+            AttemptEffect {
+                body: EffectBody::Port(port),
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("the failed Native prefix must issue the original QA replacement question");
+        };
+        let AttemptToLogicalBody::PreReadyReplacementQuery {
+            token,
+            refusal: asked,
+        } = &port.body
+        else {
+            panic!("expected the original QA replacement question");
+        };
+        assert_eq!(port.activation, activation);
+        assert_eq!(asked, &refusal);
+        assert_eq!(
+            trace.core.execution.rejected_create_observation_remaining(
+                task,
+                participation,
+                operation_id
+            ),
+            Some(lease)
+        );
+        assert!(trace.core.terminal.terminal().is_none());
+
+        let permission = trace.handle_input(
+            now,
+            sources.qa,
+            AttemptInput::Port(LogicalToAttempt {
+                activation,
+                body: LogicalToAttemptBody::PreReadyReplacementReply {
+                    token: *token,
+                    may_observe: sample.is_some(),
+                },
+            }),
+        );
+        let mut expected = refusal.clone();
+        let (mut step, at) = if let Some((observation, at_horizon)) = sample {
+            let Some(AttemptEffect {
+                body:
+                    EffectBody::ObserveProcess {
+                        request,
+                        participation: observed,
+                    },
+                ..
+            }) = permission.effect
+            else {
+                panic!("allowed replacement must ask for the exact process")
+            };
+            assert_eq!(observed, participation);
+            assert_eq!(permission.selection, InputSelection::Only(sources.process));
+            assert!(trace.core.terminal.terminal().is_none());
+            let elapsed = if at_horizon {
+                lease
+            } else {
+                lease - Duration::from_secs(1)
+            };
+            let at = now.saturating_add(elapsed);
+            if !at_horizon {
+                expected = AttemptFailure::PreReadyReplacement {
+                    refusal: Box::new(refusal),
+                    participation,
+                    operation_id,
+                    kind: OperationKind::CreateTask,
+                    replacement,
+                };
+            }
+            let step = trace.handle_input(
+                at,
+                sources.process,
+                AttemptInput::Executor(ExecutorFact::ProcessSnapshot {
+                    request,
+                    participation,
+                    sampled_at: at,
+                    observation,
+                }),
+            );
+            (step, at)
+        } else {
+            assert!(permission.effect.is_none());
+            (permission, now)
+        };
+
+        let terminal = (0..8)
+            .find_map(|_| {
+                if let Some(AttemptEffect {
+                    body: EffectBody::Port(port),
+                    ..
+                }) = step.effect.take()
+                {
+                    return Some(port);
+                }
+                assert_eq!(step.selection, InputSelection::Only(sources.actor));
+                step = trace.handle_input(at, sources.actor, AttemptInput::Timer);
+                None
+            })
+            .expect("the original attempt must publish its terminal refusal");
+        assert_eq!(terminal.activation, activation);
+        assert!(matches!(
+            terminal.body,
+            AttemptToLogicalBody::AttemptTerminal(AttemptTerminal::Failed(failure)) if failure == expected
+        ));
+    }
 }
 
 #[test]
