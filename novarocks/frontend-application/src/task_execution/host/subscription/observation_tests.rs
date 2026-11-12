@@ -2336,8 +2336,21 @@ fn frontend_host_retires_ordered_control_before_releasing_its_suffix() {
 #[test]
 fn ordered_host_runs_pending_seal_cut_through_the_attempt_core() {
     for finished_first in [true, false] {
-        run_frontend_ordered_control(Some(finished_first));
+        run_frontend_ordered_control(Some(OrderedSeal::Pending { finished_first }));
     }
+}
+
+#[test]
+fn ordered_host_runs_ready_seal_cut_through_the_attempt_core() {
+    for failure_first in [true, false] {
+        run_frontend_ordered_control(Some(OrderedSeal::Ready { failure_first }));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OrderedSeal {
+    Pending { finished_first: bool },
+    Ready { failure_first: bool },
 }
 
 struct ProtocolUnits(usize);
@@ -2367,14 +2380,24 @@ impl novarocks_attempt_protocol::capacity::StepContext for ProtocolUnits {
 enum ProtocolObservation {
     Batch(InputId, Vec<(ParticipationRef, u64)>),
     FirstSealProcessing(InputId),
-    SealResult(bool),
+    SealResult(Result<(), Box<AttemptFailure>>),
+}
+
+#[derive(Default)]
+struct ProtocolTrace {
+    ordered: Vec<ProtocolObservation>,
+    root: Option<novarocks_coordination_contract::AttemptRootProjection>,
+    failed_statuses: Vec<(
+        InputId,
+        novarocks_coordination_contract::SelectedTaskTermination,
+    )>,
 }
 
 struct ProtocolOrder {
     core: novarocks_attempt_protocol::Core,
     sources: novarocks_attempt_protocol::start::AttemptSources,
     continuation: u64,
-    observed: Arc<Mutex<Vec<ProtocolObservation>>>,
+    observed: Arc<Mutex<ProtocolTrace>>,
 }
 
 impl ProtocolOrder {
@@ -2434,7 +2457,8 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
             input::{AttemptInputId, PublicationApplied},
         };
         use novarocks_control_runtime_core::effect::EffectKind;
-        use novarocks_coordination_contract::AttemptToLogicalBody;
+        use novarocks_coordination_contract::{AttemptToLogicalBody, SelectedTaskTermination};
+        use novarocks_execution_contract::TaskState;
 
         // The ordered observations and Seal run through Core. The fixture has
         // already bootstrapped it and records only custody of the neutral hints.
@@ -2466,6 +2490,7 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
         }
         let input_id = AttemptInputId(NonZeroU64::new(claim.input.get()).unwrap());
         if let AttemptInput::Executor(ExecutorFact::Observations(batch)) = input.as_ref() {
+            let mut trace = self.observed.lock().unwrap();
             let keys = batch
                 .items()
                 .iter()
@@ -2476,17 +2501,27 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
                             ..
                         } => *sequence,
                         ObservationEvent::Fact {
-                            fact: ObservationFact::Status(_),
+                            fact: ObservationFact::Status(status),
                             ..
-                        } => 0,
+                        } => {
+                            if status.state() == TaskState::Failed {
+                                trace.failed_statuses.push((
+                                    claim.input,
+                                    SelectedTaskTermination::new(
+                                        status.identity(),
+                                        status.termination().unwrap().clone(),
+                                    ),
+                                ));
+                            }
+                            0
+                        }
                         _ => panic!("unexpected ordered fixture observation"),
                     };
                     (frame.participation, sequence)
                 })
                 .collect();
-            self.observed
-                .lock()
-                .unwrap()
+            trace
+                .ordered
                 .push(ProtocolObservation::Batch(claim.input, keys));
         }
         let now = MonotonicInstant::from_origin(Duration::from_nanos(at.0));
@@ -2502,6 +2537,7 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
             self.observed
                 .lock()
                 .unwrap()
+                .ordered
                 .push(ProtocolObservation::FirstSealProcessing(claim.input));
             let author = step.input_author().unwrap().clone();
             step.effect_from_author(
@@ -2523,7 +2559,8 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
                     EffectBody::Publish(Publication::ProtocolBatch(_)) => {
                         PublicationApplied::ProtocolBatch { published: true }
                     }
-                    EffectBody::Publish(Publication::RootStatus(_)) => {
+                    EffectBody::Publish(Publication::RootStatus(projection)) => {
+                        self.observed.lock().unwrap().root = Some(*projection);
                         PublicationApplied::RootStatus
                     }
                     EffectBody::Port(port) => {
@@ -2533,10 +2570,11 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
                         } = port.body
                         {
                             assert_eq!(reply, token(1));
-                            self.observed
-                                .lock()
-                                .unwrap()
-                                .push(ProtocolObservation::SealResult(result.is_ok()));
+                            self.observed.lock().unwrap().ordered.push(
+                                ProtocolObservation::SealResult(
+                                    result.map(|_| ()).map_err(Box::new),
+                                ),
+                            );
                             return Some((effect.id, PublicationApplied::SealResult));
                         }
                         assert!(matches!(
@@ -2581,7 +2619,7 @@ impl crate::control_runtime::actor::TestActor for ProtocolOrder {
 }
 
 fn ordered_protocol_fixture(
-    observed: Arc<Mutex<Vec<ProtocolObservation>>>,
+    observed: Arc<Mutex<ProtocolTrace>>,
     sources: novarocks_attempt_protocol::start::AttemptSources,
 ) -> (
     ProtocolOrder,
@@ -2672,7 +2710,7 @@ fn ordered_protocol_fixture(
     (protocol, activation, root, sibling, streams)
 }
 
-fn run_frontend_ordered_control(finished_first: Option<bool>) {
+fn run_frontend_ordered_control(seal: Option<OrderedSeal>) {
     use crate::control_runtime::{
         actor::{FrontendActor, FrontendActorKind, FrontendEffect, FrontendInput, TestActor},
         host::{
@@ -2844,7 +2882,7 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
     use novarocks_control_runtime::history::HistoryCapture;
     use novarocks_control_runtime_core::history::{EffectHistoryPhase, HistoryFact};
     let runtime_history = HistoryCapture::new(4096);
-    let layout = finished_first.map(|_| {
+    let layout = seal.map(|_| {
         NativeTransportCapacity::from_transport(
             novarocks_task_codec::TransportBudget::new(
                 1,
@@ -2901,7 +2939,7 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         max_step_work: 1,
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::new(Mutex::new(ProtocolTrace::default()));
     let (test_actor, activation, root, key, sibling) = if let Some(sources) = sources {
         let (protocol, activation, root, sibling, [first, second]) =
             ordered_protocol_fixture(observed.clone(), sources);
@@ -3156,18 +3194,54 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         assert!(host.is_empty() && runtime.is_empty() && ledger.is_empty());
     };
 
-    if let (Some(finished_first), Some((sibling, other))) = (finished_first, sibling) {
-        use novarocks_execution_contract::{
-            AbortCause, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
-            TerminationDetail,
+    if let (Some(seal), Some((sibling, other))) = (seal, sibling) {
+        use novarocks_attempt_protocol::{
+            error::TaskExecutionError, root_control::RootSealRefusal,
         };
+        use novarocks_coordination_contract::{AttemptRootFailure, SelectedTaskTermination};
+        use novarocks_execution_contract::{
+            AbortCause, SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatus,
+            TaskStatusVersion, TerminationDetail,
+            failure::{FailureClass, FailureFact, FailureReason},
+        };
+        use std::num::NonZeroU16;
         open(other);
         let accept = |key, event| {
             ingress
                 .accept(key, event, 32, bank.credit(false, Some(key)).unwrap())
                 .unwrap();
         };
-        // The status suffix is still part of the initial covered transfer.
+        let status = |task, state, termination| ObservationEvent::Fact {
+            source_revision: None,
+            fact: ObservationFact::Status(
+                TaskStatus::try_new_with_installed(
+                    task,
+                    TaskStatusVersion::FIRST,
+                    state,
+                    termination,
+                    TaskOutputFacts::new(state == TaskState::Finished),
+                    true,
+                )
+                .unwrap(),
+            ),
+        };
+        let exact_failure = TerminationDetail::Failed(TaskFailure::new(
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(NonZeroU16::MAX, NonZeroU16::MIN),
+            ),
+            SafeDetail::truncating("original ordered sibling failure"),
+        ));
+        let exact_failed = || status(sibling, TaskState::Failed, Some(exact_failure.clone()));
+        let expected_failure = SelectedTaskTermination::new(sibling, exact_failure.clone());
+        let failure_before_control = matches!(
+            seal,
+            OrderedSeal::Ready {
+                failure_first: true
+            }
+        );
+        let seal_is_ready = matches!(seal, OrderedSeal::Ready { .. });
+        // The status events are still part of the initial covered transfer.
         // These markers advance liveness without claiming a covered prefix.
         let marker = |key: StreamKey, sequence| ObservationEvent::Fact {
             source_revision: None,
@@ -3178,7 +3252,14 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
                 source_cut: 0,
             },
         };
-        accept(key, marker(key, 1));
+        accept(
+            key,
+            if seal_is_ready {
+                status(root, TaskState::Finished, None)
+            } else {
+                marker(key, 1)
+            },
+        );
         let read = |key| {
             let mut frame = ready(());
             let mut credit = Some(bank.credit(false, Some(key)).unwrap());
@@ -3200,9 +3281,14 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         ingress
             .complete_receive(&earlier, marker(key, 2), 32)
             .unwrap();
-        for sequence in 4..=258 {
+        for sequence in 4..=257 {
             let key = if sequence % 2 == 0 { key } else { other };
             accept(key, marker(key, sequence));
+        }
+        if failure_before_control {
+            accept(other, exact_failed());
+        } else {
+            accept(key, marker(key, 258));
         }
         let mut progress_receipts = Vec::new();
         for (role, key) in progress_roles.iter().zip([key, other]) {
@@ -3295,40 +3381,55 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
         let ordinary = filled_ordinary();
         ingress.root_control(bank.seal()).unwrap();
         assert_eq!(filled_ordinary(), ordinary);
-        let status = |task, state, termination| ObservationEvent::Fact {
-            source_revision: None,
-            fact: ObservationFact::Status(
-                TaskStatus::try_new_with_installed(
-                    task,
-                    TaskStatusVersion::FIRST,
-                    state,
-                    termination,
-                    TaskOutputFacts::new(state == TaskState::Finished),
-                    true,
-                )
-                .unwrap(),
-            ),
+        let suffix = match seal {
+            OrderedSeal::Pending { finished_first } => {
+                let finished = (key, status(root, TaskState::Finished, None));
+                let aborted = (
+                    other,
+                    status(
+                        sibling,
+                        TaskState::Aborted,
+                        Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+                    ),
+                );
+                if finished_first {
+                    vec![finished, aborted]
+                } else {
+                    vec![aborted, finished]
+                }
+            }
+            OrderedSeal::Ready {
+                failure_first: true,
+            } => vec![(key, marker(key, 259))],
+            OrderedSeal::Ready {
+                failure_first: false,
+            } => vec![(other, exact_failed())],
         };
-        let finished = (key, status(root, TaskState::Finished, None));
-        let failed = (
-            other,
-            status(
-                sibling,
-                TaskState::Aborted,
-                Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
-            ),
-        );
-        for (key, event) in if finished_first {
-            [finished, failed]
-        } else {
-            [failed, finished]
-        } {
+        let suffix_len = suffix.len();
+        for (key, event) in suffix {
             accept(key, event);
         }
 
         for _ in 0..3 {
             assert!(runtime.poll_one(Tick(1)).unwrap());
             drive();
+        }
+        if seal_is_ready {
+            let trace = observed.lock().unwrap();
+            let projection = trace
+                .root
+                .as_ref()
+                .expect("Root is visible before Seal is processed");
+            assert_eq!(projection.status.identity(), root);
+            assert_eq!(projection.status.state(), TaskState::Finished);
+            assert_eq!(
+                projection.failure,
+                if failure_before_control {
+                    AttemptRootFailure::Authoritative(expected_failure.clone())
+                } else {
+                    AttemptRootFailure::None
+                }
+            );
         }
         assert!(runtime.poll_one(Tick(1)).unwrap());
         let prefix = observed.lock().unwrap();
@@ -3337,17 +3438,40 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             ProtocolObservation::Batch(batch_id, batch),
             ProtocolObservation::Batch(last_id, last),
             ProtocolObservation::FirstSealProcessing(control),
-        ] = prefix.as_slice()
+            decision @ ..,
+        ] = prefix.ordered.as_slice()
         else {
-            panic!("the Core did not first process the pending seal after the 256-frame cut");
+            panic!("the Core did not first process the Seal after the 256-frame cut");
         };
-        assert_eq!(first.as_slice(), [(key.participation, 1)]);
+        assert_eq!(
+            first.as_slice(),
+            [(key.participation, u64::from(!seal_is_ready))]
+        );
         assert_eq!(batch.len(), 256);
         assert_eq!(
             batch[..2],
             [(key.participation, 2), (other.participation, 3)]
         );
-        assert_eq!(last.as_slice(), [(key.participation, 258)]);
+        assert_eq!(
+            last.as_slice(),
+            [if failure_before_control {
+                (other.participation, 0)
+            } else {
+                (key.participation, 258)
+            }]
+        );
+        if seal_is_ready {
+            let expected = if failure_before_control {
+                Err(Box::new(AttemptFailure::TaskProtocol(Box::new(
+                    TaskExecutionError::Schedule(RootSealRefusal::AttemptCleanup.message().into()),
+                ))))
+            } else {
+                Ok(())
+            };
+            assert_eq!(decision, [ProtocolObservation::SealResult(expected)]);
+        } else {
+            assert!(decision.is_empty(), "a pending Seal still needs its suffix");
+        }
         let mut expected_inputs = vec![*first_id, *batch_id, *last_id, *control];
         let control = *control;
         drop(prefix);
@@ -3358,27 +3482,61 @@ fn run_frontend_ordered_control(finished_first: Option<bool>) {
             let original = writer.in_flight.as_ref().unwrap();
             assert_eq!(original.input, control);
             assert!(original.control && !original.finished());
-            assert_eq!(writer.queue.len(), 2);
+            assert_eq!(writer.queue.len(), suffix_len);
         }
         drive();
         assert!(runtime.input_custody(actor(), control).unwrap().is_none());
         assert_eq!(filled_ordinary(), ordinary);
         assert!(
             runtime.poll_one(Tick(1)).unwrap(),
-            "pending Seal cannot block its evidence"
+            "the first-processing notice releases the ordered suffix"
         );
         drive();
         let history = observed.lock().unwrap();
-        let [
-            ProtocolObservation::Batch(suffix_id, suffix),
-            ProtocolObservation::SealResult(success),
-        ] = &history[4..]
-        else {
-            panic!("expected one suffix batch and one decision from the actual Core: {history:?}");
+        let suffix_id = match seal {
+            OrderedSeal::Pending { finished_first } => {
+                let [
+                    ProtocolObservation::Batch(suffix_id, suffix),
+                    ProtocolObservation::SealResult(result),
+                ] = &history.ordered[4..]
+                else {
+                    panic!(
+                        "expected the pending suffix and Seal decision: {:?}",
+                        history.ordered
+                    );
+                };
+                assert_eq!(suffix.len(), 2);
+                assert_eq!(result.is_ok(), finished_first);
+                *suffix_id
+            }
+            OrderedSeal::Ready { failure_first } => {
+                let [ProtocolObservation::Batch(suffix_id, suffix)] = &history.ordered[5..] else {
+                    panic!(
+                        "expected the ready suffix and no second decision: {:?}",
+                        history.ordered
+                    );
+                };
+                assert_eq!(
+                    suffix.as_slice(),
+                    [if failure_first {
+                        (key.participation, 259)
+                    } else {
+                        (other.participation, 0)
+                    }]
+                );
+                let failure_input = if failure_first {
+                    expected_inputs[2]
+                } else {
+                    *suffix_id
+                };
+                assert_eq!(
+                    history.failed_statuses.as_slice(),
+                    [(failure_input, expected_failure)]
+                );
+                *suffix_id
+            }
         };
-        assert_eq!(suffix.len(), 2);
-        assert_eq!(*success, finished_first);
-        expected_inputs.push(*suffix_id);
+        expected_inputs.push(suffix_id);
         drop(history);
         assert_eq!(filled_ordinary(), ordinary);
         for _ in &ordinary {
