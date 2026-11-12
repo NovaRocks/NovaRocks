@@ -309,6 +309,11 @@ struct WithdrawalTarget {
     commands: Arc<Mutex<VecDeque<TransportCommand>>>,
     handle_attempt_hints: bool,
 }
+impl WithdrawalTarget {
+    const SELECT_COMMAND_SOURCE: u64 = 2;
+    const REOPEN_SOURCES: u64 = 3;
+}
+
 impl TestActor for WithdrawalTarget {
     fn handle(
         &mut self,
@@ -341,6 +346,17 @@ impl TestActor for WithdrawalTarget {
         }
         if let FrontendInput::Test(value) = value {
             assert_ne!(value, u64::MAX, "transport fixture Core failure");
+            match value {
+                Self::SELECT_COMMAND_SOURCE => {
+                    step.select_input_source(Some(envelope.source));
+                    return;
+                }
+                Self::REOPEN_SOURCES => {
+                    step.select_input_source(None);
+                    return;
+                }
+                _ => {}
+            }
             let (effect, guard) = self
                 .commands
                 .lock()
@@ -576,6 +592,26 @@ impl WithdrawalInbox {
             .fill(FrontendInput::Test(1))
             .unwrap()
     }
+    pub(crate) fn select_command_source_for_test(
+        &self,
+        work: &novarocks_control_runtime::obligation::WorkObligation,
+        selected: bool,
+    ) {
+        let command = if selected {
+            WithdrawalTarget::SELECT_COMMAND_SOURCE
+        } else {
+            WithdrawalTarget::REOPEN_SOURCES
+        };
+        let input = self
+            .reserve_command(work)
+            .fill(FrontendInput::Test(command))
+            .unwrap();
+        assert!(self.runtime.poll_one(Tick(1)).unwrap());
+        self.runtime
+            .retire_input(self.registration.actor(), input)
+            .unwrap();
+    }
+
     pub(crate) fn reserve_command(
         &self,
         work: &novarocks_control_runtime::obligation::WorkObligation,
