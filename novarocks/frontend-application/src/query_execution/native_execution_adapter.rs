@@ -755,9 +755,8 @@ async fn acquire_replacement_admissions(
     let authority = qualification
         .native_action_authority()
         .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
-    let valid_for =
-        LeaseValidFor::new(crate::task_execution::participation_owner::ADMISSION_TICKET_VALID_FOR)
-            .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
+    let valid_for = LeaseValidFor::new(crate::task_execution::sources::ADMISSION_TICKET_VALID_FOR)
+        .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
     let attempt_runtime = &runtime.attempt_runtime;
     let scope = attempt_runtime
         .open_replacement_qualification()

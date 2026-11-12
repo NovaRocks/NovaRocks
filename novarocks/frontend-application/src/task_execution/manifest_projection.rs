@@ -23,8 +23,8 @@ use super::{
     error::TaskExecutionError,
     graph::{TaskGraph, TaskPlanSource, build_task_graph_from_manifest},
     host::transport::{AttemptEstablishMaterial, FrozenSendRequests},
-    participation_owner::ParticipationEstablishSource,
     protocol_facts::{AttemptProtocolFactsPublisher, AttemptProtocolFactsReceiver},
+    sources::ParticipationEstablishSource,
 };
 use crate::{
     control_runtime::membership::FrozenMember, query_execution::artifact::TaskManifestBinding,

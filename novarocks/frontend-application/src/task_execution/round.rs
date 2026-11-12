@@ -26,6 +26,7 @@
 //! timed out, or finished -- it moves the state machine and lets the caller
 //! read the verdicts the machine already computes.
 
+pub(crate) use super::pump_health::PumpCloseUnresolved;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -119,26 +120,6 @@ pub(crate) trait TurnPump: Send {
     /// A genuine original job/capture exit was not proven. This goes only to
     /// the enclosing process-health supervision owner, never the Task latch.
     fn take_close_unresolved(&mut self) -> Option<PumpCloseUnresolved>;
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PumpCloseUnresolved {
-    pub(crate) owner: &'static str,
-    pub(crate) cause: Arc<dyn std::error::Error + Send + Sync>,
-}
-impl std::fmt::Display for PumpCloseUnresolved {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the original {} close job did not exit normally",
-            self.owner
-        )
-    }
-}
-impl std::error::Error for PumpCloseUnresolved {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.cause.as_ref())
-    }
 }
 
 struct RoundPump {

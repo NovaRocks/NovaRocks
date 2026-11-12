@@ -29,11 +29,13 @@ use crate::{
             TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport, TaskUpdateTransportError,
         },
         split_assignment_round::{
-            RoundSplitAssignmentPlan, SplitAssignmentProfileRead,
-            executor::{OriginalSplitPublisher, SplitAssignmentExecutor},
+            RoundSplitAssignmentPlan,
+            executor::{
+                OriginalSplitPublisher, SplitAssignmentExecutor, SplitAssignmentProfileRead,
+            },
         },
     },
-    task_execution::{error::TaskExecutionError, round::PumpCloseUnresolved},
+    task_execution::{error::TaskExecutionError, pump_health::PumpCloseUnresolved},
     wake::StatusIntakeWake,
 };
 use novarocks_attempt_protocol::{
@@ -389,6 +391,7 @@ impl OriginalSplitPublisher for BoundSplitRunner {
                 SplitDiagnosticObservation::Available(self.original.pump)
             }
             SplitAssignmentProfileRead::Failed => SplitDiagnosticObservation::Failed,
+            #[cfg(test)]
             SplitAssignmentProfileRead::Pending | SplitAssignmentProfileRead::SourceGone => {
                 unreachable!("split runner publishes its original settled profile")
             }

@@ -25,6 +25,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks_execution::task_execution::domain::{
     CodecOwnedContent, CredentialDomainId, CredentialEpoch,
@@ -48,9 +49,47 @@ use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmi
 use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::graph::{TaskPlanFacts, TaskPlanSource};
-use crate::task_execution::participation_owner::{
-    ParticipationEstablishFacts, ParticipationEstablishSource,
-};
+/// How long query coordination asks a Worker to hold an unconsumed ticket.
+///
+/// This is a query-side policy. Worker retention limits remain Worker-owned
+/// and are not imported into the frontend.
+pub(crate) const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
+
+/// The shared facts an establish installs atomically.
+///
+/// All four are codec-owned content: the frontend can size and pass them
+/// along, and cannot walk them. The credential never reaches a comparable or
+/// printable form at all.
+#[derive(Clone)]
+pub struct ParticipationEstablishFacts {
+    pub catalog_binding: Arc<dyn CodecOwnedContent>,
+    pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+    pub query_options: Arc<dyn CodecOwnedContent>,
+    pub initial_credential: CredentialUpdate,
+}
+
+impl std::fmt::Debug for ParticipationEstablishFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ParticipationEstablishFacts")
+            .field("catalog_binding", &self.catalog_binding.fingerprint())
+            .field(
+                "initial_runtime_filter",
+                &self.initial_runtime_filter.fingerprint(),
+            )
+            .field("query_options", &self.query_options.fingerprint())
+            .field("initial_credential", &self.initial_credential)
+            .finish()
+    }
+}
+
+/// Where the establish facts of one participation come from.
+pub trait ParticipationEstablishSource: Send {
+    fn facts_for(
+        &self,
+        participation: ParticipationRef,
+    ) -> Result<ParticipationEstablishFacts, TaskExecutionError>;
+}
 
 /// The sealed submissions of one attempt, indexed the way the graph asks.
 ///

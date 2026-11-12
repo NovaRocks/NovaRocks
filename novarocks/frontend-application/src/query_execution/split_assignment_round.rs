@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The coordinator's per-round split-assignment pump.
+//! Split-assignment source preparation and original driver.
 //!
-//! The pump advances as part of `TaskRound`. Each synchronous Connector call
-//! moves one source into supervised blocking-I/O work; TaskUpdate
-//! submission, acknowledgement, retry delay, and source-owner bookkeeping stay
-//! on the serial round without occupying a blocking worker. The guard only signals
-//! stop, so cancellation and drop never join or block an OS thread.
+//! The admitted executor advances the driver. Each synchronous Connector call
+//! moves one source into supervised blocking-I/O work. TaskUpdate submission,
+//! acknowledgement, retry delay, and source custody stay with the driver.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -44,8 +42,12 @@ use crate::task_execution::blocking_io::{
     ConnectorOperationJob as ConnectorBlockingIoJob, ConnectorSourceCloseResult,
 };
 use crate::task_execution::error::TaskExecutionError;
+#[cfg(test)]
 use crate::task_execution::execution::QueryTaskExecution;
-use crate::task_execution::round::{PumpCloseUnresolved, TaskRound, TurnPump};
+#[cfg(test)]
+use crate::task_execution::pump_health::PumpCloseUnresolved;
+#[cfg(test)]
+use crate::task_execution::round::{TaskRound, TurnPump};
 use crate::wake::StatusIntakeWake;
 use novarocks_attempt_protocol::config::TaskUpdateRetryPolicy;
 
@@ -389,11 +391,9 @@ impl RoundSplitAssignmentPlan {
 
     /// Everything but the delivery transport.
     ///
-    /// The transport arrives at [`SplitAssignmentRoundGuard::install`] because
-    /// the two are frozen at different moments: sources must be open before
-    /// the attempt's credential leases are sealed, while the task substrate's
-    /// delivery bridge cannot exist until the task graph does -- and the graph
-    /// is built from the encoder output, which comes later.
+    /// The admitted executor binds delivery after the task graph is frozen.
+    /// Sources open before the attempt seals its credentials, while the task
+    /// graph requires the later encoder output.
     pub(crate) fn new(
         targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
@@ -454,9 +454,12 @@ struct SplitAssignmentPump {
     outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
     closing: bool,
     close_joined: bool,
+    #[cfg(test)]
     cleanup_failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
+    #[cfg(test)]
     cleanup_failure_reported: bool,
     unresolved: Arc<Mutex<SplitUnresolved>>,
+    #[cfg(test)]
     unresolved_reported: bool,
 }
 
@@ -653,6 +656,7 @@ impl SplitAssignmentPump {
                             .provider_close = Some(primary);
                     }
                     let result = self.closing_reason.clone().map_or(closed, Err);
+                    #[cfg(test)]
                     if let Err(error) = &result {
                         *self
                             .cleanup_failure
@@ -698,6 +702,7 @@ impl SplitAssignmentPump {
                                 SplitAssignmentDriverError::SplitSource { scan: None, detail },
                             )),
                         };
+                        #[cfg(test)]
                         if let Err(error) = &result {
                             *self
                                 .cleanup_failure
@@ -837,6 +842,7 @@ impl SplitAssignmentPump {
     }
 }
 
+#[cfg(test)]
 impl TurnPump for SplitAssignmentPump {
     fn name(&self) -> &'static str {
         Self::PUMP_NAME
@@ -916,6 +922,7 @@ impl Drop for SplitAssignmentPump {
 }
 
 /// A nonblocking observation handle for the round-owned split pump.
+#[cfg(test)]
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
@@ -925,17 +932,13 @@ pub(crate) struct SplitAssignmentRoundGuard {
 
 /// Read-only observation of the original close result. A weak view cannot
 /// keep a source alive or manufacture its actual-exit proof.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SplitAssignmentProfileSource {
     outcome: std::sync::Weak<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
 }
 
-pub(crate) enum SplitAssignmentProfileRead {
-    Pending,
-    Available(SplitSourceProfile),
-    Failed,
-    SourceGone,
-}
+#[cfg(test)]
 impl SplitAssignmentProfileSource {
     pub(crate) fn current(&self) -> SplitAssignmentProfileRead {
         let Some(outcome) = self.outcome.upgrade() else {
@@ -951,11 +954,13 @@ impl SplitAssignmentProfileSource {
 
 /// Read-only projection of the original pump's selected failure. This grants
 /// no source, close, retry, or actual-exit authority.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SplitAssignmentFailureSource {
     failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
 }
 
+#[cfg(test)]
 impl SplitAssignmentFailureSource {
     pub(crate) fn failure(&self) -> Option<SplitAssignmentDriverError> {
         self.failure
@@ -965,6 +970,7 @@ impl SplitAssignmentFailureSource {
     }
 }
 
+#[cfg(test)]
 impl SplitAssignmentRoundGuard {
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
         SplitAssignmentProfileSource {
@@ -1085,6 +1091,7 @@ impl SplitAssignmentRoundGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for SplitAssignmentRoundGuard {
     fn drop(&mut self) {
         self.request_stop();
@@ -2857,3 +2864,5 @@ mod tests {
 }
 
 pub(crate) mod executor;
+#[cfg(test)]
+pub(crate) use executor::SplitAssignmentProfileRead;

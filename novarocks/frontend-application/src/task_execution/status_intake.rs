@@ -15,29 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Status and observation intake: bounded queues and serial runners.
+//! Bounded intake for the original covered Native subscription adapter.
 //!
-//! A status callback holds a [`StatusIntakeHandle`] and nothing else. It can
-//! enqueue one immutable snapshot and wake the runner; it has no path to a
-//! task, a stage, or a lease, so it cannot create a task or complete a stage
-//! on the transport's thread.
-//!
-//! The legacy status queue reports overflow as observation loss. The unified
-//! observation queue below reserves capacity before reading a frame and
-//! applies bounded backpressure instead; ordinary queue fullness cannot
-//! counterfeit a gap in the accepted observation stream.
+//! The observation queue reserves capacity before reading a frame and
+//! applies bounded backpressure. Test fixtures also retain the original
+//! status queue and its overflow reports.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use crate::wake::StatusIntakeWake;
 #[cfg(test)]
-pub use crate::wake::{CountingWake, TestIntakeWake};
-pub use crate::wake::{NotifyWake, StatusIntakeWake};
+pub use crate::wake::{CountingWake, NotifyWake, TestIntakeWake};
 
 use novarocks_coordination_contract::MonotonicInstant;
-use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity, TaskStatus};
+#[cfg(test)]
+use novarocks_execution::task_execution::TaskStatus;
+use novarocks_execution::task_execution::{ParticipationRef, TaskIdentity};
 use novarocks_query_application::coordination::{
     AcceptedRootControlPort, AcceptedRootControlRequest,
 };
@@ -46,6 +42,7 @@ use novarocks_query_application::coordination::{
 use super::clock::ProcessMonotonicClock;
 use novarocks_coordination_contract::MonotonicClock;
 
+#[cfg(test)]
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusEvent {
@@ -55,6 +52,7 @@ pub enum StatusEvent {
     Gone(TaskIdentity),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct StatusIntakeInner {
     queue: Mutex<StatusIntakeQueue>,
@@ -63,6 +61,7 @@ struct StatusIntakeInner {
     wake: Arc<dyn StatusIntakeWake>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct StatusIntakeQueue {
     entries: VecDeque<StatusIntakeEntry>,
@@ -71,6 +70,7 @@ struct StatusIntakeQueue {
     root_control_queued: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) enum StatusIntakeEntry {
     Status(StatusEvent),
@@ -78,6 +78,7 @@ pub(super) enum StatusIntakeEntry {
     RootControl(AcceptedRootControlRequest),
 }
 
+#[cfg(test)]
 impl StatusIntakeQueue {
     fn enqueue_observation_loss(&mut self) {
         if !self.observation_loss_queued {
@@ -88,6 +89,7 @@ impl StatusIntakeQueue {
 }
 
 /// Whether a published snapshot was admitted.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatusIntakeAdmission {
     Enqueued,
@@ -97,11 +99,13 @@ pub enum StatusIntakeAdmission {
 }
 
 /// The only handle a transport callback holds.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct StatusIntakeHandle {
     inner: Arc<StatusIntakeInner>,
 }
 
+#[cfg(test)]
 impl StatusIntakeHandle {
     /// Enqueues one immutable snapshot and wakes the runner.
     ///
@@ -143,6 +147,7 @@ impl StatusIntakeHandle {
     }
 }
 
+#[cfg(test)]
 impl AcceptedRootControlPort for StatusIntakeHandle {
     fn enqueue_root_control(
         &self,
@@ -167,11 +172,13 @@ impl AcceptedRootControlPort for StatusIntakeHandle {
 }
 
 /// The runner side of the intake.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct StatusIntake {
     inner: Arc<StatusIntakeInner>,
 }
 
+#[cfg(test)]
 impl StatusIntake {
     pub fn new(capacity: usize, wake: Arc<dyn StatusIntakeWake>) -> Self {
         Self {
@@ -217,11 +224,13 @@ impl StatusIntake {
 }
 
 /// The exclusive right to apply intake.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct StatusIntakeRunner<'a> {
     intake: &'a StatusIntake,
 }
 
+#[cfg(test)]
 impl StatusIntakeRunner<'_> {
     /// Takes at most `max` queued snapshots and reports any observation-loss
     /// marker ordered before the next success-seal request.
@@ -274,6 +283,7 @@ impl StatusIntakeRunner<'_> {
     }
 }
 
+#[cfg(test)]
 impl Drop for StatusIntakeRunner<'_> {
     fn drop(&mut self) {
         self.intake

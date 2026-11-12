@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use crate::task_execution::operation::{OperationDispatchResult, WorkerReceiptOutcome};
 use novarocks_attempt_protocol::config::{DispatchBudget, DispatchLane};
+#[cfg(test)]
 use novarocks_coordination_contract::MonotonicInstant;
 #[cfg(test)]
 use novarocks_execution::task_execution::FetchTaskDynamicFilters;
@@ -289,6 +290,7 @@ pub struct TaskOperationQueueRequest {
 }
 
 impl TaskOperationQueueRequest {
+    #[cfg(test)]
     /// The reservation for one task create, priced before the create is
     /// frozen. `queued_bytes` is the create's exact queued size.
     pub(crate) const fn create_task(backend: BackendProcessId, queued_bytes: usize) -> Self {
@@ -301,6 +303,7 @@ impl TaskOperationQueueRequest {
         }
     }
 
+    #[cfg(test)]
     /// The reservation for one task-domain update before it enters a
     /// `RemoteTask`'s pending queue.
     pub(crate) fn task_update(backend: BackendProcessId, update: &TaskDomainUpdate) -> Self {
@@ -313,6 +316,7 @@ impl TaskOperationQueueRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_native_input(
         mut self,
         quote: novarocks_workload_control::joint_admission::NativeQueuedInputQuote,
@@ -339,6 +343,7 @@ impl TaskOperationQueueRequest {
     }
 }
 
+#[cfg(test)]
 /// Inline preparation state in the original request producer. It owns only
 /// the original paid ticket/receipt; it is not a second queue or capacity.
 #[derive(Default)]
@@ -350,6 +355,7 @@ pub struct TaskOperationQueuePreparation {
     pub(crate) grant: Option<novarocks_workload_control::joint_admission::NativeQueuedInputGrant>,
     pub(crate) failure: Option<novarocks_workload_control::WorkError>,
 }
+#[cfg(test)]
 impl std::fmt::Debug for TaskOperationQueuePreparation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OriginalNativeQueuePreparation")
@@ -360,6 +366,7 @@ impl std::fmt::Debug for TaskOperationQueuePreparation {
             .finish()
     }
 }
+#[cfg(test)]
 impl TaskOperationQueuePreparation {
     pub const fn new() -> Self {
         Self {
@@ -409,6 +416,7 @@ impl TaskOperationQueuePreparation {
     }
 }
 
+#[cfg(test)]
 struct UnpublishedQueueCleanupFailure {
     // Same original grant remains queued if cleanup did not prove exit.
     _cause: Box<dyn std::any::Any + Send>,
@@ -763,6 +771,7 @@ impl OperationAcknowledgement {
     }
 }
 
+#[cfg(test)]
 /// One batch of intents the dispatcher released for one backend and lane.
 #[derive(Debug)]
 pub struct DispatchBatch {
@@ -780,6 +789,7 @@ pub struct DispatchBatch {
     queued_at: MonotonicInstant,
 }
 
+#[cfg(test)]
 impl DispatchBatch {
     #[cfg(test)]
     pub(super) fn test_fixture(
@@ -890,6 +900,7 @@ impl DispatchBatch {
     }
 }
 
+#[cfg(test)]
 /// The immutable identity of a batch the transport accepted.
 ///
 /// Payload ownership remains with the transport. The dispatcher needs only
@@ -902,6 +913,7 @@ pub(crate) struct DispatchAcceptance {
     pub(super) operation_ids: Vec<TaskOperationId>,
 }
 
+#[cfg(test)]
 /// The result of one non-blocking transport admission attempt.
 #[derive(Debug)]
 pub enum TaskOperationSubmit {
@@ -948,6 +960,7 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     }
 }
 
+#[cfg(test)]
 /// Result of reserving process capacity before an operation enters an attempt
 /// queue.
 ///
@@ -981,6 +994,7 @@ pub(super) fn test_queue_permit() -> Box<dyn TaskOperationQueuePermit> {
     Box::new(TestQueuePermit)
 }
 
+#[cfg(test)]
 /// The seam a later transport owner implements.
 ///
 /// A submission must not block on a wire round trip: acknowledgements come

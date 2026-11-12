@@ -34,9 +34,10 @@ use crate::{
     task_execution::{
         bridge::root_control::{RootControlRequests, reply_kind},
         error::TaskExecutionError,
-        execution::ReleasedRuntimeFilterContributions,
         intent::{AckPayload, OperationAcknowledgement},
-        profile_diagnostics::{ProfileSplitDiagnostic, TaskFinalInfoCollector},
+        profile_diagnostics::{
+            ProfileSplitDiagnostic, ReleasedRuntimeFilterContributions, TaskFinalInfoCollector,
+        },
         protocol_facts::AttemptProtocolFactsPublisher,
     },
 };

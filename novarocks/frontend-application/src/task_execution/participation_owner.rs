@@ -36,9 +36,9 @@ use crate::task_execution::participation_state::{
 };
 use novarocks_coordination_contract::MonotonicInstant;
 use novarocks_execution::task_execution::{
-    AcquireParticipationAdmissionTicket, AdmissionEpochCapability, CodecOwnedContent,
-    CredentialUpdate, EstablishParticipation, LeaseSequence, LeaseValidFor, OperationKind,
-    OperationOutcome, ParticipationAdmissionTicketReceipt, ParticipationRef, ParticipationState,
+    AcquireParticipationAdmissionTicket, AdmissionEpochCapability, EstablishParticipation,
+    LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
+    ParticipationAdmissionTicketReceipt, ParticipationRef, ParticipationState,
     QuiesceParticipation, QuiesceParticipationReceipt, ReleaseOutcome, ReleaseParticipation,
     RenewParticipationLease, TaskOperationId, UpdateParticipation,
 };
@@ -48,6 +48,9 @@ use novarocks_types::NativeCompatibilityId;
 
 use super::error::TaskExecutionError;
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+pub(crate) use super::sources::{
+    ADMISSION_TICKET_VALID_FOR, ParticipationEstablishFacts, ParticipationEstablishSource,
+};
 
 /// Backoff for a release that reached a backend before its local in-flight
 /// operations finished settling.
@@ -58,12 +61,6 @@ use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 /// lease and the attempt's drain budget.
 const RELEASE_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
-
-/// How long query coordination asks a Worker to hold an unconsumed ticket.
-///
-/// This is a query-side policy. Worker retention limits remain Worker-owned
-/// and are not imported into the frontend.
-pub(crate) const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
 
 /// The original finite horizon that may outlive a rejected Create.
 ///
@@ -87,42 +84,6 @@ impl CreateRefusalObservationHorizon {
             (Self::AppliedLease(_), true) | (Self::IssuedEstablish(_), false)
         )
     }
-}
-
-/// The shared facts an establish installs atomically.
-///
-/// All four are codec-owned content: the frontend can size and pass them
-/// along, and cannot walk them. The credential never reaches a comparable or
-/// printable form at all.
-#[derive(Clone)]
-pub struct ParticipationEstablishFacts {
-    pub catalog_binding: Arc<dyn CodecOwnedContent>,
-    pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
-    pub query_options: Arc<dyn CodecOwnedContent>,
-    pub initial_credential: CredentialUpdate,
-}
-
-impl std::fmt::Debug for ParticipationEstablishFacts {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ParticipationEstablishFacts")
-            .field("catalog_binding", &self.catalog_binding.fingerprint())
-            .field(
-                "initial_runtime_filter",
-                &self.initial_runtime_filter.fingerprint(),
-            )
-            .field("query_options", &self.query_options.fingerprint())
-            .field("initial_credential", &self.initial_credential)
-            .finish()
-    }
-}
-
-/// Where the establish facts of one participation come from.
-pub trait ParticipationEstablishSource: Send {
-    fn facts_for(
-        &self,
-        participation: ParticipationRef,
-    ) -> Result<ParticipationEstablishFacts, TaskExecutionError>;
 }
 
 /// One released lifecycle request this owner must be able to replay verbatim.

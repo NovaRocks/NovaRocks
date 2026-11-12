@@ -21,7 +21,7 @@ use super::SendBindingError;
 use crate::task_execution::{
     error::TaskExecutionError,
     intent::OPERATION_FIXED_BYTES,
-    participation_owner::{ParticipationEstablishFacts, ParticipationEstablishSource},
+    sources::{ParticipationEstablishFacts, ParticipationEstablishSource},
 };
 use novarocks_attempt_protocol::{
     effect::OperationIntent,

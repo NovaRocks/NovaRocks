@@ -20,6 +20,7 @@
 //! is absent. The common Source retains this record until the real job exits.
 
 use super::*;
+use crate::task_execution::pump_health::PumpCloseUnresolved;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
@@ -29,6 +30,16 @@ impl StatusIntakeWake for ExecutorWake {
     fn wake(&self) {
         self.0.notify_one();
     }
+}
+
+/// The profile fact published by the original split executor.
+pub(crate) enum SplitAssignmentProfileRead {
+    #[cfg(test)]
+    Pending,
+    Available(SplitSourceProfile),
+    Failed,
+    #[cfg(test)]
+    SourceGone,
 }
 
 /// The original Source prepays distinct failure and profile inputs before the
@@ -129,9 +140,12 @@ impl SplitAssignmentExecutor {
             outcome: outcome.clone(),
             closing: false,
             close_joined: false,
+            #[cfg(test)]
             cleanup_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             cleanup_failure_reported: false,
             unresolved: unresolved.clone(),
+            #[cfg(test)]
             unresolved_reported: false,
         };
         Some(Arc::new(Self {
@@ -168,11 +182,13 @@ impl SplitAssignmentExecutor {
         Some(self.run_started(&UnstartedSplitClose).await.map(|_| ()))
     }
 
+    #[cfg(test)]
     pub(crate) fn profile_source(&self) -> SplitAssignmentProfileSource {
         SplitAssignmentProfileSource {
             outcome: Arc::downgrade(&self.outcome),
         }
     }
+    #[cfg(test)]
     pub(crate) fn failure_source(&self) -> SplitAssignmentFailureSource {
         SplitAssignmentFailureSource {
             failure: self.failure.clone(),
@@ -200,7 +216,7 @@ impl SplitAssignmentExecutor {
                 return None;
             };
         Some(PumpCloseUnresolved {
-            owner: "split_assignment",
+            owner: SplitAssignmentPump::PUMP_NAME,
             cause,
         })
     }

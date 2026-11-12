@@ -186,6 +186,7 @@ pub trait TaskResultTransport: Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<FinalTaskInfoRead, String>>;
 
     /// Reads whatever one task advertised above the reader's own cursor.
+    #[cfg(test)]
     fn dynamic_filters(
         &self,
         identity: TaskIdentity,
@@ -206,6 +207,7 @@ pub trait TaskResultTransport: Send + Sync + 'static {
 pub(crate) struct NativeTaskResultTransport {
     clients: BTreeMap<BackendProcessId, Client>,
     endpoints: BTreeMap<BackendProcessId, RuntimeEndpoint>,
+    #[cfg(test)]
     data_runtime: FrontendDataRuntime,
     grace: TaskReadGrace,
 }
@@ -245,6 +247,7 @@ impl NativeTaskResultTransport {
         Ok(Self {
             clients,
             endpoints,
+            #[cfg(test)]
             data_runtime,
             grace,
         })
@@ -453,6 +456,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
         })
     }
 
+    #[cfg(test)]
     fn dynamic_filters(
         &self,
         identity: TaskIdentity,

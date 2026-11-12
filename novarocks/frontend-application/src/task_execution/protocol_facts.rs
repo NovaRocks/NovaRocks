@@ -19,11 +19,13 @@
 
 use super::completion::{WriteCompletionTracker, WriteVerdict};
 use super::error::TaskExecutionError;
+#[cfg(test)]
 use super::execution::QueryTaskExecution;
 use super::graph::TaskGraph;
 use novarocks_coordination_contract::{AttemptActivationIdentity, SelectedTaskTermination};
 use novarocks_execution_contract::{TaskIdentity, TaskStatus};
 use novarocks_query_application::api::PlanSeal;
+#[cfg(test)]
 use novarocks_query_application::coordination::NativeAttemptDrive;
 use novarocks_result_contract::PerKind;
 #[cfg(test)]
@@ -238,7 +240,7 @@ impl AttemptProtocolProvenance {
     }
 }
 
-/// One serial TaskRound writer. No consumer can publish or rebind it.
+/// The attempt's original accepted-protocol publisher.
 #[derive(Debug)]
 pub(super) struct AttemptProtocolFactsPublisher {
     shared: Arc<Shared>,
@@ -304,10 +306,12 @@ impl AttemptProtocolFactsPublisher {
             },
         )
     }
+    #[cfg(test)]
     pub(super) fn bind(&mut self, drive: &NativeAttemptDrive) -> Result<(), TaskExecutionError> {
         self.bind_identity(drive.identity())
     }
 
+    #[cfg(test)]
     pub(super) fn verify_computation_ready(
         &self,
         ready: novarocks_query_application::api::ComputationReadyToken,
@@ -336,6 +340,7 @@ impl AttemptProtocolFactsPublisher {
     fn unchanged(&self, owner_revision: u64, sealed: bool) -> bool {
         self.last_owner_revision == Some(owner_revision) && self.last_sealed == sealed
     }
+    #[cfg(test)]
     pub(super) fn publish(
         &mut self,
         execution: &mut QueryTaskExecution,

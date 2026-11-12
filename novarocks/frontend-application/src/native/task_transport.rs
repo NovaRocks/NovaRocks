@@ -42,9 +42,12 @@ use novarocks_attempt_protocol::config::DispatchLane;
 #[cfg(test)]
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AcquireParticipationAdmissionTicket, OperationKind, OperationOutcome,
-    ParticipationConvergenceCursor, ParticipationConvergenceReceipt, ParticipationRef,
+    AcquireParticipationAdmissionTicket, OperationKind, OperationOutcome, ParticipationRef,
     TaskIdentity, TaskOperationId, TaskStatusCursor, UpdateParticipation,
+};
+#[cfg(test)]
+use novarocks_execution::task_execution::{
+    ParticipationConvergenceCursor, ParticipationConvergenceReceipt,
 };
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
@@ -56,14 +59,17 @@ use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
-    CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription,
-    ParticipationAwareStatusStreamEvent, ReceiptHeader, decode_covered_status_event,
-    decode_participation_aware_status_event, decode_receipt_batch, encode_abort_participation,
+    CoveredStatusStreamEvent, CoveredStatusStreamFact, DecodedCoveredSubscription, ReceiptHeader,
+    decode_covered_status_event, decode_receipt_batch, encode_abort_participation,
     encode_acquire_participation_admission_ticket, encode_advance_participation_domain,
     encode_cancel_task, encode_control_operation_batch, encode_covered_subscribe_task_status,
     encode_create_task, encode_establish_participation, encode_operation_batch,
-    encode_participation_aware_subscribe_task_status, encode_release_participation,
-    encode_renew_lease, encode_update_task,
+    encode_release_participation, encode_renew_lease, encode_update_task,
+};
+#[cfg(test)]
+use novarocks_task_codec::operation::{
+    ParticipationAwareStatusStreamEvent, decode_participation_aware_status_event,
+    encode_participation_aware_subscribe_task_status,
 };
 use novarocks_task_codec::{TransportBudget, domain as codec_domain};
 use novarocks_types::identity::BackendProcessId;
@@ -75,13 +81,18 @@ use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, Operat
 use crate::task_execution::intent::{
     DispatchBatch, TaskOperationQueueAdmission, TaskOperationSink, TaskOperationSubmit,
 };
+#[cfg(test)]
 use crate::task_execution::participation_convergence::{
     ParticipationConvergenceIntakeHandle, ParticipationConvergencePublishError,
 };
 use crate::task_execution::status_intake::{
-    ObservationFrame, ObservationIntake, ObservationPublisher, StatusEvent, StatusIntakeAdmission,
-    StatusIntakeHandle, StatusIntakeWake,
+    ObservationFrame, ObservationIntake, ObservationPublisher,
 };
+#[cfg(test)]
+use crate::task_execution::status_intake::{
+    StatusEvent, StatusIntakeAdmission, StatusIntakeHandle,
+};
+use crate::wake::StatusIntakeWake;
 
 #[cfg(test)]
 use super::apply_send_owner::{ApplyReservations, OriginalDisposition};
@@ -99,9 +110,12 @@ pub(crate) use joint_action::{
     NativeBatchAdmission, NativePhysicalOffer, clone_input_backing, original_run_encoding,
 };
 mod queue_input;
-pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
+pub(crate) use queue_input::queued_intent_quote;
+#[cfg(test)]
+pub(crate) use queue_input::{queued_creation_quote, queued_update_quote};
 
 mod covered;
+#[cfg(test)]
 mod legacy;
 mod metrics;
 #[cfg(test)]
@@ -120,7 +134,9 @@ use wire::*;
 #[cfg(test)]
 pub(crate) use covered::covered_subscription_future_layout;
 pub(crate) use covered::{CoveredTaskStatusSubscriber, SubscriptionState};
+#[cfg(test)]
 pub(crate) use legacy::TaskStatusSubscriber;
+#[cfg(test)]
 pub(crate) use metrics::observe_attempt_pump_installed;
 #[cfg(test)]
 pub(crate) use sink::NativeTaskOperationSink;

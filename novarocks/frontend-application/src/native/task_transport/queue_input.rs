@@ -128,6 +128,7 @@ pub(crate) fn queued_header_quote(payload: usize) -> Result<NativeQueuedInputQuo
         u64::try_from(payload).map_err(|_| WorkError::ArithmeticOverflow)?,
     ))
 }
+#[cfg(test)]
 pub(crate) fn queued_creation_quote(
     new_backing: usize,
 ) -> Result<NativeQueuedInputQuote, WorkError> {
@@ -151,6 +152,7 @@ pub(crate) fn queued_intent_quote(
     // to the later actual action quote, not to an encoded-length byte guess.
     queued_header_quote(0)
 }
+#[cfg(test)]
 pub(crate) fn queued_update_quote(
     _update: &novarocks_execution::task_execution::TaskDomainUpdate,
 ) -> Result<NativeQueuedInputQuote, WorkError> {
