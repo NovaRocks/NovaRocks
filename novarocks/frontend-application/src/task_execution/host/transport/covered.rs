@@ -19,7 +19,8 @@
 
 use super::{
     ActorTransportWork, AttemptCallOwner, AttemptCallSource, BodyOutcome,
-    call_source::AttemptCallReply, releases::ReleaseCapture,
+    actor_adapter::covered_open_job_backing_bytes, call_source::AttemptCallReply,
+    releases::ReleaseCapture,
 };
 #[cfg(test)]
 use crate::task_execution::host::custody::TransportSourceEvent;
@@ -79,15 +80,6 @@ pub(crate) struct SubscriptionEndpoint {
 }
 
 pub(crate) type SubscriptionEndpoints = BTreeMap<ParticipationRef, SubscriptionEndpoint>;
-
-pub(crate) struct FrozenSubscriptionInputs<'a> {
-    pub(crate) backends: &'a Arc<[BackendProcessDescriptor]>,
-    pub(crate) compatibility: NativeCompatibilityId,
-    pub(crate) data: &'a FrontendDataRuntime,
-    pub(crate) scope: &'a WorkScope,
-    pub(crate) cohort: &'a NativeSourceCohort,
-    pub(crate) ingress: &'a OrderedObservationInput<FrontendActor>,
-}
 
 pub(crate) struct FrozenSubscriptionStageInputs<'a> {
     pub(crate) backends: &'a Arc<[BackendProcessDescriptor]>,
@@ -233,24 +225,6 @@ pub(crate) fn stage_subscription_endpoints(
             .notify();
     }
     Ok(staged)
-}
-
-pub(crate) fn bind_subscription_endpoints(
-    roster: &[FrozenMember],
-    original: FrozenSubscriptionInputs<'_>,
-) -> Result<Arc<SubscriptionEndpoints>, SubscriptionEndpointError> {
-    stage_subscription_endpoints(
-        roster,
-        FrozenSubscriptionStageInputs {
-            backends: original.backends,
-            compatibility: original.compatibility,
-            data: original.data,
-            scope: original.scope,
-            cohort: original.cohort,
-            execution: original.ingress.root_binding().activation().execution(),
-        },
-    )?
-    .bind(roster, original.compatibility, original.ingress)
 }
 
 /// An unpublished endpoint has no generation or in-flight request. Return
@@ -453,6 +427,8 @@ impl AttemptSubscriptions {
         use crate::task_execution::host::observations::backing;
         let generation_bytes = backing::sum([
             SubscriptionSource::<FrontendActor>::generation_backing_bytes()?,
+            backing::arc::<AttemptEffectEnvelope>()?.size(),
+            backing::arc::<novarocks_attempt_protocol::observation::SubscriptionRequest>()?.size(),
             std::alloc::Layout::new::<BoundSubscription>().size(),
         ])?;
         let failure_bytes = SubscriptionFailureRecord::layout()
@@ -480,7 +456,10 @@ impl AttemptSubscriptions {
             // Each participant has one original open position, even when
             // records for older generations still await metadata retirement.
             sized(
-                native_subscription_io_backing_bytes()?,
+                backing::sum([
+                    native_subscription_io_backing_bytes()?,
+                    covered_open_job_backing_bytes()?,
+                ])?,
                 participants.min(generations),
             )?,
             sized(

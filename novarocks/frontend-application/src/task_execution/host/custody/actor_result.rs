@@ -30,8 +30,10 @@ use novarocks_attempt_protocol::{
     effect::EffectBody,
     input::{AttemptInput, ExecutorFact, WithdrawalOutcome},
 };
+#[cfg(test)]
+use novarocks_control_runtime::actor_turn::ActorTurnError;
 use novarocks_control_runtime::{
-    actor_turn::{ActorTurnError, InputAuthor},
+    actor_turn::InputAuthor,
     causal_input::{CausalFillFailure, CausalInputObligation},
 };
 use novarocks_control_runtime_core::identity::InputId;

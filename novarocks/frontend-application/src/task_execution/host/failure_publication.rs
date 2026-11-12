@@ -23,9 +23,10 @@ use crate::{
     task_execution::bridge::root_control::RootControlRequests,
 };
 use novarocks_attempt_protocol::failure::AttemptFailure;
+#[cfg(test)]
+use novarocks_control_runtime::obligation::WorkObligation;
 use novarocks_control_runtime::{
     actor_turn::{ActorRegistration, ActorRuntime, ActorTurnError, EffectTicket, InputAuthor},
-    obligation::WorkObligation,
     publication::{FailurePublicationSession, PublishedReply},
     transaction::ScopeHandle,
 };

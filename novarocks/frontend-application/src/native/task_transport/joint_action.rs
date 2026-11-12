@@ -22,19 +22,21 @@ use super::super::{data_runtime::CachedNativeChannel, transport::NativeDialHando
 use super::*;
 use novarocks_native_adapter::native_lane::ReservedNativeCall;
 use novarocks_proto_models::resource_layout::{CloneBackingVisitor, GeneratedCloneBacking};
+use novarocks_workload_control::WorkError;
 #[cfg(test)]
 use novarocks_workload_control::joint_admission::{
-    JointLane, JointResources, NativeAsyncActionQuote,
+    JointLane, JointResources, NativeAsyncActionAdmission, NativeAsyncActionQuote,
 };
-use novarocks_workload_control::{WorkError, joint_admission::NativeAsyncActionAdmission};
 use std::alloc::Layout;
 #[cfg(test)]
 use std::task::{Context, Poll, Waker};
 
+#[cfg(test)]
 pub(crate) struct NativeBatchAdmission {
     pub(crate) remaining: usize,
     pub(super) admission: NativeAsyncActionAdmission,
 }
+#[cfg(test)]
 impl std::fmt::Debug for NativeBatchAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OriginalNativeBatchAdmission")

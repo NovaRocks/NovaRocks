@@ -34,16 +34,21 @@ use crate::{
     task_execution::host::{
         custody::{
             CustodyError, CustodyRefusal, OriginalTransportJoinObligation, TransportJoinHandoff,
-            TransportJoinRegistration, TransportRetirement,
+            TransportJoinRegistration, TransportRetirement, storage_layouts,
         },
+        observations::{ObservationError, backing},
         pumps::{BoundPumpWork, PumpOutcome},
+        subscriptions::SubscriptionRunError,
     },
 };
-use novarocks_attempt_protocol::effect::EffectBody;
+use novarocks_attempt_protocol::{
+    effect::EffectBody,
+    input::{AttemptInput, ExecutorFact},
+};
 use novarocks_control_runtime::{
     actor_turn::InputAuthor,
     causal_input::CausalInputObligation,
-    exit_custody::ExitCustody,
+    exit_custody::{ExitCustody, ExitObligation},
     exit_work::{
         ExitWorkError, PanicSink, run_blocking, run_blocking_in_generation, run_future,
         run_future_in_generation,
@@ -51,7 +56,7 @@ use novarocks_control_runtime::{
     reported_work::ReportedWork,
 };
 use novarocks_control_runtime_core::identity::{ConsumerId, Generation};
-use std::{alloc::Layout, collections::VecDeque, sync::Arc};
+use std::{alloc::Layout, collections::VecDeque, future::Future, sync::Arc};
 use tokio::runtime::Handle;
 
 /// Holds only the authority to stage a body outcome in its original record.
@@ -161,6 +166,51 @@ pub(crate) fn actor_transport_layouts(
             Layout::new::<BoundQueue>()
         },
     ])
+}
+
+/// Backing that remains with one admitted subscription open through its
+/// original Join and result retirement. The Source separately owns the
+/// envelope, boxed binding and native stream I/O backing.
+pub(super) fn covered_open_job_backing_bytes() -> Result<usize, ObservationError> {
+    fn body_bytes<F: Future>(_: fn(BoundSubscription) -> F) -> usize {
+        Layout::new::<F>().size()
+    }
+    fn carrier_bytes<F: Future>(
+        _: fn(Box<BoundSubscription>, ExitObligation, TransportJoinRegistration, PanicSink) -> F,
+    ) -> usize {
+        Layout::new::<F>().size()
+    }
+    let storage = storage_layouts().map_err(|_| ObservationError::Budget)?;
+    backing::sum([
+        Layout::new::<BoundActorTransport>().size(),
+        Layout::new::<TransportRetirement>().size(),
+        storage.transport_record.size(),
+        storage.transport_registration.size(),
+        storage.exit_custody.size(),
+        storage.panic_sink.size(),
+        body_bytes(BoundSubscription::run),
+        carrier_bytes(run_subscription),
+    ])
+}
+
+async fn run_subscription(
+    bound: Box<BoundSubscription>,
+    exit: ExitObligation,
+    registration: TransportJoinRegistration,
+    panic: PanicSink,
+) {
+    let fact: ExecutorFact = bound.exit_fact();
+    let outcome = match run_future(exit, bound.run(), panic).await {
+        Ok(Ok(()))
+        | Ok(Err(SubscriptionRunError::Ingress(ObservationError::Closed)))
+        | Err(ExitWorkError::NotStarted(_)) => BodyOutcome::Call(AttemptCallReply::Input {
+            input: AttemptInput::Executor(fact),
+            failure: None,
+        }),
+        Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
+        Err(error) => BodyOutcome::RawFailure(Box::new(error)),
+    };
+    stage_actor_outcome(&registration, outcome);
 }
 
 /// Prepare the job and its matching host retirement row from the same
@@ -337,25 +387,8 @@ pub(crate) fn handoff_actor_transport(
             })
         }),
         ActorTransportWork::Subscription(bound) => {
-            let fact = bound.exit_fact();
-            launch.spawn(runtime, exit, |exit, registration| async move {
-                let outcome = match run_future(exit, bound.run(), panic).await {
-                    Ok(Ok(()))
-                    | Ok(Err(
-                        crate::task_execution::host::subscriptions::SubscriptionRunError::Ingress(
-                            crate::task_execution::host::observations::ObservationError::Closed,
-                        ),
-                    ))
-                    | Err(ExitWorkError::NotStarted(_)) => {
-                        BodyOutcome::Call(AttemptCallReply::Input {
-                            input: novarocks_attempt_protocol::input::AttemptInput::Executor(fact),
-                            failure: None,
-                        })
-                    }
-                    Ok(Err(error)) => BodyOutcome::RawFailure(Box::new(error)),
-                    Err(error) => BodyOutcome::RawFailure(Box::new(error)),
-                };
-                stage_actor_outcome(&registration, outcome);
+            launch.spawn(runtime, exit, |exit, registration| {
+                run_subscription(bound, exit, registration, panic)
             })
         }
         ActorTransportWork::Pump { work, generation } if work.runs_blocking() => launch

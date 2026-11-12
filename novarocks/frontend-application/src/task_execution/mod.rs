@@ -46,6 +46,7 @@ pub(crate) mod completion_facts;
 #[cfg(test)]
 pub(crate) mod conclusion;
 pub(crate) mod creation;
+#[cfg(test)]
 pub(crate) mod dispatch;
 #[cfg(test)]
 pub(crate) mod domain_tracker;

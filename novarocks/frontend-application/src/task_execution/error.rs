@@ -63,7 +63,6 @@ pub enum TaskExecutionError {
     /// The original logical owner refused this operation; preserve its reason
     /// and normal stop observation instead of reconstructing it from text.
     Actor(novarocks_query_application::coordination::LogicalExecutionActorError),
-    NativeTransport(crate::native::task_transport::NativeTaskTransportCreationError),
     Establish(novarocks_query_application::coordination::EstablishIssueError),
     /// The static schedule cannot be turned into a legal task graph.
     Schedule(String),
@@ -336,10 +335,6 @@ impl fmt::Display for TaskExecutionError {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
             Self::SplitAssignment(error) => write!(formatter, "split assignment failed: {error}"),
             Self::Workload(error) => std::fmt::Display::fmt(error, formatter),
-            Self::NativeTransport(error) => write!(
-                formatter,
-                "native Task transport construction failed: {error}"
-            ),
             Self::Actor(error) => write!(
                 formatter,
                 "logical execution actor refused Task protocol work: {error}"
@@ -443,7 +438,6 @@ impl std::error::Error for TaskExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Workload(error) => Some(error),
-            Self::NativeTransport(error) => Some(error),
             Self::Actor(error) => Some(error),
             Self::Establish(error) => Some(error),
             _ => None,
@@ -625,13 +619,6 @@ impl TaskExecutionError {
                         ExecutionFailureSite::Coordinator,
                     )
                 });
-            }
-            Self::NativeTransport(error) => {
-                return ExecutionFailureInput::new(
-                    error.failure_fact(),
-                    error.safe_detail(),
-                    ExecutionFailureSite::Coordinator,
-                );
             }
             Self::Actor(error) => {
                 return ExecutionFailureInput::new(

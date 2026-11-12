@@ -20,16 +20,17 @@
 //! The attempt bridge uses the original submission and settlement values.
 //! TaskRound fixtures also retain the legacy bounded channel adapter.
 
-use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 #[cfg(test)]
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::{collections::VecDeque, num::NonZeroUsize, sync::Mutex};
 
+#[cfg(test)]
 use crate::task_execution::operation::OperationDispatchResult;
+#[cfg(test)]
+use novarocks_execution::task_execution::OperationKind;
 use novarocks_execution::task_execution::{
-    AbortCause, AbortParticipation, OperationKind, OperationOutcome, ParticipationReceipt,
-    ParticipationState,
+    AbortCause, AbortParticipation, OperationOutcome, ParticipationReceipt, ParticipationState,
 };
 #[cfg(test)]
 use novarocks_query_application::coordination::{
@@ -41,6 +42,7 @@ use novarocks_query_application::coordination::{
     LateAbortParticipationWorkerSettlement, ParticipationStandDownCause,
     ParticipationStandDownError,
 };
+#[cfg(test)]
 use tokio::sync::{mpsc, watch};
 
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
@@ -165,6 +167,7 @@ impl Drop for NativeAbortEffectAdapter {
 /// Receiving an item releases one adapter slot and publishes the capacity
 /// epoch awaited by the logical-execution actor. The receiver is intentionally
 /// move-only so one serial owner drains the effects.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct NativeAbortEffectIntake {
     receiver: mpsc::Receiver<NativeAbortEffect>,
@@ -172,6 +175,7 @@ pub(crate) struct NativeAbortEffectIntake {
     capacity_epoch: watch::Sender<u64>,
 }
 
+#[cfg(test)]
 impl NativeAbortEffectIntake {
     /// Copies the exact front intent without releasing the adapter slot.
     ///
@@ -212,7 +216,6 @@ impl NativeAbortEffectIntake {
         Ok(effect)
     }
 
-    #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
         self.submission_order
             .lock()
@@ -220,7 +223,6 @@ impl NativeAbortEffectIntake {
             .len()
     }
 
-    #[cfg(test)]
     async fn recv(&mut self) -> Option<NativeAbortEffect> {
         let effect = self.receiver.recv().await?;
         let preview = self
@@ -315,6 +317,7 @@ fn native_cause(cause: ParticipationStandDownCause) -> AbortCause {
     }
 }
 
+#[cfg(test)]
 fn publish_capacity(capacity_epoch: &watch::Sender<u64>) {
     capacity_epoch.send_modify(|epoch| {
         *epoch = epoch
@@ -379,6 +382,7 @@ impl NativeAbortEffect {
     /// Validates the acknowledgement without consuming actor authority.
     /// TaskRound uses this before it releases dispatcher ownership so a bad
     /// receipt cannot partially settle either side of the transaction.
+    #[cfg(test)]
     pub(crate) fn validate_acknowledgement(
         &self,
         acknowledgement: &OperationAcknowledgement,
@@ -453,6 +457,7 @@ impl NativeAbortEffect {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn settle(
         self,
         acknowledgement: &OperationAcknowledgement,
@@ -494,6 +499,7 @@ impl NativeAbortEffect {
 /// dispatcher generation was already released by the unknown transport
 /// outcome. The retained application authority is exact in both operation and
 /// participation, so only its matching closing receipt may resolve it.
+#[cfg(test)]
 pub(crate) fn settle_late_abort_receipt(
     settlement: NativeLateAbortEffect,
     acknowledgement: &OperationAcknowledgement,
@@ -647,6 +653,7 @@ fn legal_abort_closing_outcome(outcome: OperationOutcome) -> bool {
     )
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "the late settlement authority must be retained or explicitly resolved"]
 pub(crate) enum NativeAbortEffectSettlement {
@@ -656,7 +663,9 @@ pub(crate) enum NativeAbortEffectSettlement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeAbortEffectAckError {
+    #[cfg(test)]
     OperationIdentityMismatch,
+    #[cfg(test)]
     OperationKindMismatch,
     MissingWorkerReceipt,
     NonClosingWorkerOutcome(OperationOutcome),
@@ -665,6 +674,7 @@ pub(crate) enum NativeAbortEffectAckError {
     NonClosingParticipationReceipt,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum NativeLateAbortEffectSettleError {
     /// The receipt does not resolve this exact late issue. The authority is
@@ -676,6 +686,7 @@ pub(crate) enum NativeLateAbortEffectSettleError {
     Application(ParticipationStandDownError),
 }
 
+#[cfg(test)]
 impl NativeLateAbortEffectSettleError {
     fn rejected(reason: NativeAbortEffectAckError, settlement: NativeLateAbortEffect) -> Self {
         Self::Rejected { reason, settlement }
@@ -689,6 +700,7 @@ impl NativeLateAbortEffectSettleError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for NativeLateAbortEffectSettleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -702,6 +714,7 @@ impl fmt::Display for NativeLateAbortEffectSettleError {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum NativeAbortEffectSettleError {
     /// The acknowledgement cannot settle this effect. The exact effect is
@@ -714,6 +727,7 @@ pub(crate) enum NativeAbortEffectSettleError {
     Application(ParticipationStandDownError),
 }
 
+#[cfg(test)]
 impl NativeAbortEffectSettleError {
     fn rejected(reason: NativeAbortEffectAckError, effect: NativeAbortEffect) -> Self {
         Self::Rejected {
@@ -722,7 +736,6 @@ impl NativeAbortEffectSettleError {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn reason(&self) -> Option<NativeAbortEffectAckError> {
         match self {
             Self::Rejected { reason, .. } => Some(*reason),
@@ -730,7 +743,6 @@ impl NativeAbortEffectSettleError {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn into_effect(self) -> Option<NativeAbortEffect> {
         match self {
             Self::Rejected { effect, .. } => Some(*effect),
@@ -746,6 +758,7 @@ impl NativeAbortEffectSettleError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for NativeAbortEffectSettleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

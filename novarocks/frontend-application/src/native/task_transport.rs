@@ -23,15 +23,17 @@
     reason = "The old TaskRound carrier remains compiled during fixture migration."
 )]
 
+use std::collections::BTreeSet;
 #[cfg(test)]
-use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 #[cfg(test)]
 use std::future::Future;
 #[cfg(test)]
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 #[cfg(test)]
 use std::task::Poll;
 use std::time::Duration;
@@ -53,6 +55,7 @@ use novarocks_execution::task_execution::{
 use novarocks_execution::task_execution::{
     ParticipationConvergenceCursor, ParticipationConvergenceReceipt, TaskStatusCursor,
 };
+#[cfg(test)]
 use novarocks_execution_contract::BackendProcessDescriptor;
 use novarocks_proto_codec::FieldPath;
 #[cfg(test)]
@@ -77,6 +80,7 @@ use novarocks_task_codec::operation::{
     encode_participation_aware_subscribe_task_status,
 };
 use novarocks_task_codec::{TransportBudget, domain as codec_domain};
+#[cfg(test)]
 use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::ParticipationReceipt;
@@ -99,23 +103,26 @@ use crate::wake::StatusIntakeWake;
 
 #[cfg(test)]
 use super::apply_send_owner::{ApplyReservations, OriginalDisposition};
+#[cfg(test)]
 use super::data_runtime::FrontendDataRuntime;
-use super::transport::{ChannelAcquisitionError, Client};
-use super::transport_supervisor::NativeTransportReadyWake;
+use super::transport::ChannelAcquisitionError;
+#[cfg(test)]
+use super::transport::Client;
 #[cfg(test)]
 use super::transport_supervisor::{
-    NativeTransportBackpressure, NativeTransportLane, NativeTransportWaiter,
+    NativeTransportBackpressure, NativeTransportLane, NativeTransportReadyWake,
+    NativeTransportWaiter,
 };
 
 mod joint_action;
-pub(crate) use joint_action::NativeCallSource;
-pub(crate) use joint_action::{
-    NativeBatchAdmission, NativePhysicalOffer, clone_input_backing, original_run_encoding,
-};
-mod queue_input;
-pub(crate) use queue_input::queued_intent_quote;
 #[cfg(test)]
-pub(crate) use queue_input::{queued_creation_quote, queued_update_quote};
+pub(crate) use joint_action::NativeBatchAdmission;
+pub(crate) use joint_action::NativeCallSource;
+pub(crate) use joint_action::{NativePhysicalOffer, clone_input_backing, original_run_encoding};
+#[cfg(test)]
+mod queue_input;
+#[cfg(test)]
+pub(crate) use queue_input::{queued_creation_quote, queued_intent_quote, queued_update_quote};
 
 #[cfg(test)]
 mod covered;
@@ -124,16 +131,20 @@ mod legacy;
 mod metrics;
 #[cfg(test)]
 mod send;
+#[cfg(test)]
 mod sink;
 pub(crate) mod wire;
 #[cfg(test)]
 use covered::*;
 #[cfg(test)]
 use legacy::*;
+#[cfg(test)]
 use metrics::*;
 #[cfg(test)]
 use send::*;
+#[cfg(test)]
 use sink::*;
+#[cfg(test)]
 use wire::*;
 
 #[cfg(test)]
@@ -146,6 +157,7 @@ pub(crate) use legacy::TaskStatusSubscriber;
 pub(crate) use metrics::observe_attempt_pump_installed;
 #[cfg(test)]
 pub(crate) use sink::NativeTaskOperationSink;
+#[cfg(test)]
 pub(crate) use sink::NativeTaskTransportCreationError;
 #[cfg(test)]
 pub(crate) use sink::{TaskAckIntake, TaskAckIntakeHandle, TaskOperationIntakeEvent};

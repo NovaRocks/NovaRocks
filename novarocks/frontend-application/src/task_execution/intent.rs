@@ -239,6 +239,7 @@ impl OperationIntent {
 
     /// The process reservation this exact operation needs before any owner
     /// retains it as queued or in flight.
+    #[cfg(test)]
     pub fn queue_request(&self) -> TaskOperationQueueRequest {
         TaskOperationQueueRequest {
             backend: self.backend_process_id(),
@@ -279,6 +280,7 @@ fn participation_domain_bytes(domain: &ParticipationDomainUpdate) -> usize {
 /// not an attempt-owned request. Producers reserve before mutating a
 /// `RemoteTask` or participation owner, so one slow target cannot bypass process
 /// admission by entering a different attempt's queue.
+#[cfg(test)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TaskOperationQueueRequest {
     backend: BackendProcessId,
@@ -289,6 +291,7 @@ pub struct TaskOperationQueueRequest {
         Option<novarocks_workload_control::joint_admission::NativeQueuedInputQuote>,
 }
 
+#[cfg(test)]
 impl TaskOperationQueueRequest {
     #[cfg(test)]
     /// The reservation for one task create, priced before the create is
@@ -940,6 +943,7 @@ pub enum TaskOperationSubmit {
 /// The reservation moves with the exact operation through dequeue, transport
 /// backpressure and replay. Once the transport accepts the batch it becomes an
 /// in-flight reservation and remains held until that send settles or drops.
+#[cfg(test)]
 pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
     fn mark_in_flight(&mut self);
     /// Borrow the original Native queue capability for the same batch's
