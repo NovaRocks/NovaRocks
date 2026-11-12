@@ -981,6 +981,210 @@ fn covered_exhaustion_follows_required_unproven_task_and_exact_terminal_control(
 }
 
 #[test]
+fn covered_exhaustion_respects_the_exact_root_terminal_before_seal() {
+    use crate::{
+        effect::Publication,
+        error::ParticipantObservationFailure,
+        failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
+        input::{ObservationFailure, ObservationFailureKind},
+    };
+    use novarocks_coordination_contract::{
+        AttemptFailureClass, AttemptTerminal, AttemptToLogicalBody,
+    };
+
+    let progression = [
+        (2, TaskState::Running),
+        (3, TaskState::Flushing),
+        (4, TaskState::Finished),
+    ];
+    for connection_lost in [false, true] {
+        for last in 0..progression.len() {
+            let mut start = start();
+            start.plan.coordination.status_subscription_error_budget = 1;
+            let now = start.initial_now;
+            let sources = start.sources;
+            let activation = start.activation.identity;
+            let mut trace = TerminalTrace {
+                core: Core::new(start).unwrap(),
+                next: 100,
+            };
+            let root = trace.core.execution.graph().root_identity();
+            let create = trace.start_create(root);
+            trace
+                .apply(
+                    Some(create_reply(
+                        create,
+                        TaskStatus::created(root).with_installed(),
+                    )),
+                    None,
+                )
+                .unwrap();
+            let statuses: Vec<_> = progression[..=last]
+                .iter()
+                .map(|&(version, state)| {
+                    TaskStatus::try_new(
+                        root,
+                        TaskStatusVersion::new(version).unwrap(),
+                        state,
+                        None,
+                        TaskOutputFacts::new(state == TaskState::Finished),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let expected_status = statuses.last().unwrap().clone();
+            let finished = expected_status.state() == TaskState::Finished;
+            let stream = status_frame(&mut trace, statuses[0].clone());
+            let participation = stream.participation;
+            let generation = stream.generation;
+            let observe = |trace: &mut TerminalTrace, at, frames| {
+                let step = trace.handle_input(
+                    at,
+                    sources.observation,
+                    AttemptInput::Executor(ExecutorFact::Observations(
+                        ObservationBatch::new(frames).unwrap(),
+                    )),
+                );
+                trace.finish_observation_round(at, step)
+            };
+            trace.handle_input(now, sources.actor, AttemptInput::Bootstrap);
+            let mut frames = vec![
+                stream.clone(),
+                ReceivedObservation {
+                    event: ObservationEvent::Fact {
+                        source_revision: None,
+                        fact: ObservationFact::CatchUpComplete {
+                            generation: generation.get(),
+                            initial_cut: 1,
+                        },
+                    },
+                    ..stream.clone()
+                },
+            ];
+            frames.extend(statuses.into_iter().skip(1).zip(2..).map(
+                |(status, source_revision)| ReceivedObservation {
+                    event: ObservationEvent::Fact {
+                        source_revision: Some(source_revision),
+                        fact: ObservationFact::Status(status),
+                    },
+                    ..stream.clone()
+                },
+            ));
+            let (round, effects) = observe(&mut trace, now, frames);
+            assert_eq!(round, Ok(()));
+            assert!(effects.iter().any(|effect| matches!(
+                &effect.body,
+                EffectBody::Publish(Publication::RootStatus(projection))
+                    if projection.status == expected_status
+                        && projection.failure == AttemptRootFailure::None
+            )));
+            assert_eq!(trace.status(root), Some(&expected_status));
+            assert_eq!(
+                trace
+                    .core
+                    .execution
+                    .requires_task_observation(participation),
+                !finished
+            );
+            assert!(
+                trace
+                    .core
+                    .execution
+                    .needs_covered_subscription(participation)
+            );
+            assert!(!trace.core.root.sealed());
+
+            let (event, state) = if connection_lost {
+                (
+                    ObservationEvent::Failed(ObservationFailure {
+                        kind: ObservationFailureKind::RecoverableTransport {
+                            observed_connection_loss: true,
+                        },
+                        cause: HostProjectedFailure {
+                            original: HostFailureRef(trace.next_id()),
+                            kind: HostFailureKind::NativeTransport,
+                            class: AttemptFailureClass::ExecutionFailure,
+                            site: AttemptFailureSite::Participation(participation),
+                        },
+                    }),
+                    ParticipantObservationFailure::ConnectionLost,
+                )
+            } else {
+                (
+                    ObservationEvent::Closed,
+                    ParticipantObservationFailure::Transport("budget_exhausted"),
+                )
+            };
+            let at = now.saturating_add(Duration::from_millis(1));
+            let (round, mut effects) = observe(
+                &mut trace,
+                at,
+                vec![ReceivedObservation {
+                    received_at: at,
+                    event,
+                    ..stream
+                }],
+            );
+            let exhausted = trace
+                .core
+                .subscriptions
+                .first_exhausted()
+                .expect("the original Root generation spent its actual retry budget");
+            assert_eq!(
+                (exhausted.participation, exhausted.state),
+                (participation, state)
+            );
+            assert_eq!(trace.status(root), Some(&expected_status));
+            assert!(!trace.core.root.sealed());
+            assert!(trace.core.execution.selected_task_failure().is_none());
+            assert!(!trace.core.execution.task_actual_stopped(root));
+            assert!(!trace.core.execution.covered_gap_pending(participation));
+            if finished {
+                assert_eq!(round, Ok(()));
+                assert!(trace.core.terminal.terminal().is_none());
+                assert!(effects.iter().any(|effect| matches!(
+                    &effect.body,
+                    EffectBody::CloseSubscription { participation: closed, generation: original }
+                        if *closed == participation && *original == generation
+                )));
+                continue;
+            }
+
+            let failure = AttemptFailure::TaskProtocol(Box::new(
+                TaskExecutionError::ParticipantUnobservable {
+                    backend: root.backend_process_id(),
+                    state,
+                },
+            ));
+            assert_eq!(round, Err(failure.clone()));
+            let terminal = AttemptTerminal::Failed(failure);
+            for _ in 0..4 {
+                if trace.core.terminal.terminal().is_some() {
+                    break;
+                }
+                effects.extend(
+                    trace
+                        .handle_input(at, sources.actor, AttemptInput::Timer)
+                        .effect,
+                );
+            }
+            assert_eq!(trace.core.terminal.terminal(), Some(&terminal));
+            assert_eq!(
+                effects.iter().filter(|effect| matches!(
+                    &effect.body,
+                    EffectBody::Port(port)
+                        if port.activation == activation && matches!(
+                            &port.body,
+                            AttemptToLogicalBody::AttemptTerminal(original) if original == &terminal
+                        )
+                )).count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
 fn accepted_failing_task_takes_precedence_over_its_covered_exhaustion() {
     use crate::{
         error::ParticipantObservationFailure,
