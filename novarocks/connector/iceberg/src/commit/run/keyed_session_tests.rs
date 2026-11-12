@@ -381,64 +381,91 @@ async fn keyed_full_zero_output_that_removes_live_files_is_delete() {
     assert_eq!(fixture.catalog.commits().len(), 1);
 }
 
-// A real local Parquet object represented by the existing neutral fragment API,
-// then finished by the real control. Reuses the cross-cutting write-stack test
-// constructors rather than inventing writer/loader protocol state.
-fn keyed_data_finish<'a>(
+// Stage a real local Parquet object through the writer sealed by this session,
+// then hand its original creation receipt to the publication owner.
+async fn keyed_data_finish<'a>(
     fixture: &Fixture,
     plan: &'a novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
     prepared: &PreparedKeyed,
 ) -> (ConnectorWriteFinishRequest<'a>, String) {
-    use crate::commit::write_stack::domain::{IcebergCommitFragment, IcebergDataFileArtifact};
-    use crate::commit::write_stack::test_support::{sample_metrics, sample_partition};
-    let path = format!(
-        "{}/keyed-data.parquet",
-        iceberg_handle(fixture, plan)
-            .staging_dir()
-            .trim_end_matches('/')
-    );
-    let local = std::path::Path::new(path.strip_prefix("file://").unwrap());
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    use crate::commit::write_stack::execution::IcebergWriteStackExecution;
+    use crate::commit::write_stack::test_support::received_write_proof;
+    use novarocks_spi::connector::write_stack::{
+        ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
+    };
+
+    let [target] = plan.targets() else {
+        panic!("keyed data publication must seal one writer target");
+    };
+    let schema = Arc::new(arrow::datatypes::Schema::new(
+        target
+            .input()
+            .fields_iter()
+            .map(|binding| binding.field().clone())
+            .collect::<Vec<_>>(),
+    ));
     let batch = arrow::record_batch::RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(arrow::array::Int64Array::from(vec![7]))],
     )
     .unwrap();
-    let mut writer =
-        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(local).unwrap(), schema, None)
-            .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
     let adapter = crate::commit::write_stack::runtime::build_write_adapter(
         fixture.provider.descriptor().clone(),
         fixture.catalog_handle.clone(),
     );
-    let fragment = adapter.wrap_commit_fragment(IcebergCommitFragment::data_file(
-        IcebergDataFileArtifact::try_new(
-            path.clone(),
-            crate::delete_file::IcebergFileFormat::Parquet,
-            sample_partition(),
-            sample_metrics(1, std::fs::metadata(local).unwrap().len()),
-            None,
-        )
-        .unwrap(),
-    ));
-    let expected = plan.expected_targets();
-    assert_eq!(expected.len(), 1);
+    let execution = IcebergWriteStackExecution::new(
+        fixture.catalog_handle.clone(),
+        adapter.clone(),
+        fixture
+            .provider
+            .runtime()
+            .resources()
+            .planning_binding()
+            .clone(),
+    );
+    let physical = ConnectorWriterPhysicalContext::new(
+        *Uuid::now_v7().as_bytes(),
+        1,
+        [2; 16],
+        0,
+        target.ordinal().get(),
+    );
+    let mut writer = execution
+        .open_writer(ConnectorOpenWriterRequest {
+            resources: None,
+            handle: target.handle().clone(),
+            target: target.ordinal(),
+            expected_schema: schema,
+            physical,
+            context: context(),
+        })
+        .await
+        .unwrap();
+    writer.append(batch).await.unwrap();
+    let fragments = writer.finish().await.unwrap();
+    let [fragment] = fragments.as_slice() else {
+        panic!("one keyed data row must produce one commit fragment");
+    };
+    let path = adapter
+        .commit_fragment(fragment)
+        .unwrap()
+        .new_object_path()
+        .unwrap()
+        .to_owned();
+    let received = ConnectorPreparedWriteSet::try_new(
+        1,
+        fragments
+            .into_iter()
+            .map(|fragment| (target.ordinal(), fragment))
+            .collect(),
+        &plan.expected_targets(),
+    )
+    .unwrap()
+    .with_received_production(received_write_proof(target.ordinal(), physical));
     (
         ConnectorWriteFinishRequest {
             commit: plan.commit_session(),
-            prepared: ConnectorPreparedWriteSet::try_new(
-                1,
-                vec![(expected[0], fragment)],
-                &expected,
-            )
-            .unwrap(),
+            prepared: received,
             statistics: vec![],
             publication: ConnectorWriteFinishPublication::KeyedDocuments(prepared.intent.clone()),
             context: context(),
@@ -453,7 +480,7 @@ async fn keyed_unknown_retains_session_data_and_manifest_without_redispatch() {
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
-    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared);
+    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared).await;
     fixture.catalog.clear();
     fixture
         .catalog
@@ -512,7 +539,7 @@ async fn keyed_conflict_cleans_owned_files_without_another_prepare() {
     let prepared = prepare_keyed(&fixture, b"result").await;
     let control = write_control(&fixture);
     let plan = control.begin_write(keyed_begin(&prepared)).unwrap();
-    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared);
+    let (request, data) = keyed_data_finish(&fixture, &plan, &prepared).await;
     fixture.catalog.clear();
     fixture
         .catalog
@@ -713,20 +740,35 @@ async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_ex
         .await
         .unwrap();
     assert!(before_live.is_empty());
-    let prepared = prepare_keyed_variant(
+    let mut prepared = prepare_keyed_variant(
         &fixture,
         ConnectorManagedPublicationTechnique::Incremental,
         false,
     )
     .await;
+    let expected_base = crate::commit::write_shared::position_mutation_base(
+        before.metadata(),
+        before.metadata_location(),
+        "main",
+        prepared.base_snapshot_id,
+    )
+    .unwrap();
+    let previous = &prepared.declaration;
+    let declaration = ConnectorDocumentPublicationDeclaration::try_new(
+        previous.publication_id(),
+        previous.admission().clone(),
+        previous.target_object_id().clone(),
+        expected_base,
+        previous.technique(),
+        previous.empty_input(),
+        None,
+        None,
+    )
+    .unwrap();
+    prepared.intent.declaration = declaration.clone();
+    prepared.declaration = declaration;
     let request = keyed_begin_shape(&prepared, ConnectorManagedPublicationShape::RowMutation);
     assert_eq!(request.intent, ConnectorWriteIntent::RowDelta);
-    assert!(
-        crate::commit::write_stack::control::session_freezes_old_deletes(
-            &request.flavor,
-            &crate::commit::write_stack::test_support::merge_on_read_input_shape(),
-        )
-    );
     fixture.catalog.clear();
     let control = write_control(&fixture);
     let plan = control.begin_write(request).unwrap();
@@ -746,7 +788,9 @@ async fn real_keyed_incremental_row_mutation_prepares_begins_and_finishes_one_ex
         vec![IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
     );
     assert_eq!(plan.targets().len(), 2);
-    assert!(plan.targets().iter().all(|target| target.route().is_some()));
+    assert!(plan.targets()[0].route().is_some());
+    assert!(plan.targets()[1].position_materialization().is_some());
+    assert!(handle.mutation_read().is_some());
     // The exact bytes may be bound before finish; finish's same-value binding
     // must be idempotent and retain these bytes through checked dispatch.
     assert!(handle.document_records().unwrap().is_none());

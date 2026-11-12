@@ -89,6 +89,14 @@ pub fn encode_partition_descriptor(
             index: 0,
             message: e.to_string(),
         })?;
+    encode_partition_descriptor_with_type(values, &partition_type)
+}
+
+/// Encode the historical partition type authored by the pinned mutation endpoint.
+pub(crate) fn encode_partition_descriptor_with_type(
+    values: &Struct,
+    partition_type: &crate::iceberg::spec::StructType,
+) -> Result<IcebergPartitionDescriptor, IcebergWriteDescriptorError> {
     if values.fields().len() != partition_type.fields().len() {
         return Err(IcebergWriteDescriptorError::FieldCountMismatch {
             expected: partition_type.fields().len(),
@@ -143,7 +151,6 @@ pub fn decode_partition_descriptor(
     metadata: &TableMetadata,
 ) -> Result<Struct, IcebergWriteDescriptorError> {
     let desc = desc.ok_or(IcebergWriteDescriptorError::MissingDescriptor)?;
-    let values = desc.values;
     let spec = metadata.partition_spec_by_id(partition_spec_id).ok_or(
         IcebergWriteDescriptorError::UnknownPartitionSpec {
             spec_id: partition_spec_id,
@@ -155,6 +162,15 @@ pub fn decode_partition_descriptor(
             index: 0,
             message: e.to_string(),
         })?;
+    decode_partition_descriptor_with_type(&desc, &partition_type)
+}
+
+/// Decode an artifact against its actual historical write interpretation.
+pub(crate) fn decode_partition_descriptor_with_type(
+    desc: &IcebergPartitionDescriptor,
+    partition_type: &crate::iceberg::spec::StructType,
+) -> Result<Struct, IcebergWriteDescriptorError> {
+    let values = &desc.values;
     if values.len() != partition_type.fields().len() {
         return Err(IcebergWriteDescriptorError::FieldCountMismatch {
             expected: partition_type.fields().len(),
@@ -163,7 +179,7 @@ pub fn decode_partition_descriptor(
     }
 
     let mut decoded = Vec::with_capacity(values.len());
-    for (idx, value) in values.into_iter().enumerate() {
+    for (idx, value) in values.iter().enumerate() {
         if value.is_null {
             if value.datum_bytes.is_some() {
                 return Err(IcebergWriteDescriptorError::DecodeFailed {
@@ -177,6 +193,7 @@ pub fn decode_partition_descriptor(
 
         let bytes = value
             .datum_bytes
+            .as_deref()
             .ok_or(IcebergWriteDescriptorError::MissingPayload { index: idx })?;
         let field_type = partition_type.fields()[idx].field_type.as_ref();
         let crate::iceberg::spec::Type::Primitive(primitive_type) = field_type else {
@@ -185,8 +202,8 @@ pub fn decode_partition_descriptor(
                 message: format!("partition field type is not primitive: {field_type:?}"),
             });
         };
-        validate_descriptor_payload_bytes(&bytes, primitive_type, idx)?;
-        let datum = crate::iceberg::spec::Datum::try_from_bytes(&bytes, primitive_type.clone())
+        validate_descriptor_payload_bytes(bytes, primitive_type, idx)?;
+        let datum = crate::iceberg::spec::Datum::try_from_bytes(bytes, primitive_type.clone())
             .map_err(|e| IcebergWriteDescriptorError::DecodeFailed {
                 index: idx,
                 message: e.to_string(),

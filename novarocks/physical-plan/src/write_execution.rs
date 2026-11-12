@@ -32,7 +32,13 @@ pub enum DeliveryRequirement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputRole {
     Relational,
-    ProviderRoute { target: WriteTargetOrdinal },
+    ProviderRoute {
+        target: WriteTargetOrdinal,
+    },
+    PositionShards {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+        target: WriteTargetOrdinal,
+    },
     Summary(SummaryKind),
     WriterResults,
 }
@@ -113,6 +119,14 @@ impl SummaryCut {
 pub enum ExchangePayloadContract {
     Relational,
     ProviderRoute(ChangeStreamWriterCut),
+    PositionContribution {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+        route: ChangeStreamWriterCut,
+    },
+    PositionShards {
+        group: novarocks_connector_contract::ConnectorMutationContributionGroupId,
+        target: WriteTargetOrdinal,
+    },
     WriterResults(WriterResultCut),
     Summary(SummaryCut),
 }
@@ -133,8 +147,14 @@ impl ExchangePayloadContract {
     pub fn role(&self) -> OutputRole {
         match self {
             Self::Relational => OutputRole::Relational,
-            Self::ProviderRoute(proof) => OutputRole::ProviderRoute {
-                target: proof.write_target_ordinal,
+            Self::ProviderRoute(proof) | Self::PositionContribution { route: proof, .. } => {
+                OutputRole::ProviderRoute {
+                    target: proof.write_target_ordinal,
+                }
+            }
+            Self::PositionShards { group, target } => OutputRole::PositionShards {
+                group: *group,
+                target: *target,
             },
             Self::WriterResults(_) => OutputRole::WriterResults,
             Self::Summary(proof) => OutputRole::Summary(proof.kind()),
@@ -152,7 +172,10 @@ impl crate::InboundFragmentCut {
 }
 impl crate::OutboundFragmentCut {
     pub fn change_stream_writer(&self) -> Option<&ChangeStreamWriterCut> {
-        self.payload.provider_route()
+        match &self.payload {
+            ExchangePayloadContract::PositionContribution { route, .. } => Some(route),
+            payload => payload.provider_route(),
+        }
     }
     pub fn writer_result(&self) -> Option<&WriterResultCut> {
         self.payload.writer_results()

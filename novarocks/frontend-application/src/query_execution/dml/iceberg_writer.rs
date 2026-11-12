@@ -346,6 +346,7 @@ impl PreparedIcebergWrite {
             execution,
             &self.semantic_binding.connector_context,
             Arc::clone(&self.semantic_binding.write_session),
+            &[],
             provider_source,
             crate::query_execution::completion_facts::SystemTableSourcePolicy::Query,
         ).await

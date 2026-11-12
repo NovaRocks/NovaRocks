@@ -21,6 +21,7 @@ use crate::commit::write_stack::domain::{IcebergWriterHandle, IcebergWriterOutpu
 use novarocks_spi::connector::{
     ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
 };
+use std::fs;
 
 fn field_requests(fields: &[ConnectorWriteFieldBinding]) -> Vec<ConnectorWriteFieldRequest> {
     fields
@@ -58,26 +59,7 @@ fn delete_input(input: &ConnectorWriteInputShape) -> ConnectorWriteInputRequest 
     }
 }
 
-fn identity_request(path: &str, pos: &str) -> ConnectorWriteInputRequest {
-    ConnectorWriteInputRequest::DeletionVector {
-        identity_fields: [(path, DataType::Utf8), (pos, DataType::Int64)]
-            .into_iter()
-            .map(|(name, data_type)| {
-                ConnectorWriteFieldRequest::try_new_typed(
-                    Field::new(name, data_type.clone(), false),
-                    novarocks_type_contract::FunctionValueType::new(data_type, false),
-                )
-                .unwrap()
-            })
-            .collect(),
-        partition_source_fields: Vec::new(),
-    }
-}
-
 fn seed_position_rewrite(lake: &FrozenRewriteLake) {
-    use novarocks_spi::connector::write_stack::{
-        ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
-    };
     lake.write_rows(
         novarocks_spi::connector::ConnectorWriteIntent::Append,
         &[11, 22],
@@ -88,73 +70,10 @@ fn seed_position_rewrite(lake: &FrozenRewriteLake) {
         .executor
         .block_on(crate::manifest::extract_data_files_with_stats(&table))
         .unwrap();
-    assert_eq!(files.len(), 1);
-    let file = &files[0];
-    let session = lake
-        .control
-        .begin_write(ConnectorWriteBeginRequest {
-            table: Arc::from("db.t"),
-            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-            intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            input: identity_request("_file", "_pos"),
-            base: None,
-            flavor: ConnectorWriteSessionFlavor::Ordinary,
-            context: request_context(),
-        })
-        .unwrap();
-    let mut vector = crate::commit::DeletionVector::new();
-    vector.insert(0).unwrap();
-    let written = lake
-        .executor
-        .block_on(crate::commit::write_single_deletion_vector_puffin(
-            table.file_io(),
-            &format!("{}/data/delete.puffin", table.metadata().location()),
-            &file.path,
-            &vector,
-        ))
-        .unwrap();
-    let fragment = IcebergCommitFragment::deletion_vector(
-        dv_artifact(
-            &written.path,
-            &file.path,
-            written.cardinality,
-            written.file_size_in_bytes,
-            written.content_offset,
-            written.content_size_in_bytes,
-        )
-        .unwrap(),
-    );
-    let target = session
-        .targets()
-        .iter()
-        .find(|target| {
-            lake.adapter
-                .writer_handle(target.handle())
-                .unwrap()
-                .branch()
-                == IcebergWriteBranch::DeletionVector
-        })
-        .unwrap();
-    let set = prepared(
-        &lake.adapter,
-        vec![(target.ordinal(), fragment)],
-        &session.expected_targets(),
-    );
-    let result = lake
-        .control
-        .finish_write(ConnectorWriteFinishRequest {
-            commit: session.commit_session(),
-            prepared: set,
-            statistics: Vec::new(),
-            publication: ConnectorWriteFinishPublication::None,
-            context: request_context(),
-        })
-        .unwrap();
-    assert!(
-        matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
-        "{result:?}"
-    );
+    let [file] = files.as_slice() else {
+        panic!("one fixture data file");
+    };
+    lake.seed_position_vector(file);
 }
 
 fn physical_bytes(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -343,69 +262,21 @@ fn output(branch: IcebergWriteBranch) -> IcebergWriterOutput {
 }
 
 #[test]
-fn empty_base_delete_recipe_accepts_only_an_empty_old_delete_set() {
-    for (branch, version) in [
-        (IcebergWriteBranch::PositionDelete, 2),
-        (IcebergWriteBranch::DeletionVector, 3),
-    ] {
-        let recipe = IcebergWriterHandle::try_new_delete(
-            branch,
-            facts(None, version),
-            output(branch),
-            Vec::new(),
-        )
-        .expect("empty table has no old deletes to merge");
-        assert_eq!(recipe.table().base_snapshot_id(), None);
-        assert!(recipe.old_deletes().is_empty());
-    }
-}
-
-#[test]
-fn delete_recipe_retains_exact_snapshot_and_missing_base_rejections() {
-    for (branch, version) in [
-        (IcebergWriteBranch::PositionDelete, 2),
-        (IcebergWriteBranch::DeletionVector, 3),
-    ] {
-        let target = || merge_target("file:///table/data/a.parquet", 2, Vec::new());
-        assert!(
-            IcebergWriterHandle::try_new_delete(
-                branch,
-                facts(None, version),
-                output(branch),
-                vec![target()]
-            )
+fn maintenance_position_writer_requires_one_exact_selected_nonempty_base() {
+    let branch = IcebergWriteBranch::DeletionVector;
+    let target = || position_rewrite_target("file:///table/data/a.parquet", 2);
+    assert!(
+        IcebergWriterHandle::try_new_delete(branch, facts(None, 3), output(branch))
+            .unwrap()
+            .try_with_position_rewrite(target())
             .is_err()
-        );
-        assert!(
-            IcebergWriterHandle::try_new_delete(
-                branch,
-                facts(Some(78), version),
-                output(branch),
-                vec![target()]
-            )
-            .is_err()
-        );
-        let exact = IcebergWriterHandle::try_new_delete(
-            branch,
-            facts(Some(77), version),
-            output(branch),
-            vec![target()],
-        )
+    );
+    let exact = IcebergWriterHandle::try_new_delete(branch, facts(Some(77), 3), output(branch))
+        .unwrap()
+        .try_with_position_rewrite(target())
         .unwrap();
-        assert_eq!(
-            exact.old_deletes()["file:///table/data/a.parquet"].base_snapshot_id(),
-            77
-        );
-        assert!(
-            IcebergWriterHandle::try_new_delete(
-                branch,
-                facts(Some(77), version),
-                output(branch),
-                vec![target(), target()]
-            )
-            .is_err()
-        );
-    }
+    assert_eq!(exact.position_rewrite(), Some(&target()));
+    assert!(exact.try_with_position_rewrite(target()).is_err());
 }
 
 #[test]
@@ -484,21 +355,34 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
         }
     };
     assert_eq!(preparation.base_version_ordinal(), None);
-    let input = if variant {
-        identity_request("_file", "_pos")
+    let table = lake.executor.block_on(
+        crate::catalog::admission_test_support::load_static_fixture_table(
+            &lake.runtime,
+            &crate::iceberg::TableIdent::new(
+                crate::iceberg::NamespaceIdent::new(namespace.to_string()),
+                name.into(),
+            ),
+        ),
+    );
+    let shape = if variant {
+        ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: Vec::new(),
+            partition_source_fields: Vec::new(),
+        }
     } else {
-        let ConnectorWriteInputRequest::DeletionVector {
-            identity_fields,
-            partition_source_fields,
-        } = identity_request("_file", "_pos")
-        else {
-            unreachable!()
-        };
         ConnectorWriteInputRequest::PositionDelete {
-            identity_fields,
-            partition_source_fields,
+            identity_fields: Vec::new(),
+            partition_source_fields: Vec::new(),
         }
     };
+    let input = crate::commit::write_preparation::freeze_position_mutation_input(
+        table.metadata(),
+        "main",
+        None,
+        &shape,
+        &context,
+    )
+    .unwrap();
     let before = physical_bytes(lake._warehouse.path());
     let session = lake
         .control
@@ -508,7 +392,7 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
             intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             input,
-            base: None,
+            base: Some(preparation.base_version().clone()),
             flavor: ConnectorWriteSessionFlavor::RowMutation,
             context: context.clone(),
         })
@@ -527,7 +411,8 @@ fn empty_delete_session(version: crate::iceberg::spec::FormatVersion, variant: b
             IcebergWriteBranch::PositionDelete
         }
     );
-    assert!(writer.old_deletes().is_empty());
+    assert!(writer.position_rewrite().is_none());
+    assert!(writer.mutation_read().unwrap().snapshot().is_none());
     assert!(matches!(
         lake.control
             .abort_write(ConnectorWriteSessionAbortRequest {

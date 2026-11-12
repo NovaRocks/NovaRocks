@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::iceberg::spec::{ManifestContentType, ManifestFile, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result};
 use crate::manifest::source::{BindingOrigin, ManifestSource};
+use crate::manifest::target_query::ManifestReadScope;
 
 use super::manifest_encoding::{ManifestWriteSource, SourcedManifestEntry};
 use super::manifest_merge::{MergeCandidate, ordered_window};
@@ -57,6 +58,36 @@ pub(crate) async fn ordinary_manifests(
     removed: &[&LocatedEntry],
     added: Vec<ManifestFile>,
 ) -> Result<OrdinaryManifests> {
+    ordinary_manifests_core(view, snapshot_id, sources, removed, added, None).await
+}
+
+pub(crate) async fn ordinary_manifests_scoped(
+    view: &super::staging::StagedView<'_>,
+    snapshot_id: i64,
+    sources: &SnapshotSources<'_>,
+    removed: &[&LocatedEntry],
+    added: Vec<ManifestFile>,
+    scope: &ManifestReadScope,
+) -> Result<OrdinaryManifests> {
+    ordinary_manifests_core(
+        view,
+        snapshot_id,
+        Some(sources),
+        removed,
+        added,
+        Some(scope),
+    )
+    .await
+}
+
+async fn ordinary_manifests_core(
+    view: &super::staging::StagedView<'_>,
+    snapshot_id: i64,
+    sources: Option<&SnapshotSources<'_>>,
+    removed: &[&LocatedEntry],
+    added: Vec<ManifestFile>,
+    scope: Option<&ManifestReadScope>,
+) -> Result<OrdinaryManifests> {
     let mut candidates = added
         .into_iter()
         .map(MergeCandidate::pending)
@@ -69,6 +100,7 @@ pub(crate) async fn ordinary_manifests(
             snapshot_id,
             sources,
             removed.iter().copied(),
+            scope,
         )
         .await?;
         candidates.extend(filtered);
@@ -79,14 +111,29 @@ pub(crate) async fn ordinary_manifests(
         }
         0
     };
-    let manifests = super::manifest_merge::merge_manifests(
-        view.artifacts(),
-        view.metadata(),
-        snapshot_id,
-        view.preparation(),
-        candidates,
-    )
-    .await?;
+    let manifests = match scope {
+        None => {
+            super::manifest_merge::merge_manifests(
+                view.artifacts(),
+                view.metadata(),
+                snapshot_id,
+                view.preparation(),
+                candidates,
+            )
+            .await?
+        }
+        Some(scope) => {
+            super::manifest_merge::merge_manifests_scoped(
+                view.artifacts(),
+                view.metadata(),
+                snapshot_id,
+                view.preparation(),
+                candidates,
+                Some(scope),
+            )
+            .await?
+        }
+    };
     let created = manifests
         .iter()
         .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
@@ -115,6 +162,7 @@ async fn apply_removals<'a, 'entry>(
     snapshot_id: i64,
     sources: &'a SnapshotSources<'_>,
     removed: impl IntoIterator<Item = &'entry LocatedEntry>,
+    scope: Option<&ManifestReadScope>,
 ) -> Result<(Vec<MergeCandidate<'a>>, usize)> {
     let mut selections = BTreeMap::<usize, OrdinalSelection<'_>>::new();
     for entry in removed {
@@ -160,7 +208,7 @@ async fn apply_removals<'a, 'entry>(
                     list_path,
                 ))
             } else {
-                filter_source(metadata, artifacts, snapshot_id, source, selected)
+                filter_source(metadata, artifacts, snapshot_id, source, selected, scope)
                     .await
                     .map(MergeCandidate::pending)
             }
@@ -176,9 +224,28 @@ async fn filter_source(
     snapshot_id: i64,
     source: ManifestSource<'_>,
     mut selected: OrdinalSelection<'_>,
+    scope: Option<&ManifestReadScope>,
 ) -> Result<ManifestFile> {
     artifacts.check_active()?;
-    let raw = source.load(artifacts.file_io()).await?;
+    let cached = scope.and_then(|scope| scope.cached_source(source));
+    let loaded;
+    let retained;
+    let raw = match cached {
+        Some(bound) => bound.raw(),
+        None => {
+            retained = match scope {
+                Some(scope) => scope.cached_raw(source).await?,
+                None => None,
+            };
+            match retained.as_deref() {
+                Some(raw) => raw.manifest(),
+                None => {
+                    loaded = source.load(artifacts.file_io()).await?;
+                    &loaded
+                }
+            }
+        }
+    };
     artifacts.check_active()?;
     let spec = metadata
         .partition_spec_by_id(source.descriptor.partition_spec_id)
@@ -187,7 +254,16 @@ async fn filter_source(
     let mut output = Vec::new();
     let mut first_explicit = None;
     let mut unassigned = false;
-    for bound in source.bind(&raw)? {
+    let fresh = if cached.is_none() {
+        Some(source.bind(raw)?)
+    } else {
+        None
+    };
+    let entries = cached
+        .into_iter()
+        .flat_map(|bound| bound.entries(source).map(Ok))
+        .chain(fresh.into_iter().flatten());
+    for bound in entries {
         artifacts.check_active()?;
         let entry = bound?;
         if !entry.raw.is_alive() {
@@ -231,7 +307,6 @@ async fn filter_source(
     if !selected.is_empty() {
         return Err(invalid("Selected live manifest entry is absent"));
     }
-    drop(raw);
     let mut descriptor = write_sourced_manifest(
         artifacts,
         metadata,

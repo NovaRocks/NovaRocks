@@ -148,6 +148,8 @@ pub struct ObservedConnectorWriteExecution {
     observation: Arc<dyn ConnectorWriteObservationPort>,
     #[cfg(novarocks_dev_controls)]
     writer_observer: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
+    #[cfg(novarocks_dev_controls)]
+    writer_role: &'static str,
 }
 
 impl ObservedConnectorWriteExecution {
@@ -167,7 +169,15 @@ impl ObservedConnectorWriteExecution {
             observation,
             #[cfg(novarocks_dev_controls)]
             writer_observer,
+            #[cfg(novarocks_dev_controls)]
+            writer_role: "data",
         }
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub fn with_writer_role(mut self, role: &'static str) -> Self {
+        self.writer_role = role;
+        self
     }
 }
 
@@ -203,6 +213,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                     self.writer_observer.as_deref(),
                     novarocks_failpoint::observation_marker::CONNECTOR_WRITER_OPENED,
                     writer,
+                    self.writer_role,
                 );
                 Ok(Box::new(ObservedConnectorBatchWriter {
                     inner,
@@ -241,9 +252,12 @@ struct ObservedConnectorBatchWriter {
     append_stop: novarocks_spi::connector::ConnectorStopView,
 }
 
-#[async_trait::async_trait]
-impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
-    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+impl ObservedConnectorBatchWriter {
+    async fn append_batch(
+        &mut self,
+        source: Option<novarocks_spi::connector::write_stack::ConnectorPositionShardSource>,
+        batch: RecordBatch,
+    ) -> Result<(), ConnectorError> {
         #[cfg(novarocks_dev_controls)]
         if let Some(release) = self.observation.hold_append(self.writer)? {
             use novarocks_spi::connector::ConnectorOperationControl;
@@ -260,9 +274,27 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
             released?;
         }
         let rows = batch.num_rows() as u64;
-        self.inner.append(batch).await?;
+        match source {
+            Some(source) => self.inner.append_position_shards(source, batch).await?,
+            None => self.inner.append(batch).await?,
+        }
         self.rows = self.rows.saturating_add(rows);
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        self.append_batch(None, batch).await
+    }
+
+    async fn append_position_shards(
+        &mut self,
+        source: novarocks_spi::connector::write_stack::ConnectorPositionShardSource,
+        batch: RecordBatch,
+    ) -> Result<(), ConnectorError> {
+        self.append_batch(Some(source), batch).await
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
@@ -311,6 +343,7 @@ fn emit_writer_marker(
     observer: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     marker: &str,
     writer: ConnectorWriterObservation,
+    role: &str,
 ) {
     if let Some(observer) = observer {
         let execution = writer.execution_id();
@@ -321,7 +354,7 @@ fn emit_writer_marker(
         let high = i64::from_be_bytes(bytes[..8].try_into().expect("fixed identity high half"));
         let low = i64::from_be_bytes(bytes[8..].try_into().expect("fixed identity low half"));
         observer.observe(&format!(
-            "{marker} execution_id={}:{}:{} task_key={high:x}:{low:x} plan_node={} write_target={} driver_id={} writer_ordinal={}",
+            "{marker} execution_id={}:{}:{} task_key={high:x}:{low:x} plan_node={} write_target={} driver_id={} writer_ordinal={} role={role}",
             execution.query_id().high(),
             execution.query_id().low(),
             execution.attempt_id().get(),
@@ -480,6 +513,7 @@ mod tests {
         let physical = ConnectorWriterPhysicalContext::new([1; 16], 2, [3; 16], 4, 5);
         let mut writer = observed
             .open_writer(ConnectorOpenWriterRequest {
+                resources: None,
                 handle: adapter().wrap_writer_handle(()),
                 target: target(),
                 expected_schema: Arc::new(arrow::datatypes::Schema::empty()),

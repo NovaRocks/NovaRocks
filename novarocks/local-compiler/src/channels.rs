@@ -663,6 +663,7 @@ fn resolve_core_with_creation<H>(
                 work.flush()?;
                 (slots, port)
             }
+            NodeKind::PositionShard(_) => fresh_relation(fragment, node, &mut next_slot, work)?,
             NodeKind::ChangeEventExpand { .. } => {
                 single_child(&node.inputs)?;
                 let mut slots = Vec::new();

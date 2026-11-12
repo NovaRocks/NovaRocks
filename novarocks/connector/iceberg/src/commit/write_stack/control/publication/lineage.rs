@@ -65,7 +65,9 @@ pub(super) fn freeze_preserved_row_ids(
             .ok_or_else(|| corrupt("Preserved rewrite output has no exact validated fragment"))?;
         if file.content != DataContentType::Data
             || !matches!(fragment.artifact(), IcebergCommitArtifact::DataFile(_))
-            || file.record_count != fragment.metrics().record_count()
+            || fragment
+                .metrics()
+                .is_none_or(|metrics| file.record_count != metrics.record_count())
         {
             return Err(corrupt(
                 "Preserved rewrite fragment differs from its frozen data output",
@@ -75,9 +77,12 @@ pub(super) fn freeze_preserved_row_ids(
             markers.push(file.first_row_id);
             continue;
         }
-        let stats = fragment.metrics().column_stats().ok_or_else(|| {
-            corrupt("Preserved rewrite output is missing physical row-id statistics")
-        })?;
+        let stats = fragment
+            .metrics()
+            .and_then(|metrics| metrics.column_stats())
+            .ok_or_else(|| {
+                corrupt("Preserved rewrite output is missing physical row-id statistics")
+            })?;
         // A partial stored column would inherit IDs from a physical position
         // after compaction, which cannot preserve the source row identities.
         if stats
@@ -227,6 +232,7 @@ mod tests {
         let execution = IcebergWriteStackExecution::new(catalog, adapter.clone(), binding);
         let mut writer = execution
             .open_writer(ConnectorOpenWriterRequest {
+                resources: None,
                 handle: adapter.wrap_writer_handle(handle),
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_schema: schema,
@@ -391,7 +397,7 @@ mod tests {
             .await;
         let original = real_writer_fragment(&source).await;
         for invalid in 0..15 {
-            let mut stats = original.metrics().column_stats().unwrap().clone();
+            let mut stats = original.metrics().unwrap().column_stats().unwrap().clone();
             match invalid {
                 0 => {
                     stats.lower_bounds.remove(&ICEBERG_RESERVED_FIELD_ID_ROW_ID);
@@ -474,11 +480,11 @@ mod tests {
                 IcebergDataFileArtifact::try_new(
                     original.path().into(),
                     crate::delete_file::IcebergFileFormat::Parquet,
-                    original.partition().clone(),
+                    original.partition().unwrap().clone(),
                     IcebergArtifactMetrics::try_new(
                         2,
-                        original.metrics().file_size_in_bytes(),
-                        original.metrics().split_offsets().to_vec(),
+                        original.metrics().unwrap().file_size_in_bytes(),
+                        original.metrics().unwrap().split_offsets().to_vec(),
                         Some(stats),
                     )
                     .unwrap(),

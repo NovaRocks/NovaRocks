@@ -215,7 +215,7 @@ impl RootOutputSemantics {
                     FunctionValueType::new(D::Int32, false),
                 ));
             }
-            append_locator_declarations(&mut declared);
+            append_locator_declarations(&mut declared, snapshot.target_file_metadata.as_deref())?;
             declared.push((
                 Some(crate::common::CHANGE_OP_COLUMN.into()),
                 FunctionValueType::new(D::Int8, false),
@@ -237,7 +237,10 @@ impl RootOutputSemantics {
                     ),
                     join.join_apply_key_column.value_type.clone(),
                 ));
-                append_locator_declarations(&mut declared);
+                append_locator_declarations(
+                    &mut declared,
+                    snapshot.target_file_metadata.as_deref(),
+                )?;
                 declared.push((
                     Some(crate::common::CHANGE_OP_COLUMN.into()),
                     join.action_column.value_type.clone(),
@@ -309,7 +312,7 @@ impl RootOutputSemantics {
                     FunctionValueType::new(D::Int32, false),
                 ));
             }
-            append_locator_declarations(&mut declared);
+            append_locator_declarations(&mut declared, snapshot.target_file_metadata.as_deref())?;
             declared.push((
                 Some(crate::common::CHANGE_OP_COLUMN.into()),
                 FunctionValueType::new(D::Int8, false),
@@ -416,7 +419,10 @@ impl RootOutputSemantics {
 }
 
 /// The writer's signed lineage/locator order is authored by its publication contract.
-fn append_locator_declarations(declared: &mut Vec<(Option<String>, FunctionValueType)>) {
+fn append_locator_declarations(
+    declared: &mut Vec<(Option<String>, FunctionValueType)>,
+    target_file_metadata: Option<&[novarocks_types::schema::ColumnDef; 2]>,
+) -> Result<(), String> {
     use arrow::datatypes::DataType as D;
     for (name, ty) in [
         (crate::common::ICEBERG_ROW_ID_COL, D::Int64),
@@ -426,6 +432,14 @@ fn append_locator_declarations(declared: &mut Vec<(Option<String>, FunctionValue
     ] {
         declared.push((Some(name.into()), FunctionValueType::new(ty, true)));
     }
+    if let Some(fields) = target_file_metadata {
+        for field in fields {
+            let value =
+                crate::planner::imv_rewrite::target_locator::nullable_file_metadata_value(field)?;
+            declared.push((Some(field.name.clone()), value));
+        }
+    }
+    Ok(())
 }
 
 /// Preserve all captured semantic nodes and precise value layout; only the
@@ -455,6 +469,83 @@ mod tests {
     use novarocks_physical_plan::ValueType;
     use novarocks_types::schema::SqlType;
     use std::sync::Arc;
+
+    #[test]
+    fn row_delta_root_declares_signed_file_metadata_before_action() {
+        use crate::compiler::mv_rewrite::test_incremental_snapshot_handle;
+        use crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor;
+        use novarocks_types::schema::ColumnDef;
+
+        let spec = ColumnDef::from_value_type(
+            "_spec_id".into(),
+            FunctionValueType::new(D::Int32, false),
+            None,
+        )
+        .unwrap();
+        let partition = ColumnDef {
+            name: "_partition".into(),
+            data_type: D::Struct(vec![Field::new("historical", D::Utf8, true)].into()),
+            nullable: true,
+            write_default: None,
+            logical_type: Some(SqlType::Struct(vec![("historical".into(), SqlType::Json)])),
+        };
+        let partition_type = partition.declared_value_type().unwrap();
+        let physical_partition = FunctionValueType::new(partition.data_type.clone(), true);
+        let snapshot = test_incremental_snapshot_handle()
+            .with_target_file_metadata([spec, partition])
+            .unwrap();
+        let mut factory = ColumnRefFactory::new();
+        let mut column = |name: &str, value_type: FunctionValueType, is_internal| OutputColumn {
+            column_id: factory.create(None, name.into(), value_type.clone()),
+            name: name.into(),
+            value_type,
+            is_internal,
+        };
+        let visible = column("k", FunctionValueType::new(D::Int64, false), false);
+        let semantics = RootOutputSemantics::from_declared_names(
+            std::slice::from_ref(&visible),
+            vec![Some("k".into())].into_boxed_slice(),
+        )
+        .unwrap();
+        let mut output = vec![visible];
+        for (name, ty, nullable) in [
+            ("__nova_base_row_id", D::Int64, false),
+            (crate::common::ICEBERG_ROW_ID_COL, D::Int64, true),
+            (crate::common::ICEBERG_LAST_UPDATED_SEQ_COL, D::Int64, true),
+            (crate::common::ICEBERG_FILE_PATH_COL, D::Utf8, true),
+            (crate::common::ICEBERG_ROW_POS_COL, D::Int64, true),
+            ("_spec_id", D::Int32, true),
+        ] {
+            output.push(column(name, FunctionValueType::new(ty, nullable), true));
+        }
+        output.push(column("_partition", partition_type, true));
+        output.push(column(
+            crate::common::CHANGE_OP_COLUMN,
+            FunctionValueType::new(D::Int8, false),
+            true,
+        ));
+
+        let descriptor = ImvChangeStreamDescriptor::default();
+        let rewritten = semantics
+            .clone()
+            .imv_output(&output, snapshot.snapshot(), &descriptor, true)
+            .unwrap();
+        assert_eq!(
+            rewritten.field_names(&output).unwrap()[6..],
+            [
+                Some("_spec_id".to_owned()),
+                Some("_partition".to_owned()),
+                Some(crate::common::CHANGE_OP_COLUMN.to_owned()),
+            ]
+        );
+        output[7].value_type = physical_partition;
+        assert!(
+            semantics
+                .imv_output(&output, snapshot.snapshot(), &descriptor, true)
+                .unwrap_err()
+                .contains("transformed root declaration type differs at ordinal 7")
+        );
+    }
 
     #[test]
     fn planned_roots_preserve_names_for_repeated_window_and_rollup_values() {

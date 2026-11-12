@@ -17,7 +17,10 @@
 
 //! Actual handle authors and the complete-input pure seal; no runtime factory.
 
-use super::super::{domain::*, test_support::table_facts};
+use super::super::{
+    domain::*,
+    test_support::{sample_partition, table_facts},
+};
 use super::*;
 use crate::delete_file::IcebergFileFormat;
 use crate::scan_model::IcebergSchemaFieldDef;
@@ -125,8 +128,25 @@ fn delete_handle(branch: IcebergWriteBranch) -> dto::IcebergWriterHandle {
     } else {
         IcebergFileFormat::Parquet
     };
+    use crate::commit::write_stack::domain::{IcebergMutationReadRecipe, IcebergMutationSnapshot};
+    let table = table_facts();
+    let recipe = IcebergMutationReadRecipe::try_new(
+        &table,
+        "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
+        format!("sha256:{}", "a".repeat(64)),
+        Some(
+            IcebergMutationSnapshot::try_new("s3://b/wh/db/t/metadata/snap-77.avro".to_owned(), 1)
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let group = (branch == IcebergWriteBranch::DeletionVector).then(|| {
+        novarocks_connector_contract::ConnectorMutationContributionGroupId::from_bytes([4; 32])
+    });
     encode(
-        &IcebergWriterHandle::try_new_delete(branch, table_facts(), output(format), vec![])
+        &IcebergWriterHandle::try_new_delete(branch, table, output(format))
+            .unwrap()
+            .try_with_mutation_read(recipe, group)
             .unwrap(),
     )
 }
@@ -278,80 +298,96 @@ fn data_private_recipe_keeps_all_actual_public_flavors_and_exact_fields() {
 }
 
 #[test]
-fn private_delete_roles_preserve_legacy_positional_columns_and_public_groups() {
-    for branch in [
-        IcebergWriteBranch::PositionDelete,
-        IcebergWriteBranch::DeletionVector,
-    ] {
-        let raw = delete_handle(branch);
-        let make = |fields| {
-            if branch == IcebergWriteBranch::PositionDelete {
-                ConnectorWriteInputShape::PositionDelete {
-                    identity_fields: fields,
-                    partition_source_fields: vec![],
-                }
-            } else {
-                ConnectorWriteInputShape::DeletionVector {
-                    identity_fields: fields,
-                    partition_source_fields: vec![],
-                }
-            }
-        };
-        assert_unchanged(&draft(
-            &raw,
-            make(vec![
-                field("_FiLe", DataType::Utf8, true, 700, 7),
-                field("_PoS", DataType::Int64, true, 701, 8),
-            ]),
-        ));
-        // The legacy writer reads the first two flattened columns by type.
-        // Names, extra identity columns and role-group boundaries are not new
-        // semantic gates; all original public metadata/tokens remain sealed.
-        assert_unchanged(&draft(
-            &raw,
-            make(vec![
-                field("path_alias", DataType::Utf8, false, 710, 17),
-                field("position_alias", DataType::Int64, true, 711, 18),
-                field("extra_identity", DataType::Int32, true, 712, 19),
-            ]),
-        ));
-        let across_groups = if branch == IcebergWriteBranch::PositionDelete {
-            ConnectorWriteInputShape::PositionDelete {
-                identity_fields: vec![field("path", DataType::Utf8, true, 710, 17)],
-                partition_source_fields: vec![field("position", DataType::Int64, true, 711, 18)],
-            }
-        } else {
-            ConnectorWriteInputShape::DeletionVector {
-                identity_fields: vec![field("path", DataType::Utf8, true, 710, 17)],
-                partition_source_fields: vec![field("position", DataType::Int64, true, 711, 18)],
-            }
-        };
-        assert_unchanged(&draft(&raw, across_groups));
-        let mut reversed = identity();
-        reversed.reverse();
-        assert_provider_failure(&draft(&raw, make(reversed)), "first input columns");
-        assert_provider_failure(
-            &draft(
-                &raw,
-                make(vec![
-                    field("_file", DataType::Binary, true, 700, 7),
-                    field("_pos", DataType::Int64, true, 701, 8),
-                ]),
-            ),
-            "first input columns",
-        );
-        assert_provider_failure(&draft(&raw, data_input()), "public input shape");
-    }
+fn fixed_delete_recipes_require_their_signed_raw_or_shard_layout() {
+    let partition = DataType::Struct(vec![Field::new("bucket", DataType::Int32, true)].into());
+    let file = field("_file", DataType::Utf8, false, 700, 7);
+    let spec = field("_spec_id", DataType::Int32, false, 702, 9);
+    let partition = field("_partition", partition, true, 703, 10);
+    let v2 = ConnectorWriteInputShape::PositionDelete {
+        identity_fields: vec![file.clone(), field("_pos", DataType::Int64, false, 701, 8)],
+        partition_source_fields: vec![spec.clone(), partition.clone()],
+    };
+    let parquet = delete_handle(IcebergWriteBranch::PositionDelete);
+    assert_unchanged(&draft(&parquet, v2));
+
+    let fields = [
+        ("driver", DataType::Int64),
+        ("high32", DataType::Int32),
+        ("container", DataType::Int32),
+        ("index", DataType::Int64),
+        ("count", DataType::Int64),
+        ("bitmap", DataType::Binary),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (name, data_type))| {
+        field(
+            name,
+            data_type,
+            false,
+            710 + index as i32,
+            17 + index as u32,
+        )
+    })
+    .collect::<Vec<_>>();
+    let identity_fields = vec![file, spec, partition];
+    let puffin = delete_handle(IcebergWriteBranch::DeletionVector);
+    let shards = ConnectorWriteInputShape::DeletionVector {
+        identity_fields: identity_fields.clone(),
+        partition_source_fields: fields.clone(),
+    };
+    assert_unchanged(&draft(&puffin, shards.clone()));
+    assert_provider_failure(&draft(&parquet, shards), "public input shape");
+
+    let mut wrong_width = fields;
+    wrong_width[0] = field("driver", DataType::Int32, false, 710, 17);
     assert_provider_failure(
         &draft(
-            &delete_handle(IcebergWriteBranch::PositionDelete),
+            &puffin,
+            ConnectorWriteInputShape::DeletionVector {
+                identity_fields,
+                partition_source_fields: wrong_width,
+            },
+        ),
+        "wrong layout",
+    );
+    assert_provider_failure(
+        &draft(
+            &puffin,
             ConnectorWriteInputShape::DeletionVector {
                 identity_fields: identity(),
                 partition_source_fields: vec![],
             },
         ),
-        "public input shape",
+        "wrong layout",
     );
+}
+
+#[test]
+fn standalone_position_rewrite_keeps_its_positional_input() {
+    let rewrite = IcebergPositionRewriteTarget::try_new(
+        "s3://b/wh/db/t/data/selected.parquet".into(),
+        3,
+        sample_partition(),
+    )
+    .unwrap();
+    let handle = IcebergWriterHandle::try_new_delete(
+        IcebergWriteBranch::DeletionVector,
+        table_facts(),
+        output(IcebergFileFormat::Puffin),
+    )
+    .unwrap()
+    .try_with_position_rewrite(rewrite)
+    .unwrap();
+    let raw = encode(&handle);
+    let input = |identity_fields| ConnectorWriteInputShape::DeletionVector {
+        identity_fields,
+        partition_source_fields: vec![],
+    };
+    assert_unchanged(&draft(&raw, input(identity())));
+    let mut reversed = identity();
+    reversed.reverse();
+    assert_provider_failure(&draft(&raw, input(reversed)), "first input columns");
 }
 
 #[test]

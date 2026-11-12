@@ -724,6 +724,7 @@ impl PhysicalExpressionRoots {
                     | NodeKind::Repeat { .. }
                     | NodeKind::AssertOneRow(_)
                     | NodeKind::ExchangeSource { .. }
+                    | NodeKind::PositionShard(_)
                     | NodeKind::TableWriter { .. } => {}
                 }
                 collector.step()?;

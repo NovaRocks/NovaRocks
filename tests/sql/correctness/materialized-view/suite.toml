@@ -18,7 +18,13 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/mv-application/**", "novarocks/sql/src/system_table.rs", "novarocks/query-application/src/system_tables/**", "novarocks/frontend-application/src/system_tables/**"]
+paths = [
+    "novarocks/mv-application/**",
+    "novarocks/frontend-application/**",
+    "novarocks/sql/**",
+    "novarocks/connector/iceberg/**",
+    "novarocks/query-application/src/system_tables/**",
+]
 
 [reuse]
 scope = "suite"

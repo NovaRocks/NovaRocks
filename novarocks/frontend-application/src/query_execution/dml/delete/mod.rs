@@ -72,12 +72,17 @@ pub(crate) struct PreparedDeleteWrite {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     delete_query: novarocks_parser::ast::Query,
-    sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
+    write_plan: DeleteWritePlan,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    match_read: Option<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    distribution: novarocks_sql::compiler::RootDistributionRequirement,
+}
+
+enum DeleteWritePlan {
+    Direct(novarocks_sql::planning::dml::DmlWritePlanInput),
+    Materialized(novarocks_spi::connector::ConnectorControlPlanningPin),
 }
 
 impl PreparedDeleteWrite {
@@ -91,19 +96,57 @@ impl PreparedDeleteWrite {
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
     > {
+        use super::mutation_flow::{
+            RoutedMutationWrite, bind_change_stream_routes, compile_routed_mutation_write,
+        };
+
+        let sql_write_input = match &self.write_plan {
+            DeleteWritePlan::Direct(input) => input.clone(),
+            DeleteWritePlan::Materialized(pin) => {
+                let (routes, statistics_targets) = bind_change_stream_routes(
+                    &self.target,
+                    &self.write_session,
+                    pin,
+                    &self.table_bindings,
+                )?;
+                return compile_routed_mutation_write(
+                    RoutedMutationWrite {
+                        state: &self.state,
+                        target: &self.target,
+                        execution: &self.execution,
+                        context: &self.connector_context,
+                        bindings: &self.table_bindings,
+                        match_read: self
+                            .match_read
+                            .as_ref()
+                            .ok_or("position DELETE lost its signed match read")?,
+                        session: &self.write_session,
+                        query: &self.delete_query,
+                        kind: standard::delete_change_stream_kind(),
+                        assertion: None,
+                        routes,
+                        statistics_targets,
+                    },
+                    provider_source,
+                    query_options,
+                )
+                .await;
+            }
+        };
         crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session_and_constants_async(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
             &self.delete_query,
             None,
-            self.sql_write_input.clone(),
+            sql_write_input,
             Arc::clone(&self.table_bindings),
             query_options,
-            self.distribution.clone(),
+            novarocks_sql::compiler::RootDistributionRequirement::Any,
             &self.execution,
             &self.connector_context,
             Arc::clone(&self.write_session),
+            self.match_read.as_slice(),
             provider_source,
             crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
         ).await

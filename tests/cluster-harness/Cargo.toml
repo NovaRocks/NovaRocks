@@ -32,6 +32,8 @@ bytes.workspace = true
 h2.workspace = true
 http.workspace = true
 hmac.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["tokio"] }
 libc.workspace = true
 novarocks-test-support.workspace = true
 novarocks-test-trino-client.workspace = true
@@ -46,7 +48,7 @@ percent-encoding.workspace = true
 prost.workspace = true
 novarocks-secret.workspace = true
 novarocks-types.workspace = true
-reqwest = { workspace = true, features = ["blocking", "http2", "json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking", "http2", "json", "rustls-tls", "stream"] }
 rcgen.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

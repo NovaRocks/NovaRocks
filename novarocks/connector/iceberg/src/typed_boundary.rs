@@ -321,6 +321,100 @@ impl IcebergTypedBoundary {
         Arc::clone(&self.runtime)
     }
 
+    fn prepare_original_write_target(
+        &self,
+        name: &SchemaTableName,
+        table: &novarocks_spi::connector::ConnectorTableHandle,
+        original_source: &novarocks_spi::connector::ConnectorProcessLocalPayload,
+        snapshot_id: Option<i64>,
+    ) -> Result<(IcebergPhysicalTable, SchemaRef), ConnectorError> {
+        let owner = novarocks_spi::connector::ConnectorProviderBindingKey {
+            instance_id: self.descriptor.instance_id.clone(),
+            incarnation: self.incarnation,
+        };
+        original_source.validate_owner(&owner)?;
+        if table.owner() != &owner.instance_id {
+            return Err(invalid("frozen write target belongs to another provider"));
+        }
+        let original =
+            original_source.value::<IcebergObservedSourceReadFacts>(owner.instance_id.as_str())?;
+        let payload: crate::metadata::IcebergTablePayload =
+            crate::file_reader::execution_payload::decode_payload(
+                table.payload(),
+                "frozen write target",
+            )?;
+        if payload.metadata_table_type.is_some()
+            || payload.row_mutation_frozen_source
+            || payload.explicit_files.is_some()
+            || !payload.prepared_files.is_empty()
+            || payload.namespace != name.schema_name()
+            || payload.table != name.table_name()
+            || original.access.identifier().namespace().to_url_string() != payload.namespace
+            || original.access.identifier().name() != payload.table
+        {
+            return Err(invalid(
+                "frozen write target does not name its original base table",
+            ));
+        }
+        let info = payload
+            .table_info
+            .as_ref()
+            .ok_or_else(|| invalid("frozen write target has no table descriptor"))?;
+        let serialized = info
+            .serialized_metadata
+            .as_deref()
+            .ok_or_else(|| invalid("frozen write target has no frozen metadata"))?;
+        let signed: TableMetadata = crate::metadata_json::from_metadata_str(serialized)
+            .map_err(|error| invalid(format!("decode frozen write target metadata: {error}")))?;
+        let metadata = original.access.metadata();
+        if &signed != metadata
+            || info.current_snapshot_id != snapshot_id
+            || info.table_uuid.as_deref() != Some(metadata.uuid().to_string().as_str())
+            || snapshot_id.is_some_and(|id| metadata.snapshot_by_id(id).is_none())
+        {
+            return Err(invalid(
+                "frozen write target differs from its original metadata or base",
+            ));
+        }
+        let schema = metadata
+            .schema_by_id(info.schema_id)
+            .cloned()
+            .ok_or_else(|| {
+                invalid("frozen write target schema is absent from its original metadata")
+            })?;
+        let context = self.prepared_source_request_context()?;
+        let physical = original.access.reacquired_request_scoped(
+            self.runtime
+                .resources()
+                .planning_binding()
+                .for_request(context),
+            self.runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        )?;
+        if physical.table.metadata_location() != payload.metadata_location.as_deref() {
+            return Err(invalid(
+                "frozen write target metadata location differs from its observation",
+            ));
+        }
+        self.check_request_active()?;
+        let mut tables = self
+            .request_pinned_physical_tables
+            .as_ref()
+            .ok_or_else(|| invalid("frozen write target has no request inventory"))?
+            .lock()
+            .map_err(|_| corrupt("request physical inventory poisoned"))?;
+        if tables.contains_key(name) {
+            return Err(invalid(
+                "frozen write target request already has a table observation",
+            ));
+        }
+        tables.insert(name.clone(), physical.clone());
+        Ok((physical, schema))
+    }
+
     fn prepared_source_access(
         &self,
         relation: &crate::typed_read::IcebergRuntimeRelation,
@@ -1293,6 +1387,7 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
 /// Completed facts for one exact original relation request. Fields are private.
 pub struct IcebergPreparedRelation {
     partition_snapshot: Option<crate::read_model::IcebergReadSnapshot>,
+    mutation_match_schema: Option<SchemaRef>,
     physical: IcebergPhysicalTable,
     // Original opaque selection/content survives all completed SDK facts.
     request: novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationRequest,
@@ -1464,7 +1559,46 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             use novarocks_spi::connector::read_stack::ConnectorReadRelationPreparationKind as K;
             self.check_request_active()?;
             let name = request.name();
+            if let K::RowMutationMatch {
+                table,
+                original_source,
+                snapshot_id,
+            } = request.kind()
+            {
+                let (physical, schema) =
+                    self.prepare_original_write_target(name, table, original_source, *snapshot_id)?;
+                return Ok(Some(IcebergPreparedRelation {
+                    partition_snapshot: None,
+                    mutation_match_schema: Some(schema),
+                    physical,
+                    request: request.clone(),
+                }));
+            }
             let physical = match request.kind() {
+                K::FrozenMvTarget {
+                    table,
+                    original_source,
+                    object_id,
+                    snapshot_id,
+                    selection,
+                } => {
+                    let (physical, _) = self.prepare_original_write_target(
+                        name,
+                        table,
+                        original_source,
+                        *snapshot_id,
+                    )?;
+                    validate_mv_target_pin(physical.table.metadata(), object_id, *snapshot_id)?;
+                    if selection.as_ref().is_some_and(|selection| {
+                        selection.object_id() != object_id
+                            || Some(selection.snapshot_id()) != *snapshot_id
+                    }) {
+                        return Err(invalid(
+                            "frozen MV target partition selection differs from its base",
+                        ));
+                    }
+                    Some(physical)
+                }
                 K::Metadata {
                     request: metadata_request,
                 } => {
@@ -1526,7 +1660,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             let Some(physical) = physical else {
                 return Ok(None);
             };
-            let partition_snapshot = if let K::MvTargetPartition { selection } = request.kind() {
+            let partition_selection = match request.kind() {
+                K::MvTargetPartition { selection } => Some(selection),
+                K::FrozenMvTarget { selection, .. } => selection.as_ref(),
+                _ => None,
+            };
+            let partition_snapshot = if let Some(selection) = partition_selection {
                 validate_mv_target_partition_selection(physical.table.metadata(), selection)?;
                 // Preserve the original pure schema/selection preflight before physical I/O.
                 projection_schema_for_pinned_snapshot(
@@ -1555,6 +1694,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 request: request.clone(),
                 physical,
                 partition_snapshot,
+                mutation_match_schema: None,
             }))
         })
     }
@@ -1573,6 +1713,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             request,
             physical,
             partition_snapshot,
+            mutation_match_schema,
         } = prepared;
         let name = request.name();
         let table = match request.kind() {
@@ -1582,6 +1723,16 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     physical.table.metadata(),
                     *version,
                     reference.as_deref(),
+                )?),
+            ),
+            K::RowMutationMatch { snapshot_id, .. } => Some(
+                crate::typed_read::IcebergRuntimeRelation::Table(pinned_table_handle_with_schema(
+                    name,
+                    physical.table.metadata(),
+                    *snapshot_id,
+                    mutation_match_schema
+                        .ok_or_else(|| corrupt("mutation match lost its signed schema"))?,
+                    None,
                 )?),
             ),
             K::PinnedFileSet { pinned } => {
@@ -1621,6 +1772,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             K::MvTarget {
                 object_id,
                 snapshot_id,
+            }
+            | K::FrozenMvTarget {
+                object_id,
+                snapshot_id,
+                selection: None,
+                ..
             } => {
                 let metadata = physical.table.metadata();
                 validate_mv_target_pin(metadata, object_id, *snapshot_id)?;
@@ -1632,7 +1789,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                     table_handle_for_version(name, metadata, version, None)?,
                 ))
             }
-            K::MvTargetPartition { selection } => {
+            K::MvTargetPartition { selection }
+            | K::FrozenMvTarget {
+                selection: Some(selection),
+                ..
+            } => {
                 let metadata = physical.table.metadata();
                 validate_mv_target_partition_selection(metadata, selection)?;
                 let schema =
@@ -2038,6 +2199,15 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                         metadata_pseudo_columns(self.relation_has_row_lineage(handle)?)?
                     {
                         columns.push((name.to_string(), column, true));
+                    }
+                    if let Some(mutation) = handle.mutation_metadata()? {
+                        for field in [mutation.spec_field(), mutation.partition_field()] {
+                            columns.push((
+                                field.name.clone(),
+                                IcebergColumnHandle::base_column(field)?,
+                                true,
+                            ));
+                        }
                     }
                 }
                 columns
@@ -3353,7 +3523,7 @@ fn table_handle_for_version(
 /// identity. A rename preserves the complete field-ID tree, so current SQL
 /// names remain safe for a historical read. Any structural change keeps the
 /// snapshot's own schema rather than guessing a correspondence.
-fn projection_schema_for_pinned_snapshot(
+pub(crate) fn projection_schema_for_pinned_snapshot(
     metadata: &TableMetadata,
     snapshot_id: i64,
 ) -> Result<SchemaRef, ConnectorError> {
@@ -3434,6 +3604,10 @@ fn pinned_table_handle_with_schema_and_domain(
     let document =
         crate::schema_mapping::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
     let read_domain = read_domain()?;
+    let mutation_partition_type = crate::metadata::mutation_metadata_schema(metadata, &schema)?
+        .map(|mutation| serde_json::to_string(mutation.partition_type()))
+        .transpose()
+        .map_err(|error| corrupt(format!("Iceberg mutation partition: {error}")))?;
     IcebergTableHandle::try_new(IcebergTableHandleParams {
         schema_table_name: name.clone(),
         snapshot_id,
@@ -3453,6 +3627,7 @@ fn pinned_table_handle_with_schema_and_domain(
         storage_properties: reader_visible_storage_properties(metadata.properties()),
         pinned_data_files,
     })?
+    .with_mutation_partition_type(mutation_partition_type)?
     .with_scalar_integer_domains(crate::scalar_integer_domain::of_schema(
         &schema,
         &document.integers,
@@ -6264,6 +6439,118 @@ mod prepared_source_relation_tests {
             projection,
         })
         .collect();
+    }
+
+    #[test]
+    fn write_target_relation_uses_original_metadata_and_keeps_an_empty_head() {
+        use novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata;
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadRelationPreparationKind as K, ConnectorReadRelationPreparationRequest as R,
+        };
+        let (executor, _warehouse, boundary, source) = inventory_fixture();
+        let observed = &source.to_metadata;
+        let name = source.request.name();
+        let session =
+            ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+        let fresh = || boundary.for_request(boundary.prepared_source_request_context().unwrap());
+        let mut match_source: crate::metadata::IcebergTablePayload =
+            crate::file_reader::execution_payload::decode_payload(
+                observed.table.payload(),
+                "test match source",
+            )
+            .unwrap();
+        let object_id = ConnectorTableObjectId::try_new(bytes::Bytes::from(
+            source.access.metadata().uuid().to_string(),
+        ))
+        .unwrap();
+        let original = observed.source_read_facts().unwrap();
+
+        // The fixture only holds these tables in memory, with no catalog table
+        // available for a second lookup. Each read has its own request scope.
+        for snapshot_id in [Some(41), None] {
+            match_source
+                .table_info
+                .as_mut()
+                .unwrap()
+                .current_snapshot_id = snapshot_id;
+            let signed = novarocks_spi::connector::ConnectorTableHandle::try_new(
+                observed.table.owner().clone(),
+                crate::file_reader::execution_payload::encode_payload(
+                    &match_source,
+                    "test match source",
+                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let read = fresh();
+            let req = R::new(
+                name.clone(),
+                K::RowMutationMatch {
+                    table: signed.clone(),
+                    original_source: original.clone(),
+                    snapshot_id,
+                },
+            );
+            let prepared = executor
+                .block_on(read.prepare_relation(&session, &req))
+                .unwrap()
+                .unwrap();
+            let (relation, _) = read
+                .create_prepared_relation(prepared)
+                .unwrap()
+                .unwrap()
+                .into_parts();
+            let crate::typed_read::IcebergRuntimeRelation::Table(table) = relation else {
+                panic!("original match target must be a table");
+            };
+            assert_eq!(table.snapshot_id(), snapshot_id);
+            assert_eq!(
+                read.load_pinned_relation(name).unwrap().table.metadata(),
+                source.access.metadata(),
+            );
+            let wrong = R::new(
+                name.clone(),
+                K::RowMutationMatch {
+                    table: signed,
+                    original_source: original.clone(),
+                    snapshot_id: Some(42),
+                },
+            );
+            assert!(
+                executor
+                    .block_on(fresh().prepare_relation(&session, &wrong))
+                    .is_err()
+            );
+        }
+
+        // An empty MV target may not widen to a later catalog head.
+        assert_eq!(source.access.metadata().current_snapshot_id(), None);
+        let read = fresh();
+        let req = R::new(
+            name.clone(),
+            K::FrozenMvTarget {
+                table: observed.table.clone(),
+                original_source: original.clone(),
+                object_id,
+                snapshot_id: None,
+                selection: None,
+            },
+        );
+        let prepared = executor
+            .block_on(read.prepare_relation(&session, &req))
+            .unwrap()
+            .unwrap();
+        let (relation, _) = read
+            .create_prepared_relation(prepared)
+            .unwrap()
+            .unwrap()
+            .into_parts();
+        let crate::typed_read::IcebergRuntimeRelation::Table(table) = relation else {
+            panic!("original MV target must be a table");
+        };
+        assert_eq!(table.snapshot_id(), None);
     }
 
     #[test]

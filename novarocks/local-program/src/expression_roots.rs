@@ -460,6 +460,7 @@ impl<H> RootCollector<'_, '_, H> {
             ProgramNodeKind::AssertNumRows { .. }
             | ProgramNodeKind::Repeat { .. }
             | ProgramNodeKind::UnionAll { .. }
+            | ProgramNodeKind::PositionShard { .. }
             | ProgramNodeKind::Limit { .. }
             | ProgramNodeKind::TableFunction { .. }
             | ProgramNodeKind::GenerateSeries { .. }

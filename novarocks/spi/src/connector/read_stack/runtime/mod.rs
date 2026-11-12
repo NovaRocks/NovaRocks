@@ -558,6 +558,18 @@ pub enum ConnectorReadRelationPreparationKind {
         version: ConnectorReadRelationVersion,
         reference: Option<String>,
     },
+    RowMutationMatch {
+        table: crate::connector::ConnectorTableHandle,
+        original_source: crate::connector::ConnectorProcessLocalPayload,
+        snapshot_id: Option<i64>,
+    },
+    FrozenMvTarget {
+        table: crate::connector::ConnectorTableHandle,
+        original_source: crate::connector::ConnectorProcessLocalPayload,
+        object_id: crate::connector::ConnectorTableObjectId,
+        snapshot_id: Option<i64>,
+        selection: Option<super::ConnectorMvTargetPartitionSelection>,
+    },
     Metadata {
         request: Option<super::ConnectorReadMetadataRequest>,
     },

@@ -158,6 +158,7 @@ enum DmlRowMutationEffectSet {
 pub(crate) struct DmlChangeStreamPreparations {
     _write: novarocks_spi::connector::ConnectorWrite,
     preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
+    match_observation: Option<novarocks_spi::connector::ConnectorTableMetadata>,
 }
 
 impl DmlChangeStreamPreparations {
@@ -178,10 +179,7 @@ impl DmlChangeStreamPreparations {
         };
         let (lease, preparation) =
             target.prepare_row_mutation(target_ref, operation_id, intent, context)?;
-        Ok(Self {
-            _write: lease,
-            preparation,
-        })
+        Ok(Self::from_signed(lease, preparation, target.metadata()))
     }
 
     /// Wrap a preparation this statement already obtained.
@@ -190,13 +188,18 @@ impl DmlChangeStreamPreparations {
     /// the strategy off it during admission reuse that same value here rather
     /// than asking the provider again, so one statement never carries two base
     /// versions or two digests.
-    const fn from_signed(
+    fn from_signed(
         lease: novarocks_spi::connector::ConnectorWrite,
         preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
+        observation: &novarocks_spi::connector::ConnectorTableMetadata,
     ) -> Self {
+        let match_observation = (preparation.strategy()
+            == novarocks_spi::connector::ConnectorRowMutationStrategy::MergeOnRead)
+            .then(|| observation.clone());
         Self {
             _write: lease,
             preparation,
+            match_observation,
         }
     }
 }
@@ -280,7 +283,7 @@ fn mor_change_stream_input_request(
 
 /// One logical write target of a row-mutation session paired with the routing
 /// facts the provider signed for it.
-type ChangeStreamRoutedTarget<'a> = (
+pub(crate) type ChangeStreamRoutedTarget<'a> = (
     &'a novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
     &'a novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
 );
@@ -298,26 +301,50 @@ type ChangeStreamRoutedTarget<'a> = (
 fn change_stream_routed_targets(
     write_session: &ConnectorWriteSession,
 ) -> Result<Vec<ChangeStreamRoutedTarget<'_>>, String> {
-    let mut routed = write_session
-        .targets()
-        .iter()
-        .map(|write_target| {
-            write_target
-                .route()
-                .map(|route| (write_target, route))
-                .ok_or_else(|| {
-                    format!(
-                        "row-mutation write target {} carries no provider routing facts",
-                        write_target.ordinal().get()
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    routed.sort_by_key(|(write_target, _)| write_target.ordinal());
+    routed_write_targets(write_session.targets())
+}
+
+pub(crate) fn routed_write_targets(
+    targets: &[novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan],
+) -> Result<Vec<ChangeStreamRoutedTarget<'_>>, String> {
+    let mut routed = Vec::new();
+    for target in targets {
+        if let Some(group) = target.position_materialization() {
+            routed.extend(group.routes().iter().map(|route| (target, route)));
+        } else {
+            let route = target.route().ok_or_else(|| {
+                format!(
+                    "row-mutation write target {} carries no provider routing facts",
+                    target.ordinal().get()
+                )
+            })?;
+            routed.push((target, route));
+        }
+    }
+    routed.sort_by_key(|(target, _)| target.ordinal());
     Ok(routed)
 }
 
-fn bind_change_stream_routes(
+pub(crate) fn signed_change_stream_route(
+    target: &novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
+    route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+) -> DmlChangeStreamRoute {
+    let sink = match target.position_materialization() {
+        Some(group) => sink.with_position_materialization(group.clone()),
+        None => sink,
+    };
+    DmlChangeStreamRoute {
+        route_id: route.route_id(),
+        write_target_ordinal: target.ordinal(),
+        accepted_effects: route.accepted_effects().to_vec(),
+        input_ordinals: route.input_ordinals().to_vec(),
+        requirements: route.requirements().clone(),
+        sink,
+    }
+}
+
+pub(crate) fn bind_change_stream_routes(
     target: &crate::catalog_application::resolver::TargetBackend,
     write_session: &ConnectorWriteSession,
     write_planning_pin: &novarocks_spi::connector::ConnectorControlPlanningPin,
@@ -339,7 +366,21 @@ fn bind_change_stream_routes(
     let routed_targets = change_stream_routed_targets(write_session)?;
     let mut routes = Vec::with_capacity(routed_targets.len());
     let mut statistics_targets = Vec::with_capacity(routed_targets.len());
+    let mut last_sink: Option<(
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+        novarocks_sql::planning::dml::DmlWritePlanInput,
+    )> = None;
     for (write_target, route) in routed_targets {
+        if let Some((ordinal, sink)) = &last_sink
+            && *ordinal == write_target.ordinal()
+        {
+            routes.push(signed_change_stream_route(
+                write_target,
+                route,
+                sink.clone(),
+            ));
+            continue;
+        }
         let target_binding = admit_session_connector_write_target(
             table_bindings,
             FrozenConnectorScanIdentity::new(
@@ -365,16 +406,12 @@ fn bind_change_stream_routes(
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
 
-        routes.push(DmlChangeStreamRoute {
-            route_id: route.route_id(),
-            // The branch's identity is its sealed ordinal, never its position
-            // in this loop.
-            write_target_ordinal: write_target.ordinal(),
-            accepted_effects: route.accepted_effects().to_vec(),
-            input_ordinals: route.input_ordinals().to_vec(),
-            requirements: route.requirements().clone(),
-            sink,
-        });
+        routes.push(signed_change_stream_route(
+            write_target,
+            route,
+            sink.clone(),
+        ));
+        last_sink = Some((write_target.ordinal(), sink));
         statistics_targets.push(
             novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget {
                 write_target_ordinal: write_target.ordinal(),
@@ -959,8 +996,11 @@ fn finish_update_mutation_preparation(
             target_binding.dml_target_columns()?
         };
     validate_update_assignments(&stmt.assignments, &target_columns)?;
-    let signed_preparations =
-        DmlChangeStreamPreparations::from_signed(strategy_lease, strategy_preparation);
+    let signed_preparations = DmlChangeStreamPreparations::from_signed(
+        strategy_lease,
+        strategy_preparation,
+        target_binding.metadata(),
+    );
     let cow_preparations = (mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite)
         .then(|| signed_preparations.clone());
@@ -1312,6 +1352,8 @@ fn build_update_match_query(
             "_last_updated_sequence_number",
             "__nr_last_updated_sequence_number",
         ),
+        ("_spec_id", "__nr_spec_id"),
+        ("_partition", "__nr_partition"),
     ]
     .into_iter()
     .map(|(name, alias)| {
@@ -1381,6 +1423,7 @@ fn build_update_mor_producer(
     Ok((
         query,
         DmlChangeStreamKind::Update {
+            file_metadata: Some([4, 5]),
             target_columns: target_columns.to_vec(),
         },
         Some(DmlPreExpandKeyedAssert {
@@ -1458,6 +1501,8 @@ fn build_merge_match_query(
             "_last_updated_sequence_number",
             "__nr_last_updated_sequence_number",
         ),
+        ("_spec_id", "__nr_spec_id"),
+        ("_partition", "__nr_partition"),
     ] {
         projection.push(build::item(
             nullable(name)?,
@@ -1598,6 +1643,7 @@ fn build_merge_mor_producer(
     Ok((
         query,
         DmlChangeStreamKind::Merge {
+            file_metadata: Some([4, 5]),
             target_columns: target_columns.to_vec(),
             matched_update: action == Some(MERGE_ACTION_MATCHED_UPDATE),
             matched_delete: action == Some(MERGE_ACTION_MATCHED_DELETE),
@@ -4064,6 +4110,12 @@ mod tests {
                         K::Delta { window } => self
                             .get_change_window_plan(session, name, *window)
                             .map(|v| v.map(|v| (v, None))),
+                        K::RowMutationMatch { .. } | K::FrozenMvTarget { .. } => {
+                            Err(novarocks_spi::connector::ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                                "fixture has no original write-target observation",
+                            ))
+                        }
                         K::MvTarget {
                             object_id,
                             snapshot_id,
@@ -5013,7 +5065,7 @@ mod tests {
             // Supply exactly the external target's facts through a local
             // relation, retaining the production-generated expression tree.
             select.from[0].joins[0].relation = test_relation(
-                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number) AS t",
+                "(SELECT 1 AS id, 2 AS v, 'f' AS _file, CAST(0 AS BIGINT) AS _pos, CAST(1 AS BIGINT) AS _row_id, CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
             );
             let error = analyze_mutation_query(query).unwrap_err();
             let error = crate::dml::error::DmlExecutionError::from_compile(error)
@@ -5066,7 +5118,7 @@ mod tests {
             Some(test_expr("t.id = 1")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, CAST((NULL) AS BIGINT) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((NULL) AS BIGINT) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
         for assignments in [
             vec![prepared_assignment("missing", "1")],
             vec![prepared_assignment("p", "1"), prepared_assignment("P", "2")],
@@ -5086,7 +5138,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, s.v AS __nr_new_v FROM ice.db1.t AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, s.v AS __nr_new_v FROM ice.db1.t AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     #[test]
@@ -5134,7 +5186,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t.*, CAST((src_v) AS INT) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((src_v) AS INT) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {
@@ -7056,5 +7108,6 @@ mod root_output_declaration_tests {
 mod async_preparation;
 pub(crate) use async_preparation::{
     PreparedCowMatchAssembly, PreparedCowMutationWrite, PreparedCowSelection,
-    PreparedMorMutationWrite, PreparedMutationFacts, prepare_mutation_facts_async,
+    PreparedMorMutationWrite, PreparedMutationFacts, RoutedMutationWrite,
+    compile_routed_mutation_write, prepare_mutation_facts_async,
 };

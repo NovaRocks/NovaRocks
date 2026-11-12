@@ -44,7 +44,8 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(2 AS BIGINT) AS v, \
          'fixture.parquet' AS _file, CAST(0 AS BIGINT) AS _pos, \
          CAST(20 AS BIGINT) AS _row_id, \
-         CAST(1 AS BIGINT) AS _last_updated_sequence_number) AS t",
+         CAST(1 AS BIGINT) AS _last_updated_sequence_number, CAST(0 AS INT) AS _spec_id, \
+         CAST(NULL AS STRUCT<bucket INT>) AS _partition) AS t",
         "t",
         "(SELECT CAST(2 AS BIGINT) AS id, CAST(2000 AS BIGINT) AS v \
          UNION ALL SELECT CAST(99 AS BIGINT), CAST(9900 AS BIGINT)) AS s",
@@ -162,6 +163,7 @@ fn mor_merge_completion_freezes_original_routes_and_exact_summary_sources() {
         DmlChangeStreamCompileRequest {
             optimize_request: SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
             kind: DmlChangeStreamKind::Merge {
+                file_metadata: None,
                 target_columns: columns,
                 matched_update: true,
                 matched_delete: false,

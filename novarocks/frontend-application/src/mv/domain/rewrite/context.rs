@@ -321,6 +321,19 @@ impl IcebergMvRewriteContext {
         Ok(values)
     }
 
+    pub(crate) fn to_sql_rewrite_snapshot_with_target_file_metadata(
+        &self,
+        target_binding: SqlTableBindingId,
+        target_metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    ) -> Result<SqlImvRewriteSnapshotHandle, String> {
+        self.to_sql_rewrite_snapshot(target_binding)?
+            .with_target_file_metadata(
+                crate::query_execution::mv_assembly::iceberg_activation::target_file_metadata(
+                    target_metadata,
+                )?,
+            )
+    }
+
     pub fn to_sql_rewrite_snapshot(
         &self,
         target_binding: SqlTableBindingId,

@@ -61,6 +61,42 @@ impl DeletionVector {
         Ok(())
     }
 
+    pub(crate) fn merge_owned_bitmap(&mut self, high: u32, bitmap: RoaringBitmap) -> Result<()> {
+        ensure!(
+            high <= i32::MAX as u32,
+            "DV bitmap is outside nonnegative i64 positions"
+        );
+        match self.bitmaps.entry(high) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(bitmap);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() |= bitmap;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn maximum_position(&self) -> Option<u64> {
+        let (&high, bitmap) = self.bitmaps.last_key_value()?;
+        Some((u64::from(high) << 32) | u64::from(bitmap.max()?))
+    }
+
+    pub(crate) fn merge_disjoint_positions(&mut self, old: &roaring::RoaringTreemap) -> Result<()> {
+        for (high, bitmap) in old.bitmaps() {
+            if let Some(new) = self.bitmaps.get(&high) {
+                ensure!(
+                    new.is_disjoint(bitmap),
+                    "new visible positions overlap old position deletes"
+                );
+            }
+        }
+        for (high, bitmap) in old.bitmaps() {
+            self.merge_owned_bitmap(high, bitmap.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: &DeletionVector) {
         for (key, bitmap) in &other.bitmaps {
             let target = self.bitmaps.entry(*key).or_default();
@@ -96,23 +132,30 @@ impl DeletionVector {
         )
     }
 
+    pub(crate) fn payload_size(&self) -> Result<u64> {
+        let body = self.bitmaps.values().try_fold(12u64, |size, bitmap| {
+            size.checked_add(4)
+                .and_then(|size| size.checked_add(bitmap.serialized_size() as u64))
+                .context("deletion vector payload length overflow")
+        })?;
+        Ok(u64::from(u32::try_from(body).context("deletion vector payload too large")?) + 8)
+    }
+
     pub fn to_iceberg_payload(&self) -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&MAGIC);
-        body.extend_from_slice(&(self.bitmaps.len() as u64).to_le_bytes());
+        let size = usize::try_from(self.payload_size()?)
+            .context("deletion vector payload exceeds usize")?;
+        let body_len = u32::try_from(size - 8).context("deletion vector payload too large")?;
+        let mut payload = Vec::with_capacity(size);
+        payload.extend_from_slice(&body_len.to_be_bytes());
+        payload.extend_from_slice(&MAGIC);
+        payload.extend_from_slice(&(self.bitmaps.len() as u64).to_le_bytes());
         for (key, bitmap) in &self.bitmaps {
-            body.extend_from_slice(&key.to_le_bytes());
+            payload.extend_from_slice(&key.to_le_bytes());
             bitmap
-                .serialize_into(&mut body)
+                .serialize_into(&mut payload)
                 .context("failed to serialize deletion vector bitmap")?;
         }
-
-        let body_len = u32::try_from(body.len()).context("deletion vector payload too large")?;
-        let crc = crc32fast::hash(&body);
-
-        let mut payload = Vec::with_capacity(4 + body.len() + 4);
-        payload.extend_from_slice(&body_len.to_be_bytes());
-        payload.extend_from_slice(&body);
+        let crc = crc32fast::hash(&payload[4..]);
         payload.extend_from_slice(&crc.to_be_bytes());
         Ok(payload)
     }
@@ -504,6 +547,139 @@ fn validate_allocated_dv_class(class: super::model::ArtifactClass) -> Result<()>
     Ok(())
 }
 
+/// A blob's immutable coordinates before the physical container is closed.
+pub(crate) struct StagedPuffinBlob {
+    pub(crate) offset: i64,
+    pub(crate) length: i64,
+    pub(crate) cardinality: u64,
+}
+
+/// One managed streaming Puffin. Only footer metadata and the current blob are
+/// retained after an append, and every blob names the same physical object.
+pub(crate) struct StreamingPuffinDv {
+    writer: Box<dyn crate::iceberg::io::FileWrite>,
+    offset: i64,
+    blobs: Vec<serde_json::Value>,
+    footer_json_bytes: u64,
+}
+
+impl StreamingPuffinDv {
+    pub(crate) async fn open(file_io: &crate::iceberg::io::FileIO, path: &str) -> Result<Self> {
+        let output = file_io.new_output(path)?;
+        let mut writer = output.writer().await?;
+        writer.write(Bytes::from_static(PUFFIN_MAGIC)).await?;
+        let footer_json_bytes = serde_json::to_vec(&puffin_footer(Vec::new()))?.len() as u64;
+        Ok(Self {
+            writer,
+            offset: i64::try_from(PUFFIN_MAGIC.len())?,
+            blobs: Vec::new(),
+            footer_json_bytes,
+        })
+    }
+
+    pub(crate) fn fits(&self, data_file: &str, positions: &DeletionVector) -> Result<bool> {
+        let length = i64::try_from(positions.payload_size()?)?;
+        let descriptor =
+            puffin_blob_descriptor(data_file, self.offset, length, positions.cardinality());
+        Ok(self.offset.checked_add(length).is_some()
+            && u32::try_from(self.footer_size_with(&descriptor)?).is_ok())
+    }
+
+    fn footer_size_with(&self, descriptor: &serde_json::Value) -> Result<u64> {
+        let separator = u64::from(!self.blobs.is_empty());
+        let bytes = serde_json::to_vec(descriptor)?.len() as u64;
+        self.footer_json_bytes
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(bytes))
+            .context("Puffin footer length overflow")
+    }
+
+    pub(crate) async fn append(
+        &mut self,
+        data_file: &str,
+        positions: &DeletionVector,
+    ) -> Result<StagedPuffinBlob> {
+        let length = i64::try_from(positions.payload_size()?)?;
+        let offset = self.offset;
+        let next = offset
+            .checked_add(length)
+            .context("Puffin blob offset exceeds i64")?;
+        let cardinality = positions.cardinality();
+        let descriptor = puffin_blob_descriptor(data_file, offset, length, cardinality);
+        let footer_json_bytes = self.footer_size_with(&descriptor)?;
+        ensure!(
+            u32::try_from(footer_json_bytes).is_ok(),
+            "Puffin footer length exceeds u32"
+        );
+        let payload = positions.to_iceberg_payload()?;
+        self.writer.write(Bytes::from(payload)).await?;
+        self.blobs.push(descriptor);
+        self.footer_json_bytes = footer_json_bytes;
+        self.offset = next;
+        Ok(StagedPuffinBlob {
+            offset,
+            length,
+            cardinality,
+        })
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<u64> {
+        ensure!(!self.blobs.is_empty(), "Cannot finish an empty DV Puffin");
+        let footer_json = serde_json::to_vec(&puffin_footer(self.blobs))?;
+        ensure!(
+            footer_json.len() as u64 == self.footer_json_bytes,
+            "Puffin footer length changed before close"
+        );
+        let footer_len =
+            u32::try_from(footer_json.len()).context("Puffin footer length exceeds u32")?;
+        let offset = u64::try_from(self.offset)?;
+        let size = offset
+            .checked_add(u64::from(footer_len))
+            .and_then(|size| size.checked_add(16))
+            .context("Puffin length exceeds u64")?;
+        self.writer.write(Bytes::from_static(PUFFIN_MAGIC)).await?;
+        self.writer.write(Bytes::from(footer_json)).await?;
+        let mut trailer = Vec::with_capacity(12);
+        trailer.extend_from_slice(&footer_len.to_le_bytes());
+        trailer.extend_from_slice(&[0u8; 4]);
+        trailer.extend_from_slice(PUFFIN_MAGIC);
+        self.writer.write(Bytes::from(trailer)).await?;
+        let closed = self.writer.close().await?;
+        ensure!(
+            closed.size == size,
+            "Puffin close size differs from appended bytes"
+        );
+        Ok(size)
+    }
+}
+
+fn puffin_blob_descriptor(
+    data_file: &str,
+    offset: i64,
+    length: i64,
+    cardinality: u64,
+) -> serde_json::Value {
+    json!({
+        "type": "deletion-vector-v1",
+        "fields": [],
+        "snapshot-id": -1,
+        "sequence-number": -1,
+        "offset": offset,
+        "length": length,
+        "properties": {
+            "referenced-data-file": data_file,
+            "cardinality": cardinality.to_string(),
+        }
+    })
+}
+
+fn puffin_footer(blobs: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({
+        "blobs": blobs,
+        "properties": { "created-by": "NovaRocks" },
+    })
+}
+
 pub async fn write_single_deletion_vector_puffin(
     file_io: &crate::iceberg::io::FileIO,
     path: &str,
@@ -515,23 +691,12 @@ pub async fn write_single_deletion_vector_puffin(
     let content_size_in_bytes =
         i64::try_from(payload.len()).context("deletion vector payload is too large")?;
     let cardinality = dv.cardinality();
-    let footer = json!({
-        "blobs": [{
-            "type": "deletion-vector-v1",
-            "fields": [],
-            "snapshot-id": -1,
-            "sequence-number": -1,
-            "offset": content_offset,
-            "length": content_size_in_bytes,
-            "properties": {
-                "referenced-data-file": referenced_data_file,
-                "cardinality": cardinality.to_string(),
-            }
-        }],
-        "properties": {
-            "created-by": "NovaRocks",
-        }
-    });
+    let footer = puffin_footer(vec![puffin_blob_descriptor(
+        referenced_data_file,
+        content_offset,
+        content_size_in_bytes,
+        cardinality,
+    )]);
     let footer_json =
         serde_json::to_vec(&footer).context("failed to serialize Puffin footer metadata")?;
     let footer_json_len =
@@ -599,26 +764,15 @@ pub async fn write_multi_deletion_vector_puffin(
         .iter()
         .zip(&payloads)
         .map(|(input, (_, content_offset, content_size_in_bytes))| {
-            json!({
-                "type": "deletion-vector-v1",
-                "fields": [],
-                "snapshot-id": -1,
-                "sequence-number": -1,
-                "offset": *content_offset,
-                "length": *content_size_in_bytes,
-                "properties": {
-                    "referenced-data-file": input.referenced_data_file,
-                    "cardinality": input.deletion_vector.cardinality().to_string(),
-                }
-            })
+            puffin_blob_descriptor(
+                &input.referenced_data_file,
+                *content_offset,
+                *content_size_in_bytes,
+                input.deletion_vector.cardinality(),
+            )
         })
         .collect();
-    let footer = json!({
-        "blobs": blobs,
-        "properties": {
-            "created-by": "NovaRocks",
-        }
-    });
+    let footer = puffin_footer(blobs);
     let footer_json =
         serde_json::to_vec(&footer).context("failed to serialize Puffin footer metadata")?;
     let footer_json_len =
@@ -750,6 +904,41 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn streaming_puffin_keeps_independent_blob_ranges_under_one_close() {
+        let io = crate::iceberg::io::FileIO::new_with_memory();
+        let path = "memory:///stream.puffin";
+        let mut writer = StreamingPuffinDv::open(&io, path).await.unwrap();
+        let mut first = DeletionVector::new();
+        for position in [2, 0x1_0000_0001] {
+            first.insert(position).unwrap();
+        }
+        let a = writer.append("memory:///a.parquet", &first).await.unwrap();
+        let mut second = DeletionVector::new();
+        for position in [0, 65_537, 65_539] {
+            second.insert(position).unwrap();
+        }
+        let b = writer.append("memory:///b.parquet", &second).await.unwrap();
+        let size = writer.finish().await.unwrap();
+        assert_eq!((a.offset, a.cardinality), (4, 2));
+        assert_eq!((b.offset, b.cardinality), (a.offset + a.length, 3));
+        assert!(size > (b.offset + b.length) as u64);
+        let decoded = read_deletion_vector_puffin(&io, path, a.offset, a.length)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.to_roaring_treemap().into_iter().collect::<Vec<_>>(),
+            [2, 0x1_0000_0001]
+        );
+        let decoded = read_deletion_vector_puffin(&io, path, b.offset, b.length)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.to_roaring_treemap().into_iter().collect::<Vec<_>>(),
+            [0, 65_537, 65_539]
+        );
+    }
+
     use super::*;
     use std::sync::Arc;
 

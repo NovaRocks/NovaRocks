@@ -101,8 +101,105 @@ def check_lineage_seed(receipt: dict, seed_path: pathlib.Path) -> None:
     }
 
 
+def delete_key(entry: dict) -> tuple:
+    return tuple(entry.get(key) for key in
+                 ("path", "spec_id", "referenced_data_file", "content_offset", "content_size"))
+
+
+def delete_entry_for_comparison(entry: dict) -> dict:
+    # Java can report an absent metrics map as null. Rewriting a manifest
+    # through the Rust SDK serializes its empty map with no column statistics.
+    optional_metrics = {"value_counts", "null_value_counts", "nan_value_counts",
+                        "lower_bounds_base64", "upper_bounds_base64"}
+    return {field: {} if field in optional_metrics and value is None else value
+            for field, value in entry.items()}
+
+
+def check_mutation_seed(receipt: dict, seed_path: pathlib.Path) -> None:
+    seed_bytes = seed_path.read_bytes()
+    seed = json.loads(seed_bytes)
+    if seed["mode"] != "mutation-seed" or len(seed["cases"]) != 1:
+        raise ValueError("Expected the one original materialization seed receipt")
+    for key in ("iceberg", "iceberg_class_source", "requested_warehouse", "namespace", "prefix"):
+        if receipt["runtime"][key] != seed["runtime"][key]:
+            raise ValueError(f"Materialization verification changed the seed {key}")
+    before, after = seed["cases"][0], receipt["cases"][0]
+    lower, upper = before["generation"], after["generation"]
+    if (before["table"] != after["table"] or lower["table_uuid"] != upper["table_uuid"]
+            or upper["parent_snapshot"] != before["snapshot"]
+            or upper["snapshot_sequence"] != lower["snapshot_sequence"] + 1):
+        raise ValueError("Native DELETE must publish one child of the exact Java seed")
+    if lower["format_version"] != 3 or upper["format_version"] != 3:
+        raise ValueError("Materialization requires the upgraded v3 table")
+    if lower["current_spec"] != upper["current_spec"]:
+        raise ValueError("Native mutation changed the historical partition setup")
+    def by_data_path(entries):
+        return {entry["file"]["path"]: entry for entry in entries}
+
+    data = by_data_path(lower["live_data"])
+    if (len(data) != 3 or len(lower["live_data"]) != 3 or len(upper["live_data"]) != 3
+            or data != by_data_path(upper["live_data"])):
+        raise ValueError("Materialization changed data entries, sequence or row lineage")
+    if any(entry["file"]["spec_id"] == lower["current_spec"] for entry in data.values()):
+        raise ValueError("All targets in this fixture must have a historical spec")
+
+    before_deletes = {delete_key(entry): entry for entry in lower["live_deletes"]}
+    after_deletes = {delete_key(entry): entry for entry in upper["live_deletes"]}
+    if (len(before_deletes) != len(lower["live_deletes"])
+            or len(after_deletes) != len(upper["live_deletes"])):
+        raise ValueError("Delete receipt repeated a physical logical entry")
+    old_dvs = {entry["referenced_data_file"]: entry for entry in lower["old_dvs"]}
+    b, c = lower["target_b"], lower["untouched_c"]
+    if old_dvs[b]["path"] != old_dvs[c]["path"] or delete_key(old_dvs[b]) == delete_key(old_dvs[c]):
+        raise ValueError("Expected distinct target blobs in the original shared Puffin")
+    # The old vectors already include the applicable position rows. Verify Java
+    # actually suppresses the corresponding Parquet sources when a DV applies.
+    tasks = {task["data"]["path"]: task for task in before["java_planFiles"]["tasks"]}
+    for target in (b, c):
+        position_inputs = [delete_key(entry) for entry in tasks[target]["deletes"]
+                           if entry["content"] == "POSITION_DELETES"]
+        if position_inputs != [delete_key(old_dvs[target])]:
+            raise ValueError(f"Java seed did not observe the planned DV priority for {target}")
+
+    removed = {delete_key(lower["exclusive"]), delete_key(old_dvs[b])}
+    if before_deletes.keys() - after_deletes.keys() != removed:
+        raise ValueError("Expected only the exclusive Parquet and B's old logical blob to be removed")
+    preserved = set(before_deletes) - removed
+    if preserved != {delete_key(lower["shared"]), delete_key(lower["shadowed"]),
+                     delete_key(lower["equality"]), delete_key(old_dvs[c])}:
+        raise ValueError("Seed delete inventory did not contain the intended immutable peers")
+    if any(delete_entry_for_comparison(after_deletes[key]) != delete_entry_for_comparison(before_deletes[key])
+           for key in preserved):
+        raise ValueError("Native DELETE changed a shared, suppressed, equality, or untouched entry")
+
+    created = [after_deletes[key] for key in after_deletes.keys() - before_deletes.keys()]
+    expected_counts = {lower["target_a"]: 2, b: 3}
+    if len(created) != 2 or {entry["referenced_data_file"]: entry["record_count"]
+                              for entry in created} != expected_counts:
+        raise ValueError("New DVs did not preserve deduplicated old plus selected positions")
+    for entry in created:
+        target = data[entry["referenced_data_file"]]["file"]
+        if (entry["format"] != "PUFFIN" or entry["spec_id"] != target["spec_id"]
+                or entry["partition"] != target["partition"]
+                or entry["file_sequence"] != upper["snapshot_sequence"]
+                or entry["data_sequence"] < target["data_sequence"]
+                or entry["content_offset"] is None or not entry["content_size"]):
+            raise ValueError("New DV has the wrong format, historical partition or sequence")
+
+    digests = {artifact["path"]: artifact["sha256"] for artifact in receipt["artifacts"]}
+    for artifact in seed["artifacts"]:
+        if artifact["kind"] != "metadata" and digests.get(artifact["path"]) != artifact["sha256"]:
+            raise ValueError(f"Native DELETE modified a historical object: {artifact['path']}")
+    if any(entry["path"] not in digests for entry in created):
+        raise ValueError("New Puffin artifacts were not retained")
+    receipt["mutation_seed_receipt"] = {
+        "path": str(seed_path.resolve()), "sha256": hashlib.sha256(seed_bytes).hexdigest(),
+    }
+
+
 def validate(log: pathlib.Path, output: pathlib.Path, mode: str,
-             lineage_phase: Optional[str] = None, lineage_seed: Optional[pathlib.Path] = None) -> dict:
+             lineage_phase: Optional[str] = None, lineage_seed: Optional[pathlib.Path] = None,
+             mutation_seed: Optional[pathlib.Path] = None) -> dict:
     text = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text())
     if "UEA4G_COMPLETE" not in text.splitlines():
         raise ValueError("Missing completion marker; Scala compilation or execution failed")
@@ -118,6 +215,10 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str,
     expected = {f"same_commit_{kind}" for kind in ("position", "equality", "dv")}
     if mode == "lineage":
         expected = set()
+    elif mode == "mutation-seed":
+        expected = {"materialization_seed"}
+    elif mode == "mutation-check":
+        expected = {"materialization_after"}
     elif mode == "promotion":
         expected = {f"promotion_{partition}_{scan}" for partition in ("partitioned", "unpartitioned")
                     for scan in ("before", "snapshot", "current_projection")}
@@ -225,6 +326,10 @@ def validate(log: pathlib.Path, output: pathlib.Path, mode: str,
         receipt["lineage"] = validate_lineage(records, artifact_paths, lineage_phase)
         if lineage_seed is not None:
             check_lineage_seed(receipt, lineage_seed)
+    if mode == "mutation-check":
+        if mutation_seed is None:
+            raise ValueError("Materialization check requires the original seed receipt")
+        check_mutation_seed(receipt, mutation_seed)
     (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     for case in cases:
         planned = case["java_planFiles"]
@@ -237,12 +342,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection", "lineage"), required=True)
+    parser.add_argument("--mode", choices=("positive", "anomalies", "corpus", "promotion", "projection", "lineage",
+                                           "mutation-seed", "mutation-check"), required=True)
     parser.add_argument("--lineage-phase", choices=LINEAGE_PHASES)
     parser.add_argument("--lineage-seed-receipt", type=pathlib.Path)
+    parser.add_argument("--mutation-seed-receipt", type=pathlib.Path)
     args = parser.parse_args()
     if (args.mode == "lineage") != (args.lineage_phase is not None):
         parser.error("--lineage-phase is required with --mode lineage and unavailable otherwise")
     if (args.lineage_phase == "historical-check") != (args.lineage_seed_receipt is not None):
         parser.error("--lineage-seed-receipt is required with historical-check and unavailable otherwise")
-    validate(args.log, args.output, args.mode, args.lineage_phase, args.lineage_seed_receipt)
+    if (args.mode == "mutation-check") != (args.mutation_seed_receipt is not None):
+        parser.error("--mutation-seed-receipt is required with mutation-check and unavailable otherwise")
+    validate(args.log, args.output, args.mode, args.lineage_phase, args.lineage_seed_receipt,
+             args.mutation_seed_receipt)

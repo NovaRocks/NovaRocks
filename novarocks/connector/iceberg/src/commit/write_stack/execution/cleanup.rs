@@ -24,20 +24,18 @@ use crate::commit::operation::OperationLimits;
 use crate::iceberg::io::FileIO;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
-    ConnectorStopOwner,
 };
-use std::time::Instant;
 
 pub(super) struct UnsealedWriterCleanup {
     binding: IcebergReadBinding,
     original: ConnectorRequestContext,
     location: String,
     phase: Option<CleanupPhase>,
+    stream_cleanup: Option<novarocks_spi::connector::ConnectorIoCleanupFuture>,
 }
 struct CleanupPhase {
     request: ConnectorRequestContext,
     file_io: FileIO,
-    _stop: ConnectorStopOwner,
     objects_per_turn: usize,
     completed_in_turn: usize,
 }
@@ -52,9 +50,10 @@ impl UnsealedWriterCleanup {
             original,
             location: location.into(),
             phase: None,
+            stream_cleanup: None,
         }
     }
-    fn phase(&mut self) -> &mut CleanupPhase {
+    fn phase(&mut self, journal: &StagedPathJournal) -> &mut CleanupPhase {
         let original = &self.original;
         let binding = &self.binding;
         let location = &self.location;
@@ -63,9 +62,7 @@ impl UnsealedWriterCleanup {
             // existing Provider policy once, not a new Work deadline and not
             // the async actor's diagnostic watchdog.
             let budget = OperationLimits::default().cleanup;
-            let stop = ConnectorStopOwner::new();
-            let request =
-                original.for_existing_obligation(Instant::now() + budget.time, stop.view());
+            let request = journal.cleanup_request(original);
             let file_io = crate::fs_io::build_file_io_for_location(
                 location,
                 binding.for_request(request.clone()),
@@ -73,15 +70,28 @@ impl UnsealedWriterCleanup {
             CleanupPhase {
                 request,
                 file_io,
-                _stop: stop,
                 objects_per_turn: budget.objects,
                 completed_in_turn: 0,
             }
         })
     }
     pub(super) async fn run(&mut self, journal: &StagedPathJournal) -> Result<(), ConnectorError> {
-        while let Some(path) = journal.last() {
-            let phase = self.phase();
+        let mut stream_error = None;
+        loop {
+            if self.stream_cleanup.is_none() {
+                self.stream_cleanup = journal.take_stream_cleanup();
+            }
+            let Some(cleanup) = self.stream_cleanup.as_mut() else {
+                break;
+            };
+            // The original upload must finish aborting before deleting its objects.
+            if let Err(error) = cleanup.await {
+                stream_error.get_or_insert(error);
+            }
+            self.stream_cleanup = None;
+        }
+        while let Some(path) = journal.last_owned() {
+            let phase = self.phase(journal);
             phase.request.check_active()?;
             let result = tokio::time::timeout_at(
                 phase.request.deadline().into(),
@@ -113,6 +123,21 @@ impl UnsealedWriterCleanup {
                 phase.completed_in_turn = 0;
                 tokio::task::yield_now().await;
             }
+        }
+        if let Some(error) = stream_error {
+            return Err(error);
+        }
+        if let Some((path, original)) = journal.first_stream_exit_failure() {
+            return Err(error(
+                ConnectorErrorKind::Unavailable,
+                format!("Iceberg staged object {path} has unproven stream exit: {original}"),
+            ));
+        }
+        if journal.has_unproven() {
+            return Err(error(
+                ConnectorErrorKind::Internal,
+                "Iceberg staged object ownership remains unproven",
+            ));
         }
         Ok(())
     }

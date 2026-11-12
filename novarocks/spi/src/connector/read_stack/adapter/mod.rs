@@ -1990,6 +1990,12 @@ mod tests {
                     K::Delta { window } => self
                         .get_change_window_plan(session, name, *window)
                         .map(|v| v.map(|v| (v, None))),
+                    K::RowMutationMatch { .. } | K::FrozenMvTarget { .. } => {
+                        Err(crate::connector::ConnectorError::new(
+                            crate::connector::ConnectorErrorKind::Unsupported,
+                            "fixture has no original write-target observation",
+                        ))
+                    }
                     K::MvTarget {
                         object_id,
                         snapshot_id,

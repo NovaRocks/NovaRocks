@@ -646,6 +646,12 @@ impl<'a> TreeContext<'a> {
                     target.get()
                 ))?;
             }
+            novarocks_physical_plan::OutputRole::PositionShards { target, .. } => {
+                out.push(format_args!(
+                    "    ROLE: position-shards(target={})",
+                    target.get()
+                ))?;
+            }
             novarocks_physical_plan::OutputRole::Summary(kind) => {
                 out.push(format_args!(
                     "    ROLE: summary({}: {})",
@@ -1546,6 +1552,12 @@ impl TreeContext<'_> {
             }
             NodeKind::AssertOneRow(_) => {
                 out.push(format_args!("{prefix}ASSERT ONE ROW{stats}"))?;
+            }
+            NodeKind::PositionShard(spec) => {
+                out.push(format_args!(
+                    "{prefix}POSITION_SHARD_AGGREGATION(routes={}){stats}",
+                    spec.inputs.len(),
+                ))?;
             }
             NodeKind::ChangeEventExpand { events, .. } => {
                 out.push(format_args!(

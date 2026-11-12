@@ -14,6 +14,7 @@ pub(crate) mod iceberg_writer;
 pub mod insert;
 pub mod mutation;
 pub(crate) mod mutation_flow;
+mod mutation_match_read;
 pub mod truncate;
 
 pub(crate) mod cow_closed_ast;

@@ -17,23 +17,16 @@
 
 //! Cross-cutting write-stack tests.
 //!
-//! The D10 tests read real Parquet position-delete files off a temporary local
-//! filesystem so that "missing", "corrupt", and "stale" are genuine I/O
-//! outcomes rather than mocked verdicts.
-
 use crate::commit::model::EntryIdentity;
 use novarocks_spi::connector::write_stack::{ConnectorWriteBeginRequest, ConnectorWriteControl};
 use std::collections::BTreeMap;
-use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Int8Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_fs::{
-    FileIoRuntime, FileIoSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner,
-};
+use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteRouteFacts, ConnectorWriteSelectionBindingRole, ConnectorWriteSessionFlavor,
     ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
@@ -51,13 +44,12 @@ use novarocks_spi::connector::{
     ConnectorWriteInputShape, ConnectorWriteRouteId, ExternalMutationEffect,
     ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
 };
-use parquet::arrow::ArrowWriter;
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    release_session_state, session_freezes_old_deletes, session_plan_from_targets,
-    settle_empty_write_without_commit, validate_prepared_set,
+    release_session_state, session_plan_from_targets, settle_empty_write_without_commit,
+    validate_prepared_set,
 };
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
@@ -70,9 +62,6 @@ use crate::commit::write_stack::flavor::{
     plan_distributed_rewrite_branches, plan_document_publication_branches, plan_ordinary_branches,
     plan_row_mutation_branches,
 };
-use crate::commit::write_stack::old_delete::{
-    IcebergOldDeleteMergeTarget, read_and_merge_old_deletes,
-};
 use crate::commit::write_stack::planning::{
     IcebergBranchSessionPlanInput, IcebergWriteBranchPlan, IcebergWriteSessionPlanInput,
     IcebergWriteTargetPlan, plan_branch_session, plan_write_session,
@@ -81,13 +70,12 @@ use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRunti
 use crate::commit::write_stack::test_support::{
     binding, copy_on_write_input_shape, copy_on_write_match_contract, data_branch_plan,
     data_input_shape, delete_branch_plan, delete_input_shape, document_publication_facts,
-    document_publication_facts_with_shape, document_publication_flavor, dv_artifact,
-    equality_delete_input_shape, equality_delete_recipe, merge_on_read_input_shape, merge_target,
-    parquet_ref, sample_metrics, sample_partition, session_material, table_facts,
+    document_publication_facts_with_shape, dv_artifact, equality_delete_input_shape,
+    equality_delete_recipe, merge_on_read_input_shape, position_rewrite_target, sample_metrics,
+    sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
-use crate::position_delete::{FILE_PATH_COLUMN, POS_COLUMN};
 
 pub(super) fn request_context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
@@ -116,266 +104,6 @@ fn adapter(catalog: &str, version: u8) -> IcebergWriteAdapter {
         descriptor,
         catalog_handle,
     )))
-}
-
-fn local_binding() -> (IcebergReadBinding, tokio::runtime::Runtime) {
-    let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
-    let file_runtime: Arc<dyn FileIoRuntime> =
-        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
-    let io_spawner: Arc<dyn FileIoSpawner> =
-        Arc::new(TokioFileIoSpawner::new(runtime.handle().clone()));
-    let binding = IcebergReadBinding::new(
-        None,
-        FsAccessResolver::new(),
-        file_runtime,
-        novarocks_fs::TokioRefreshExecutor::shared(runtime.handle().clone()),
-        io_spawner,
-    );
-    (binding, runtime)
-}
-
-fn write_delete_parquet(path: &std::path::Path, file_paths: &[&str], positions: &[i64]) -> u64 {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(FILE_PATH_COLUMN, DataType::Utf8, false),
-        Field::new(POS_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(StringArray::from(file_paths.to_vec())),
-            Arc::new(Int64Array::from(positions.to_vec())),
-        ],
-    )
-    .expect("build delete batch");
-    let file = fs::File::create(path).expect("create delete file");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
-    writer.write(&batch).expect("write delete batch");
-    writer.close().expect("close parquet writer");
-    fs::metadata(path).expect("stat delete file").len()
-}
-
-fn location(path: &std::path::Path) -> String {
-    format!("file://{}", path.display())
-}
-
-// -------------------------------------------------------------------------
-// D10: the backend reads, validates, and merges the frozen references.
-// -------------------------------------------------------------------------
-
-#[test]
-fn multiple_old_delete_files_for_one_data_file_are_read_and_merged() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let data_file = "/data/a.parquet";
-    let first = directory.path().join("d1.parquet");
-    let second = directory.path().join("d2.parquet");
-    let first_size = write_delete_parquet(&first, &[data_file, data_file], &[2, 5]);
-    let second_size = write_delete_parquet(&second, &[data_file, "/data/b.parquet"], &[7, 9]);
-
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        data_file.to_string(),
-        100,
-        Some(4),
-        sample_partition(),
-        77,
-        vec![
-            parquet_ref(&location(&first), Some(data_file), first_size, 2).expect("reference"),
-            // The second file is shared with another data file, so it is frozen
-            // without an exclusive reference and may contribute fewer rows.
-            parquet_ref(&location(&second), None, second_size, 2).expect("reference"),
-        ],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    let merged = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect("read and merge old deletes");
-    assert_eq!(
-        merged.positions().iter().collect::<Vec<_>>(),
-        vec![2, 5, 7],
-        "the merge is the union of every frozen reference's positions for this data file"
-    );
-    assert_eq!(
-        merged.merged_references(),
-        &[
-            EntryIdentity::DeleteFile {
-                path: location(&first)
-            },
-            EntryIdentity::DeleteFile {
-                path: location(&second)
-            }
-        ],
-        "the artifact records exactly which references it superseded"
-    );
-}
-
-#[test]
-fn a_data_file_with_no_frozen_references_merges_to_nothing_without_touching_storage() {
-    let target = merge_target("s3://b/a.parquet", 100, Vec::new());
-    let (binding, _runtime) = local_binding();
-    let merged = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect("no references is a decision, not a read");
-    assert!(merged.positions().is_empty());
-    assert!(merged.merged_references().is_empty());
-}
-
-#[test]
-fn a_missing_old_delete_artifact_fails_closed_instead_of_reading_as_empty() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let absent = directory.path().join("gone.parquet");
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref(&location(&absent), Some("/data/a.parquet"), 512, 2).expect("reference")],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    let error = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect_err("a missing artifact must fail the writer");
-    assert_ne!(
-        error.kind(),
-        ConnectorErrorKind::Unsupported,
-        "a missing artifact must not be silently absorbed"
-    );
-}
-
-#[test]
-fn a_stale_old_delete_artifact_is_detected_before_it_is_parsed() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("d.parquet");
-    let real_size = write_delete_parquet(&path, &["/data/a.parquet"], &[3]);
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![
-            // The frozen size no longer matches what is in storage: the
-            // artifact was replaced between planning and execution.
-            parquet_ref(&location(&path), Some("/data/a.parquet"), real_size + 1, 1)
-                .expect("reference"),
-        ],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    let error = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect_err("a stale artifact must fail the writer");
-    assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    assert!(error.message().contains("is stale"), "{}", error.message());
-}
-
-#[test]
-fn a_corrupt_old_delete_artifact_fails_closed() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("corrupt.parquet");
-    fs::write(&path, b"this is not a parquet file").expect("write corrupt file");
-    let size = fs::metadata(&path).expect("stat").len();
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref(&location(&path), Some("/data/a.parquet"), size, 1).expect("reference")],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    let error = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect_err("a corrupt artifact must fail the writer");
-    assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-}
-
-#[test]
-fn an_exclusive_artifact_that_reads_empty_is_corruption_not_an_empty_delete_set() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("foreign.parquet");
-    // The file exists and parses, but every row belongs to another data file.
-    // Frozen as exclusive to `/data/a.parquet`, that is a contradiction.
-    let size = write_delete_parquet(&path, &["/data/b.parquet"], &[1]);
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref(&location(&path), None, size, 0).expect("reference")],
-    )
-    .expect("merge target");
-    // Re-freeze the same artifact as exclusive to /data/a.parquet.
-    let exclusive = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref(&location(&path), Some("/data/a.parquet"), size, 0).expect("reference")],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    // The shared framing is allowed to contribute nothing.
-    assert!(
-        read_and_merge_old_deletes(&target, &binding, &request_context())
-            .expect("shared artifact")
-            .positions()
-            .is_empty()
-    );
-    // The exclusive framing is not.
-    let error = read_and_merge_old_deletes(&exclusive, &binding, &request_context())
-        .expect_err("an exclusive artifact must contribute at least one position");
-    assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    assert!(
-        error.message().contains("decoded no positions"),
-        "{}",
-        error.message()
-    );
-}
-
-#[test]
-fn a_position_outside_the_referenced_data_file_is_rejected() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("d.parquet");
-    let size = write_delete_parquet(&path, &["/data/a.parquet"], &[500]);
-    let target = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        // The data file has only 100 rows, so position 500 cannot exist.
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref(&location(&path), Some("/data/a.parquet"), size, 1).expect("reference")],
-    )
-    .expect("merge target");
-
-    let (binding, _runtime) = local_binding();
-    let error = read_and_merge_old_deletes(&target, &binding, &request_context())
-        .expect_err("a position past the data file must fail");
-    assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    assert!(
-        error.message().contains("which has only 100 rows"),
-        "{}",
-        error.message()
-    );
-}
-
-#[test]
-fn an_artifact_frozen_for_another_data_file_is_rejected_before_any_io() {
-    let error = IcebergOldDeleteMergeTarget::try_new(
-        "/data/a.parquet".to_string(),
-        100,
-        None,
-        sample_partition(),
-        77,
-        vec![parquet_ref("s3://b/d.parquet", Some("/data/b.parquet"), 512, 1).expect("reference")],
-    )
-    .expect_err("mismatched reference");
-    assert!(error.message().contains("belongs to data file"));
 }
 
 // -------------------------------------------------------------------------
@@ -459,6 +187,22 @@ fn another_catalog_generation_cannot_recover_a_fragment() {
 // Prepared-set validation and the single-commit latch.
 // -------------------------------------------------------------------------
 
+fn fixed_delete_recipe(table: &IcebergWriteTableFacts) -> super::domain::IcebergMutationReadRecipe {
+    super::domain::IcebergMutationReadRecipe::try_new(
+        table,
+        "s3://b/wh/db/t/metadata/v4.metadata.json".to_owned(),
+        format!("sha256:{}", "a".repeat(64)),
+        table.base_snapshot_id().map(|snapshot| {
+            super::domain::IcebergMutationSnapshot::try_new(
+                format!("s3://b/wh/db/t/metadata/snap-{snapshot}.avro"),
+                table.schema_id(),
+            )
+            .unwrap()
+        }),
+    )
+    .unwrap()
+}
+
 fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
     let (handle, _plans) = plan_write_session(
         IcebergWriteSessionId::new(),
@@ -469,21 +213,12 @@ fn dv_session() -> (IcebergWriteCommitSession, IcebergWriteAdapter) {
             base_version_digest: None,
             staged_metadata: None,
             data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(
-                IcebergWriteBranch::DeletionVector,
-                vec![merge_target(
-                    "s3://b/wh/db/t/data/a.parquet",
-                    100,
-                    vec![
-                        parquet_ref("s3://b/wh/db/t/data/old.parquet", None, 512, 2)
-                            .expect("reference"),
-                    ],
-                )],
-            )],
+            deletes: vec![delete_branch_plan(IcebergWriteBranch::DeletionVector, None)],
         },
     )
     .expect("session");
-    (handle, adapter("unit", 1))
+    let recipe = fixed_delete_recipe(handle.table());
+    (handle.with_mutation_read(recipe), adapter("unit", 1))
 }
 
 fn ordinal(value: u32) -> WriteTargetOrdinal {
@@ -515,6 +250,45 @@ fn dv_fragment(path: &str, referenced: &str, merged: Vec<EntryIdentity>) -> Iceb
         )
         .expect("deletion vector artifact"),
     )
+}
+
+fn final_vector(vector: super::domain::IcebergDeletionVectorArtifact) -> IcebergCommitFragment {
+    let target = super::domain::IcebergDeleteTargetLocator::try_new(
+        "s3://b/wh/db/t/metadata/snap-77.avro".to_owned(),
+        "s3://b/wh/db/t/metadata/manifest.avro".to_owned(),
+        0,
+        0,
+        77,
+        vector.referenced_data_file().to_owned(),
+        100,
+    )
+    .unwrap();
+    IcebergCommitFragment::final_delete(
+        super::domain::IcebergFinalDeleteEffect::try_new(
+            target,
+            1,
+            super::domain::IcebergFinalDeleteKind::ReplacePositions(Box::new(vector)),
+        )
+        .unwrap(),
+    )
+}
+
+fn fixed_dv_fragment(
+    path: &str,
+    referenced: &str,
+    merged: Vec<EntryIdentity>,
+) -> IcebergCommitFragment {
+    let vector = super::domain::IcebergDeletionVectorArtifact::try_new(
+        path.to_owned(),
+        sample_partition(),
+        sample_metrics(3, 1024),
+        referenced.to_owned(),
+        super::domain::IcebergContentRange::try_new(4, 64).unwrap(),
+        3,
+        merged,
+    )
+    .unwrap();
+    final_vector(vector)
 }
 
 fn data_fragment(path: &str) -> IcebergCommitFragment {
@@ -552,7 +326,7 @@ fn a_valid_prepared_set_passes_every_sealed_check() {
             (ordinal(0), data_fragment("s3://b/wh/db/t/data/new.parquet")),
             (
                 ordinal(1),
-                dv_fragment(
+                fixed_dv_fragment(
                     "s3://b/wh/db/t/data/v.puffin",
                     "s3://b/wh/db/t/data/a.parquet",
                     vec![EntryIdentity::DeleteFile {
@@ -574,7 +348,7 @@ fn a_fragment_whose_branch_disagrees_with_its_target_is_rejected() {
         &adapter,
         vec![(
             ordinal(0),
-            dv_fragment(
+            fixed_dv_fragment(
                 "s3://b/wh/db/t/data/v.puffin",
                 "s3://b/wh/db/t/data/a.parquet",
                 Vec::new(),
@@ -598,7 +372,7 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
         vec![
             (
                 ordinal(1),
-                dv_fragment(
+                fixed_dv_fragment(
                     "s3://b/wh/db/t/data/v1.puffin",
                     "s3://b/wh/db/t/data/a.parquet",
                     Vec::new(),
@@ -606,7 +380,7 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
             ),
             (
                 ordinal(1),
-                dv_fragment(
+                fixed_dv_fragment(
                     "s3://b/wh/db/t/data/v2.puffin",
                     "s3://b/wh/db/t/data/a.parquet",
                     Vec::new(),
@@ -624,25 +398,32 @@ fn two_delete_artifacts_for_one_data_file_are_rejected() {
 }
 
 #[test]
-fn a_delete_artifact_for_an_unrouted_data_file_is_rejected() {
-    let (handle, adapter) = dv_session();
+fn a_position_rewrite_artifact_for_an_unselected_data_file_is_rejected() {
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
+        POSITION_DELETE_REWRITE,
+        &position_delete_rewrite_groups(&["a"]),
+    )
+    .unwrap();
+    let (handle, _) = flavor_session(plan);
+    let adapter = adapter("unit", 1);
     let set = prepared(
         &adapter,
         vec![(
-            ordinal(1),
+            ordinal(0),
             dv_fragment(
                 "s3://b/wh/db/t/data/v.puffin",
-                "s3://b/wh/db/t/data/never-routed.parquet",
+                "s3://b/wh/db/t/data/never-selected.parquet",
                 Vec::new(),
             ),
         )],
         &handle.expected_targets(),
     );
-    let error = validate_prepared_set(&handle, &adapter, &set).expect_err("unrouted data file");
+    let error = validate_prepared_set(&handle, &adapter, &set).expect_err("unselected data file");
     assert!(
-        error.message().contains("never routed"),
-        "{}",
-        error.message()
+        error
+            .message()
+            .contains("differs from its selected data file")
     );
 }
 
@@ -677,33 +458,14 @@ fn a_prepared_set_accepts_distinct_vectors_in_the_same_puffin_object() {
         "s3://b/wh/db/t/data/a.parquet",
         "s3://b/wh/db/t/data/b.parquet",
     ];
-    let (handle, _) = plan_write_session(
-        IcebergWriteSessionId::new(),
-        IcebergWriteSessionPlanInput {
-            flavor: IcebergWriteFlavor::RowMutationDeletionVector,
-            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            table: table_facts(),
-            base_version_digest: None,
-            staged_metadata: None,
-            data: data_branch_plan(),
-            deletes: vec![delete_branch_plan(
-                IcebergWriteBranch::DeletionVector,
-                paths
-                    .iter()
-                    .map(|path| merge_target(path, 100, Vec::new()))
-                    .collect(),
-            )],
-        },
-    )
-    .unwrap();
-    let adapter = adapter("unit", 1);
+    let (handle, adapter) = dv_session();
     let fragments = paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
             (
                 ordinal(1),
-                IcebergCommitFragment::deletion_vector(
+                final_vector(
                     dv_artifact(
                         "s3://b/wh/db/t/data/shared.puffin",
                         path,
@@ -724,86 +486,6 @@ fn a_prepared_set_accepts_distinct_vectors_in_the_same_puffin_object() {
     let second = adapter.commit_fragment(&set.fragments()[1].1).unwrap();
     assert_eq!(first.path(), second.path());
     assert_ne!(first.entry_identity(), second.entry_identity());
-}
-
-#[test]
-fn a_delete_artifact_must_supersede_exactly_the_frozen_references() {
-    let (handle, adapter) = dv_session();
-    let frozen = handle.frozen_old_references();
-    assert_eq!(
-        frozen[&ordinal(1)]["s3://b/wh/db/t/data/a.parquet"],
-        vec![EntryIdentity::DeleteFile {
-            path: "s3://b/wh/db/t/data/old.parquet".to_string()
-        }]
-    );
-
-    let matching = prepared(
-        &adapter,
-        vec![(
-            ordinal(1),
-            dv_fragment(
-                "s3://b/wh/db/t/data/v.puffin",
-                "s3://b/wh/db/t/data/a.parquet",
-                vec![EntryIdentity::DeleteFile {
-                    path: "s3://b/wh/db/t/data/old.parquet".to_string(),
-                }],
-            ),
-        )],
-        &handle.expected_targets(),
-    );
-    let validated = validate_prepared_set(&handle, &adapter, &matching).expect("valid");
-    crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
-        .expect("the artifact superseded exactly the frozen references");
-
-    // A writer that merged nothing must not be committed: the new artifact
-    // replaces the old ones, so the old deletes would silently disappear.
-    let dropped = prepared(
-        &adapter,
-        vec![(
-            ordinal(1),
-            dv_fragment(
-                "s3://b/wh/db/t/data/v.puffin",
-                "s3://b/wh/db/t/data/a.parquet",
-                Vec::new(),
-            ),
-        )],
-        &handle.expected_targets(),
-    );
-    let validated = validate_prepared_set(&handle, &adapter, &dropped).expect("valid shape");
-    let error =
-        crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
-            .expect_err("dropped old references");
-    assert!(
-        error.message().contains("merged 0 old references"),
-        "{}",
-        error.message()
-    );
-}
-
-/// A statement that deletes from some data files and not others is the normal
-/// case, not a corrupt one.
-///
-/// The session freezes old-delete references for *every* data file of the base
-/// snapshot, because `begin_write` cannot know which files the predicate will
-/// match. A writer stages an artifact only for the files it actually deleted a
-/// row from, and the commit carries every untouched file's delete manifest
-/// through unchanged -- so an unsuperseded frozen reference is a file this
-/// statement did not touch, and nothing is lost by committing.
-#[test]
-fn a_frozen_data_file_this_statement_never_touched_is_not_an_error() {
-    let (handle, adapter) = dv_session();
-    let frozen = handle.frozen_old_references();
-    assert!(
-        frozen[&ordinal(1)].contains_key("s3://b/wh/db/t/data/a.parquet"),
-        "the fixture must freeze at least one data file carrying an old delete"
-    );
-
-    // Nothing staged at all: a DELETE whose predicate matched no row of any
-    // frozen file.
-    let untouched = prepared(&adapter, Vec::new(), &handle.expected_targets());
-    let validated = validate_prepared_set(&handle, &adapter, &untouched).expect("valid shape");
-    crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
-        .expect("an untouched frozen data file keeps its existing deletes");
 }
 
 #[test]
@@ -977,14 +659,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
                 base_version_digest: None,
                 staged_metadata: None,
                 data: data_branch_plan(),
-                deletes: vec![delete_branch_plan(
-                    branch,
-                    vec![merge_target(
-                        "s3://b/wh/db/t/data/a.parquet",
-                        10,
-                        Vec::new(),
-                    )],
-                )],
+                deletes: vec![delete_branch_plan(branch, None)],
             },
         )
         .unwrap_or_else(|error| panic!("{} must plan: {error:?}", flavor.as_str()));
@@ -1207,7 +882,7 @@ fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergWriteCommitSession {
                 crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
                     ordinal(u32::try_from(index).expect("ordinal")),
                     IcebergWriteBranch::Data,
-                    std::collections::BTreeMap::new(),
+                    None,
                 )
             })
             .collect(),
@@ -1296,21 +971,9 @@ fn an_ordinary_session_yields_unrouted_targets() {
             .all(|target| target.route().is_none())
     );
 
-    let mut material = session_material(delete_input_shape(IcebergWriteBranch::DeletionVector));
-    material.merge_targets = vec![merge_target(
-        "s3://b/wh/db/t/data/a.parquet",
-        10,
-        Vec::new(),
-    )];
-    let plan = plan_ordinary_branches(IcebergWriteFlavor::RowMutationDeletionVector, &material)
-        .expect("plan an ordinary row-level write");
-    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
-    assert_eq!(sealed.targets().len(), 2);
+    let material = session_material(delete_input_shape(IcebergWriteBranch::DeletionVector));
     assert!(
-        sealed
-            .targets()
-            .iter()
-            .all(|target| target.route().is_none())
+        plan_ordinary_branches(IcebergWriteFlavor::RowMutationDeletionVector, &material).is_err()
     );
 }
 
@@ -1320,12 +983,7 @@ fn a_row_mutation_yields_one_routed_target_per_branch() {
     // row: the delete branch consumes the before-image identity and the data
     // branch consumes the after-image values, so a Replace reaches both.
     let adapter = adapter("row_mutation", 2);
-    let mut material = session_material(merge_on_read_input_shape());
-    material.merge_targets = vec![merge_target(
-        "s3://b/wh/db/t/data/a.parquet",
-        10,
-        Vec::new(),
-    )];
+    let material = session_material(merge_on_read_input_shape());
     let plan = plan_row_mutation_branches(&material).expect("plan a merge-on-read mutation");
     assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationDeletionVector);
     let (handle, targets) = flavor_session(plan);
@@ -1394,18 +1052,13 @@ fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
     // partition source fields travel as routing facts because SQL, not the
     // writer, supplies them.
     let adapter = adapter("delete_only", 3);
-    let mut material = session_material(ConnectorWriteInputShape::DeletionVector {
+    let material = session_material(ConnectorWriteInputShape::DeletionVector {
         identity_fields: vec![
             binding("_file", 2, DataType::Utf8),
             binding("_pos", 3, DataType::Int64),
         ],
         partition_source_fields: vec![binding("k1", 1, DataType::Int64)],
     });
-    material.merge_targets = vec![merge_target(
-        "s3://b/wh/db/t/data/a.parquet",
-        10,
-        Vec::new(),
-    )];
     let plan = plan_row_mutation_branches(&material).expect("plan a delete-only mutation");
     let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
     assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
@@ -1799,14 +1452,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
                     route: Some(data_route),
                 },
                 IcebergWriteBranchPlan::Delete {
-                    plan: delete_branch_plan(
-                        IcebergWriteBranch::DeletionVector,
-                        vec![merge_target(
-                            "s3://b/wh/db/t/data/a.parquet",
-                            10,
-                            Vec::new(),
-                        )],
-                    ),
+                    plan: delete_branch_plan(IcebergWriteBranch::DeletionVector, None),
                     route: Some(delete_route),
                 },
             ],
@@ -1888,7 +1534,7 @@ fn data_rewrite_branches(
         .into_iter()
         .map(|group| IcebergFrozenRewriteBranch {
             group,
-            delete_targets: Vec::new(),
+            position_rewrite: None,
         })
         .collect()
 }
@@ -1937,14 +1583,10 @@ fn position_delete_rewrite_groups(partitions: &[&str]) -> Vec<IcebergFrozenRewri
         .expect("plan position-delete rewrite groups")
         .into_iter()
         .map(|group| {
-            let delete_targets = group
-                .data_files
-                .iter()
-                .map(|file| merge_target(&file.path, 1, Vec::new()))
-                .collect();
+            let position_rewrite = Some(position_rewrite_target(&group.data_files[0].path, 1));
             IcebergFrozenRewriteBranch {
                 group,
-                delete_targets,
+                position_rewrite,
             }
         })
         .collect()
@@ -2101,32 +1743,12 @@ fn a_position_delete_rewrite_seals_one_delete_branch_per_frozen_group() {
             .iter()
             .all(|target| target.branch() == IcebergWriteBranch::DeletionVector)
     );
-    // Each branch owns exactly its own group's data file, which is what makes
-    // the unique-owner proof pass with two delete branches in one session.
-    // Ordinals follow the supplied frozen order even when it differs from digest order.
-    assert_eq!(handle.delete_owner().len(), 2);
     for (index, branch) in groups.iter().enumerate() {
-        for file in &branch.group.data_files {
-            assert_eq!(
-                handle
-                    .delete_owner()
-                    .get(&file.path)
-                    .map(|target| target.get()),
-                Some(index as u32),
-                "{} must be owned by its own group's branch",
-                file.path
-            );
-        }
+        let expected = branch.position_rewrite.as_ref().unwrap();
+        assert_eq!(handle.targets()[index].position_rewrite(), Some(expected));
+        assert_eq!(targets[index].handle().position_rewrite(), Some(expected));
+        assert_eq!(expected.path(), branch.group.data_files[0].path);
     }
-    // A rewrite reads the old vectors through its own scan, so its writer has
-    // no old reference to merge -- and the commit still retires them.
-    assert!(
-        handle
-            .frozen_old_references()
-            .values()
-            .flat_map(|files| files.values())
-            .all(|references| references.is_empty())
-    );
     let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
     assert_eq!(sealed.targets().len(), 2);
     assert!(
@@ -2268,7 +1890,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
             crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
                 ordinal(0),
                 IcebergWriteBranch::Data,
-                std::collections::BTreeMap::new(),
+                None,
             ),
         ],
     )
@@ -2554,7 +2176,7 @@ fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
         )
         .expect("plan a change-stream publication"),
     );
-    assert_eq!(delta.commit_op_kind(), CommitOpKind::RowDeltaDvFromFiles);
+    assert_eq!(delta.commit_op_kind(), CommitOpKind::MaterializedRowDelta);
     // It is the same op an ordinary DML merge-on-read mutation commits under --
     // the delta form follows the artifact the delete branch writes, and the
     // mapping is stated once.
@@ -2630,38 +2252,6 @@ fn a_full_refresh_cannot_apply_a_change_stream() {
         "unexpected message: {}",
         error.message()
     );
-}
-
-#[test]
-fn a_change_stream_publication_freezes_the_old_deletes_it_supersedes() {
-    // A merge-on-read refresh stages a deletion vector that must account for
-    // every delete artifact already attached to the data file it touches. The
-    // session freezes those references at admission, and a publication that
-    // skipped the freeze would stage an artifact that silently dropped them.
-    let signed = merge_on_read_input_shape();
-    assert!(session_freezes_old_deletes(
-        &document_publication_flavor(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-        ),
-        &signed,
-    ));
-    // A wholesale republication seals no delete branch, so it has nothing to
-    // supersede and must not pay for the read.
-    assert!(!session_freezes_old_deletes(
-        &document_publication_flavor(
-            ConnectorManagedPublicationTechnique::Full,
-            ConnectorManagedPublicationShape::Data,
-        ),
-        &data_input_shape(),
-    ));
-    assert!(!session_freezes_old_deletes(
-        &document_publication_flavor(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-        ),
-        &data_input_shape(),
-    ));
 }
 
 #[test]
@@ -3060,7 +2650,18 @@ fn staged_target_handle(
     runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
     incarnation: ProviderBindingEpoch,
 ) -> novarocks_spi::connector::ConnectorTableHandle {
-    let location = "file:///tmp/novarocks-staged-session/table";
+    staged_target_handle_at(
+        runtime,
+        incarnation,
+        "file:///tmp/novarocks-staged-session/table",
+    )
+}
+
+fn staged_target_handle_at(
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+    location: &str,
+) -> novarocks_spi::connector::ConnectorTableHandle {
     let schema = crate::iceberg::spec::Schema::builder()
         .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
             1,
@@ -3183,7 +2784,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
     };
 
     let incarnation = ProviderBindingEpoch::new();
-    let (_executor, runtime) = unreachable_rest_runtime();
+    let (executor, runtime) = unreachable_rest_runtime();
     let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
         descriptor("unit"),
         incarnation,
@@ -3193,10 +2794,13 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
         ),
         Arc::clone(&runtime),
     );
+    let scratch = tempfile::TempDir::new().unwrap();
+    let location = format!("file://{}/table", scratch.path().display());
     let plan = control
-        .begin_write(staged_begin_request(staged_target_handle(
+        .begin_write(staged_begin_request(staged_target_handle_at(
             &runtime,
             incarnation,
+            &location,
         )))
         .expect("staged begin");
     let adapter = crate::commit::write_stack::runtime::build_write_adapter(
@@ -3206,14 +2810,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             CatalogVersion::from_bytes([1; 32]),
         ),
     );
-    let set = prepared(
-        &adapter,
-        vec![(
-            ordinal(0),
-            data_fragment("file:///tmp/novarocks-staged-session/table/data/a.parquet"),
-        )],
-        &[ordinal(0)],
-    );
+    let (set, _writer) = seal_test_data_output(&executor, &runtime, &adapter, &plan);
 
     let outcome = control
         .finish_write(ConnectorWriteFinishRequest {
@@ -3335,22 +2932,11 @@ fn an_equality_delete_session_seals_one_equality_branch_and_no_data_branch() {
     // It appends delete files rather than superseding a data file's deletes, so
     // it commits as an ordinary row delta.
     assert_eq!(handle.commit_op_kind(), CommitOpKind::RowDelta);
-    // And it froze no old-delete reference, because it supersedes nothing.
-    assert!(handle.frozen_old_references().is_empty());
+    assert!(handle.targets()[0].position_rewrite().is_none());
 
     let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
     assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
     assert!(sealed.targets()[0].route().is_none());
-}
-
-/// An equality delete supersedes no existing artifact, so the session must not
-/// pay for -- or freeze -- an old-delete merge.
-#[test]
-fn an_equality_delete_session_freezes_no_old_deletes() {
-    assert!(!session_freezes_old_deletes(
-        &ConnectorWriteSessionFlavor::Ordinary,
-        &equality_delete_input_shape(),
-    ));
 }
 
 fn scalar_integer_staged_target_handle(
@@ -4163,43 +3749,175 @@ impl FrozenRewriteLake {
         &self,
         session: &novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
         rows: &[i64],
-        name: &str,
+        _name: &str,
     ) -> ConnectorPreparedWriteSet {
-        let root = self
-            .table()
-            .metadata()
-            .location()
-            .trim_start_matches("file://")
-            .to_string();
-        let path = std::path::PathBuf::from(root)
-            .join("data")
-            .join(format!("{name}.parquet"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(rows.to_vec()))],
-        )
-        .unwrap();
-        let mut writer =
-            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let fragment = IcebergCommitFragment::data_file(
-            IcebergDataFileArtifact::try_new(
-                location(&path),
-                IcebergFileFormat::Parquet,
-                sample_partition(),
-                sample_metrics(rows.len() as u64, std::fs::metadata(&path).unwrap().len()),
-                None,
-            )
-            .unwrap(),
+        let target = &session.targets()[0];
+        let ConnectorWriteInputShape::Data { fields } = target.input() else {
+            panic!("fixture data writer input");
+        };
+        let schema = Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|field| field.field().clone())
+                .collect::<Vec<_>>(),
+        ));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(rows.to_vec()))]).unwrap();
+        self.stage_batch(session, target, batch, None, rows.len() as u64)
+    }
+
+    fn stage_batch(
+        &self,
+        session: &novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+        target: &ConnectorWriteTargetPlan,
+        batch: RecordBatch,
+        source: Option<novarocks_spi::connector::write_stack::ConnectorPositionShardSource>,
+        row_count: u64,
+    ) -> ConnectorPreparedWriteSet {
+        use novarocks_spi::connector::write_stack::{
+            ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
+        };
+        let execution = super::execution::IcebergWriteStackExecution::new(
+            session.commit_session().binding().catalog_handle().clone(),
+            self.adapter.clone(),
+            self.runtime.resources().planning_binding().clone(),
         );
-        prepared(
-            &self.adapter,
-            vec![(session.targets()[0].ordinal(), fragment)],
+        let physical = ConnectorWriterPhysicalContext::new(
+            *uuid::Uuid::now_v7().as_bytes(),
+            0,
+            [2; 16],
+            0,
+            target.ordinal().get(),
+        );
+        let fragments = self.executor.block_on(async {
+            let mut writer = execution
+                .open_writer(ConnectorOpenWriterRequest {
+                    resources: source.map(|_| super::test_support::writer_resources()),
+                    handle: target.handle().clone(),
+                    target: target.ordinal(),
+                    expected_schema: batch.schema(),
+                    physical,
+                    context: request_context(),
+                })
+                .await
+                .unwrap();
+            if let Some(source) = source {
+                writer.append_position_shards(source, batch).await.unwrap();
+            } else {
+                writer.append(batch).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        });
+        ConnectorPreparedWriteSet::try_new(
+            row_count,
+            fragments
+                .into_iter()
+                .map(|fragment| (target.ordinal(), fragment))
+                .collect(),
             &session.expected_targets(),
         )
+        .unwrap()
+        .with_received_production(super::test_support::received_write_proof(
+            target.ordinal(),
+            physical,
+        ))
+    }
+
+    fn seed_position_vector(&self, file: &DataFileWithStats) {
+        use arrow::array::{BinaryArray, Int32Array, StructArray};
+        use novarocks_spi::connector::ConnectorWriteInputRequest;
+        use novarocks_spi::connector::write_stack::{
+            ConnectorPositionShardSource, ConnectorWriteFinishPublication,
+            ConnectorWriteFinishRequest,
+        };
+        let table = self.table();
+        let context = request_context();
+        let snapshot = table.metadata().current_snapshot_id();
+        let shape = ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: Vec::new(),
+            partition_source_fields: Vec::new(),
+        };
+        let input = crate::commit::write_preparation::freeze_position_mutation_input(
+            table.metadata(),
+            "main",
+            snapshot,
+            &shape,
+            &context,
+        )
+        .unwrap();
+        let base = crate::commit::write_shared::position_mutation_base(
+            table.metadata(),
+            table.metadata_location(),
+            "main",
+            snapshot,
+        )
+        .unwrap();
+        let session = self
+            .control
+            .begin_write(ConnectorWriteBeginRequest {
+                table: Arc::from("db.t"),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input,
+                base: Some(base),
+                flavor: ConnectorWriteSessionFlavor::RowMutation,
+                context,
+            })
+            .unwrap();
+        let [target] = session.targets() else {
+            panic!("a delete-only fixture must seal one vector writer");
+        };
+        let group = self
+            .adapter
+            .writer_handle(target.handle())
+            .unwrap()
+            .position_group()
+            .unwrap();
+        let source = ConnectorPositionShardSource::new(group, [3; 16], 1.try_into().unwrap());
+        let mut bitmap = Vec::new();
+        roaring::RoaringBitmap::from_iter([0])
+            .serialize_into(&mut bitmap)
+            .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "_file",
+                Arc::new(StringArray::from(vec![file.path.as_str()])) as arrow::array::ArrayRef,
+            ),
+            (
+                "_spec_id",
+                Arc::new(Int32Array::from(vec![file.partition_spec_id.unwrap()])),
+            ),
+            (
+                "_partition",
+                Arc::new(StructArray::new_empty_fields(1, None)),
+            ),
+            ("driver", Arc::new(Int64Array::from(vec![0]))),
+            ("high_word", Arc::new(Int32Array::from(vec![0]))),
+            ("container_key", Arc::new(Int32Array::from(vec![0]))),
+            ("shard_index", Arc::new(Int64Array::from(vec![0]))),
+            ("shard_count", Arc::new(Int64Array::from(vec![1]))),
+            (
+                "positions",
+                Arc::new(BinaryArray::from(vec![bitmap.as_slice()])),
+            ),
+        ])
+        .unwrap();
+        let prepared = self.stage_batch(&session, target, batch, Some(source), 1);
+        let result = self
+            .control
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: session.commit_session(),
+                prepared,
+                statistics: Vec::new(),
+                publication: ConnectorWriteFinishPublication::None,
+                context: request_context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
+            "{result:?}"
+        );
     }
     fn rows(&self) -> Vec<i64> {
         let table = self.table();
@@ -4253,6 +3971,9 @@ impl FrozenRewriteLake {
         paths
     }
 }
+
+#[path = "tests/baseline_contract_tests.rs"]
+mod baseline_contract_tests;
 
 #[test]
 fn distributed_rewrite_inputs_are_attempt_owned_and_never_written() {
@@ -4496,9 +4217,6 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         ConnectorReadFrozenRewriteGroup, ConnectorReadRequestControlFactory,
         ConnectorReadTableExecuteProcedure, ConnectorSession, SchemaTableName,
     };
-    use novarocks_spi::connector::write_stack::{
-        ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
-    };
     use novarocks_spi::connector::{
         ConnectorFrozenRewriteGroup, ConnectorPlanningContext, ConnectorProcessLocalPayload,
         ConnectorRewriteCohortRead,
@@ -4519,88 +4237,8 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
         .executor
         .block_on(crate::manifest::extract_data_files_with_stats(&table))
         .unwrap();
-    for (index, file) in files.iter().enumerate() {
-        let input = novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
-            identity_fields: vec![
-                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                    Field::new("_file", DataType::Utf8, false),
-                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
-                )
-                .expect("fixture declares required file path"),
-                novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
-                    Field::new("_pos", DataType::Int64, false),
-                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-                )
-                .expect("fixture declares required row position"),
-            ],
-            partition_source_fields: Vec::new(),
-        };
-        let session = lake
-            .control
-            .begin_write(ConnectorWriteBeginRequest {
-                table: Arc::from("db.t"),
-                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                input,
-                base: None,
-                flavor: ConnectorWriteSessionFlavor::Ordinary,
-                context: request_context(),
-            })
-            .unwrap();
-        let path = format!("{}/data/vector-{index}.puffin", table.metadata().location());
-        let mut vector = crate::commit::DeletionVector::new();
-        vector.insert(0).unwrap();
-        let written = lake
-            .executor
-            .block_on(crate::commit::write_single_deletion_vector_puffin(
-                table.file_io(),
-                &path,
-                &file.path,
-                &vector,
-            ))
-            .unwrap();
-        let fragment = IcebergCommitFragment::deletion_vector(
-            dv_artifact(
-                &written.path,
-                &file.path,
-                written.cardinality,
-                written.file_size_in_bytes,
-                written.content_offset,
-                written.content_size_in_bytes,
-            )
-            .unwrap(),
-        );
-        let target = session
-            .targets()
-            .iter()
-            .find(|target| {
-                lake.adapter
-                    .writer_handle(target.handle())
-                    .unwrap()
-                    .branch()
-                    == IcebergWriteBranch::DeletionVector
-            })
-            .unwrap();
-        let set = prepared(
-            &lake.adapter,
-            vec![(target.ordinal(), fragment)],
-            &session.expected_targets(),
-        );
-        let result = lake
-            .control
-            .finish_write(ConnectorWriteFinishRequest {
-                commit: session.commit_session(),
-                prepared: set,
-                statistics: Vec::new(),
-                publication: ConnectorWriteFinishPublication::None,
-                context: request_context(),
-            })
-            .unwrap();
-        assert!(
-            matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
-            "{result:?}"
-        );
+    for file in &files {
+        lake.seed_position_vector(file);
     }
     let before = lake.inventory();
     let plan = lake.plan(true);
@@ -4880,18 +4518,15 @@ fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_a
 fn project_prepared_managed_rows(
     technique: ConnectorManagedPublicationTechnique,
     shape: ConnectorManagedPublicationShape,
-    merge_targets: Vec<IcebergOldDeleteMergeTarget>,
     entries: Vec<(WriteTargetOrdinal, IcebergCommitFragment)>,
 ) -> Result<Option<novarocks_spi::connector::write_stack::ConnectorWriteRowChange>, ConnectorError>
 {
-    let mut material =
-        session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
-            merge_on_read_input_shape()
-        } else {
-            data_input_shape()
-        });
-    material.merge_targets = merge_targets;
-    let (handle, targets) = flavor_session(plan_document_publication_branches(
+    let material = session_material(if shape == ConnectorManagedPublicationShape::RowMutation {
+        merge_on_read_input_shape()
+    } else {
+        data_input_shape()
+    });
+    let (handle, _) = flavor_session(plan_document_publication_branches(
         &material,
         document_publication_facts_with_shape(
             technique,
@@ -4899,13 +4534,24 @@ fn project_prepared_managed_rows(
             shape,
         ),
     )?);
-    let handle = handle.with_frozen_delete_merge_targets(
-        targets
-            .iter()
-            .filter(|target| target.branch().writes_deletes())
-            .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
-            .collect(),
-    )?;
+    let handle = if shape == ConnectorManagedPublicationShape::RowMutation {
+        use crate::commit::write_stack::domain::{
+            IcebergMutationReadRecipe, IcebergMutationSnapshot,
+        };
+        let snapshot = handle
+            .table()
+            .base_snapshot_id()
+            .map(|_| IcebergMutationSnapshot::try_new("s3://b/list.avro".into(), 1).unwrap());
+        let recipe = IcebergMutationReadRecipe::try_new(
+            handle.table(),
+            "s3://b/table.metadata.json".into(),
+            format!("sha256:{}", "a".repeat(64)),
+            snapshot,
+        )?;
+        handle.with_mutation_read(recipe)
+    } else {
+        handle
+    };
     let expected = handle.expected_targets();
     let adapter = adapter("unit", 1);
     let commit = adapter.wrap_commit_session(handle);
@@ -4949,25 +4595,104 @@ fn logical_data_fragment(path: &str, rows: u64) -> IcebergCommitFragment {
     )
 }
 
-fn logical_dv_fragment(
-    path: &str,
+fn logical_final_delete(
     data: &str,
-    cardinality: u64,
-    offset: i64,
-    merged: Vec<EntryIdentity>,
-) -> IcebergCommitFragment {
-    IcebergCommitFragment::deletion_vector(
-        crate::commit::write_stack::domain::IcebergDeletionVectorArtifact::try_new(
-            path.into(),
-            sample_partition(),
-            sample_metrics(cardinality, 4096),
-            data.into(),
-            crate::commit::write_stack::domain::IcebergContentRange::try_new(offset, 64).unwrap(),
-            cardinality,
-            merged,
+    new_rows: u64,
+    total_rows: u64,
+    replace: Option<(&str, u64)>,
+) -> Result<IcebergCommitFragment, ConnectorError> {
+    use crate::commit::write_stack::domain::{
+        IcebergContentRange, IcebergDeleteTargetLocator, IcebergDeletionVectorArtifact,
+        IcebergFinalDeleteEffect, IcebergFinalDeleteKind,
+    };
+    let target = IcebergDeleteTargetLocator::try_new(
+        "s3://b/list.avro".into(),
+        "s3://b/source.avro".into(),
+        0,
+        0,
+        1,
+        data.into(),
+        total_rows,
+    )?;
+    let kind = match replace {
+        None => IcebergFinalDeleteKind::RemoveDataFile {
+            partition: sample_partition(),
+            old_exclusive_deletes: Box::new([]),
+        },
+        Some((path, rows)) => IcebergFinalDeleteKind::ReplacePositions(Box::new(
+            IcebergDeletionVectorArtifact::try_new(
+                path.into(),
+                sample_partition(),
+                sample_metrics(rows, 4096),
+                data.into(),
+                IcebergContentRange::try_new(4, 64)?,
+                rows,
+                vec![],
+            )?,
+        )),
+    };
+    Ok(IcebergCommitFragment::final_delete(
+        IcebergFinalDeleteEffect::try_new(target, new_rows, kind)?,
+    ))
+}
+
+#[test]
+fn managed_logical_rows_count_newly_deleted_rows_from_both_final_effects() {
+    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::Delta;
+
+    let a = logical_final_delete("s3://b/a.parquet", 3, 9, Some(("s3://b/a.puffin", 5))).unwrap();
+    let b = logical_final_delete("s3://b/b.parquet", 4, 4, None).unwrap();
+    let insert = logical_data_fragment("s3://b/new.parquet", 5);
+    let project = |entries| {
+        project_prepared_managed_rows(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+            entries,
         )
+    };
+    assert_eq!(
+        project(vec![
+            (ordinal(0), insert),
+            (ordinal(1), a.clone()),
+            (ordinal(1), b)
+        ])
         .unwrap(),
+        Some(Delta {
+            inserted: 5,
+            deleted: 7
+        }),
+    );
+    assert!(
+        project(vec![(ordinal(1), a.clone()), (ordinal(1), a)])
+            .unwrap_err()
+            .message()
+            .contains("repeats staged artifact")
+    );
+    assert!(logical_final_delete("s3://b/a.parquet", 10, 9, None).is_err());
+    assert!(logical_final_delete("s3://b/a.parquet", 3, 9, Some(("s3://b/a.puffin", 2))).is_err());
+}
+
+#[test]
+fn managed_logical_rows_refuse_insertion_count_overflow() {
+    let error = project_prepared_managed_rows(
+        ConnectorManagedPublicationTechnique::Full,
+        ConnectorManagedPublicationShape::Data,
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|name| {
+                (
+                    ordinal(0),
+                    logical_data_fragment(&format!("s3://b/{name}.parquet"), i64::MAX as u64),
+                )
+            })
+            .collect(),
     )
+    .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("logical insertion count overflowed")
+    );
 }
 
 #[test]
@@ -4987,7 +4712,6 @@ fn managed_prepared_logical_rows_distinguish_replacement_append_and_empty_delta(
             project_prepared_managed_rows(
                 technique,
                 ConnectorManagedPublicationShape::Data,
-                vec![],
                 vec![
                     (ordinal(0), logical_data_fragment("s3://b/new-a.parquet", 5)),
                     (ordinal(0), logical_data_fragment("s3://b/new-b.parquet", 7)),
@@ -5021,265 +4745,10 @@ fn managed_prepared_logical_rows_distinguish_replacement_append_and_empty_delta(
         ),
     ] {
         assert_eq!(
-            project_prepared_managed_rows(technique, shape, vec![], vec![]).unwrap(),
+            project_prepared_managed_rows(technique, shape, vec![]).unwrap(),
             Some(expected)
         );
     }
-}
-
-#[test]
-fn managed_prepared_logical_rows_count_only_touched_dv_net_changes() {
-    use super::test_support::puffin_ref;
-    use novarocks_spi::connector::write_stack::ConnectorWriteRowChange::Delta;
-    let a = "s3://b/wh/db/t/data/a.parquet";
-    let b = "s3://b/wh/db/t/data/b.parquet";
-    let old_a = puffin_ref("s3://b/old.puffin", Some(a), 4096, 2, 4, 64).unwrap();
-    // This untouched file's deletes must neither be subtracted nor cause None.
-    let untouched = puffin_ref("s3://b/old.puffin", Some(b), 4096, 0, 100, 64).unwrap();
-    for (new_count, expected_deleted) in [(2, 0), (5, 3)] {
-        assert_eq!(
-            project_prepared_managed_rows(
-                ConnectorManagedPublicationTechnique::Incremental,
-                ConnectorManagedPublicationShape::RowMutation,
-                vec![
-                    merge_target(a, 100, vec![old_a.clone()]),
-                    merge_target(b, 100, vec![untouched.clone()])
-                ],
-                vec![
-                    (
-                        ordinal(0),
-                        logical_data_fragment("s3://b/new-data.parquet", 5)
-                    ),
-                    (
-                        ordinal(1),
-                        logical_dv_fragment(
-                            "s3://b/new.puffin",
-                            a,
-                            new_count,
-                            4,
-                            vec![old_a.entry_identity()]
-                        )
-                    ),
-                ],
-            )
-            .unwrap(),
-            Some(Delta {
-                inserted: 5,
-                deleted: expected_deleted
-            })
-        );
-    }
-    assert_eq!(
-        project_prepared_managed_rows(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-            vec![merge_target(a, 100, vec![])],
-            vec![(
-                ordinal(1),
-                logical_dv_fragment("s3://b/first.puffin", a, 5, 4, vec![])
-            )],
-        )
-        .unwrap(),
-        Some(Delta {
-            inserted: 0,
-            deleted: 5
-        })
-    );
-    let old_b = puffin_ref("s3://b/old.puffin", Some(b), 4096, 4, 100, 64).unwrap();
-    assert_eq!(
-        project_prepared_managed_rows(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-            vec![
-                merge_target(a, 100, vec![old_a.clone()]),
-                merge_target(b, 100, vec![old_b.clone()])
-            ],
-            vec![
-                (
-                    ordinal(1),
-                    logical_dv_fragment(
-                        "s3://b/new-shared.puffin",
-                        a,
-                        5,
-                        4,
-                        vec![old_a.entry_identity()]
-                    )
-                ),
-                (
-                    ordinal(1),
-                    logical_dv_fragment(
-                        "s3://b/new-shared.puffin",
-                        b,
-                        6,
-                        100,
-                        vec![old_b.entry_identity()]
-                    )
-                ),
-            ],
-        )
-        .unwrap(),
-        Some(Delta {
-            inserted: 0,
-            deleted: 5
-        })
-    );
-}
-
-#[test]
-fn managed_prepared_logical_rows_leave_unprovable_old_cardinality_unknown() {
-    use super::test_support::puffin_ref;
-    let data = "s3://b/wh/db/t/data/a.parquet";
-    for references in [
-        vec![puffin_ref("s3://b/old.puffin", Some(data), 4096, 0, 4, 64).unwrap()],
-        vec![parquet_ref("s3://b/old.parquet", Some(data), 4096, 2).unwrap()],
-        vec![parquet_ref("s3://b/shared.parquet", None, 4096, 20).unwrap()],
-    ] {
-        let merged = references
-            .iter()
-            .map(|reference| reference.entry_identity())
-            .collect();
-        assert_eq!(
-            project_prepared_managed_rows(
-                ConnectorManagedPublicationTechnique::Incremental,
-                ConnectorManagedPublicationShape::RowMutation,
-                vec![merge_target(data, 100, references)],
-                vec![(
-                    ordinal(1),
-                    logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged)
-                )],
-            )
-            .unwrap(),
-            None
-        );
-    }
-}
-
-#[test]
-fn managed_prepared_logical_rows_reject_duplicate_and_mismatched_delete_proofs() {
-    use super::test_support::puffin_ref;
-    let data = "s3://b/wh/db/t/data/a.parquet";
-    let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap();
-    let project = |entries| {
-        project_prepared_managed_rows(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-            vec![merge_target(data, 100, vec![old.clone()])],
-            entries,
-        )
-    };
-    let missing = project(vec![(
-        ordinal(1),
-        logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![]),
-    )])
-    .unwrap_err();
-    assert!(missing.message().contains("merged 0 old references"));
-    let duplicate = project(vec![
-        (
-            ordinal(1),
-            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, vec![old.entry_identity()]),
-        ),
-        (
-            ordinal(1),
-            logical_dv_fragment(
-                "s3://b/another.puffin",
-                data,
-                5,
-                4,
-                vec![old.entry_identity()],
-            ),
-        ),
-    ])
-    .unwrap_err();
-    assert!(
-        duplicate
-            .message()
-            .contains("more than one delete artifact")
-    );
-    let foreign = project(vec![(
-        ordinal(1),
-        logical_dv_fragment("s3://b/new.puffin", "s3://b/foreign.parquet", 5, 4, vec![]),
-    )])
-    .unwrap_err();
-    assert!(foreign.message().contains("never routed"));
-}
-
-#[test]
-fn managed_prepared_logical_rows_reject_impossible_cardinality_and_checked_overflow() {
-    use super::test_support::puffin_ref;
-    let data = "s3://b/wh/db/t/data/a.parquet";
-    for (old_count, new_count, rows, expected) in [
-        (5, 3, 100, "lost frozen deleted rows"),
-        (2, 6, 5, "exceeds its frozen data-file row count"),
-        (
-            6,
-            5,
-            5,
-            "frozen deletion vector exceeds its data-file row count",
-        ),
-    ] {
-        let old = puffin_ref("s3://b/old.puffin", Some(data), 4096, old_count, 4, 64).unwrap();
-        let error = project_prepared_managed_rows(
-            ConnectorManagedPublicationTechnique::Incremental,
-            ConnectorManagedPublicationShape::RowMutation,
-            vec![merge_target(data, rows, vec![old.clone()])],
-            vec![(
-                ordinal(1),
-                logical_dv_fragment(
-                    "s3://b/new.puffin",
-                    data,
-                    new_count,
-                    4,
-                    vec![old.entry_identity()],
-                ),
-            )],
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-        assert!(error.message().contains(expected), "{error}");
-    }
-    let old_refs = vec![
-        puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64).unwrap(),
-        puffin_ref("s3://b/old.puffin", Some(data), 4096, 3, 100, 64).unwrap(),
-    ];
-    let merged = old_refs
-        .iter()
-        .map(|reference| reference.entry_identity())
-        .collect();
-    let duplicate_old = project_prepared_managed_rows(
-        ConnectorManagedPublicationTechnique::Incremental,
-        ConnectorManagedPublicationShape::RowMutation,
-        vec![merge_target(data, 100, old_refs)],
-        vec![(
-            ordinal(1),
-            logical_dv_fragment("s3://b/new.puffin", data, 5, 4, merged),
-        )],
-    )
-    .unwrap_err();
-    assert!(
-        duplicate_old
-            .message()
-            .contains("more than one deletion vector")
-    );
-    let error = project_prepared_managed_rows(
-        ConnectorManagedPublicationTechnique::Full,
-        ConnectorManagedPublicationShape::Data,
-        vec![],
-        ["a", "b", "c"]
-            .into_iter()
-            .map(|name| {
-                (
-                    ordinal(0),
-                    logical_data_fragment(&format!("s3://b/{name}.parquet"), i64::MAX as u64),
-                )
-            })
-            .collect(),
-    )
-    .unwrap_err();
-    assert!(
-        error
-            .message()
-            .contains("logical insertion count overflowed")
-    );
 }
 
 #[test]
@@ -5361,63 +4830,6 @@ fn prepared_logical_rows_require_exact_adapter_and_live_context_and_exclude_ordi
 }
 
 #[test]
-fn logical_row_merge_facts_must_match_the_one_sealed_reference_owner() {
-    let data = "s3://b/wh/db/t/data/a.parquet";
-    let mut material = session_material(merge_on_read_input_shape());
-    material.merge_targets = vec![merge_target(
-        data,
-        100,
-        vec![
-            super::test_support::puffin_ref("s3://b/old.puffin", Some(data), 4096, 2, 4, 64)
-                .unwrap(),
-        ],
-    )];
-    let make = || {
-        flavor_session(
-            plan_document_publication_branches(
-                &material,
-                document_publication_facts_with_shape(
-                    ConnectorManagedPublicationTechnique::Incremental,
-                    ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-                    ConnectorManagedPublicationShape::RowMutation,
-                ),
-            )
-            .unwrap(),
-        )
-    };
-    let (handle, _) = make();
-    let mismatched = BTreeMap::from([(
-        ordinal(1),
-        BTreeMap::from([(data.to_owned(), merge_target(data, 100, vec![]))]),
-    )]);
-    assert!(
-        handle
-            .with_frozen_delete_merge_targets(mismatched)
-            .unwrap_err()
-            .message()
-            .contains("sealed old-delete identities")
-    );
-    let (handle, targets) = make();
-    let facts = targets
-        .iter()
-        .filter(|target| target.branch().writes_deletes())
-        .map(|target| (target.ordinal(), target.handle().old_deletes().clone()))
-        .collect::<BTreeMap<_, _>>();
-    let handle = handle
-        .with_frozen_delete_merge_targets(facts.clone())
-        .unwrap();
-    assert!(
-        handle
-            .with_frozen_delete_merge_targets(facts)
-            .unwrap_err()
-            .message()
-            .contains("one managed publication owner")
-    );
-}
-#[path = "tests/baseline_contract_tests.rs"]
-mod baseline_contract_tests;
-
-#[test]
 fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
     use novarocks_spi::connector::CatalogActivityReader;
     use novarocks_spi::connector::write_stack::{
@@ -5470,7 +4882,7 @@ fn async_write_control_commits_real_files_without_a_catalog_join_bridge() {
         before,
         "async begin must not enter the sync bridge"
     );
-    let prepared = lake.output(&session, &[7, 9], "async-insert");
+    let (prepared, _writer) = sealed_writer_output_for_abort(&lake, &session);
     let statistics = Vec::new();
     let publication = ConnectorWriteFinishPublication::None;
     let context = request_context();
@@ -5703,13 +5115,25 @@ fn sealed_writer_output_for_abort(
     ConnectorPreparedWriteSet,
     Box<dyn novarocks_spi::connector::write_stack::ConnectorBatchWriter>,
 ) {
+    seal_test_data_output(&lake.executor, &lake.runtime, &lake.adapter, session)
+}
+
+fn seal_test_data_output(
+    executor: &tokio::runtime::Runtime,
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    adapter: &IcebergWriteAdapter,
+    session: &novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+) -> (
+    ConnectorPreparedWriteSet,
+    Box<dyn novarocks_spi::connector::write_stack::ConnectorBatchWriter>,
+) {
     use novarocks_spi::connector::write_stack::{
         ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
     };
     let execution = super::execution::IcebergWriteStackExecution::new(
         session.commit_session().binding().catalog_handle().clone(),
-        lake.adapter.clone(),
-        lake.runtime.resources().planning_binding().clone(),
+        adapter.clone(),
+        runtime.resources().planning_binding().clone(),
     );
     let target = &session.targets()[0];
     let novarocks_spi::connector::ConnectorWriteInputShape::Data { fields } = target.input() else {
@@ -5721,19 +5145,20 @@ fn sealed_writer_output_for_abort(
             .map(|field| field.field().clone())
             .collect::<Vec<_>>(),
     ));
-    let mut writer = lake
-        .executor
+    let physical = ConnectorWriterPhysicalContext::new([1; 16], 1, [2; 16], 0, 0);
+    let mut writer = executor
         .block_on(execution.open_writer(ConnectorOpenWriterRequest {
+            resources: None,
             handle: target.handle().clone(),
             target: target.ordinal(),
             expected_schema: schema.clone(),
-            physical: ConnectorWriterPhysicalContext::new([1; 16], 0, [2; 16], 0, 0),
+            physical,
             context: request_context(),
         }))
         .unwrap();
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, 9]))]).unwrap();
-    lake.executor.block_on(writer.append(batch)).unwrap();
-    let fragments = lake.executor.block_on(writer.finish()).unwrap();
+    executor.block_on(writer.append(batch)).unwrap();
+    let fragments = executor.block_on(writer.finish()).unwrap();
     let prepared = ConnectorPreparedWriteSet::try_new(
         2,
         fragments
@@ -5742,7 +5167,11 @@ fn sealed_writer_output_for_abort(
             .collect(),
         &session.expected_targets(),
     )
-    .unwrap();
+    .unwrap()
+    .with_received_production(super::test_support::received_write_proof(
+        target.ordinal(),
+        physical,
+    ));
     (prepared, writer)
 }
 
@@ -6019,13 +5448,24 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 "s3://b/wh/db/t/data".into(),
                 "main".into(),
                 snapshot,
-                4,
+                snapshot.map_or(0, |_| 4),
                 1,
                 0,
-                3,
+                if flavor == IcebergWriteFlavor::RowMutationPositionDelete {
+                    2
+                } else {
+                    3
+                },
             )
             .unwrap();
-            let plan = plan_ordinary_branches(flavor, &material).unwrap();
+            let position_mutation = flavor != IcebergWriteFlavor::EqualityDelete;
+            let plan = if position_mutation {
+                plan_row_mutation_branches(&material)
+            } else {
+                plan_ordinary_branches(flavor, &material)
+            }
+            .unwrap();
+            assert_eq!(plan.flavor, flavor);
             let (handle, _) = plan_branch_session(
                 IcebergWriteSessionId::new(),
                 IcebergBranchSessionPlanInput {
@@ -6043,6 +5483,12 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 },
             )
             .unwrap();
+            let handle = if position_mutation {
+                let recipe = fixed_delete_recipe(handle.table());
+                handle.with_mutation_read(recipe)
+            } else {
+                handle
+            };
             let inconsistent =
                 ConnectorPreparedWriteSet::try_new(1, Vec::new(), &handle.expected_targets())
                     .unwrap();
@@ -6050,7 +5496,6 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 &handle,
                 &inconsistent,
                 Vec::new(),
-                &BTreeMap::new(),
                 None,
                 &request_context(),
                 None,
@@ -6077,7 +5522,6 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 &handle,
                 &prepared,
                 Vec::new(),
-                &BTreeMap::new(),
                 None,
                 &cancelled,
                 None,
@@ -6092,7 +5536,6 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                 &handle,
                 &prepared,
                 Vec::new(),
-                &BTreeMap::new(),
                 None,
                 &request_context(),
                 None,
@@ -6254,7 +5697,6 @@ fn an_empty_finish_cannot_replace_an_original_terminal_or_inflight_fact() {
                     &handle,
                     &prepared,
                     Vec::new(),
-                    &BTreeMap::new(),
                     None,
                     &request_context(),
                     None,
@@ -6534,7 +5976,7 @@ fn borrowed_provider_finish_and_abort_preserve_the_winning_terminal_fact() {
 }
 
 #[test]
-fn partition_replace_freezes_after_image_recipe_and_old_file_delete_ownership() {
+fn partition_replace_routes_after_image_partition_and_old_file_identity() {
     let input = merge_on_read_input_shape();
     let mut material = session_material(input.clone());
     material.data_recipe = super::domain::IcebergDataBranchRecipe::try_new(
@@ -6551,31 +5993,6 @@ fn partition_replace_freezes_after_image_recipe_and_old_file_delete_ownership() 
         false,
     )
     .unwrap();
-    let old_file = "s3://b/wh/db/t/data/old-p0.parquet";
-    let old_partition = super::domain::IcebergArtifactPartition::try_new(
-        "partition_key=0".into(),
-        String::new(),
-        0,
-        crate::write_descriptor::IcebergPartitionDescriptor {
-            values: vec![crate::write_descriptor::IcebergPartitionValueDescriptor {
-                is_null: false,
-                datum_bytes: Some(0_i32.to_le_bytes().to_vec()),
-            }],
-        },
-    )
-    .unwrap();
-    material.merge_targets = vec![
-        IcebergOldDeleteMergeTarget::try_new(
-            old_file.into(),
-            100,
-            Some(4),
-            old_partition,
-            77,
-            Vec::new(),
-        )
-        .unwrap(),
-    ];
-    let frozen_old_partition = material.merge_targets[0].partition().clone();
     let plan = plan_row_mutation_branches(&material).unwrap();
     let (_, plans) = flavor_session(plan);
     let data = &plans[0];
@@ -6617,15 +6034,6 @@ fn partition_replace_freezes_after_image_recipe_and_old_file_delete_ownership() 
             .iter()
             .any(|field| field.token() == new_partition),
         "new partition data cannot become old-delete ownership"
-    );
-    assert_eq!(
-        delete
-            .handle()
-            .old_deletes()
-            .get(old_file)
-            .unwrap()
-            .partition(),
-        &frozen_old_partition
     );
     assert!(
         data.route()

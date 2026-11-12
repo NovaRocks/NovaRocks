@@ -28,6 +28,7 @@ pub enum ConnectorResourceClass {
     SplitPlanning,
     ReaderState,
     ReaderOutput,
+    WriterState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

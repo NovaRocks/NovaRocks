@@ -1151,6 +1151,7 @@ impl RawCreate {
                         vec![proto::TaskExchangeInbound {
                             destination_node_id: 10,
                             delivery: proto::ExchangeDeliveryRequirement::DemandDriven as i32,
+                            position_shard_source_dops: None,
                             sources: vec![proto::TaskExchangeSource {
                                 task: Some(proto::TaskIdentity {
                                     query_execution_id: Some(execution),

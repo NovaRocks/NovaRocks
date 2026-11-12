@@ -40,7 +40,7 @@ pub(crate) fn table(
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
     let document = super::nominal_declaration::TableNominalDocument::from_metadata(metadata)?;
-    table_from_document(&document, declaration, pseudo_columns, creation)
+    table_from_document(&document, declaration, pseudo_columns, None, creation)
 }
 
 /// Reuse the same validated document for catalog schema and planning facts.
@@ -48,10 +48,11 @@ pub(crate) fn table_with_document(
     document: &super::nominal_declaration::TableNominalDocument,
     declaration: &Schema,
     pseudo_columns: &[String],
+    mutation: Option<&crate::typed_read::schema_binding::MutationMetadataSchema>,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     creation.work(1)?;
-    table_from_document(document, declaration, pseudo_columns, creation)
+    table_from_document(document, declaration, pseudo_columns, mutation, creation)
 }
 
 /// The exact frozen COW source retains the same format-owned metadata NULL
@@ -69,6 +70,7 @@ fn table_from_document(
     document: &super::nominal_declaration::TableNominalDocument,
     declaration: &Schema,
     pseudo_columns: &[String],
+    mutation: Option<&crate::typed_read::schema_binding::MutationMetadataSchema>,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<ConnectorReadExecutionSchema, Failure> {
     let integers = crate::scalar_integer_domain::of_schema(declaration, &document.integers)?;
@@ -78,7 +80,7 @@ fn table_from_document(
         .as_struct()
         .fields()
         .len()
-        .checked_add(pseudo_columns.len())
+        .checked_add(pseudo_columns.len() + 2 * usize::from(mutation.is_some()))
         .ok_or_else(bad)?;
     if count > novarocks_connector_contract::MAX_CONNECTOR_RECIPE_COLUMNS {
         return Err(bad());
@@ -125,6 +127,20 @@ fn table_from_document(
             value.nullable(),
         ))?);
         bindings.push(value);
+    }
+    if let Some(mutation) = mutation {
+        for field in [mutation.spec_field(), mutation.partition_field()] {
+            let value = crate::typed_read::schema_binding::mutation_partition::field_value(
+                field, creation,
+            )?;
+            let name = creation.text(&field.name)?;
+            fields.push(creation.arc(Field::new(
+                name,
+                value.data_type().clone(),
+                value.nullable(),
+            ))?);
+            bindings.push(value);
+        }
     }
     let fields = creation.arrow_fields(fields)?;
     let schema = creation.arc(ArrowSchema::new(fields))?;

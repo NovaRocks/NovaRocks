@@ -920,3 +920,64 @@ fn simple_nodes_all_original_control_prefixes_and_nested_work_admission_are_obse
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+#[test]
+fn position_shard_node_preserves_route_order_and_required_columns() {
+    let fixture = Fixture::new();
+    let control = Control::default();
+    let mut physical = source(3);
+    let [a, b, c] = [0, 7, u32::MAX].map(p::ValueId::new);
+    physical.kind = p::NodeKind::PositionShard(p::PositionShardAggregation {
+        group: ConnectorMutationContributionGroupId::from_bytes([31; 32]),
+        target: WriteTargetOrdinal::try_new(17).unwrap(),
+        inputs: Box::from([
+            p::PositionShardInput {
+                route: ConnectorWriteRouteId::from_bytes([23; 32]),
+                file: a,
+                position: b,
+                spec_id: c,
+                partition: a,
+            },
+            p::PositionShardInput {
+                route: ConnectorWriteRouteId::from_bytes([19; 32]),
+                file: b,
+                position: c,
+                spec_id: a,
+                partition: b,
+            },
+        ]),
+        output: p::PositionShardOutput {
+            file: c,
+            spec_id: a,
+            partition: b,
+            driver_ordinal: c,
+            high32: a,
+            container_key: b,
+            index: c,
+            count: a,
+            bitmap: b,
+        },
+    });
+    // The node codec projects references. Full layout validity belongs to Fragment.
+    fixture.with_tokens(&control, |values, expressions, read| {
+        let (encoded, _) =
+            encode_simple_node(&physical, values, expressions, SOURCE, limits()).unwrap();
+        assert_eq!(
+            decode_simple_node(&encoded, read, SOURCE, limits())
+                .unwrap()
+                .0,
+            physical,
+        );
+        let mut incomplete = encoded;
+        let Some(wire::physical_node::Kind::PositionShard(payload)) = &mut incomplete.kind else {
+            panic!("expected position shard payload");
+        };
+        assert_eq!(payload.contribution_group_id, [31; 32]);
+        assert_eq!(payload.write_target_ordinal, 17);
+        assert_eq!(payload.inputs[0].route_id, [23; 32]);
+        assert_eq!(payload.inputs[1].route_id, [19; 32]);
+        assert_eq!(payload.output.as_ref().unwrap().count_value_id, Some(0));
+        payload.output.as_mut().unwrap().count_value_id = None;
+        assert!(decode_simple_node(&incomplete, read, SOURCE, limits()).is_err());
+    });
+}

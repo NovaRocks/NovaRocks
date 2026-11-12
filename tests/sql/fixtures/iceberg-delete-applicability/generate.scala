@@ -80,6 +80,7 @@ object DeleteApplicabilityFixture {
     require(run.forall(id => ns.startsWith(id + "_") && ns.length <= 63 && ns.substring(id.length + 1).matches("[a-z][a-z0-9]*")), "namespace is outside the original scratch run")
     spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$namespace")
     emit(obj("record" -> "runtime", "iceberg" -> IcebergBuild.fullVersion(),
+      "iceberg_class_source" -> classOf[Table].getProtectionDomain.getCodeSource.getLocation.toString,
       "spark" -> spark.version, "java" -> System.getProperty("java.version"),
       "requested_warehouse" -> spark.conf.get("spark.sql.catalog.ice_rest.warehouse", ""),
       "namespace" -> namespace, "prefix" -> prefix))

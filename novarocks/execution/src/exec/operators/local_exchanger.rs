@@ -80,6 +80,9 @@ pub(crate) enum LocalExchangePartitionSpec {
     Single,
     InputSlotIds(Vec<SlotId>),
     HierarchicalInputSlotIds(Vec<(SlotId, novarocks_type_contract::FunctionValueType)>),
+    /// Equal typed file occurrences on distinct contribution receivers have
+    /// the same ordinal but different fragment-local slot identities.
+    HierarchicalFileInput(novarocks_type_contract::FunctionValueType),
     ConditionalKey {
         applies: SlotId,
         keys: Vec<(SlotId, novarocks_type_contract::FunctionValueType)>,
@@ -278,6 +281,7 @@ impl LocalExchanger {
         matches!(
             &self.partition_spec,
             LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+                | LocalExchangePartitionSpec::HierarchicalFileInput(_)
                 | LocalExchangePartitionSpec::ConditionalKey { .. }
         )
     }
@@ -587,6 +591,24 @@ impl LocalExchanger {
                     control,
                 );
             }
+            LocalExchangePartitionSpec::HierarchicalFileInput(ty) => {
+                let slot = chunk
+                    .chunk_schema()
+                    .slots()
+                    .first()
+                    .ok_or_else(|| {
+                        crate::runtime::task::ExecutionFailure::from_domain(LocalPartitionContract)
+                    })?
+                    .slot_id();
+                return self.partition_hierarchical(
+                    chunk,
+                    &[(slot, ty.clone())],
+                    None,
+                    bypass_cursor,
+                    factory,
+                    control,
+                );
+            }
             LocalExchangePartitionSpec::ConditionalKey { applies, keys } => {
                 return self.partition_hierarchical(
                     chunk,
@@ -650,6 +672,10 @@ impl LocalExchanger {
                     .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))
             })
             .transpose()?;
+        let position_file = matches!(
+            &self.partition_spec,
+            LocalExchangePartitionSpec::HierarchicalFileInput(_)
+        );
         for row in 0..chunk.len() {
             if row.is_multiple_of(256) {
                 ctx.checkpoint()?;
@@ -682,7 +708,15 @@ impl LocalExchanger {
                         .chunk_schema()
                         .slot(*slot)
                         .ok_or_else(|| ExecutionFailure::from_domain(LocalPartitionContract))?;
-                    if signed.field_schema().value_type() != expected.value_type() {
+                    // A ChangeEvent envelope may allow NULL at the file root.
+                    // Hashing uses the required shard file type, which still rejects a NULL row.
+                    let matches = if position_file {
+                        signed.field_schema().kind() == expected.value_type().kind()
+                            && signed.data_type() == expected.data_type()
+                    } else {
+                        signed.field_schema().value_type() == expected.value_type()
+                    };
+                    if !matches {
                         return Err(ExecutionFailure::from_domain(LocalPartitionContract));
                     }
                     Ok(expected.clone())
@@ -767,6 +801,7 @@ impl LocalExchanger {
             }
             LocalExchangePartitionSpec::Single
             | LocalExchangePartitionSpec::HierarchicalInputSlotIds(_)
+            | LocalExchangePartitionSpec::HierarchicalFileInput(_)
             | LocalExchangePartitionSpec::ConditionalKey { .. } => {
                 return Err(crate::runtime::task::ExecutionFailure::from_domain(
                     LocalPartitionContract,

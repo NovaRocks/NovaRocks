@@ -77,6 +77,32 @@ pub fn build_staged_file_io(
     ))
 }
 
+/// Open the same staged output path with its immutable creation authority.
+pub(crate) fn build_staged_file_io_with_creation(
+    binding: &IcebergReadBinding,
+    data_location: &str,
+    handle: &crate::commit::write_stack::domain::IcebergWriterHandle,
+    physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
+    journal: &crate::commit::data_writer::StagedPathJournal,
+) -> Result<crate::iceberg::io::FileIO, novarocks_spi::connector::ConnectorError> {
+    let Some(scope) = handle.creation_scope() else {
+        return build_staged_file_io(binding, data_location).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                error,
+            )
+        });
+    };
+    crate::fs_io::build_managed_file_io(
+        data_location,
+        binding.clone(),
+        scope,
+        physical,
+        handle.output().file_format(),
+        journal.clone(),
+    )
+}
+
 /// Encode and persist one Parquet file through one request-scoped storage binding.
 pub async fn write_parquet_file(
     binding: &IcebergReadBinding,

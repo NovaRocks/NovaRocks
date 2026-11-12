@@ -1414,7 +1414,9 @@ impl ContractLoweringVisitor<'_> {
                                 .expect("validated root NULL contract");
                         }
                     }
-                    NodeKind::GenerateSeries { .. } | NodeKind::SystemRelation { .. } => {}
+                    NodeKind::GenerateSeries { .. }
+                    | NodeKind::SystemRelation { .. }
+                    | NodeKind::PositionShard(_) => {}
                     NodeKind::Scan { .. }
                     | NodeKind::Filter { .. }
                     | NodeKind::Project { .. }

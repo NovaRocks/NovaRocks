@@ -156,6 +156,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
+- [ADR-0228](ADR-0228-iceberg-position-delete-materialization.md) — Iceberg v3 位置贡献如何按文件归并、由 BE 物化唯一效果，以及受管对象如何条件创建并核验归属（active）
 - [ADR-0227](ADR-0227-metadata-listing-and-task-transport-use-real-capacity-boundaries.md) — 元数据列举与任务传输为何使用真实容量边界，组批为何只作目标，回复布局为何只在 Joint 记责而不构成回复总字节治理（active；部分替代 Task创建版0158、0170、0196、HMS版0216与0224的准确固定额度条款，其余规则保留）
 - [ADR-0225](ADR-0225-iceberg-manifest-source-binding-and-incremental-commits.md) — Iceberg 提交为何在观察时绑定来源、按源过滤并执行标准合并，以及历史输出编码与真实 list 的职责（active）
 - [ADR-0224](ADR-0224-mv-document-capacity-comes-from-real-boundaries.md) — MV 文档为何不自设容量额度、读方为何覆盖写方、StateStore 为何声明真实能力、REST 为何按期望值核验并把 413 归为确定拒绝（active；部分替代 ADR-0180 的额度与首条重评条件，以及 REST 会话版 ADR-0175 的属性保留量与拒绝集；原存放、身份、生命周期、认证与路由保留；薄清单条目/名字/token固定界由 ADR-0227 部分替代，其余文档与后端边界保留）

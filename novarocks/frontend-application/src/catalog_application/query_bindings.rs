@@ -224,6 +224,8 @@ pub enum QueryTableBindingAdmission {
     /// A connector-owned table admission retains the exact generation that
     /// admitted its read materialization or terminal write target.
     Exact(ConnectorControlPlanningPin),
+    /// One statement's signed mutation target scan and admitted base.
+    RowMutationMatch(ConnectorControlPlanningPin, Option<i64>),
     /// A provider-frozen read has no independent table-selector materialization.
     /// Its source facts remain opaque in the provider request, while this
     /// retained lease fences the synthetic SQL relation to one exact control
@@ -234,7 +236,9 @@ pub enum QueryTableBindingAdmission {
 impl QueryTableBindingAdmission {
     pub fn exact_planning_pin(&self) -> Result<ConnectorControlPlanningPin, String> {
         match self {
-            Self::Exact(lease) | Self::FrozenRead(lease) => Ok(lease.clone()),
+            Self::Exact(lease) | Self::FrozenRead(lease) | Self::RowMutationMatch(lease, _) => {
+                Ok(lease.clone())
+            }
             Self::Local => Err("query binding has no connector planning pin".to_string()),
         }
     }
@@ -397,6 +401,7 @@ pub struct MvTargetReadAdmission {
     pub target_table_uuid: String,
     pub target_object_id: novarocks_spi::connector::ConnectorTableObjectId,
     pub frozen_snapshot_id: Option<i64>,
+    pub original_source: Option<novarocks_spi::connector::ConnectorProcessLocalPayload>,
 }
 
 impl std::fmt::Debug for QueryScanMaterialization {
@@ -682,7 +687,8 @@ impl QueryTableBindingStore {
                 material.extend_from_slice(Sha256::digest(pin.data_version.as_bytes()).as_slice());
             }
             if let QueryTableBindingAdmission::Exact(lease)
-            | QueryTableBindingAdmission::FrozenRead(lease) = &binding.admission
+            | QueryTableBindingAdmission::FrozenRead(lease)
+            | QueryTableBindingAdmission::RowMutationMatch(lease, _) = &binding.admission
             {
                 let descriptor = lease.binding().descriptor();
                 material.extend_from_slice(descriptor.provider_id.as_str().as_bytes());

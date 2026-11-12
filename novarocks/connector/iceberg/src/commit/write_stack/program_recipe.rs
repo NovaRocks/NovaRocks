@@ -133,13 +133,50 @@ fn compile(
                 })?;
             work.step()?;
         }
-        (IcebergWriteBranch::PositionDelete, ConnectorWriteInputShape::PositionDelete { .. })
-        | (IcebergWriteBranch::DeletionVector, ConnectorWriteInputShape::DeletionVector { .. }) => {
-            // Null/nonnegative positions and frozen-file membership are row
-            // obligations of the existing writer, not static schema defaults.
-            // Match the runtime's actual flattened, positional input contract.
-            // Names and additional identity-role fields impose no extra gate;
-            // the compiled draft still retains every field, role and token.
+        (
+            IcebergWriteBranch::PositionDelete,
+            ConnectorWriteInputShape::PositionDelete {
+                identity_fields, ..
+            },
+        ) => validate_position_layout(
+            draft.input(),
+            identity_fields.len(),
+            2,
+            &[
+                Some(DataType::Utf8),
+                Some(DataType::Int64),
+                Some(DataType::Int32),
+                None,
+            ],
+            work,
+        )?,
+        (
+            IcebergWriteBranch::DeletionVector,
+            ConnectorWriteInputShape::DeletionVector {
+                identity_fields, ..
+            },
+        ) if value.position_group().is_some() => validate_position_layout(
+            draft.input(),
+            identity_fields.len(),
+            3,
+            &[
+                Some(DataType::Utf8),
+                Some(DataType::Int32),
+                None,
+                Some(DataType::Int64),
+                Some(DataType::Int32),
+                Some(DataType::Int32),
+                Some(DataType::Int64),
+                Some(DataType::Int64),
+                Some(DataType::Binary),
+            ],
+            work,
+        )?,
+        (IcebergWriteBranch::DeletionVector, ConnectorWriteInputShape::DeletionVector { .. })
+            if value.position_rewrite().is_some() =>
+        {
+            // Standalone maintenance still consumes its original positional
+            // relation. The runtime checks each row against the frozen target.
             let mut fields = draft.input().fields_iter();
             let file_matches = fields
                 .next()
@@ -173,6 +210,38 @@ fn compile(
     let compiled = draft.clone();
     work.step()?;
     Ok(compiled)
+}
+
+fn validate_position_layout(
+    input: &ConnectorWriteInputShape,
+    identity_count: usize,
+    expected_identity_count: usize,
+    types: &[Option<DataType>],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), Failure> {
+    let invalid_layout = || {
+        invalid(
+            "input",
+            "Iceberg fixed position writer input has the wrong layout",
+        )
+    };
+    if identity_count != expected_identity_count || input.field_count() != types.len() {
+        return Err(invalid_layout());
+    }
+    for (binding, expected) in input.fields_iter().zip(types) {
+        work.step()?;
+        let field = binding.field();
+        // The mutation source author signs the exact historical Struct and
+        // the loaded endpoint checks it again against the actual file spec.
+        let matches = match expected {
+            Some(data_type) => !field.is_nullable() && field.data_type() == data_type,
+            None => field.is_nullable() && matches!(field.data_type(), DataType::Struct(_)),
+        };
+        if !matches {
+            return Err(invalid_layout());
+        }
+    }
+    Ok(())
 }
 
 fn input_schema(

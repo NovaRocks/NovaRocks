@@ -713,6 +713,7 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
             let mut writer = execution
                 .open_writer(ConnectorOpenWriterRequest {
+                    resources: None,
                     handle: adapter().wrap_writer_handle("held".to_owned()),
                     target: WriteTargetOrdinal::try_new(0).unwrap(),
                     expected_schema: schema.clone(),

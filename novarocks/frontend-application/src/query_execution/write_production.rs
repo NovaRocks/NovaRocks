@@ -26,9 +26,11 @@ use novarocks_workload_control::joint_admission::{
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::num::{NonZeroU64, NonZeroUsize};
 
-// Original identities only: plan16, query16, attempt8, stage4, task4,
-// backend16, fragment4, writer-node4, target4. No object names or secrets.
-const COHORT_BYTES: usize = 76;
+// Creation membership prefix: query16, attempt8, task key16, target4,
+// writer ordinal4. Original plan, stage, task, backend, fragment and node
+// follow. No object names or credentials.
+const CREATION_PREFIX_BYTES: usize = 48;
+const COHORT_BYTES: usize = 96;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WriteProductionQuote {
     quote: UnreceivedProductionQuote,
@@ -197,6 +199,22 @@ impl ConnectorWriteSession {
             }
         }
     }
+    pub(super) fn received_creation_proof(
+        &self,
+    ) -> Result<
+        Option<Arc<dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof>>,
+        ConnectorError,
+    > {
+        let production = self
+            .productions
+            .lock()
+            .map_err(|_| production_error("write production state is poisoned"))?;
+        Ok(production.owner.clone().map(|owner| {
+            Arc::new(ReceivedCreationProof(owner))
+                as Arc<dyn novarocks_spi::connector::write_stack::ConnectorWriteProductionProof>
+        }))
+    }
+
     pub(super) fn production_never_registered(&self) -> Result<bool, ConnectorError> {
         let state = self
             .productions
@@ -271,6 +289,28 @@ impl ConnectorWriteSession {
             .transpose()
     }
 }
+struct ReceivedCreationProof(UnreceivedProductionOwner);
+
+impl novarocks_spi::connector::write_stack::ConnectorWriteProductionProof
+    for ReceivedCreationProof
+{
+    fn admits(
+        &self,
+        target: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+        physical: &novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext,
+    ) -> Result<bool, ConnectorError> {
+        let mut prefix = [0u8; CREATION_PREFIX_BYTES];
+        prefix[..16].copy_from_slice(&physical.execution_query_id());
+        prefix[16..24].copy_from_slice(&physical.execution_attempt_id().to_be_bytes());
+        prefix[24..40].copy_from_slice(&physical.task_key());
+        prefix[40..44].copy_from_slice(&target.get().to_be_bytes());
+        prefix[44..48].copy_from_slice(&physical.writer_ordinal().to_be_bytes());
+        self.0
+            .received_facts_have_prefix(NonZeroUsize::new(COHORT_BYTES).unwrap(), &prefix)
+            .map_err(production_work_error)
+    }
+}
+
 fn encode_cohorts(
     manifest: &TaskManifestBinding,
     quote: WriteProductionQuote,
@@ -295,16 +335,20 @@ fn encode_occurrences(
         let PlanSeal::Version(plan) = cohort.plan();
         let task = cohort.task();
         let execution = task.query_execution_id();
+        put(&execution.query_id().high().to_be_bytes());
+        put(&execution.query_id().low().to_be_bytes());
+        put(&execution.attempt_id().get().to_be_bytes());
+        put(&cohort.task_key().high().to_be_bytes());
+        put(&cohort.task_key().low().to_be_bytes());
+        put(&cohort.writer().target().get().to_be_bytes());
+        // A checked compiled Task has one root TableWriter.
+        put(&0u32.to_be_bytes());
         put(plan.as_bytes());
-        put(&execution.query_id().high().to_le_bytes());
-        put(&execution.query_id().low().to_le_bytes());
-        put(&execution.attempt_id().get().to_le_bytes());
         put(&task.stage_id().get().to_le_bytes());
         put(&task.task_id().get().to_le_bytes());
         put(&task.backend_process_id().to_bytes());
         put(&cohort.fragment().to_le_bytes());
         put(&cohort.writer().node().get().to_le_bytes());
-        put(&cohort.writer().target().get().to_le_bytes());
         if cursor != COHORT_BYTES || offset + COHORT_BYTES > bytes.len() {
             return Err(production_error("frozen writer occurrence layout changed"));
         }

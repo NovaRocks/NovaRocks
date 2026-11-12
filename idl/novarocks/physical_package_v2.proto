@@ -628,6 +628,7 @@ message PhysicalNode {
     WriterTarget table_writer = 25;
     WriterFinish table_finish = 26;
     SystemRelationNode system_relation = 27;
+    PositionShardNode position_shard = 28;
   }
 }
 message OutputPort {
@@ -915,6 +916,30 @@ enum RowMutationEffect {
   ROW_MUTATION_EFFECT_REPLACE = 2;
   ROW_MUTATION_EFFECT_INSERT = 3;
 }
+message PositionShardNode {
+  bytes contribution_group_id = 1;
+  repeated PositionShardInput inputs = 2;
+  PositionShardOutput output = 3;
+  uint32 write_target_ordinal = 4;
+}
+message PositionShardInput {
+  bytes route_id = 1;
+  optional uint32 file_value_id = 2;
+  optional uint32 position_value_id = 3;
+  optional uint32 spec_id_value_id = 4;
+  optional uint32 partition_value_id = 5;
+}
+message PositionShardOutput {
+  optional uint32 file_value_id = 1;
+  optional uint32 spec_id_value_id = 2;
+  optional uint32 partition_value_id = 3;
+  optional uint32 driver_ordinal_value_id = 4;
+  optional uint32 high32_value_id = 5;
+  optional uint32 container_key_value_id = 6;
+  optional uint32 index_value_id = 7;
+  optional uint32 count_value_id = 8;
+  optional uint32 bitmap_value_id = 9;
+}
 message ExchangeSourceNode {
   optional uint32 edge_id = 1;
   repeated ValueMapping imports = 2;
@@ -1135,6 +1160,14 @@ message ChangeStreamWriterCut {
   uint32 write_target_ordinal = 2;
   repeated ChangeStreamWriterCutField fields = 3;
 }
+message PositionContributionCut {
+  bytes contribution_group_id = 1;
+  ChangeStreamWriterCut route = 2;
+}
+message PositionShardWriterCut {
+  bytes contribution_group_id = 1;
+  uint32 write_target_ordinal = 2;
+}
 message WriterResultCutField {
   optional uint32 source_value_id = 1;
   optional uint32 destination_value_id = 2;
@@ -1161,6 +1194,8 @@ message InboundFragmentCut {
     WriterResultCut writer_result = 8;
     novarocks.physical_control_v2.Empty relational = 10;
     SummaryCut summary = 14;
+    PositionContributionCut position_contribution = 15;
+    PositionShardWriterCut position_shards = 16;
   }
   DeliveryRequirement delivery = 12;
   FragmentOutputPort source_port = 13;
@@ -1179,6 +1214,8 @@ message OutboundFragmentCut {
     WriterResultCut writer_result = 8;
     novarocks.physical_control_v2.Empty relational = 11;
     SummaryCut summary = 14;
+    PositionContributionCut position_contribution = 15;
+    PositionShardWriterCut position_shards = 16;
   }
   FragmentOutputPort source_port = 10;
   DeliveryRequirement delivery = 13;

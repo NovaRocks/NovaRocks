@@ -250,6 +250,12 @@ impl ProviderReadMetadata for LateProvider {
                 K::Delta { window } => self
                     .get_change_window_plan(session, name, *window)
                     .map(|v| v.map(|v| (v, None))),
+                K::RowMutationMatch { .. } | K::FrozenMvTarget { .. } => {
+                    Err(novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                        "fixture has no original write-target observation",
+                    ))
+                }
                 K::MvTarget {
                     object_id,
                     snapshot_id,
@@ -1279,6 +1285,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
                 &mv_relation(snapshot),
                 &AdmittedRead::MvTarget {
                     materialization: frozen,
+                    original_source: None,
                     object_id: object.clone(),
                 }
             ),
@@ -1321,6 +1328,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
             &partition_relation,
             &AdmittedRead::MvTarget {
                 materialization: partitioned.clone(),
+                original_source: None,
                 object_id: object.clone(),
             }
         ),
@@ -1374,6 +1382,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
             &partition_relation,
             &AdmittedRead::MvTarget {
                 materialization: partitioned,
+                original_source: None,
                 object_id: object
             },
             "db.orders",

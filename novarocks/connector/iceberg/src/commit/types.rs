@@ -26,7 +26,7 @@ pub enum CommitOpKind {
     FastAppend,
     Overwrite,
     RowDelta,
-    RowDeltaDvFromFiles,
+    MaterializedRowDelta,
     SelectedRewrite,
     CowUpdate,
     Truncate,

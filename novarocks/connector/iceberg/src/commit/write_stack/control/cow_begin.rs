@@ -195,8 +195,7 @@ impl IcebergWriteSessionControl {
                 input,
                 data_output: output,
                 data_recipe: recipe,
-                merge_targets: Vec::new(),
-                equality: None,
+                        equality: None,
             };
             let snapshot_id = snapshot_id.ok_or_else(|| {
                 invalid("Iceberg copy-on-write mutation requires a frozen base snapshot")

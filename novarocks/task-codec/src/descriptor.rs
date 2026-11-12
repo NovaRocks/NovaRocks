@@ -267,15 +267,42 @@ fn decode_inbound(
         )?;
         sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
     }
-    ExchangeInbound::try_new(node, sources, delivery).map_err(|error| match error {
+    let inbound = ExchangeInbound::try_new(node, sources, delivery).map_err(|error| match error {
         novarocks_execution_contract::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
             _,
-        ) => duplicate(path, error.to_string()),
+        ) => duplicate(path.clone(), error.to_string()),
         novarocks_execution_contract::task_execution::descriptor::DescriptorError::InvalidInboundSenderOrdinals {
             ..
-        } => inconsistent(path, error.to_string()),
-        _ => inconsistent(path, error.to_string()),
-    })
+        } => inconsistent(path.clone(), error.to_string()),
+        _ => inconsistent(path.clone(), error.to_string()),
+    })?;
+    let Some(roster) = &src.position_shard_source_dops else {
+        return Ok(inbound);
+    };
+    let roster_path = path.field("position_shard_source_dops");
+    let dops_path = roster_path.clone().field("sender_dops");
+    if roster.sender_dops.len() != inbound.sources().len() {
+        return Err(inconsistent(
+            dops_path,
+            "position-shard roster must cover the exact frozen sender set",
+        ));
+    }
+    let dops = roster
+        .sender_dops
+        .iter()
+        .enumerate()
+        .map(|(ordinal, &dop)| {
+            NonZeroU32::new(dop).ok_or_else(|| {
+                out_of_range(
+                    dops_path.clone().index(ordinal),
+                    "position-shard sender DOP must be positive",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    inbound
+        .try_with_position_shard_source_dops(dops)
+        .map_err(|error| inconsistent(roster_path, error.to_string()))
 }
 
 fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
@@ -298,6 +325,11 @@ fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
                 sender_ordinal: source.sender_ordinal(),
             })
             .collect(),
+        position_shard_source_dops: value.position_shard_source_dops().map(|dops| {
+            novarocks::TaskPositionShardSourceDops {
+                sender_dops: dops.iter().map(|dop| dop.get()).collect(),
+            }
+        }),
     }
 }
 
@@ -424,6 +456,7 @@ mod inbound_delivery_tests {
             destination_node_id: 1,
             sources: Vec::new(),
             delivery,
+            position_shard_source_dops: None,
         };
         for delivery in [0, -1, 99] {
             let error = decode_inbound(&inbound(delivery), FieldPath::root("inbound")).unwrap_err();
