@@ -887,6 +887,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_abort_local_dispatch_refusal_keeps_its_cause_and_remote_residual() {
+        exercise_registered_abort_route(RegisteredAbortCase::LocalDispatchRefusal).await;
+    }
+
+    #[tokio::test]
     async fn late_abort_failure_closes_the_original_issue_before_control_rearms() {
         exercise_registered_abort_route(RegisteredAbortCase::LateOwnerFailed).await;
     }
@@ -897,6 +902,7 @@ mod tests {
         OwnerFailed,
         InvalidReceipts,
         WorkerOwnerFailed,
+        LocalDispatchRefusal,
         LateOwnerFailed,
     }
 
@@ -934,7 +940,7 @@ mod tests {
                     AttemptAbortIngress,
                 },
                 host::{
-                    adapter::tests::{original_abort_owner_failure, start},
+                    adapter::tests::{OriginalAbortRefusal, original_abort_refusal, start},
                     custody::tests::WithdrawalInbox,
                     transport::SendKey,
                 },
@@ -957,10 +963,15 @@ mod tests {
         };
         use std::num::NonZeroU64;
 
-        let frozen = (case == RegisteredAbortCase::WorkerOwnerFailed).then(start);
+        let refusal = match case {
+            RegisteredAbortCase::WorkerOwnerFailed => Some(OriginalAbortRefusal::WorkerOwnerFailed),
+            RegisteredAbortCase::LocalDispatchRefusal => Some(OriginalAbortRefusal::LocalDispatch),
+            _ => None,
+        };
+        let frozen = refusal.map(|refusal| (start(), refusal));
         let exact = frozen.as_ref().map_or_else(
             || participation(BackendProcessId::new_v7()),
-            |frozen| *frozen.plan.establish_material.keys().next().unwrap(),
+            |(frozen, _)| *frozen.plan.establish_material.keys().next().unwrap(),
         );
         let execution = exact.query_execution_id();
         let router = LogicalAbortRouter::new();
@@ -1238,12 +1249,23 @@ mod tests {
             return;
         }
 
-        if let Some(frozen) = frozen {
+        if let Some((frozen, refusal)) = frozen {
             let (input, AttemptInput::Port(original)) = inbox.try_commit_owner_control().unwrap()
             else {
                 panic!("original Abort Control input");
             };
-            let failure = original_abort_owner_failure(frozen, &inbox, &scope, input, original);
+            let before = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
+            let failure =
+                original_abort_refusal(frozen, &inbox, &scope, input, original, refusal).await;
+            assert_eq!(
+                logical
+                    .stand_down_snapshot(exact)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .closure(),
+                before.closure()
+            );
             let snapshot = logical.stand_down_snapshot(exact).await.unwrap().unwrap();
             assert_eq!(snapshot.identity(), Some(identity));
             assert_eq!(

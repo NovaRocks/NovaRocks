@@ -149,29 +149,46 @@ pub(in crate::task_execution) fn start() -> AttemptStart {
     }
 }
 
-pub(in crate::task_execution) fn original_abort_owner_failure(
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::task_execution) enum OriginalAbortRefusal {
+    WorkerOwnerFailed,
+    LocalDispatch,
+}
+
+pub(in crate::task_execution) async fn original_abort_refusal(
     mut start: AttemptStart,
     inbox: &crate::task_execution::host::custody::tests::WithdrawalInbox,
     scope: &novarocks_control_runtime::transaction::ScopeHandle,
     input: InputId,
     original: novarocks_coordination_contract::LogicalToAttempt<AttemptFailure>,
+    refusal: OriginalAbortRefusal,
 ) -> novarocks_coordination_contract::AttemptToLogical<AttemptFailure> {
-    use crate::task_execution::{
-        host::transport::{NativeReceiptError, SendKey},
-        intent::AckPayload,
+    use crate::{
+        native::apply_send_owner::canonical_dispatch_rejection_fixture,
+        task_execution::{
+            bridge::terminal::{TerminalOutbox, TerminalPublication},
+            error::TaskExecutionError as FrontendTaskError,
+            host::{
+                publication::OriginalHostFailure,
+                transport::{NativeReceiptError, SendKey},
+            },
+            intent::{AckPayload, attempt_receipt::failure_site},
+        },
     };
     use novarocks_attempt_protocol::{
         capacity::{QueueStage, ReservationToken, StepContext},
         config::DispatchLane,
         effect::{AttemptEffect, EffectClass},
         error::TaskExecutionError,
-        failure::AttemptFailure,
+        failure::{AttemptFailure, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{AttemptSourceCut, QueuedInputGrantRef},
     };
     use novarocks_coordination_contract::{
         AbortIssueSettlement, AttemptToLogicalBody, LogicalToAttemptBody,
     };
     use novarocks_execution_contract::{OperationOutcome, TaskOperationId, status::SafeDetail};
+    use novarocks_query_application::api::NativeAttemptTerminal;
+    use novarocks_workload_control::WorkError;
     use std::task::Poll;
 
     struct ExactAbortQueueStage;
@@ -327,8 +344,9 @@ pub(in crate::task_execution) fn original_abort_owner_failure(
         .unwrap();
     work.start().unwrap();
     let mut receipt = inbox.reserve_native_receipt(&work, key, OperationKind::AbortParticipation);
-    let owner_failed = |operation, kind| {
-        OperationAcknowledgement::worker_receipt(
+    let dispatch_cause = WorkError::Capacity("Native dispatch proof work");
+    let original_report = |operation, kind| match refusal {
+        OriginalAbortRefusal::WorkerOwnerFailed => OperationAcknowledgement::worker_receipt(
             operation,
             kind,
             OperationOutcome::OwnerFailed,
@@ -336,25 +354,36 @@ pub(in crate::task_execution) fn original_abort_owner_failure(
         )
         .with_detail(Some(SafeDetail::truncating(
             "the original Abort owner failed",
-        )))
+        ))),
+        OriginalAbortRefusal::LocalDispatch => {
+            canonical_dispatch_rejection_fixture(operation, kind, dispatch_cause.clone())
+        }
     };
+    let local_refusal =
+        (refusal == OriginalAbortRefusal::LocalDispatch).then_some(HostFailureRef(positive(81)));
     for refused in [
-        owner_failed(TaskOperationId::new_v7(), OperationKind::AbortParticipation),
-        owner_failed(operation, OperationKind::CancelTask),
+        original_report(TaskOperationId::new_v7(), OperationKind::AbortParticipation),
+        original_report(operation, OperationKind::CancelTask),
     ] {
         let (reason, returned) = receipt
-            .record(key, refused.clone(), None, None)
+            .record(key, refused.clone(), None, local_refusal)
             .unwrap_err();
         assert!(matches!(reason, NativeReceiptError::WrongSend));
         assert_eq!(returned, refused);
+        if local_refusal.is_some() {
+            assert!(returned.shares_original_canonical_with(&refused));
+            assert_eq!(returned.governance_failure(), Some(&dispatch_cause));
+        }
         assert!(matches!(
             receipt.submit(),
             Err(ActorTurnError::InputNotReserved)
         ));
         assert_eq!(runtime.input_custody(actor, input).unwrap(), Some(control));
     }
-    let canonical = owner_failed(operation, OperationKind::AbortParticipation);
-    receipt.record(key, canonical.clone(), None, None).unwrap();
+    let canonical = original_report(operation, OperationKind::AbortParticipation);
+    receipt
+        .record(key, canonical.clone(), None, local_refusal)
+        .unwrap();
     let report_input = receipt.submit().unwrap();
     let fact = inbox.commit(report_input);
     let failed = step(
@@ -369,7 +398,7 @@ pub(in crate::task_execution) fn original_abort_owner_failure(
         ..
     }) = failed.abort_settlement
     else {
-        panic!("the original Worker verdict must close the QA Abort issue");
+        panic!("the original refusal must fail the QA Abort issue closed");
     };
     assert_eq!(port.activation, activation);
     assert!(matches!(port.body, AttemptToLogicalBody::AbortSettlement {
@@ -378,18 +407,54 @@ pub(in crate::task_execution) fn original_abort_owner_failure(
     } if abort_action == action && actual_generation == admission
         && participation == exact && operation_id == operation));
     let round = step(sources.actor, AttemptInput::Timer, false, None);
+    let original_failure = canonical
+        .governance_failure()
+        .cloned()
+        .map(FrontendTaskError::Workload);
+    let expected = if let Some(reference) = local_refusal {
+        let typed = original_failure.as_ref().unwrap().preparation_input();
+        TaskExecutionError::Workload(HostProjectedFailure {
+            original: reference,
+            kind: HostFailureKind::Workload,
+            class: typed.attempt_class(),
+            site: failure_site(typed.site()),
+        })
+    } else {
+        TaskExecutionError::OperationFailed {
+            task: None,
+            participation: exact,
+            operation_id: operation,
+            kind: OperationKind::AbortParticipation,
+            rejection: canonical.worker_header().unwrap(),
+        }
+    };
     assert_eq!(
         round.round_result,
-        Some(Err(AttemptFailure::TaskProtocol(Box::new(
-            TaskExecutionError::OperationFailed {
-                task: None,
-                participation: exact,
-                operation_id: operation,
-                kind: OperationKind::AbortParticipation,
-                rejection: canonical.worker_header().unwrap(),
-            },
-        ))))
+        Some(Err(AttemptFailure::TaskProtocol(Box::new(expected))))
     );
+    if let Some((reference, original)) = local_refusal.zip(original_failure) {
+        assert_eq!(canonical.governance_failure(), Some(&dispatch_cause));
+        let expected = original.preparation_input();
+        let terminal = round
+            .effect
+            .or_else(|| step(sources.actor, AttemptInput::Timer, false, None).effect);
+        let Some(AttemptEffect {
+            body: EffectBody::Port(terminal),
+            ..
+        }) = terminal
+        else {
+            panic!("the Core must publish the original local dispatch failure");
+        };
+        let outbox = TerminalOutbox::new(activation);
+        let mut publication = TerminalPublication::new(terminal);
+        assert_eq!(publication.host_reference(), Some(reference));
+        publication.attach_host_failure(reference, OriginalHostFailure::Task(original));
+        assert!(outbox.publish(Box::new(publication)).is_ok());
+        let NativeAttemptTerminal::Failed(failure) = outbox.terminal().await.unwrap() else {
+            panic!("the local refusal cannot complete the attempt");
+        };
+        assert_eq!(failure.input(), &expected);
+    }
     runtime.retire_input(actor, report_input).unwrap();
     work.body_exited().unwrap();
     work.captures_exited().unwrap();
@@ -397,6 +462,13 @@ pub(in crate::task_execution) fn original_abort_owner_failure(
         panic!("the original Native report and producer have exited");
     };
     assert_eq!(retained.original, canonical);
+    if local_refusal.is_some() {
+        assert!(retained.original.shares_original_canonical_with(&canonical));
+        assert_eq!(
+            retained.original.governance_failure(),
+            Some(&dispatch_cause)
+        );
+    }
     assert!(retained.unpublished.is_none());
     payer.finish().unwrap();
     port
