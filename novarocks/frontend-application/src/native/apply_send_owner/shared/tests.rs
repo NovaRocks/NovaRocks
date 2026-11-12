@@ -1713,10 +1713,16 @@ async fn actor_replays_same_native_request_with_a_fresh_wc_input_after_original_
     run_actor_send(ActorSendMode::Replay, None).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn actor_withdraws_a_fresh_replay_after_host_handoff_and_before_send_start() {
+    run_actor_send(ActorSendMode::WithdrawReplay, None).await;
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ActorSendMode {
     Send,
     Replay,
+    WithdrawReplay,
     Withdraw,
     Release,
 }
@@ -1774,11 +1780,12 @@ async fn run_actor_send(
     };
     use novarocks_types::FrontendProcessId;
 
-    let replay = mode == ActorSendMode::Replay;
+    let withdraw_replay = mode == ActorSendMode::WithdrawReplay;
+    let replay = mode == ActorSendMode::Replay || withdraw_replay;
     let history = replay.then(|| novarocks_control_runtime::history::HistoryCapture::new(4096));
     let roles = Roles::with_history(history.clone());
     let fail_core = failure_verdict.is_some();
-    let sends = matches!(mode, ActorSendMode::Send | ActorSendMode::Replay);
+    let sends = mode == ActorSendMode::Send || replay;
     let withdraw = mode == ActorSendMode::Withdraw;
     let release = mode == ActorSendMode::Release;
     let mut peer = if sends {
@@ -1810,7 +1817,9 @@ async fn run_actor_send(
         if replay {
             peer.expect_transport_unknown();
         }
-        peer.accept_abort(participation);
+        if !withdraw_replay {
+            peer.accept_abort(participation);
+        }
         match failure_verdict {
             Some(OperationOutcome::Accepted) => peer.accept_abort(participation),
             Some(OperationOutcome::OwnerFailed) => peer.fail_abort_owner(),
@@ -1895,11 +1904,24 @@ async fn run_actor_send(
     let replay_send_id = AttemptActionId::new(NonZeroU64::new(4).unwrap());
     let replay_commands = replay.then(|| {
         let (send, guard) = make_send(replay_send_id, replay_reference);
-        let work = guard
-            .as_ref()
-            .expect("replay's original queue guard")
-            .work_id();
-        ([(make_admit(replay_reference), None), (send, guard)], work)
+        let original = guard.as_ref().expect("replay's original queue guard");
+        let custody = (original.work_id(), original.reservation_id());
+        (
+            [(make_admit(replay_reference), None), (send, guard)],
+            custody,
+        )
+    });
+    let withdraw_effect = withdraw_replay.then(|| {
+        (
+            AttemptEffectEnvelope::new(AttemptEffect {
+                id: AttemptActionId::new(NonZeroU64::new(5).unwrap()),
+                class: EffectClass::Cleanup,
+                body: EffectBody::Withdraw {
+                    effect: replay_send_id,
+                },
+            }),
+            None,
+        )
     });
     struct ScopeOwner {
         scope: ScopeHandle,
@@ -2090,18 +2112,21 @@ async fn run_actor_send(
     let failure_payer = failure_capacity.id();
     let failure_work =
         ReportedWork::try_new(failure_work, failure_capacity, failure_report).unwrap();
-    let replay_work = replay_commands.as_ref().map(|(_, work)| *work);
+    let replay_custody = replay_commands.as_ref().map(|(_, custody)| *custody);
     let mut mailbox = [8; 4];
     if replay {
-        mailbox[InputClass::Lifecycle.index()] += 2;
+        mailbox[InputClass::Lifecycle.index()] += 2 + usize::from(withdraw_replay);
     }
     let inbox = custody::tests::WithdrawalInbox::with_failure_work(
         &roles.scope,
-        [(admit, None), (send.clone(), queue)].into_iter().chain(
-            replay_commands
-                .into_iter()
-                .flat_map(|(commands, _)| commands),
-        ),
+        [(admit, None), (send.clone(), queue)]
+            .into_iter()
+            .chain(
+                replay_commands
+                    .into_iter()
+                    .flat_map(|(commands, _)| commands),
+            )
+            .chain(withdraw_effect),
         mailbox,
         Some(failure_work.work()),
     );
@@ -2113,6 +2138,7 @@ async fn run_actor_send(
             inbox.reserve_command(&parent),
         ]
     });
+    let withdraw_command = withdraw_replay.then(|| inbox.reserve_command(&parent));
     let admission = transport::AdmissionSource::new(
         &parent,
         &payer,
@@ -2353,7 +2379,11 @@ async fn run_actor_send(
         .await
         .unwrap()
     };
-    let observe_send = async |wc: &mut Governed, effect_id, send_generation, expect_unknown| {
+    let observe_send = async |wc: &mut Governed,
+                              effect_id,
+                              send_generation,
+                              expect_unknown,
+                              expect_withdrawn| {
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut started = false;
             loop {
@@ -2361,16 +2391,16 @@ async fn run_actor_send(
                 advance_host();
                 if let Some((_, fact)) = inbox.try_commit_next() {
                     match fact {
-                        ExecutorFact::Withdrawn { effect, outcome: WithdrawalOutcome::DefinitelyUnsent } if withdraw => {
+                        ExecutorFact::Withdrawn { effect, outcome: WithdrawalOutcome::DefinitelyUnsent } if expect_withdrawn => {
                             assert_eq!(effect, effect_id);
                             return;
                         }
-                        ExecutorFact::SendStarted { effect, .. } if sends => {
+                        ExecutorFact::SendStarted { effect, .. } if !expect_withdrawn => {
                             assert_eq!(effect, effect_id);
                             assert!(!started);
                             started = true;
                         }
-                        ExecutorFact::Operation(observed) if sends => {
+                        ExecutorFact::Operation(observed) if !expect_withdrawn => {
                             assert!(started);
                             assert_eq!(observed.generation, send_generation);
                             assert_eq!(observed.reply.operation_id(), key.operation);
@@ -2388,7 +2418,7 @@ async fn run_actor_send(
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        if sends {
+        if !expect_withdrawn {
             tokio::time::timeout(Duration::from_secs(3), async {
                 while receipt.lock().unwrap().is_none() {
                     drive(&mut wc.driver);
@@ -2422,7 +2452,7 @@ async fn run_actor_send(
                 .0,
             reservation.unwrap()
         );
-        observe_send(&mut wc, send_id, key.generation, replay).await;
+        observe_send(&mut wc, send_id, key.generation, replay, withdraw).await;
     }
     assert_eq!(starts.was_started(participation), sends);
     drop(starts);
@@ -2491,14 +2521,62 @@ async fn run_actor_send(
         assert_ne!(actual.record(), first_grant.record());
         assert_ne!(actual.generation(), first_grant.generation());
         let send = submit(send_command);
-        observe_send(&mut wc, replay_send_id, replay_generation, false).await;
-        actor_runtime.retire_input(actor, send).unwrap();
+        let (replay_work, replay_reservation) = replay_custody.unwrap();
+        if let Some(withdraw_command) = withdraw_command {
+            use novarocks_control_runtime::actor_turn::ActorTurnError;
+
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    drive(&mut wc.driver);
+                    advance_host();
+                    match actor_runtime.retire_input(actor, send) {
+                        Ok(()) => break,
+                        Err(ActorTurnError::EffectsRemain) => tokio::task::yield_now().await,
+                        Err(error) => panic!("original replay command: {error:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+            // The test script supplies the committed withdrawal. On this
+            // current-thread runtime the accepted Tokio job cannot poll
+            // between the successful handoff above and this Host turn.
+            let command = submit(withdraw_command);
+            advance_host();
+            actor_runtime.retire_input(actor, command).unwrap();
+        }
+        observe_send(
+            &mut wc,
+            replay_send_id,
+            replay_generation,
+            false,
+            withdraw_replay,
+        )
+        .await;
+        if withdraw_replay {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while roles.scope.work_lifecycle(replay_work).unwrap().is_some() {
+                    drive(&mut wc.driver);
+                    advance_host();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(receipt.lock().unwrap().is_none());
+            assert!(inbox.try_commit_next().is_none());
+        } else {
+            actor_runtime.retire_input(actor, send).unwrap();
+        }
         let requests = peer.as_ref().unwrap().applied_requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0], requests[1],
-            "exact original request crosses both sends"
-        );
+        assert_eq!(requests.len(), if withdraw_replay { 1 } else { 2 });
+        if !withdraw_replay {
+            assert_eq!(
+                requests[0], requests[1],
+                "exact original request crosses both sends"
+            );
+        }
         let remaining = history.drain(4096);
         assert!(
             remaining.complete && remaining.remaining == 0,
@@ -2518,13 +2596,42 @@ async fn run_actor_send(
             |fact, original| matches!(fact, HistoryFact::WorkRetired { work, .. } if *work == original),
             first_send_work.unwrap(),
         );
-        let replay_started = recorded(
-            |fact, original| matches!(fact, HistoryFact::Started { work, .. } if *work == original),
-            replay_work.unwrap(),
-        );
         // A single paid send result is reused only after the installed
         // Source has retired the first send, including its WC input.
-        assert!(split_at < first_retired && first_retired < replay_started);
+        assert!(split_at < first_retired);
+        if withdraw_replay {
+            let (partition, replay_split_at) = remaining
+                .entries
+                .iter()
+                .find_map(|entry| match entry.fact {
+                    HistoryFact::CapacitySplit { from, to } if from == replay_reservation => {
+                        Some((to, entry.ordinal))
+                    }
+                    _ => None,
+                })
+                .expect("the replay bound its own physical queue partition");
+            let partition_retired = remaining
+                .entries
+                .iter()
+                .find(|entry| matches!(entry.fact, HistoryFact::ReservationRetired { reservation } if reservation == partition))
+                .expect("the replay's actual queue partition retired")
+                .ordinal;
+            let replay_retired = recorded(
+                |fact, original| matches!(fact, HistoryFact::WorkRetired { work, .. } if *work == original),
+                replay_work,
+            );
+            assert!(first_retired < replay_split_at);
+            assert!(replay_split_at < partition_retired && partition_retired < replay_retired);
+            assert!(!remaining.entries.iter().any(|entry| {
+                matches!(entry.fact, HistoryFact::Started { work, .. } if work == replay_work)
+            }));
+        } else {
+            let replay_started = recorded(
+                |fact, original| matches!(fact, HistoryFact::Started { work, .. } if *work == original),
+                replay_work,
+            );
+            assert!(first_retired < replay_started);
+        }
     }
     assert_transport_usage([0, 0]);
     if fail_core {
@@ -2558,7 +2665,7 @@ async fn run_actor_send(
     actor_runtime.close_timer_source(actor).unwrap();
     host.close_registration();
     advance_host();
-    if sends {
+    if sends && !withdraw_replay {
         assert!(
             !host.is_empty(),
             "the original Native row still has a reply alias"
@@ -2677,6 +2784,14 @@ async fn run_actor_send(
         assert!(!cleanup.lock().unwrap().transferred);
     }
     assert!(host.is_empty() && actor_runtime.is_empty() && roles.ledger.is_empty());
+    if withdraw_replay {
+        let waits = roles
+            .ledger
+            .try_capacity_waiter_snapshot()
+            .unwrap()
+            .unwrap();
+        assert_eq!((waits.logical_waiters, waits.domain_registrations), (0, 0));
+    }
     let deadline = Instant::now() + Duration::from_secs(3);
     runtime.drain_original_apply_until(deadline).await.unwrap();
     runtime
