@@ -59,6 +59,10 @@ struct Flight {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "candidate authorization moves its original QA request directly into the actor output"
+)]
 pub(crate) enum AuthorizationStep {
     Request(AttemptEffect),
     Ready,
@@ -67,6 +71,10 @@ pub(crate) enum AuthorizationStep {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the current ACK observer step moves its QA request directly to the round tail without a heap wrapper"
+)]
 pub(crate) enum ObserverStep {
     Request(AttemptEffect),
     Consumed { retire: Option<TaskOperationId> },

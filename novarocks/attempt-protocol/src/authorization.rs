@@ -54,6 +54,10 @@ pub(crate) enum AdmissionGateDirective {
     Retired,
 }
 #[derive(Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the same synchronous reply moves the typed admission refusal and its original retirement decision together on the stack"
+)]
 pub(crate) enum AdmissionGateReply {
     Stale,
     Authorized,

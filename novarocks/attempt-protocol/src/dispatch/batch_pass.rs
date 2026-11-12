@@ -24,6 +24,10 @@ use crate::effect::{AttemptEffect, AttemptEffectId, EffectBody, EffectClass, Ope
 use crate::error::TaskExecutionError;
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the charged dispatch pass moves the send effect directly to the caller without a per-batch allocation"
+)]
 pub(crate) enum BatchDispatch {
     Ready(AttemptEffect),
     /// The original ledger installed the capacity wake. No immediate retry.

@@ -87,6 +87,10 @@ struct QueueExpiryPass {
     first_error: Option<TaskExecutionError>,
 }
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the expiry pass returns the retained first typed error after draining original grants without boxing the completion"
+)]
 pub(crate) enum QueueExpiryProgress {
     Yield,
     ReleaseQueuedInput {

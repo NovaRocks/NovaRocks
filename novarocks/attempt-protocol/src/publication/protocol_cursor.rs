@@ -43,6 +43,10 @@ pub(crate) enum PublicationProgress {
     Failed,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the same synchronous apply step returns the original typed failure to Core without a heap wrapper"
+)]
 pub(crate) enum PublicationApplyDisposition {
     Stale,
     Applied { published: bool },

@@ -41,6 +41,10 @@ pub(crate) enum Directive {
     Retired,
 }
 #[derive(Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the synchronous QA reply moves a typed Establish rejection directly to the gate without boxing it"
+)]
 pub(crate) enum AuthorizationReply {
     Stale,
     IssueRecorded(AttemptAuthorizationRef),
@@ -64,6 +68,10 @@ pub(crate) enum Step {
     Ready,
 }
 #[derive(Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the original settlement returns the optional first typed failure and exact retirement decision on the stack"
+)]
 pub(crate) enum SettlementReply {
     Stale,
     Progress,

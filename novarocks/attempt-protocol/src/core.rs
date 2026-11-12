@@ -90,6 +90,10 @@ pub struct Core {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a charged ACK step forwards the original QA effect or round failure on the stack"
+)]
 pub(crate) enum AckSettlementProgress {
     Yield,
     Waiting,

@@ -65,6 +65,10 @@ pub(super) struct ClosingGate {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the charged close drive moves each original QA settlement or detach effect directly into the actor output"
+)]
 pub(crate) enum CloseProgress {
     Yield,
     Request(AttemptEffect),

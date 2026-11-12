@@ -69,6 +69,10 @@ impl AcceptedObservation {
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the serial observer moves each accepted frame to execution without cloning or allocating a wrapper"
+)]
 pub enum ObservationDisposition {
     ApplyEntity(AcceptedObservation),
     Ignore,

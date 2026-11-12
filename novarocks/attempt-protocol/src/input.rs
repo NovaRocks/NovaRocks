@@ -474,6 +474,10 @@ pub enum UpdateAdmission {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the prepaid executor fact carries the original typed refusal inline without a second allocation"
+)]
 pub enum DynamicFilterRead {
     Empty,
     Available {
@@ -515,6 +519,10 @@ pub struct FinalTaskInfoProjection {
 /// The core closes its diagnostic snapshot before applying a reply at or after
 /// the original deadline, while the host continues to retain the actual job.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the executor moves the bounded final status inline while the Source retains the original final-info allocation"
+)]
 pub enum DiagnosticRead {
     Available(FinalTaskInfoProjection),
     Unavailable(novarocks_execution_contract::OperationOutcome),

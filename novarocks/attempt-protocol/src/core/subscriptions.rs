@@ -82,6 +82,10 @@ pub(super) struct Subscriptions {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the subscription drive moves each open, close, or read effect directly into the actor output"
+)]
 pub(crate) enum SubscriptionStep {
     Idle,
     Yield,

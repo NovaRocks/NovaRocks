@@ -36,6 +36,10 @@ pub(super) enum StopWithdrawals {
     Closed,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "each charged stop step moves its withdrawal effect directly to the caller without a heap wrapper"
+)]
 pub(super) enum StopProgress {
     Yield,
     Effect(AttemptEffect),

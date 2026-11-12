@@ -34,6 +34,10 @@ pub(super) struct DiagnosticDrive {
     snapshot_settled: bool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one synchronous step moves the diagnostic read or publication effect into the actor output without an extra allocation"
+)]
 pub(super) enum DiagnosticStep {
     Idle,
     Yield,

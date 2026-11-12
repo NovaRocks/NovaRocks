@@ -29,6 +29,10 @@ use crate::{
 use novarocks_execution_contract::{TaskIdentity, TaskOperationId};
 use std::ops::Bound::{Excluded, Unbounded};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a charged edge step moves its queued-input request directly into the actor output"
+)]
 pub(crate) enum EdgeAdmissionProgress {
     Blocked,
     Discarded,
