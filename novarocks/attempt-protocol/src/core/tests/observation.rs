@@ -590,6 +590,12 @@ fn first_terminal_create_reply_and_stream_duplicate_queue_one_diagnostic_read() 
 
 #[test]
 fn fatal_current_subscription_fails_the_attempt_with_its_original_participation() {
+    for root_finished in [false, true] {
+        current_identity_violation_remains_fatal(root_finished);
+    }
+}
+
+fn current_identity_violation_remains_fatal(root_finished: bool) {
     use crate::{
         failure::{AttemptFailureSite, HostFailureKind, HostFailureRef, HostProjectedFailure},
         input::{ObservationFailure, ObservationFailureKind},
@@ -733,6 +739,28 @@ fn fatal_current_subscription_fails_the_attempt_with_its_original_participation(
     );
     assert!(trace.core.terminal.terminal().is_none());
 
+    let finished = root_finished.then(|| {
+        TaskStatus::try_new(
+            root,
+            TaskStatusVersion::new(1).unwrap(),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .unwrap()
+    });
+    if let Some(finished) = &finished {
+        let root_frame = status_frame(&mut trace, finished.clone());
+        assert_eq!(observe(&mut trace, reopen_at, root_frame).0, Ok(()));
+        assert_eq!(trace.status(root), Some(finished));
+        assert_eq!(
+            trace.core.seal_facts().root,
+            crate::root_control::RootCompletion::ExactFinished
+        );
+        assert!(!trace.core.root.sealed());
+        assert!(trace.core.terminal.terminal().is_none());
+    }
+
     let fatal = failure(
         current_open,
         ObservationFailureKind::ProcessMismatch,
@@ -772,6 +800,10 @@ fn fatal_current_subscription_fails_the_attempt_with_its_original_participation(
         &effect.body,
         EffectBody::SendBatch { .. } | EffectBody::ObserveProcess { .. }
     )));
+    if let Some(finished) = &finished {
+        assert_eq!(trace.status(root), Some(finished));
+        assert!(!trace.core.root.sealed());
+    }
     assert_eq!(trace.status(peer), Some(&installed));
     assert!(!trace.core.execution.task_actual_stopped(peer));
     assert!(
