@@ -53,7 +53,6 @@ fn contract_source(
     };
     let table = ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap();
     let base = ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap();
-    let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
     ConnectorMutationMatchContract::try_new(
         owner,
         table,
@@ -61,7 +60,6 @@ fn contract_source(
         vec![source],
         Vec::new(),
         Vec::new(),
-        vec![token],
         ConnectorMutationEffectField::try_new(
             ConnectorWriteFieldToken::from_bytes([2; 32]),
             Field::new("effect", DataType::Int8, false),
@@ -157,9 +155,6 @@ fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [
             },
         )
         .unwrap();
-    }
-    for token in &contract.uniqueness_tokens {
-        h.update(token.to_bytes());
     }
     h.update(contract.effect_field.token.to_bytes());
     h.update(contract.effect_field.target_ordinal.to_be_bytes());
@@ -342,7 +337,6 @@ fn match_bounds_actual_vec_capacity_is_checked_before_layout_allocation() {
         identities,
         Vec::new(),
         Vec::new(),
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap_err();
@@ -362,7 +356,6 @@ fn match_bounds_field_count_refused_before_layout_allocation() {
         identities,
         Vec::new(),
         Vec::new(),
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap_err();
@@ -414,7 +407,6 @@ fn match_bounds_before_after_order_and_effect_keep_formatted_source_and_typed_di
         c.identity_fields,
         before,
         after,
-        c.uniqueness_tokens,
         c.effect_field,
     )
     .unwrap();

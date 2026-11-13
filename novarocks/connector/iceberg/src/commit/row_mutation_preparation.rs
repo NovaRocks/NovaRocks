@@ -120,7 +120,6 @@ pub(crate) fn prepare_row_mutation(
     // fields nullable; Delete/Replace validation still rejects null keys.
     let insert_eligible = request.intent.accepts(ConnectorRowMutationEffect::Insert);
     let mut identity_source_fields = metadata_arrow_fields(&payload.metadata_columns)?;
-    let uniqueness_width = identity_source_fields.len();
     if identity_source_fields.is_empty() {
         return Ok(ConnectorRowMutationPreparationOutcome::Denied(
             ConnectorError::new(
@@ -312,29 +311,6 @@ pub(crate) fn prepare_row_mutation(
                 )
             })?,
     )?;
-    // `_last_updated_sequence_number` is a signed source role, but it is not
-    // part of row uniqueness.  COW rewrites bind the same token separately as
-    // the writer's forward-looking version field. Keeping it in the match
-    // tuple would make one token claim both roles and the SPI correctly
-    // rejects that ambiguous recipe. The file metadata suffix belongs only to
-    // delete materialization and does not change the original match tuple.
-    let uniqueness_tokens = identity_fields
-        .iter()
-        .take(uniqueness_width)
-        .filter(|field| {
-            !field
-                .field()
-                .name()
-                .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
-        })
-        .map(ConnectorMutationSourceField::token)
-        .collect::<Vec<_>>();
-    if uniqueness_tokens.is_empty() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg row-mutation identity has no non-version uniqueness field",
-        ));
-    }
     let contract = ConnectorMutationMatchContract::try_new(
         owner.clone(),
         request.table.clone(),
@@ -342,7 +318,6 @@ pub(crate) fn prepare_row_mutation(
         identity_fields,
         before_fields,
         after_fields,
-        uniqueness_tokens,
         effect_field,
     )?;
     let preparation_payload = Bytes::from(format!(
@@ -777,14 +752,6 @@ mod tests {
             &Field::new("__row_mutation_effect", DataType::Int8, false)
         );
         assert_eq!(contract.effect_field().target_ordinal(), 6);
-        assert_eq!(
-            contract.uniqueness_tokens(),
-            contract
-                .identity_fields()
-                .iter()
-                .map(ConnectorMutationSourceField::token)
-                .collect::<Vec<_>>()
-        );
         // Delete never accepts Insert, so nothing is widened.
         assert!(!contract.identity_fields()[0].field().is_nullable());
         assert!(!contract.before_fields()[0].field().is_nullable());
@@ -871,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn written_version_identity_is_not_a_uniqueness_token() {
+    fn written_version_identity_and_delete_materialization_roles_are_preserved() {
         let owner = owner();
         let table_metadata = metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]);
         let mut spec = PayloadSpec::new(&table_metadata);
@@ -898,13 +865,20 @@ mod tests {
                     .name()
                     .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
             })
-            .expect("written version identity")
-            .token();
-        assert!(!contract.uniqueness_tokens().contains(&written));
-        // MOR appends the file spec/partition roles for delete materialization;
-        // neither changes the original row-uniqueness tuple.
+            .expect("written version identity");
+        assert_eq!(written.source_ordinal(), 3);
+        assert_eq!(written.field().data_type(), &DataType::Int64);
+        // The original scan declaration permits missing lineage in older
+        // files; removing the unused uniqueness tuple must not harden it.
+        assert!(written.field().is_nullable());
+        assert!(
+            written
+                .execution_type()
+                .expect("complete lineage value")
+                .nullable()
+        );
+        // MOR retains both file metadata roles alongside the original identity.
         assert_eq!(contract.identity_fields().len(), 6);
-        assert_eq!(contract.uniqueness_tokens().len(), 3);
     }
 
     #[test]

@@ -1413,6 +1413,68 @@ mod tests {
     }
 
     #[test]
+    fn route_allows_distinct_tokens_to_share_one_producer_ordinal() {
+        let ConnectorWriteInputShape::Data { mut fields } = input_shape() else {
+            panic!("data input fixture");
+        };
+        let first = fields[0].token();
+        let second = ConnectorWriteFieldToken::from_bytes([32; 32]);
+        fields.push(
+            ConnectorWriteFieldBinding::try_new_typed(
+                second,
+                arrow::datatypes::Field::new("alias", DataType::Int64, true),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
+            .expect("complete alias declaration"),
+        );
+        let input = ConnectorWriteInputShape::Data { fields };
+        let requirements = ConnectorWriteRouteRequirements {
+            colocation: ConnectorWriteColocation::ByKey(vec![second]),
+            layout: ConnectorWriteLayoutPreference::ClusterBy(vec![first, second]),
+        };
+        let route = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([34; 32]),
+            vec![ConnectorRowMutationEffect::Delete],
+            vec![
+                ConnectorMutationRouteInput::new(first, 0),
+                ConnectorMutationRouteInput::new(second, 0),
+            ],
+            requirements.clone(),
+        )
+        .expect("distinct route tokens may share one producer occurrence");
+        let adapter = adapter();
+        let target = ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(0).expect("bounded target ordinal"),
+            adapter.wrap_writer_handle(Value),
+            input,
+        )
+        .with_route(route);
+        let session =
+            ConnectorWriteSessionPlan::try_new(adapter.wrap_commit_session(Value), vec![target])
+                .expect("shared producer occurrence remains a valid routed session");
+        let route = session.targets()[0]
+            .route()
+            .expect("routing facts retained");
+        assert_eq!(
+            route
+                .input_ordinals()
+                .iter()
+                .map(|input| input.token())
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            route
+                .input_ordinals()
+                .iter()
+                .map(|input| input.input_ordinal())
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+        assert_eq!(route.requirements(), &requirements);
+    }
+
+    #[test]
     fn statistics_contract_binds_the_exact_target_field() {
         let input = input_shape();
         let contract = WriteStatisticsContract::try_new(

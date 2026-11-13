@@ -117,7 +117,7 @@ pub use control::{
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
 };
-pub use cow_begin::{ConnectorCowBeginCause, ConnectorCowBeginFailure, ConnectorCowBeginPlan};
+pub use cow_begin::ConnectorCowBeginCause;
 pub use credential::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
@@ -305,21 +305,10 @@ pub use resources::{
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
-    ConnectorMutationMatchContract, ConnectorMutationRouteInput,
-    ConnectorMutationSelectionFieldRef, ConnectorMutationSelectionFieldRole,
-    ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorRowConversionBatchFootprint, ConnectorRowConversionFootprint,
-    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
-    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationEffect,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
-    ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
-    ConnectorRowMutationSourceArray, ConnectorRowMutationSourceBatch,
-    ConnectorRowMutationSourceBuffer, ConnectorRowMutationSourceBuilder,
-    ConnectorRowMutationSourceChildren, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
-    MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
-    MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES, MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES,
+    ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
+    ConnectorMutationTargetField, ConnectorRowMutationEffect, ConnectorRowMutationIntent,
+    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorRowMutationStrategy, ConnectorWriteRouteId,
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use semantic_revision::{

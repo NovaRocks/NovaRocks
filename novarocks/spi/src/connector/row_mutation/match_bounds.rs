@@ -28,7 +28,9 @@ const MAX_DEPTH: usize = 64;
 // Engineering traversal bound including every repeated type/field reference
 // and metadata entry. It precedes recursive Arrow Debug formatting.
 const MAX_NODES: usize = 16 * 1024;
-const MAX_DEBUG: usize = MAX_CONNECTOR_ROW_CONVERSION_WORKSPACE_BYTES;
+// Preserve the original shared schema byte ceiling after retiring RowConverter.
+pub(super) const MAX_CANONICAL_SCHEMA_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DEBUG: usize = MAX_CANONICAL_SCHEMA_BYTES;
 
 fn exhausted() -> ConnectorError {
     ConnectorError::new(
@@ -133,7 +135,6 @@ pub(super) fn preflight(
     identity: &Vec<ConnectorMutationSourceField>,
     before: &Vec<ConnectorMutationTargetField>,
     after: &Vec<ConnectorMutationTargetField>,
-    unique: &Vec<ConnectorWriteFieldToken>,
     effect: &ConnectorMutationEffectField,
 ) -> Result<(), ConnectorError> {
     let count = identity
@@ -142,14 +143,13 @@ pub(super) fn preflight(
         .and_then(|n| n.checked_add(after.len()))
         .and_then(|n| n.checked_add(1))
         .ok_or_else(exhausted)?;
-    if count > MAX_FIELDS || unique.len() > MAX_FIELDS {
+    if count > MAX_FIELDS {
         return Err(exhausted());
     }
     let mut bound = Bound::default();
     bound.slots::<ConnectorMutationSourceField>(identity.capacity())?;
     bound.slots::<ConnectorMutationTargetField>(before.capacity())?;
     bound.slots::<ConnectorMutationTargetField>(after.capacity())?;
-    bound.slots::<ConnectorWriteFieldToken>(unique.capacity())?;
     for f in identity {
         bound.field(&f.field, 0)?;
     }

@@ -567,25 +567,15 @@ pub enum ConnectorWritePreparationOutcome {
     Denied(ConnectorError),
 }
 
-/// The signed admission evidence consumed by the exact-generation activation
-/// transition.  The tagged form prevents callers from smuggling a row plan
-/// through the ordinary preparation path.
-// The tagged shape is the contract: see the doc comment above. Boxing a variant
-// to equalize sizes would obscure it for no runtime benefit on a per-admission
-// value.
-#[allow(clippy::large_enum_variant)]
+/// The signed preparation evidence consumed by the exact-generation activation
+/// transition.
 #[derive(Clone)]
 pub enum ConnectorWriteActivationSource {
     Prepared(ConnectorWritePreparation),
-    RowMutation(super::ConnectorRowMutationExecutionPlan),
 }
 
 impl ConnectorWriteActivationSource {
-    fn validate(
-        &self,
-        owner: &ConnectorProviderBindingKey,
-        operation_id: ConnectorWriteOperationId,
-    ) -> Result<[u8; 32], ConnectorError> {
+    fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<[u8; 32], ConnectorError> {
         match self {
             Self::Prepared(preparation) => {
                 preparation.validate()?;
@@ -596,16 +586,6 @@ impl ConnectorWriteActivationSource {
                     ));
                 }
                 Ok(preparation.digest())
-            }
-            Self::RowMutation(plan) => {
-                plan.validate()?;
-                if plan.owner() != owner || plan.operation_id() != operation_id {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "connector row-mutation activation does not match the exact operation owner",
-                    ));
-                }
-                Ok(plan.digest())
             }
         }
     }
@@ -1311,7 +1291,7 @@ impl ConnectorWriteActivationRequest {
         &self,
         owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
-        self.source.validate(owner, self.operation_id)
+        self.source.validate(owner)
     }
 }
 
@@ -1900,18 +1880,6 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
-    /// Activates a sealed direct route set or COW preparation plus bounded
-    /// selection. Implementations must not obtain a new control generation.
-    fn activate_row_mutation(
-        &self,
-        _request: super::ConnectorRowMutationActivationRequest,
-    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "connector write control does not implement row-mutation activation",
-        ))
-    }
-
     /// Issue an operation-scoped proof only when this provider guarantees that
     /// the matching activation and all later `plan_write` calls remain free of
     /// staging, object, catalog, publication, and other external effects until
@@ -2115,59 +2083,6 @@ impl ConnectorWrite {
         let preview = self.control.preview_managed_partition_spec(request)?;
         preview.validate_for_request(&self.provider_binding_key, operation_id)?;
         Ok(preview)
-    }
-
-    pub fn activate_row_mutation(
-        &self,
-        request: super::ConnectorRowMutationActivationRequest,
-    ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
-        request.validate(&self.provider_binding_key)?;
-        let expected_request = request.clone();
-        let preparation = request.preparation().clone();
-        let plan = self.control.activate_row_mutation(request)?;
-        let contract = preparation.match_contract();
-        for route in plan.routes() {
-            route.validate()?;
-            if route.preparation().owner() != &self.provider_binding_key {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "row-mutation route preparation does not retain the lease generation",
-                ));
-            }
-            if route.preparation().table() != preparation.table()
-                || route.preparation().base_version() != preparation.base_version()
-                || route
-                    .accepted_effects()
-                    .iter()
-                    .any(|effect| !preparation.intent().accepts(*effect))
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "row-mutation route does not match its sealed table, base version, or intent",
-                ));
-            }
-            if route.input().fields().into_iter().any(|binding| {
-                !contract
-                    .identity_fields()
-                    .iter()
-                    .any(|field| field.token() == binding.token())
-                    && !contract
-                        .before_fields()
-                        .iter()
-                        .any(|field| field.token() == binding.token())
-                    && !contract
-                        .after_fields()
-                        .iter()
-                        .any(|field| field.token() == binding.token())
-            }) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "row-mutation route has an input token foreign to its match contract",
-                ));
-            }
-        }
-        plan.validate_against_activation(&expected_request, &self.provider_binding_key)?;
-        Ok(plan)
     }
 
     pub fn certify_pre_ready_write_planning(
