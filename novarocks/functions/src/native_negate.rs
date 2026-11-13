@@ -304,7 +304,3 @@ impl PreparedNativeNegateRecipe {
 #[cfg(test)]
 #[path = "native_negate_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "native_negate_compile_author_tests.rs"]
-mod compile_author_tests;

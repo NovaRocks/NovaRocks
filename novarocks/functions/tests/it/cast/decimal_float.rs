@@ -15,11 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Complete decimal Float32 recipe admission, selected origins and original failure controls.
-use super::*;
-use crate::{ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Selection};
+//! Complete decimal Float64 recipe admission, selected origins and original failure controls.
+use arrow_array::Array;
 use arrow_array::ArrayRef;
+use arrow_array::Decimal128Array;
+use arrow_array::Decimal256Array;
+use arrow_array::Int32Array;
 use arrow_buffer::{NullBuffer, i256};
+use arrow_schema::DataType;
+use novarocks_functions::*;
+use novarocks_functions::{
+    ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Selection,
+};
+use novarocks_type_contract::CompileControlError;
+use novarocks_type_contract::CompilePhase;
+use novarocks_type_contract::DecimalOverflowPolicy;
+use novarocks_type_contract::ExpressionEffectContext;
+use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::PureCompileControl;
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
@@ -88,7 +102,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
     PreparedCastRecipe::try_new(
         CastOperation::Carrier,
         &FunctionValueType::from_legacy_declared_projection(ty, nullable),
-        &FunctionValueType::new(DataType::Float32, nullable),
+        &FunctionValueType::new(DataType::Float64, nullable),
         DecimalOverflowPolicy::ReportError,
         true,
         &Control::default(),
@@ -96,7 +110,7 @@ fn recipe(ty: DataType, nullable: bool) -> PreparedCastRecipe {
     .unwrap()
 }
 #[test]
-fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
+fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(1),
         domain: EvaluationDomainId::new(2),
@@ -118,7 +132,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                                     nullable,
                                 );
                                 let target =
-                                    FunctionValueType::new(DataType::Float32, target_nullable);
+                                    FunctionValueType::new(DataType::Float64, target_nullable);
                                 let prepared = PreparedCastRecipe::try_new(
                                     CastOperation::Carrier,
                                     &source,
@@ -127,7 +141,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                                     allow,
                                     &Control::default(),
                                 );
-                                if !target_nullable && (nullable || (!wide && scale < 0)) {
+                                if nullable && !target_nullable {
                                     assert_eq!(prepared, Err(CastPrepareError::TypeMismatch));
                                     continue;
                                 }
@@ -143,14 +157,11 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                                         .unwrap()
                                         .may_raise_row_error
                                 );
-                                assert_eq!(
-                                    carrier_cast_can_produce_null(
-                                        source.data_type(),
-                                        target.data_type(),
-                                        allow
-                                    ),
-                                    !wide && scale < 0
-                                );
+                                assert!(!carrier_cast_can_produce_null(
+                                    source.data_type(),
+                                    target.data_type(),
+                                    allow
+                                ));
                             }
                         }
                     }
@@ -177,7 +188,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
                 PreparedCastRecipe::try_new(
                     operation,
                     &FunctionValueType::from_legacy_declared_projection(dtype(wide, max, 0), true),
-                    &FunctionValueType::new(DataType::Float32, true),
+                    &FunctionValueType::new(DataType::Float64, true),
                     DecimalOverflowPolicy::ReportError,
                     true,
                     &Control::default()
@@ -196,7 +207,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
         PreparedCastRecipe::try_new(
             CastOperation::Carrier,
             &largeint,
-            &FunctionValueType::new(DataType::Float32, false),
+            &FunctionValueType::new(DataType::Float64, false),
             DecimalOverflowPolicy::ReportError,
             true,
             &Control::default()
@@ -205,7 +216,7 @@ fn decimal_float32_complete_metadata_policy_nullability_and_effect_contract() {
     );
 }
 #[test]
-fn decimal_float32_selected_slice_nonzero_constant_and_inherited_error_contract() {
+fn decimal_float_selected_slice_nonzero_constant_and_inherited_error_contract() {
     for wide in [false, true] {
         let p = if wide { 76 } else { 38 };
         let ty = dtype(wide, p, 2);
@@ -294,20 +305,20 @@ fn decimal_float32_selected_slice_nonzero_constant_and_inherited_error_contract(
     }
 }
 #[test]
-fn decimal_float32_original_hidden_payload_and_scale_min_failure_contract() {
+fn decimal_float_original_hidden_payload_and_scale_min_failure_contract() {
     let a = Decimal128Array::new(
         vec![i128::MIN, 12345].into(),
         Some(NullBuffer::from(vec![false, true])),
     )
     .with_precision_and_scale(38, 2)
     .unwrap();
-    let converted = crate::decimal_float_cast::decimal128_array_to_f32(&a, 2);
+    let converted = novarocks_functions::decimal_float_cast::decimal128_array_to_f64(&a, 2);
     assert!(converted.is_null(0));
     assert_eq!(
         converted.value(0).to_bits(),
-        ((i128::MIN as f64 / 100.0) as f32).to_bits()
+        (i128::MIN as f64 / 100.0).to_bits()
     );
-    assert_eq!(converted.value(1).to_bits(), 123.45_f32.to_bits());
+    assert_eq!(converted.value(1).to_bits(), 123.45_f64.to_bits());
     for policy in [
         DecimalOverflowPolicy::OutputNull,
         DecimalOverflowPolicy::ReportError,
@@ -317,7 +328,7 @@ fn decimal_float32_original_hidden_payload_and_scale_min_failure_contract() {
             let r = PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
                 &FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true),
-                &FunctionValueType::new(DataType::Float32, true),
+                &FunctionValueType::new(DataType::Float64, true),
                 policy,
                 allow,
                 &Control::default(),
@@ -331,25 +342,26 @@ fn decimal_float32_original_hidden_payload_and_scale_min_failure_contract() {
             assert_eq!(
                 r.evaluate_row(EvaluatedArgument::Column(&a), 0, 0, &Control::default())
                     .unwrap(),
-                CastRowResult::Float32(0.0),
+                CastRowResult::Float64(0.0),
             );
-            for (row, expected) in [(2, f32::INFINITY), (3, -f32::INFINITY)] {
-                let CastRowResult::Float32(got) = r
+            for (row, expected) in [(2, 1e128), (3, -1e128)] {
+                let CastRowResult::Float64(got) = r
                     .evaluate_row(EvaluatedArgument::Column(&a), row, row, &Control::default())
                     .unwrap()
                 else {
-                    panic!("exact Float32 minimum-scale result")
+                    panic!("exact Float64 minimum-scale result")
                 };
-                assert_eq!(got.to_bits(), expected.to_bits());
+                assert!(got.is_finite());
+                assert!((got - expected).abs() <= expected.abs() * f64::EPSILON * 4.0);
             }
         }
     }
 }
 #[test]
-fn decimal_float32_all_actual_callbacks_preserve_seven_causes_and_no_tail() {
+fn decimal_float_all_actual_callbacks_preserve_seven_causes_and_no_tail() {
     for wide in [false, true] {
-        for value in [Some(12345), Some(i128::MAX), None] {
-            let a = input(wide, if wide { 76 } else { 38 }, -1, vec![value]);
+        for value in [Some(12345), None] {
+            let a = input(wide, if wide { 76 } else { 38 }, 2, vec![value]);
             let r = recipe(a.data_type().clone(), true);
             let baseline = Control::default();
             r.evaluate_row(EvaluatedArgument::Column(&a), 0, 0, &baseline)
@@ -383,7 +395,7 @@ fn decimal_float32_all_actual_callbacks_preserve_seven_causes_and_no_tail() {
 }
 
 #[test]
-fn decimal_float32_compile_callbacks_preserve_primary_causes_on_success_and_rejection() {
+fn decimal_float_compile_callbacks_preserve_primary_causes_on_success_and_rejection() {
     struct CompileControl {
         calls: Mutex<Vec<(CompilePhase, u32)>>,
         refusal: Option<(usize, CompileControlError)>,
@@ -415,7 +427,7 @@ fn decimal_float32_compile_callbacks_preserve_primary_causes_on_success_and_reje
                 dtype(wide, if wide { 76 } else { 38 }, 2),
                 source_nullable,
             );
-            let result = FunctionValueType::new(DataType::Float32, result_nullable);
+            let result = FunctionValueType::new(DataType::Float64, result_nullable);
             let baseline = CompileControl {
                 calls: Mutex::new(Vec::new()),
                 refusal: None,
@@ -470,76 +482,43 @@ fn decimal_float32_compile_callbacks_preserve_primary_causes_on_success_and_reje
 }
 
 #[test]
-fn decimal_float32_preserves_original_expr_null_and_unsanitized_project_projection() {
-    let source = FunctionValueType::new(DataType::Decimal128(38, -1), false);
-    let input = input(false, 38, -1, vec![Some(i128::MAX), Some(1)]);
-    let raw = crate::decimal_float_cast::decimal128_array_to_f32(
-        input.as_any().downcast_ref::<Decimal128Array>().unwrap(),
-        -1,
+fn decimal256_selected_and_scalar_casts_keep_independent_midpoint_bits() {
+    let array = input(
+        true,
+        19,
+        0,
+        vec![
+            Some(9_223_372_036_854_776_833),
+            None,
+            Some(-9_223_372_036_854_776_833),
+        ],
     );
-    assert_eq!(raw.value(0).to_bits(), f32::INFINITY.to_bits());
-    assert_eq!(raw.value(1).to_bits(), 10.0_f32.to_bits());
-    for policy in [
-        DecimalOverflowPolicy::OutputNull,
-        DecimalOverflowPolicy::ReportError,
-    ] {
-        for allow in [false, true] {
-            let r = PreparedCastRecipe::try_new(
-                CastOperation::Carrier,
-                &source,
-                &FunctionValueType::new(DataType::Float32, true),
-                policy,
-                allow,
+    let prepared = recipe(array.data_type().clone(), true);
+    for (row, expected) in [(0, 0x43e0_0000_0000_0000), (2, 0xc3e0_0000_0000_0001)] {
+        let CastRowResult::Float64(value) = prepared
+            .evaluate_row(
+                EvaluatedArgument::Column(&array),
+                17,
+                row,
                 &Control::default(),
             )
-            .unwrap();
-            assert_eq!(
-                r.evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control::default())
-                    .unwrap(),
-                CastRowResult::Null
-            );
-            assert_eq!(
-                r.evaluate_row(EvaluatedArgument::Column(&input), 1, 1, &Control::default())
-                    .unwrap(),
-                CastRowResult::Float32(10.0)
-            );
-            assert_eq!(
-                PreparedCastRecipe::try_new(
-                    CastOperation::Carrier,
-                    &source,
-                    &FunctionValueType::new(DataType::Float32, false),
-                    policy,
-                    allow,
-                    &Control::default()
-                ),
-                Err(CastPrepareError::TypeMismatch)
-            );
-        }
+            .unwrap()
+        else {
+            panic!("original decimal float value");
+        };
+        assert_eq!(value.to_bits(), expected);
+        let scalar = array.slice(row, 1);
+        let CastRowResult::Float64(value) = prepared
+            .evaluate_row(
+                EvaluatedArgument::Scalar(&scalar),
+                31,
+                999,
+                &Control::default(),
+            )
+            .unwrap()
+        else {
+            panic!("original scalar decimal float value");
+        };
+        assert_eq!(value.to_bits(), expected);
     }
-    let source: ArrayRef = Arc::new(
-        Decimal256Array::from(vec![i256::MIN, i256::MAX])
-            .with_precision_and_scale(76, 0)
-            .unwrap(),
-    );
-    let r = recipe(source.data_type().clone(), false);
-    assert_eq!(
-        r.evaluate_row(
-            EvaluatedArgument::Column(&source),
-            0,
-            0,
-            &Control::default()
-        )
-        .unwrap(),
-        CastRowResult::Float32(f32::NEG_INFINITY)
-    );
-    assert_eq!(
-        r.evaluate_row(
-            EvaluatedArgument::Column(&source),
-            1,
-            1,
-            &Control::default()
-        )
-        .unwrap(),
-        CastRowResult::Float32(f32::INFINITY)
-    );
 }

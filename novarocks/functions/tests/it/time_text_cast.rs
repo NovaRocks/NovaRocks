@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact text-to-TIME profile and every originating host-control refusal.
-use crate::{
+use arrow_array::{ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow_schema::{DataType, TimeUnit};
+use novarocks_functions::{
     CastOperation, CastRowResult, EvaluatedArgument, KernelDiagnostic, KernelEvaluationControl,
     KernelFailure, PreparedCastRecipe,
 };
-use arrow_array::{ArrayRef, LargeStringArray, StringArray, StringViewArray};
-use arrow_schema::{DataType, TimeUnit};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType, PureCompileControl,
 };
@@ -114,7 +114,7 @@ fn text_time_kernel_every_actual_callback_seven_typed_causes_no_failure_footer()
 }
 #[test]
 fn text_time_kernel_original_parser_full_domain_keeps_distinct_carriers_and_typed_mode() {
-    use crate::time_text_cast::{TimeTextParseMode, evaluate_arrays};
+    use novarocks_functions::time_text_cast::{TimeTextParseMode, evaluate_arrays};
     let source: ArrayRef = Arc::new(StringArray::from(vec![
         "25:00:00",
         "+01:02:03",
@@ -201,8 +201,8 @@ fn text_time_kernel_checked_scalar_address_does_not_read_unselected_invalid_or_n
 
 #[test]
 fn text_time_kernel_exact_compact_and_nonzero_pool_ordinals_keep_original_row_addresses() {
-    use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
     use arrow_array::Array;
+    use novarocks_functions::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
     let rows = [1, 2, 3];
     for dtype in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
         let raw = [Some("ignored"), Some("01:02:03"), None, Some("+01:02:03")];
@@ -282,7 +282,7 @@ fn text_time_kernel_exact_compact_and_nonzero_pool_ordinals_keep_original_row_ad
 }
 #[test]
 fn text_time_frozen_target_contract_precedes_any_observer() {
-    use crate::time_text_cast::{TimeTextParseMode, evaluate_arrays_observed};
+    use novarocks_functions::time_text_cast::{TimeTextParseMode, evaluate_arrays_observed};
     let input: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
     let target = DataType::Time64(TimeUnit::Nanosecond);
     let mut observer =
@@ -317,10 +317,10 @@ fn raw_time_text_keeps_distinct_carrier_whitespace_and_numeric_grammar() {
         Arc::new(LargeStringArray::from(raw.clone())) as ArrayRef,
         Arc::new(StringViewArray::from(raw.clone())) as ArrayRef,
     ] {
-        let output = crate::time_text_cast::evaluate_arrays(
+        let output = novarocks_functions::time_text_cast::evaluate_arrays(
             &source,
             &DataType::Time64(TimeUnit::Microsecond),
-            crate::time_text_cast::TimeTextParseMode::Duration,
+            novarocks_functions::time_text_cast::TimeTextParseMode::Duration,
         )
         .unwrap();
         assert_eq!(

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::legacy_literal::{eval, native_negate_zero};
 use arrow_array::{Array, ArrayRef, Decimal128Array, Decimal256Array};
 use arrow_buffer::i256;
+use novarocks_functions::legacy_literal::{eval, native_negate_zero};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ fn native_negate_original_decimal_full_carrier_outside_precision_is_successful_n
         assert_eq!(input.null_count(), 1);
         let zero = eval(&native_negate_zero(input.data_type()).unwrap(), input.len()).unwrap();
         let dtype = input.data_type().clone();
-        let actual = crate::legacy_arithmetic::eval_sub_arrays(
+        let actual = novarocks_functions::legacy_arithmetic::eval_sub_arrays(
             zero,
             input,
             dtype.clone(),

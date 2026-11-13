@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
 use arrow_schema::DataType;
+use novarocks_functions::*;
+use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::NativeBetweenPlan;
+use novarocks_type_contract::PureCompileControl;
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::{CompileControlError, CompilePhase};
 use std::sync::Mutex;
 struct Control {

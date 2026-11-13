@@ -17,8 +17,12 @@
 
 //! Public compilation entry points on real supported and unsupported types.
 //! No replacement resolver, invalid type graph, or runtime row invocation.
-use super::*;
+use arrow_schema::DataType;
 use novarocks_failure_contract::{FailureFact, FailureProjection, OuterFailureProjection};
+use novarocks_functions::*;
+use novarocks_type_contract::CompilePhase;
+use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::PureCompileControl;
 use novarocks_type_contract::{CompileControlError, owned_resources::layout::LayoutResourceError};
 use std::{
     fmt,

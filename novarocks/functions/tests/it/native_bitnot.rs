@@ -15,8 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact intrinsic preparation/selection/control; no ordinary bitnot rebind.
-use super::*;
+use arrow_array::Array;
+use arrow_array::ArrayRef;
 use arrow_array::{Int8Array, Int16Array, Int32Array, Int64Array, StringArray};
+use arrow_schema::DataType;
+use novarocks_functions::*;
+use novarocks_type_contract::FunctionValueType;
+use novarocks_type_contract::PureCompileControl;
+use novarocks_type_contract::ValueLogicalType;
 use novarocks_type_contract::{CompileControlError, CompilePhase};
 use std::sync::{Arc, Mutex};
 #[derive(Default)]
@@ -102,7 +108,7 @@ fn native_bitnot_kernel_signed_four_profiles_preserve_exact_nonnull_nullable_emp
                 let actual = recipe
                     .evaluate_selected(
                         EvaluatedArgument::Column(&input),
-                        crate::Selection::all(input.len()),
+                        novarocks_functions::Selection::all(input.len()),
                         &Control::default(),
                     )
                     .unwrap();
@@ -110,7 +116,7 @@ fn native_bitnot_kernel_signed_four_profiles_preserve_exact_nonnull_nullable_emp
                 assert_eq!(actual.values().to_data(), expected.to_data());
             }
             let rows = [0, 4];
-            let selection = crate::Selection::try_sparse(5, &rows).unwrap();
+            let selection = novarocks_functions::Selection::try_sparse(5, &rows).unwrap();
             let actual = recipe
                 .evaluate_selected(
                     EvaluatedArgument::Column(&input),
@@ -129,14 +135,14 @@ fn native_bitnot_kernel_signed_four_profiles_preserve_exact_nonnull_nullable_emp
 }
 #[test]
 fn native_bitnot_kernel_largeint_full128_bits_nulls_and_scalar_domain() {
-    let input = crate::largeint::array_from_i128(&[
+    let input = novarocks_functions::largeint::array_from_i128(&[
         Some(i128::MIN),
         Some(i128::MAX),
         Some(1_i128 << 100),
         None,
     ])
     .unwrap();
-    let expected = crate::largeint::array_from_i128(&[
+    let expected = novarocks_functions::largeint::array_from_i128(&[
         Some(i128::MAX),
         Some(i128::MIN),
         Some(-(1_i128 << 100) - 1),
@@ -153,7 +159,7 @@ fn native_bitnot_kernel_largeint_full128_bits_nulls_and_scalar_domain() {
     let actual = recipe
         .evaluate_selected(
             EvaluatedArgument::Column(&input),
-            crate::Selection::all(4),
+            novarocks_functions::Selection::all(4),
             &Control::default(),
         )
         .unwrap();
@@ -162,13 +168,13 @@ fn native_bitnot_kernel_largeint_full128_bits_nulls_and_scalar_domain() {
     let actual = recipe
         .evaluate_selected(
             EvaluatedArgument::Scalar(&scalar),
-            crate::Selection::all(3),
+            novarocks_functions::Selection::all(3),
             &Control::default(),
         )
         .unwrap();
     assert_eq!(
         actual.values().to_data(),
-        crate::largeint::array_from_i128(&[Some(i128::MAX); 3])
+        novarocks_functions::largeint::array_from_i128(&[Some(i128::MAX); 3])
             .unwrap()
             .to_data()
     );
@@ -176,7 +182,7 @@ fn native_bitnot_kernel_largeint_full128_bits_nulls_and_scalar_domain() {
 #[test]
 fn native_bitnot_kernel_compact_inherited_errors_and_hidden_inactive_null_are_not_recomputed() {
     let rows = [1, 3];
-    let selection = crate::Selection::try_sparse(4, &rows).unwrap();
+    let selection = novarocks_functions::Selection::try_sparse(4, &rows).unwrap();
     let input: ArrayRef = Arc::new(Int8Array::from(vec![None, Some(-1), None, Some(1)]));
     let recipe = prepared(FunctionValueType::new(DataType::Int8, false));
     let actual = recipe
@@ -190,11 +196,14 @@ fn native_bitnot_kernel_compact_inherited_errors_and_hidden_inactive_null_are_no
         actual.values().to_data(),
         Int8Array::from(vec![0, -2]).to_data()
     );
-    let compact = crate::SelectedValues::try_new(
+    let compact = novarocks_functions::SelectedValues::try_new(
         selection,
         &DataType::Int8,
         Arc::new(Int8Array::from(vec![Some(-1), None])),
-        Box::from([crate::RowDataError::new(1, "original child failure")]),
+        Box::from([novarocks_functions::RowDataError::new(
+            1,
+            "original child failure",
+        )]),
     )
     .unwrap();
     let actual = recipe
@@ -218,7 +227,7 @@ fn native_bitnot_kernel_every_runtime_callback_preserves_seven_causes_without_fo
     recipe
         .evaluate_selected(
             EvaluatedArgument::Column(&input),
-            crate::Selection::all(3),
+            novarocks_functions::Selection::all(3),
             &success,
         )
         .unwrap();
@@ -229,9 +238,15 @@ fn native_bitnot_kernel_every_runtime_callback_preserves_seven_causes_without_fo
             KernelFailure::Cancelled,
             KernelFailure::DeadlineExceeded,
             KernelFailure::ResourceExhausted,
-            KernelFailure::InvalidProgram(crate::KernelDiagnostic::new("original invalid")),
-            KernelFailure::Internal(crate::KernelDiagnostic::new("original internal")),
-            KernelFailure::Operational(crate::KernelDiagnostic::new("original operational")),
+            KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                "original invalid",
+            )),
+            KernelFailure::Internal(novarocks_functions::KernelDiagnostic::new(
+                "original internal",
+            )),
+            KernelFailure::Operational(novarocks_functions::KernelDiagnostic::new(
+                "original operational",
+            )),
             KernelFailure::InstanceFailed,
         ] {
             let c = Control {
@@ -242,7 +257,7 @@ fn native_bitnot_kernel_every_runtime_callback_preserves_seven_causes_without_fo
                 recipe
                     .evaluate_selected(
                         EvaluatedArgument::Column(&input),
-                        crate::Selection::all(3),
+                        novarocks_functions::Selection::all(3),
                         &c
                     )
                     .unwrap_err(),
@@ -314,7 +329,7 @@ fn native_bitnot_kernel_unsigned_physical_null_and_opaque_tags_are_explicit_prep
     assert!(matches!(
         prepared(FunctionValueType::new(DataType::Int64, false)).evaluate_selected(
             EvaluatedArgument::Column(&empty_foreign),
-            crate::Selection::all(0),
+            novarocks_functions::Selection::all(0),
             &Control::default()
         ),
         Err(KernelFailure::InvalidProgram(_))
@@ -324,7 +339,7 @@ fn native_bitnot_kernel_unsigned_physical_null_and_opaque_tags_are_explicit_prep
         prepared(FunctionValueType::new(DataType::Int64, false))
             .evaluate_selected(
                 EvaluatedArgument::Column(&foreign),
-                crate::Selection::all(1),
+                novarocks_functions::Selection::all(1),
                 &Control::default()
             )
             .is_err()

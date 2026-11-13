@@ -2202,28 +2202,8 @@ mod temporal_carrier_tests;
 mod decimal_text_tests;
 
 #[cfg(test)]
-#[path = "cast_largeint_text_tests.rs"]
-mod largeint_text_tests;
-
-#[cfg(test)]
-#[path = "cast_date_float_tests.rs"]
-mod date_float_tests;
-
-#[cfg(test)]
-#[path = "cast_float_date_tests.rs"]
-mod float_date_tests;
-
-#[cfg(test)]
 #[path = "cast_binary_text_tests.rs"]
 mod binary_text_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal_float_tests.rs"]
-mod decimal_float_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal_float32_tests.rs"]
-mod decimal_float32_tests;
 
 #[cfg(test)]
 #[path = "cast_decimal128_rescale_tests.rs"]
@@ -2232,10 +2212,6 @@ mod decimal128_rescale_tests;
 #[cfg(test)]
 #[path = "cast_observed_list_tests.rs"]
 mod observed_list_tests;
-
-#[cfg(test)]
-#[path = "cast_float_decimal128_tests.rs"]
-mod float_decimal128_tests;
 
 #[cfg(test)]
 #[path = "cast_nested_identity_tests.rs"]
