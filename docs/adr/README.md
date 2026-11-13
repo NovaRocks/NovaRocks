@@ -630,11 +630,10 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 
 ### test-fixtures
 
-领域哲学：测试运行不获取外部产物。镜像、Maven artifact 和 derived image 的身份由锁定输入与本机 READY BOM
-共同证明；网络获取与 Docker build 只属于显式 provisioning。verify 与测试消费者只读取本机证据，缺失是 BLOCKED
-而不是下载或普通测试失败。
+领域哲学：输入版本与 recipe 由 `versions.json` 唯一声明；普通入口直接消费已有环境，只有实际需要且缺失的输入由同一 builder 创建。数据集消费保持 check-only；运行 owner、准确资源身份和真实退出独立保留。
 
-- ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
+- [ADR-0155](ADR-0155-fixture-provisioning-and-offline-verification.md) — fixture 输入为何由 `versions.json` 唯一声明，普通入口不检查，缺失时由同一 builder 创建（active）
+- [ADR-0231](ADR-0231-reference-inputs-declared-once-and-bound-per-run.md) — 参照构件为何统一声明、仅在创建时核对、由运行入口按最终选择冻结引用并记录来源（active）
 - [ADR-0191](ADR-0191-machine-shared-fixture-and-bounded-scratch.md) — 每个daemon为何只有一组共享fixture服务，维护显式、scratch有界、原owner确认实际writer退出（active；替代ADR-0165运行层，保留ADR-0155供给与ADR-0173 check-only消费）
 - [ADR-0199](ADR-0199-readonly-observation-and-mutation-settlement.md) — 只读观察失败为何与变更结算分开，由原owner显式处置准确观察而保留原失败及未知退出（active；补充ADR-0191，原writer退出与scratch屏障保留）
 - [ADR-0202](ADR-0202-benchmark-ready-after-complete-data.md) — 标准数据为何只在完整后普通发布 READY，删除条件覆盖与原地重建而保留准确只读消费（active；部分替代 ADR-0173 的条件发布与 rebuild）
