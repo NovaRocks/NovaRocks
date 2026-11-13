@@ -3546,19 +3546,43 @@ impl<'a> ContractLoweringVisitor<'a> {
         write: &SqlWritePlanInput,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let width = write.contract.input_columns.len();
-        // A writer publishes rows the target accepts. Nullability is checked
-        // there for each row; it does not change the value carried across a
-        // router edge. A different data type needs an explicit conversion.
+        // Preserve V when the original W/T declaration permits assignment.
+        // The writer checks reachable required values and constructs W. Only
+        // an ordinary value conversion needs another source projection.
         let mut source_matches_target = source.output.len() == width;
         if source_matches_target {
-            for (value, column) in source.output.iter().zip(&write.contract.input_columns) {
+            for (field_ordinal, (value, column)) in source
+                .output
+                .iter()
+                .zip(&write.contract.input_columns)
+                .enumerate()
+            {
                 let ty = self.value_declared_type_in(source.fragment, *value)?;
                 let target = column_value_type(column, self.control)?;
-                if !ty.same_physical_binding_ignoring_root_nullability_observed(&target, || {
-                    self.control
-                        .checkpoint(CompilePhase::LowerProgram, 1)
-                        .map_err(ContractLoweringError::from)
-                })? {
+                let field = write
+                    .contract
+                    .target
+                    .fields
+                    .get(field_ordinal)
+                    .ok_or_else(|| {
+                        invalid_write("writer projection has no original target occurrence".into())
+                    })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        ty.typed_binding().borrowed(),
+                        target.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if !related {
                     source_matches_target = false;
                     break;
                 }
@@ -3588,7 +3612,25 @@ impl<'a> ContractLoweringVisitor<'a> {
             {
                 let expected = column_value_type(column, self.control)?;
                 let actual = expression_type(expression);
-                if actual != expected {
+                let field = write.contract.target.fields.get(ordinal).ok_or_else(|| {
+                    invalid_write("writer root expression has no original target occurrence".into())
+                })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        actual.typed_binding().borrowed(),
+                        expected.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if !related {
                     return Err(ContractLoweringError::ExpressionTypeMismatch {
                         context: format!("TableWriter root projection {ordinal}"),
                         expected,
@@ -3645,13 +3687,40 @@ impl<'a> ContractLoweringVisitor<'a> {
                 let ty =
                     column_value_type(&write.contract.input_columns[field_ordinal], self.control)?;
                 let source_ty = self.value_declared_type_in(source.fragment, value)?;
-                // A conversion is where the two types meet, whichever of them
-                // differs: a column that admits a null the value never holds
-                // is stated the same way a narrower one is.
-                if source_ty == ty {
+                // Compare this exact target occurrence with actual V before
+                // considering ordinary conversion. W stays independently
+                // declared at the writer.
+                let field = write
+                    .contract
+                    .target
+                    .fields
+                    .get(field_ordinal)
+                    .ok_or_else(|| {
+                        invalid_write(
+                            "writer ordinal projection has no original target occurrence".into(),
+                        )
+                    })?;
+                let related =
+                    novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                        source_ty.typed_binding().borrowed(),
+                        ty.typed_binding().borrowed(),
+                        field
+                            .storage_type
+                            .as_ref()
+                            .map(|storage| storage.typed_binding().borrowed()),
+                        || {
+                            self.control
+                                .checkpoint(CompilePhase::LowerProgram, 1)
+                                .map_err(ContractLoweringError::from)
+                        },
+                    )?
+                    .is_some();
+                if related {
+                    // The selected writer assignment owns V -> W construction.
+                    // Keep both the real source promise and its original ID.
                     let expression = self.fragment_mut().add_expression(
                         node,
-                        ty,
+                        source_ty.clone(),
                         ContractExprKind::Value(value),
                     )?;
                     expressions.push((expression, value));

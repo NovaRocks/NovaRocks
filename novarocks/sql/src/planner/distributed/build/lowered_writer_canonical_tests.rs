@@ -507,3 +507,186 @@ fn actual_writer_lowering_preserves_each_original_control_refusal() {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+enum LicensedWriterProjectionFixture {
+    RootOrdinal,
+    ExplicitOrdinal,
+    RootExpression,
+    RepeatedOrdinal,
+}
+
+fn assert_licensed_nested_writer_projection(mode: LicensedWriterProjectionFixture) {
+    use crate::analysis::{ExprKind, TypedExpr};
+    use novarocks_spi::connector::ConnectorWriteFieldToken;
+    use novarocks_types::schema::ColumnDef;
+
+    let nested =
+        |leaf, nullable| DataType::Struct(vec![Arc::new(Field::new("f", leaf, nullable))].into());
+    let source_data = nested(DataType::Binary, true);
+    let source_type = FunctionValueType::new(source_data.clone(), true);
+    let input_type = FunctionValueType::new(nested(DataType::Binary, false), true);
+    let storage_type = FunctionValueType::new(nested(DataType::FixedSizeBinary(4), false), true);
+    // A real scalar constant has a NULL parent and nullable Binary child. Its
+    // actual declaration remains V; no fixed-width cast is part of this source.
+    let array = arrow::array::new_null_array(&source_data, 1);
+    let constant = novarocks_functions::ConstantValue::from_scalar_array(
+        Arc::new(Field::new("source", source_data.clone(), true)),
+        source_type.clone(),
+        array.to_data(),
+        crate::constant::test_constant_policy(),
+        CompilePhase::Validate,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
+    let source = values(
+        vec![column(1, "order_id", source_data, true)],
+        vec![vec![TypedExpr {
+            kind: ExprKind::Constant(constant),
+            value_type: source_type.clone(),
+        }]],
+    );
+    let binding = match mode {
+        LicensedWriterProjectionFixture::RootOrdinal
+        | LicensedWriterProjectionFixture::RootExpression => {
+            ConnectorWriteInputBinding::RootOutputByOrdinal
+        }
+        LicensedWriterProjectionFixture::ExplicitOrdinal => {
+            ConnectorWriteInputBinding::OutputOrdinals(vec![0])
+        }
+        LicensedWriterProjectionFixture::RepeatedOrdinal => {
+            ConnectorWriteInputBinding::OutputOrdinals(vec![0, 0])
+        }
+    };
+    let mut write = simple_sql_write_plan_input(binding);
+    let input = ColumnDef::from_value_type("order_id".into(), input_type.clone(), None).unwrap();
+    write.contract.input_columns[0] = input.clone();
+    write.contract.target.fields[0].column = input;
+    write.contract.target.fields[0].storage_type = Some(storage_type.clone());
+    if matches!(mode, LicensedWriterProjectionFixture::RootExpression) {
+        write.root_output_exprs = Some(vec![TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: crate::column_id::ColumnId(1),
+                qualifier: None,
+                column: "order_id".into(),
+            },
+            value_type: source_type.clone(),
+        }]);
+    }
+    if matches!(mode, LicensedWriterProjectionFixture::RepeatedOrdinal) {
+        let mut second = write.contract.target.fields[0].clone();
+        second.token = ConnectorWriteFieldToken::from_bytes([2; 32]);
+        second.column.name = "order_id_copy".into();
+        second.storage_type = Some(FunctionValueType::new(
+            nested(DataType::FixedSizeBinary(8), false),
+            true,
+        ));
+        write.contract.input_columns.push(second.column.clone());
+        write.contract.target.fields.push(second);
+    }
+    let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+    let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let owner = lower_final_physical_write_plan(
+        &source,
+        version(),
+        dop(),
+        FinalWriteLowering {
+            reads: None,
+            write,
+            write_target_ordinal: ordinal,
+            auxiliary: &auxiliary,
+            targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
+        },
+        crate::functions::builtin_sql_function_catalog().snapshot(),
+        false,
+        crate::constant::test_constant_policy(),
+        &control,
+    )
+    .unwrap()
+    .finish_observed(&control)
+    .unwrap();
+    let (fragment, target) = owner
+        .plan()
+        .fragments()
+        .values()
+        .find_map(|fragment| {
+            fragment.nodes().values().find_map(|node| match &node.kind {
+                NodeKind::TableWriter { target } => Some((fragment, target)),
+                _ => None,
+            })
+        })
+        .expect("the real writer lowering produced its target");
+    let original = target.target_fields[0].input;
+    let ValueOrigin::NodeOutput {
+        node,
+        output_ordinal,
+    } = &fragment.values()[&original].origin
+    else {
+        panic!("the writer must keep the original source ValueId");
+    };
+    assert_eq!(*output_ordinal, 0);
+    assert!(matches!(
+        fragment.nodes()[node].kind,
+        NodeKind::Values { .. }
+    ));
+    assert_eq!(fragment.nodes()[node].output.columns[0], original);
+    for (index, field) in target.target_fields.iter().enumerate() {
+        assert_eq!(
+            field.input, original,
+            "each occurrence borrows the actual V"
+        );
+        assert_eq!(fragment.values()[&field.input].ty, source_type);
+        assert_eq!(field.ty, input_type);
+        assert_eq!(fragment.values()[&field.projected].ty, input_type);
+        assert_ne!(field.input, field.projected);
+        assert!(matches!(
+            fragment.values()[&field.projected].origin,
+            ValueOrigin::WriterDerived {
+                kind: WriterDerivedKind::ProjectedInput,
+                ..
+            }
+        ));
+        let expected_width = if index == 0 { 4 } else { 8 };
+        assert_eq!(
+            field.storage_type.as_ref().unwrap().data_type(),
+            &nested(DataType::FixedSizeBinary(expected_width), false)
+        );
+    }
+    if target.target_fields.len() == 2 {
+        assert_ne!(
+            target.target_fields[0].projected,
+            target.target_fields[1].projected
+        );
+    }
+    assert!(
+        !fragment
+            .expressions()
+            .iter()
+            .any(|(_, expression)| matches!(
+                &expression.kind,
+                ContractExprKind::Cast {
+                    target: DataType::Struct(_),
+                    ..
+                }
+            )),
+        "no second ordinary nested CAST may harden the source NULL envelope"
+    );
+}
+
+#[test]
+fn licensed_nested_writer_root_ordinal_preserves_source_and_projected_identity() {
+    assert_licensed_nested_writer_projection(LicensedWriterProjectionFixture::RootOrdinal);
+}
+#[test]
+fn licensed_nested_writer_explicit_ordinal_preserves_source_and_projected_identity() {
+    assert_licensed_nested_writer_projection(LicensedWriterProjectionFixture::ExplicitOrdinal);
+}
+#[test]
+fn licensed_nested_writer_root_expression_preserves_source_and_projected_identity() {
+    assert_licensed_nested_writer_projection(LicensedWriterProjectionFixture::RootExpression);
+}
+#[test]
+fn licensed_nested_writer_repeated_source_keeps_each_storage_occurrence() {
+    assert_licensed_nested_writer_projection(LicensedWriterProjectionFixture::RepeatedOrdinal);
+}
