@@ -507,13 +507,6 @@ impl DmlWritePlanInput {
         self
     }
 
-    /// Preserve the admitted application's logical affected-row owner.
-    /// The physical writer's row and artifact checks still apply.
-    pub fn with_external_count_owner(mut self) -> Self {
-        self.0.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
-        self
-    }
-
     /// What the provider calls each field this target accepts, by the token it
     /// issued for it.
     ///
@@ -902,81 +895,6 @@ fn complete_connector_write_plan(
     draft
         .finish_with_dependency_observer_observed(control)
         .map_err(final_plan_publication_error)
-}
-
-/// One internal DML read, optimized and waiting for its provider facts.
-pub struct DmlReadCompletion {
-    constant_policy: novarocks_functions::ConstantPolicy,
-    root_allow_throw_exception: bool,
-    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
-    root_semantics: crate::compiler::root_output::RootOutputSemantics,
-    query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
-    physical: crate::planner::physical::PhysicalPlanNode,
-}
-
-pub fn begin_final_dml_read_plan(
-    request: crate::compiler::SqlOptimizeRequest<'_>,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<
-    (DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>),
-    crate::compiler::SqlCompileError,
-> {
-    let constant_policy = request.constant_policy();
-    let control = request.control().clone();
-    let compiled = crate::compiler::SqlCompiler::optimize(request)?
-        .into_optimized_output()
-        .map_err(|_| "DML read intent did not produce optimized SQL facts".to_string())?;
-    let mut physical =
-        crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters_for_compiled(
-        &mut physical,
-        settings,
-    );
-    let (physical, needs) = crate::compiler::collect_provider_needs(
-        physical,
-        0,
-        settings.connector_static_predicate_pushdown_enabled(),
-        &control,
-    )?;
-    Ok((
-        DmlReadCompletion {
-            constant_policy,
-            root_allow_throw_exception: compiled.root_allow_throw_exception,
-            functions: compiled.function_catalog,
-            root_semantics: compiled.root_semantics,
-            physical,
-            query_statistics: compiled.statistics.snapshot,
-        },
-        needs,
-    ))
-}
-
-impl DmlReadCompletion {
-    pub fn finish(
-        self,
-        version: novarocks_physical_plan::PlanVersionId,
-        dop_domain: novarocks_physical_plan::PipelineDopDomain,
-        reads: DmlFinalizedProviderReadSet,
-        control: &crate::compiler::SqlCompileControl,
-    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
-        let mut draft =
-            crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
-                &self.physical,
-                version,
-                dop_domain,
-                reads.into_optional(),
-                self.root_semantics,
-                self.functions,
-                self.root_allow_throw_exception,
-                self.constant_policy,
-                control,
-            )
-            .map_err(final_lowering_error)?;
-        self.query_statistics.annotate_final_plan(&mut draft);
-        draft
-            .finish_with_dependency_observer_observed(control)
-            .map_err(final_plan_publication_error)
-    }
 }
 
 /// SQL-owned, immutable CTAS source artifact. Its optimizer graph never
@@ -5005,7 +4923,7 @@ mod tests {
     }
 
     #[test]
-    fn dml_read_and_ctas_keep_actual_analyzed_root_allow_across_move_handoffs() {
+    fn ctas_keeps_actual_analyzed_root_allow_across_move_handoffs() {
         use crate::compiler::{
             SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
             SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
@@ -5071,14 +4989,6 @@ mod tests {
                 assert_eq!(request.root_allow_throw_exception(), expected);
                 request
             };
-            let (completion, reads) = super::begin_final_dml_read_plan(
-                request(SqlCompileIntent::DmlInternalRead),
-                &SessionOptimizerSettings::default(),
-            )
-            .unwrap();
-            assert!(reads.is_empty());
-            assert_eq!(completion.root_allow_throw_exception, expected);
-            assert_eq!(completion.constant_policy, constant_policy);
             let source = super::compile_ctas_source(request(SqlCompileIntent::Query)).unwrap();
             assert_eq!(source.root_allow_throw_exception, expected);
             assert_eq!(source.constant_policy, constant_policy);

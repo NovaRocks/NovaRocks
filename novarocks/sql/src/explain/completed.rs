@@ -127,7 +127,6 @@ pub(super) fn finish_count_mode_name(
     match mode {
         novarocks_physical_plan::FinishCountMode::LogicalChanges => "logical-changes",
         novarocks_physical_plan::FinishCountMode::WriterReported => "writer-reported",
-        novarocks_physical_plan::FinishCountMode::ExternalOwner => "external-owner",
     }
 }
 

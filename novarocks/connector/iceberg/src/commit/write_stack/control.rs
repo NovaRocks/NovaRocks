@@ -2032,16 +2032,8 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (
-                ordinal,
-                writer,
-                input,
-                route,
-                routing_proof,
-                rewrite_source,
-                rewrite_group_digest,
-                position_materialization,
-            ) = target.into_parts();
+            let (ordinal, writer, input, route, rewrite_group_digest, position_materialization) =
+                target.into_parts();
             let statistics = write_statistics_contract(
                 &writer,
                 &input,
@@ -2067,14 +2059,6 @@ pub(crate) fn session_plan_from_targets(
             };
             let plan = match position_materialization {
                 Some(group) => plan.with_position_materialization(group),
-                None => plan,
-            };
-            let plan = match routing_proof {
-                Some(proof) => plan.with_routing_proof(proof),
-                None => plan,
-            };
-            let plan = match rewrite_source {
-                Some(source) => plan.with_rewrite_source(source),
                 None => plan,
             };
             let plan = match rewrite_group_digest {
@@ -2132,7 +2116,6 @@ fn position_contribution_group(
                     vec![effect],
                     route.input_ordinals().to_vec(),
                     route.requirements().clone(),
-                    Vec::new(),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -2409,12 +2392,6 @@ impl IcebergWriteSessionControl {
                 CatalogOperation::PublishDocuments
             }
             ConnectorWriteSessionFlavor::RowMutation => CatalogOperation::RowMutation,
-            ConnectorWriteSessionFlavor::CopyOnWrite { .. } => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "Iceberg copy-on-write sessions are retired",
-                ));
-            }
             ConnectorWriteSessionFlavor::DistributedRewrite { shape, .. } => match shape {
                 ConnectorDistributedRewriteShape::DataFiles { .. } => {
                     CatalogOperation::RewriteDataFiles
@@ -2932,7 +2909,7 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
                 plan_document_publication_branches(
                     &material,
-                    IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
+                    IcebergDocumentPublicationFacts::new(declaration.as_ref().clone(), *shape),
                 )?
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
@@ -2948,12 +2925,6 @@ impl IcebergWriteSessionControl {
                     )
                     .await?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
-            }
-            ConnectorWriteSessionFlavor::CopyOnWrite { .. } => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "Iceberg copy-on-write sessions are retired",
-                ));
             }
         };
         let IcebergSessionFlavorPlan {
@@ -3510,34 +3481,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         Box::pin(self.begin_write_original(request))
     }
 
-    fn begin_cow_write_checked_async(
-        &self,
-        request: ConnectorWriteBeginRequest,
-        original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        novarocks_spi::connector::ConnectorCowBeginPlan,
-                        novarocks_spi::connector::ConnectorCowBeginFailure,
-                    >,
-                > + Send
-                + '_,
-        >,
-    > {
-        let _ = request;
-        Box::pin(async move {
-            Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                ConnectorError::new(
-                    ConnectorErrorKind::Unsupported,
-                    "Iceberg copy-on-write sessions are retired",
-                )
-                .into(),
-                original,
-            ))
-        })
-    }
-
     fn finish_write_async<'a>(
         &'a self,
         request: ConnectorWriteFinishRequestRef<'a>,
@@ -3625,25 +3568,6 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             .catalog_runtime()
             .block_on(self.begin_write_original(request))
             .map_err(unavailable)?
-    }
-
-    fn begin_cow_write_checked(
-        &self,
-        request: ConnectorWriteBeginRequest,
-        original: novarocks_spi::connector::ConnectorOriginalResultScope,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorCowBeginPlan,
-        novarocks_spi::connector::ConnectorCowBeginFailure,
-    > {
-        let _ = request;
-        Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg copy-on-write sessions are retired",
-            )
-            .into(),
-            original,
-        ))
     }
 
     fn prepared_logical_row_change(

@@ -369,7 +369,6 @@ pub(crate) async fn compile_routed_mutation_write(
         },
         control.clone(),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
-        None,
     )
     .map_err(DmlError::from_compile)?;
     while !preparation.needs().is_empty() {

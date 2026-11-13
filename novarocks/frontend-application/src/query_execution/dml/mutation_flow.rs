@@ -2116,46 +2116,10 @@ mod tests {
                 colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
                 layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
             },
-            Vec::new(),
         )?))
     }
 
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeRowMutationControl {
-        fn begin_cow_write_checked_async(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            novarocks_spi::connector::ConnectorCowBeginPlan,
-                            novarocks_spi::connector::ConnectorCowBeginFailure,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async move { self.begin_cow_write_checked(request, original) })
-        }
-        fn begin_cow_write_checked(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorCowBeginPlan,
-            novarocks_spi::connector::ConnectorCowBeginFailure,
-        > {
-            let _ = request;
-            Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                    "copy-on-write is not supported",
-                )
-                .into(),
-                original,
-            ))
-        }
         fn io_profile(
             &self,
         ) -> Result<

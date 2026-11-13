@@ -33,9 +33,6 @@ pub fn encode_kind(value: RootOutputKind) -> wire::RootOutputKind {
         RootOutputKind::CountOnly => Kind::CountOnly(true),
         RootOutputKind::InternalFacts(domain) => Kind::InternalFacts(match domain {
             InternalResultDomain::ScalarValueV1 => wire::InternalResultDomain::ScalarValueV1,
-            InternalResultDomain::CowSelectionArrowV1 => {
-                wire::InternalResultDomain::CowSelectionArrowV1
-            }
             InternalResultDomain::StatisticsArtifactV1 => {
                 wire::InternalResultDomain::StatisticsArtifactV1
             }
@@ -58,9 +55,6 @@ pub fn decode_kind(
             let domain = match wire::InternalResultDomain::try_from(*domain) {
                 Ok(wire::InternalResultDomain::ScalarValueV1) => {
                     InternalResultDomain::ScalarValueV1
-                }
-                Ok(wire::InternalResultDomain::CowSelectionArrowV1) => {
-                    InternalResultDomain::CowSelectionArrowV1
                 }
                 Ok(wire::InternalResultDomain::StatisticsArtifactV1) => {
                     InternalResultDomain::StatisticsArtifactV1
@@ -92,7 +86,6 @@ mod tests {
             RootOutputKind::ClientRows,
             RootOutputKind::CountOnly,
             RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
-            RootOutputKind::InternalFacts(InternalResultDomain::CowSelectionArrowV1),
             RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
             RootOutputKind::InternalFacts(InternalResultDomain::PreparedWriteCommitV1),
         ] {
@@ -105,6 +98,9 @@ mod tests {
             wire::RootOutputKind { kind: None },
             wire::RootOutputKind {
                 kind: Some(wire::root_output_kind::Kind::ClientRows(false)),
+            },
+            wire::RootOutputKind {
+                kind: Some(wire::root_output_kind::Kind::InternalFacts(2)),
             },
             wire::RootOutputKind {
                 kind: Some(wire::root_output_kind::Kind::InternalFacts(100)),

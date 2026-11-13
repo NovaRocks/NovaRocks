@@ -24,8 +24,7 @@
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorMutationContributionGroup, ConnectorWriteCohortRoutingProof,
-    ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorMutationContributionGroup, ConnectorWriteRouteFacts,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
@@ -43,8 +42,6 @@ type IcebergWriteTargetPlanParts = (
     IcebergWriterHandle,
     ConnectorWriteInputShape,
     Option<ConnectorWriteRouteFacts>,
-    Option<ConnectorWriteCohortRoutingProof>,
-    Option<ConnectorWriteRewriteSource>,
     Option<[u8; 32]>,
     Option<ConnectorMutationContributionGroup>,
 );
@@ -57,8 +54,6 @@ pub struct IcebergWriteTargetPlan {
     handle: IcebergWriterHandle,
     input: ConnectorWriteInputShape,
     route: Option<ConnectorWriteRouteFacts>,
-    routing_proof: Option<ConnectorWriteCohortRoutingProof>,
-    rewrite_source: Option<ConnectorWriteRewriteSource>,
     rewrite_group_digest: Option<[u8; 32]>,
     position_materialization: Option<ConnectorMutationContributionGroup>,
 }
@@ -80,14 +75,6 @@ impl IcebergWriteTargetPlan {
     /// session routes rows by change event.
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
-    }
-    /// The read contract of one copy-on-write branch, present exactly when the
-    /// branch produces its rows by re-reading the files it replaces.
-    pub const fn rewrite_source(&self) -> Option<&ConnectorWriteRewriteSource> {
-        self.rewrite_source.as_ref()
-    }
-    pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
-        self.routing_proof.as_ref()
     }
     pub(crate) fn with_creation_scope(
         mut self,
@@ -125,8 +112,6 @@ impl IcebergWriteTargetPlan {
             self.handle,
             self.input,
             self.route,
-            self.routing_proof,
-            self.rewrite_source,
             self.rewrite_group_digest,
             self.position_materialization,
         )
@@ -366,10 +351,8 @@ pub fn plan_branch_session(
             handle: plan.writer_handle(writer_table)?,
             input: plan.input().clone(),
             route: plan.route().cloned(),
-            routing_proof: None,
             rewrite_group_digest: None,
             position_materialization: None,
-            rewrite_source: None,
         });
     }
 

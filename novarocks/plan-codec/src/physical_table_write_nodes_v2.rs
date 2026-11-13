@@ -240,7 +240,6 @@ fn finish_mode(value: i32) -> Result<p::FinishCountMode, Error> {
     match wire::FinishCountMode::try_from(value) {
         Ok(wire::FinishCountMode::LogicalChanges) => Ok(p::FinishCountMode::LogicalChanges),
         Ok(wire::FinishCountMode::WriterReported) => Ok(p::FinishCountMode::WriterReported),
-        Ok(wire::FinishCountMode::ExternalOwner) => Ok(p::FinishCountMode::ExternalOwner),
         _ => Err(invalid("finish count mode is absent or unknown")),
     }
 }
@@ -1376,9 +1375,6 @@ fn emit_encode(
                     }
                     p::FinishCountMode::WriterReported => {
                         wire::FinishCountMode::WriterReported as i32
-                    }
-                    p::FinishCountMode::ExternalOwner => {
-                        wire::FinishCountMode::ExternalOwner as i32
                     }
                 },
                 writer_results_input: Some(t.inputs.writer_results),

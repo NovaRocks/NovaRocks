@@ -41,9 +41,7 @@
 
 use crate::commit::model::EntryIdentity;
 use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
-use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteRouteFacts, ConnectorWriteSelectionBinding,
-};
+use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
     ConnectorManagedPublicationTechnique, ConnectorMutationRouteInput, ConnectorRowMutationEffect,
@@ -51,7 +49,6 @@ use novarocks_spi::connector::{
     ConnectorWriteRouteId,
 };
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 
 use crate::commit::write_stack::domain::IcebergPositionRewriteTarget;
 use crate::commit::write_stack::domain::{
@@ -307,7 +304,6 @@ fn plan_publication_branch_list(
                 &ordinals,
                 data_fields.iter().copied(),
                 &[],
-                Vec::new(),
             )?;
             vec![IcebergWriteBranchPlan::Data {
                 plan: material.data_plan(material.input.clone())?,
@@ -544,7 +540,6 @@ pub(crate) fn plan_row_mutation_branches(
                 } else {
                     partition_source_fields
                 },
-                Vec::new(),
             )?;
             Ok(IcebergSessionFlavorPlan {
                 flavor,
@@ -615,7 +610,6 @@ fn plan_merge_on_read_branches(
         ordinals,
         data_fields.iter(),
         &[],
-        Vec::new(),
     )?;
     // Every change event that touches one old data file has to reach one
     // physical delete writer: Iceberg permits a single deletion vector per data
@@ -651,7 +645,6 @@ fn plan_merge_on_read_branches(
         ordinals,
         row_identity_fields.iter(),
         std::slice::from_ref(&file_identity),
-        Vec::new(),
     )?;
     Ok(IcebergSessionFlavorPlan {
         flavor,
@@ -757,7 +750,6 @@ fn route_facts<'a>(
     ordinals: &InputOrdinals,
     consumed: impl Iterator<Item = &'a ConnectorWriteFieldBinding>,
     partition_source_fields: &[ConnectorWriteFieldBinding],
-    selection_bindings: impl Into<Arc<[ConnectorWriteSelectionBinding]>>,
 ) -> Result<ConnectorWriteRouteFacts, ConnectorError> {
     let consumed = consumed.collect::<Vec<_>>();
     let input_ordinals = consumed
@@ -806,6 +798,5 @@ fn route_facts<'a>(
         accepted_effects,
         input_ordinals,
         ConnectorWriteRouteRequirements { colocation, layout },
-        selection_bindings,
     )
 }

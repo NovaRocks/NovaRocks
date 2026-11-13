@@ -222,7 +222,7 @@ impl ConnectorWriteSession {
         receiving.claim()?;
         let declaration = match &request.flavor {
             ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } => {
-                declaration.clone()
+                declaration.as_ref().clone()
             }
             _ => {
                 return Err(ConnectorError::new(
@@ -1558,43 +1558,6 @@ pub(crate) mod tests {
             })
         }
 
-        fn begin_cow_write_checked_async(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            novarocks_spi::connector::ConnectorCowBeginPlan,
-                            novarocks_spi::connector::ConnectorCowBeginFailure,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async move { self.begin_cow_write_checked(request, original) })
-        }
-
-        fn begin_cow_write_checked(
-            &self,
-            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
-            original: novarocks_spi::connector::ConnectorOriginalResultScope,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorCowBeginPlan,
-            novarocks_spi::connector::ConnectorCowBeginFailure,
-        > {
-            let _ = request;
-            Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
-                novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                    "copy-on-write is not supported",
-                )
-                .into(),
-                original,
-            ))
-        }
-
         fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.binding_key
         }
@@ -1611,7 +1574,7 @@ pub(crate) mod tests {
                     ..
                 } = &request.flavor
                 {
-                    recorded.begin_declaration = Some(declaration.clone());
+                    recorded.begin_declaration = Some(declaration.as_ref().clone());
                 }
                 if recorded.capture_begin_context {
                     recorded.begin_context = Some(request.context);
@@ -2229,7 +2192,7 @@ pub(crate) mod tests {
             },
             base: Some(declaration.expected_base().clone()),
             flavor: ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape:
                     novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },

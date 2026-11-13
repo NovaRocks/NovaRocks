@@ -728,7 +728,6 @@ impl NativeTaskExecutionHost {
         identity: TaskIdentity,
         sink: Option<&novarocks_local_program::StaticSinkProgram>,
         statistics_source_is_unpivot: bool,
-        root_layout: &novarocks_local_program::StaticLayout,
         preparation: &novarocks_worker::TaskPreparationContext,
         preparation_child: &Arc<NativePreparationChild>,
     ) -> Result<Option<Arc<NativeRootResultSession>>, HostRejection> {
@@ -789,30 +788,11 @@ impl NativeTaskExecutionHost {
                         "Root output exit has a different original readiness source",
                     )));
                 }
-                let cow_recipe = if contract.kind()
-                    == novarocks_result_contract::RootOutputKind::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
-                    ) {
-                    match crate::root_cow_selection_codec::prepare_recipe(
-                        &channel,
-                        root_layout,
-                        preparation.runtime_control().as_ref(),
-                    ) {
-                        Ok(recipe) => Some(recipe),
-                        Err(cause) => {
-                            channel.close(novarocks_execution_contract::root_lifetime::RootRetentionClose::ParticipationAborted);
-                            return Err(host_failure(cause));
-                        }
-                    }
-                } else {
-                    None
-                };
-                match NativeRootResultSession::try_open_prepared_with_cow_recipe(
+                match NativeRootResultSession::try_open_prepared(
                     channel.clone(),
                     &self.root_producer_pool,
                     preparation,
                     preparation_child,
-                    cow_recipe,
                 ) {
                     Ok(session) => Some(session),
                     Err(error) => {
@@ -1066,7 +1046,6 @@ impl NativeTaskExecutionHost {
                 program.graph().nodes()[program.graph().root().index()].kind(),
                 novarocks_local_program::ProgramNodeKind::Unpivot { .. }
             ),
-            program.graph().nodes()[program.graph().root().index()].output_layout(),
             &preparation_scope,
             &preparation_child,
         )?;

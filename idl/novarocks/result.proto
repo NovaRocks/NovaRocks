@@ -109,7 +109,8 @@ message ClientRenderSchema {
 enum InternalResultDomain {
   INTERNAL_RESULT_DOMAIN_UNSPECIFIED = 0;
   SCALAR_VALUE_V1 = 1;
-  COW_SELECTION_ARROW_V1 = 2;
+  reserved 2;
+  reserved "COW_SELECTION_ARROW_V1";
   STATISTICS_ARTIFACT_V1 = 3;
   PREPARED_WRITE_COMMIT_V1 = 4;
 }

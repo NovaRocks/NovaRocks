@@ -23,7 +23,6 @@ use std::num::NonZeroU32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum InternalResultDomain {
     ScalarValueV1,
-    CowSelectionArrowV1,
     StatisticsArtifactV1,
     PreparedWriteCommitV1,
 }

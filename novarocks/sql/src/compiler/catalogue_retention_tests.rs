@@ -17,14 +17,9 @@
 
 //! Original catalogue ownership through real completion paths.
 
-use super::tests::{
-    FrozenOrdersCatalog, answer_catalog, answer_exact_statistics, answer_provider,
-    available_statistics_evidence, incomplete, provider_contract, request,
-};
+use super::tests::{answer_catalog, answer_exact_statistics, answer_provider, incomplete, request};
 use super::*;
-use crate::compiler::{
-    SessionOptimizerSettings, builtin_sql_function_catalog, noop_constant_evaluator,
-};
+use crate::compiler::{SessionOptimizerSettings, builtin_sql_function_catalog};
 use std::sync::{
     Weak,
     atomic::{AtomicUsize, Ordering},
@@ -418,76 +413,6 @@ fn catalogue_query_provider_completion_moves_the_actual_optimizer_snapshot() {
         catalog.count(),
         captures,
         "provider and final lowering reuse the admitted owner"
-    );
-}
-
-#[test]
-fn catalogue_dml_read_completion_retains_its_optimized_owner_without_recapture() {
-    let catalog = CountingCatalog::new(builtin_sql_function_catalog().snapshot(), false);
-    let control = SqlCompileControl::unbounded();
-    let analyzed = SqlCompiler::analyze(crate::compiler::SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(crate::compiler::test_query(
-            "SELECT MIN(order_key) FROM orders",
-        )),
-        SqlCompileIntent::Query,
-        request("SELECT 1", SqlCompileIntent::Query).session,
-        SqlPlanningEnvironment::Distributed,
-        &FrozenOrdersCatalog,
-        catalog.as_ref(),
-        noop_constant_evaluator(),
-        None,
-        crate::constant::test_constant_policy(),
-        control.clone(),
-    ))
-    .expect("actual analysis")
-    .into_pending()
-    .expect("analyzed source");
-    let statistics = DmlStatisticsSnapshot::from_evidence([available_statistics_evidence(13)]);
-    let (completion, needs) = crate::planning::dml::begin_final_dml_read_plan(
-        crate::compiler::SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
-        &SessionOptimizerSettings::default(),
-    )
-    .expect("actual DML optimization");
-    let optimizer_snapshot = catalog.last_snapshot();
-    let captures = catalog.count();
-    assert_eq!(captures, 1);
-    let reads =
-        crate::planning::dml::DmlFinalizedProviderReadSet::try_new(needs.iter().map(|need| {
-            crate::planning::dml::DmlFinalizedProviderRead {
-                fact: ProviderReadFact::negotiated(need, provider_contract(need))
-                    .expect("provider fact"),
-                read_budget: ScanReadBudget {
-                    max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                    max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-                },
-            }
-        }))
-        .expect("actual provider reads");
-    let owner = completion
-        .finish(
-            PlanVersionId::try_new([24; 16]).expect("version"),
-            PipelineDopDomain {
-                min: 1,
-                max: 8,
-                requires_power_of_two: true,
-            },
-            reads,
-            &control,
-        )
-        .expect("actual DML final plan");
-    assert!(Arc::ptr_eq(owner.function_catalog(), &optimizer_snapshot));
-    assert_eq!(catalog.count(), captures);
-    assert!(
-        owner
-            .plan()
-            .fragments()
-            .values()
-            .any(|fragment| fragment.nodes().values().any(|node| {
-                matches!(
-                    &node.kind,
-                    novarocks_physical_plan::NodeKind::Aggregate { .. }
-                )
-            }))
     );
 }
 

@@ -28,7 +28,6 @@
 //! assembled bytes are still not published facts until the decoder accepts
 //! the complete record.
 
-use crate::root_cow_selection_codec::{COW_SELECTION_HEADER_BYTES, CowSelectionRecordHeader};
 use crate::root_statistics_codec::{STATISTICS_HEADER_BYTES, StatisticsArtifactHeader};
 use crate::root_write_commit_codec::{WRITE_COMMIT_HEADER_BYTES, WriteCommitRecordHeader};
 use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
@@ -38,7 +37,6 @@ use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
 pub enum RootRecordDomain {
     WriteCommit,
     Statistics,
-    CowSelection,
 }
 
 impl RootRecordDomain {
@@ -46,7 +44,6 @@ impl RootRecordDomain {
         match self {
             Self::WriteCommit => WRITE_COMMIT_HEADER_BYTES,
             Self::Statistics => STATISTICS_HEADER_BYTES,
-            Self::CowSelection => COW_SELECTION_HEADER_BYTES,
         }
     }
 
@@ -59,12 +56,6 @@ impl RootRecordDomain {
             Self::Statistics => StatisticsArtifactHeader::parse(prefix)
                 .map(StatisticsArtifactHeader::record_bytes)
                 .map_err(RootRecordFramingError::Statistics),
-            Self::CowSelection => CowSelectionRecordHeader::parse(prefix)
-                .map_err(RootRecordFramingError::Cow)
-                .and_then(|header| {
-                    usize::try_from(header.record_bytes())
-                        .map_err(|_| RootRecordFramingError::LengthOverflow)
-                }),
         }
     }
 }
@@ -75,23 +66,19 @@ impl RootRecordDomain {
 pub enum RootRecordFramingError {
     Write(crate::root_write_commit_codec::WriteCommitCodecError),
     Statistics(crate::root_statistics_codec::StatisticsCodecError),
-    Cow(crate::root_cow_selection_codec::CowSelectionCodecError),
     Capacity { requested: usize, limit: usize },
     Incomplete,
-    LengthOverflow,
 }
 impl std::fmt::Display for RootRecordFramingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Write(e) => e.fmt(f),
             Self::Statistics(e) => e.fmt(f),
-            Self::Cow(e) => e.fmt(f),
             Self::Capacity { requested, limit } => write!(
                 f,
                 "domain record declares {requested} bytes, beyond its {limit} byte assembly bound"
             ),
             Self::Incomplete => f.write_str("root stream ended inside an unfinished domain record"),
-            Self::LengthOverflow => f.write_str("domain record length exceeds usize"),
         }
     }
 }
@@ -100,8 +87,7 @@ impl std::error::Error for RootRecordFramingError {
         match self {
             Self::Write(error) => Some(error),
             Self::Statistics(error) => Some(error),
-            Self::Cow(error) => Some(error),
-            Self::Capacity { .. } | Self::Incomplete | Self::LengthOverflow => None,
+            Self::Capacity { .. } | Self::Incomplete => None,
         }
     }
 }
@@ -111,7 +97,6 @@ impl novarocks_execution_contract::failure::FailureProjection for RootRecordFram
         match self {
             Self::Write(e) => e.failure_fact(),
             Self::Statistics(e) => e.failure_fact(),
-            Self::Cow(e) => e.failure_fact(),
             Self::Capacity { .. } => FailureFact::new(
                 FailureClass::Resource,
                 FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(221).unwrap()),
@@ -119,10 +104,6 @@ impl novarocks_execution_contract::failure::FailureProjection for RootRecordFram
             Self::Incomplete => FailureFact::new(
                 FailureClass::Data,
                 FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(222).unwrap()),
-            ),
-            Self::LengthOverflow => FailureFact::new(
-                FailureClass::Representation,
-                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(223).unwrap()),
             ),
         }
     }

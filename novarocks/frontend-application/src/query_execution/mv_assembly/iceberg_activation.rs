@@ -214,7 +214,7 @@ fn prepare_first_refresh_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
@@ -311,7 +311,7 @@ fn prepare_metadata_only_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
@@ -544,7 +544,7 @@ fn prepare_incremental_document_write_request(
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             Some(base),
             novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-                declaration,
+                declaration: Box::new(declaration),
                 shape,
             },
             connector_context,

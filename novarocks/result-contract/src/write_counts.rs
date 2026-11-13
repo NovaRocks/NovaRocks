@@ -23,7 +23,6 @@ use std::fmt;
 pub enum FinishCountMode {
     LogicalChanges,
     WriterReported,
-    ExternalOwner,
 }
 
 /// Node input positions, disjoint from provider write-target ordinals.

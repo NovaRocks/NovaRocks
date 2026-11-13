@@ -105,47 +105,6 @@ opaque_handle!(
 );
 opaque_handle!(ConnectorReadTransactionHandle);
 
-/// Provider-owned source waiting for adoption by an admitted read generation.
-///
-/// This process-local receipt is not a read binding or a native wire handle.
-/// Roles can retain it but cannot recover its provider-private source facts.
-#[derive(Clone)]
-pub struct ConnectorFrozenReadSource {
-    owner: crate::connector::ConnectorProviderBindingKey,
-    payload: OpaquePayload,
-}
-
-impl ConnectorFrozenReadSource {
-    pub const fn owner(&self) -> &crate::connector::ConnectorProviderBindingKey {
-        &self.owner
-    }
-}
-
-impl Debug for ConnectorFrozenReadSource {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ConnectorFrozenReadSource")
-            .field("owner", &self.owner)
-            .finish_non_exhaustive()
-    }
-}
-
-pub(crate) fn frozen_read_source<T: Send + Sync + 'static>(
-    owner: crate::connector::ConnectorProviderBindingKey,
-    value: T,
-) -> ConnectorFrozenReadSource {
-    ConnectorFrozenReadSource {
-        owner,
-        payload: OpaquePayload::new(value),
-    }
-}
-
-pub(crate) fn frozen_read_source_value<T: 'static>(
-    source: &ConnectorFrozenReadSource,
-) -> Option<&T> {
-    source.payload.downcast_ref()
-}
-
 #[derive(Clone)]
 pub struct ConnectorReadSplit {
     binding: ConnectorReadBinding,
@@ -757,19 +716,6 @@ pub trait ConnectorReadMetadata: Send + Sync {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "provider read generation does not support frozen MV target reads",
-        ))
-    }
-
-    /// Adopt a provider-frozen source without reopening or widening it.
-    /// The installed provider must validate its source owner and observation.
-    fn adopt_frozen_source(
-        &self,
-        _session: &ConnectorSession,
-        _source: &ConnectorFrozenReadSource,
-    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
-        Err(ConnectorError::new(
-            crate::connector::ConnectorErrorKind::Unsupported,
-            "provider read generation does not adopt frozen write sources",
         ))
     }
 

@@ -1036,34 +1036,22 @@ impl<'a> AnalyzerContext<'a> {
         }
     }
 
-    /// Analyze ordinary syntax VALUES and the original checked materialized inputs.
+    /// Analyze syntax VALUES, retaining checked expression constants at their exact sites.
     fn analyze_values(
         &self,
         values: &ast::Values,
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope();
-        let materialized = self
-            .materialized_values
-            .and_then(|source| source.rows_at(values));
-        let row_count = materialized.map_or_else(|| values.rows.len(), |rows| rows.len());
+        let row_count = values.rows.len();
         let mut resolved_rows = Vec::with_capacity(row_count);
         let mut column_types = Vec::new();
         for row_idx in 0..row_count {
             self.check_control()?;
-            let width =
-                materialized.map_or_else(|| values.rows[row_idx].len(), |rows| rows[row_idx].len());
+            let width = values.rows[row_idx].len();
             let mut resolved_row = Vec::with_capacity(width);
             for col_idx in 0..width {
                 self.check_control()?;
-                let typed = if let Some(rows) = materialized {
-                    let value = &rows[row_idx][col_idx];
-                    TypedExpr {
-                        kind: ExprKind::Constant(value.clone()),
-                        value_type: value.value_type().clone(),
-                    }
-                } else {
-                    self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?
-                };
+                let typed = self.analyze_expr(&values.rows[row_idx][col_idx], &scope)?;
                 if col_idx < column_types.len() {
                     column_types[col_idx] = helpers::assignment_common_value_type(
                         &column_types[col_idx],

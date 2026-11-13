@@ -877,7 +877,6 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
                 colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
                 layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
             },
-            Vec::new(),
         )
         .expect("route facts")
     };
@@ -2721,7 +2720,7 @@ fn document_publication_for_refusal(
     );
     (
         ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
-            declaration,
+            declaration: Box::new(declaration),
             shape: ConnectorManagedPublicationShape::Data,
         },
         base,

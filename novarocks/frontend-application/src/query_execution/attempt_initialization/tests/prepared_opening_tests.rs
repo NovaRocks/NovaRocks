@@ -254,7 +254,6 @@ impl ProviderReadSplitManager for Provider {
 impl ProviderReadMetadata for Provider {
     type PreparedSourceRead = UnsupportedPreparedSourceRead;
     type PreparedRelation = ();
-    type FrozenSource = ();
     fn prepare_relation<'a>(
         &'a self,
         _: &'a read::ConnectorSession,

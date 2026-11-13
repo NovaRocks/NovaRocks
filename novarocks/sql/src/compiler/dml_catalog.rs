@@ -33,7 +33,6 @@ pub struct SqlDmlCatalogPreparation {
     session: SqlSessionContext,
     control: SqlCompileControl,
     intent: SqlCompileIntent,
-    root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
 }
 
 impl SqlDmlCatalogPreparation {
@@ -48,28 +47,22 @@ impl SqlDmlCatalogPreparation {
             session,
             control,
             SqlCompileIntent::IcebergWrite { root_distribution },
-            None,
         )
     }
 
-    /// The same catalog prepass for the closed DML computation families. An
-    /// internal COW read retains its complete signed root declaration here.
+    /// The same catalog prepass for the closed DML write computation families.
     pub fn try_new_for_intent(
         statement: SqlStatementInput,
         session: SqlSessionContext,
         control: SqlCompileControl,
         intent: SqlCompileIntent,
-        root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
     ) -> Result<Self, SqlCompileError> {
         if !matches!(
             &intent,
-            SqlCompileIntent::IcebergWrite { .. }
-                | SqlCompileIntent::ChangeStreamWrite
-                | SqlCompileIntent::DmlInternalRead
-        ) || (root_output_declaration.is_some() && intent != SqlCompileIntent::DmlInternalRead)
-        {
+            SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
+        ) {
             return Err(SqlCompileError::InvalidRequest(
-                "DML catalog preparation requires its exact write or internal-read contract".into(),
+                "DML catalog preparation requires its exact write contract".into(),
             ));
         }
         control.check()?;
@@ -105,7 +98,6 @@ impl SqlDmlCatalogPreparation {
             session,
             control,
             intent,
-            root_output_declaration,
         })
     }
 
@@ -160,10 +152,6 @@ impl SqlDmlCatalogPreparation {
             policy,
             self.control,
         );
-        let request = match self.root_output_declaration {
-            Some(declaration) => request.with_root_output_declaration(declaration)?,
-            None => request,
-        };
         SqlCompiler::analyze(request)?.into_pending()
     }
 }
@@ -343,91 +331,17 @@ mod tests {
     }
 
     #[test]
-    fn complete_materialized_rows_retain_the_original_checked_values() {
-        let control = SqlCompileControl::unbounded();
-        let value = variant(&control);
-        let mut query = query("SELECT v.payload FROM (VALUES (0)) AS v(payload)");
-        let novarocks_parser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-            panic!("SELECT fixture")
-        };
-        let novarocks_parser::ast::TableFactor::Derived { subquery, .. } =
-            &mut select.from[0].relation
-        else {
-            panic!("derived fixture")
-        };
-        let novarocks_parser::ast::SetExpr::Values(values) = subquery.body.as_mut() else {
-            panic!("VALUES fixture")
-        };
-        values.rows.clear();
-        let input = SqlStatementInput::materialized_values_query(
-            Box::new(query),
-            super::super::SqlMaterializedValuesSite::SelectFromDerived { from: 0 },
-            vec![vec![value.clone()].into_boxed_slice()].into(),
-            &control,
-        )
-        .unwrap();
-        let analyzed = analyze(prepare(input), &[]).unwrap();
-        assert_original_constant(&analyzed, &value);
-    }
-
-    #[test]
-    fn internal_read_preserves_its_signed_root_declaration_through_async_catalog_preparation() {
-        let declaration = vec![novarocks_type_contract::FunctionValueType::new(
-            arrow::datatypes::DataType::Int16,
-            true,
-        )];
-        let source = SqlDmlCatalogPreparation::try_new_for_intent(
-            SqlStatementInput::parsed_query(Box::new(query("SELECT 1 AS __nr_sel_0"))),
-            session(),
-            SqlCompileControl::unbounded(),
-            SqlCompileIntent::DmlInternalRead,
-            Some(declaration.clone()),
-        )
-        .unwrap();
-        assert!(source.needs().is_empty());
-        assert_eq!(source.root_output_declaration.as_ref(), Some(&declaration));
-        let analyzed = analyze(source, &[]).expect("signed internal read analyzes");
-        assert_eq!(analyzed.intent, SqlCompileIntent::DmlInternalRead);
-        let output = crate::planner::plan_output_columns(&analyzed.logical_plan).unwrap();
-        assert_eq!(output.len(), 1);
-        // The declaration changes the original integer width. Analysis may
-        // retain a stronger non-NULL promise; every other type fact stays exact.
-        assert_eq!(
-            output[0].value_type.data_type(),
-            &arrow::datatypes::DataType::Int16
-        );
-        assert_eq!(
-            output[0].value_type.with_nullable(true).unwrap(),
-            declaration[0]
-        );
-    }
-
-    #[test]
-    fn change_stream_preserves_its_compile_intent_and_refuses_internal_read_declarations() {
+    fn change_stream_preserves_its_compile_intent() {
         let source = SqlDmlCatalogPreparation::try_new_for_intent(
             SqlStatementInput::parsed_query(Box::new(query("SELECT 1"))),
             session(),
             SqlCompileControl::unbounded(),
             SqlCompileIntent::ChangeStreamWrite,
-            None,
         )
         .unwrap();
         assert_eq!(
             analyze(source, &[]).unwrap().intent,
             SqlCompileIntent::ChangeStreamWrite
-        );
-        assert!(
-            SqlDmlCatalogPreparation::try_new_for_intent(
-                SqlStatementInput::parsed_query(Box::new(query("SELECT 1"))),
-                session(),
-                SqlCompileControl::unbounded(),
-                SqlCompileIntent::ChangeStreamWrite,
-                Some(vec![novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    false
-                )]),
-            )
-            .is_err()
         );
     }
 }

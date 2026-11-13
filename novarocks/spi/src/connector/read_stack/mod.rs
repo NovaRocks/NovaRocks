@@ -81,7 +81,7 @@ pub use projection::{
 };
 pub use public_schema::{ConnectorReadPublicSchema, ConnectorReadSchemaCreation};
 pub use runtime::{
-    ConnectorAdmittedReadProviderFactory, ConnectorFrozenReadSource, ConnectorPreparedSourceRead,
+    ConnectorAdmittedReadProviderFactory, ConnectorPreparedSourceRead,
     ConnectorPreparedSourceReadFuture, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,

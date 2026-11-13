@@ -14914,62 +14914,6 @@ mod tests {
     }
 
     #[test]
-    fn external_count_owner_keeps_writer_validation_without_a_summary_input() {
-        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
-        let input = column(1, "order_id", DataType::Int64, false);
-        let source = values(vec![input], Vec::new());
-        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
-        let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
-        let mut write =
-            simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
-        write.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
-        let plan = lower_final_physical_write_plan(
-            &source,
-            version(),
-            dop(),
-            FinalWriteLowering {
-                reads: None,
-                write,
-                write_target_ordinal: ordinal,
-                auxiliary: &auxiliary,
-                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
-            },
-            crate::functions::builtin_sql_function_catalog().snapshot(),
-            false,
-            crate::constant::test_constant_policy(),
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .unwrap()
-        .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
-        .unwrap()
-        .plan()
-        .clone();
-        let (node, finish) = plan
-            .fragments()
-            .values()
-            .flat_map(|fragment| fragment.nodes().values())
-            .find_map(|node| match &node.kind {
-                NodeKind::TableFinish(spec) => Some((node, spec)),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            finish.count_mode,
-            novarocks_physical_plan::FinishCountMode::ExternalOwner
-        );
-        assert_eq!(finish.expected_target_ordinals.as_ref(), &[ordinal]);
-        assert_eq!(node.inputs.len(), 1);
-        assert_eq!(finish.inputs.writer_results, 0);
-        assert!(finish.inputs.summaries.write_counts.is_none());
-        assert!(finish.summaries.write_counts.is_none());
-        assert_eq!(
-            finish.input_schema.fields.len(),
-            novarocks_spi::connector::write_stack::WRITE_RELATION_COLUMN_COUNT
-        );
-        assert_eq!(finish.output_schema.fields.len(), 12);
-    }
-
-    #[test]
     fn ordinary_write_preserves_repeated_source_output_occurrences() {
         use crate::planner::distributed::write::contract::test_support::repeated_source_sql_write_plan_input;
 
@@ -15213,7 +15157,6 @@ mod tests {
                     colocation: ConnectorWriteColocation::ByKey(vec![raw_fields[0].token()]),
                     layout: ConnectorWriteLayoutPreference::None,
                 },
-                Vec::new(),
             )
             .unwrap()
         })
