@@ -19,7 +19,7 @@
 //! Arrow NULL behavior from ROUND's accepted Strict selected reader. They do
 //! not register a new Arrow-mode runtime kernel or adjudicate that behavior.
 
-use super::*;
+use super::super::*;
 use crate::builtin::binding_control;
 use arrow_schema::{Field, UnionFields};
 use novarocks_type_contract::CompilePhase;

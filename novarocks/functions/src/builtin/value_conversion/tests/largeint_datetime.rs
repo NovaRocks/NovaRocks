@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact existing LARGEINT_SIGNED + numeric calendar composition.
-use super::*;
+use super::super::*;
 use arrow_schema::TimeUnit;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ValueConstructionFailure, ValueTypeStorageHold,
@@ -117,7 +117,7 @@ impl Drop for Creator {
 }
 #[test]
 fn largeint_datetime_intermediate_retains_actual_caller_creator_after_constructor_exits() {
-    use super::super::scalar_construction::ScalarConstruction;
+    use super::super::super::scalar_construction::ScalarConstruction;
     let exits = Arc::new(AtomicUsize::new(0));
     let intermediate = {
         let storage = ValueTypeStorageLifetime::held(Arc::new(Creator(exits.clone())));
@@ -142,7 +142,7 @@ fn largeint_datetime_intermediate_retains_actual_caller_creator_after_constructo
 }
 #[test]
 fn largeint_datetime_intermediate_every_actual_constructor_refusal_is_preserved_without_tail() {
-    use super::super::scalar_construction::{OwnerFailure, ScalarConstruction};
+    use super::super::super::scalar_construction::{OwnerFailure, ScalarConstruction};
     let source = source(false);
     let target = target(true);
     let mut observed = Vec::new();

@@ -588,3 +588,5 @@ fn interval_digits_keep_prepared_deferred_nonempty_refusal() {
         );
     }
 }
+
+mod arrow;

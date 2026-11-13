@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use arrow_array::{Array, Int64Array};
 use novarocks_type_contract::{CompileControlError, CompilePhase};
 use std::sync::Mutex;
