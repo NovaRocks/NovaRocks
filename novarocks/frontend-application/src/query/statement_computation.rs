@@ -704,7 +704,7 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
         if let Some(output) = &self.output {
             let cpu = output.cpu_custody();
             cpu.begin_close();
-            match cpu.poll_join_closed(cx) {
+            match cpu.poll_statement_closed(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(cause)) => {
                     self.close_failure = Some(StatementNativeHealthFailure::actual_exit_unproven(
