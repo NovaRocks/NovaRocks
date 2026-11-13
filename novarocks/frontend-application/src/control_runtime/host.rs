@@ -1176,6 +1176,7 @@ impl HostRegistry {
         }
         let mut handoff_refused = false;
         let mut observation_advanced = false;
+        let mut indexed_this_turn = false;
         if budget != 0 {
             let indexed = original_dispatch!(machine.dispatch.index_committed_with(
                 &self.runtime,
@@ -1190,6 +1191,7 @@ impl HostRegistry {
                 }
             ));
             budget -= indexed.units;
+            indexed_this_turn = !indexed.inputs.is_empty();
             if attempt
                 && !indexed.inputs.is_empty()
                 && let Some(timer) = self
@@ -1480,6 +1482,13 @@ impl HostRegistry {
                 }
             }
         }
+        // Keep a fresh scan owed by actual indexing/retirement work across
+        // the budget cut. Snapshot before clearing a completed Full pass so
+        // an exact-budget pass does not restart without a real change.
+        let initial_scan_pending = budget == 0
+            && (retired.progressed || indexed_this_turn)
+            && machine.scan_remaining.is_none()
+            && machine.dispatch.ready_positions() != 0;
         let mut rescan = false;
         if machine.scan_remaining == Some(0) {
             machine.scan_remaining = None;
@@ -1492,6 +1501,7 @@ impl HostRegistry {
             || controls_more
             || timer_more
             || observation_advanced
+            || initial_scan_pending
             || rescan
             || machine.dispatch.has_unindexed(&self.runtime)?
             || (budget == 0

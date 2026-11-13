@@ -117,6 +117,7 @@ struct Observed {
     bound: Vec<u64>,
     origins: Vec<bool>,
     availability_changes: usize,
+    retirement_checks: usize,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum FailurePoint {
@@ -156,6 +157,7 @@ struct Bank {
     closed: bool,
     failed: Option<PendingHandoff>,
     failure_hook: Option<FailureHook>,
+    inspect_pending_retirement: bool,
 }
 fn take_failure_hook(bank: &mut Bank, point: FailurePoint) -> Option<FailureHook> {
     if bank
@@ -250,6 +252,23 @@ impl EffectSource for PurposeSource {
         budget: usize,
     ) -> SourceProgress {
         let mut bank = self.0.lock().unwrap();
+        if bank.inspect_pending_retirement {
+            let mut units = 0;
+            // Every unit pays one real original custody readiness inspection.
+            // None of these never-started jobs has actually exited; observing
+            // Pending neither returns its loan nor manufactures progress.
+            for original in bank.originals.values().take(budget) {
+                assert!(!original.custody.actual_exit_ready().unwrap());
+                units += 1;
+            }
+            bank.observed.retirement_checks += units;
+            return SourceProgress {
+                units,
+                progressed: false,
+                more: false,
+                retired: false,
+            };
+        }
         let changed = budget != 0 && std::mem::take(&mut bank.changed);
         if changed {
             bank.observed.availability_changes += 1;
@@ -381,6 +400,7 @@ impl Fixture {
             closed: false,
             failed: None,
             failure_hook: None,
+            inspect_pending_retirement: false,
         };
         for (value, work, mut capacity) in reserved {
             let role = CausalInputObligation::reserve_admitted(
@@ -859,6 +879,128 @@ fn actual_completion_during_active_pass_rescans_the_new_same_lane_head() {
     assert_eq!(observed.returned, 0);
     assert!(observed.origins.iter().all(|same| *same));
     assert_eq!(dropped, 16);
+}
+
+#[test]
+fn an_exact_budget_full_scan_reaches_idle_without_restarting_itself() {
+    // The same original fixture derives ten Host units. After original
+    // indexing, exactly ten Full heads consume one complete finite pass.
+    // Ending that pass must not look like a fresh scan that never started.
+    let full = (1..=10).collect::<Vec<_>>();
+    let f = Fixture::new(
+        full.iter()
+            .map(|&value| vec![(value, value, vec![])])
+            .collect(),
+        &full,
+    );
+    for batch in 0..10 {
+        f.send(batch);
+    }
+    let budget = f.host.state.lock().unwrap().entries[&f.scope.id()].budget;
+    let (turns, idle) = f.to_idle();
+    let (observed, accepted) = f.captured();
+    let no_idle_claims = (0..8).all(|_| {
+        let turn = f.runtime.claim_host_actor();
+        let idle = turn.is_none();
+        if let Some(turn) = turn {
+            turn.release(false).unwrap();
+        }
+        idle
+    });
+    let visited = observed.visits.iter().copied().collect::<BTreeSet<_>>();
+    let cleanup = f.finish(false);
+    // Both behavior and the bounded no-spin oracle follow actual cleanup.
+    assert_eq!(budget, 10);
+    assert_eq!(cleanup, (10, true));
+    assert!(turns < 128 && idle && no_idle_claims);
+    assert_eq!(visited.len(), 10);
+    assert!(accepted.is_empty() && observed.borrowed.is_empty() && observed.bound.is_empty());
+    assert_eq!(observed.returned, 0);
+}
+
+#[test]
+fn an_original_credit_return_survives_exact_index_budget_before_a_new_scan() {
+    // The maximum batch has two effects, so this existing fixture derives a
+    // fifteen-unit Host allowance. Do not alter the actual registered budget.
+    let groups = vec![
+        vec![(1, 1, vec![]), (2, 2, vec![])],
+        vec![(3, 3, vec![]), (4, 4, vec![])],
+        vec![(5, 5, vec![]), (6, 6, vec![])],
+        vec![(7, 7, vec![]), (8, 8, vec![])],
+        vec![(9, 9, vec![]), (10, 10, vec![])],
+        vec![(11, 11, vec![])],
+    ];
+    let f = Fixture::new(groups, &(1..=11).collect::<Vec<_>>());
+    f.send(0);
+    let (_, first_idle) = f.to_idle();
+    let first_visits = f.captured().0.visits;
+    let no_partial_scan = !f.active_scan();
+    let budget = f.host.state.lock().unwrap().entries[&f.scope.id()].budget;
+    // This moves the same original paid loan back into its bank. Its one real
+    // availability change costs one unit; the next five original batches cost
+    // 4*(1+2)+(1+1)=14 index units. The old scan has already ended.
+    f.release_credit(1);
+    for batch in 1..6 {
+        f.send(batch);
+    }
+    let (_, idle) = f.to_idle();
+    let (observed, accepted) = f.captured();
+    let cleanup = f.finish(false);
+    assert!(first_idle && no_partial_scan && idle);
+    assert!(first_visits.contains(&1) && first_visits.contains(&2));
+    assert_eq!(budget, 15);
+    assert_eq!(cleanup, (11, true));
+    assert_eq!(observed.availability_changes, 1);
+    assert_eq!(accepted, vec![1]);
+    assert_eq!(observed.borrowed, vec![1]);
+    assert_eq!(observed.bound, vec![1]);
+    assert_eq!(observed.returned, 0);
+    assert!(observed.origins.iter().all(|same| *same));
+}
+
+#[test]
+fn pending_retirement_checks_that_fill_the_budget_do_not_restart_an_idle_scan() {
+    let full = (1..=10).collect::<Vec<_>>();
+    let f = Fixture::new(
+        full.iter()
+            .map(|&value| vec![(value, value, vec![])])
+            .collect(),
+        &full,
+    );
+    for batch in 0..10 {
+        f.send(batch);
+    }
+    let (_, first_idle) = f.to_idle();
+    let before = f.captured().0;
+    let scan_finished = {
+        let entry = f.host.state.lock().unwrap().entries[&f.scope.id()].clone();
+        entry
+            .machine
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .scan_remaining
+            .is_none()
+    };
+    let budget = f.host.state.lock().unwrap().entries[&f.scope.id()].budget;
+    f.bank.lock().unwrap().inspect_pending_retirement = true;
+    // One controlled original Host notification starts the readiness check.
+    // No new input, credit return, timer, or subsequent wake is submitted.
+    f.runtime.notify_host_actor(&f.registration).unwrap();
+    let (turns, idle) = f.to_idle();
+    let (observed, accepted) = f.captured();
+    let cleanup = f.finish(false);
+    // Inspect every outcome only after all original jobs/captures/roles exit.
+    assert!(first_idle && scan_finished);
+    assert_eq!(budget, 10);
+    assert_eq!(cleanup, (10, true));
+    assert_eq!(turns, 1);
+    assert!(idle);
+    assert_eq!(observed.retirement_checks, budget);
+    assert_eq!(observed.visits, before.visits);
+    assert_eq!(observed.availability_changes, 0);
+    assert!(accepted.is_empty() && observed.borrowed.is_empty() && observed.bound.is_empty());
 }
 
 #[test]
