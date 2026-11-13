@@ -142,7 +142,7 @@ pub(crate) fn materialize_target_value(
     }
     let mut growth = |layout| owner.request(layout).map_err(ExecutionFailure::from);
     validate_target_requiredness(array, &target, &mut growth, &mut observed_work)?;
-    if source.data_type() == target.output.data_type() {
+    if array.data_type() == target.output.data_type() {
         return Ok(Arc::clone(array));
     }
     let original = |failure| match failure {

@@ -92,7 +92,10 @@ pub use local_exchange_sink::LocalExchangeSinkFactory;
 pub use local_exchange_source::LocalExchangeSourceFactory;
 pub use noop_sink::NoopSinkFactory;
 #[cfg(test)]
-pub(crate) use project_processor::materialize_project_output;
+pub(crate) use project_processor::{
+    ProjectEncodingSource, materialize_project_output, materialize_project_output_owned,
+    project_reserve,
+};
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(any(test, novarocks_dev_controls))]
 pub(crate) use result_sink::{ResultSinkBuffer, ResultSinkFactory};

@@ -966,3 +966,280 @@ fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
         }
     }
 }
+
+#[test]
+fn identity_slot_preserves_required_binding_and_null_parent_carrier() {
+    use crate::exec::chunk::ChunkSlotSchema;
+    use crate::exec::operators::family_fixture::{
+        FixtureControl, compile, constant_policy, package,
+    };
+    use crate::exec::pipeline::operator::input_construction::{
+        ConstructionFailure, try_runtime_input_construction_factory,
+    };
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, StructArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Field;
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_physical_plan::{
+        ConstantPool, ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder,
+        FragmentId, NodeId, ValueOrigin,
+    };
+    use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueTypeStorageLifetime};
+
+    let required =
+        DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(4), false)].into());
+    let source_type = FunctionValueType::new(required.clone(), true);
+    // The static program has a legal exact constant declaration and values.
+    // Its runtime input is supplied independently, as a reader supplies a page.
+    let present: ArrayRef =
+        Arc::new(FixedSizeBinaryArray::try_from_iter([b"abcd", b"efgh"].into_iter()).unwrap());
+    let DataType::Struct(fields) = &required else {
+        unreachable!()
+    };
+    let admitted = StructArray::try_new(fields.clone(), vec![present], None).unwrap();
+    let pool = ConstantPool::try_new(
+        Arc::new(Field::new("st", required, true)),
+        source_type.clone(),
+        admitted.to_data(),
+        constant_policy(),
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    let pool_id = ConstantPoolId::new(904);
+    let mut constants = ConstantPools::empty();
+    constants.insert(pool_id, pool).unwrap();
+    let mut builder = FragmentBuilder::new(FragmentId::new(66));
+    let source = NodeId::new(0);
+    let project = NodeId::new(1);
+    let input = builder
+        .add_value(
+            source_type.clone(),
+            ValueOrigin::NodeOutput {
+                node: source,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    let rows = (0..2)
+        .map(|ordinal| {
+            vec![
+                builder
+                    .add_expression(
+                        source,
+                        source_type.clone(),
+                        ExprKind::Constant(ConstantReference {
+                            pool: pool_id,
+                            ordinal,
+                        }),
+                    )
+                    .unwrap(),
+            ]
+            .into_boxed_slice()
+        })
+        .collect::<Vec<_>>();
+    builder
+        .add_values(source, rows.into_boxed_slice(), Box::from([input]))
+        .unwrap();
+    let expression = builder
+        .add_expression(project, source_type, ExprKind::Value(input))
+        .unwrap();
+    let output = builder
+        .add_value(
+            FunctionValueType::new(admitted.data_type().clone(), true),
+            ValueOrigin::Expr {
+                node: project,
+                expr: expression,
+            },
+        )
+        .unwrap();
+    builder
+        .add_project(
+            project,
+            source,
+            Box::from([(expression, output)]),
+            Box::from([output]),
+        )
+        .unwrap();
+    let program = compile(package(builder, project, constants, 1), 1);
+    let layout = program.graph().nodes()[0].output_layout();
+    let binding = layout.value_binding_at(0).unwrap();
+    let expected = binding.data_type().clone();
+    let DataType::Struct(fields) = &expected else {
+        panic!("frozen source Struct")
+    };
+    assert!(
+        !fields[0].is_nullable(),
+        "the original source still promises a required child"
+    );
+    let actual: ArrayRef = Arc::new(
+        StructArray::try_new(
+            vec![Arc::new(fields[0].as_ref().clone().with_nullable(true))].into(),
+            vec![Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some(b"abcd".as_slice()), None].into_iter(),
+                    4,
+                )
+                .unwrap(),
+            )],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap(),
+    );
+    let actual_type = actual.data_type().clone();
+    assert_ne!(
+        actual_type, expected,
+        "the reader carrier has its own physical NULL flag"
+    );
+    let pure = ValueTypeStorageLifetime::pure();
+    let slot = ChunkSlotSchema::try_new_typed(
+        layout.slots()[0],
+        Arc::new(
+            layout
+                .schema()
+                .field(0)
+                .clone()
+                .with_data_type(actual_type.clone()),
+        ),
+        binding.clone(),
+        None,
+        pure.clone(),
+    )
+    .unwrap();
+    let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+    assert_eq!(schema.slots()[0].typed_binding(), binding);
+    let factory = try_runtime_input_construction_factory(
+        crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+        MemTracker::new_root("permissive fixed source construction"),
+        Arc::new(RuntimeErrorState::default()),
+    )
+    .unwrap();
+    let owner = factory.begin_typed_construction(&schema).unwrap();
+    owner
+        .observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns { channels: 1 },
+        )
+        .unwrap();
+    let mut chunk = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+        schema,
+        vec![actual],
+        2,
+        owner.storage_lifetime(),
+        |step| owner.observe(0, &[], step),
+    )
+    .unwrap();
+    let source_tracker = MemTracker::new_root("permissive fixed source payload");
+    chunk.try_transfer_to(&source_tracker).unwrap();
+    assert!(source_tracker.current() > 0);
+    // Materialization keeps the legal source carrier for both full and sparse
+    // demand; the actual Project output author then rebuilds its declared port.
+    for selected in [vec![0, 1], vec![1]] {
+        let selection = if selected.len() == 2 {
+            Selection::all(2)
+        } else {
+            Selection::try_sparse(2, &selected).unwrap()
+        };
+        let original_array = chunk.columns()[0].clone();
+        let original_owner = chunk.source_authority().owner_identity();
+        let seen = Arc::new(Mutex::new(0));
+        let observed = seen.clone();
+        let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
+            let (array, source) = column.into_parts();
+            assert!(Arc::ptr_eq(array, &original_array));
+            let BorrowedInputSource::Attached(source) = source else {
+                panic!("original source loan")
+            };
+            assert_eq!(source.owner_identity(), original_owner);
+            *observed.lock().unwrap() += 1;
+        });
+        let host_tracker = MemTracker::new_root("permissive fixed identity result");
+        let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+            program.clone(),
+            ProgramExpressionRootSite::Node {
+                node: ProgramNodeId::new(1),
+                role: ProgramNodeExpressionRole::ProjectOutput { expression: 0 },
+            },
+            &Control,
+            Some(crate::runtime::tracked_state_allocator::expression_allocation_host(host_tracker)),
+        )
+        .unwrap();
+        instance.observe_slot_source(observer);
+        let output = evaluate(&mut instance, CompiledInputLoan::from_chunk(&chunk), selection)
+            .unwrap_or_else(|failure| panic!(
+                "legal NULL-parent Slot must materialize: selected={selected:?}, expected={expected:?}, actual={actual_type:?}, fact={:?}, failure={failure:?}",
+                failure.failure_fact(),
+            ));
+        assert_eq!(*seen.lock().unwrap(), 1);
+        assert_eq!(output.values().data_type(), &actual_type);
+        assert!(output.errors().is_empty());
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let child = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        for (ordinal, source_row) in selected.iter().copied().enumerate() {
+            assert_eq!(values.is_null(ordinal), source_row == 1);
+            if source_row == 0 {
+                assert_eq!(child.value(ordinal), b"abcd");
+            } else {
+                assert!(child.is_null(ordinal));
+            }
+        }
+        let declared = factory
+            .create_compiled_chunk_schema(program.graph().nodes()[1].output_layout())
+            .unwrap();
+        let project_owner = factory.begin_typed_construction(&declared).unwrap();
+        let storage = chunk
+            .source_storage_lifetime_observed::<ConstructionFailure>(
+                project_owner.storage_lifetime(),
+                |layout| project_owner.request(layout),
+            )
+            .unwrap();
+        let mut columns =
+            crate::exec::operators::project_reserve::<ArrayRef>(1, project_owner.as_ref()).unwrap();
+        columns.push(output.values().clone());
+        let projected = crate::exec::operators::materialize_project_output_owned(
+            columns,
+            selected.len(),
+            declared,
+            |_| Ok(binding),
+            |_| Ok(crate::exec::operators::ProjectEncodingSource::Plain),
+            storage,
+            project_owner.as_ref(),
+        )
+        .expect("the actual Project author rebuilds its frozen required-child output");
+        assert_eq!(projected.columns()[0].data_type(), &expected);
+        assert_eq!(projected.chunk_schema().slots()[0].typed_binding(), binding);
+        let projected_values = projected.columns()[0]
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let projected_child = projected_values
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        for (ordinal, source_row) in selected.iter().copied().enumerate() {
+            assert_eq!(projected_values.is_null(ordinal), source_row == 1);
+            if source_row == 0 {
+                assert_eq!(projected_child.value(ordinal), b"abcd");
+            }
+        }
+        // A required Struct child may physically remain NULL below its NULL
+        // parent; the declared child field and active-value check are exact.
+        assert!(!projected_values.fields()[0].is_nullable());
+        drop(projected);
+        drop(output);
+        drop(instance);
+    }
+    drop(chunk);
+    assert_eq!(source_tracker.current(), 0);
+}
