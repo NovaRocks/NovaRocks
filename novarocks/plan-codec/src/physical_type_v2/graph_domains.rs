@@ -587,6 +587,7 @@ mod tests {
     }
     fn binding(id: u32) -> package_wire::ConnectorWriteFieldBinding {
         package_wire::ConnectorWriteFieldBinding {
+            storage_value_type_id: None,
             source_field_id: Some(id),
             field_token: vec![],
             value_type_id: None,

@@ -66,7 +66,7 @@ pub mod write_control;
 pub mod write_fence;
 pub mod write_io;
 mod write_preparation;
-mod write_shared;
+pub(crate) mod write_shared;
 pub mod write_stack;
 
 pub use mv_provenance::{

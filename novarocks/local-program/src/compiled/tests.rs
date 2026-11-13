@@ -110,6 +110,7 @@ fn checked_with(writer: bool, sink: bool, legacy: bool, nullable: bool) -> Progr
                 target: WriteTargetOrdinal::try_new(0).unwrap(),
                 expected_layout: layout.clone(),
                 projection: StaticWriterProjection {
+                    storage_types: vec![None],
                     arena,
                     expressions: vec![ProgramExprId::new(0)],
                     layout: layout.clone(),

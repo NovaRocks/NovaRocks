@@ -298,7 +298,10 @@ fn shared_if(catalog: &EngineFunctionCatalog) -> (Fragment, ExprId) {
                 events: Box::from([ChangeEventSpec {
                     predicate: Some(root),
                     effect: novarocks_connector_contract::ConnectorRowMutationEffect::Insert,
-                    assignments: Box::from([(value, Some(root))]),
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                        value,
+                        Some(root),
+                    )]),
                 }]),
                 effect_output: effect,
             },

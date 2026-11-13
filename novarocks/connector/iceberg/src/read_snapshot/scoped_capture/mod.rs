@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Prospective request-layout receipts for the actual COW capture pipeline.
+//! Prospective request-layout receipts for the actual scoped capture pipeline.
 
 use novarocks_spi::connector::{
-    ConnectorCowBeginCause, ConnectorError, ConnectorErrorKind, ConnectorOriginalResultScope,
+    ConnectorError, ConnectorErrorKind, ConnectorOriginalResultScope, ConnectorScopedBeginCause,
 };
 #[derive(Debug)]
 pub(crate) enum ReadFailure {
     Semantic(String),
-    Original(ConnectorCowBeginCause),
+    Original(ConnectorScopedBeginCause),
 }
 impl From<String> for ReadFailure {
     fn from(error: String) -> Self {
@@ -34,7 +34,7 @@ impl std::fmt::Display for ReadFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Semantic(message) => f.write_str(message),
-            Self::Original(_) => f.write_str("original COW capture check failed"),
+            Self::Original(_) => f.write_str("original scoped capture check failed"),
         }
     }
 }
@@ -43,8 +43,8 @@ impl ReadFailure {
     /// ordinary scan preparation without formatting either domain cause.
     pub(crate) fn into_connector(self) -> ConnectorError {
         match self {
-            Self::Original(ConnectorCowBeginCause::Provider(error)) => error,
-            Self::Original(ConnectorCowBeginCause::OriginalResult(error)) => {
+            Self::Original(ConnectorScopedBeginCause::Provider(error)) => error,
+            Self::Original(ConnectorScopedBeginCause::OriginalResult(error)) => {
                 ConnectorError::from_domain_static(
                     ConnectorErrorKind::Internal,
                     error,
@@ -58,7 +58,7 @@ impl ReadFailure {
         }
     }
 
-    pub(crate) fn into_cause(self) -> ConnectorCowBeginCause {
+    pub(crate) fn into_cause(self) -> ConnectorScopedBeginCause {
         match self {
             Self::Original(cause) => cause,
             Self::Semantic(message) => {

@@ -82,22 +82,6 @@ fn relation_ordinal(
     Ok(None)
 }
 
-/// The first position of `value` in `values`.
-fn first_position(
-    values: &[ValueId],
-    value: ValueId,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Option<usize>, FragmentCompileError> {
-    for (ordinal, candidate) in values.iter().enumerate() {
-        let found = *candidate == value;
-        work.step()?;
-        if found {
-            return Ok(Some(ordinal));
-        }
-    }
-    Ok(None)
-}
-
 /// Every writer call has one logical value channel.
 fn admit_single_channel(
     node: &PhysicalNode,
@@ -123,8 +107,25 @@ fn admit_single_channel(
     Ok(())
 }
 
+fn projected_position(
+    target: &WriterTarget,
+    value: ValueId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<usize>, FragmentCompileError> {
+    let mut found = None;
+    for (ordinal, field) in target.target_fields.iter().enumerate() {
+        work.step()?;
+        if field.projected == value && found.replace(ordinal).is_some() {
+            return Err(FragmentCompileError::Invalid(
+                "writer partial aggregate input has duplicate projected owners",
+            ));
+        }
+    }
+    Ok(found)
+}
+
 /// Admit a writer's partial calls: each runs its Partial phase over one value
-/// of the writer's own target input and writes one auxiliary channel of its
+/// of the writer's own projected input and writes one auxiliary channel of its
 /// multiplex relation.
 pub(crate) fn admit_partial_calls(
     node: &PhysicalNode,
@@ -140,7 +141,7 @@ pub(crate) fn admit_partial_calls(
             ));
         }
         admit_single_channel(node, call)?;
-        if first_position(&target.input, call.input, work)?.is_none() {
+        if projected_position(target, call.input, work)?.is_none() {
             return Err(unsupported(
                 node,
                 "writer partial aggregate over a value outside its target input",
@@ -316,7 +317,7 @@ fn resolved_signature(
 }
 
 /// Lower one writer's partial calls. A call reads the projected field of the
-/// first target input position holding its value and writes the multiplex
+/// exact projected field position and writes the multiplex
 /// slot of its auxiliary output field.
 pub(crate) fn lower_partial_calls<H>(
     target: &WriterTarget,
@@ -336,7 +337,7 @@ pub(crate) fn lower_partial_calls<H>(
     let mut calls = Vec::new();
     reserve_vec(&mut calls, target.partial_aggregates.len(), work)?;
     for call in target.partial_aggregates.iter() {
-        let input = first_position(&target.input, call.input, work)?.ok_or(
+        let input = projected_position(target, call.input, work)?.ok_or(
             FragmentCompileError::Invalid("writer partial aggregate input is not projected"),
         )?;
         let output = relation_ordinal(

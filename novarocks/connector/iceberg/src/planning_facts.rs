@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType as ArrowDataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorColumnDefault, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
@@ -192,6 +192,7 @@ enum PlanningAuthority {
 fn table_planning_columns<'a>(
     input: &IcebergTablePlanningFactsInput<'a>,
     authority: PlanningAuthority,
+    write_inputs: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
 ) -> Result<TablePlanningColumns<'a>, ConnectorError> {
     let column_facts = input
         .schema
@@ -236,16 +237,21 @@ fn table_planning_columns<'a>(
             };
             // A selected snapshot supplies read facts, never authority to
             // write through its historical defaults or target representation.
-            let (write_default, write_target_type) = match authority {
+            let (write_default, write_input) = match authority {
                 PlanningAuthority::Current => {
                     let current_schema = input.iceberg_schema.and_then(|_| {
                         input
                             .table_metadata
                             .map(|metadata| metadata.current_schema().as_ref())
                     });
+                    let declaration = write_inputs
+                        .get(ordinal)
+                        .filter(|declaration| declaration.field().name() == field.name());
                     (
                         iceberg_write_default(current_schema, field.name())?,
-                        iceberg_write_target_type(current_schema, field.name(), field.data_type()),
+                        declaration
+                            .filter(|declaration| declaration.storage_type().is_some())
+                            .cloned(),
                     )
                 }
                 PlanningAuthority::HistoricalRead => (None, None),
@@ -262,7 +268,7 @@ fn table_planning_columns<'a>(
                 role,
             )
             .with_write_default(write_default)
-            .with_write_target_type(write_target_type))
+            .with_write_input(write_input))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let metadata = input.table_metadata;
@@ -285,15 +291,31 @@ fn table_planning_columns<'a>(
     })
 }
 
+#[cfg(test)]
 pub fn table_planning_facts(
     input: IcebergTablePlanningFactsInput<'_>,
+) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
+    crate::metadata::with_pure_schema_creation(input.context, |creation| {
+        let declarations = match (input.iceberg_schema, input.table_metadata) {
+            (Some(_), Some(metadata)) => {
+                crate::commit::write_shared::canonical_data_write_fields(metadata, creation)?
+            }
+            _ => Vec::new(),
+        };
+        table_planning_facts_with_write_inputs(input, &declarations)
+    })
+}
+
+pub(crate) fn table_planning_facts_with_write_inputs(
+    input: IcebergTablePlanningFactsInput<'_>,
+    declarations: &[novarocks_spi::connector::ConnectorWriteFieldRequest],
 ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
     let TablePlanningColumns {
         column_facts,
         unique_constraints,
         foreign_key_constraints,
         metadata,
-    } = table_planning_columns(&input, PlanningAuthority::Current)?;
+    } = table_planning_columns(&input, PlanningAuthority::Current, declarations)?;
     let partition_source_column_ordinals = match (metadata.as_ref(), input.iceberg_schema) {
         (Some(metadata), Some(_)) => {
             iceberg_partition_source_ordinals(metadata, metadata.current_schema(), input.schema)?
@@ -323,7 +345,7 @@ pub fn table_planning_facts(
 pub(crate) fn snapshot_source_planning_facts(
     input: IcebergTablePlanningFactsInput<'_>,
 ) -> Result<ConnectorTablePlanningFacts, ConnectorError> {
-    let facts = table_planning_columns(&input, PlanningAuthority::HistoricalRead)?;
+    let facts = table_planning_columns(&input, PlanningAuthority::HistoricalRead, &[])?;
     ConnectorTablePlanningFacts::try_new_snapshot_source(
         input.schema,
         facts.column_facts,
@@ -331,29 +353,6 @@ pub(crate) fn snapshot_source_planning_facts(
         facts.foreign_key_constraints,
         input.context,
     )
-}
-
-/// The Arrow type this column takes as a row-DML write target, when that is not
-/// the same as its read type.
-///
-/// Iceberg `variant` and `binary` are the two types whose write-target encoding
-/// deliberately differs from the read encoding NovaRocks presents to SQL. This
-/// projects that existing divergence as an explicit signed fact instead of
-/// having each write caller re-derive it from an Iceberg schema.
-fn iceberg_write_target_type(
-    iceberg_schema: Option<&crate::iceberg::spec::Schema>,
-    field_name: &str,
-    read_type: &ArrowDataType,
-) -> Option<ArrowDataType> {
-    use crate::iceberg::spec::{PrimitiveType, Type};
-
-    let nested = iceberg_schema?.field_by_name(field_name)?;
-    let write_type = match nested.field_type.as_ref() {
-        Type::Variant(_) => ArrowDataType::LargeBinary,
-        Type::Primitive(PrimitiveType::Binary) => ArrowDataType::Binary,
-        _ => return None,
-    };
-    (write_type != *read_type).then_some(write_type)
 }
 
 /// Arrow ordinals of the columns the table's current default partition spec
@@ -820,9 +819,12 @@ mod tests {
             });
             let facts = result.unwrap();
             assert_eq!(facts.column_facts().len(), 2);
-            assert!(facts.column_facts().iter().all(|fact| {
-                fact.write_default().is_none() && fact.write_target_type().is_none()
-            }));
+            assert!(
+                facts
+                    .column_facts()
+                    .iter()
+                    .all(|fact| { fact.write_default().is_none() && fact.write_input().is_none() })
+            );
             assert_eq!(facts.partition_source_column_ordinals(), None);
         }
     }
@@ -916,10 +918,77 @@ mod tests {
     }
 
     #[test]
-    fn spi5h_write_target_type_is_declared_only_where_it_differs_from_the_read_type() {
-        // The read schema presents the variant column as Utf8, which is exactly
-        // the divergence the write-target fact has to carry. The binary column
-        // is already read as Binary, so it needs no override.
+    fn current_planning_publishes_full_canonical_input_but_history_never_grants_it() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        let iceberg = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                71,
+                "payload",
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            ))])
+            .build()
+            .unwrap();
+        // New-table construction assigns fresh IDs. Retain the explicit
+        // non-default ID through schema evolution, then use that one loaded
+        // metadata generation for both the read and canonical write authors.
+        let metadata = unpartitioned_metadata(&iceberg)
+            .into_builder(None)
+            .add_schema(iceberg)
+            .unwrap()
+            .set_current_schema(-1)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let iceberg = metadata.current_schema().as_ref();
+        let raw = Arc::new(crate::schema_mapping::sql_read_schema_from_iceberg(iceberg).unwrap());
+        assert_eq!(
+            raw.field(0)
+                .metadata()
+                .get("PARQUET:field_id")
+                .map(String::as_str),
+            Some("71")
+        );
+        let namespace = Arc::from("db");
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let context = context();
+        let nominals = BTreeMap::new();
+        let input = || IcebergTablePlanningFactsInput {
+            schema: &raw,
+            iceberg_schema: Some(iceberg),
+            metadata_columns: &[],
+            hidden_columns: &[],
+            nominal_declarations: &nominals,
+            table_metadata: Some(&metadata),
+            namespace: &namespace,
+            instance_id: &instance_id,
+            context: &context,
+        };
+        let current = table_planning_facts(input()).unwrap();
+        let declaration = current.column_facts()[0]
+            .write_input()
+            .expect("full W/T override");
+        assert_eq!(declaration.field().name(), "payload");
+        assert_eq!(declaration.field().metadata(), raw.field(0).metadata());
+        assert_eq!(declaration.field().data_type(), &DataType::Binary);
+        assert!(!declaration.field().is_nullable());
+        assert_eq!(
+            declaration.execution_type().unwrap().data_type(),
+            &DataType::Binary
+        );
+        assert_eq!(
+            declaration.storage_type().unwrap().data_type(),
+            &DataType::FixedSizeBinary(4)
+        );
+        let historical = snapshot_source_planning_facts(input()).unwrap();
+        assert!(historical.column_facts()[0].write_input().is_none());
+        assert_eq!(raw.field(0).data_type(), &DataType::FixedSizeBinary(4));
+    }
+
+    #[test]
+    fn complete_read_bindings_need_no_redundant_write_input_override() {
+        // Complete read declarations already carry VARIANT and BINARY. Raw
+        // Arrow display carriers do not require a second type interpretation.
         let arrow_schema = Arc::new(Schema::new(vec![
             Field::new("v", DataType::Utf8, true),
             Field::new("b", DataType::Binary, true),
@@ -929,12 +998,9 @@ mod tests {
         let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
             .expect("planning facts");
 
-        assert_eq!(
-            facts.column_facts()[0].write_target_type(),
-            Some(&DataType::LargeBinary)
-        );
-        assert_eq!(facts.column_facts()[1].write_target_type(), None);
-        assert_eq!(facts.column_facts()[2].write_target_type(), None);
+        assert_eq!(facts.column_facts()[0].write_input(), None);
+        assert_eq!(facts.column_facts()[1].write_input(), None);
+        assert_eq!(facts.column_facts()[2].write_input(), None);
     }
 
     #[test]
@@ -949,14 +1015,14 @@ mod tests {
         let facts = write_default_facts(Some(&write_target_type_schema()), &arrow_schema)
             .expect("planning facts");
 
-        assert_eq!(facts.column_facts()[3].write_target_type(), None);
+        assert_eq!(facts.column_facts()[3].write_input(), None);
         // A metadata table has no Iceberg schema at all.
         let metadata_table = write_default_facts(None, &arrow_schema).expect("planning facts");
         assert!(
             metadata_table
                 .column_facts()
                 .iter()
-                .all(|fact| fact.write_target_type().is_none())
+                .all(|fact| fact.write_input().is_none())
         );
         assert!(
             metadata_table

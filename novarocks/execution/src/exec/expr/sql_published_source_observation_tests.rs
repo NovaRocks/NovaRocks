@@ -187,6 +187,7 @@ fn dml(sql: &str, control: SqlCompileControl) -> Result<SqlAuthoredPhysicalPlan,
             namespace: "fixture".into(),
             table: "target".into(),
             fields: vec![DmlWriteTargetField {
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column.clone(),
                 is_hidden: false,

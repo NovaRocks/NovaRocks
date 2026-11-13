@@ -2012,6 +2012,7 @@ pub(crate) fn session_plan_from_targets(
     mut handle: IcebergWriteCommitSession,
     targets: Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
     statistics_metadata: Option<&TableMetadata>,
+    statistics_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let statistics_enabled = statistics_metadata.is_some_and(collect_on_write_enabled);
     // Statistics describe the rows a write produced, so a session with no
@@ -2039,6 +2040,7 @@ pub(crate) fn session_plan_from_targets(
                 &input,
                 statistics_metadata,
                 statistics_enabled && statistics_eligible,
+                statistics_context,
             )?;
             if !statistics.is_empty() {
                 expectations.insert(
@@ -2160,6 +2162,7 @@ fn write_statistics_contract(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     metadata: Option<&TableMetadata>,
     enabled: bool,
+    context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
 ) -> Result<WriteStatisticsContract, ConnectorError> {
     let Some(data_recipe) = writer.data() else {
         return WriteStatisticsContract::try_new(input, Vec::new());
@@ -2188,25 +2191,45 @@ fn write_statistics_contract(
     }
     let metadata = metadata
         .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
+    let context = context
+        .ok_or_else(|| invalid("Iceberg statistics lost its original preparation context"))?;
+    let declarations = crate::metadata::with_pure_schema_creation(context, |creation| {
+        crate::commit::write_shared::canonical_data_write_fields(metadata, creation)
+    })?;
     let iceberg_schema = metadata.current_schema();
-    // The engine binds the SQL read carrier at admission, so that is what a
-    // write input's columns are shaped by and what this gate has to compare
-    // against. Converting the Iceberg schema again here restated the carrier
-    // rule shallowly -- it adapted the top-level primitives and cloned every
-    // nested type verbatim -- and the two statements drifted apart the moment
-    // one of them said something about a nested field.
-    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
+    // The complete writer input is independent of storage. Field IDs and
+    // storage compatibility continue to come from the same frozen declaration.
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();
-        let Some((field_id, value_type)) = resolve_statistics_field(
+        let authoritative = declarations.iter().find(|declaration| {
+            declaration
+                .field()
+                .name()
+                .eq_ignore_ascii_case(field.name())
+        });
+        if authoritative.is_none()
+            && data_recipe.row_lineage()
+            && matches!(
+                field.name().as_str(),
+                crate::row_lineage_synth::ICEBERG_ROW_ID_COL
+                    | crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL
+            )
+        {
+            continue;
+        }
+        let authoritative = authoritative.ok_or_else(|| {
+            invalid("Iceberg statistics lost its complete authoritative writer declaration")
+        })?;
+        let Some((field_id, value_type)) = resolve_statistics_field_with_declaration(
             iceberg_schema,
-            &arrow_schema,
             field,
             data_recipe.row_lineage(),
             binding.execution_type().ok_or_else(|| {
                 invalid("Iceberg statistics writer input has no complete declaration")
             })?,
+            binding.storage_type(),
+            authoritative,
         )?
         else {
             continue;
@@ -2232,12 +2255,13 @@ fn write_statistics_contract(
     WriteStatisticsContract::try_new(input, requirements)
 }
 
-fn resolve_statistics_field(
+fn resolve_statistics_field_with_declaration(
     iceberg_schema: &crate::iceberg::spec::Schema,
-    arrow_schema: &arrow::datatypes::Schema,
     field: &arrow::datatypes::Field,
     row_lineage: bool,
     value_type: &novarocks_type_contract::FunctionValueType,
+    storage_type: Option<&novarocks_type_contract::FunctionValueType>,
+    authoritative: &novarocks_spi::connector::ConnectorWriteFieldRequest,
 ) -> Result<Option<(i32, novarocks_type_contract::FunctionValueType)>, ConnectorError> {
     let candidates = iceberg_schema
         .as_struct()
@@ -2246,7 +2270,7 @@ fn resolve_statistics_field(
         .enumerate()
         .filter(|(_, candidate)| candidate.name.eq_ignore_ascii_case(field.name()))
         .collect::<Vec<_>>();
-    let (schema_ordinal, iceberg_field) = match candidates.as_slice() {
+    let (_, iceberg_field) = match candidates.as_slice() {
         [] if row_lineage
             && matches!(
                 field.name().as_str(),
@@ -2270,8 +2294,11 @@ fn resolve_statistics_field(
             )));
         }
     };
-    let expected_arrow = arrow_schema.field(schema_ordinal).data_type();
-    if field.data_type() != expected_arrow || field.is_nullable() == iceberg_field.required {
+    let complete_matches = authoritative.execution_type() == Some(value_type)
+        && authoritative.storage_type() == storage_type
+        && authoritative.field().data_type() == field.data_type()
+        && authoritative.field().is_nullable() == field.is_nullable();
+    if !complete_matches {
         return Err(invalid(format!(
             "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
             field.name()
@@ -2340,12 +2367,12 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
     }
 }
 
-#[path = "control/cow_begin.rs"]
-pub(crate) mod cow_begin;
-#[path = "control/cow_begin_own.rs"]
-mod cow_begin_own;
 #[path = "control/rewrite_begin.rs"]
 mod rewrite_begin;
+#[path = "control/rewrite_scope.rs"]
+pub(crate) mod rewrite_scope;
+#[path = "control/rewrite_source.rs"]
+mod rewrite_source;
 
 impl IcebergWriteSessionControl {
     async fn admit_async_with_rewrite_io(
@@ -2689,7 +2716,7 @@ impl IcebergWriteSessionControl {
         }
         let base_sequence_number = source_snapshot_sequence(&metadata, base_snapshot_id)?;
         let facts = if let Some(scope) = rewrite_scope.as_ref() {
-            let loaded = cow_begin_own::loaded_facts(cow_begin_own::LoadedFactsInput {
+            let loaded = rewrite_source::loaded_facts(rewrite_source::LoadedFactsInput {
                 metadata: &metadata,
                 namespace,
                 table: table_name,
@@ -2701,7 +2728,7 @@ impl IcebergWriteSessionControl {
                 format_version: format_version_number(&metadata),
                 scope,
             })
-            .map_err(cow_begin::own_error)
+            .map_err(rewrite_scope::own_error)
             .map_err(formation_error)?;
             loaded.into_facts()
         } else {
@@ -2819,8 +2846,8 @@ impl IcebergWriteSessionControl {
             &request.context,
         )?;
         let signed = if let Some(scope) = rewrite_scope.as_ref() {
-            let signed = cow_begin_own::signed_input(&facts, &authored_input, scope)
-                .map_err(cow_begin::own_error)
+            let signed = rewrite_source::signed_input(&facts, &authored_input, scope)
+                .map_err(rewrite_scope::own_error)
                 .map_err(formation_error)?;
             signed.into_shape()
         } else {
@@ -2867,12 +2894,12 @@ impl IcebergWriteSessionControl {
                 .map(|size| size as u64),
             )?,
             data_recipe: if let Some(scope) = rewrite_scope.as_ref() {
-                cow_begin_own::data_recipe(
+                rewrite_source::data_recipe(
                     writer_metadata,
                     matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
                     scope,
                 )
-                .map_err(cow_begin::own_error)
+                .map_err(rewrite_scope::own_error)
                 .map_err(formation_error)?
             } else {
                 data_branch_recipe(
@@ -3034,17 +3061,16 @@ impl IcebergWriteSessionControl {
                     let snapshot = io.snapshot(owned, snapshot_id).await?;
                     let scope = io.formation_scope()?;
                     let capture =
-                        crate::read_snapshot::cow_capture::CaptureScope::new(scope.original())
+                        crate::read_snapshot::scoped_capture::CaptureScope::new(scope.original())
                             .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
-                    let checked =
-                        crate::manifest::finish_checked_cow_data_files_from_original_files(
-                            metadata,
-                            snapshot_id,
-                            snapshot.files,
-                            scope.original(),
-                            &capture,
-                        )
-                        .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
+                    let checked = crate::manifest::finish_checked_data_files_from_original_files(
+                        metadata,
+                        snapshot_id,
+                        snapshot.files,
+                        scope.original(),
+                        &capture,
+                    )
+                    .map_err(crate::distributed_rewrite::async_plan::capture_failure)?;
                     checked
                         .files
                         .into_iter()
@@ -3188,7 +3214,7 @@ fn sign_input_shape(
             .enumerate()
             .map(|(index, field)| {
                 let mut hasher = Sha256::new();
-                hasher.update(b"novarocks.iceberg.write-stack.field.v1\0");
+                hasher.update(b"novarocks.iceberg.write-stack.field.v2\0");
                 hasher.update(facts.table_uuid().as_bytes());
                 hasher.update([0]);
                 hasher.update(facts.target_ref().as_bytes());
@@ -3200,8 +3226,16 @@ fn sign_input_shape(
                 hasher.update([0]);
                 hasher.update(format!("{:?}", field.field().data_type()).as_bytes());
                 hasher.update([u8::from(field.field().is_nullable())]);
+                novarocks_connector_contract::write_input_projection_identity_observed(
+                    field.execution_type(),
+                    field.storage_type(),
+                    |bytes| {
+                        hasher.update(bytes);
+                        Ok::<(), ConnectorError>(())
+                    },
+                )?;
                 let token = ConnectorWriteFieldToken::from_bytes(hasher.finalize().into());
-                ConnectorWriteFieldBinding::try_new_typed(
+                let binding = ConnectorWriteFieldBinding::try_new_typed(
                     token,
                     field.field().clone(),
                     field
@@ -3210,7 +3244,11 @@ fn sign_input_shape(
                             invalid("Iceberg session field has no frozen complete declaration")
                         })?
                         .clone(),
-                )
+                )?;
+                match field.storage_type() {
+                    Some(storage) => binding.with_storage_type(storage.clone()),
+                    None => Ok(binding),
+                }
             })
             .collect::<Result<Vec<_>, ConnectorError>>()
     };
@@ -3644,7 +3682,7 @@ mod statistics_contract_tests {
 
     use super::{
         IcebergWriteSessionId, eager_proof_finalization, iceberg_write_phase_marker,
-        resolve_statistics_field, validate_theta_properties,
+        resolve_statistics_field_with_declaration, validate_theta_properties,
     };
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
@@ -3722,6 +3760,101 @@ mod statistics_contract_tests {
             .expect("schema")
     }
 
+    // Existing source-domain oracles also pass through the production resolver.
+    // The frozen declaration is independent of the supplied Field attributes.
+    fn resolve_statistics_field(
+        iceberg: &Schema,
+        arrow: &arrow::datatypes::Schema,
+        field: &Field,
+        lineage: bool,
+        value: &novarocks_type_contract::FunctionValueType,
+    ) -> Result<
+        Option<(i32, novarocks_type_contract::FunctionValueType)>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let original = arrow
+            .fields()
+            .iter()
+            .find(|candidate| candidate.name().eq_ignore_ascii_case(field.name()))
+            .expect("fixture source field");
+        let declaration = novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+            original.as_ref().clone(),
+            value.clone(),
+        )?;
+        resolve_statistics_field_with_declaration(
+            iceberg,
+            field,
+            lineage,
+            value,
+            None,
+            &declaration,
+        )
+    }
+
+    #[test]
+    fn statistics_canonical_bytes_preserve_storage_identity_and_reject_forged_width() {
+        use novarocks_spi::connector::ConnectorWriteFieldRequest;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let iceberg = schema(vec![Arc::new(NestedField::required(
+            31,
+            "payload",
+            Type::Primitive(PrimitiveType::Fixed(4)),
+        ))]);
+        let input = FunctionValueType::new(DataType::Binary, false);
+        let storage = FunctionValueType::new(DataType::FixedSizeBinary(4), false);
+        let field = Field::new("payload", DataType::Binary, false);
+        let declaration = ConnectorWriteFieldRequest::try_new_typed(field.clone(), input.clone())
+            .unwrap()
+            .with_storage_type(storage.clone())
+            .unwrap();
+        let (id, actual) = resolve_statistics_field_with_declaration(
+            &iceberg,
+            &field,
+            false,
+            &input,
+            Some(&storage),
+            &declaration,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(id, 31);
+        assert_eq!(actual, input);
+        assert_eq!(actual.logical_type(), ValueLogicalType::Physical);
+        for forged in [
+            None,
+            Some(FunctionValueType::new(DataType::FixedSizeBinary(8), false)),
+        ] {
+            assert!(
+                resolve_statistics_field_with_declaration(
+                    &iceberg,
+                    &field,
+                    false,
+                    &input,
+                    forged.as_ref(),
+                    &declaration,
+                )
+                .is_err()
+            );
+        }
+        let nominal = FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            false,
+            ValueLogicalType::Hll,
+        )
+        .unwrap();
+        assert!(
+            resolve_statistics_field_with_declaration(
+                &iceberg,
+                &field,
+                false,
+                &nominal,
+                Some(&storage),
+                &declaration,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn write_phase_marker_identifies_session_attempt_and_phase_without_table_facts() {
         let session_id = IcebergWriteSessionId::from_bytes([1; 16]);
@@ -3780,7 +3913,7 @@ mod statistics_contract_tests {
                     &arrow,
                     &field,
                     false,
-                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+                    &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
                 )
                 .is_err()
             );
@@ -3934,7 +4067,7 @@ mod statistics_contract_tests {
                         true,
                         novarocks_type_contract::ValueLogicalType::Uuid
                     )
-                    .unwrap()
+                    .unwrap(),
                 )
                 .is_err()
             );
@@ -3972,7 +4105,7 @@ mod statistics_contract_tests {
                 "object".into(),
             )]));
         assert_eq!(
-            resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen)
+            resolve_statistics_field(&iceberg, &arrow, &conflicting, false, &frozen,)
                 .unwrap()
                 .unwrap()
                 .1,
@@ -5491,7 +5624,13 @@ impl IcebergWriteSessionControl {
         let (handle, targets, statistics_metadata) = self
             .admit_async_with_rewrite_io(&request, rewrite_io)
             .await?;
-        session_plan_from_targets(&self.adapter, handle, targets, Some(&statistics_metadata))
+        session_plan_from_targets(
+            &self.adapter,
+            handle,
+            targets,
+            Some(&statistics_metadata),
+            Some(&request.context),
+        )
     }
 
     async fn abort_write_original(

@@ -155,6 +155,9 @@ pub(super) fn preflight(
     }
     for f in before.iter().chain(after) {
         bound.field(&f.field, 0)?;
+        if let Some(storage) = f.storage_type() {
+            bound.charge(novarocks_type_contract::owned_resources::type_representation::function_value_type_retained_bytes(storage).ok_or_else(exhausted)?)?;
+        }
     }
     bound.field(&effect.field, 0)?;
     let mut debug = DebugCount::default();

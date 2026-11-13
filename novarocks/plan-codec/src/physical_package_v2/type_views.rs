@@ -963,7 +963,7 @@ pub(crate) fn collect_package_type_views_in<'source>(
 mod tests {
     use super::*;
     use crate::physical_type_v2::{
-        PackageTypeProjectionLimits, encode_borrowed_type_namespaces_sources_in,
+        PackageTypeProjectionLimits, WriterTypeRootRole, encode_borrowed_type_namespaces_sources_in,
     };
     use arrow::datatypes::DataType;
     use novarocks_connector_contract as c;
@@ -1487,7 +1487,7 @@ mod tests {
                 views.fields().len(),
                 writers.len()
             ),
-            (24, 24, 0, 1)
+            (25, 25, 0, 1)
         );
         assert_eq!(
             (
@@ -1495,7 +1495,7 @@ mod tests {
                 budget.facts().value_root_count,
                 budget.facts().field_root_count
             ),
-            (24, 24, 1)
+            (25, 25, 1)
         );
         let encoded = encode_borrowed_type_namespaces_sources_in(
             views.values(),
@@ -1521,7 +1521,7 @@ mod tests {
                 encoded.as_wire().value_types.len(),
                 encoded.as_wire().fields.len()
             ),
-            (24, 0)
+            (25, 0)
         );
         for row in views.occurrences() {
             match (row.root, row.source) {
@@ -1739,5 +1739,58 @@ mod tests {
                 "axis {axis}"
             );
         }
+    }
+    #[test]
+    fn storage_target_type_root_retains_its_original_author_and_independent_id() {
+        let original = package();
+        let recipe = original.writes().values().next().unwrap();
+        let field = recipe.input().fields_iter().next().unwrap();
+        let field = field
+            .clone()
+            .with_storage_type(field.execution_type().unwrap().clone())
+            .unwrap();
+        let recipe = c::ConnectorWriteRecipeDraft::try_new(
+            recipe.binding().clone(),
+            recipe.payload().clone(),
+            c::ConnectorWriteInputShape::Data {
+                fields: vec![field],
+            },
+        )
+        .unwrap();
+        let package = crate::physical_type_v2::sender_tests::checked_writer_package(recipe);
+        let (node, recipe) = package.writes().iter().next().unwrap();
+        let binding = recipe.input().fields_iter().next().unwrap();
+        let storage = binding.storage_type().unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut admit = |_: &TypeViewFacts| Ok(());
+        let mut budget =
+            TypeViewBudget::new_in(&package, SOURCE, limits(), &mut admit, &work).unwrap();
+        let views = collect_package_type_views_in(&mut budget, &mut work).unwrap();
+        let occurrence = PackageTypeOccurrence {
+            fragment: package.fragment().id(),
+            owner: PackageTypeOwner::Recipe(*node),
+            channel: PackageTypeChannel::WriterStorage {
+                role: WriterTypeRootRole::Data,
+                ordinal: 0,
+            },
+        };
+        let storage_id = views
+            .value_root_for_in(occurrence, storage, &mut budget, &mut work)
+            .unwrap();
+        assert_ne!(storage_id, views.writer_value_ids[0]);
+        let actual = views
+            .values()
+            .iter()
+            .find(|(id, _)| *id == storage_id)
+            .unwrap()
+            .1;
+        assert!(std::ptr::eq(actual, storage));
+        let foreign = storage.clone();
+        assert!(
+            views
+                .value_root_for_in(occurrence, &foreign, &mut budget, &mut work)
+                .is_err()
+        );
     }
 }

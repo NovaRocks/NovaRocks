@@ -564,6 +564,7 @@ fn sink(binding: novarocks_sql::binding::SqlTableBindingId) -> DmlWritePlanInput
             namespace: "db".into(),
             table: "mv".into(),
             fields: vec![DmlWriteTargetField {
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: col.clone(),
                 is_hidden: false,

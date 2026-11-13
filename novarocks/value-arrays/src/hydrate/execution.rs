@@ -18,7 +18,6 @@
 use super::{HydrateEvent, HydrateObserver, HydratePathStep, child, invalid, reserve, tree::Node};
 use crate::{
     ValueError, ValueFailure, ValueViolation,
-    access::ByteSource,
     arrow_raw::{self, StructuralRef},
     build::{ValueBuilder, WriteFailure},
     control::{Growth, Work},
@@ -155,11 +154,7 @@ impl Node {
         observe: &mut HydrateObserver<'_, E>,
     ) -> Result<ArrayRef, ValueFailure<E>> {
         let layout = self.layout.ok_or_else(invalid)?;
-        let source = ByteSource::parse(
-            &self.source,
-            self.source_layout.ok_or_else(invalid)?,
-            self.dictionary_layout,
-        )?;
+        let source = self.leaf_source()?;
         // View descriptors and cache choices were already acquired and frozen
         // during planning. Execution neither allocates another decoded bottom
         // nor changes the strategy after output capacity has been requested.
@@ -193,12 +188,7 @@ impl Node {
                     }
                 }
             } else {
-                match source.mapped_row(row)? {
-                    None => builder.append_null(growth, work),
-                    Some(index) => {
-                        builder.append_array_value(source.values().as_ref(), index, growth, work)
-                    }
-                }
+                source.append(row, &mut builder, growth, work)
             };
             result.map_err(|error| match error {
                 WriteFailure::Failure(error) => error,

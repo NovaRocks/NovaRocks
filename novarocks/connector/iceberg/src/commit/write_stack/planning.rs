@@ -224,7 +224,9 @@ impl IcebergWriteBranchPlan {
             Self::Data { plan, .. } => IcebergWriterHandle::try_new_data(
                 table.clone(),
                 plan.output.clone(),
-                plan.recipe.clone(),
+                plan.recipe.clone().with_write_input_identity(
+                    super::domain::data_write_input_identity(&plan.input)?,
+                ),
             ),
             Self::Delete { plan, .. } => {
                 let handle = IcebergWriterHandle::try_new_delete(

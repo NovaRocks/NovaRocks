@@ -194,7 +194,7 @@ impl PreparedMutationFacts {
                 self.target(),
                 self.target_ref(),
                 novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-                mor_change_stream_input_request(self.columns())?,
+                mor_change_stream_input_request(self.columns(), self.signed()?.match_contract())?,
                 novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 Some(self.signed()?.base_version().clone()),
                 novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
@@ -357,6 +357,8 @@ pub(crate) async fn compile_routed_mutation_write(
         .await?;
     }
     let control = crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    let assignments = mutation_write_assignments(&query, &kind, &routes, &control)
+        .map_err(DmlError::from_compile)?;
     let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlSessionContext {
@@ -371,6 +373,11 @@ pub(crate) async fn compile_routed_mutation_write(
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
     )
     .map_err(DmlError::from_compile)?;
+    if let Some(assignments) = assignments {
+        preparation = preparation
+            .with_write_assignments(assignments)
+            .map_err(DmlError::from_compile)?;
+    }
     while !preparation.needs().is_empty() {
         let facts = provider
             .resolve_catalog_relations(preparation.needs())
@@ -463,4 +470,305 @@ fn install_dml_fact_source(
         ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
+}
+
+enum MutationWriteTypeError {
+    Source(novarocks_types::ColumnValueTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ColumnValueTypeError> for MutationWriteTypeError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for MutationWriteTypeError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Source(error.into())
+    }
+}
+impl MutationWriteTypeError {
+    fn into_compile(self) -> novarocks_sql::compiler::SqlCompileError {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::ValueTypeError;
+        match self {
+            Self::Control(error) => error.into(),
+            Self::Source(novarocks_types::ColumnValueTypeError::Type(
+                ValueTypeError::TooDeep | ValueTypeError::TooManyNodes,
+            )) => SqlCompileError::ResourceExhausted,
+            Self::Source(error) => SqlCompileError::Compilation(error.to_string()),
+        }
+    }
+}
+
+/// Bind generated match-query occurrences to the original routed declarations.
+/// The ordinal formulas belong to the UPDATE/MERGE query constructors above;
+/// names only identify which already-resolved target column an alias denotes.
+fn mutation_write_assignments(
+    query: &ast::Query,
+    kind: &DmlChangeStreamKind,
+    routes: &[DmlChangeStreamRoute],
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<
+    Option<Arc<novarocks_sql::compiler::SqlWriteAssignments>>,
+    novarocks_sql::compiler::SqlCompileError,
+> {
+    use novarocks_sql::compiler::{
+        SqlCompileError, SqlConstantExpressionSite, SqlWriteAssignmentSite, SqlWriteAssignments,
+        SqlWriteLiteralContext,
+    };
+    use novarocks_type_contract::PureCompileControl;
+    let (columns, old_start, wildcard) = match kind {
+        DmlChangeStreamKind::Delete { .. } => return Ok(None),
+        DmlChangeStreamKind::Update { target_columns, .. } => (target_columns, 6, true),
+        DmlChangeStreamKind::Merge {
+            matched_update: false,
+            not_matched_insert: false,
+            ..
+        } => return Ok(None),
+        DmlChangeStreamKind::Merge { target_columns, .. } => (target_columns, 7, false),
+    };
+    let invalid = |detail: &str| SqlCompileError::InvalidRequest(detail.into());
+    let ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(invalid("generated mutation lost its exact SELECT source"));
+    };
+    let declaration = |column: &novarocks_types::schema::ColumnDef| -> Result<_, SqlCompileError> {
+        let mut declared = None;
+        for route in routes {
+            control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)?;
+            for (name, input, storage) in route.sink.write_field_declarations() {
+                if name != column.name {
+                    continue;
+                }
+                let input = input
+                    .declared_value_type_observed::<MutationWriteTypeError>(|| {
+                        control
+                            .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                            .map_err(MutationWriteTypeError::Control)
+                    })
+                    .map_err(MutationWriteTypeError::into_compile)?;
+                let next = (input, storage.cloned());
+                if declared.as_ref().is_some_and(|previous| previous != &next) {
+                    return Err(invalid(
+                        "mutation target has ambiguous routed write declarations",
+                    ));
+                }
+                declared = Some(next);
+            }
+        }
+        declared.ok_or_else(|| {
+            invalid("mutation target is absent from its original routed write declarations")
+        })
+    };
+    let mut sites = Vec::new();
+    let mut contexts = Vec::new();
+    for (ordinal, column) in columns.iter().enumerate() {
+        let (input, storage) = declaration(column)?;
+        sites.push(SqlWriteAssignmentSite::try_new(
+            old_start + ordinal,
+            input,
+            storage,
+            control,
+        )?);
+        if !wildcard {
+            contexts.push(SqlWriteLiteralContext::new(
+                Vec::new(),
+                SqlConstantExpressionSite::SelectProjection {
+                    column: old_start + ordinal,
+                },
+                old_start + ordinal,
+            ));
+        }
+    }
+    let first_assignment = if wildcard {
+        7
+    } else {
+        old_start + columns.len()
+    };
+    if wildcard
+        && !matches!(
+            select.projection.get(6),
+            Some(ast::SelectItem::QualifiedWildcard { .. })
+        )
+    {
+        return Err(invalid(
+            "generated UPDATE lost its target wildcard occurrence",
+        ));
+    }
+    for (index, item) in select.projection.iter().enumerate().skip(first_assignment) {
+        let ast::SelectItem::ExprWithAlias { alias, expr, .. } = item else {
+            return Err(invalid("mutation assignment lost its exact output alias"));
+        };
+        let name = alias
+            .value
+            .strip_prefix("__nr_new_")
+            .or_else(|| alias.value.strip_prefix("__nr_ins_"))
+            .ok_or_else(|| invalid("mutation assignment has an unknown generated output kind"))?;
+        let column = columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| {
+                invalid("mutation assignment alias differs from its resolved target column")
+            })?;
+        let ordinal = if wildcard {
+            6 + columns.len() + index - first_assignment
+        } else {
+            index
+        };
+        let (input, storage) = declaration(column)?;
+        sites.push(
+            SqlWriteAssignmentSite::try_new(ordinal, input, storage, control)?
+                .with_source_span(expr.span()),
+        );
+        contexts.push(SqlWriteLiteralContext::new(
+            Vec::new(),
+            SqlConstantExpressionSite::SelectProjection { column: index },
+            ordinal,
+        ));
+    }
+    Ok(Some(Arc::new(
+        SqlWriteAssignments::try_new(sites.into_boxed_slice(), control)?
+            .with_literal_contexts(contexts.into_boxed_slice()),
+    )))
+}
+
+#[cfg(test)]
+mod typed_assignment_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use novarocks_type_contract::FunctionValueType;
+    fn route(width: i32) -> DmlChangeStreamRoute {
+        use novarocks_spi::connector::write_stack::{
+            ConnectorWriteColocation, ConnectorWriteLayoutPreference,
+            ConnectorWriteRouteRequirements, WriteTargetOrdinal,
+        };
+        use novarocks_sql::planning::dml::{
+            ConnectorWriteInputBinding, DmlWritePlanInput, DmlWriteSinkMode, DmlWriteTarget,
+            DmlWriteTargetField,
+        };
+        let column = novarocks_types::schema::ColumnDef::from_value_type(
+            "v".into(),
+            FunctionValueType::new(DataType::Binary, false),
+            None,
+        )
+        .unwrap();
+        let binding = novarocks_sql::binding::SqlTableBindingAllocator::new_unique()
+            .unwrap()
+            .allocate()
+            .unwrap();
+        let target = DmlWriteTarget {
+            binding,
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+            fields: vec![DmlWriteTargetField {
+                token: novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                column: column.clone(),
+                storage_type: Some(FunctionValueType::new(
+                    DataType::FixedSizeBinary(width),
+                    false,
+                )),
+                is_hidden: false,
+            }],
+        };
+        let sink = DmlWritePlanInput::try_new(
+            DmlWriteSinkMode::Data,
+            target,
+            vec![column],
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+        )
+        .unwrap();
+        DmlChangeStreamRoute {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([1; 32]),
+            write_target_ordinal: WriteTargetOrdinal::try_new(1).unwrap(),
+            accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
+            input_ordinals: Vec::new(),
+            requirements: ConnectorWriteRouteRequirements {
+                colocation: ConnectorWriteColocation::None,
+                layout: ConnectorWriteLayoutPreference::None,
+            },
+            sink,
+        }
+    }
+    fn query(sql: &str) -> ast::Query {
+        let statements = novarocks_parser::parse(sql).unwrap();
+        let [ast::Statement::Query(query)] = statements.as_slice() else {
+            panic!("query");
+        };
+        query.clone()
+    }
+    fn source_columns() -> Vec<novarocks_types::schema::ColumnDef> {
+        vec![
+            novarocks_types::schema::ColumnDef::from_value_type(
+                "v".into(),
+                FunctionValueType::new(DataType::FixedSizeBinary(4), false),
+                None,
+            )
+            .unwrap(),
+        ]
+    }
+    #[test]
+    fn update_generated_occurrences_retain_original_storage_and_user_span() {
+        let query = query("SELECT 1, 2, 3, 4, 5, 6, t.*, NULL AS __nr_new_v FROM t");
+        let assignments = mutation_write_assignments(
+            &query,
+            &DmlChangeStreamKind::Update {
+                file_metadata: Some([4, 5]),
+                target_columns: source_columns(),
+            },
+            &[route(4)],
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            assignments
+                .sites()
+                .iter()
+                .map(|site| site.output_ordinal())
+                .collect::<Vec<_>>(),
+            [6, 7]
+        );
+        assert_eq!(
+            assignments.sites()[0].input().data_type(),
+            &DataType::Binary
+        );
+        assert_eq!(
+            assignments.sites()[0].storage().unwrap().data_type(),
+            &DataType::FixedSizeBinary(4)
+        );
+        let ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("SELECT");
+        };
+        let ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[7] else {
+            panic!("assignment");
+        };
+        assert_eq!(assignments.sites()[1].source_span(), Some(expr.span()));
+    }
+    #[test]
+    fn merge_delete_only_has_no_data_projection_and_ambiguous_data_declarations_reject() {
+        let query = query("SELECT 1, 2, 3, 4, 5, 6, 0, NULL AS v, NULL AS __nr_new_v FROM t");
+        let control = novarocks_sql::compiler::SqlCompileControl::unbounded();
+        let delete = DmlChangeStreamKind::Merge {
+            file_metadata: Some([4, 5]),
+            target_columns: source_columns(),
+            matched_update: false,
+            matched_delete: true,
+            not_matched_insert: false,
+        };
+        assert!(
+            mutation_write_assignments(&query, &delete, &[], &control)
+                .unwrap()
+                .is_none()
+        );
+        let update = DmlChangeStreamKind::Merge {
+            file_metadata: Some([4, 5]),
+            target_columns: source_columns(),
+            matched_update: true,
+            matched_delete: false,
+            not_matched_insert: false,
+        };
+        assert!(
+            mutation_write_assignments(&query, &update, &[route(4), route(8)], &control).is_err()
+        );
+    }
 }

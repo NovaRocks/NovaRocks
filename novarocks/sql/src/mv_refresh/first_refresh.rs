@@ -1458,6 +1458,7 @@ fn add_join_incremental_change_stream_effect(
         .map(|column| {
             arena.remember_source_column_display(column.column_id, None, column.name.clone());
             Ok(ChangeEventOutputExpr {
+                write_input: None,
                 output_column_id: column.column_id,
                 expr: Some(arena.intern_observed(
                     ScalarNode::ColumnRef(column.column_id),
@@ -3434,6 +3435,7 @@ mod tests {
                         namespace: "db".into(),
                         table: "mv".into(),
                         fields: vec![DmlWriteTargetField {
+                            storage_type: None,
                             token,
                             column: column.clone(),
                             is_hidden: false,

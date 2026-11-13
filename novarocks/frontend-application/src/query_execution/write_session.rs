@@ -146,7 +146,7 @@ pub(crate) struct ConnectorWriteSession {
 
 /// What a session has collected so far across the queries it drives.
 ///
-/// Most writes are one query, but a copy-on-write mutation and a distributed
+/// Most writes are one query, but a distributed
 /// rewrite drive several against one session and commit once at the end. Each
 /// query still produces a set that is complete for its own execution graph;
 /// what accumulates here is the statement's union.
@@ -3408,7 +3408,7 @@ pub(crate) mod tests {
         assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
-    /// A copy-on-write mutation and a distributed rewrite drive several
+    /// A distributed rewrite can drive several
     /// queries against one session and commit once. Each query's set is
     /// complete for its own graph; the statement commits their union.
     #[test]

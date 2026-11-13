@@ -464,7 +464,13 @@ mod tests {
             )
             .expect("output"),
             IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
-                .expect("recipe"),
+                .expect("recipe")
+                .with_write_input_identity(
+                    crate::commit::write_stack::domain::data_write_input_identity(
+                        &crate::commit::write_stack::test_support::data_input_shape(),
+                    )
+                    .expect("original fixture input identity"),
+                ),
         )
         .expect("writer handle")
     }

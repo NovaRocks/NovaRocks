@@ -291,7 +291,49 @@ impl Fixture {
             &DecodedExpressions<'_, '_, '_>,
         ) -> R,
     ) -> R {
-        let types = encode_type_table_sources(&self.roots, &[], types_limits(), control).unwrap();
+        self.with_witness_tokens(control, None, run)
+    }
+    fn with_witness_tokens<R>(
+        &self,
+        control: &Control,
+        node: Option<&p::PhysicalNode>,
+        run: impl FnOnce(
+            &EncodedValues<'_, '_, '_>,
+            &EncodedExpressions<'_, '_, '_>,
+            &DecodedExpressions<'_, '_, '_>,
+        ) -> R,
+    ) -> R {
+        let mut roots = self
+            .roots
+            .iter()
+            .map(|(id, ty)| (*id, ty))
+            .collect::<Vec<_>>();
+        if let Some(node) = node {
+            let (events, _) = physical_payload(node).unwrap();
+            for event in events {
+                for assignment in &event.assignments {
+                    if let Some(declaration) = &assignment.write_input {
+                        roots.push((u32::try_from(roots.len()).unwrap(), &declaration.input));
+                        if let Some(storage) = &declaration.storage {
+                            roots.push((u32::try_from(roots.len()).unwrap(), storage));
+                        }
+                    }
+                }
+            }
+            // A second occurrence may retain the very same original loan.
+            // The shared source locator must choose the stable first ID.
+            let alias = roots[3].1;
+            roots.push((u32::try_from(roots.len()).unwrap(), alias));
+        }
+        let mut type_work = CompileCheckpoints::try_new(control, CompilePhase::Encode).unwrap();
+        let types = crate::physical_type_v2::encode_borrowed_type_table_associated_sources_pure_in(
+            &roots,
+            &[],
+            types_limits(),
+            &mut type_work,
+        )
+        .unwrap();
+        type_work.flush().unwrap();
         let read_types = decode_type_table(types.as_wire(), types_limits(), control).unwrap();
         let payloads = encode_connector_payloads(&[], 64 << 10, payload_limits(), control).unwrap();
         let read_payloads =
@@ -409,24 +451,42 @@ fn source() -> p::PhysicalNode {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Delete,
                     assignments: Box::from([
-                        (p::ValueId::new(0), Some(p::ExprId::new(0))),
-                        (p::ValueId::new(u32::MAX), None),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(0),
+                            Some(p::ExprId::new(0)),
+                        ),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(u32::MAX),
+                            None,
+                        ),
                     ]),
                 },
                 p::ChangeEventSpec {
                     predicate: Some(p::ExprId::new(u32::MAX)),
                     effect: ConnectorRowMutationEffect::Replace,
                     assignments: Box::from([
-                        (p::ValueId::new(0), Some(p::ExprId::new(7))),
-                        (p::ValueId::new(u32::MAX), Some(p::ExprId::new(0))),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(0),
+                            Some(p::ExprId::new(7)),
+                        ),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(u32::MAX),
+                            Some(p::ExprId::new(0)),
+                        ),
                     ]),
                 },
                 p::ChangeEventSpec {
                     predicate: Some(p::ExprId::new(u32::MAX)),
                     effect: ConnectorRowMutationEffect::Insert,
                     assignments: Box::from([
-                        (p::ValueId::new(u32::MAX), Some(p::ExprId::new(7))),
-                        (p::ValueId::new(0), Some(p::ExprId::new(0))),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(u32::MAX),
+                            Some(p::ExprId::new(7)),
+                        ),
+                        novarocks_physical_plan::ChangeAssignment::exact(
+                            p::ValueId::new(0),
+                            Some(p::ExprId::new(0)),
+                        ),
                     ]),
                 },
             ]),
@@ -468,10 +528,14 @@ fn expected() -> wire::PhysicalNode {
                             wire::ChangeAssignment {
                                 value_id: Some(0),
                                 expr_id: Some(0),
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
                                 expr_id: None,
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                         ],
                     },
@@ -482,10 +546,14 @@ fn expected() -> wire::PhysicalNode {
                             wire::ChangeAssignment {
                                 value_id: Some(0),
                                 expr_id: Some(7),
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
                                 expr_id: Some(0),
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                         ],
                     },
@@ -496,10 +564,14 @@ fn expected() -> wire::PhysicalNode {
                             wire::ChangeAssignment {
                                 value_id: Some(u32::MAX),
                                 expr_id: Some(7),
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                             wire::ChangeAssignment {
                                 value_id: Some(0),
                                 expr_id: Some(0),
+                                write_input_value_type_id: None,
+                                storage_value_type_id: None,
                             },
                         ],
                     },
@@ -543,8 +615,8 @@ fn change_event_complete_independent_dto_preserves_three_effects_sparse_ids_and_
         // rejects duplicate output assignments rather than this codec deduping.
         let mut node = source();
         events(&mut node)[0].assignments = Box::from([
-            (p::ValueId::new(0), None),
-            (p::ValueId::new(0), Some(p::ExprId::new(0))),
+            p::ChangeAssignment::exact(p::ValueId::new(0), None),
+            p::ChangeAssignment::exact(p::ValueId::new(0), Some(p::ExprId::new(0))),
         ]);
         c.arm(None);
         let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits())
@@ -561,11 +633,15 @@ fn change_event_complete_independent_dto_preserves_three_effects_sparse_ids_and_
             &[
                 wire::ChangeAssignment {
                     value_id: Some(0),
-                    expr_id: None
+                    expr_id: None,
+                    write_input_value_type_id: None,
+                    storage_value_type_id: None
                 },
                 wire::ChangeAssignment {
                     value_id: Some(0),
-                    expr_id: Some(0)
+                    expr_id: Some(0),
+                    write_input_value_type_id: None,
+                    storage_value_type_id: None
                 }
             ]
         );
@@ -700,7 +776,7 @@ fn change_event_independent_layout_and_every_seven_caps_apply_in_both_directions
                 + std::mem::size_of::<p::PhysicalProperties>()
                 + 3 * std::mem::size_of::<p::ValueId>()
                 + 3 * std::mem::size_of::<p::ChangeEventSpec>()
-                + 6 * std::mem::size_of::<(p::ValueId, Option<p::ExprId>)>())
+                + 6 * std::mem::size_of::<p::ChangeAssignment>())
         );
         for is_decode in [false, true] {
             let cap = exact(if is_decode { decode } else { encode });
@@ -806,9 +882,9 @@ fn change_event_unknown_effect_missing_payload_and_absent_references_fail() {
                         *effect_output = p::ValueId::new(99);
                     }
                 }
-                2 => events(&mut node)[0].assignments[0].0 = p::ValueId::new(99),
+                2 => events(&mut node)[0].assignments[0].output = p::ValueId::new(99),
                 3 => events(&mut node)[0].predicate = Some(p::ExprId::new(99)),
-                4 => events(&mut node)[0].assignments[0].1 = Some(p::ExprId::new(99)),
+                4 => events(&mut node)[0].assignments[0].expression = Some(p::ExprId::new(99)),
                 _ => unreachable!(),
             }
             c.arm(None);
@@ -844,7 +920,8 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
             ..limits()
         };
         let mut node = source();
-        events(&mut node)[0].assignments = vec![(p::ValueId::new(0), None); 320].into_boxed_slice();
+        events(&mut node)[0].assignments =
+            vec![p::ChangeAssignment::exact(p::ValueId::new(0), None); 320].into_boxed_slice();
         c.arm(None);
         assert!(matches!(
             prepare_change_event_node_encode(&node, values, expressions, SOURCE, low),
@@ -855,7 +932,9 @@ fn change_event_inner_capacity_and_initial_work_are_admitted_before_visiting_ass
         wire_events(&mut wire).events[0].assignments = vec![
             wire::ChangeAssignment {
                 value_id: Some(0),
-                expr_id: None
+                expr_id: None,
+                write_input_value_type_id: None,
+                storage_value_type_id: None
             };
             320
         ];
@@ -877,7 +956,10 @@ fn small_source() -> p::PhysicalNode {
     *events(&mut node) = Box::from([p::ChangeEventSpec {
         predicate: Some(p::ExprId::new(u32::MAX)),
         effect: ConnectorRowMutationEffect::Insert,
-        assignments: Box::from([(p::ValueId::new(0), Some(p::ExprId::new(0)))]),
+        assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+            p::ValueId::new(0),
+            Some(p::ExprId::new(0)),
+        )]),
     }]);
     node
 }
@@ -889,6 +971,8 @@ fn small_wire() -> wire::PhysicalNode {
         assignments: vec![wire::ChangeAssignment {
             value_id: Some(0),
             expr_id: Some(0),
+            write_input_value_type_id: None,
+            storage_value_type_id: None,
         }],
     }];
     node
@@ -911,7 +995,7 @@ fn control_case(
         } else {
             let mut node = small_source();
             if ordinary {
-                events(&mut node)[0].assignments[0].0 = p::ValueId::new(99);
+                events(&mut node)[0].assignments[0].output = p::ValueId::new(99);
             }
             encode_change_event_node(&node, values, expressions, SOURCE, limits()).map(|_| ())
         }
@@ -949,7 +1033,7 @@ fn change_event_all_small_original_control_prefixes_and_wide_real_quantum_are_pr
     let fixture = Fixture::new();
     let c = Control::default();
     fixture.with_tokens(&c, |values, expressions, read| {
-        let mut node = small_source(); events(&mut node)[0].assignments = vec![(p::ValueId::new(0), None); 320].into_boxed_slice();
+        let mut node = small_source(); events(&mut node)[0].assignments = vec![p::ChangeAssignment::exact(p::ValueId::new(0), None); 320].into_boxed_slice();
         c.arm(None); let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits()).unwrap().0;
         let trace = c.trace(); let at = trace.iter().position(|(_, units)| *units == 256).unwrap();
         for cause in CAUSES { c.arm(Some((at, cause.clone()))); assert!(matches!(encode_change_event_node(&node, values, expressions, SOURCE, limits()), Err(Error::Control(actual)) if actual == cause)); assert_eq!(c.trace(), trace[..=at]); }
@@ -998,3 +1082,211 @@ fn change_event_empty_events_and_absent_expressions_are_representation_not_stati
 
 #[path = "owned_tests.rs"]
 mod owned_tests;
+
+fn witnessed_source() -> p::PhysicalNode {
+    let mut node = small_source();
+    events(&mut node)[0].assignments[0].write_input =
+        Some(novarocks_type_contract::WriteInputDeclaration {
+            input: FunctionValueType::new(DataType::Binary, false),
+            storage: Some(FunctionValueType::new(DataType::FixedSizeBinary(8), false)),
+        });
+    node
+}
+
+#[test]
+fn change_event_write_input_witness_roundtrips_complete_original_types() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let node = witnessed_source();
+    fixture.with_witness_tokens(&c, Some(&node), |values, expressions, read| {
+        c.arm(None);
+        let (wire, _) =
+            encode_change_event_node(&node, values, expressions, SOURCE, limits()).unwrap();
+        let declaration = &wire_payload(&wire).unwrap().events[0].assignments[0];
+        assert_eq!(declaration.write_input_value_type_id, Some(3));
+        assert_eq!(declaration.storage_value_type_id, Some(4));
+        c.arm(None);
+        assert_eq!(
+            decode_change_event_node(&wire, read, SOURCE, limits())
+                .unwrap()
+                .0,
+            node
+        );
+        // Equal type facts do not lend a different original source occurrence.
+        let other = node.clone();
+        c.arm(None);
+        assert!(matches!(
+            encode_change_event_node(&other, values, expressions, SOURCE, limits()),
+            Err(Error::InvalidShape(_))
+        ));
+        for kind in 0..3 {
+            let mut wrong = wire.clone();
+            let a = &mut wire_events(&mut wrong).events[0].assignments[0];
+            match kind {
+                0 => a.write_input_value_type_id = None,
+                1 => a.write_input_value_type_id = Some(99),
+                2 => a.storage_value_type_id = Some(99),
+                _ => unreachable!(),
+            }
+            c.arm(None);
+            assert!(matches!(
+                decode_change_event_node(&wrong, read, SOURCE, limits()),
+                Err(Error::InvalidShape(_))
+            ));
+        }
+        c.arm(None);
+        let (combined, facts) =
+            encode_change_event_node(&node, values, expressions, SOURCE, limits()).unwrap();
+        let trace = c.trace();
+        c.arm(None);
+        let prepared =
+            prepare_change_event_node_encode(&node, values, expressions, SOURCE, limits()).unwrap();
+        assert_eq!(*prepared.facts(), facts);
+        assert_eq!(prepared.emit().unwrap().0, combined);
+        assert_eq!(
+            c.trace()
+                .iter()
+                .map(|(_, units)| u64::from(*units))
+                .sum::<u64>(),
+            trace
+                .iter()
+                .map(|(_, units)| u64::from(*units))
+                .sum::<u64>()
+        );
+    });
+}
+
+#[test]
+fn change_event_write_input_without_storage_is_present_and_not_an_exact_placeholder() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let mut node = witnessed_source();
+    events(&mut node)[0].assignments[0]
+        .write_input
+        .as_mut()
+        .unwrap()
+        .storage = None;
+    fixture.with_witness_tokens(&c, Some(&node), |values, expressions, read| {
+        c.arm(None);
+        let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits())
+            .unwrap()
+            .0;
+        let declaration = &wire_payload(&wire).unwrap().events[0].assignments[0];
+        assert_eq!(declaration.write_input_value_type_id, Some(3));
+        assert_eq!(declaration.storage_value_type_id, None);
+        c.arm(None);
+        assert_eq!(
+            decode_change_event_node(&wire, read, SOURCE, limits())
+                .unwrap()
+                .0,
+            node
+        );
+    });
+}
+
+#[test]
+fn change_event_write_input_preserves_all_original_control_prefixes_and_model_caps() {
+    for decode in [false, true] {
+        let fixture = Fixture::new();
+        let c = Control::default();
+        let node = witnessed_source();
+        fixture.with_witness_tokens(&c, Some(&node), |values, expressions, read| {
+            c.arm(None);
+            let wire = encode_change_event_node(&node, values, expressions, SOURCE, limits())
+                .unwrap()
+                .0;
+            c.arm(None);
+            let (_, facts) = if decode {
+                decode_change_event_node(&wire, read, SOURCE, limits()).unwrap()
+            } else {
+                let (_, facts) =
+                    encode_change_event_node(&node, values, expressions, SOURCE, limits()).unwrap();
+                (node.clone(), facts)
+            };
+            let trace = c.trace();
+            for stop in 0..trace.len() {
+                for cause in CAUSES {
+                    c.arm(Some((stop, cause.clone())));
+                    let result = if decode {
+                        decode_change_event_node(&wire, read, SOURCE, limits()).map(|_| ())
+                    } else {
+                        encode_change_event_node(&node, values, expressions, SOURCE, limits())
+                            .map(|_| ())
+                    };
+                    assert!(matches!(result,Err(Error::Control(actual)) if actual==cause));
+                    assert_eq!(c.trace(), trace[..=stop]);
+                }
+            }
+            for axis in 0..7 {
+                c.arm(None);
+                let cap = under(exact(facts), axis);
+                let result = if decode {
+                    decode_change_event_node(&wire, read, SOURCE, cap).map(|_| ())
+                } else {
+                    encode_change_event_node(&node, values, expressions, SOURCE, cap).map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+            }
+        });
+    }
+}
+
+#[test]
+fn assignment_type_references_keep_the_original_value_and_list_axes() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    let witnessed = witnessed_source();
+    fixture.with_witness_tokens(&c, Some(&witnessed), |values, expressions, read| {
+        c.arm(None);
+        let (_, plain) =
+            encode_change_event_node(&small_source(), values, expressions, SOURCE, limits())
+                .unwrap();
+        c.arm(None);
+        let (wire, facts) =
+            encode_change_event_node(&witnessed, values, expressions, SOURCE, limits()).unwrap();
+        // Three port Values, one effect Value and one assignment output.
+        // Neither of the two independent W/T TypeIds is a Value occurrence.
+        assert_eq!(plain.value_reference_count, 5);
+        assert_eq!(facts.value_reference_count, 5);
+        assert_eq!(facts.list_item_count, plain.list_item_count);
+        assert!(facts.cumulative_work_upper_bound > plain.cumulative_work_upper_bound);
+        let mut exact_values = limits();
+        exact_values.max_value_references = 5;
+        c.arm(None);
+        encode_change_event_node(&witnessed, values, expressions, SOURCE, exact_values).unwrap();
+        c.arm(None);
+        let (_, received) = decode_change_event_node(&wire, read, SOURCE, exact_values).unwrap();
+        assert_eq!(received.value_reference_count, 5);
+        assert_eq!(received.list_item_count, plain.list_item_count);
+        for decode in [false, true] {
+            for axis in 0..3 {
+                let mut cap = exact_values;
+                match axis {
+                    0 => cap.max_value_references = 4,
+                    1 => cap.max_list_items = plain.list_item_count - 1,
+                    _ => {
+                        cap.max_work = if decode {
+                            received.cumulative_work_upper_bound
+                        } else {
+                            facts.cumulative_work_upper_bound
+                        } - 1
+                    }
+                }
+                c.arm(None);
+                let result = if decode {
+                    decode_change_event_node(&wire, read, SOURCE, cap).map(|_| ())
+                } else {
+                    encode_change_event_node(&witnessed, values, expressions, SOURCE, cap)
+                        .map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::Control(CompileControlError::ResourceExhausted))
+                ));
+            }
+        }
+    });
+}

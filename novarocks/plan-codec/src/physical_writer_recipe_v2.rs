@@ -472,10 +472,13 @@ fn borrowed_shape<'a>(
         },
     }
 }
+use crate::physical_type_v2::OriginalValueTypeSourceIndex as StorageSourceIndex;
+
 fn encode_group(
     fields: &[ConnectorWriteFieldBinding],
     ids: &[u32],
     types: &EncodedTypeTable<'_>,
+    storage_sources: Option<&StorageSourceIndex<'_>>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<wire::ConnectorWriteFieldBinding>, E> {
     let mut output = reserve(fields.len(), work)?;
@@ -511,6 +514,17 @@ fn encode_group(
             },
             work,
         )?;
+        let storage_value_type_id = field
+            .storage_type()
+            .map(|storage| {
+                storage_sources
+                    .ok_or(E::InvalidShape("writer storage source index is absent"))?
+                    .source_id_observed(storage, work)?
+                    .ok_or(E::InvalidShape(
+                        "writer storage value ID has no original execution author",
+                    ))
+            })
+            .transpose()?;
         let mut token = reserve(32, work)?;
         for byte in field.token().to_bytes() {
             token.push(byte);
@@ -520,6 +534,7 @@ fn encode_group(
             field_token: token,
             source_field_id: Some(*id),
             value_type_id: Some(value_id),
+            storage_value_type_id,
         });
         work.step()?;
     }
@@ -572,10 +587,19 @@ fn decode_group<'a>(
                 "writer value binding ID is absent from execution namespace",
             ))?;
         work.step()?;
-        output.push(ConnectorWriteFieldRef::new_typed(
+        let storage = field
+            .storage_value_type_id
+            .map(|id| {
+                types.value_type_observed(id, work)?.ok_or(E::InvalidShape(
+                    "writer storage value binding ID is absent from execution namespace",
+                ))
+            })
+            .transpose()?;
+        output.push(ConnectorWriteFieldRef::new_typed_with_storage(
             ConnectorWriteFieldToken::from_bytes(token),
             actual.as_ref(),
             value,
+            storage,
         ));
         work.step()?;
     }
@@ -623,6 +647,7 @@ pub fn encode_writer_recipes_observed(
     let payload_floor = context.payloads.retained_floor_observed(work)?;
     observed(model.floor(provider_floor.max(payload_floor)), work)?;
     let field_roots = context.types.source_counts().1;
+    let mut storage_count = 0;
     for recipe in sources {
         let (_, groups) = source_roles(recipe.recipe.input());
         let count = add(groups[0].len(), groups[1].len())?;
@@ -694,6 +719,7 @@ pub fn encode_writer_recipes_observed(
             .payloads
             .source_id_observed(recipe.recipe.payload(), work)?;
         for (binding, id) in recipe.recipe.input().fields_iter().zip(recipe.field_ids) {
+            storage_count = add(storage_count, usize::from(binding.storage_type().is_some()))?;
             let actual = context.types.source_field_source_observed(*id, work)?;
             observed(
                 if actual.is_some_and(|actual| std::ptr::eq(actual, binding.field())) {
@@ -707,6 +733,34 @@ pub fn encode_writer_recipes_observed(
             )?;
         }
     }
+    let storage_sources = (storage_count != 0)
+        .then(|| {
+            StorageSourceIndex::prepare(
+                context.types,
+                mul(storage_count, 2)?,
+                &mut |facts| {
+                    model.request(facts.node_layout, facts.allocation_requests_upper_bound)?;
+                    model.work(facts.cumulative_work_upper_bound)?;
+                    model.gate(limits, admit)
+                },
+                &mut E::SourceModel,
+                work,
+            )
+        })
+        .transpose()?;
+    if let Some(index) = storage_sources.as_ref() {
+        for source in sources {
+            for binding in source.recipe.input().fields_iter() {
+                if let Some(storage) = binding.storage_type() {
+                    index
+                        .source_id_observed(storage, work)?
+                        .ok_or(E::InvalidShape(
+                            "writer storage value ID has no original execution author",
+                        ))?;
+                }
+            }
+        }
+    }
     let _index = BindingIndex::prepare(sources.len(), |i| sources[i].node.get(), work)?;
     let mut output = reserve(sources.len(), work)?;
     for recipe in sources {
@@ -718,8 +772,20 @@ pub fn encode_writer_recipes_observed(
             .source_id_observed(recipe.recipe.payload(), work)?;
         let (shape, groups) = source_roles(recipe.recipe.input());
         let (first_ids, second_ids) = recipe.field_ids.split_at(groups[0].len());
-        let first = encode_group(groups[0], first_ids, context.types, work)?;
-        let second = encode_group(groups[1], second_ids, context.types, work)?;
+        let first = encode_group(
+            groups[0],
+            first_ids,
+            context.types,
+            storage_sources.as_ref(),
+            work,
+        )?;
+        let second = encode_group(
+            groups[1],
+            second_ids,
+            context.types,
+            storage_sources.as_ref(),
+            work,
+        )?;
         output.push(wire::FrozenWriterRecipe {
             node_id: Some(recipe.node.get()),
             provider_binding_id: Some(provider),
@@ -961,6 +1027,14 @@ fn decode_writer_recipes_core<H, F: ValueSchemaCreationFactory<H>>(
                         )),
                     work,
                 )?;
+                if let Some(storage_id) = field.storage_value_type_id {
+                    // This optional reference is now captured. Admit both its
+                    // preflight and borrowed-input lookups before observing it.
+                    model.work(mul(type_lookup, 2)?)?;
+                    model.gate(limits, admit)?;
+                    observed(context.types.value_type_observed(storage_id, work)?.ok_or(
+                        E::InvalidShape("writer storage value binding ID is absent from execution namespace")), work)?;
+                }
                 raw_floor = add(raw_floor, field.field_token.capacity())?;
                 observed(model.floor(raw_floor), work)?;
                 let actual = context.types.source_field_observed(

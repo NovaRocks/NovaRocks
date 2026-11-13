@@ -3481,6 +3481,7 @@ mod tests {
                     predicate: None,
                     effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                     assignments: vec![ChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: ColumnId::new_for_test(101),
                         expr: None,
                     }],

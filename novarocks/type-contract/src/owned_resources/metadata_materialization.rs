@@ -106,25 +106,87 @@ fn original_field_clone_request_core<
     loan: &mut Option<MetadataAllocationLoan<'_, E>>,
 ) -> Result<OriginalFieldCloneRequest, E> {
     let metadata = original_map_clone_request_core(origin, field.metadata(), observe, loan)?;
+    field_clone_request_after_metadata(field, metadata, Some(scratch), observe, loan)
+}
+
+/// Observe one plain Arrow Field clone's actual requests. Immutable Metadata
+/// clones share the original Arc; this is neither a positive original-source
+/// receipt nor allocation permission. The caller still owns source custody.
+pub fn plain_field_clone_allocation_requests_observed<
+    'a,
+    E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+>(
+    field: &'a Field,
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+) -> Result<OriginalFieldCloneRequest, E> {
+    observe()?;
+    field_clone_request_after_metadata(
+        field,
+        shared_metadata_clone_request(),
+        Some(scratch),
+        observe,
+        loan,
+    )
+}
+
+/// Observe a Field header/name reconstruction that MOVES an already-created
+/// replacement DataType. It does not clone or charge the discarded source
+/// DataType, and conveys no positive metadata provenance or capacity grant.
+pub fn plain_field_header_allocation_requests_observed<
+    E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+>(
+    field: &Field,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+) -> Result<OriginalFieldCloneRequest, E> {
+    observe()?;
+    field_clone_request_after_metadata(field, shared_metadata_clone_request(), None, observe, loan)
+}
+
+fn shared_metadata_clone_request() -> MetadataTableCloneRequest {
+    // Arrow 60 Metadata::clone is Option<Arc<BTreeMap>>::clone. There is no new
+    // Arc header, tree node, table or text allocation; live backing is separate.
+    MetadataTableCloneRequest {
+        table_backing: None,
+        text_requests: 0,
+        text_bytes: 0,
+    }
+}
+
+fn field_clone_request_after_metadata<
+    'a,
+    E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+>(
+    field: &'a Field,
+    metadata: MetadataTableCloneRequest,
+    scratch: Option<&mut crate::owned_resources::type_validation::TypeValidationScratch<'a>>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+) -> Result<OriginalFieldCloneRequest, E> {
     let mut dictionary_box_requests = 0_usize;
     let mut dictionary_box_bytes = 0_usize;
-    crate::visit_original_data_type_clone_with_scratch_observed(
-        field.data_type(),
-        scratch,
-        |visit| {
-            if let crate::ValueTypeVisit::TypeNode(arrow_schema::DataType::Dictionary(_, _)) = visit
-            {
-                allocation(loan, std::alloc::Layout::new::<arrow_schema::DataType>(), 2)?;
-                dictionary_box_requests = dictionary_box_requests
-                    .checked_add(2)
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-                dictionary_box_bytes = dictionary_box_bytes
-                    .checked_add(2 * std::mem::size_of::<arrow_schema::DataType>())
-                    .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
-            }
-            observe()
-        },
-    )?;
+    if let Some(scratch) = scratch {
+        crate::visit_original_data_type_clone_with_scratch_observed(
+            field.data_type(),
+            scratch,
+            |visit| {
+                if let crate::ValueTypeVisit::TypeNode(arrow_schema::DataType::Dictionary(_, _)) =
+                    visit
+                {
+                    allocation(loan, std::alloc::Layout::new::<arrow_schema::DataType>(), 2)?;
+                    dictionary_box_requests = dictionary_box_requests
+                        .checked_add(2)
+                        .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
+                    dictionary_box_bytes = dictionary_box_bytes
+                        .checked_add(2 * std::mem::size_of::<arrow_schema::DataType>())
+                        .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
+                }
+                observe()
+            },
+        )?;
+    }
     allocation(loan, text_layout::<E>(field.name().len())?, 1)?;
     let request_bytes = field
         .name()

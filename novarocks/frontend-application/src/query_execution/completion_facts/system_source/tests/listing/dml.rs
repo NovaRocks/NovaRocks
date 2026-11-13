@@ -59,6 +59,7 @@ fn sink() -> DmlWritePlanInput {
                 .iter()
                 .enumerate()
                 .map(|(index, column)| DmlWriteTargetField {
+                    storage_type: None,
                     token: token(index),
                     column: column.clone(),
                     is_hidden: false,

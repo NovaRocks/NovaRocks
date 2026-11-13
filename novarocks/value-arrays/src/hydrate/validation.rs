@@ -83,6 +83,44 @@ pub fn required_values_satisfied_observed<E>(
     Ok(satisfied)
 }
 
+/// The proof authorizes normalized type changes, never an encoded carrier.
+/// Validate the actual V carrier through the original explicit encoding policy
+/// before inspecting a licensed plain Fixed leaf or enforcing W requiredness.
+pub(super) fn validate_assignment<E>(
+    source: &ArrayRef,
+    proof: novarocks_type_contract::CheckedWriteInputProjection<'_>,
+    options: HydrateOptions,
+    work: &mut Work<'_, E>,
+    observe: &mut HydrateObserver<'_, E>,
+) -> Result<(), ValueFailure<E>> {
+    if !parameterized_shape(source, proof.source(), options, work)? {
+        return Err(ValueError::Invariant(ValueViolation::Layout).into());
+    }
+    inspect(source, work, observe, ArrowTypeDepth::ROOT)?;
+    let mut missing = || Err(ValueError::Invariant(ValueViolation::RequiredNull).into());
+    for row in 0..source.len() {
+        validate_row(
+            source,
+            proof.source(),
+            options,
+            row,
+            work,
+            &mut missing,
+            ArrowTypeDepth::ROOT,
+        )?;
+        validate_row(
+            source,
+            proof.input(),
+            options,
+            row,
+            work,
+            &mut missing,
+            ArrowTypeDepth::ROOT,
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn validate_with_options<E>(
     source: &ArrayRef,
     binding: &TypedValueBinding,

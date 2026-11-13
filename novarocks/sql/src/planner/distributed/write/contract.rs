@@ -131,6 +131,7 @@ pub(crate) enum SqlWriteSinkMode {
 /// ID to SQL planning.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SqlWriteTargetField {
+    pub(crate) storage_type: Option<novarocks_type_contract::FunctionValueType>,
     pub(crate) token: ConnectorWriteFieldToken,
     pub(crate) column: ColumnDef,
     pub(crate) is_hidden: bool,
@@ -239,6 +240,7 @@ pub(crate) mod test_support {
                 table: "orders".to_string(),
             },
             vec![SqlWriteTargetField {
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column.clone(),
                 is_hidden: false,
@@ -267,6 +269,7 @@ pub(crate) mod test_support {
             logical_type: None,
         };
         input.contract.target.fields.push(SqlWriteTargetField {
+            storage_type: None,
             token: ConnectorWriteFieldToken::from_bytes([2; 32]),
             column: second.clone(),
             is_hidden: false,
@@ -329,6 +332,7 @@ mod tests {
                 table: "orders".to_string(),
             },
             vec![SqlWriteTargetField {
+                storage_type: None,
                 token: ConnectorWriteFieldToken::from_bytes([1; 32]),
                 column: column("order_id", DataType::Int64),
                 is_hidden: false,
@@ -366,11 +370,13 @@ mod tests {
             },
             vec![
                 SqlWriteTargetField {
+                    storage_type: None,
                     token: ConnectorWriteFieldToken::from_bytes([9; 32]),
                     column: column("order_id", DataType::Int64),
                     is_hidden: false,
                 },
                 SqlWriteTargetField {
+                    storage_type: None,
                     token: ConnectorWriteFieldToken::from_bytes([9; 32]),
                     column: column("customer_id", DataType::Int64),
                     is_hidden: false,

@@ -802,6 +802,20 @@ pub(crate) fn validate_edge(
         .zip(edge.destination.receive_mapping.iter())
         .enumerate()
     {
+        if source.values().get(projected).is_some_and(|value| {
+            matches!(
+                value.origin,
+                ValueOrigin::WriterDerived {
+                    kind: crate::WriterDerivedKind::ProjectedInput,
+                    ..
+                }
+            )
+        }) {
+            errors.push(ValidationError::new(
+                &path,
+                "writer projected value cannot cross a fragment edge",
+            ));
+        }
         if projected != mapped_source {
             errors.push(ValidationError::new(
                 &path,

@@ -2696,6 +2696,31 @@ pub(super) fn invalid_table_writer_fragment(
     } else {
         Distribution::Unconstrained
     };
+    let projected_target_fields_0: Box<[crate::WriterTargetField]> =
+        Box::from([WriterTargetField {
+            storage_type: None,
+            projected: builder
+                .add_value(
+                    (ty(DataType::Int64, false)).clone(),
+                    crate::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: crate::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: match fixture {
+                TableWriterFixture::ProviderName(bytes) => "v".repeat(bytes).into(),
+                _ => "v".into(),
+            },
+            token: ConnectorWriteFieldToken::from_bytes([7; 32]),
+            input: if matches!(fixture, TableWriterFixture::TargetField) {
+                output_value
+            } else {
+                input_value
+            },
+            ty: ty(DataType::Int64, false),
+            hidden: false,
+        }]);
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
@@ -2716,20 +2741,7 @@ pub(super) fn invalid_table_writer_fragment(
                         input_value
                     }]),
                     required_distribution: writer_distribution,
-                    target_fields: Box::from([WriterTargetField {
-                        provider_name: match fixture {
-                            TableWriterFixture::ProviderName(bytes) => "v".repeat(bytes).into(),
-                            _ => "v".into(),
-                        },
-                        token: ConnectorWriteFieldToken::from_bytes([7; 32]),
-                        input: if matches!(fixture, TableWriterFixture::TargetField) {
-                            output_value
-                        } else {
-                            input_value
-                        },
-                        ty: ty(DataType::Int64, false),
-                        hidden: false,
-                    }]),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: if matches!(fixture, TableWriterFixture::SchemaRevision) {
                             WRITER_MULTIPLEX_SCHEMA_REVISION + 1

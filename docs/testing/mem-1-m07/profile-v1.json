@@ -154,10 +154,6 @@
     "assembly_bytes": 33554432,
     "bookkeeping_bytes": 8388608,
     "root_window_bytes": 8388608,
-    "cow_selected_bytes": 67108864,
-    "cow_old_and_new_bytes": 134217728,
-    "cow_rows": 1048576,
-    "cow_batches": 4096,
     "statistics_total_bytes": 134217728,
     "prepared_write_total_bytes": 67108864,
     "metadata_bytes": 16777216

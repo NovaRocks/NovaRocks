@@ -34,6 +34,19 @@ pub(crate) fn compatible<E>(
     nulls: Nullability,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<bool, E> {
+    compatible_write_projection(left, right, nulls, false, observe)
+}
+
+// The original semantic comparison body. Only the checked write-projection
+// author enables its one physical-byte leaf exception; all original callers
+// retain false and their exact observer sequence.
+pub(crate) fn compatible_write_projection<E>(
+    left: &ValueTypeRef,
+    right: &ValueTypeRef,
+    nulls: Nullability,
+    allow_fixed_bytes: bool,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
     observe()?;
     match nulls {
         Nullability::Fits if left.nullable() && !right.nullable() => return Ok(false),
@@ -59,6 +72,11 @@ pub(crate) fn compatible<E>(
             Ok(true)
         };
     Ok(match (left.kind(), right.kind()) {
+        (ValueKind::Scalar(DataType::FixedSizeBinary(_)), ValueKind::Binary)
+            if allow_fixed_bytes =>
+        {
+            true
+        }
         (ValueKind::Scalar(a), ValueKind::Scalar(b)) => {
             crate::schema::arrow_validated_data_types_exact_observed(a, b, observe)?
         }
@@ -67,7 +85,9 @@ pub(crate) fn compatible<E>(
             observe()?;
             a == b
         }
-        (ValueKind::List(a), ValueKind::List(b)) => compatible(a, b, children, observe)?,
+        (ValueKind::List(a), ValueKind::List(b)) => {
+            compatible_write_projection(a, b, children, allow_fixed_bytes, observe)?
+        }
         (
             ValueKind::FixedSizeList {
                 item: a,
@@ -79,7 +99,7 @@ pub(crate) fn compatible<E>(
             },
         ) => {
             observe()?;
-            al == bl && compatible(a, b, children, observe)?
+            al == bl && compatible_write_projection(a, b, children, allow_fixed_bytes, observe)?
         }
         (ValueKind::Struct(a), ValueKind::Struct(b)) => {
             observe()?;
@@ -88,7 +108,13 @@ pub(crate) fn compatible<E>(
             }
             for (a, b) in a.iter().zip(b) {
                 if !names_equal(a.name(), b.name(), observe)?
-                    || !compatible(a.value_type(), b.value_type(), children, observe)?
+                    || !compatible_write_projection(
+                        a.value_type(),
+                        b.value_type(),
+                        children,
+                        allow_fixed_bytes,
+                        observe,
+                    )?
                 {
                     return Ok(false);
                 }
@@ -96,7 +122,8 @@ pub(crate) fn compatible<E>(
             true
         }
         (ValueKind::Map { key: ak, value: av }, ValueKind::Map { key: bk, value: bv }) => {
-            compatible(ak, bk, children, observe)? && compatible(av, bv, children, observe)?
+            compatible_write_projection(ak, bk, children, allow_fixed_bytes, observe)?
+                && compatible_write_projection(av, bv, children, allow_fixed_bytes, observe)?
         }
         (ValueKind::Union(a), ValueKind::Union(b)) => {
             observe()?;
@@ -107,10 +134,11 @@ pub(crate) fn compatible<E>(
                 observe()?;
                 if a.type_id != b.type_id
                     || !names_equal(a.field.name(), b.field.name(), observe)?
-                    || !compatible(
+                    || !compatible_write_projection(
                         a.field.value_type(),
                         b.field.value_type(),
                         children,
+                        allow_fixed_bytes,
                         observe,
                     )?
                 {

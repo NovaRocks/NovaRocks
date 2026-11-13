@@ -637,6 +637,15 @@ impl IcebergWriteValueCodec {
             partition_column_names: recipe.partition_column_names().to_vec(),
             transform_exprs: recipe.transform_exprs().to_vec(),
             row_lineage: recipe.row_lineage(),
+            write_input_identity: recipe
+                .write_input_identity()
+                .ok_or_else(|| {
+                    self.invalid(
+                        _path.field("write_input_identity"),
+                        "data recipe has no complete write input identity",
+                    )
+                })?
+                .to_vec(),
         })
     }
 
@@ -654,6 +663,16 @@ impl IcebergWriteValueCodec {
                     "an Iceberg data branch requires its data recipe",
                 ))
             })?;
+            let write_input_identity: [u8; 32] = recipe
+                .write_input_identity
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    spi_codec_error(self.invalid(
+                        path.field("write_input_identity"),
+                        "data write input identity must contain exactly 32 bytes",
+                    ))
+                })?;
             let target_schema = recipe
                 .target_schema_json
                 .as_deref()
@@ -675,6 +694,7 @@ impl IcebergWriteValueCodec {
                         arguments.3,
                         arguments.4,
                     )
+                    .map(|recipe| recipe.with_write_input_identity(write_input_identity))
                 })?
             }
             .map_err(|error| spi_codec_error(self.rejected(path, &error)))
@@ -2008,7 +2028,13 @@ mod tests {
                 vec!["day(d)".to_string()],
                 true,
             )
-            .expect("recipe"),
+            .expect("recipe")
+            .with_write_input_identity(
+                crate::commit::write_stack::domain::data_write_input_identity(
+                    &crate::commit::write_stack::test_support::data_input_shape(),
+                )
+                .expect("original fixture input identity"),
+            ),
         )
         .expect("data handle")
     }
@@ -2166,6 +2192,7 @@ mod tests {
                 );
                 assert_eq!(left.transform_exprs(), right.transform_exprs());
                 assert_eq!(left.row_lineage(), right.row_lineage());
+                assert_eq!(left.write_input_identity(), right.write_input_identity());
             }
             _ => panic!("one handle has a data recipe and the other does not"),
         }
@@ -2728,7 +2755,7 @@ mod tests {
             );
             assert_eq!(ledger.raw_bytes(), 0);
         }
-        for revision in [3, 4, 5, 6, 7] {
+        for revision in [3, 4, 5, 6, 7, 9] {
             for category in [
                 ConnectorCodecCategory::WriteHandle,
                 ConnectorCodecCategory::CommitFragment,
@@ -3324,7 +3351,13 @@ mod tests {
             )
             .expect("output"),
             IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
-                .expect("recipe"),
+                .expect("recipe")
+                .with_write_input_identity(
+                    crate::commit::write_stack::domain::data_write_input_identity(
+                        &crate::commit::write_stack::test_support::data_input_shape(),
+                    )
+                    .expect("original fixture input identity"),
+                ),
         )
         .expect("handle");
         let error = facets
@@ -3549,8 +3582,8 @@ mod tests {
     }
     // Insert INSIDE commit::write_stack::codec::tests; reuse original facets/table_facts/output.
     #[test]
-    fn cow_shared_data_recipe_uses_the_original_writer_handle_wire_and_decodes_owned() {
-        use crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking;
+    fn shared_data_recipe_uses_the_original_writer_handle_wire_and_decodes_owned() {
+        use crate::commit::write_stack::domain::IcebergSharedTargetSchemaBacking;
         use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
         use std::sync::{
             Arc,
@@ -3565,8 +3598,8 @@ mod tests {
         let dropped = Arc::new(AtomicUsize::new(0));
         let guard = ConnectorPayloadRetentionGuard::new(Witness(dropped.clone()));
         // This known finite existing codec fixture does not claim a FE authorization.
-        // Complete target JSON authorization is tested on the COW constructor.
-        let backing = IcebergCowTargetSchemaBacking::from_checked(schema(), guard);
+        // Complete target JSON authorization is tested on the scoped constructor.
+        let backing = IcebergSharedTargetSchemaBacking::from_checked(schema(), guard);
         let old_recipe = IcebergDataBranchRecipe::try_new(
             Some(schema()),
             vec!["d".into()],
@@ -3575,7 +3608,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let cow_recipe = IcebergDataBranchRecipe::try_new_cow(
+        let shared_recipe = IcebergDataBranchRecipe::try_new_shared(
             backing,
             vec!["d".into()],
             vec!["d_day".into()],
@@ -3591,10 +3624,15 @@ mod tests {
                 Some(4096),
             )
             .unwrap(),
-            old_recipe,
+            old_recipe.with_write_input_identity(
+                crate::commit::write_stack::domain::data_write_input_identity(
+                    &crate::commit::write_stack::test_support::data_input_shape(),
+                )
+                .expect("original fixture input identity"),
+            ),
         )
         .unwrap();
-        let cow = IcebergWriterHandle::try_new_data(
+        let shared = IcebergWriterHandle::try_new_data(
             table_facts(),
             IcebergWriterOutput::try_new(
                 IcebergFileFormat::Parquet,
@@ -3602,14 +3640,19 @@ mod tests {
                 Some(4096),
             )
             .unwrap(),
-            cow_recipe,
+            shared_recipe.with_write_input_identity(
+                crate::commit::write_stack::domain::data_write_input_identity(
+                    &crate::commit::write_stack::test_support::data_input_shape(),
+                )
+                .expect("original fixture input identity"),
+            ),
         )
         .unwrap();
         let facets = generation();
         let old_wire = facets.handle_encoder.encode_private(&old).unwrap();
-        let cow_wire = facets.handle_encoder.encode_private(&cow).unwrap();
-        assert_eq!(cow_wire, old_wire);
-        let decoded = decode_private_handle(&facets, &cow_wire, private_limits()).unwrap();
+        let shared_wire = facets.handle_encoder.encode_private(&shared).unwrap();
+        assert_eq!(shared_wire, old_wire);
+        let decoded = decode_private_handle(&facets, &shared_wire, private_limits()).unwrap();
         assert_eq!(
             decoded.data().unwrap().target_schema_json(),
             old.data().unwrap().target_schema_json()
@@ -3627,20 +3670,24 @@ mod tests {
             &["day(d)".to_string()]
         );
         assert!(decoded.data().unwrap().row_lineage());
+        assert_eq!(
+            decoded.data().unwrap().write_input_identity(),
+            old.data().unwrap().write_input_identity()
+        );
         let decoded_clone = decoded.clone();
         // Real codec decode uses ordinary Owned; no extra variant/tag/guard on wire.
         assert!(!std::ptr::eq(
             decoded.data().unwrap().target_schema_json().unwrap(),
             decoded_clone.data().unwrap().target_schema_json().unwrap()
         ));
-        let cow_last = cow.clone();
+        let shared_last = shared.clone();
         assert!(std::ptr::eq(
-            cow.data().unwrap().target_schema_json().unwrap(),
-            cow_last.data().unwrap().target_schema_json().unwrap()
+            shared.data().unwrap().target_schema_json().unwrap(),
+            shared_last.data().unwrap().target_schema_json().unwrap()
         ));
-        drop(cow);
+        drop(shared);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        drop(cow_last);
+        drop(shared_last);
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         drop(decoded_clone);
         drop(decoded);

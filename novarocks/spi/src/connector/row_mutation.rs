@@ -40,7 +40,7 @@ mod match_bounds_tests;
 #[cfg(test)]
 thread_local! { static MATCH_LAYOUT_ALLOCATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 2;
+pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorRowMutationIntent {
@@ -155,6 +155,7 @@ pub struct ConnectorMutationTargetField {
     token: ConnectorWriteFieldToken,
     field: Field,
     target_ordinal: u32,
+    storage_type: Option<novarocks_type_contract::FunctionValueType>,
     execution_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
@@ -181,8 +182,30 @@ impl ConnectorMutationTargetField {
             token,
             field,
             target_ordinal,
+            storage_type: None,
             execution_type: Some(execution_type),
         })
+    }
+    pub fn with_storage_type(
+        mut self,
+        storage: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        let input = self.execution_type.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation write input lacks its complete declaration",
+            )
+        })?;
+        novarocks_connector_contract::validate_write_input_projection_observed(
+            input,
+            Some(&storage),
+            || Ok::<_, ConnectorError>(()),
+        )?;
+        self.storage_type = Some(storage);
+        Ok(self)
+    }
+    pub fn storage_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.storage_type.as_ref()
     }
     pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
         self.execution_type.as_ref()
@@ -297,6 +320,15 @@ impl ConnectorMutationMatchContract {
         }
         match_bounds::preflight(identity_fields, before_fields, after_fields, effect_field)?;
         base_version.validate()?;
+        if before_fields
+            .iter()
+            .any(|field| field.storage_type().is_some())
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation before fields cannot carry write storage projections",
+            ));
+        }
         #[cfg(test)]
         MATCH_LAYOUT_ALLOCATION_CALLS.with(|n| n.set(n.get() + 1));
         let mut tokens = HashSet::new();
@@ -477,16 +509,21 @@ impl ConnectorRowMutationPreparation {
         base_version.validate()?;
         match_contract.validate()?;
         let match_source_schema_digest = canonical_schema_digest(match_source_schema.as_ref())?;
-        for expected in match_contract
+        for (expected, storage) in match_contract
             .identity_fields()
             .iter()
-            .map(ConnectorMutationSourceField::field)
+            .map(|field| (field.field(), None))
             .chain(
                 match_contract
                     .before_fields()
                     .iter()
-                    .chain(match_contract.after_fields())
-                    .map(ConnectorMutationTargetField::field),
+                    .map(|field| (field.field(), None)),
+            )
+            .chain(
+                match_contract
+                    .after_fields()
+                    .iter()
+                    .map(|field| (field.field(), field.storage_type())),
             )
         {
             let mut matching = match_source_schema
@@ -499,10 +536,27 @@ impl ConnectorRowMutationPreparation {
                     "row-mutation match source omits a signed match field",
                 )
             })?;
-            if matching.next().is_some()
-                || actual.data_type() != expected.data_type()
-                || (actual.is_nullable() && !expected.is_nullable())
-            {
+            let matches = matching.next().is_none()
+                && !(actual.is_nullable() && !expected.is_nullable())
+                && if let Some(storage) = storage {
+                    // The match source remains ReadT; an after field carries
+                    // canonical W independently. Borrow the original layout
+                    // matcher so raw source attributes never become normalized
+                    // execution attributes or inferred logical domains.
+                    novarocks_type_contract::value_layout_matches_carrier_observed::<
+                        novarocks_type_contract::ValueTypeError,
+                    >(
+                        storage.typed_binding().layout(),
+                        actual.data_type(),
+                        |_| Ok(()),
+                    )
+                    .map_err(|error| {
+                        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+                    })?
+                } else {
+                    actual.data_type() == expected.data_type()
+                };
+            if !matches {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "row-mutation match source field differs from its signed match role",
@@ -703,7 +757,7 @@ fn match_digest(
     effect: &ConnectorMutationEffectField,
 ) -> Result<[u8; 32], ConnectorError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-row-mutation-match.v2\0");
+    hasher.update(b"novarocks.connector-row-mutation-match.v3\0");
     digest_owner(&mut hasher, owner);
     digest_bytes(&mut hasher, table.payload());
     hasher.update(base.digest());
@@ -718,6 +772,14 @@ fn match_digest(
         hasher.update(field.target_ordinal.to_be_bytes());
         match_bounds::digest_debug_field(&mut hasher, &field.field)?;
         digest_match_execution_type(&mut hasher, field.execution_type())?;
+        novarocks_connector_contract::write_input_projection_identity_observed(
+            field.execution_type(),
+            field.storage_type(),
+            |part| {
+                hasher.update(part);
+                Ok::<_, ConnectorError>(())
+            },
+        )?;
     }
     hasher.update(effect.token.to_bytes());
     hasher.update(effect.target_ordinal.to_be_bytes());
@@ -1198,6 +1260,118 @@ mod tests {
             Bytes::from_static(b"payload"),
         )
         .expect("preparation")
+    }
+
+    #[test]
+    fn match_source_keeps_read_storage_for_canonical_after_input() {
+        use novarocks_type_contract::FunctionValueType;
+        let prepare = |source: Field, input: DataType, storage: DataType| {
+            let seed = preparation_with_base_version_ordinal(None);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                source.clone(),
+            ]));
+            let contract = ConnectorMutationMatchContract::try_new(
+                seed.owner.clone(),
+                seed.table.clone(),
+                seed.base_version.clone(),
+                seed.match_contract.identity_fields.clone(),
+                vec![
+                    ConnectorMutationTargetField::try_new_typed(
+                        ConnectorWriteFieldToken::from_bytes([3; 32]),
+                        source.clone(),
+                        1,
+                        FunctionValueType::new(source.data_type().clone(), source.is_nullable()),
+                    )
+                    .unwrap(),
+                ],
+                vec![
+                    ConnectorMutationTargetField::try_new_typed(
+                        ConnectorWriteFieldToken::from_bytes([4; 32]),
+                        Field::new("value", input.clone(), false),
+                        2,
+                        FunctionValueType::new(input, false),
+                    )
+                    .unwrap()
+                    .with_storage_type(FunctionValueType::new(storage, false))
+                    .unwrap(),
+                ],
+                ConnectorMutationEffectField::try_new(
+                    ConnectorWriteFieldToken::from_bytes([5; 32]),
+                    Field::new("effect", DataType::Int8, false),
+                    3,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            ConnectorRowMutationPreparation::try_new(
+                seed.owner,
+                seed.operation_id,
+                seed.table,
+                seed.match_source,
+                schema,
+                seed.target_ref,
+                ConnectorRowMutationIntent::Update,
+                seed.base_version,
+                contract,
+                ConnectorRowMutationStrategy::MergeOnRead,
+                None,
+                seed.payload,
+            )
+        };
+        let source = Field::new("value", DataType::FixedSizeBinary(4), false);
+        let valid = prepare(
+            source.clone(),
+            DataType::Binary,
+            DataType::FixedSizeBinary(4),
+        )
+        .unwrap();
+        assert_eq!(
+            valid.match_source_schema().field(1).data_type(),
+            &DataType::FixedSizeBinary(4)
+        );
+        assert_eq!(
+            valid.match_contract().after_fields()[0].field().data_type(),
+            &DataType::Binary
+        );
+        for wrong_source in [
+            Field::new("value", DataType::Binary, false),
+            Field::new("value", DataType::FixedSizeBinary(8), false),
+            source.with_nullable(true),
+        ] {
+            let error = prepare(wrong_source, DataType::Binary, DataType::FixedSizeBinary(4))
+                .err()
+                .expect("wrong original read source must be rejected");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(
+                error.message(),
+                "row-mutation match source field differs from its signed match role"
+            );
+        }
+        let nested = |carrier, nullable| {
+            DataType::Struct(
+                vec![Arc::new(
+                    Field::new("original-child", carrier, nullable).with_metadata(HashMap::from([
+                        ("PARQUET:field_id".into(), "71".into()),
+                        ("source.attribute".into(), "opaque".into()),
+                    ])),
+                )]
+                .into(),
+            )
+        };
+        let read = nested(DataType::FixedSizeBinary(4), false);
+        let input = nested(DataType::Binary, false);
+        let raw = Field::new("value", read.clone(), false);
+        let valid = prepare(raw.clone(), input.clone(), read.clone()).unwrap();
+        assert_eq!(valid.match_source_schema().field(1), &raw);
+        assert!(
+            prepare(
+                Field::new("value", nested(DataType::FixedSizeBinary(4), true), false),
+                input,
+                read
+            )
+            .is_err()
+        );
     }
 
     #[test]

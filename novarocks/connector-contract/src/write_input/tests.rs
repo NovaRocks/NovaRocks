@@ -352,3 +352,143 @@ fn actual_validation_and_copy_callbacks_keep_all_three_causes_and_ordinary_tail(
         }
     }
 }
+
+fn fixed_storage_binding(width: i32) -> ConnectorWriteFieldBinding {
+    use novarocks_type_contract::FunctionValueType;
+    ConnectorWriteFieldBinding::try_new_typed(
+        ConnectorWriteFieldToken::from_bytes([19; 32]),
+        Field::new("payload", DataType::Binary, false).with_metadata(
+            std::collections::HashMap::from([("field_id".to_owned(), "19".to_owned())]),
+        ),
+        FunctionValueType::new(DataType::Binary, false),
+    )
+    .unwrap()
+    .with_storage_type(FunctionValueType::new(
+        DataType::FixedSizeBinary(width),
+        false,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn explicit_storage_projection_survives_the_original_owned_copy_and_public_equality() {
+    let original = ConnectorWriteInputShape::Data {
+        fields: vec![fixed_storage_binding(4)],
+    };
+    let copied = invoke(&original, &Control::default()).unwrap();
+    assert_eq!(copied, original);
+    let field = copied.fields_iter().next().unwrap();
+    assert_eq!(
+        field.field().metadata().get("field_id").map(String::as_str),
+        Some("19")
+    );
+    assert_eq!(
+        field.execution_type().unwrap().data_type(),
+        &DataType::Binary
+    );
+    assert_eq!(
+        field.storage_type().unwrap().data_type(),
+        &DataType::FixedSizeBinary(4)
+    );
+    let different_storage = ConnectorWriteInputShape::Data {
+        fields: vec![fixed_storage_binding(8)],
+    };
+    assert!(
+        !copied
+            .same_layout_observed(&different_storage, || Ok::<
+                (),
+                novarocks_type_contract::ValueTypeError,
+            >(()))
+            .unwrap()
+    );
+    let different_attributes = ConnectorWriteInputShape::Data {
+        fields: vec![
+            ConnectorWriteFieldBinding::try_new_typed(
+                field.token(),
+                field
+                    .field()
+                    .clone()
+                    .with_metadata(std::collections::HashMap::from([(
+                        "field_id".to_owned(),
+                        "20".to_owned(),
+                    )])),
+                field.execution_type().unwrap().clone(),
+            )
+            .unwrap()
+            .with_storage_type(field.storage_type().unwrap().clone())
+            .unwrap(),
+        ],
+    };
+    assert!(
+        !copied
+            .same_layout_observed(&different_attributes, || Ok::<
+                (),
+                novarocks_type_contract::ValueTypeError,
+            >(()))
+            .unwrap()
+    );
+}
+
+#[test]
+fn explicit_storage_projection_cannot_author_identity_or_delete_roles() {
+    let field = fixed_storage_binding(4);
+    let data = ConnectorWriteInputShape::RowLineage {
+        data_fields: vec![field.clone()],
+        row_identity_fields: vec![binding(2, "row")],
+    };
+    assert!(invoke(&data, &Control::default()).is_ok());
+    for forbidden in [
+        ConnectorWriteInputShape::RowLineage {
+            data_fields: vec![binding(1, "data")],
+            row_identity_fields: vec![field.clone()],
+        },
+        ConnectorWriteInputShape::EqualityDelete {
+            equality_fields: vec![field.clone()],
+        },
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields: vec![field.clone()],
+            partition_source_fields: vec![],
+        },
+        ConnectorWriteInputShape::DeletionVector {
+            identity_fields: vec![binding(2, "row")],
+            partition_source_fields: vec![field],
+        },
+    ] {
+        assert_eq!(
+            forbidden.validate().unwrap_err().kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+}
+
+#[test]
+fn explicit_storage_identity_uses_complete_types_and_original_sink_refusal() {
+    use novarocks_type_contract::FunctionValueType;
+    let input = FunctionValueType::new(DataType::Binary, false);
+    let storage = FunctionValueType::new(DataType::FixedSizeBinary(4), false);
+    let emit = |target: &FunctionValueType| {
+        let mut bytes = Vec::new();
+        write_input_projection_identity_observed(Some(&input), Some(target), |part| {
+            bytes.extend_from_slice(part);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        bytes
+    };
+    assert_eq!(emit(&storage), emit(&storage.clone()));
+    assert_ne!(
+        emit(&storage),
+        emit(&FunctionValueType::new(DataType::FixedSizeBinary(8), false))
+    );
+    assert_ne!(
+        emit(&storage),
+        emit(&FunctionValueType::new(DataType::FixedSizeBinary(4), true))
+    );
+    let mut calls = 0;
+    let error = write_input_projection_identity_observed(Some(&input), Some(&storage), |_| {
+        calls += 1;
+        Err::<(), _>("original identity sink")
+    });
+    assert_eq!(error, Err("original identity sink"));
+    assert_eq!(calls, 1);
+}

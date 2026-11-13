@@ -112,7 +112,7 @@ fn refused_corrupted_source(field: Field) {
 
 fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"novarocks.connector-row-mutation-match.v2\0");
+    h.update(b"novarocks.connector-row-mutation-match.v3\0");
     digest_owner(&mut h, &contract.owner);
     digest_bytes(&mut h, contract.table.payload());
     h.update(contract.base_version.digest());
@@ -155,6 +155,30 @@ fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [
             },
         )
         .unwrap();
+        // Independent spelling of the complete W/T stream, separate from the
+        // production match and projection identity wrappers.
+        h.update(b"novarocks-write-input-projection-v1");
+        for value in [f.execution_type(), f.storage_type()] {
+            h.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                novarocks_type_contract::write_value_type_identity_observed(
+                    value.value_type(),
+                    |part| {
+                        h.update(part);
+                        Ok::<_, std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+                novarocks_type_contract::write_value_layout_identity_observed(
+                    value.typed_binding().layout(),
+                    |part| {
+                        h.update(part);
+                        Ok::<_, std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+            }
+        }
     }
     h.update(contract.effect_field.token.to_bytes());
     h.update(contract.effect_field.target_ordinal.to_be_bytes());

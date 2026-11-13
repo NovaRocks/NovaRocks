@@ -139,6 +139,14 @@ fn draft() -> ConnectorWriteRecipeDraft {
 }
 
 fn draft_with_fields(fields: Vec<Field>) -> ConnectorWriteRecipeDraft {
+    let storage = vec![None; fields.len()];
+    draft_with_storage(fields, storage)
+}
+
+fn draft_with_storage(
+    fields: Vec<Field>,
+    storage: Vec<Option<FunctionValueType>>,
+) -> ConnectorWriteRecipeDraft {
     let binding = adapter().binding().clone();
     let payload = ConnectorEncodedPayload::new(
         ConnectorEnvelopeHeader::new(
@@ -161,12 +169,16 @@ fn draft_with_fields(fields: Vec<Field>) -> ConnectorWriteRecipeDraft {
                     // These are the fixed provider's independent value
                     // declarations; the original source Field carries no
                     // semantic authority for the complete typed projection.
-                    ConnectorWriteFieldBinding::try_new_typed(
+                    let binding = ConnectorWriteFieldBinding::try_new_typed(
                         ConnectorWriteFieldToken::from_bytes([ordinal as u8 + 1; 32]),
                         field,
                         execution,
                     )
-                    .unwrap()
+                    .unwrap();
+                    match storage[ordinal].clone() {
+                        Some(storage) => binding.with_storage_type(storage).unwrap(),
+                        None => binding,
+                    }
                 })
                 .collect(),
         },
@@ -300,6 +312,35 @@ fn plan_with_cells(
         .unwrap();
     let writer = builder.reserve_node_id().unwrap();
     let fields = relation_fields(&mut builder, writer, false);
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> = draft
+        .input()
+        .fields_iter()
+        .zip(&values)
+        .map(|(binding, value)| WriterTargetField {
+            storage_type: binding.storage_type().cloned(),
+            projected: builder
+                .add_value(
+                    (ty(
+                        binding.field().data_type().clone(),
+                        binding.field().is_nullable(),
+                    ))
+                    .clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: binding.field().name().clone().into(),
+            token: binding.token(),
+            input: *value,
+            ty: ty(
+                binding.field().data_type().clone(),
+                binding.field().is_nullable(),
+            ),
+            hidden: false,
+        })
+        .collect();
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
@@ -316,21 +357,7 @@ fn plan_with_cells(
                     write_target_ordinal: ordinal,
                     input: values.clone().into_boxed_slice(),
                     required_distribution: Distribution::Singleton,
-                    target_fields: draft
-                        .input()
-                        .fields_iter()
-                        .zip(&values)
-                        .map(|(binding, value)| WriterTargetField {
-                            provider_name: binding.field().name().clone().into(),
-                            token: binding.token(),
-                            input: *value,
-                            ty: ty(
-                                binding.field().data_type().clone(),
-                                binding.field().is_nullable(),
-                            ),
-                            hidden: false,
-                        })
-                        .collect(),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),
@@ -952,17 +979,17 @@ fn compiled_insert_values_writes_pages_and_publishes_the_root_relation() {
         assert_eq!(binding.field(), &provider_fields[ordinal]);
         assert_eq!(binding.execution_type(), Some(&provider_types[ordinal]));
     }
-    // These literal source values are required, independently of target NULL law.
-    let source_types = [ty(DataType::Int64, false), ty(DataType::Utf8, false)];
+    // The independent projected values carry the complete signed Provider input.
+    let projected_types = [ty(DataType::Int64, false), ty(DataType::Utf8, true)];
     let execution_schema = Schema::new(vec![
         Field::new("c1", DataType::Int64, false),
-        Field::new("c2", DataType::Utf8, false),
+        Field::new("c2", DataType::Utf8, true),
     ]);
     assert_eq!(projection.layout.schema().as_ref(), &execution_schema);
-    for (ordinal, source) in source_types.iter().enumerate() {
+    for (ordinal, projected) in projected_types.iter().enumerate() {
         assert_eq!(
             projection.layout.value_binding_at(ordinal),
-            Some(source.typed_binding())
+            Some(projected.typed_binding())
         );
     }
     let recorded = Arc::new(Mutex::new(Recorded::default()));
@@ -1116,6 +1143,138 @@ fn nested_insert(child: Option<i64>, source_child_nullable: bool, parent_valid: 
         finish: compile(packages.remove(&FragmentId::new(2)).unwrap(), 1, true),
         receiver,
     }
+}
+
+fn nested_fixed_insert(child: Option<[u8; 4]>, parent_valid: bool) -> Insert {
+    use arrow::array::StructArray;
+    use arrow::buffer::NullBuffer;
+    use novarocks_physical_plan::{ConstantPool, ConstantPoolId, ConstantPools, ConstantReference};
+    let source_fields = vec![Field::new("f", DataType::FixedSizeBinary(4), true)].into();
+    let array = StructArray::try_new(
+        source_fields,
+        vec![Arc::new(
+            arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [child].into_iter(),
+                4,
+            )
+            .unwrap(),
+        )],
+        Some(NullBuffer::from(vec![parent_valid])),
+    )
+    .unwrap();
+    let source = ty(array.data_type().clone(), true);
+    let policy = ConstantPolicy {
+        max_rows: 16,
+        max_array_nodes: 128,
+        max_logical_elements: 1024,
+        max_retained_buffer_bytes: 1 << 20,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 20,
+        max_library_validation_bytes: 1 << 20,
+    };
+    let pool = ConstantPool::try_new(
+        Arc::new(Field::new("st", source.data_type().clone(), true)),
+        source.clone(),
+        array.to_data(),
+        policy,
+        CompilePhase::Validate,
+        &FixtureControl,
+    )
+    .unwrap();
+    let id = ConstantPoolId::new(901);
+    let mut pools = ConstantPools::empty();
+    pools.insert(id, pool).unwrap();
+    let target = draft_with_storage(
+        vec![
+            Field::new("c1", DataType::Int64, false),
+            Field::new(
+                "st",
+                DataType::Struct(vec![Field::new("f", DataType::Binary, false)].into()),
+                true,
+            ),
+        ],
+        vec![
+            None,
+            Some(ty(
+                DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(8), false)].into()),
+                true,
+            )),
+        ],
+    );
+    let (plan, receiver) = plan_with_cells(
+        [ty(DataType::Int64, false), source],
+        vec![[
+            ExprKind::Literal(LiteralValue::Int64(1)),
+            ExprKind::Constant(ConstantReference {
+                pool: id,
+                ordinal: 0,
+            }),
+        ]],
+        &target,
+        pools,
+    );
+    let mut packages = packages_with_draft(&plan, target);
+    Insert {
+        writer: compile(packages.remove(&FragmentId::new(1)).unwrap(), 1, false),
+        finish: compile(packages.remove(&FragmentId::new(2)).unwrap(), 1, true),
+        receiver,
+    }
+}
+
+#[test]
+fn licensed_fixed_bytes_reach_the_compiled_provider_input_without_a_width_cast() {
+    let insert = nested_fixed_insert(Some([0, 255, 128, 1]), true);
+    let recorded = Arc::new(Mutex::new(Recorded::default()));
+    run_insert(&insert, 1, &recorded).expect("licensed physical bytes reach canonical W");
+    let recorded = recorded.lock().unwrap();
+    let nested = recorded.batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    let bytes = nested
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()
+        .unwrap();
+    assert_eq!(bytes.value(0), &[0, 255, 128, 1]);
+    assert_eq!(
+        bytes.value_length(0),
+        4,
+        "storage T width 8 must not NULL, pad or trim input W"
+    );
+    assert!(!nested.fields()[0].is_nullable());
+}
+
+#[test]
+fn licensed_fixed_required_null_is_data_before_any_compiled_provider_page() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let insert = nested_fixed_insert(None, true);
+    let recorded = Arc::new(Mutex::new(Recorded::default()));
+    let error = run_insert(&insert, 1, &recorded).expect_err("active required NULL");
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(error.failure_fact().reason().code(), 498);
+    assert!(error.detail().contains(".f"), "{error}");
+    assert!(recorded.lock().unwrap().batches.is_empty());
+}
+
+#[test]
+fn licensed_fixed_null_parent_builds_legal_compiled_provider_input() {
+    let insert = nested_fixed_insert(None, false);
+    let recorded = Arc::new(Mutex::new(Recorded::default()));
+    run_insert(&insert, 1, &recorded).expect("NULL parent masks required child");
+    let recorded = recorded.lock().unwrap();
+    let nested = recorded.batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert!(nested.is_null(0));
+    assert_eq!(nested.column(0).null_count(), 0);
+    assert_eq!(nested.column(0).data_type(), &DataType::Binary);
 }
 
 #[test]
@@ -1692,6 +1851,47 @@ mod statistics {
             })
             .collect::<Box<[_]>>();
         let draft = draft();
+        let projected_target_fields_1: Box<[novarocks_physical_plan::WriterTargetField]> = draft
+            .input()
+            .fields_iter()
+            .zip(&values)
+            .map(|(binding, value)| WriterTargetField {
+                storage_type: binding.storage_type().cloned(),
+                projected: builder
+                    .add_value(
+                        (ty(
+                            binding.field().data_type().clone(),
+                            binding.field().is_nullable(),
+                        ))
+                        .clone(),
+                        novarocks_physical_plan::ValueOrigin::WriterDerived {
+                            writer_node: writer,
+                            kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                        },
+                    )
+                    .unwrap(),
+                provider_name: binding.field().name().clone().into(),
+                token: binding.token(),
+                input: *value,
+                ty: ty(
+                    binding.field().data_type().clone(),
+                    binding.field().is_nullable(),
+                ),
+                hidden: false,
+            })
+            .collect();
+        let partial_aggregates = partial_aggregates
+            .iter()
+            .cloned()
+            .map(|mut call| {
+                call.input = projected_target_fields_1
+                    .iter()
+                    .find(|field| field.input == call.input)
+                    .expect("fixture aggregate reads a projected field")
+                    .projected;
+                call
+            })
+            .collect::<Box<[_]>>();
         builder
             .insert_node_unchecked(PhysicalNode {
                 id: writer,
@@ -1708,21 +1908,7 @@ mod statistics {
                         write_target_ordinal: ordinal,
                         input: values.clone().into_boxed_slice(),
                         required_distribution: Distribution::Singleton,
-                        target_fields: draft
-                            .input()
-                            .fields_iter()
-                            .zip(&values)
-                            .map(|(binding, value)| WriterTargetField {
-                                provider_name: binding.field().name().clone().into(),
-                                token: binding.token(),
-                                input: *value,
-                                ty: ty(
-                                    binding.field().data_type().clone(),
-                                    binding.field().is_nullable(),
-                                ),
-                                hidden: false,
-                            })
-                            .collect(),
+                        target_fields: projected_target_fields_1,
                         output_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                             fields: fields.clone().into_boxed_slice(),

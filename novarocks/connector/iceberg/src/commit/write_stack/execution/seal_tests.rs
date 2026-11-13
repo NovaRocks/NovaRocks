@@ -150,7 +150,28 @@ impl Fixture {
         let (handle, batch) = match branch {
             IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                 let handle = if branch == IcebergWriteBranch::Data {
-                    IcebergWriterHandle::try_new_data(table, output, data.recipe).unwrap()
+                    if let Some(batch) = data_batch.as_ref() {
+                        data.input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
+                            fields: batch.schema().fields().iter().enumerate().map(|(ordinal, field)| {
+                                let mut token = [0; 32];
+                                token[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+                                novarocks_spi::connector::ConnectorWriteFieldBinding::try_new_typed(
+                                    novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(token),
+                                    field.as_ref().clone(),
+                                    novarocks_type_contract::FunctionValueType::new(field.data_type().clone(), field.is_nullable()),
+                                ).unwrap()
+                            }).collect(),
+                        };
+                    }
+                    let identity =
+                        crate::commit::write_stack::domain::data_write_input_identity(&data.input)
+                            .unwrap();
+                    IcebergWriterHandle::try_new_data(
+                        table,
+                        output,
+                        data.recipe.with_write_input_identity(identity),
+                    )
+                    .unwrap()
                 } else {
                     IcebergWriterHandle::try_new_equality_delete(table, output, equality).unwrap()
                 };

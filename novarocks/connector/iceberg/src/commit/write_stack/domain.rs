@@ -821,18 +821,18 @@ impl IcebergWriterOutput {
     }
 }
 
-/// Complete provider schema JSON; its allocation retains the original COW holder.
+/// Complete provider schema JSON; its allocation retains the original scoped holder.
 #[derive(Clone, Debug)]
 pub(crate) enum IcebergDataSchema {
     Owned(String),
-    CowShared(Arc<IcebergCowTargetSchemaBacking>),
+    Shared(Arc<IcebergSharedTargetSchemaBacking>),
 }
 #[derive(Debug)]
-pub(crate) struct IcebergCowTargetSchemaBacking {
+pub(crate) struct IcebergSharedTargetSchemaBacking {
     schema: String,
     _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
-impl IcebergCowTargetSchemaBacking {
+impl IcebergSharedTargetSchemaBacking {
     pub(crate) fn from_checked(
         schema: String,
         original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
@@ -847,21 +847,105 @@ impl IcebergDataSchema {
     pub(crate) fn schema(&self) -> &str {
         match self {
             Self::Owned(schema) => schema,
-            Self::CowShared(owner) => &owner.schema,
+            Self::Shared(owner) => &owner.schema,
         }
     }
+}
+
+/// Canonical private identity of the actual DATA input. Flavor-only delete
+/// identities are excluded; reserved row-lineage data fields remain included.
+/// This is not an identity of the independent raw Field attribute namespace.
+/// No alternate semantic table or inferred nominal domain is constructed.
+pub(crate) fn data_write_input_identity_observed<E>(
+    input: &novarocks_connector_contract::ConnectorWriteInputShape,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<[u8; 32], E> {
+    use novarocks_connector_contract::{ConnectorWriteFieldBinding, ConnectorWriteInputShape};
+    use sha2::{Digest, Sha256};
+    let (data, identities): (&[ConnectorWriteFieldBinding], &[ConnectorWriteFieldBinding]) =
+        match input {
+            ConnectorWriteInputShape::Data { fields } => (fields, &[]),
+            ConnectorWriteInputShape::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } => (data_fields, row_identity_fields),
+            ConnectorWriteInputShape::PositionDelete {
+                partition_source_fields,
+                ..
+            }
+            | ConnectorWriteInputShape::DeletionVector {
+                partition_source_fields,
+                ..
+            } => (partition_source_fields, &[]),
+            ConnectorWriteInputShape::EqualityDelete { .. } => (&[], &[]),
+        };
+    let is_lineage = |field: &&ConnectorWriteFieldBinding| {
+        field
+            .field()
+            .name()
+            .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_ROW_ID_COL)
+            || field
+                .field()
+                .name()
+                .eq_ignore_ascii_case(crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"novarocks.iceberg.data-write-input-identity.v1\0");
+    let mut count = data.len();
+    for field in identities {
+        observe()?;
+        if is_lineage(&field) {
+            count += 1;
+        }
+    }
+    hasher.update((count as u64).to_be_bytes());
+    for (ordinal, field) in data
+        .iter()
+        .chain(identities.iter().filter(is_lineage))
+        .enumerate()
+    {
+        observe()?;
+        hasher.update((ordinal as u64).to_be_bytes());
+        hasher.update(field.token().to_bytes());
+        let name = field.field().name().as_bytes();
+        hasher.update((name.len() as u64).to_be_bytes());
+        for bytes in name.chunks(1024) {
+            observe()?;
+            hasher.update(bytes);
+        }
+        novarocks_connector_contract::write_input_projection_identity_observed(
+            field.execution_type(),
+            field.storage_type(),
+            |bytes| {
+                for chunk in bytes.chunks(1024) {
+                    observe()?;
+                    hasher.update(chunk);
+                }
+                Ok::<(), E>(())
+            },
+        )?;
+    }
+    observe()?;
+    Ok(hasher.finalize().into())
+}
+
+pub(crate) fn data_write_input_identity(
+    input: &novarocks_connector_contract::ConnectorWriteInputShape,
+) -> Result<[u8; 32], ConnectorError> {
+    data_write_input_identity_observed(input, || Ok(()))
 }
 
 /// Complete frozen target schema and partition facts for the data branch.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
     target_schema: Option<IcebergDataSchema>,
+    write_input_identity: Option<[u8; 32]>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
     /// Descriptive only. Input lineage columns select the reserved definitions.
     row_lineage: bool,
-    _cow_original: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
+    _source_retention: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 impl IcebergDataBranchRecipe {
     pub fn try_new(
@@ -879,15 +963,15 @@ impl IcebergDataBranchRecipe {
             row_lineage,
         )
     }
-    pub(crate) fn try_new_cow(
-        target_schema: Arc<IcebergCowTargetSchemaBacking>,
+    pub(crate) fn try_new_shared(
+        target_schema: Arc<IcebergSharedTargetSchemaBacking>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
         row_lineage: bool,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_schema_backing(
-            Some(IcebergDataSchema::CowShared(target_schema)),
+            Some(IcebergDataSchema::Shared(target_schema)),
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
@@ -918,17 +1002,27 @@ impl IcebergDataBranchRecipe {
             ));
         }
         let original = match &target_schema {
-            Some(IcebergDataSchema::CowShared(owner)) => Some(owner._original.clone()),
+            Some(IcebergDataSchema::Shared(owner)) => Some(owner._original.clone()),
             _ => None,
         };
         Ok(Self {
+            write_input_identity: None,
             target_schema,
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
             row_lineage,
-            _cow_original: original,
+            _source_retention: original,
         })
+    }
+    /// The private seal covers ordered field tokens/names and complete W/T.
+    /// Raw Field attributes retain their independent original-schema authors.
+    pub fn with_write_input_identity(mut self, identity: [u8; 32]) -> Self {
+        self.write_input_identity = Some(identity);
+        self
+    }
+    pub fn write_input_identity(&self) -> Option<&[u8; 32]> {
+        self.write_input_identity.as_ref()
     }
     pub fn target_schema_json(&self) -> Option<&str> {
         self.target_schema.as_ref().map(IcebergDataSchema::schema)
@@ -971,6 +1065,11 @@ impl IcebergWriterHandle {
     ) -> Result<Self, ConnectorError> {
         if output.file_format() != IcebergFileFormat::Parquet {
             return Err(invalid("Iceberg data writer must produce Parquet"));
+        }
+        if data.write_input_identity().is_none() {
+            return Err(invalid(
+                "Iceberg data writer requires its complete write input identity",
+            ));
         }
         Ok(Self {
             branch: IcebergWriteBranch::Data,
@@ -2253,14 +2352,6 @@ pub struct IcebergWriteCommitSession {
     /// order. Present exactly on a distributed rewrite, which is the one flavor
     /// whose commit replaces files it named before any writer ran.
     rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
-    /// What every sealed copy-on-write branch replaces, in ordinal order.
-    /// Present exactly on a copy-on-write mutation.
-    ///
-    /// It stays on the session because the single external commit needs it and
-    /// nothing on the data plane carries it: a writer produces replacement
-    /// rows, and which old file those rows supersede — together with the row
-    /// ids inside it that were matched — is a planning fact the session froze
-    /// before any writer ran.
     /// The partition replacement this session's single external commit applies
     /// ahead of its snapshot. Present only on a managed publication that was
     /// admitted with one.

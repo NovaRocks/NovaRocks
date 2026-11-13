@@ -388,6 +388,7 @@ impl BridgeCtx<'_> {
                             .assignments
                             .iter()
                             .map(|assignment| DistributedChangeEventOutputExpr {
+                                write_input: assignment.write_input.clone(),
                                 output_column_id: assignment.output_column_id,
                                 expr: assignment.expr.map(|expr| materialize(self.scalars, expr)),
                             })
@@ -1883,6 +1884,7 @@ mod tests {
                 predicate: Some(predicate),
                 effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
                 assignments: vec![ChangeEventOutputExpr {
+                    write_input: None,
                     output_column_id: ColumnId::new_for_test(2),
                     expr: Some(assignment),
                 }],

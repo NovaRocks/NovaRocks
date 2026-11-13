@@ -481,6 +481,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
     let mut typed_layout =
         crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     let mut ordinals = Vec::new();
+    let mut storage_types = Vec::new();
     let mut channels = Vec::new();
     reserve_vec(&mut nodes, width, work)?;
     match type_scope.as_mut() {
@@ -488,6 +489,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         None => reserve_vec(&mut types, width, work)?,
     }
     reserve_vec(&mut ordinals, width, work)?;
+    reserve_vec(&mut storage_types, width, work)?;
     reserve_vec(
         &mut channels,
         width
@@ -518,7 +520,16 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
                 "table writer provider field has no complete value requirement",
             ))?;
         work.flush()?;
-        if !ty.same_physical_binding_ignoring_nullability_observed(requirement, || work.step())? {
+        if novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+            ty.typed_binding().borrowed(),
+            requirement.typed_binding().borrowed(),
+            binding
+                .storage_type()
+                .map(|storage| storage.typed_binding().borrowed()),
+            || work.step(),
+        )?
+        .is_none()
+        {
             return Err(FragmentCompileError::Invalid(
                 "table writer source and provider requirement differ beyond nullability",
             )
@@ -526,25 +537,13 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         }
         // The source is still evaluated under its original complete binding.
         // Only the constructed output receives the checked target declaration.
-        let output_ty = {
-            let observed_work = std::cell::RefCell::new(&mut *work);
-            requirement.with_nullable_observed(
-                ty.nullable(),
-                creation.storage_lifetime(),
-                |layout| {
-                    observed_work.borrow_mut().flush()?;
-                    creation
-                        .request_layout(layout)
-                        .map_err(crate::FragmentCreationError::Creator)
-                },
-                |units| {
-                    for _ in 0..units {
-                        observed_work.borrow_mut().step()?;
-                    }
-                    Ok::<(), crate::FragmentCreationError<H>>(())
-                },
-            )?
-        };
+        let output_ty = requirement.clone_observed(|| work.step())?;
+        storage_types.push(
+            binding
+                .storage_type()
+                .map(|storage| storage.clone_observed(|| work.step()))
+                .transpose()?,
+        );
         work.flush()?;
         nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(input.child_layout.slots()[source]),
@@ -646,6 +645,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
             target: target.write_target_ordinal,
             expected_layout: projection_layout.clone(),
             projection: StaticWriterProjection {
+                storage_types,
                 arena,
                 expressions: (0..width).map(ProgramExprId::new).collect(),
                 layout: projection_layout,

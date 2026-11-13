@@ -30,7 +30,9 @@ use crate::{
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use novarocks_failure_contract::{RepresentationBoundary, RepresentationFacts};
-use novarocks_type_contract::BorrowedTypedValueBinding;
+use novarocks_type_contract::{
+    BorrowedTypedValueBinding, CheckedWriteInputProjection, WriteInputLeafProjection,
+};
 use std::{alloc::Layout, ops::Range, sync::Arc};
 
 pub(super) struct Node {
@@ -40,6 +42,7 @@ pub(super) struct Node {
     // Reading and output layout are separate only for an explicit plain-byte
     // projection. Dictionary parse policy continues to use frozen output L.
     pub source_layout: Option<ByteLayout>,
+    pub fixed_binary_source_width: Option<i32>,
     pub convert: bool,
     pub clear_nulls: bool,
     pub rebuild: bool,
@@ -58,6 +61,7 @@ impl Node {
         source: &ArrayRef,
         binding: BorrowedTypedValueBinding<'_>,
         options: HydrateOptions,
+        proof: Option<CheckedWriteInputProjection<'_>>,
         path: &mut [HydratePathStep],
         depth: usize,
         keep_encoded: &mut impl FnMut(&[HydratePathStep], &DataType) -> bool,
@@ -72,6 +76,17 @@ impl Node {
         observe(HydrateEvent::InspectType(source.data_type())).map_err(ValueFailure::Caller)?;
         let layout = ByteLayout::from_data_type(binding.data_type());
         let dictionary = matches!(source.data_type(), DataType::Dictionary(..));
+        let fixed_binary_source_width = match proof.map(|proof| proof.leaf_projection()) {
+            Some(WriteInputLeafProjection::FixedBytesToBinary { source_width }) => {
+                if source.data_type() != &DataType::FixedSizeBinary(source_width)
+                    || layout != Some(ByteLayout::Binary)
+                {
+                    return Err(invalid().into());
+                }
+                Some(source_width)
+            }
+            _ => None,
+        };
         let keep = dictionary && keep_encoded(&path[..depth], source.data_type());
         let source_layout =
             if options.projection == HydrateProjection::ExactByteLayouts && !dictionary {
@@ -79,10 +94,11 @@ impl Node {
             } else {
                 layout
             };
-        let byte_projection = options.projection == HydrateProjection::ExactByteLayouts
-            && !dictionary
-            && layout.is_some()
-            && layout != source_layout;
+        let byte_projection = fixed_binary_source_width.is_some()
+            || options.projection == HydrateProjection::ExactByteLayouts
+                && !dictionary
+                && layout.is_some()
+                && layout != source_layout;
         let required_inactive_nulls = !binding.value_type().nullable() && source.null_count() != 0;
         let convert = dictionary && !keep
             || !dictionary && layout.is_some() && required_inactive_nulls
@@ -98,6 +114,7 @@ impl Node {
             children: Vec::new(),
             layout,
             source_layout,
+            fixed_binary_source_width,
             convert,
             clear_nulls,
             rebuild: convert || clear_nulls,
@@ -120,6 +137,10 @@ impl Node {
                 input,
                 child(binding, index)?,
                 options,
+                match proof {
+                    Some(proof) => Some(proof.child_at(index).ok_or_else(invalid)?),
+                    None => None,
+                },
                 path,
                 depth + 1,
                 keep_encoded,
@@ -186,11 +207,7 @@ impl Node {
     ) -> Result<(), ValueFailure<E>> {
         work(1).map_err(ValueFailure::Caller)?;
         if self.convert {
-            let source = ByteSource::parse(
-                &self.source,
-                self.source_layout.ok_or_else(invalid)?,
-                self.dictionary_layout,
-            )?;
+            let source = self.leaf_source()?;
             if let Some(length) = source.value_len(row)? {
                 self.row_extent = self
                     .row_extent
@@ -450,11 +467,7 @@ impl Node {
     ) -> Result<(), ValueFailure<E>> {
         if self.convert {
             let layout = self.layout.ok_or_else(invalid)?;
-            let source = ByteSource::parse(
-                &self.source,
-                self.source_layout.ok_or_else(invalid)?,
-                self.dictionary_layout,
-            )?;
+            let source = self.leaf_source()?;
             let mut logical = 0u128;
             let mut copied = 0u128;
             for row in self.active.iter() {

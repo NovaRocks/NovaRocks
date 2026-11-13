@@ -303,15 +303,24 @@ fn real_theta_writer_partial_canonical_and_final_original_capture_are_distinct()
 }
 
 #[test]
-fn writer_update_reselects_actual_nullable_input_without_replacing_original_capture() {
+fn writer_update_uses_checked_materialized_input_without_replacing_source_or_capture() {
     let (source, auxiliary, functions) = fixture(true);
     let owner = authored(&source, &auxiliary, functions, &Control::default()).unwrap();
     let partial = entry(&owner, true);
     let canonical = partial.canonical().unwrap();
     assert_argument(&partial.captured().request().arguments[0], false);
-    assert_argument(&canonical.request().arguments[0], true);
+    // Required values are checked before materialization publishes W. The
+    // original nullable source remains a separate value, never relabelled.
+    assert_argument(&canonical.request().arguments[0], false);
+    let NodeKind::TableWriter { target } = &partial.node().kind else {
+        panic!("partial belongs to its writer");
+    };
+    let field = &target.target_fields[0];
+    assert_eq!(partial.source().input, field.projected);
+    assert_ne!(field.input, field.projected);
+    assert!(partial.fragment().values()[&field.input].ty.nullable());
     assert!(
-        partial.fragment().values()[&partial.source().input]
+        !partial.fragment().values()[&partial.source().input]
             .ty
             .nullable()
     );

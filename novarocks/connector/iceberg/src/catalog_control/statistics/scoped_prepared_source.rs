@@ -102,7 +102,7 @@ impl Work {
     fn run_phase(&mut self) -> Result<(), ConnectorError> {
         self.original.check_active().map_err(|e| {
             super::scoped_read::checked_read(
-                crate::read_snapshot::cow_capture::ReadFailure::Original(e.into()),
+                crate::read_snapshot::scoped_capture::ReadFailure::Original(e.into()),
             )
         })?;
         self.context.check_active()?;

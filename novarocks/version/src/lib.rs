@@ -92,6 +92,13 @@ impl StaticPlanInterpreter {
 /// plan contract revision, so those exact inputs separate their compatibility
 /// islands without an additional execution-only epoch change.
 ///
+/// RWM-7 retires COW vocabulary and freezes explicit writer W/T declarations,
+/// projected writer values and selected-assignment construction in the package
+/// descriptor and plan revision 25. Iceberg revision 10 also freezes the private
+/// DATA input seal and removes its retired read proof. These exact components
+/// already separate the new interpretation from prior peers; epoch 15 remains
+/// unchanged because no additional execution-only boundary is unrepresented.
+///
 /// Epoch 15 gives signed integer arithmetic its declared width, checked
 /// overflow and integer division semantics. Epoch-14 peers interpret the same
 /// frozen integer program differently and must remain in another island.

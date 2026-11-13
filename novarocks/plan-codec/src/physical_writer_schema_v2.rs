@@ -382,10 +382,17 @@ impl<'a> Source<'a> {
             Self::Targets(s) => s.len(),
         }
     }
-    fn ty(self, i: usize) -> &'a FunctionValueType {
+    fn types(self) -> SourceTypes<'a> {
+        SourceTypes {
+            source: self,
+            next: 0,
+            pending: None,
+        }
+    }
+    fn storage(self, i: usize) -> Option<&'a FunctionValueType> {
         match self {
-            Self::Schema(s) => &s.fields[i].ty,
-            Self::Targets(s) => &s[i].ty,
+            Self::Schema(_) => None,
+            Self::Targets(fields) => fields[i].storage_type.as_ref(),
         }
     }
     fn name(self, i: usize) -> &'a str {
@@ -405,6 +412,31 @@ impl<'a> Source<'a> {
                 resources::bytes::<p::WriterTargetField>(s.len())?,
             )?,
         })
+    }
+}
+/// W followed immediately by its optional T, without rescanning prior fields.
+struct SourceTypes<'a> {
+    source: Source<'a>,
+    next: usize,
+    pending: Option<&'a FunctionValueType>,
+}
+impl<'a> Iterator for SourceTypes<'a> {
+    type Item = &'a FunctionValueType;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(ty) = self.pending.take() {
+            return Some(ty);
+        }
+        let i = self.next;
+        let ty = match self.source {
+            Source::Schema(schema) => &schema.fields.get(i)?.ty,
+            Source::Targets(fields) => {
+                let field = fields.get(i)?;
+                self.pending = field.storage_type.as_ref();
+                &field.ty
+            }
+        };
+        self.next += 1;
+        Some(ty)
     }
 }
 #[derive(Clone, Copy)]
@@ -431,6 +463,19 @@ impl<'a> Raw<'a> {
             Self::Targets(s) => s[i].value_type_id,
         }
     }
+    fn storage_id(self, i: usize) -> Option<u32> {
+        match self {
+            Self::Schema(_) => None,
+            Self::Targets(fields) => fields[i].storage_value_type_id,
+        }
+    }
+    fn type_ids(self) -> RawTypeIds<'a> {
+        RawTypeIds {
+            raw: self,
+            next: 0,
+            pending: None,
+        }
+    }
     fn floor(self) -> Result<usize, Error> {
         Ok(match self {
             Self::Schema(s) => resources::add(
@@ -442,6 +487,26 @@ impl<'a> Raw<'a> {
                 resources::bytes::<wire::WriterTargetField>(s.capacity())?,
             )?,
         })
+    }
+}
+struct RawTypeIds<'a> {
+    raw: Raw<'a>,
+    next: usize,
+    pending: Option<u32>,
+}
+impl Iterator for RawTypeIds<'_> {
+    type Item = Option<u32>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(id) = self.pending.take() {
+            return Some(Some(id));
+        }
+        if self.next >= self.raw.len() {
+            return None;
+        }
+        let i = self.next;
+        self.next += 1;
+        self.pending = self.raw.storage_id(i);
+        Some(self.raw.type_id(i))
     }
 }
 fn typed<'a>(
@@ -496,13 +561,11 @@ fn preflight_encode_context<'admit>(
     c.admit = admit;
     // Original linear root lookups run once here; emitted IDs need no lookup.
     // Admit the sole clone preflight for every actual source occurrence.
-    c.model.delegated_work = resources::mul(
-        n,
-        resources::add(
-            resources::add(roots, 8)?,
-            physical_type_v2::value_type_clone_preflight_work_upper_bound(),
-        )?,
+    let occurrence_work = resources::add(
+        resources::add(roots, 8)?,
+        physical_type_v2::value_type_clone_preflight_work_upper_bound(),
     )?;
+    c.model.delegated_work = resources::mul(n, occurrence_work)?;
     if c.admit.is_some() {
         match source {
             Source::Schema(_) => c.model.request::<wire::WriterRelationField>(n, 1)?,
@@ -510,13 +573,23 @@ fn preflight_encode_context<'admit>(
         }
     }
     c.facts(invoice, roots, l, w)?;
+    if let Source::Targets(_) = source {
+        for i in 0..n {
+            if source.storage(i).is_some() {
+                c.model.refs = resources::add(c.model.refs, 1)?;
+                c.model.delegated_work = resources::add(c.model.delegated_work, occurrence_work)?;
+                c.numerical_facts(invoice, roots, l)?;
+            }
+            w.step()?;
+        }
+    }
     let mut known = resources::add(source.floor()?, resources::bytes::<u32>(ids.len())?)?;
     resources::floor(
         invoice,
         resources::add(known, resources::bytes::<FunctionValueType>(roots)?)?,
         w,
     )?;
-    let valid = ids.len() == n;
+    let valid = ids.len() == c.model.refs;
     w.step()?;
     if !valid {
         return Err(shape(
@@ -543,17 +616,17 @@ fn preflight_encode_context<'admit>(
         resources::floor(invoice, known, w)?;
         c.facts(invoice, roots, l, w)?;
     }
-    for (i, id) in ids.iter().enumerate() {
+    for (source_ty, id) in source.types().zip(ids) {
         let bound = if c.admit.is_some() {
             let mut captured_bound = None;
             let captured = types.value_type_captured(
                 *id,
                 &mut |ty, work| {
-                    c.comparison_prefix(source.ty(i), ty, invoice, roots, l)?;
+                    c.comparison_prefix(source_ty, ty, invoice, roots, l)?;
                     let remaining = c.remaining(invoice, roots, l, work)?;
                     let base = c.model.delegated_work;
                     captured_bound = Some(verify_type_binding_admitted_in(
-                        source.ty(i),
+                        source_ty,
                         ty,
                         invoice,
                         remaining,
@@ -578,7 +651,7 @@ fn preflight_encode_context<'admit>(
                 .value_type_observed(*id, w)?
                 .ok_or_else(|| shape("writer field type reference is unknown"))?;
             let bound = verify_type_binding(
-                source.ty(i),
+                source_ty,
                 ty,
                 invoice,
                 c.remaining(invoice, roots, l, w)?,
@@ -597,7 +670,7 @@ fn preflight_encode_context<'admit>(
         }
         // Root-owned Dictionary Boxes are retained even when encoding; reuse
         // the sole clone topology for their necessary source backing floor.
-        let clone = c.clone_facts(source.ty(i), false, None, invoice, roots, l, w)?;
+        let clone = c.clone_facts(source_ty, false, None, invoice, roots, l, w)?;
         known = resources::add(known, clone.allocation_request_bytes_upper_bound())?;
         // The sole grammar's ceiling was admitted for every occurrence before
         // any type walk, and remains in final facts for exact-envelope replay.
@@ -651,16 +724,14 @@ fn preflight_decode_context<'admit>(
     let lookups = crate::btree_resources_v2::lookup_work(roots).map_err(shape)?;
     // Each actual occurrence has a lookup and clone in prepare and in emit.
     // Keep both original clone ceilings rather than narrowing final facts.
-    c.model.delegated_work = resources::mul(
-        n,
-        resources::mul(
-            resources::add(
-                lookups,
-                physical_type_v2::value_type_clone_preflight_work_upper_bound(),
-            )?,
-            2,
+    let occurrence_work = resources::mul(
+        resources::add(
+            lookups,
+            physical_type_v2::value_type_clone_preflight_work_upper_bound(),
         )?,
+        2,
     )?;
+    c.model.delegated_work = resources::mul(n, occurrence_work)?;
     if c.admit.is_some() {
         match raw {
             Raw::Schema(_) => c.model.request::<p::WriterRelationField>(n, 2)?,
@@ -668,6 +739,16 @@ fn preflight_decode_context<'admit>(
         }
     }
     c.facts(invoice, roots, l, w)?;
+    if let Raw::Targets(_) = raw {
+        for i in 0..n {
+            if raw.storage_id(i).is_some() {
+                c.model.refs = resources::add(c.model.refs, 1)?;
+                c.model.delegated_work = resources::add(c.model.delegated_work, occurrence_work)?;
+                c.numerical_facts(invoice, roots, l)?;
+            }
+            w.step()?;
+        }
+    }
     let mut known = raw.floor()?;
     resources::floor(
         invoice,
@@ -696,6 +777,7 @@ fn preflight_decode_context<'admit>(
             }
             Raw::Targets(s) => {
                 required(s[i].input_value_id, w)?;
+                required(s[i].projected_value_id, w)?;
                 known = resources::add(known, s[i].token.capacity())?;
                 let valid = s[i].token.len() == 32;
                 w.step()?;
@@ -709,8 +791,8 @@ fn preflight_decode_context<'admit>(
         resources::floor(invoice, known, w)?;
         c.facts(invoice, roots, l, w)?;
     }
-    for i in 0..n {
-        let id = required(raw.type_id(i), w)?;
+    for id in raw.type_ids() {
+        let id = required(id, w)?;
         let request_base = c.model;
         let ty = if c.admit.is_some() {
             w.flush()?;
@@ -820,16 +902,30 @@ pub(crate) fn emit_targets(
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<Vec<wire::WriterTargetField>, Error> {
     let mut fields = resources::reserve(source.len(), w)?;
-    for (f, id) in source.iter().zip(ids) {
+    let mut ids = ids.iter();
+    for f in source {
+        let id = ids
+            .next()
+            .ok_or_else(|| shape("prepared writer input type ID is absent"))?;
+        let storage_value_type_id = if f.storage_type.is_some() {
+            Some(
+                *ids.next()
+                    .ok_or_else(|| shape("prepared writer storage type ID is absent"))?,
+            )
+        } else {
+            None
+        };
         let mut token = resources::reserve(32, w)?;
         for byte in f.token.to_bytes() {
             token.push(byte);
             w.step()?;
         }
         fields.push(wire::WriterTargetField {
+            storage_value_type_id,
             token,
             provider_name: text(&f.provider_name, w)?,
             input_value_id: Some(f.input.get()),
+            projected_value_id: Some(f.projected.get()),
             value_type_id: Some(*id),
             hidden: f.hidden,
         });
@@ -873,14 +969,29 @@ pub(crate) fn read_targets(
             .try_into()
             .map_err(|_| shape("prepared writer field token is not 32 bytes"))?;
         w.step()?;
+        let provider_name = name(&f.provider_name, w)?;
+        let input = p::ValueId::new(required(f.input_value_id, w)?);
+        let projected = p::ValueId::new(required(f.projected_value_id, w)?);
+        let ty = physical_type_v2::clone_value_type_observed(
+            typed(types, required(f.value_type_id, w)?, w)?,
+            w,
+        )?;
+        let storage_type = f
+            .storage_value_type_id
+            .map(|id| -> Result<_, Error> {
+                Ok(physical_type_v2::clone_value_type_observed(
+                    typed(types, id, w)?,
+                    w,
+                )?)
+            })
+            .transpose()?;
         fields.push(p::WriterTargetField {
             token: ConnectorWriteFieldToken::from_bytes(token),
-            provider_name: name(&f.provider_name, w)?,
-            input: p::ValueId::new(required(f.input_value_id, w)?),
-            ty: physical_type_v2::clone_value_type_observed(
-                typed(types, required(f.value_type_id, w)?, w)?,
-                w,
-            )?,
+            provider_name,
+            input,
+            projected,
+            ty,
+            storage_type,
             hidden: f.hidden,
         });
         w.step()?;

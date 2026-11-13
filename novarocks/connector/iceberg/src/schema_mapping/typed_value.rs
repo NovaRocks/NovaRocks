@@ -28,6 +28,12 @@ use novarocks_type_contract::{
 use std::sync::Arc;
 
 pub(crate) type Failure = PureProviderCompileError<ConnectorError>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DeclarationPurpose {
+    Read,
+    CanonicalWriteInput,
+}
+
 pub(crate) struct DeclaredValue {
     pub(crate) source_layout: DataType,
     pub(crate) binding: FunctionValueType,
@@ -59,6 +65,7 @@ pub(crate) fn from_declaration(
         nominal,
         integer,
         &Default::default(),
+        DeclarationPurpose::Read,
         creation,
     )
 }
@@ -76,6 +83,28 @@ pub(crate) fn from_field(
         nominals.get(&field.id).map(|domain| domain.logical_type()),
         integer,
         nominals,
+        DeclarationPurpose::Read,
+        creation,
+    )
+}
+
+/// The same declaration author, with explicit raw Fixed data leaves exposed
+/// as byte strings for writing. Nominal carriers and required flags remain
+/// authored by the original schema, not inferred from physical width.
+pub(crate) fn from_write_field(
+    field: &crate::iceberg::spec::NestedField,
+    nullable: bool,
+    nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
+    creation: &mut ConnectorReadSchemaCreation<'_>,
+) -> Result<DeclaredValue, Failure> {
+    from_declaration_with_nominals(
+        &field.field_type,
+        nullable,
+        nominals.get(&field.id).map(|domain| domain.logical_type()),
+        integer,
+        nominals,
+        DeclarationPurpose::CanonicalWriteInput,
         creation,
     )
 }
@@ -86,6 +115,7 @@ fn from_declaration_with_nominals(
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    purpose: DeclarationPurpose,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<DeclaredValue, Failure> {
     let (source_layout, layout, semantic) = author(
@@ -94,6 +124,7 @@ fn from_declaration_with_nominals(
         nominal,
         integer,
         nominals,
+        purpose,
         1,
         &mut 0,
         creation,
@@ -120,6 +151,7 @@ fn author(
     nominal: Option<ValueLogicalType>,
     integer: Option<crate::scalar_integer_domain::ScalarIntegerDomain>,
     nominals: &super::nominal_declaration::NominalSourceDeclarations,
+    purpose: DeclarationPurpose,
     depth: usize,
     nodes: &mut usize,
     creation: &mut ConnectorReadSchemaCreation<'_>,
@@ -134,7 +166,7 @@ fn author(
     let storage = creation.storage();
     let (source, layout, kind) = match declaration {
         Type::Primitive(_) | Type::Variant(_) => {
-            let (data_type, domain) = match declaration {
+            let (mut data_type, domain) = match declaration {
                 Type::Primitive(primitive) => (
                     primitive_layout(primitive, integer)?,
                     nominal.unwrap_or(match primitive {
@@ -157,6 +189,12 @@ fn author(
                 }
                 _ => unreachable!("scalar declaration arm"),
             };
+            if purpose == DeclarationPurpose::CanonicalWriteInput
+                && domain == ValueLogicalType::Physical
+                && matches!(declaration, Type::Primitive(PrimitiveType::Fixed(_)))
+            {
+                data_type = DataType::Binary;
+            }
             domain.validate_carrier(&data_type).map_err(|_| {
                 invalid("Iceberg source domain conflicts with its declared primitive carrier")
             })?;
@@ -184,6 +222,7 @@ fn author(
                     nominals.get(&field.id).map(|domain| domain.logical_type()),
                     None,
                     nominals,
+                    purpose,
                     depth + 1,
                     nodes,
                     creation,
@@ -219,6 +258,7 @@ fn author(
                 nominals.get(&item.id).map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                purpose,
                 depth + 1,
                 nodes,
                 creation,
@@ -249,6 +289,7 @@ fn author(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                purpose,
                 depth + 2,
                 nodes,
                 creation,
@@ -261,6 +302,7 @@ fn author(
                     .map(|domain| domain.logical_type()),
                 None,
                 nominals,
+                purpose,
                 depth + 2,
                 nodes,
                 creation,

@@ -291,7 +291,7 @@ pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), Str
 ///   could never commit.
 /// - UPDATE and every MERGE shape use merge-on-read after the v3 and writable
 ///   schema checks. Table write-mode properties do not choose execution policy.
-// Design: ADR-0055 (docs/adr/ADR-0055-row-dml-strategy-consumer-closeout.md)
+// Design: ADR-0231 (docs/adr/ADR-0231-iceberg-mor-only-and-provider-owned-write-validation.md)
 pub fn row_mutation_strategy_from_metadata(
     metadata: &TableMetadata,
     intent: &novarocks_spi::connector::ConnectorRowMutationIntent,

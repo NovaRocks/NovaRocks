@@ -455,3 +455,86 @@ fn captured_enclosing_initialization_admits_before_real_length_progress_at_256()
         assert_eq!(control.trace(), vec![(CompilePhase::Decode, 0)]);
     }
 }
+
+#[test]
+fn typed_writer_references_charge_each_known_raw_scalar_and_optional_wrapper() {
+    use novarocks_proto_models::physical_package_v2 as wire;
+    let model = model();
+    // Independent actual wire paths from FragmentPackage to each inline
+    // reference owner. IDs are sparse references, never allocation lengths.
+    for (path, tag, inline) in [
+        (
+            &[20, 4, 1, 1][..],
+            4,
+            size_of::<wire::ConnectorWriteFieldBinding>(),
+        ),
+        (
+            &[3, 5, 23, 1, 3][..],
+            3,
+            size_of::<wire::ChangeAssignment>(),
+        ),
+        (
+            &[3, 5, 23, 1, 3][..],
+            4,
+            size_of::<wire::ChangeAssignment>(),
+        ),
+        (&[3, 5, 25, 5][..], 6, size_of::<wire::WriterTargetField>()),
+        (&[3, 5, 25, 5][..], 7, size_of::<wire::WriterTargetField>()),
+    ] {
+        let wrap = |mut payload: Vec<u8>| {
+            for &tag in path.iter().rev() {
+                payload = ld(tag, &payload);
+            }
+            payload
+        };
+        let empty = model
+            .preflight(&wrap(Vec::new()), limits(), &Control::default())
+            .unwrap()
+            .usage;
+        let mut payload = Vec::new();
+        for id in [0, u32::MAX, 0] {
+            payload.extend(varint(tag, u64::from(id)));
+        }
+        let raw = wrap(payload.clone());
+        let full = model
+            .preflight(&raw, limits(), &Control::default())
+            .unwrap();
+        assert_eq!(full.status, ResourceCursorStatus::Complete);
+        assert_eq!(full.usage.message_occurrences, path.len() + 1);
+        assert_eq!(full.usage.scalar_elements, 3);
+        assert_eq!(full.usage.field_occurrences, path.len() + 3);
+        assert_eq!(
+            full.usage.initialization_bytes_upper - empty.initialization_bytes_upper,
+            3 * (inline + size_of::<Option<u32>>())
+        );
+        for axis in 0..3 {
+            let mut bound = limits();
+            match axis {
+                0 => bound.max_scalar_elements = 2,
+                1 => bound.max_field_occurrences = path.len() + 2,
+                _ => bound.max_initialization_bytes = full.usage.initialization_bytes_upper - 1,
+            }
+            for cause in causes() {
+                let control = Control {
+                    fail: Some((1, cause)),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    complete(&model, &raw, bound, &control, &mut Vec::new()),
+                    Err(ResourceModelError::Control(
+                        CompileControlError::ResourceExhausted
+                    ))
+                );
+                assert_eq!(control.trace(), vec![(CompilePhase::Decode, 0)]);
+            }
+        }
+        // A recognized scalar's original charges survive its malformed value.
+        encode_key(tag, WireType::Varint, &mut payload);
+        let prefix = model
+            .preflight(&wrap(payload), limits(), &Control::default())
+            .unwrap();
+        assert_eq!(prefix.status, ResourceCursorStatus::MalformedPrefix);
+        assert_eq!(prefix.usage.scalar_elements, 4);
+        assert_eq!(prefix.usage.field_occurrences, path.len() + 4);
+    }
+}

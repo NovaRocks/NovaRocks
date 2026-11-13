@@ -504,9 +504,6 @@ fn frozen_rewrite_branch_input(
 ///   so it is a merge-on-read mutation: the delete branch consumes the
 ///   before-image identity and the data branch consumes the after-image values.
 ///   A `Replace` reaches both, which is why both accept it;
-/// * a row-lineage input whose identity is `_row_id`/`_last_updated_sequence_number`
-///   is a copy-on-write mutation: one data branch rewrites whole files, so it
-///   sees every change event that touches a file it rewrites.
 pub(crate) fn plan_row_mutation_branches(
     material: &IcebergSessionMaterial,
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {

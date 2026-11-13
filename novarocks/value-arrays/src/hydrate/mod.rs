@@ -25,10 +25,13 @@ use crate::{
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field};
 use novarocks_failure_contract::RepresentationFacts;
-use novarocks_type_contract::{BorrowedTypedValueBinding, TypedValueBinding};
+use novarocks_type_contract::{
+    BorrowedTypedValueBinding, CheckedWriteInputProjection, TypedValueBinding,
+};
 use std::{alloc::Layout, sync::Arc};
 
 mod execution;
+mod leaf_source;
 mod tree;
 mod validation;
 use tree::Node;
@@ -206,12 +209,80 @@ impl HydratePlan {
         work: &mut Work<'_, E>,
         observe: &mut HydrateObserver<'_, E>,
     ) -> Result<Self, ValueFailure<E>> {
-        validation::validate_with_options(source, binding, options, work, observe)?;
+        Self::plan_internal(
+            source,
+            binding,
+            options,
+            None,
+            context,
+            storage,
+            keep_encoded,
+            growth,
+            work,
+            observe,
+        )
+    }
+
+    /// Materialize only the leaf projections authorized by the checked V/W/T
+    /// relation. The complete W binding supplies its original storage lifetime;
+    /// the proof borrows normalized declarations and grants no capacity.
+    pub fn plan_assignment_projection_with_storage_observed<E>(
+        source: &ArrayRef,
+        binding: &TypedValueBinding,
+        proof: CheckedWriteInputProjection<'_>,
+        context: &mut ValueConversionContext,
+        storage: &novarocks_type_contract::ValueTypeStorageLifetime,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut HydrateObserver<'_, E>,
+    ) -> Result<Self, ValueFailure<E>> {
+        if !binding
+            .borrowed()
+            .exactly_equals_observed(proof.input(), || work(1))
+            .map_err(ValueFailure::Caller)?
+        {
+            return Err(ValueError::Invariant(ValueViolation::Layout).into());
+        }
+        Self::plan_internal(
+            source,
+            binding,
+            HydrateOptions {
+                dictionary_value_layout: None,
+                projection: HydrateProjection::FrozenNamesAndNullability,
+            },
+            Some(proof),
+            context,
+            storage,
+            &mut |_, _| false,
+            growth,
+            work,
+            observe,
+        )
+    }
+
+    fn plan_internal<E>(
+        source: &ArrayRef,
+        binding: &TypedValueBinding,
+        options: HydrateOptions,
+        proof: Option<CheckedWriteInputProjection<'_>>,
+        context: &mut ValueConversionContext,
+        storage: &novarocks_type_contract::ValueTypeStorageLifetime,
+        keep_encoded: &mut impl FnMut(&[HydratePathStep], &DataType) -> bool,
+        growth: &mut Growth<'_, E>,
+        work: &mut Work<'_, E>,
+        observe: &mut HydrateObserver<'_, E>,
+    ) -> Result<Self, ValueFailure<E>> {
+        if let Some(proof) = proof {
+            validation::validate_assignment(source, proof, options, work, observe)?;
+        } else {
+            validation::validate_with_options(source, binding, options, work, observe)?;
+        }
         let mut path = [HydratePathStep::ListItem; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
         let mut root = Node::plan(
             source,
             binding.borrowed(),
             options,
+            proof,
             &mut path,
             0,
             keep_encoded,
@@ -248,6 +319,7 @@ impl HydratePlan {
                 &sliced,
                 binding.borrowed(),
                 options,
+                proof,
                 &mut path,
                 0,
                 &mut |_, _| {

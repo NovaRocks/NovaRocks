@@ -196,6 +196,28 @@ mod tests {
             3,
         )
         .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false),
+            Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, false),
+        ]));
+        let public_input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
+            fields: schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, field)| {
+                    let mut token = [0; 32];
+                    token[..8].copy_from_slice(&(ordinal as u64).to_be_bytes());
+                    novarocks_spi::connector::ConnectorWriteFieldBinding::new(
+                        novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(token),
+                        field.as_ref().clone(),
+                    )
+                })
+                .collect(),
+        };
+        let input_identity =
+            crate::commit::write_stack::domain::data_write_input_identity(&public_input).unwrap();
         let handle = IcebergWriterHandle::try_new_data(
             table,
             IcebergWriterOutput::try_new(
@@ -211,14 +233,10 @@ mod tests {
                 Vec::new(),
                 true,
             )
-            .unwrap(),
+            .unwrap()
+            .with_write_input_identity(input_identity),
         )
         .unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false),
-            Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, false),
-        ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

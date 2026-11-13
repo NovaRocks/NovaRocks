@@ -1451,6 +1451,7 @@ fn writer_derived_kind(kind: novarocks_physical_plan::WriterDerivedKind) -> &'st
         WriterDerivedKind::RelationAuxiliary => "relation-auxiliary",
         WriterDerivedKind::WriteTargetOrdinal => "write-target-ordinal",
         WriterDerivedKind::GroupingKey => "grouping-key",
+        WriterDerivedKind::ProjectedInput => "projected-input",
     }
 }
 
@@ -3230,15 +3231,15 @@ condition,
                     "effect={} predicate={} assignments=[{}]",
                     connector_row_mutation_effect(event.effect),
                     format_optional_readable_expr(plan, fragment_id, fragment, event.predicate),
-                    joined(&event.assignments, ", ", |(value, expression): &(ValueId, Option<ExprId>), output: &mut fmt::Formatter<'_>| write!(
+                    joined(&event.assignments, ", ", |assignment: &novarocks_physical_plan::ChangeAssignment, output: &mut fmt::Formatter<'_>| write!(
                             output,
                             "v{}->{}",
-                            value.get(),
+                            assignment.output.get(),
                             format_optional_readable_expr(
                                 plan,
                                 fragment_id,
                                 fragment,
-                                *expression
+                                assignment.expression
                             )
                         ))
                 ))
@@ -3255,9 +3256,10 @@ condition,
             format_distribution_complete(context, fragment_id, &target.required_distribution),
             joined(&target.target_fields, "; ", |field: &novarocks_physical_plan::WriterTargetField, formatter: &mut fmt::Formatter<'_>| write!(
                     formatter,
-                    "token={} input=v{} type={} hidden={}",
+                    "token={} input=v{} projected=v{} type={} hidden={}",
                     format_hex(&field.token.to_bytes()),
                     field.input.get(),
+                    field.projected.get(),
                     format_value_type(&field.ty),
                     field.hidden
                 )),

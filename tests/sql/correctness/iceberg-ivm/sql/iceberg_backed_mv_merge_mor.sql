@@ -21,9 +21,9 @@
 -- Test Point:
 --   Validate projection/filter MV incremental refresh after a MERGE INTO
 --   on a v3 row-lineage Iceberg base table whose update mode is
---   merge-on-read. The MERGE produces a MOR UPDATE snapshot
---   (Operation::Delete with the NovaRocks update marker) followed by a
---   FastAppend INSERT snapshot; the MV planner must walk both.
+--   merge-on-read. The MERGE publishes one RowDelta snapshot containing
+--   matched-row deletions, replacement after-images and unmatched inserts;
+--   the MV planner must consume every admitted row effect.
 -- Method:
 --   Create a projection MV, refresh once, MERGE updates +
 --   inserts, refresh, and verify the MV reflects the matched update plus

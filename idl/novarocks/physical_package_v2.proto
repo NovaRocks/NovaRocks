@@ -344,6 +344,7 @@ enum WriterDerivedKind {
   WRITER_DERIVED_KIND_RELATION_AUXILIARY = 5;
   WRITER_DERIVED_KIND_WRITE_TARGET_ORDINAL = 6;
   WRITER_DERIVED_KIND_GROUPING_KEY = 7;
+  WRITER_DERIVED_KIND_PROJECTED_INPUT = 8;
 }
 message ExpressionDefinition {
   uint32 id = 1;
@@ -909,6 +910,8 @@ message ChangeEvent {
 message ChangeAssignment {
   optional uint32 value_id = 1;
   optional uint32 expr_id = 2;
+  optional uint32 write_input_value_type_id = 3;
+  optional uint32 storage_value_type_id = 4;
 }
 enum RowMutationEffect {
   ROW_MUTATION_EFFECT_UNSPECIFIED = 0;
@@ -959,6 +962,8 @@ message WriterTargetField {
   optional uint32 input_value_id = 3;
   optional uint32 value_type_id = 4;
   bool hidden = 5;
+  optional uint32 projected_value_id = 6;
+  optional uint32 storage_value_type_id = 7;
 }
 message WriterRelationSchema {
   uint32 revision = 1;
@@ -1659,6 +1664,8 @@ message ConnectorWriteFieldBinding {
   optional uint32 source_field_id = 2;
   // Genuine complete execution projection, separate from source attributes.
   optional uint32 value_type_id = 3;
+  // Optional complete storage target; absence admits only exact input.
+  optional uint32 storage_value_type_id = 4;
 }
 message ConnectorWriteDataInput {
   repeated ConnectorWriteFieldBinding fields = 1;

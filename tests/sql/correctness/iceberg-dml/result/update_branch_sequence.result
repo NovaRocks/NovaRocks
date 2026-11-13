@@ -21,3 +21,8 @@ id	v
 -- types	bigint
 preserved_row_ids
 2
+
+-- query 7
+-- types	boolean
+has_delete_artifacts
+true

@@ -35,7 +35,7 @@
 //! `HydratePlan::require_complete` rather than silently returning a prefix.
 //!
 //! Conversion contexts belong to the real serial caller (for example a driver
-//! or a COW operation). Borrow them across related synchronous calls and clear
+//! or a write assignment). Borrow them across related synchronous calls and clear
 //! their cache when work exits. Efficiency budgets may skip reuse, never reject
 //! an otherwise legal value; published aliases retain their own source custody.
 //! Growth, Work and structure observations remain separate caller policies.

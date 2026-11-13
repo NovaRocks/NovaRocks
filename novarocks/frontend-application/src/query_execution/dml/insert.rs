@@ -83,9 +83,9 @@ impl InsertEngine for DmlExecutionKernel {
 /// - `ConnectorTableMetadata::schema` is the full physical Arrow schema. Hidden
 ///   columns are *marked* in the planning facts rather than removed from the
 ///   schema, so this field set is the provider's whole current schema.
-/// - `write_target_type()` is the provider-signed DML write type, published only
-///   where it differs from the read type, so falling back to the Arrow field
-///   type reproduces the read-side type exactly.
+/// - `write_input()` carries the complete signed Field/W/T declaration where
+///   writing differs from reading. Absence preserves the complete read binding,
+///   including its nominal domain and all nested NULL declarations.
 /// - `write_default()` is the value a write omitting the column receives; it
 ///   projects onto the neutral catalog vocabulary variant-for-variant.
 pub(crate) fn insert_columns_from_connector_metadata(
@@ -93,7 +93,7 @@ pub(crate) fn insert_columns_from_connector_metadata(
 ) -> Result<Vec<ColumnDef>, String> {
     crate::connector::require_current_write_authority(&metadata.planning_facts)?;
     let column_facts = metadata.planning_facts.column_facts();
-    Ok(metadata
+    metadata
         .schema()
         .fields()
         .iter()
@@ -109,21 +109,14 @@ pub(crate) fn insert_columns_from_connector_metadata(
                 fact.role() != novarocks_spi::connector::ConnectorTableColumnRole::RowLineageSystem
             })
         })
-        .map(|(ordinal, field)| ColumnDef {
-            name: field.name().clone(),
-            data_type: column_facts
-                .get(ordinal)
-                .and_then(|fact| fact.write_target_type())
-                .cloned()
-                .unwrap_or_else(|| field.data_type().clone()),
-            nullable: field.is_nullable(),
-            write_default: crate::connector::connector_write_default_at(
-                &metadata.planning_facts,
+        .map(|(ordinal, _)| {
+            crate::connector::connector_write_column(
+                metadata,
                 ordinal,
-            ),
-            logical_type: None,
+                crate::connector::connector_write_default_at(&metadata.planning_facts, ordinal),
+            )
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 -- @sequential=true
 -- Spark/Java independently prove pre-commit NULL lineage, then inspect the
 -- actual committed snapshot and rows after a MOR UPDATE of a historical row.
--- COW on files without lineage is outside this MOR case's supported contract.
+-- UPDATE uses MOR; historical rows without stored lineage retain physical-position matching.
 
 -- query 1
 -- @result_contains=SPARK_UPGRADE_NULL_LINEAGE_READY

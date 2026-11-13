@@ -75,78 +75,90 @@ impl SqlExpressionConstant {
         query: &'a ast::Query,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<&'a ast::Expr, SqlCompileError> {
-        let mut body = query.body.as_ref();
-        for step in &self.body_path {
-            work.step()?;
-            body = match (step, body) {
-                (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => {
-                    query.body.as_ref()
-                }
-                (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
-                    if matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All) =>
-                {
-                    op.left.as_ref()
-                }
-                (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
-                    if matches!(op.operator, ast::SetOperator::Union)
-                        && matches!(op.quantifier, ast::SetQuantifier::All) =>
-                {
-                    op.right.as_ref()
-                }
-                (
-                    SqlConstantQueryStep::SelectFromDerived { from },
-                    ast::SetExpr::Select(select),
-                ) => {
-                    let Some(ast::TableFactor::Derived { subquery, .. }) =
-                        select.from.get(*from).map(|from| &from.relation)
-                    else {
-                        return Err(invalid(
-                            "constant source path differs from its owned derived relation",
-                        ));
-                    };
-                    subquery.body.as_ref()
-                }
-                _ => {
-                    return Err(invalid(
-                        "constant source path differs from its owned query body",
-                    ));
-                }
-            };
-        }
+        resolve_expression_site(
+            query,
+            &self.body_path,
+            self.site,
+            &self.expression_path,
+            false,
+            work,
+        )
+    }
+}
+
+pub(crate) fn resolve_expression_site<'a>(
+    query: &'a ast::Query,
+    body_path: &[SqlConstantQueryStep],
+    site: SqlConstantExpressionSite,
+    expression_path: &[SqlConstantExpressionStep],
+    allow_set_operations: bool,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<&'a ast::Expr, SqlCompileError> {
+    let mut body = query.body.as_ref();
+    for step in body_path {
         work.step()?;
-        let mut expression = match (self.site, body) {
-            (
-                SqlConstantExpressionSite::ValuesCell { row, column },
-                ast::SetExpr::Values(values),
-            ) => values.rows.get(row).and_then(|row| row.get(column)),
-            (
-                SqlConstantExpressionSite::SelectProjection { column },
-                ast::SetExpr::Select(select),
-            ) => select.projection.get(column).and_then(|item| match item {
+        body = match (step, body) {
+            (SqlConstantQueryStep::NestedQuery, ast::SetExpr::Query(query)) => query.body.as_ref(),
+            (SqlConstantQueryStep::UnionLeft, ast::SetExpr::SetOperation(op))
+                if allow_set_operations
+                    || (matches!(op.operator, ast::SetOperator::Union)
+                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            {
+                op.left.as_ref()
+            }
+            (SqlConstantQueryStep::UnionRight, ast::SetExpr::SetOperation(op))
+                if allow_set_operations
+                    || (matches!(op.operator, ast::SetOperator::Union)
+                        && matches!(op.quantifier, ast::SetQuantifier::All)) =>
+            {
+                op.right.as_ref()
+            }
+            (SqlConstantQueryStep::SelectFromDerived { from }, ast::SetExpr::Select(select)) => {
+                let Some(ast::TableFactor::Derived { subquery, .. }) =
+                    select.from.get(*from).map(|from| &from.relation)
+                else {
+                    return Err(invalid(
+                        "constant source path differs from its owned derived relation",
+                    ));
+                };
+                subquery.body.as_ref()
+            }
+            _ => {
+                return Err(invalid(
+                    "constant source path differs from its owned query body",
+                ));
+            }
+        };
+    }
+    work.step()?;
+    let mut expression = match (site, body) {
+        (SqlConstantExpressionSite::ValuesCell { row, column }, ast::SetExpr::Values(values)) => {
+            values.rows.get(row).and_then(|row| row.get(column))
+        }
+        (SqlConstantExpressionSite::SelectProjection { column }, ast::SetExpr::Select(select)) => {
+            select.projection.get(column).and_then(|item| match item {
                 ast::SelectItem::UnnamedExpr(expr)
                 | ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
                 _ => None,
-            }),
-            _ => None,
+            })
         }
-        .ok_or_else(|| invalid("constant source expression is outside its owned query"))?;
-        for step in &self.expression_path {
-            work.step()?;
-            expression = match (step, expression) {
-                (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => {
-                    &nested.expression
-                }
-                _ => {
-                    return Err(invalid(
-                        "constant source expression path differs from its owned syntax",
-                    ));
-                }
-            };
-        }
-        Ok(expression)
+        _ => None,
     }
+    .ok_or_else(|| invalid("constant source expression is outside its owned query"))?;
+    for step in expression_path {
+        work.step()?;
+        expression = match (step, expression) {
+            (SqlConstantExpressionStep::Nested, ast::Expr::Nested(nested)) => &nested.expression,
+            _ => {
+                return Err(invalid(
+                    "constant source expression path differs from its owned syntax",
+                ));
+            }
+        };
+    }
+    Ok(expression)
 }
+
 pub type SqlExpressionConstants = std::sync::Arc<[SqlExpressionConstant]>;
 
 /// Each constant retains its actual immutable pool and complete value type.
@@ -161,6 +173,38 @@ pub(crate) struct MaterializedSourceBorrow<'a> {
     _query: std::marker::PhantomData<&'a ast::Query>,
     expressions: std::collections::BTreeMap<usize, novarocks_functions::ConstantValue>,
 }
+
+impl<'a> MaterializedSourceBorrow<'a> {
+    pub(crate) fn empty(_query: &'a ast::Query) -> Self {
+        Self {
+            _query: std::marker::PhantomData,
+            expressions: std::collections::BTreeMap::new(),
+        }
+    }
+    pub(crate) fn has_expression(&self, expression: &ast::Expr) -> bool {
+        self.expressions
+            .contains_key(&(std::ptr::from_ref(expression) as usize))
+    }
+    pub(crate) fn insert_context_constant(
+        &mut self,
+        expression: &'a ast::Expr,
+        value: novarocks_functions::ConstantValue,
+        control: &super::SqlCompileControl,
+    ) -> Result<(), SqlCompileError> {
+        control.checkpoint(CompilePhase::Validate, 1)?;
+        if self
+            .expressions
+            .insert(std::ptr::from_ref(expression) as usize, value)
+            .is_some()
+        {
+            return Err(invalid(
+                "write literal context repeats an original constant occurrence",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl MaterializedSourceBorrow<'_> {
     pub(crate) fn view(&self) -> MaterializedValuesLoan<'_> {
         MaterializedValuesLoan {

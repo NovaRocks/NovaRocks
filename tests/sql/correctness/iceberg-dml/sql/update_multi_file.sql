@@ -16,16 +16,15 @@
 -- under the License.
 
 -- @order_sensitive=true
--- Test Point: one v3 COW UPDATE activates one sealed rewrite cohort per old
---             data file while committing the aggregate as one snapshot.
--- Method: separate INSERT statements deliberately produce two admitted old
---         files. One UPDATE matches a row in each file. A correct COW plan
---         therefore has two rewrite cohorts but only one terminal commit.
+-- Test Point: a v3 merge-on-read UPDATE changes multiple original files
+-- while publishing one snapshot and preserving row lineage.
+-- Method: two separate INSERT statements create two original files. One
+-- UPDATE replaces a row from each file; the snapshot count advances once.
 
 -- query 1
 -- @skip_result_check=true
-DROP TABLE IF EXISTS ${case_db}.t_v3_update_cow_multi_file FORCE;
-CREATE TABLE ${case_db}.t_v3_update_cow_multi_file (
+DROP TABLE IF EXISTS ${case_db}.t_v3_update_multi_file FORCE;
+CREATE TABLE ${case_db}.t_v3_update_multi_file (
   id BIGINT,
   v STRING
 )
@@ -33,32 +32,32 @@ TBLPROPERTIES (
   "format-version" = "3",
   "write.row-lineage" = "true"
 );
-INSERT INTO ${case_db}.t_v3_update_cow_multi_file VALUES (1, 'a');
-INSERT INTO ${case_db}.t_v3_update_cow_multi_file VALUES (2, 'b');
+INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (1, 'a');
+INSERT INTO ${case_db}.t_v3_update_multi_file VALUES (2, 'b');
 
 -- query 2
 SELECT count(*) AS snaps_before
-FROM ${case_db}.t_v3_update_cow_multi_file$snapshots;
+FROM ${case_db}.t_v3_update_multi_file$snapshots;
 
 -- query 3
 -- @skip_result_check=true
-UPDATE ${case_db}.t_v3_update_cow_multi_file
+UPDATE ${case_db}.t_v3_update_multi_file
 SET v = CONCAT(v, '_updated')
 WHERE id IN (1, 2);
 
 -- query 4
 SELECT count(*) AS snaps_after
-FROM ${case_db}.t_v3_update_cow_multi_file$snapshots;
+FROM ${case_db}.t_v3_update_multi_file$snapshots;
 
 -- query 5
 SELECT id, v
-FROM ${case_db}.t_v3_update_cow_multi_file
+FROM ${case_db}.t_v3_update_multi_file
 ORDER BY id;
 
 -- query 6
 SELECT COUNT(DISTINCT _row_id) AS distinct_row_ids, COUNT(*) AS total_rows
-FROM ${case_db}.t_v3_update_cow_multi_file;
+FROM ${case_db}.t_v3_update_multi_file;
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE ${case_db}.t_v3_update_cow_multi_file FORCE;
+DROP TABLE ${case_db}.t_v3_update_multi_file FORCE;

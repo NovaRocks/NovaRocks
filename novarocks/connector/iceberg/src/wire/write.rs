@@ -249,6 +249,7 @@ fn field_rule(message: MessageKind, field: u32) -> Option<FieldRule> {
         (M::DataRecipe, 1) => Some(singular(F::Text)),
         (M::DataRecipe, 2..=4) => Some(repeated(F::Text)),
         (M::DataRecipe, 5) => Some(singular(F::Varint)),
+        (M::DataRecipe, 6) => Some(singular(F::Bytes)),
 
         (M::EqualityRecipe, 1) => Some(repeated(F::Message(M::EqualityColumn))),
         (M::EqualityRecipe, 2) => Some(singular(F::Text)),
@@ -773,6 +774,11 @@ fn validate_data_recipe(
     context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<(), ConnectorCodecError> {
     let result = (|| {
+        require_exact_bytes::<32>(
+            &recipe.write_input_identity,
+            path.field("write_input_identity"),
+        )?;
+        context.observe_compile_step()?;
         if let Some(schema) = &recipe.target_schema_json {
             bounded_text(
                 schema,
@@ -1624,7 +1630,13 @@ mod compile_control_tests {
                 vec!["identity(k1)".into(); 321],
                 false,
             )
-            .unwrap(),
+            .unwrap()
+            .with_write_input_identity(
+                crate::commit::write_stack::domain::data_write_input_identity(
+                    &crate::commit::write_stack::test_support::data_input_shape(),
+                )
+                .expect("original fixture input identity"),
+            ),
         )
         .unwrap();
         let equality = IcebergWriterHandle::try_new_equality_delete(

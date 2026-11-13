@@ -1378,6 +1378,14 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                     return Ok(());
                 }
                 usage.add_items(event.assignments.len());
+                for assignment in &event.assignments {
+                    if let Some(declaration) = &assignment.write_input {
+                        validate_value_type_core(&declaration.input, path, usage, errors, policy)?;
+                        if let Some(storage) = &declaration.storage {
+                            validate_value_type_core(storage, path, usage, errors, policy)?;
+                        }
+                    }
+                }
             }
         }
         NodeKind::PositionShard(spec) => {
@@ -1412,6 +1420,15 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                     errors,
                     policy,
                 )?;
+                if let Some(storage) = &field.storage_type {
+                    validate_value_type_core(
+                        storage,
+                        &format!("{path}.target_fields[{index}].storage"),
+                        usage,
+                        errors,
+                        policy,
+                    )?;
+                }
             }
             add_writer_schema_usage_core(
                 &target.output_schema,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Private COW constructor specialization. Ordinary constructors remain unchanged.
+// Private rewrite constructor specialization. Ordinary constructors remain unchanged.
 // Original cancellation and retention accompany the actual constructors.
 use crate::commit::write_stack::domain::{IcebergDataBranchRecipe, IcebergWriteTableFacts};
 use crate::iceberg::spec::TableMetadata;
@@ -33,11 +33,11 @@ pub(super) enum Failure<E> {
 impl<E> fmt::Debug for Failure<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Original(_) => "CowBeginOwn::Original",
-            Self::Provider(_) => "CowBeginOwn::Provider",
-            Self::Projection(_) => "CowBeginOwn::Projection",
-            Self::Overflow => "CowBeginOwn::Overflow",
-            Self::ShapeChanged => "CowBeginOwn::ShapeChanged",
+            Self::Original(_) => "RewriteSource::Original",
+            Self::Provider(_) => "RewriteSource::Provider",
+            Self::Projection(_) => "RewriteSource::Projection",
+            Self::Overflow => "RewriteSource::Overflow",
+            Self::ShapeChanged => "RewriteSource::ShapeChanged",
         })
     }
 }
@@ -199,13 +199,14 @@ pub(super) fn data_recipe<E>(
     let length = projection::count(schema.as_ref(), scope).map_err(Failure::Projection)?;
     let target_schema_json =
         projection::exact_json(schema.as_ref(), length, scope).map_err(Failure::Projection)?;
-    let backing = crate::commit::write_stack::domain::IcebergCowTargetSchemaBacking::from_checked(
-        target_schema_json,
-        scope.original_guard(),
-    );
+    let backing =
+        crate::commit::write_stack::domain::IcebergSharedTargetSchemaBacking::from_checked(
+            target_schema_json,
+            scope.original_guard(),
+        );
     scope.check_active().map_err(Failure::Original)?;
     let recipe =
-        IcebergDataBranchRecipe::try_new_cow(backing, sources, names, transforms, row_lineage)
+        IcebergDataBranchRecipe::try_new_shared(backing, sources, names, transforms, row_lineage)
             .map_err(Failure::Provider)?;
     if let Err(original) = scope.check_active() {
         drop(recipe); // Actual unclaimed graph exits BEFORE returning original cause.
@@ -252,7 +253,7 @@ pub(super) fn signed_input<E>(
         for (index, field) in fields.iter().enumerate() {
             scope.check_active().map_err(Failure::Original)?;
             let mut hasher = Sha256::new();
-            hasher.update(b"novarocks.iceberg.write-stack.field.v1\0");
+            hasher.update(b"novarocks.iceberg.write-stack.field.v2\0");
             hasher.update(facts.table_uuid().as_bytes());
             hasher.update([0]);
             hasher.update(facts.target_ref().as_bytes());
@@ -268,22 +269,35 @@ pub(super) fn signed_input<E>(
             )
             .map_err(|_| Failure::ShapeChanged)?;
             hasher.update([u8::from(field.field().is_nullable())]);
+            novarocks_connector_contract::write_input_projection_identity_observed(
+                field.execution_type(),
+                field.storage_type(),
+                |bytes| {
+                    scope.check_active().map_err(Failure::Original)?;
+                    hasher.update(bytes);
+                    Ok::<(), Failure<E>>(())
+                },
+            )?;
             let token = ConnectorWriteFieldToken::from_bytes(hasher.finalize().into());
-            output.push(
-                ConnectorWriteFieldBinding::try_new_typed(
-                    token,
-                    field.field().clone(),
-                    field
-                        .execution_type()
-                        .ok_or_else(|| {
-                            Failure::Provider(super::invalid(
-                                "Iceberg session field has no frozen complete declaration",
-                            ))
-                        })?
-                        .clone(),
-                )
-                .map_err(Failure::Provider)?,
-            );
+            let binding = ConnectorWriteFieldBinding::try_new_typed(
+                token,
+                field.field().clone(),
+                field
+                    .execution_type()
+                    .ok_or_else(|| {
+                        Failure::Provider(super::invalid(
+                            "Iceberg session field has no frozen complete declaration",
+                        ))
+                    })?
+                    .clone(),
+            )
+            .map_err(Failure::Provider)?;
+            output.push(match field.storage_type() {
+                Some(storage) => binding
+                    .with_storage_type(storage.clone())
+                    .map_err(Failure::Provider)?,
+                None => binding,
+            });
         }
         Ok(output)
     };
@@ -407,7 +421,7 @@ mod signed_input_type_tests {
         .expect("source and complete declaration agree")
     }
     #[test]
-    fn cow_signer_preserves_complete_request_types_and_original_role_tokens() {
+    fn rewrite_signer_preserves_complete_request_types_and_original_role_tokens() {
         let data = field("v", ValueLogicalType::LargeInt, false);
         let identity = field("id", ValueLogicalType::Uuid, true);
         let requests = [
@@ -432,7 +446,7 @@ mod signed_input_type_tests {
         ];
         for request in &requests {
             let scope = Scope::new(false);
-            let actual = signed_input(&facts(), request, &scope).expect("bounded COW signer");
+            let actual = signed_input(&facts(), request, &scope).expect("bounded rewrite signer");
             let ordinary =
                 super::super::sign_input_shape(&facts(), request).expect("original signer");
             assert_eq!(actual.shape(), &ordinary);
@@ -460,7 +474,37 @@ mod signed_input_type_tests {
         }
     }
     #[test]
-    fn cow_signer_rejects_missing_complete_declaration_instead_of_reauthoring_carrier() {
+    fn rewrite_signer_retains_complete_storage_and_agrees_with_ordinary_tokens() {
+        let request = |width| ConnectorWriteInputRequest::Data {
+            fields: vec![
+                ConnectorWriteFieldRequest::try_new_typed(
+                    Field::new("v", DataType::Binary, false),
+                    FunctionValueType::new(DataType::Binary, false),
+                )
+                .unwrap()
+                .with_storage_type(FunctionValueType::new(
+                    DataType::FixedSizeBinary(width),
+                    false,
+                ))
+                .unwrap(),
+            ],
+        };
+        let scope = Scope::new(false);
+        let first = request(4);
+        let signed = signed_input(&facts(), &first, &scope).unwrap();
+        let ordinary = super::super::sign_input_shape(&facts(), &first).unwrap();
+        assert_eq!(signed.shape(), &ordinary);
+        assert_eq!(
+            signed.shape().fields_iter().next().unwrap().storage_type(),
+            Some(&FunctionValueType::new(DataType::FixedSizeBinary(4), false))
+        );
+        let second = request(8);
+        let other = signed_input(&facts(), &second, &scope).unwrap();
+        assert_ne!(signed.shape(), other.shape());
+    }
+
+    #[test]
+    fn rewrite_signer_rejects_missing_complete_declaration_instead_of_reauthoring_carrier() {
         let request = ConnectorWriteInputRequest::Data {
             fields: vec![ConnectorWriteFieldRequest::new(Field::new(
                 "v",
@@ -484,7 +528,7 @@ mod signed_input_type_tests {
         }
     }
     #[test]
-    fn cow_signer_preserves_first_original_stop_without_callback_tail() {
+    fn rewrite_signer_preserves_first_original_stop_without_callback_tail() {
         let request = ConnectorWriteInputRequest::Data {
             fields: vec![field("v", ValueLogicalType::LargeInt, false)],
         };
@@ -542,7 +586,7 @@ mod target_schema_tests {
         }
     }
     #[test]
-    fn cow_complete_schema_preserves_original_stop_and_last_recipe_guard() {
+    fn rewrite_complete_schema_preserves_original_stop_and_last_recipe_guard() {
         let metadata = crate::commit::write_stack::test_support::staged_table_metadata();
         let denied = scope(Some(2));
         assert!(matches!(

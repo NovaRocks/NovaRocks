@@ -66,6 +66,11 @@ pub(crate) enum PackageTypeOwner {
     Binding(BindingOccurrence),
     Relation(p::NodeId),
     WriterTarget(p::NodeId),
+    ChangeAssignment {
+        node: p::NodeId,
+        event: usize,
+        assignment: usize,
+    },
     WriterOutput(p::NodeId),
     FinishInput(p::NodeId),
     FinishOutput(p::NodeId),
@@ -97,8 +102,11 @@ pub(crate) enum PackageTypeChannel {
     LambdaResult(usize),
     ExpressionLambdaParameter(usize),
     CastTarget,
+    WriteInput,
+    Storage,
     Intermediate,
     Field(usize),
+    StorageField(usize),
     ScanExecutionValue(usize),
     ScanSourceField(usize),
     CutImport(usize),
@@ -108,6 +116,10 @@ pub(crate) enum PackageTypeChannel {
     ExpectedResult,
     ConstantField,
     WriterField {
+        role: WriterTypeRootRole,
+        ordinal: usize,
+    },
+    WriterStorage {
         role: WriterTypeRootRole,
         ordinal: usize,
     },
@@ -297,6 +309,13 @@ impl<'a, E: From<CompileControlError>> Walk<'a, '_, '_, '_, E> {
                     binding,
                 },
             )?;
+            if let Some(storage) = binding.storage_type() {
+                self.value(
+                    PackageTypeOwner::Recipe(node),
+                    PackageTypeChannel::WriterStorage { role, ordinal },
+                    storage,
+                )?;
+            }
         }
         // Empty original roles are actual input occurrences as well.
         self.completed()
@@ -414,6 +433,9 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             p::NodeKind::TableWriter { target } => {
                 for (ordinal, field) in target.target_fields.iter().enumerate() {
                     walk.value(O::WriterTarget(*id), C::Field(ordinal), &field.ty)?;
+                    if let Some(storage) = &field.storage_type {
+                        walk.value(O::WriterTarget(*id), C::StorageField(ordinal), storage)?;
+                    }
                 }
                 walk.writer_schema(O::WriterOutput(*id), &target.output_schema)?;
                 for (ordinal, call) in target.partial_aggregates.iter().enumerate() {
@@ -432,6 +454,25 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
                         BindingOccurrence::FinishFinal { node: *id, ordinal },
                         &call.binding,
                     )?;
+                    walk.completed()?;
+                }
+            }
+            p::NodeKind::ChangeEventExpand { events, .. } => {
+                for (event, source) in events.iter().enumerate() {
+                    for (assignment, source) in source.assignments.iter().enumerate() {
+                        if let Some(declaration) = &source.write_input {
+                            let owner = O::ChangeAssignment {
+                                node: *id,
+                                event,
+                                assignment,
+                            };
+                            walk.value(owner, C::WriteInput, &declaration.input)?;
+                            if let Some(storage) = &declaration.storage {
+                                walk.value(owner, C::Storage, storage)?;
+                            }
+                        }
+                        walk.completed()?;
+                    }
                     walk.completed()?;
                 }
             }
@@ -459,7 +500,6 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
             | p::NodeKind::Unpivot { .. }
             | p::NodeKind::GenerateSeries { .. }
             | p::NodeKind::AssertOneRow(_)
-            | p::NodeKind::ChangeEventExpand { .. }
             | p::NodeKind::PositionShard(_)
             | p::NodeKind::ExchangeSource { .. } => {}
         }
@@ -726,10 +766,10 @@ mod tests {
         )
         .unwrap();
         work.finish().unwrap();
-        // This actual fixture has five Values, one literal, one target field,
+        // This actual fixture has six Values (including the private writer projection), one literal, one target field,
         // four Writer output fields, three ordered four-field cut copies,
         // and one independent original recipe Field.
-        assert_eq!(roots.len(), 24);
+        assert_eq!(roots.len(), 25);
         for ((id, value), (occurrence, source)) in package.fragment().values().iter().zip(&roots) {
             assert_eq!(occurrence.owner, PackageTypeOwner::Value(*id));
             let PackageTypeSource::Value(actual) = source else {
@@ -861,7 +901,7 @@ mod tests {
                 assert_eq!(stopped, trace[..=at]);
             }
         }
-        for rejected in 0..24 {
+        for rejected in 0..25 {
             let control = Control::default();
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             let mut captured = 0;
@@ -931,5 +971,59 @@ mod tests {
             assert_eq!(captured, 1);
             assert_eq!(control.events.lock().unwrap().len(), 3);
         }
+    }
+    #[test]
+    fn writer_storage_occurrence_borrows_its_complete_original_target() {
+        let original = package();
+        let recipe = original.writes().values().next().unwrap();
+        let field = recipe.input().fields_iter().next().unwrap();
+        let binding = c::ConnectorWriteFieldBinding::try_new_typed(
+            field.token(),
+            field.field().clone(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        )
+        .unwrap()
+        .with_storage_type(novarocks_type_contract::FunctionValueType::new(
+            DataType::Int64,
+            false,
+        ))
+        .unwrap();
+        let recipe = c::ConnectorWriteRecipeDraft::try_new(
+            recipe.binding().clone(),
+            recipe.payload().clone(),
+            c::ConnectorWriteInputShape::Data {
+                fields: vec![binding],
+            },
+        )
+        .unwrap();
+        let package = crate::physical_type_v2::sender_tests::checked_writer_package(recipe);
+        let (node, recipe) = package.writes().iter().next().unwrap();
+        let binding = recipe.input().fields_iter().next().unwrap();
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut captured = 0;
+        visit_package_type_sources::<CompileControlError>(
+            &package,
+            &mut |occurrence, source, _| {
+                if occurrence.channel
+                    == (PackageTypeChannel::WriterStorage {
+                        role: WriterTypeRootRole::Data,
+                        ordinal: 0,
+                    })
+                {
+                    assert_eq!(occurrence.owner, PackageTypeOwner::Recipe(*node));
+                    let PackageTypeSource::Value(value) = source else {
+                        panic!("storage is a complete Value root")
+                    };
+                    assert!(std::ptr::eq(value, binding.storage_type().unwrap()));
+                    assert!(!std::ptr::eq(value, binding.execution_type().unwrap()));
+                    captured += 1;
+                }
+                Ok(())
+            },
+            &mut work,
+        )
+        .unwrap();
+        assert_eq!(captured, 1);
     }
 }

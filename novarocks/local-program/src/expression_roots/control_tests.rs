@@ -832,6 +832,7 @@ fn three_scope_program(
                     target: WriteTargetOrdinal::try_new(0).unwrap(),
                     expected_layout: layout.clone(),
                     projection: StaticWriterProjection {
+                        storage_types: vec![None],
                         arena: arenas[1].clone(),
                         expressions: vec![ProgramExprId::new(definition)],
                         layout: layout.clone(),

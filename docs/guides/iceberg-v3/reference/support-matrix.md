@@ -226,7 +226,7 @@ under the License.
 | INSERT INTO（VALUES / SELECT） | ✅ | |
 | INSERT OVERWRITE（静态分区 + 全表） | ✅ | |
 | DELETE FROM（V2 position-delete + V3 DV 双路径） | ✅ | |
-| UPDATE（COW + MOR + UPDATE FROM source） | ✅ | PR #76 |
+| UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
 | INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | 见 [DML](../dml.md) |
@@ -257,7 +257,6 @@ under the License.
 | `_row_id` / `_last_updated_sequence_number` 元数据列读 | ✅ | |
 | INSERT / OVERWRITE 实际分配 `first_row_id` 与 snapshot row range | ✅ | 包括未赋值历史 EXISTING 文件的首次分配 |
 | DELETE 不分配新 `_row_id`（DV 合并保留语义） | ✅ | |
-| COW UPDATE 保留 `_row_id` | ✅ | 源身份与 replacement/append 输出分别冻结 |
 | MOR UPDATE 复用 `_row_id`，新行版本继承实际提交 | ✅ | `_last_updated_sequence_number` 写 NULL |
 | OPTIMIZE 重写后保留每行 `_row_id`（写到 reserved field id `i32::MAX-107` / `-108`） | ✅ | PR #85 |
 | `_row_id` 跨 snapshot 唯一性 invariant 测试（含 OPTIMIZE 后） | ✅ | PR #85（`iceberg_v3_row_lineage_uniqueness.sql`） |
@@ -296,9 +295,8 @@ under the License.
 | IVM —— Partition evolution | ✅ | |
 | 投影 / 过滤 MV | ✅ | |
 | 聚合 MV：SUM / COUNT / AVG / MIN / MAX | ✅ | |
-| IVM —— COW UPDATE | ✅ | PR #76 |
 | IVM —— MOR UPDATE | ✅ | PR #76 |
-| IVM —— MERGE INTO（COW + MOR） | ✅ | PR #78 |
+| IVM —— MERGE INTO（MOR） | ✅ | PR #78 |
 
 ### 14.2 缺口
 

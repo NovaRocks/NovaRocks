@@ -41,14 +41,12 @@ use super::{
 };
 
 pub const MAX_CONNECTOR_WRITE_RECEIPT_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
-pub const MAX_CONNECTOR_WRITE_COHORTS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
-const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-observation.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
@@ -298,13 +296,24 @@ pub enum ConnectorWriteAdmissionPurpose {
 pub struct ConnectorWriteFieldRequest {
     field: Field,
     execution_type: Option<novarocks_type_contract::FunctionValueType>,
+    storage_type: Option<novarocks_type_contract::FunctionValueType>,
 }
+
+impl PartialEq for ConnectorWriteFieldRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.execution_type == other.execution_type
+            && self.storage_type == other.storage_type
+            && novarocks_type_contract::arrow_fields_exact(&self.field, &other.field)
+    }
+}
+impl Eq for ConnectorWriteFieldRequest {}
 
 impl ConnectorWriteFieldRequest {
     pub fn new(field: Field) -> Self {
         Self {
             field,
             execution_type: None,
+            storage_type: None,
         }
     }
 
@@ -330,7 +339,31 @@ impl ConnectorWriteFieldRequest {
         Ok(Self {
             field,
             execution_type: Some(execution_type),
+            storage_type: None,
         })
+    }
+
+    /// Preserve the provider's complete independent storage declaration.
+    pub fn with_storage_type(
+        mut self,
+        storage_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        let input = self.execution_type.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "writer storage projection requires its complete input declaration",
+            )
+        })?;
+        novarocks_connector_contract::validate_write_input_projection_observed(
+            input,
+            Some(&storage_type),
+            || Ok::<(), ConnectorError>(()),
+        )?;
+        self.storage_type = Some(storage_type);
+        Ok(self)
+    }
+    pub fn storage_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.storage_type.as_ref()
     }
 
     pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
@@ -1732,89 +1765,6 @@ impl ConnectorWriteReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorWriteCohortDescriptor {
-    cohort_id: ConnectorWriteCohortId,
-    intent: ConnectorWriteIntent,
-    planning_digest: [u8; 32],
-}
-
-impl ConnectorWriteCohortDescriptor {
-    pub const fn new(
-        cohort_id: ConnectorWriteCohortId,
-        intent: ConnectorWriteIntent,
-        planning_digest: [u8; 32],
-    ) -> Self {
-        Self {
-            cohort_id,
-            intent,
-            planning_digest,
-        }
-    }
-
-    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
-    }
-
-    pub const fn intent(&self) -> ConnectorWriteIntent {
-        self.intent
-    }
-
-    pub const fn planning_digest(&self) -> [u8; 32] {
-        self.planning_digest
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorSealedWriteCohortSet {
-    operation_id: ConnectorWriteOperationId,
-    cohorts: Vec<ConnectorWriteCohortDescriptor>,
-    digest: [u8; 32],
-}
-
-impl ConnectorSealedWriteCohortSet {
-    pub fn try_new(
-        operation_id: ConnectorWriteOperationId,
-        cohorts: Vec<ConnectorWriteCohortDescriptor>,
-    ) -> Result<Self, ConnectorError> {
-        if cohorts.is_empty() || cohorts.len() > MAX_CONNECTOR_WRITE_COHORTS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector write cohort set must contain 1..=4096 cohorts",
-            ));
-        }
-        let mut cohorts = cohorts;
-        cohorts.sort_by_key(ConnectorWriteCohortDescriptor::cohort_id);
-        if cohorts
-            .windows(2)
-            .any(|pair| pair[0].cohort_id == pair[1].cohort_id)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector write cohort set contains a duplicate cohort ID",
-            ));
-        }
-        let digest = cohort_set_digest(operation_id, &cohorts);
-        Ok(Self {
-            operation_id,
-            cohorts,
-            digest,
-        })
-    }
-
-    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-
-    pub fn cohorts(&self) -> &[ConnectorWriteCohortDescriptor] {
-        &self.cohorts
-    }
-
-    pub const fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorWriteAbortOutcome {
     KnownUncommitted {
         cleanup: ExternalMutationFinalization,
@@ -2194,22 +2144,6 @@ fn validate_receipt_payload(payload: &Bytes) -> Result<(), ConnectorError> {
     Ok(())
 }
 
-fn cohort_set_digest(
-    operation_id: ConnectorWriteOperationId,
-    cohorts: &[ConnectorWriteCohortDescriptor],
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(CONNECTOR_WRITE_COHORT_SET_DOMAIN);
-    hasher.update(operation_id.to_bytes());
-    hasher.update((cohorts.len() as u64).to_be_bytes());
-    for cohort in cohorts {
-        hasher.update(cohort.cohort_id.to_bytes());
-        hasher.update([write_intent_tag(cohort.intent)]);
-        hasher.update(cohort.planning_digest);
-    }
-    hasher.finalize().into()
-}
-
 fn digest_owner(hasher: &mut Sha256, owner: &ConnectorProviderBindingKey) {
     digest_bytes(hasher, owner.instance_id.as_str().as_bytes());
     hasher.update(owner.incarnation.to_bytes());
@@ -2248,6 +2182,21 @@ fn validate_input_request(request: &ConnectorWriteInputRequest) -> Result<(), Co
             "connector write input request must contain at least one field",
         ));
     }
+    let data_width = match request {
+        ConnectorWriteInputRequest::Data { fields } => fields.len(),
+        ConnectorWriteInputRequest::RowLineage { data_fields, .. } => data_fields.len(),
+        ConnectorWriteInputRequest::PositionDelete { .. }
+        | ConnectorWriteInputRequest::DeletionVector { .. }
+        | ConnectorWriteInputRequest::EqualityDelete { .. } => 0,
+    };
+    for (ordinal, field) in fields.iter().enumerate() {
+        if field.storage_type().is_some() && ordinal >= data_width {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "writer storage projection is only admitted for data fields",
+            ));
+        }
+    }
     let mut names = HashSet::new();
     if fields
         .iter()
@@ -2271,7 +2220,7 @@ fn preparation_digest(
     payload: &Bytes,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"novarocks.connector-write-preparation.v1\0");
+    hasher.update(b"novarocks.connector-write-preparation.v2\0");
     digest_owner(&mut hasher, owner);
     digest_bytes(&mut hasher, table.owner().as_str().as_bytes());
     digest_bytes(&mut hasher, table.payload());
@@ -2321,6 +2270,15 @@ fn digest_bound_fields(hasher: &mut Sha256, fields: &[ConnectorWriteFieldBinding
     for field in fields {
         hasher.update(field.token().to_bytes());
         digest_bytes(hasher, format!("{:?}", field.field()).as_bytes());
+        novarocks_connector_contract::write_input_projection_identity_observed(
+            field.execution_type(),
+            field.storage_type(),
+            |part| {
+                hasher.update(part);
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .expect("infallible write projection digest sink");
     }
 }
 
@@ -2629,39 +2587,32 @@ mod tests {
         assert_eq!(decoded.committed_partitioning(), Some(&partitioning));
     }
 
-    /// The sealed cohort set survives the write-operation aggregate because a
-    /// row-mutation execution plan is still sealed against one, so its ordering
-    /// and duplicate rules still have to hold.
     #[test]
-    fn sealed_cohort_set_is_sorted_and_rejects_duplicates() {
-        let operation_id = ConnectorWriteOperationId::new();
-        let first = ConnectorWriteCohortId::derive(operation_id, b"rewrite", [1; 32])
-            .expect("first cohort");
-        let second = ConnectorWriteCohortId::derive(operation_id, b"rewrite", [2; 32])
-            .expect("second cohort");
-        let sealed = ConnectorSealedWriteCohortSet::try_new(
-            operation_id,
-            vec![
-                ConnectorWriteCohortDescriptor::new(
-                    second,
-                    ConnectorWriteIntent::RowDelta,
-                    [4; 32],
-                ),
-                ConnectorWriteCohortDescriptor::new(first, ConnectorWriteIntent::RowDelta, [3; 32]),
-            ],
-        )
-        .expect("sealed cohorts");
-        assert!(sealed.cohorts()[0].cohort_id() < sealed.cohorts()[1].cohort_id());
-
-        let duplicate = ConnectorSealedWriteCohortSet::try_new(
-            operation_id,
-            vec![
-                ConnectorWriteCohortDescriptor::new(first, ConnectorWriteIntent::RowDelta, [3; 32]),
-                ConnectorWriteCohortDescriptor::new(first, ConnectorWriteIntent::RowDelta, [3; 32]),
-            ],
-        )
-        .expect_err("duplicate cohort");
-        assert_eq!(duplicate.kind(), ConnectorErrorKind::InvalidRequest);
+    fn cohort_identity_is_repeatable_and_binds_operation_role_and_key() {
+        let operation = ConnectorWriteOperationId::from_bytes([1; 16]);
+        let id = ConnectorWriteCohortId::derive(operation, b"rewrite", [2; 32]).unwrap();
+        assert_eq!(
+            id,
+            ConnectorWriteCohortId::derive(operation, b"rewrite", [2; 32]).unwrap()
+        );
+        for changed in [
+            ConnectorWriteCohortId::derive(
+                ConnectorWriteOperationId::from_bytes([3; 16]),
+                b"rewrite",
+                [2; 32],
+            )
+            .unwrap(),
+            ConnectorWriteCohortId::derive(operation, b"maintenance", [2; 32]).unwrap(),
+            ConnectorWriteCohortId::derive(operation, b"rewrite", [4; 32]).unwrap(),
+        ] {
+            assert_ne!(id, changed);
+        }
+        assert_eq!(
+            ConnectorWriteCohortId::derive(operation, b"", [2; 32])
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     #[test]

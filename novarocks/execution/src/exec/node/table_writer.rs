@@ -100,13 +100,14 @@ impl TableWriterPhysicalContextTemplate {
 pub(crate) struct TargetValueDeclaration<'a> {
     pub(crate) column: usize,
     pub(crate) name: &'a str,
-    pub(crate) requirement: BorrowedTypedValueBinding<'a>,
+    pub(crate) requirement: &'a TypedValueBinding,
+    pub(crate) storage: Option<BorrowedTypedValueBinding<'a>>,
     pub(crate) output: &'a TypedValueBinding,
     pub(crate) input_rows: Option<&'a [usize]>,
 }
 
-/// Fulfil a nullable-only assignment using the original construction owner.
-/// This does not cast a value or relabel its source promise. The checked
+/// Fulfil the checked assignment using the original construction owner.
+/// This preserves licensed byte strings and never relabels its source promise. The checked
 /// source and the target requirement remain separate through materialization.
 pub(crate) fn materialize_target_value(
     array: &ArrayRef,
@@ -129,14 +130,20 @@ pub(crate) fn materialize_target_value(
             )
             .map_err(ExecutionFailure::from)
     };
-    if !source.same_physical_binding_ignoring_nullability_observed(target.requirement, || {
-        observed_work(1)
-    })? || !target
+    let proof = novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+        source,
+        target.requirement.borrowed(),
+        target.storage,
+        || observed_work(1),
+    )?
+    .ok_or_else(|| target_value_contract(ValueViolation::Layout))?;
+    if !target
         .output
         .borrowed()
-        .same_physical_binding_ignoring_root_nullability_observed(target.requirement, || {
-            observed_work(1)
-        })?
+        .same_physical_binding_ignoring_root_nullability_observed(
+            target.requirement.borrowed(),
+            || observed_work(1),
+        )?
     {
         return Err(target_value_contract(ValueViolation::Layout));
     }
@@ -156,26 +163,54 @@ pub(crate) fn materialize_target_value(
                 .map_err(ExecutionFailure::from)
         })
     };
-    let plan = HydratePlan::plan_with_options_and_storage_observed(
-        array,
-        target.output,
-        HydrateOptions {
-            dictionary_value_layout: None,
-            projection: HydrateProjection::FrozenNamesAndNullability,
-        },
-        context,
-        &owner.storage_lifetime(),
-        &mut |_, _| false,
-        &mut growth,
-        &mut observed_work,
-        &mut observe,
-    )
+    let plan = if target.storage.is_some() {
+        HydratePlan::plan_assignment_projection_with_storage_observed(
+            array,
+            target.requirement,
+            proof,
+            context,
+            &owner.storage_lifetime(),
+            &mut growth,
+            &mut observed_work,
+            &mut observe,
+        )
+    } else {
+        HydratePlan::plan_with_options_and_storage_observed(
+            array,
+            target.output,
+            HydrateOptions {
+                dictionary_value_layout: None,
+                projection: HydrateProjection::FrozenNamesAndNullability,
+            },
+            context,
+            &owner.storage_lifetime(),
+            &mut |_, _| false,
+            &mut growth,
+            &mut observed_work,
+            &mut observe,
+        )
+    }
     .map_err(original)?;
     plan.require_complete()
         .map_err(ExecutionFailure::from_domain)?;
     let output = plan
         .execute_observed(context, &mut growth, &mut observed_work, &mut observe)
         .map_err(original)?;
+    let output = if target.storage.is_some() {
+        // Hydrate normalizes raw annotations. The exact W layout, rather than
+        // a source Field or storage T, authors the published wrapper metadata.
+        novarocks_functions::array_projection::rebuild_array_observed::<ExecutionFailure, _>(
+            &output,
+            target.output.data_type(),
+            &mut |step| {
+                owner
+                    .observe(target.column, &[], step)
+                    .map_err(ExecutionFailure::from)
+            },
+        )?
+    } else {
+        output
+    };
     if output.data_type() != target.output.data_type() {
         return Err(target_value_contract(ValueViolation::Layout));
     }
@@ -387,7 +422,7 @@ fn validate_target_requiredness(
     {
         return Err(target_value_contract(ValueViolation::Bounds));
     }
-    let nested = has_required_children(target.requirement, work)?;
+    let nested = has_required_children(target.requirement.borrowed(), work)?;
     if !nested && target.requirement.value_type().nullable() {
         return Ok(());
     }
@@ -396,7 +431,7 @@ fn validate_target_requiredness(
         return Ok(());
     }
     let plan = nested
-        .then(|| RequiredValuePlan::new(target.requirement, growth, work))
+        .then(|| RequiredValuePlan::new(target.requirement.borrowed(), growth, work))
         .transpose()?;
     let callback = std::cell::RefCell::new(work);
     let observed_work = |units| (callback.borrow_mut())(units);
@@ -404,7 +439,7 @@ fn validate_target_requiredness(
     for row in 0..array.len() {
         validate_target_row(
             array,
-            target.requirement,
+            target.requirement.borrowed(),
             row,
             row,
             target,
@@ -546,6 +581,190 @@ impl novarocks_failure_contract::FailureProjection for WriterRequiredValue {
 mod required_value_source_properties {
     use super::*;
     use novarocks_failure_contract::{FailureClass, FailureProjection};
+    fn assignment_owner(
+        required: &novarocks_type_contract::FunctionValueType,
+    ) -> Box<dyn crate::exec::pipeline::operator::InputConstructionOwner> {
+        use arrow::datatypes::{Field, Schema};
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("checked assignment materializer");
+        tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+        let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),tracker,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let layout = crate::exec::chunk::typed_fixture::layout(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                required.data_type().clone(),
+                required.nullable(),
+            )])),
+            &[novarocks_types::SlotId(1)],
+            std::slice::from_ref(required),
+        );
+        let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+        factory.begin_typed_construction(&schema).unwrap()
+    }
+
+    #[test]
+    fn checked_assignment_preserves_fixed_bytes_and_rejects_only_unlicensed_conversion() {
+        use arrow::array::{BinaryArray, FixedSizeBinaryArray};
+        use novarocks_type_contract::FunctionValueType;
+        let source = FunctionValueType::new(DataType::FixedSizeBinary(4), true);
+        let input = FunctionValueType::new(DataType::Binary, true);
+        let storage = FunctionValueType::new(DataType::FixedSizeBinary(8), true);
+        let array: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some([0, 255, 128, 1]), None].into_iter(),
+                4,
+            )
+            .unwrap(),
+        );
+        let owner = assignment_owner(&input);
+        let mut context = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let output = materialize_target_value(
+            &array,
+            source.typed_binding().borrowed(),
+            TargetValueDeclaration {
+                column: 0,
+                name: "payload",
+                requirement: input.typed_binding(),
+                storage: Some(storage.typed_binding().borrowed()),
+                output: input.typed_binding(),
+                input_rows: None,
+            },
+            &mut context,
+            owner.as_ref(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let bytes = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(bytes.value(0), &[0, 255, 128, 1]);
+        assert!(bytes.is_null(1));
+        assert_eq!(output.data_type(), input.data_type());
+        let failure = materialize_target_value(
+            &array,
+            source.typed_binding().borrowed(),
+            TargetValueDeclaration {
+                column: 0,
+                name: "payload",
+                requirement: input.typed_binding(),
+                storage: None,
+                output: input.typed_binding(),
+                input_rows: None,
+            },
+            &mut context,
+            owner.as_ref(),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    }
+
+    #[test]
+    fn checked_assignment_uses_strict_w_before_global_nullable_event_output() {
+        use arrow::array::{FixedSizeBinaryArray, StructArray};
+        use arrow::buffer::NullBuffer;
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::FunctionValueType;
+        let source = FunctionValueType::new(
+            DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(4), true)].into()),
+            true,
+        );
+        let input = FunctionValueType::new(
+            DataType::Struct(vec![Field::new("f", DataType::Binary, false)].into()),
+            true,
+        );
+        let storage = FunctionValueType::new(
+            DataType::Struct(vec![Field::new("f", DataType::FixedSizeBinary(8), false)].into()),
+            true,
+        );
+        let build = |valid| -> ArrayRef {
+            Arc::new(
+                StructArray::try_new(
+                    vec![Field::new("f", DataType::FixedSizeBinary(4), true)].into(),
+                    vec![Arc::new(
+                        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            [None::<[u8; 4]>].into_iter(),
+                            4,
+                        )
+                        .unwrap(),
+                    )],
+                    Some(NullBuffer::from(vec![valid])),
+                )
+                .unwrap(),
+            )
+        };
+        let owner = assignment_owner(&input);
+        let mut context = novarocks_value_arrays::decode::ValueConversionContext::default();
+        let failure = materialize_target_value(
+            &build(true),
+            source.typed_binding().borrowed(),
+            TargetValueDeclaration {
+                column: 0,
+                name: "payload",
+                requirement: input.typed_binding(),
+                storage: Some(storage.typed_binding().borrowed()),
+                output: input.typed_binding(),
+                input_rows: Some(&[23]),
+            },
+            &mut context,
+            owner.as_ref(),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 498);
+        assert!(failure.detail().contains("payload.f"), "{failure}");
+        assert!(failure.detail().contains("row=Some(23)"), "{failure}");
+        let output = materialize_target_value(
+            &build(false),
+            source.typed_binding().borrowed(),
+            TargetValueDeclaration {
+                column: 0,
+                name: "payload",
+                requirement: input.typed_binding(),
+                storage: Some(storage.typed_binding().borrowed()),
+                output: input.typed_binding(),
+                input_rows: Some(&[23]),
+            },
+            &mut context,
+            owner.as_ref(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let values = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(values.is_null(0));
+        assert_eq!(values.column(0).null_count(), 0);
+
+        let source = FunctionValueType::new(DataType::FixedSizeBinary(4), true);
+        let strict = FunctionValueType::new(DataType::Binary, false);
+        let global = FunctionValueType::new(DataType::Binary, true);
+        let storage = FunctionValueType::new(DataType::FixedSizeBinary(8), false);
+        let null: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size([None::<[u8; 4]>].into_iter(), 4)
+                .unwrap(),
+        );
+        let owner = assignment_owner(&global);
+        let failure = materialize_target_value(
+            &null,
+            source.typed_binding().borrowed(),
+            TargetValueDeclaration {
+                column: 0,
+                name: "payload",
+                requirement: strict.typed_binding(),
+                storage: Some(storage.typed_binding().borrowed()),
+                output: global.typed_binding(),
+                input_rows: Some(&[23]),
+            },
+            &mut context,
+            owner.as_ref(),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 498);
+    }
+
     #[test]
     fn actual_required_value_failure_keeps_its_column_and_row_without_input_owners() {
         use arrow::array::{ArrayRef, Int32Array};
@@ -561,7 +780,8 @@ mod required_value_source_properties {
             &TargetValueDeclaration {
                 column: 0,
                 name: field.name(),
-                requirement: required.typed_binding().borrowed(),
+                requirement: required.typed_binding(),
+                storage: None,
                 output: required.typed_binding(),
                 input_rows: None,
             },
@@ -602,7 +822,8 @@ mod required_value_source_properties {
             &TargetValueDeclaration {
                 column: 2,
                 name: "payload",
-                requirement: required.typed_binding().borrowed(),
+                requirement: required.typed_binding(),
+                storage: None,
                 output: required.typed_binding(),
                 input_rows,
             },

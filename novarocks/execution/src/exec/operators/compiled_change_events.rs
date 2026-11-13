@@ -64,10 +64,11 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime::task::{ExecutionFailure, ExecutionResult};
 
 /// One event's frozen facts, resolved to root indices and output ordinals.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AssignedValue {
     root: usize,
     expression: novarocks_local_program::ProgramExprId,
+    write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
 }
 
 #[derive(Clone)]
@@ -181,13 +182,29 @@ impl CompiledChangeEventProcessorFactory {
                         let target = layout.value_binding_at(ordinal).ok_or_else(|| {
                             invalid("has an output without a complete value binding".into())
                         })?;
-                        if !source
-                            .typed_binding()
-                            .borrowed()
-                            .same_physical_binding_ignoring_nullability_observed(
-                                target.borrowed(),
-                                || Ok::<(), crate::runtime::task::ExecutionFailure>(()),
-                            )?
+                        let requirement = assignment
+                            .write_input
+                            .as_ref()
+                            .map_or(target, |declaration| declaration.input.typed_binding());
+                        let storage = assignment.write_input.as_ref().and_then(|declaration| {
+                            declaration
+                                .storage
+                                .as_ref()
+                                .map(|ty| ty.typed_binding().borrowed())
+                        });
+                        if novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+                            source.typed_binding().borrowed(),
+                            requirement.borrowed(),
+                            storage,
+                            || Ok::<(), ExecutionFailure>(()),
+                        )?
+                        .is_none()
+                            || !target
+                                .borrowed()
+                                .same_physical_binding_ignoring_root_nullability_observed(
+                                    requirement.borrowed(),
+                                    || Ok::<(), ExecutionFailure>(()),
+                                )?
                         {
                             return Err(invalid(format!(
                                 "event {event_ordinal} assignment differs from its complete output binding"
@@ -206,6 +223,7 @@ impl CompiledChangeEventProcessorFactory {
                     assigned[ordinal] = Some(AssignedValue {
                         root: sites.len() - 1,
                         expression,
+                        write_input: assignment.write_input.clone(),
                     });
                 }
             }
@@ -382,7 +400,7 @@ impl CompiledChangeEventProcessor {
         for (ordinal, field) in schema.fields().iter().enumerate() {
             let column = if ordinal == self.effect_ordinal {
                 Arc::new(Int8Array::from_value(event.effect, rows.len())) as ArrayRef
-            } else if let Some(assignment) = event.assigned[ordinal] {
+            } else if let Some(assignment) = event.assigned[ordinal].as_ref() {
                 let root = assignment.root;
                 let values = evaluate_selected(
                     &mut instances[root],
@@ -407,13 +425,26 @@ impl CompiledChangeEventProcessor {
                     ));
                 };
                 let target = output.slots()[ordinal].typed_binding();
+                // Global event slots are nullable for unassigned placeholders.
+                // A selected assignment retains its independent strict W.
+                let requirement = assignment
+                    .write_input
+                    .as_ref()
+                    .map_or(target, |declaration| declaration.input.typed_binding());
+                let storage = assignment.write_input.as_ref().and_then(|declaration| {
+                    declaration
+                        .storage
+                        .as_ref()
+                        .map(|ty| ty.typed_binding().borrowed())
+                });
                 let values = crate::exec::node::table_writer::materialize_target_value(
                     &values,
                     source_type.typed_binding().borrowed(),
                     crate::exec::node::table_writer::TargetValueDeclaration {
                         column: ordinal,
                         name: field.name(),
-                        requirement: target.borrowed(),
+                        requirement,
+                        storage,
                         output: target,
                         input_rows: Some(&rows),
                     },

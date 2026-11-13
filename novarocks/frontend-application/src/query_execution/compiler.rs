@@ -1050,6 +1050,15 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         }
         None => novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
     };
+    let assignments = sink
+        .root_write_assignments(&compile_control)
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    let assignments = assignments
+        .map(|assignments| {
+            crate::dml::insert::attach_write_literal_contexts(query, assignments, &compile_control)
+        })
+        .transpose()
+        .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
     let mut preparation = novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new(
         statement,
         novarocks_sql::compiler::SqlSessionContext {
@@ -1062,6 +1071,11 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
         root_distribution,
     )
     .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    if let Some(assignments) = assignments {
+        preparation = preparation
+            .with_write_assignments(assignments)
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?;
+    }
     while !preparation.needs().is_empty() {
         let facts = provider_source
             .resolve_catalog_relations(preparation.needs())

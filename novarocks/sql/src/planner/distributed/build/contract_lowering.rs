@@ -2461,7 +2461,11 @@ impl<'a> ContractLoweringVisitor<'a> {
                                 self.lower_expression(node, expression, &child.columns)
                             })
                             .transpose()?;
-                        Ok((value, expression))
+                        Ok(novarocks_physical_plan::ChangeAssignment {
+                            output: value,
+                            expression,
+                            write_input: assignment.write_input.clone(),
+                        })
                     })
                     .collect::<Result<Vec<_>, ContractLoweringError>>()?;
                 Ok(ChangeEventSpec {
@@ -3360,14 +3364,24 @@ impl<'a> ContractLoweringVisitor<'a> {
                         "write target field {field_ordinal} type differs from its input contract"
                     )));
                 }
+                let ty = column_value_type(input, self.control)?;
+                let projected_value = self.fragment_mut().add_value(
+                    ty.clone(),
+                    ValueOrigin::WriterDerived {
+                        writer_node: node,
+                        kind: WriterDerivedKind::ProjectedInput,
+                    },
+                )?;
                 Ok(WriterTargetField {
+                    storage_type: target.storage_type.clone(),
                     token: target.token,
                     provider_name: target.column.name.clone().into(),
                     input: *value,
+                    projected: projected_value,
                     // Stated in the plan's own vocabulary, like every other
                     // type it carries: the provider's decoration belongs to
                     // the contract the field was frozen from, not to the plan.
-                    ty: column_value_type(input, self.control)?,
+                    ty,
                     hidden: target.is_hidden,
                 })
             })
@@ -3384,12 +3398,15 @@ impl<'a> ContractLoweringVisitor<'a> {
                 if call.input_slot_id() == 0 {
                     return Err(invalid_write("writer input slot is zero".into()));
                 }
-                let input = projected.output.get(input_index).copied().ok_or_else(|| {
-                    invalid_write(format!(
-                        "writer aggregate input slot {} is outside the exact input",
-                        call.input_slot_id()
-                    ))
-                })?;
+                let input = target_fields
+                    .get(input_index)
+                    .map(|field| field.projected)
+                    .ok_or_else(|| {
+                        invalid_write(format!(
+                            "writer aggregate input slot {} is outside the exact input",
+                            call.input_slot_id()
+                        ))
+                    })?;
                 let output = output_slots
                     .get(&call.intermediate_slot_id())
                     .copied()
@@ -14957,6 +14974,29 @@ mod tests {
         assert_eq!(target.input.len(), 2);
         assert_eq!(target.input[0], target.input[1]);
         assert_eq!(target.target_fields[0].input, target.target_fields[1].input);
+        assert_ne!(
+            target.target_fields[0].projected,
+            target.target_fields[1].projected
+        );
+        for field in &target.target_fields {
+            assert_ne!(field.projected, field.input);
+            let value = plan
+                .fragments()
+                .values()
+                .find_map(|fragment| {
+                    fragment.values().get(&field.projected).filter(|value| {
+                        matches!(
+                            value.origin,
+                            ValueOrigin::WriterDerived {
+                                kind: WriterDerivedKind::ProjectedInput,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .expect("each field owns its distinct projected declaration");
+            assert_eq!(value.ty, field.ty);
+        }
     }
 
     #[test]
@@ -15189,6 +15229,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, column)| SqlWriteTargetField {
+                storage_type: None,
                 token: token(i as u8 + 11),
                 column: column.clone(),
                 is_hidden: false,
@@ -15260,11 +15301,13 @@ mod tests {
                         .iter()
                         .zip(&inputs)
                         .map(|(out, input)| DistributedChangeEventOutputExpr {
+                            write_input: None,
                             output_column_id: out.column_id,
                             expr: (effect != ConnectorRowMutationEffect::Insert)
                                 .then(|| column_ref(input)),
                         })
                         .chain([DistributedChangeEventOutputExpr {
+                            write_input: None,
                             output_column_id: data.column_id,
                             expr: Some(column_ref(&inputs[1])),
                         }])
@@ -15421,6 +15464,7 @@ mod tests {
                     predicate: None,
                     effect,
                     assignments: vec![DistributedChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: data.column_id,
                         expr: Some(column_ref(&input)),
                     }],
@@ -15691,6 +15735,7 @@ mod tests {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Replace,
                     assignments: vec![DistributedChangeEventOutputExpr {
+                        write_input: None,
                         output_column_id: data.column_id,
                         expr: Some(column_ref(&input)),
                     }],

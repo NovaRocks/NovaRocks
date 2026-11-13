@@ -133,6 +133,7 @@ fn source() -> package::FragmentPackage {
                 kind: Some(package::connector_write_input_shape::Kind::Data(
                     package::ConnectorWriteDataInput {
                         fields: vec![package::ConnectorWriteFieldBinding {
+                            storage_value_type_id: None,
                             source_field_id: Some(2),
                             field_token: vec![],
                             value_type_id: Some(0),

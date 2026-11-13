@@ -42,6 +42,8 @@ pub use required_constant::{
 
 mod captured_catalog;
 mod dml_catalog;
+mod write_assignment;
+pub use write_assignment::{SqlWriteAssignmentSite, SqlWriteAssignments, SqlWriteLiteralContext};
 mod logical_explain;
 mod scalar_presence_catalog;
 pub use crate::planner::distributed::build::{
@@ -996,6 +998,7 @@ impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
 /// Statistics are deliberately absent because exact binding tokens do not
 /// exist until this phase has completed.
 pub struct SqlAnalyzeRequest<'a> {
+    pub(crate) write_assignments: Option<Arc<SqlWriteAssignments>>,
     pub(crate) statement: SqlStatementInput,
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
@@ -1011,6 +1014,28 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
+    pub fn with_write_assignments(
+        mut self,
+        assignments: Arc<SqlWriteAssignments>,
+    ) -> Result<Self, SqlCompileError> {
+        self.control.check()?;
+        if !matches!(
+            &self.intent,
+            SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
+        ) || !matches!(
+            &self.statement.kind,
+            SqlStatementInputKind::ParsedQuery(_)
+                | SqlStatementInputKind::MaterializedValuesQuery { .. }
+        ) || self.write_assignments.is_some()
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "write assignments require one original DML query source".into(),
+            ));
+        }
+        self.write_assignments = Some(assignments);
+        Ok(self)
+    }
+
     pub fn new(
         statement: SqlStatementInput,
         intent: SqlCompileIntent,
@@ -1024,6 +1049,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
+            write_assignments: None,
             statement,
             intent,
             session,
@@ -1058,6 +1084,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
         control: SqlCompileControl,
     ) -> Self {
         Self {
+            write_assignments: None,
             statement: SqlStatementInput::logical_plan(plan, factory, root_semantics),
             intent,
             session,
@@ -1709,7 +1736,7 @@ impl SqlCompiler {
                     )
                 })?;
                 let (resolved, ctes, mut factory) =
-                    crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
+                    crate::analyzer::analyze_with_write_assignments_and_sql_semantics(
                         &query,
                         catalog,
                         &request.session.current_database,
@@ -1723,6 +1750,7 @@ impl SqlCompiler {
                             }
                             _ => None,
                         },
+                        request.write_assignments.as_deref(),
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;

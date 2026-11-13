@@ -166,6 +166,7 @@ pub struct UnpivotMapping {
 
 #[derive(Clone, Debug)]
 pub struct ChangeEventOutputExpr {
+    pub write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
     pub output_slot_id: SlotId,
     pub expr: Option<ProgramExprId>,
 }
@@ -471,6 +472,8 @@ pub struct AggregateTopNFilter {
 
 #[derive(Clone, Debug)]
 pub struct StaticWriterProjection {
+    /// One independent storage declaration per projected input occurrence.
+    pub storage_types: Vec<Option<novarocks_type_contract::FunctionValueType>>,
     /// Writer projection owns a separate expression arena in the current plan.
     pub arena: Arc<ImmutableExpressions>,
     pub expressions: Vec<ProgramExprId>,
@@ -2360,7 +2363,8 @@ fn validate_shape(
             expected_layout,
             ..
         } => {
-            let bad = projection.expressions.is_empty()
+            let bad = projection.storage_types.len() != projection.expressions.len()
+                || projection.expressions.is_empty()
                 || projection.expressions.len() != projection.layout.slots().len();
             work.step()?;
             if bad {

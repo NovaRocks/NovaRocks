@@ -185,7 +185,10 @@ fn fragment(sink: p::FragmentSink, wide: bool) -> p::Fragment {
                 events: Box::from([p::ChangeEventSpec {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Insert,
-                    assignments: Box::from([(p::ValueId::new(1), None)]),
+                    assignments: Box::from([novarocks_physical_plan::ChangeAssignment::exact(
+                        p::ValueId::new(1),
+                        None,
+                    )]),
                 }]),
                 effect_output: p::ValueId::new(0),
             },

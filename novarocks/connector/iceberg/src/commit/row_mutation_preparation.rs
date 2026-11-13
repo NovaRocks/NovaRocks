@@ -172,7 +172,7 @@ pub(crate) fn prepare_row_mutation(
             ))
         })
         .collect::<Vec<_>>();
-    let (target_fields, identity_fields) =
+    let (target_fields, canonical_fields, identity_fields) =
         crate::metadata::with_pure_schema_creation(&request.context, |creation| {
             creation
                 .work(0)
@@ -213,7 +213,14 @@ pub(crate) fn prepare_row_mutation(
                     value,
                 )?);
             }
-            Ok((targets, identity))
+            let canonical =
+                crate::commit::write_shared::canonical_data_write_fields_from_declaration(
+                    &document,
+                    &target_iceberg_schema,
+                    &execution,
+                    creation,
+                )?;
+            Ok((targets, canonical, identity))
         })?;
     // The match query must scan the exact target ref/base chosen above. The
     // ordinary admitted table handle names the provider's default/current ref,
@@ -283,14 +290,22 @@ pub(crate) fn prepare_row_mutation(
                     target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
                     before_value,
                 )?);
-                after.push(ConnectorMutationTargetField::try_new_typed(
+                let canonical = &canonical_fields[ordinal];
+                let after_field = ConnectorMutationTargetField::try_new_typed(
                     row_mutation_field_token(owner, &request.table, b"after", ordinal),
-                    field.field().clone(),
+                    canonical.field().clone(),
                     target_start
                         + target_width
                         + u32::try_from(ordinal).expect("target ordinal fits u32"),
-                    value.clone(),
-                )?);
+                    canonical
+                        .execution_type()
+                        .expect("canonical provider after declaration")
+                        .clone(),
+                )?;
+                after.push(match canonical.storage_type() {
+                    Some(storage) => after_field.with_storage_type(storage.clone())?,
+                    None => after_field,
+                });
             }
             Ok((before, after))
         })?;
@@ -756,6 +771,51 @@ mod tests {
         assert!(!contract.identity_fields()[0].field().is_nullable());
         assert!(!contract.before_fields()[0].field().is_nullable());
         assert!(!contract.after_fields()[0].field().is_nullable());
+    }
+
+    #[test]
+    fn mor_before_keeps_storage_and_after_signs_required_canonical_input() {
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "payload",
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            ))])
+            .build()
+            .unwrap();
+        let table = metadata_with_schema(FormatVersion::V3, &[ROW_LINEAGE_ON], schema);
+        for intent in [
+            ConnectorRowMutationIntent::Update,
+            merge(&[
+                ConnectorRowMutationEffect::Replace,
+                ConnectorRowMutationEffect::Insert,
+            ]),
+        ] {
+            let accepts_insert = intent.accepts(ConnectorRowMutationEffect::Insert);
+            let preparation = prepared(
+                prepare_row_mutation(
+                    request(PayloadSpec::new(&table).handle(), "main", intent),
+                    &owner(),
+                )
+                .unwrap(),
+            );
+            let contract = preparation.match_contract();
+            let before = &contract.before_fields()[0];
+            assert_eq!(before.field().data_type(), &DataType::FixedSizeBinary(4));
+            assert_eq!(before.field().is_nullable(), accepts_insert);
+            assert!(before.storage_type().is_none());
+            let after = &contract.after_fields()[0];
+            assert_eq!(after.field().data_type(), &DataType::Binary);
+            assert!(!after.field().is_nullable());
+            assert!(!after.execution_type().unwrap().nullable());
+            assert_eq!(
+                after.storage_type(),
+                Some(&novarocks_type_contract::FunctionValueType::new(
+                    DataType::FixedSizeBinary(4),
+                    false
+                ))
+            );
+        }
     }
 
     #[test]

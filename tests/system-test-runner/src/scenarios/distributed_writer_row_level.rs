@@ -790,188 +790,171 @@ fn partition_replacement_after_spec_evolution(
     database: &str,
     dop: i32,
 ) -> Result<()> {
-    for (mode, label) in [("merge-on-read", "mor"), ("copy-on-write", "cow")] {
-        let table = format!("{catalog}.{database}.partition_replace_evolved_{label}_{dop}");
-        control.execute(format!(
+    let table = format!("{catalog}.{database}.partition_replace_evolved_{dop}");
+    control.execute(format!(
             "CREATE TABLE {table} (id BIGINT,v BIGINT,p BIGINT) PARTITION BY(p) TBLPROPERTIES \
-             (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"{mode}\")"
+             (\"format-version\"=\"3\",\"write.row-lineage\"=\"true\",\"novarocks.update.mode\"=\"merge-on-read\")"
         ))?;
-        // Singleton applies only to this tiny fixture's seeding. Actual file
-        // observations prove its shape; the tested mutation restores DOP below.
-        control.execute("SET pipeline_dop=1")?;
-        let seed_result = control.execute(format!(
-            "INSERT INTO {table} SELECT generate_series,generate_series,0 \
+    // Singleton applies only to this tiny fixture's seeding. Actual file
+    // observations prove its shape; the tested mutation restores DOP below.
+    control.execute("SET pipeline_dop=1")?;
+    let seed_result = control.execute(format!(
+        "INSERT INTO {table} SELECT generate_series,generate_series,0 \
              FROM TABLE(generate_series(1,3)) ORDER BY generate_series"
-        ))?;
-        assert_affected(
-            &seed_result,
-            3,
-            "seed three original rows for partition Replace",
-        )?;
-        let old_rows: Vec<(i64, String, i64)> = writer_row_ids(
-            &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
-        )?;
-        anyhow::ensure!(
-            old_rows.len() == 3
-                && old_rows[0].0 == 1
-                && old_rows[1].0 == 2
-                && old_rows[2].0 == 3
-                && old_rows.iter().all(|row| row.1 == old_rows[0].1),
-            "{mode}: partition Replace seed must have three observed rows in one original file: {old_rows:?}"
-        );
-        let old_file = old_rows[0].1.clone();
-        let old_files: Vec<(String, i32, i64)> = writer_file_partitions(&control.execute(format!(
+    ))?;
+    assert_affected(
+        &seed_result,
+        3,
+        "seed three original rows for partition Replace",
+    )?;
+    let old_rows: Vec<(i64, String, i64)> = writer_row_ids(
+        &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
+    )?;
+    anyhow::ensure!(
+        old_rows.len() == 3
+            && old_rows[0].0 == 1
+            && old_rows[1].0 == 2
+            && old_rows[2].0 == 3
+            && old_rows.iter().all(|row| row.1 == old_rows[0].1),
+        "merge-on-read: partition Replace seed must have three observed rows in one original file: {old_rows:?}"
+    );
+    let old_file = old_rows[0].1.clone();
+    let old_files: Vec<(String, i32, i64)> = writer_file_partitions(&control.execute(format!(
             "SELECT file_path,spec_id,record_count FROM {table}$files WHERE content=0 ORDER BY file_path"
         ))?)?;
-        anyhow::ensure!(
-            old_files.len() == 1 && old_files[0].0 == old_file && old_files[0].2 == 3,
-            "{mode}: original manifest does not prove the seed file: {old_files:?}"
-        );
-        let old_spec = old_files[0].1;
-        // Both operations use the maintained partition-evolution SQL surface.
-        // The original data file keeps its old spec; new writes use bucket[8].
-        control.execute(format!("ALTER TABLE {table} DROP PARTITION COLUMN p"))?;
-        control.execute(format!(
-            "ALTER TABLE {table} ADD PARTITION COLUMN bucket(p,8)"
-        ))?;
-        let seed_result = control.execute(format!("INSERT INTO {table} VALUES(4,4,30)"))?;
-        assert_affected(&seed_result, 1, "seed one row under the new default spec")?;
-        let before: Vec<(i64, String, i64)> = writer_row_ids(
-            &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
-        )?;
-        anyhow::ensure!(
-            before.len() == 4 && before[..3] == old_rows && before[3].0 == 4,
-            "{mode}: partition evolution changed original rows or lost the new row: {before:?}"
-        );
-        let evolved_files: Vec<(String, i32)> = writer_file_specs(&control.execute(format!(
-            "SELECT file_path,spec_id FROM {table}$files WHERE content=0 ORDER BY file_path"
+    anyhow::ensure!(
+        old_files.len() == 1 && old_files[0].0 == old_file && old_files[0].2 == 3,
+        "merge-on-read: original manifest does not prove the seed file: {old_files:?}"
+    );
+    let old_spec = old_files[0].1;
+    // Both operations use the maintained partition-evolution SQL surface.
+    // The original data file keeps its old spec; new writes use bucket[8].
+    control.execute(format!("ALTER TABLE {table} DROP PARTITION COLUMN p"))?;
+    control.execute(format!(
+        "ALTER TABLE {table} ADD PARTITION COLUMN bucket(p,8)"
+    ))?;
+    let seed_result = control.execute(format!("INSERT INTO {table} VALUES(4,4,30)"))?;
+    assert_affected(&seed_result, 1, "seed one row under the new default spec")?;
+    let before: Vec<(i64, String, i64)> = writer_row_ids(
+        &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
+    )?;
+    anyhow::ensure!(
+        before.len() == 4 && before[..3] == old_rows && before[3].0 == 4,
+        "merge-on-read: partition evolution changed original rows or lost the new row: {before:?}"
+    );
+    let evolved_files: Vec<(String, i32)> = writer_file_specs(&control.execute(format!(
+        "SELECT file_path,spec_id FROM {table}$files WHERE content=0 ORDER BY file_path"
+    ))?)?;
+    let current_spec = evolved_files
+        .iter()
+        .find(|(path, _)| path == &before[3].1)
+        .context("new default-spec row is absent from actual manifest")?
+        .1;
+    anyhow::ensure!(
+        current_spec != old_spec,
+        "merge-on-read: fixture did not establish different old/current partition specs: {evolved_files:?}"
+    );
+    control.execute(format!("SET pipeline_dop={dop}"))?;
+    // Iceberg bucket[8] for BIGINT 11 and 21 is respectively 7 and 1.
+    // Both moved rows come from the same observed old file, while row 3
+    // remains an untouched peer in that file and row 4 is outside it.
+    mutate(
+        control,
+        &table,
+        &format!("UPDATE {table} SET p=id*10+1,v=v+100 WHERE id IN (1,2)"),
+        2,
+        1,
+        "two Replace actions move one old file's rows into distinct current partitions",
+    )?;
+    let rows: Vec<(i64, i64, i64)> = writer_partition_rows(
+        &control.execute(format!("SELECT id,v,p FROM {table} ORDER BY id"))?,
+    )?;
+    anyhow::ensure!(
+        rows == [(1, 101, 11), (2, 102, 21), (3, 3, 0), (4, 4, 30)],
+        "merge-on-read: cross-spec replacement changed the exact logical row bag: {rows:?}"
+    );
+    for (partition_value, expected) in [(11_i64, 1_i64), (21, 2), (0, 3), (30, 4)] {
+        let ids: Vec<i64> = sql::integer_column(&control.execute(format!(
+            "SELECT id FROM {table} WHERE p={partition_value} ORDER BY id"
         ))?)?;
-        let current_spec = evolved_files
-            .iter()
-            .find(|(path, _)| path == &before[3].1)
-            .context("new default-spec row is absent from actual manifest")?
-            .1;
         anyhow::ensure!(
-            current_spec != old_spec,
-            "{mode}: fixture did not establish different old/current partition specs: {evolved_files:?}"
+            ids == [expected],
+            "merge-on-read: current partition pruning lost or duplicated p={partition_value}: {ids:?}"
         );
-        control.execute(format!("SET pipeline_dop={dop}"))?;
-        // Iceberg bucket[8] for BIGINT 11 and 21 is respectively 7 and 1.
-        // Both moved rows come from the same observed old file, while row 3
-        // remains an untouched peer in that file and row 4 is outside it.
-        mutate(
-            control,
-            &table,
-            &format!("UPDATE {table} SET p=id*10+1,v=v+100 WHERE id IN (1,2)"),
-            2,
-            1,
-            "two Replace actions move one old file's rows into distinct current partitions",
-        )?;
-        let rows: Vec<(i64, i64, i64)> = writer_partition_rows(
-            &control.execute(format!("SELECT id,v,p FROM {table} ORDER BY id"))?,
-        )?;
-        anyhow::ensure!(
-            rows == [(1, 101, 11), (2, 102, 21), (3, 3, 0), (4, 4, 30)],
-            "{mode}: cross-spec replacement changed the exact logical row bag: {rows:?}"
-        );
-        for (partition_value, expected) in [(11_i64, 1_i64), (21, 2), (0, 3), (30, 4)] {
-            let ids: Vec<i64> = sql::integer_column(&control.execute(format!(
-                "SELECT id FROM {table} WHERE p={partition_value} ORDER BY id"
-            ))?)?;
-            anyhow::ensure!(
-                ids == [expected],
-                "{mode}: current partition pruning lost or duplicated p={partition_value}: {ids:?}"
-            );
-        }
-        let after: Vec<(i64, String, i64)> = writer_row_ids(
-            &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
-        )?;
-        anyhow::ensure!(
-            after.len() == 4
-                && after
-                    .iter()
-                    .zip(&before)
-                    .all(|(a, b)| a.0 == b.0 && a.2 == b.2)
-                && after[0].1 != old_file
-                && after[1].1 != old_file
-                && after[0].1 != after[1].1
-                && after[3] == before[3],
-            "{mode}: replacement lost original lineage, distinct destinations or the unrelated peer: before={before:?} after={after:?}"
-        );
-        let files: Vec<(i32, String, i32, i64)> = writer_file_spec_counts(&control.execute(format!(
+    }
+    let after: Vec<(i64, String, i64)> = writer_row_ids(
+        &control.execute(format!("SELECT id,_file,_row_id FROM {table} ORDER BY id"))?,
+    )?;
+    anyhow::ensure!(
+        after.len() == 4
+            && after
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| a.0 == b.0 && a.2 == b.2)
+            && after[0].1 != old_file
+            && after[1].1 != old_file
+            && after[0].1 != after[1].1
+            && after[3] == before[3],
+        "merge-on-read: replacement lost original lineage, distinct destinations or the unrelated peer: before={before:?} after={after:?}"
+    );
+    let files: Vec<(i32, String, i32, i64)> = writer_file_spec_counts(&control.execute(format!(
             "SELECT content,file_path,spec_id,record_count FROM {table}$files ORDER BY content,file_path"
         ))?)?;
-        // Read the whole published partition ROW. Selecting its child in SQL
-        // would need an unrelated struct-subfield function implementation.
-        let rendered_partitions = writer_partition_values(&control.execute(format!(
-            "SELECT file_path,`partition` FROM {table}$files ORDER BY file_path"
-        ))?)?;
-        let mut partitions = std::collections::BTreeMap::new();
-        for (path, partition) in rendered_partitions {
-            anyhow::ensure!(
-                partitions.insert(path, partition).is_none(),
-                "{mode}: duplicate physical artifact in partition observation"
-            );
-        }
-        for (row, bucket) in [(&after[0], 7_i32), (&after[1], 1), (&after[3], 3)] {
-            let expected = serde_json::json!({"p":null,"p_bucket_8":bucket});
-            anyhow::ensure!(
-                partitions.get(&row.1) == Some(&expected),
-                "{mode}: physical current-spec partition differs from the independent bucket oracle: file={} expected={expected} actual={:?}",
-                row.1,
-                partitions.get(&row.1)
-            );
-        }
-        for row in [&after[0], &after[1], &after[3]] {
-            anyhow::ensure!(
-                files.iter().any(|file| file.0 == 0
-                    && file.1 == row.1
-                    && file.2 == current_spec
-                    && file.3 == 1),
-                "{mode}: replacement data did not retain its exact current-spec manifest: {files:?}"
-            );
-        }
-        if label == "mor" {
-            anyhow::ensure!(
-                after[2] == before[2]
-                    && files.len() == 5
-                    && files.iter().filter(|file| file.0 == 1).count() == 1
-                    && files.iter().any(|file| file.0 == 0
-                        && file.1 == old_file
-                        && file.2 == old_spec
-                        && file.3 == 3)
-                    && files
-                        .iter()
-                        .any(|file| file.0 == 1 && file.2 == old_spec && file.3 == 2),
-                "MOR must retain one old data file and exactly one old-spec DV for both moved rows: {files:?}"
-            );
-            let expected = serde_json::json!({"p":0,"p_bucket_8":null});
-            let old_delete = files
-                .iter()
-                .find(|file| file.0 == 1)
-                .context("original old-spec deletion vector is absent")?;
-            anyhow::ensure!(
-                partitions.get(&old_file) == Some(&expected)
-                    && partitions.get(&old_delete.1) == Some(&expected),
-                "MOR old data and DV must retain the original physical partition: {partitions:?}"
-            );
-        } else {
-            anyhow::ensure!(
-                after[2].1 != old_file
-                    && files.len() == 4
-                    && files
-                        .iter()
-                        .all(|file| file.0 == 0 && file.1 != old_file && file.2 == current_spec)
-                    && files.iter().any(|file| file.1 == after[2].1 && file.3 == 1),
-                "COW must retire the exact old file and preserve its untouched peer under the current spec: {files:?}"
-            );
-            let expected = serde_json::json!({"p":null,"p_bucket_8":4});
-            anyhow::ensure!(
-                partitions.get(&after[2].1) == Some(&expected),
-                "COW untouched p=0 peer must use its exact current physical bucket: {partitions:?}"
-            );
-        }
-        control.execute(format!("DROP TABLE {table} FORCE"))?;
+    // Read the whole published partition ROW. Selecting its child in SQL
+    // would need an unrelated struct-subfield function implementation.
+    let rendered_partitions = writer_partition_values(&control.execute(format!(
+        "SELECT file_path,`partition` FROM {table}$files ORDER BY file_path"
+    ))?)?;
+    let mut partitions = std::collections::BTreeMap::new();
+    for (path, partition) in rendered_partitions {
+        anyhow::ensure!(
+            partitions.insert(path, partition).is_none(),
+            "merge-on-read: duplicate physical artifact in partition observation"
+        );
     }
+    for (row, bucket) in [(&after[0], 7_i32), (&after[1], 1), (&after[3], 3)] {
+        let expected = serde_json::json!({"p":null,"p_bucket_8":bucket});
+        anyhow::ensure!(
+            partitions.get(&row.1) == Some(&expected),
+            "merge-on-read: physical current-spec partition differs from the independent bucket oracle: file={} expected={expected} actual={:?}",
+            row.1,
+            partitions.get(&row.1)
+        );
+    }
+    for row in [&after[0], &after[1], &after[3]] {
+        anyhow::ensure!(
+            files.iter().any(|file| file.0 == 0
+                && file.1 == row.1
+                && file.2 == current_spec
+                && file.3 == 1),
+            "merge-on-read: replacement data did not retain its exact current-spec manifest: {files:?}"
+        );
+    }
+
+    anyhow::ensure!(
+        after[2] == before[2]
+            && files.len() == 5
+            && files.iter().filter(|file| file.0 == 1).count() == 1
+            && files
+                .iter()
+                .any(|file| file.0 == 0 && file.1 == old_file && file.2 == old_spec && file.3 == 3)
+            && files
+                .iter()
+                .any(|file| file.0 == 1 && file.2 == old_spec && file.3 == 2),
+        "MOR must retain one old data file and exactly one old-spec DV for both moved rows: {files:?}"
+    );
+    let expected = serde_json::json!({"p":0,"p_bucket_8":null});
+    let old_delete = files
+        .iter()
+        .find(|file| file.0 == 1)
+        .context("original old-spec deletion vector is absent")?;
+    anyhow::ensure!(
+        partitions.get(&old_file) == Some(&expected)
+            && partitions.get(&old_delete.1) == Some(&expected),
+        "MOR old data and DV must retain the original physical partition: {partitions:?}"
+    );
+
+    control.execute(format!("DROP TABLE {table} FORCE"))?;
+
     Ok(())
 }

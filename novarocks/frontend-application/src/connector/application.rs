@@ -629,6 +629,37 @@ pub(crate) fn require_current_write_authority(
     Ok(())
 }
 
+/// Borrow the complete current Provider declaration. The original Field
+/// attributes stay with W; absence explicitly uses the complete read binding.
+pub(crate) fn connector_write_input(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+    ordinal: usize,
+) -> Result<novarocks_spi::connector::ConnectorWriteFieldRequest, String> {
+    require_current_write_authority(&metadata.planning_facts)?;
+    if let Some(input) = metadata
+        .planning_facts
+        .column_facts()
+        .get(ordinal)
+        .and_then(|fact| fact.write_input())
+    {
+        return Ok(input.clone());
+    }
+    let field = metadata
+        .schema()
+        .fields()
+        .get(ordinal)
+        .ok_or_else(|| "connector write input is outside its source schema".to_owned())?;
+    let value = metadata
+        .execution_schema()
+        .binding(ordinal)
+        .ok_or_else(|| "connector write input has no complete source declaration".to_owned())?;
+    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+        field.as_ref().clone(),
+        value.clone(),
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Project the provider's complete value contract to its declared write layout.
 /// A physical target override changes representation and preserves every
 /// semantic child; it cannot infer or erase a domain from format annotations.
@@ -647,26 +678,19 @@ pub(crate) fn connector_write_column(
         .execution_schema()
         .binding(ordinal)
         .ok_or_else(|| "connector write column has no complete execution binding".to_string())?;
-    let value_type = if let Some(target) = metadata
+    let value_type = match metadata
         .planning_facts
         .column_facts()
         .get(ordinal)
-        .and_then(|facts| facts.write_target_type())
+        .and_then(|facts| facts.write_input())
     {
-        let layout = novarocks_type_contract::ValueLayout::try_new(
-            target,
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-        )
-        .map_err(|error| format!("invalid connector write layout: {error}"))?;
-        novarocks_type_contract::FunctionValueType::try_from_value(
-            binding.value_type().clone(),
-            layout,
-        )
-        .map_err(|error| {
-            format!("connector write layout conflicts with its value contract: {error}")
-        })?
-    } else {
-        binding.clone()
+        Some(input) => input
+            .execution_type()
+            .ok_or_else(|| {
+                "connector write input lacks its complete value declaration".to_string()
+            })?
+            .clone(),
+        None => binding.clone(),
     };
     novarocks_types::schema::ColumnDef::from_value_type(
         field.name().clone(),
@@ -997,7 +1021,7 @@ mod source_value_type_tests {
         use novarocks_spi::connector::*;
         let source = Arc::new(Schema::new(vec![Field::new(
             "payload",
-            DataType::Binary,
+            DataType::LargeBinary,
             true,
         )]));
         let current = ConnectorTablePlanningFacts::try_new(
@@ -1012,7 +1036,13 @@ mod source_value_type_tests {
                 .with_write_default(Some(ConnectorColumnDefault::Binary(
                     bytes::Bytes::from_static(&[7]),
                 )))
-                .with_write_target_type(Some(DataType::LargeBinary)),
+                .with_write_input(Some(
+                    ConnectorWriteFieldRequest::try_new_typed(
+                        source.field(0).clone(),
+                        FunctionValueType::new(DataType::LargeBinary, true),
+                    )
+                    .unwrap(),
+                )),
             ],
             vec![],
             vec![],
@@ -1044,13 +1074,13 @@ mod source_value_type_tests {
                     .unwrap(),
             },
             source,
-            vec![FunctionValueType::new(DataType::Binary, true)],
+            vec![FunctionValueType::new(DataType::LargeBinary, true)],
         );
         // The source remains a valid read declaration. A snapshot carrying
         // stale write facts still cannot become a Current write target.
         assert_eq!(
             sql_columns_from_connector_metadata(&metadata).unwrap()[0].data_type,
-            DataType::Binary
+            DataType::LargeBinary
         );
         assert!(
             super::connector_write_column(&metadata, 0, None)

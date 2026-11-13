@@ -2215,12 +2215,15 @@ fn writer_package_separates_declared_value_binding_from_provider_dictionary_fact
         unreachable!()
     };
     let input_value = target.target_fields[0].input;
+    let projected_value = target.target_fields[0].projected;
     target.target_fields[0].ty =
         ValueType::new(nested_type(1), target.target_fields[0].ty.nullable());
     let target = target.clone();
     let mut values = original.values().clone();
     let value = values.get_mut(&input_value).unwrap();
     value.ty = ValueType::new(nested_type(1), value.ty.nullable());
+    let projected = values.get_mut(&projected_value).unwrap();
+    projected.ty = target.target_fields[0].ty.clone();
     let fragment = Fragment::from(crate::plan::FragmentParts {
         summaries: Box::default(),
         stage_placement: crate::StagePlacementPolicy::Singleton,

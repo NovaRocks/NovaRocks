@@ -391,6 +391,8 @@ fn writer() -> p::PhysicalNode {
             required_distribution: p::Distribution::Singleton,
             target_fields: Box::from([
                 p::WriterTargetField {
+                    storage_type: None,
+                    projected: p::ValueId::new(7),
                     token: ConnectorWriteFieldToken::from_bytes([0; 32]),
                     provider_name: "".into(),
                     input: p::ValueId::new(0),
@@ -398,6 +400,8 @@ fn writer() -> p::PhysicalNode {
                     hidden: false,
                 },
                 p::WriterTargetField {
+                    storage_type: None,
+                    projected: p::ValueId::new(0),
                     token: ConnectorWriteFieldToken::from_bytes([255; 32]),
                     provider_name: "雪λ".into(),
                     input: p::ValueId::new(u32::MAX),
@@ -500,7 +504,10 @@ impl Ids {
         };
         match physical(n).unwrap() {
             Body::Writer(t) => Self {
-                a: t.target_fields.iter().map(|f| id(&f.ty)).collect(),
+                a: t.target_fields
+                    .iter()
+                    .flat_map(|f| std::iter::once(id(&f.ty)).chain(f.storage_type.as_ref().map(id)))
+                    .collect(),
                 b: t.output_schema.fields.iter().map(|f| id(&f.ty)).collect(),
                 writer: true,
             },
@@ -618,6 +625,8 @@ fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
                 }),
                 target_fields: vec![
                     wire::WriterTargetField {
+                        storage_value_type_id: None,
+                        projected_value_id: Some(7),
                         token: vec![0; 32],
                         provider_name: "".into(),
                         input_value_id: Some(0),
@@ -625,6 +634,8 @@ fn expected(writer: bool, grouped: bool) -> wire::PhysicalNode {
                         hidden: false,
                     },
                     wire::WriterTargetField {
+                        storage_value_type_id: None,
+                        projected_value_id: Some(0),
                         token: vec![255; 32],
                         provider_name: "雪λ".into(),
                         input_value_id: Some(u32::MAX),
@@ -1420,6 +1431,8 @@ fn simple_writer() -> p::PhysicalNode {
     t.input = Box::from([p::ValueId::new(0)]);
     t.partial_aggregates = Box::default();
     t.target_fields = Box::from([p::WriterTargetField {
+        storage_type: None,
+        projected: p::ValueId::new(7),
         token: ConnectorWriteFieldToken::from_bytes([5; 32]),
         provider_name: "p".into(),
         input: p::ValueId::new(0),
@@ -1937,7 +1950,7 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
         assert_eq!(received.list_item_count, received_base.list_item_count + 4);
         c.arm(None);
         assert!(decode_table_write_node(&raw, r, a, SOURCE, under).is_err());
-        for fault in 0..9 {
+        for fault in 0..10 {
             let mut bad = raw.clone();
             let finish = raw_finish(&mut bad);
             match fault {
@@ -1956,7 +1969,9 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
                         .value_ids
                         .pop();
                 }
-                _ => finish.summaries.push(finish.summaries[0].clone()),
+                8 => finish.summaries.push(finish.summaries[0].clone()),
+                9 => finish.count_mode = 3, // Retired ExternalOwner vocabulary.
+                _ => unreachable!(),
             }
             c.arm(None);
             assert!(
@@ -1975,5 +1990,35 @@ fn finish_summary_is_three_original_references_with_strict_header_presence() {
             .value_ids[0] = 404;
         c.arm(None);
         assert!(decode_table_write_node(&unknown, r, a, SOURCE, limits()).is_err());
+    });
+}
+
+#[test]
+fn table_writer_storage_type_uses_flat_w_then_t_ids_without_losing_the_target() {
+    let c = Control::default();
+    let fixture = Fixture::new();
+    let mut node = simple_writer();
+    target(&mut node).target_fields[0].storage_type =
+        Some(FunctionValueType::new(DataType::Int64, false));
+    let ids = Ids::new(&node);
+    assert_eq!(ids.a, vec![4, 4]);
+    fixture.with(&node, &c, |values, expressions, read, aggregates| {
+        c.arm(None);
+        let wire =
+            encode_table_write_node(&node, values, expressions, ids.view(), SOURCE, limits())
+                .unwrap()
+                .0;
+        let wire::physical_node::Kind::TableWriter(writer) = wire.kind.as_ref().unwrap() else {
+            panic!("writer")
+        };
+        assert_eq!(writer.target_fields[0].value_type_id, Some(4));
+        assert_eq!(writer.target_fields[0].storage_value_type_id, Some(4));
+        c.arm(None);
+        assert_eq!(
+            decode_table_write_node(&wire, read, aggregates, SOURCE, limits())
+                .unwrap()
+                .0,
+            node
+        );
     });
 }

@@ -33,8 +33,7 @@ use novarocks_parser::ast::Query;
 use novarocks_parser::{SYNTHETIC, ast, build};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
-    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteInputRequest, ConnectorWriteIntent,
 };
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
@@ -402,14 +401,13 @@ pub(crate) fn build_iceberg_write_plan(
         fields: write_columns
             .iter()
             .map(|column| {
-                let value_type = column
-                    .declared_value_type()
-                    .map_err(|error| error.to_string())?;
-                let field = value_type
-                    .try_to_field(&column.name)
-                    .map_err(|error| error.to_string())?;
-                ConnectorWriteFieldRequest::try_new_typed(field, value_type)
-                    .map_err(|error| error.to_string())
+                let ordinal = metadata
+                    .schema()
+                    .fields()
+                    .iter()
+                    .position(|field| field.name() == &column.name)
+                    .ok_or_else(|| "INSERT target is absent from its signed metadata".to_owned())?;
+                crate::connector::connector_write_input(metadata, ordinal)
             })
             .collect::<Result<Vec<_>, String>>()?,
     };
@@ -434,24 +432,31 @@ pub(crate) fn build_iceberg_write_plan(
         }
     }
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
-    let (query, constants) = match crate::dml::insert::shape_insert_source_with_constants(
+    let (query, constants) = match crate::dml::insert::shape_typed_write_source(
         source,
         insert_columns,
         &source_columns,
         &write_columns,
-        policy,
-        control,
+        Some((policy, control)),
     )? {
         Some(shaped) => shaped,
-        None => (
-            append_source_to_query_for_write(
+        None => {
+            let mut query = append_source_to_query_for_write(
                 source,
                 insert_columns,
                 &source_columns,
                 &write_columns,
-            )?,
-            None,
-        ),
+            )?;
+            let constants = crate::dml::insert::capture_typed_write_constants(
+                &mut query,
+                insert_columns,
+                &source_columns,
+                &write_columns,
+                policy,
+                control,
+            )?;
+            (query, constants)
+        }
     };
     Ok((query, constants, input))
 }
@@ -481,11 +486,12 @@ fn append_source_to_query_for_write(
     source_columns: &[ColumnDef],
     write_columns: &[ColumnDef],
 ) -> Result<Query, String> {
-    if let Some(query) = crate::dml::insert::shape_insert_source(
+    if let Some((query, _)) = crate::dml::insert::shape_typed_write_source(
         source,
         insert_columns,
         source_columns,
         write_columns,
+        None,
     )? {
         return Ok(query);
     }
@@ -536,13 +542,6 @@ fn wrap_insert_query_with_write_projection(
             None => crate::dml::insert::omitted_insert_expr(column)?,
         };
         let expression = crate::dml::insert::canonical_insert_wrapper_expression(expression)?;
-        let target = column
-            .declared_value_type()
-            .map_err(|error| error.to_string())?;
-        let expression = build::cast(
-            expression,
-            novarocks_sql::sql_type_syntax(&target).map_err(|error| error.to_string())?,
-        );
         projection.push(build::item(
             expression,
             Some(build::ident(&column.name, Some('`'))),
@@ -643,10 +642,11 @@ fn source_index_for_write_column(
 ///   Hidden columns (the IMV apply key, declared aggregate-state columns) are
 ///   *marked* in the planning facts rather than filtered out of the schema, so
 ///   the field set here is the same one `current_schema()` produced.
-/// - `write_target_type` is the provider-signed DML write type for variant and
-///   binary columns (ADR-0055 decision 5). The provider only signs it when it
-///   differs from the read type, so falling back to the Arrow field type
-///   reproduces the previous inline override exactly.
+/// - Optional planning `write_input` carries the Provider's complete signed W
+///   and independent storage T. SQL columns use its exact execution type W;
+///   the original request retains T for writer validation and byte adaptation.
+///   Without a separate write declaration, the complete execution-schema
+///   binding authors the Exact input. Arrow carriers never infer a domain.
 ///
 /// Write defaults keep coming from the resolved SQL table columns, unchanged.
 fn insert_columns_from_connector_metadata(
@@ -881,11 +881,6 @@ mod tests {
 
     #[test]
     fn write_carrier_override_cannot_erase_an_authored_uuid_domain() {
-        use novarocks_spi::connector::{
-            ConnectorRequestContext, ConnectorStopOwner, ConnectorTableColumnPlanningFact,
-            ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
-            ConnectorTableColumnVisibility, ConnectorTablePlanningFacts,
-        };
         use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
         let uuid = FunctionValueType::try_with_logical_type(
@@ -894,51 +889,28 @@ mod tests {
             ValueLogicalType::Uuid,
         )
         .expect("UUID type");
-        let mut metadata = write_metadata(
+        let metadata = write_metadata(
             vec![uuid.try_to_field("v").expect("UUID field")],
             vec![uuid.clone()],
         );
-        let context = ConnectorRequestContext::try_new(
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            ConnectorStopOwner::new().view(),
-            1024,
-            65536,
+        let error = novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+            Field::new("v", DataType::Binary, true),
+            novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
         )
-        .expect("bounded request");
-        let source_schema = Arc::new(metadata.schema().clone());
-        metadata.planning_facts = ConnectorTablePlanningFacts::try_new(
-            &source_schema,
-            vec![
-                ConnectorTableColumnPlanningFact::new(
-                    0,
-                    ConnectorTableColumnVisibility::Sql,
-                    ConnectorTableColumnSemanticKind::None,
-                    ConnectorTableColumnRole::Ordinary,
-                )
-                .with_write_target_type(Some(DataType::Binary)),
-            ],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            &context,
-        )
-        .expect("provider write carrier override");
-        assert_eq!(metadata.execution_schema().binding(0), Some(&uuid));
+        .unwrap()
+        .with_storage_type(uuid.clone())
+        .expect_err("nominal UUID cannot grant a plain binary projection");
         assert_eq!(
-            metadata.planning_facts.column_facts()[0].write_target_type(),
-            Some(&DataType::Binary)
-        );
-        let error = insert_columns_from_connector_metadata(&metadata, &HashMap::new())
-            .expect_err("a carrier override retains and validates the authored UUID identity");
-        assert_eq!(
-            error,
-            "connector write layout conflicts with its value contract: invalid Arrow carrier for Uuid"
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
         );
         assert_eq!(metadata.execution_schema().binding(0), Some(&uuid));
-        assert_eq!(
-            metadata.planning_facts.column_facts()[0].write_target_type(),
-            Some(&DataType::Binary)
-        );
+        // This fixture authors no optional planning override. Its complete
+        // execution binding remains the authority for the UUID domain.
+        assert!(metadata.planning_facts.column_facts().is_empty());
+        assert_eq!(metadata.schema().fields().len(), 1);
+        let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
+        assert_eq!(columns[0].declared_value_type().unwrap(), uuid);
     }
 
     #[test]
@@ -1083,14 +1055,11 @@ mod tests {
         };
         let row = values.rows.first().expect("one row");
         let rendered: Vec<String> = row.iter().map(printer::print_expr).collect();
-        assert_eq!(
-            rendered,
-            vec!["CAST(10 AS INT)", "CAST(5 AS INT)", "CAST(30 AS INT)"]
-        );
+        assert_eq!(rendered, vec!["10", "5", "30"]);
     }
 
     #[test]
-    fn append_source_to_query_values_casts_literals_to_target_types() {
+    fn append_source_to_query_values_preserves_original_literals_for_typed_assignment() {
         let target_columns = vec![
             test_column("id", DataType::Int64, None),
             test_column("region", DataType::Utf8, None),
@@ -1121,22 +1090,8 @@ mod tests {
         };
         let first_row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
         let second_row: Vec<String> = values.rows[1].iter().map(printer::print_expr).collect();
-        assert_eq!(
-            first_row,
-            vec![
-                "CAST(1 AS BIGINT)",
-                "CAST('us' AS STRING)",
-                "CAST(10.5 AS DOUBLE)"
-            ]
-        );
-        assert_eq!(
-            second_row,
-            vec![
-                "CAST(2 AS BIGINT)",
-                "CAST('eu' AS STRING)",
-                "CAST(20 AS DOUBLE)"
-            ]
-        );
+        assert_eq!(first_row, vec!["1", "'us'", "10.5"]);
+        assert_eq!(second_row, vec!["2", "'eu'", "20"]);
     }
 
     #[test]
@@ -1165,10 +1120,7 @@ mod tests {
             );
         };
         let row: Vec<String> = values.rows[0].iter().map(printer::print_expr).collect();
-        assert_eq!(
-            row,
-            vec!["CAST(1 AS INT)", "CAST(NULL AS STRING)", "CAST(10 AS INT)"]
-        );
+        assert_eq!(row, vec!["1", "NULL", "10"]);
     }
 
     #[test]
@@ -1209,11 +1161,8 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let ast::Expr::Cast(cast) = &values.rows[0][0] else {
-            panic!("expected CAST expression");
-        };
-        let ast::Expr::Literal(value) = cast.expr.as_ref() else {
-            panic!("expected string literal inside CAST");
+        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+            panic!("original source string literal");
         };
         let ast::LiteralKind::String(s) = &value.kind else {
             panic!("expected single-quoted string");
@@ -1222,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn append_source_to_query_values_renders_binary_literals_as_hex() {
+    fn append_source_to_query_values_retains_binary_target_source_text_until_typed_conversion() {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
         let source = rows_query(vec![vec![build::string(
             novarocks_sql::literal::bytes_to_latin1_string(&[0xab, 0x01]),
@@ -1238,16 +1187,16 @@ mod tests {
                 printer::print_query(&query)
             );
         };
-        let ast::Expr::Cast(cast) = &values.rows[0][0] else {
-            panic!("expected CAST expression");
+        let ast::Expr::Literal(value) = &values.rows[0][0] else {
+            panic!("original literal");
         };
-        let ast::Expr::Literal(value) = cast.expr.as_ref() else {
-            panic!("expected hex literal inside CAST");
+        let ast::LiteralKind::String(s) = &value.kind else {
+            panic!("original string source");
         };
-        let ast::LiteralKind::HexString(s) = &value.kind else {
-            panic!("expected hex literal");
-        };
-        assert_eq!(s, "AB01");
+        assert_eq!(
+            novarocks_sql::literal::latin1_string_to_bytes(s).unwrap(),
+            [0xab, 0x01]
+        );
     }
 
     #[test]
@@ -1293,7 +1242,7 @@ mod tests {
 
         use ast::SyntaxEq;
         let expected = parse_query(
-            "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c` FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)",
+            "SELECT `__nr_insert_src`.`a` AS `a`, 7 AS `b`, `__nr_insert_src`.`c` AS `c` FROM (SELECT x, y FROM src) AS `__nr_insert_src`(`c`, `a`)",
         );
         assert!(
             query.syntax_eq(&expected),
@@ -1313,14 +1262,10 @@ mod tests {
         let ast::SetExpr::Select(original) = source.body.as_ref() else {
             panic!("source SELECT");
         };
-        let ast::SelectItem::ExprWithAlias {
-            expr: ast::Expr::Cast(cast),
-            ..
-        } = &outer.projection[0]
-        else {
-            panic!("target CAST");
+        let ast::SelectItem::ExprWithAlias { expr, .. } = &outer.projection[0] else {
+            panic!("target source reference");
         };
-        assert_eq!(cast.span, original.projection[1].span());
+        assert_eq!(expr.span(), original.projection[1].span());
     }
 
     #[test]
@@ -1350,24 +1295,19 @@ mod tests {
         let ast::SetExpr::Select(outer) = query.body.as_ref() else {
             panic!("outer SELECT");
         };
-        for (item, expected) in outer.projection[1..].iter().zip(["MAP", "STRUCT"]) {
-            let ast::SelectItem::ExprWithAlias {
-                expr: ast::Expr::Cast(cast),
-                ..
-            } = item
-            else {
-                panic!("target CAST");
+        for item in &outer.projection[1..] {
+            let ast::SelectItem::ExprWithAlias { expr, .. } = item else {
+                panic!("target source expression");
             };
-            assert_eq!(cast.data_type.name.parts[0].value, expected);
             assert!(
                 matches!(
-                    cast.expr.as_ref(),
+                    expr,
                     ast::Expr::Literal(ast::Literal {
                         kind: ast::LiteralKind::Null,
                         ..
                     })
                 ),
-                "omitted complex columns are cast from NULL exactly once"
+                "omitted complex NULL waits for full typed target context"
             );
         }
     }
@@ -1432,12 +1372,14 @@ mod provider_admission_before_shaping_tests {
         failure: Option<ConnectorErrorKind>,
     ) -> (String, Arc<Control>) {
         let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
-        // This source cannot be shaped without inventing a SQL UUID spelling.
-        let source = super::tests::parse_query("SELECT NULL");
+        // A real shape error remains independent from the UUID's SQL type
+        // spelling: one target field cannot consume two source cells.
+        // Provider admission must retain precedence over this actual failure.
+        let source = super::tests::parse_query("VALUES (NULL, NULL)");
         assert!(
             append_source_to_query_for_write(&source, &[], &columns, &columns)
                 .unwrap_err()
-                .contains("UUID has no SQL DDL type spelling")
+                .contains("insert column count mismatch: expected 1 values for column list, got 2")
         );
         let resolved = ResolvedTable { columns };
         let control = Arc::new(Control {
@@ -1488,7 +1430,7 @@ mod provider_admission_before_shaping_tests {
         (error, control)
     }
     #[test]
-    fn provider_uuid_denial_precedes_sql_cast_rendering_without_starting_a_session() {
+    fn provider_uuid_denial_precedes_source_shape_validation_without_starting_a_session() {
         let (error, control) = run(None);
         assert!(error.contains("Iceberg uuid writes are not supported"));
         assert!(!error.contains("UUID has no SQL DDL type spelling"));
@@ -1635,8 +1577,8 @@ mod provider_admission_before_shaping_tests {
         provider.release.notify_one();
         let metadata = load.await.unwrap();
         assert_eq!(provider.created.load(Ordering::SeqCst), 1);
-        // The actual original SELECT source still cannot be rendered as UUID;
-        // the same provider author must reject it before that SQL projection.
+        // The original source has a real width mismatch. The same Provider
+        // author must reject the write before that shape validation runs.
         let (error, control) = run_with_metadata(metadata, None);
         assert!(error.contains("Iceberg uuid writes are not supported"));
         assert!(!error.contains("UUID has no SQL DDL type spelling"));

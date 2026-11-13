@@ -73,6 +73,7 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
                 .into_iter()
                 .map(|field| {
                     Ok(DmlWriteTargetField {
+                        storage_type: field.storage_type().cloned(),
                         token: field.token(),
                         column: admitted_write_column(field)?,
                         is_hidden: false,

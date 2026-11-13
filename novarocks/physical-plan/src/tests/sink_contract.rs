@@ -162,7 +162,12 @@ fn change_event_root_with_assignment(
                 events: Box::from([ChangeEventSpec {
                     predicate: None,
                     effect: ConnectorRowMutationEffect::Insert,
-                    assignments: assignments.into_boxed_slice(),
+                    assignments: assignments
+                        .into_iter()
+                        .map(|(output, expression)| {
+                            crate::ChangeAssignment::exact(output, expression)
+                        })
+                        .collect(),
                 }]),
                 effect_output: effect,
             },
@@ -405,6 +410,24 @@ fn finish_router_writer_fixture(
     } else {
         route_token
     };
+    let projected_target_fields_0: Box<[crate::WriterTargetField]> =
+        Box::from([WriterTargetField {
+            storage_type: None,
+            projected: destination_builder
+                .add_value(
+                    (ty(DataType::Int64, false)).clone(),
+                    crate::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: crate::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: "v".into(),
+            token: writer_token,
+            input: imported,
+            ty: ty(DataType::Int64, false),
+            hidden: false,
+        }]);
     destination_builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
@@ -428,13 +451,7 @@ fn finish_router_writer_fixture(
                     write_target_ordinal: writer_ordinal,
                     input: Box::from([imported]),
                     required_distribution: edge_distribution.clone(),
-                    target_fields: Box::from([WriterTargetField {
-                        provider_name: "v".into(),
-                        token: writer_token,
-                        input: imported,
-                        ty: ty(DataType::Int64, false),
-                        hidden: false,
-                    }]),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: writer_output_fields.clone().into_boxed_slice(),
@@ -575,6 +592,24 @@ fn finish_router_writer_fixture(
                 }
             })
             .collect::<Vec<_>>();
+        let projected_target_fields_1: Box<[crate::WriterTargetField]> =
+            Box::from([WriterTargetField {
+                storage_type: None,
+                projected: local_builder
+                    .add_value(
+                        (ty(DataType::Int64, false)).clone(),
+                        crate::ValueOrigin::WriterDerived {
+                            writer_node: local_writer,
+                            kind: crate::WriterDerivedKind::ProjectedInput,
+                        },
+                    )
+                    .unwrap(),
+                provider_name: "v".into(),
+                token: ConnectorWriteFieldToken::from_bytes([8; 32]),
+                input: local_input_value,
+                ty: ty(DataType::Int64, false),
+                hidden: false,
+            }]);
         local_builder
             .insert_node_unchecked(PhysicalNode {
                 id: local_writer,
@@ -595,13 +630,7 @@ fn finish_router_writer_fixture(
                         write_target_ordinal: write_target_ordinal(1),
                         input: Box::from([local_input_value]),
                         required_distribution: Distribution::Singleton,
-                        target_fields: Box::from([WriterTargetField {
-                            provider_name: "v".into(),
-                            token: ConnectorWriteFieldToken::from_bytes([8; 32]),
-                            input: local_input_value,
-                            ty: ty(DataType::Int64, false),
-                            hidden: false,
-                        }]),
+                        target_fields: projected_target_fields_1,
                         output_schema: WriterRelationSchema {
                             revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                             fields: local_fields.clone().into_boxed_slice(),
@@ -1757,5 +1786,102 @@ fn a_fragment_cannot_declare_two_outputs_of_the_same_summary_kind() {
             .errors()
             .iter()
             .any(|error| error.message() == "fragment declares a summary kind more than once")
+    );
+}
+
+#[test]
+fn writer_projected_values_have_one_exact_private_owner_and_type() {
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let original = &plan.fragments()[&FragmentId::new(722)];
+    let writer = original.root();
+    for corruption in 0..5 {
+        let mut nodes = original.nodes().clone();
+        let mut values = original.values().clone();
+        let node = nodes.get_mut(&writer).unwrap();
+        let NodeKind::TableWriter { target } = &mut node.kind else {
+            unreachable!()
+        };
+        let field = target.target_fields[0].clone();
+        assert_ne!(field.input, field.projected);
+        assert_eq!(values[&field.projected].ty, field.ty);
+        let expected = match corruption {
+            0 => {
+                target.target_fields[0].projected = field.input;
+                "projected value differs from its exact owner or output type"
+            }
+            1 => {
+                values.get_mut(&field.projected).unwrap().origin = ValueOrigin::WriterDerived {
+                    writer_node: node.inputs[0],
+                    kind: WriterDerivedKind::ProjectedInput,
+                };
+                "projected value must belong to an exact table writer"
+            }
+            2 => {
+                values.get_mut(&field.projected).unwrap().ty = ty(DataType::Utf8, false);
+                "projected value differs from its exact owner or output type"
+            }
+            3 => {
+                let mut duplicate = field.clone();
+                duplicate.token = ConnectorWriteFieldToken::from_bytes([77; 32]);
+                target.target_fields = vec![field.clone(), duplicate].into();
+                "table writer fields repeat a projected value"
+            }
+            4 => {
+                node.output.columns = vec![field.projected].into();
+                "writer projected value cannot be a relational node output"
+            }
+            _ => unreachable!(),
+        };
+        let fragment = Fragment::from(crate::plan::FragmentParts {
+            id: original.id(),
+            root: writer,
+            values,
+            nodes,
+            expressions: original.expressions().clone(),
+            sink: original.sink().clone(),
+            summaries: original.summaries().into(),
+            dop_domain: original.dop_domain(),
+            stage_placement: original.stage_placement().clone(),
+            runtime_filters: original.runtime_filters().into(),
+            call_requests: original.call_requests().clone(),
+        });
+        let error = crate::validation::validate_fragment_definition(&fragment)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "corruption={corruption}: {error}");
+    }
+}
+
+#[test]
+fn writer_projected_values_cannot_be_transported_by_an_edge() {
+    let plan = finish_router_writer_plan(RouterWriterShape::Valid).unwrap();
+    let writer_fragment = FragmentId::new(722);
+    let fragment = &plan.fragments()[&writer_fragment];
+    let NodeKind::TableWriter { target } = &fragment.nodes()[&fragment.root()].kind else {
+        unreachable!()
+    };
+    let projected = target.target_fields[0].projected;
+    let mut edges = plan.edges().clone();
+    let edge = edges
+        .values_mut()
+        .find(|edge| edge.source.fragment == writer_fragment)
+        .unwrap();
+    edge.source.projection[0] = projected;
+    edge.destination.receive_mapping[0].0 = projected;
+    let invalid = PhysicalPlan::from(crate::plan::PhysicalPlanParts {
+        constants: plan.constants().clone(),
+        parameters: plan.parameters().clone(),
+        version: plan.version(),
+        fragments: plan.fragments().clone(),
+        edges,
+        runtime_filters: plan.runtime_filters().clone(),
+        result_port: plan.result_port().cloned(),
+        required: plan.required(),
+        annotations: plan.annotations().into(),
+    });
+    let error = crate::validate_plan(&invalid).unwrap_err().to_string();
+    assert!(
+        error.contains("writer projected value cannot cross a fragment edge"),
+        "{error}"
     );
 }

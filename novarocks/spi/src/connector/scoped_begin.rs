@@ -15,39 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Move-only checked COW begin custody. Ordinary writes keep their entrypoint.
+//! Move-only checked scoped begin custody. Ordinary writes keep their entrypoint.
 
 use super::{ConnectorError, OriginalResultCheckError};
 use std::{error::Error, fmt};
 
-pub enum ConnectorCowBeginCause {
+pub enum ConnectorScopedBeginCause {
     Provider(ConnectorError),
     OriginalResult(OriginalResultCheckError),
 }
-impl From<ConnectorError> for ConnectorCowBeginCause {
+impl From<ConnectorError> for ConnectorScopedBeginCause {
     fn from(e: ConnectorError) -> Self {
         Self::Provider(e)
     }
 }
-impl From<OriginalResultCheckError> for ConnectorCowBeginCause {
+impl From<OriginalResultCheckError> for ConnectorScopedBeginCause {
     fn from(e: OriginalResultCheckError) -> Self {
         Self::OriginalResult(e)
     }
 }
-impl fmt::Debug for ConnectorCowBeginCause {
+impl fmt::Debug for ConnectorScopedBeginCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Provider(_) => "COW provider failure",
-            Self::OriginalResult(_) => "COW original result failure",
+            Self::Provider(_) => "scoped provider failure",
+            Self::OriginalResult(_) => "scoped original result failure",
         })
     }
 }
-impl fmt::Display for ConnectorCowBeginCause {
+impl fmt::Display for ConnectorScopedBeginCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("copy-on-write begin failed")
+        f.write_str("scoped begin failed")
     }
 }
-impl Error for ConnectorCowBeginCause {
+impl Error for ConnectorScopedBeginCause {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(match self {
             Self::Provider(e) => e,
@@ -56,7 +56,7 @@ impl Error for ConnectorCowBeginCause {
     }
 }
 
-impl novarocks_failure_contract::FailureProjection for ConnectorCowBeginCause {
+impl novarocks_failure_contract::FailureProjection for ConnectorScopedBeginCause {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         match self {
             Self::Provider(error) => error.failure_fact(),

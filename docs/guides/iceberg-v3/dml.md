@@ -26,7 +26,7 @@ under the License.
 | INSERT INTO（VALUES / SELECT） | ✅ | |
 | INSERT OVERWRITE（静态分区 + 全表） | ✅ | |
 | DELETE FROM（V2 position-delete + V3 DV 双路径） | ✅ | |
-| UPDATE（COW + MOR + UPDATE FROM source） | ✅ | PR #76 |
+| UPDATE（MOR + UPDATE FROM source） | ✅ | PR #76 |
 | MERGE INTO（matched UPDATE / matched DELETE / not matched INSERT） | ✅ | PR #78 |
 | OPTIMIZE TABLE（whole-table 重写） | ✅ | 见 [maintenance](maintenance.md) |
 | INSERT OVERWRITE 动态分区（`INSERT OVERWRITE PARTITIONS`） | ✅ | v3、分区表，见下文 |
@@ -106,7 +106,7 @@ V2 / V3 双路径：
 
 入口：`novarocks/frontend-application/src/query_execution/dml/delete/`。
 
-## ✅ UPDATE（COW + MOR + UPDATE FROM source）
+## ✅ UPDATE（MOR + UPDATE FROM source）
 
 ```sql
 -- 简单 UPDATE
@@ -119,10 +119,25 @@ UPDATE orders t
  WHERE t.id = s.id;
 ```
 
-NovaRocks 默认走 COW（写新文件 + 替换），可通过表 property `write.update.mode = 'merge-on-read'` 切到 MOR（写 DV + 新文件保留 `_row_id`）。
+NovaRocks 的 UPDATE 与所有 MERGE 形状只走 MOR：写 DV 标删旧物理行，再写 after-image。
+`novarocks.update.mode`、`write.update.mode` 及其他 `write.*.mode` 不选择执行算法；已有值、
+`copy-on-write` 或非法值均不能改变原 v3、类型与 ref 准入。
 
-MoR 更新行的 `_last_updated_sequence_number` 写 NULL，读时继承实际提交的 data sequence；
+MOR 更新行的 `_last_updated_sequence_number` 写 NULL，读时继承实际提交的 data sequence；
 其他 branch 先提交也不会使它落到预测的旧版本。入口：`novarocks/frontend-application/src/query_execution/dml/mutation_flow.rs`。
+
+### 赋值类型与必填约束
+
+赋值继续使用普通 SQL 转换，在完整来源查询之后得到真实值 V，保留来源 NULL 与原字节。
+Provider 独立签发规范输入 W 和存储目标 T；定长 data 字段可使用明确许可的 Binary 输入，
+W 仍保留 T 的各层必填约束。只有实际选中的 MERGE 分支或 writer assignment 才执行写入投影。
+
+可达嵌套必填 NULL 在 Provider I/O 前以 Data 错误拒绝；父 NULL 或偏移未引用的子值不误拒绝。
+定长 `fixed(N)` 存储按可达非 NULL 原字节长度检查，长度不符以 Data 拒绝，不截断或填充有效值。
+普通 Binary→Fixed CAST 的坏宽度 NULL 结果不能替代这个检查，普通嵌套 CAST 能力也不扩大。
+STRING 转 FLOAT/DOUBLE 的非有限文本仍按普通 CAST 变成 NULL；可空目标接受，必填目标拒绝。
+UUID、Variant 等原有 Provider 不可写类型限制保留。上述为写入合同，不宣称所有来源转换或最终
+端到端测试已通过；完整来源/目标接线与原生用例的最终验证须分别取证。
 
 ## ✅ MERGE INTO
 
@@ -135,16 +150,15 @@ USING (SELECT id, user_id, amount, ts FROM orders_changes) s
  WHEN NOT MATCHED THEN INSERT (id, user_id, amount, ts) VALUES (s.id, s.user_id, s.amount, s.ts);
 ```
 
-实现概要（PR #78）：
+实现概要：
 
-- 单次 LEFT JOIN 用 `__nr_match_kind` 字段区分 matched / not-matched，再叠加每子句的 `AND` apply flag，一次性物化所有批次
-- matched 走 v3 row-lineage UPDATE executor（COW / MOR 双路径同 UPDATE）
-- not matched 走 FastAppend
-- matched DELETE 走 position-delete / DV 路径
+- 保留原 admitted AST；匹配读取使用 Provider 签发的同一 target ref/base。
+- matched UPDATE、matched DELETE 和 not matched INSERT 形成原逻辑 effect，由同一 MOR 写入会话路由。
+- after-image、删除目标与统计事实保留 Provider 的 signed ordinals；逻辑计数仍由原 Root 完成事实提供。
 
 要求基表 v3；`write.row-lineage` 不参与准入。
 
-MOR路径按目标行物理位置与命中子句判重，未命中子句的匹配行也参与；重复返回Trino119，UPDATE FROM使用UPDATE原文。当前UPDATE/UPDATE FROM默认仍可走COW，其独立consumer的重复拒绝没有这个119身份。当前SQL MERGE统一路由MOR，表的COW设置不代表MERGE实际走COW。
+UPDATE、UPDATE FROM 与 MERGE 统一在 MOR 路径按目标行物理位置与命中子句判重，未命中子句的匹配行也参与；重复返回 Trino 119，UPDATE FROM 保留原 UPDATE 语句身份。
 
 ### ❌ MERGE INTO 写指定 branch
 

@@ -26,7 +26,7 @@ pub(crate) fn view_value_type(
     value: &novarocks_type_contract::FunctionValueType,
     control: &crate::compiler::SqlCompileControl,
 ) -> Result<novarocks_type_contract::FunctionValueType, crate::compiler::SqlCompileError> {
-    root_output_declaration::widen_declaration(value, control)
+    declaration_widening::widen_declaration(value, control)
 }
 
 pub(crate) mod constant_expression;
@@ -45,6 +45,7 @@ pub(crate) mod functions;
 mod helpers;
 #[cfg(test)]
 pub(crate) use helpers::sql_logical_projection;
+pub(crate) mod declaration_widening;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
@@ -55,13 +56,13 @@ mod logical_output;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
-pub(crate) mod root_output_declaration;
 #[cfg(test)]
 mod scalar_rebind_contract_tests;
 mod value_conversion;
 mod view;
 #[cfg(test)]
 mod window_canonical_tests;
+mod write_assignment;
 /// The analyzer owns this bound and enforces it; it is named outside the
 /// analyzer only where a test has to build a chain that crosses it.
 #[cfg(test)]
@@ -190,6 +191,7 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -217,6 +219,38 @@ pub(crate) fn analyze_with_materialized_values_and_sql_semantics(
         constant_policy,
         control,
         materialized,
+    )
+}
+
+pub(crate) fn analyze_with_write_assignments_and_sql_semantics(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
+    assignments: Option<&crate::compiler::SqlWriteAssignments>,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
+    analyze_with_factory_and_function_catalog_and_assignments_inner(
+        query,
+        catalog,
+        current_database,
+        crate::column_id::ColumnRefFactory::new(),
+        function_catalog,
+        sql_semantics,
+        constant_policy,
+        control,
+        materialized,
+        assignments,
     )
 }
 
@@ -304,6 +338,39 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
+    analyze_with_factory_and_function_catalog_and_assignments_inner(
+        query,
+        catalog,
+        current_database,
+        factory,
+        function_catalog,
+        sql_semantics,
+        constant_policy,
+        control,
+        materialized,
+        None,
+    )
+}
+
+fn analyze_with_factory_and_function_catalog_and_assignments_inner(
+    query: &ast::Query,
+    catalog: &dyn PlannerTableProvider,
+    current_database: &str,
+    factory: crate::column_id::ColumnRefFactory,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+    materialized: Option<&crate::compiler::materialized_values::MaterializedValues>,
+    assignments: Option<&crate::compiler::SqlWriteAssignments>,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::analysis::cte::CTERegistry,
+        crate::column_id::ColumnRefFactory,
+    ),
+    AnalyzeError,
+> {
     novarocks_type_contract::PureCompileControl::checkpoint(
         control,
         novarocks_type_contract::CompilePhase::Validate,
@@ -312,7 +379,7 @@ fn analyze_with_factory_and_function_catalog_inner(
     .map_err(AnalyzeError::control)?;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze_with_semantics(query, sql_semantics)?;
-    let materialized_source = materialized
+    let mut materialized_source = materialized
         .map(|source| source.loan(&query, control))
         .transpose()
         .map_err(|error| match error {
@@ -327,6 +394,18 @@ fn analyze_with_factory_and_function_catalog_inner(
             ),
             other => AnalyzeError::internal(other.to_string()),
         })?;
+    if let Some(assignments) = assignments {
+        let source = materialized_source.get_or_insert_with(|| {
+            crate::compiler::materialized_values::MaterializedSourceBorrow::empty(&query)
+        });
+        write_assignment::materialize_write_literal_contexts(
+            &query,
+            assignments,
+            source,
+            constant_policy,
+            control,
+        )?;
+    }
     let materialized_values = materialized_source.as_ref().map(|source| source.view());
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
@@ -348,6 +427,10 @@ fn analyze_with_factory_and_function_catalog_inner(
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     };
     let resolved = ctx.analyze_query(&query)?;
+    let resolved = match assignments {
+        Some(assignments) => ctx.bind_write_source_query(resolved, assignments, query.span)?,
+        None => resolved,
+    };
     ctx.check_control()?;
     let registry = ctx.cte_registry.into_inner();
     let col_factory = std::rc::Rc::try_unwrap(factory)

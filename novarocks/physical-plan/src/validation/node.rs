@@ -236,6 +236,20 @@ pub(crate) fn validate_value(
         ValueOrigin::ExchangeImport { .. } | ValueOrigin::CteImport { .. } => {
             // Cross-fragment definitions are checked with the complete graph.
         }
+        ValueOrigin::WriterDerived {
+            writer_node,
+            kind: crate::WriterDerivedKind::ProjectedInput,
+        } => {
+            if !matches!(
+                fragment.nodes().get(writer_node).map(|node| &node.kind),
+                Some(NodeKind::TableWriter { .. })
+            ) {
+                errors.push(ValidationError::new(
+                    &path,
+                    "writer projected value must belong to an exact table writer",
+                ));
+            }
+        }
         ValueOrigin::WriterDerived { writer_node, .. } => match fragment.nodes().get(writer_node) {
             Some(node)
                 if matches!(
@@ -265,6 +279,22 @@ pub(crate) fn validate_node(
         fragment.id().get(),
         node.id.get()
     );
+    for value in &node.output.columns {
+        if fragment.values().get(value).is_some_and(|value| {
+            matches!(
+                value.origin,
+                ValueOrigin::WriterDerived {
+                    kind: crate::WriterDerivedKind::ProjectedInput,
+                    ..
+                }
+            )
+        }) {
+            errors.push(ValidationError::new(
+                &path,
+                "writer projected value cannot be a relational node output",
+            ));
+        }
+    }
     if node.output.node != node.id {
         errors.push(ValidationError::new(
             &path,
@@ -710,8 +740,8 @@ pub(crate) fn value_origin_allowed(
         ) => node_edge == edge,
         (
             NodeKind::TableWriter { .. } | NodeKind::TableFinish(_),
-            ValueOrigin::WriterDerived { writer_node, .. },
-        ) => *writer_node == node.id,
+            ValueOrigin::WriterDerived { writer_node, kind },
+        ) => *writer_node == node.id && *kind != crate::WriterDerivedKind::ProjectedInput,
         (NodeKind::Repeat { .. }, ValueOrigin::NullExtended { node: owner, of }) => {
             *owner == node.id && repeat_grouping_values.contains(&(*of, definition.id))
         }
@@ -1503,7 +1533,31 @@ pub(crate) fn validate_node_semantics(
                 errors,
             );
             let mut target_tokens = BTreeSet::new();
+            let mut projected_values = BTreeSet::new();
             for field in &target.target_fields {
+                if !projected_values.insert(field.projected) {
+                    errors.push(ValidationError::new(
+                        path,
+                        "table writer fields repeat a projected value",
+                    ));
+                }
+                if !fragment
+                    .values()
+                    .get(&field.projected)
+                    .is_some_and(|value| {
+                        value.ty == field.ty
+                            && value.origin
+                                == (ValueOrigin::WriterDerived {
+                                    writer_node: node.id,
+                                    kind: crate::WriterDerivedKind::ProjectedInput,
+                                })
+                    })
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "table writer projected value differs from its exact owner or output type",
+                    ));
+                }
                 if field.provider_name.is_empty() {
                     errors.push(ValidationError::new(
                         path,
@@ -1522,7 +1576,11 @@ pub(crate) fn validate_node_semantics(
                     // differences are row obligations of the constructing
                     // writer projection, before Provider I/O.
                     Some(value)
-                        if !super::write_assignment_bindings_match(&value.ty, &field.ty) =>
+                        if !super::write_assignment_projection_matches(
+                            &value.ty,
+                            &field.ty,
+                            field.storage_type.as_ref(),
+                        ) =>
                     {
                         errors.push(ValidationError::new(
                             path,
@@ -1547,7 +1605,7 @@ pub(crate) fn validate_node_semantics(
                 fragment,
                 &target.partial_aggregates,
                 node.id,
-                child_values,
+                &|value| projected_values.contains(value),
                 path,
                 errors,
             );
@@ -1691,7 +1749,7 @@ pub(crate) fn validate_node_semantics(
                 fragment,
                 &spec.final_aggregates,
                 node.id,
-                &child_values,
+                &|value| child_values.contains(value),
                 path,
                 errors,
             );
@@ -2172,7 +2230,8 @@ pub(crate) fn validate_node_semantics(
                     require_boolean_expression(fragment, predicate, path, errors);
                 }
                 let mut assigned_outputs = BTreeMap::new();
-                for (output, expression) in &event.assignments {
+                for assignment in &event.assignments {
+                    let (output, expression) = (&assignment.output, &assignment.expression);
                     require_value(fragment, *output, path, errors);
                     if *output == *effect_output {
                         errors.push(ValidationError::new(
@@ -2195,20 +2254,39 @@ pub(crate) fn validate_node_semantics(
                             "change-event event contains a duplicate assignment output",
                         ));
                     }
-                    if let Some(expression) = expression
-                        && let (Some(output), Some(expression)) = (
-                            fragment.values().get(output),
-                            fragment.expressions().get(*expression),
-                        )
-                        && !super::write_assignment_bindings_match(&output.ty, &expression.ty)
-                    {
-                        errors.push(ValidationError::new(
+                    match (&assignment.write_input, expression) {
+                        (Some(declaration), Some(expression)) => {
+                            if let (Some(output), Some(expression)) = (
+                                fragment.values().get(output),
+                                fragment.expressions().get(*expression),
+                            ) && (!super::value_bindings_match_ignoring_root_nullability(
+                                &output.ty,
+                                &declaration.input,
+                            ) || !super::write_assignment_projection_matches(
+                                &expression.ty,
+                                &declaration.input,
+                                declaration.storage.as_ref(),
+                            )) {
+                                errors.push(ValidationError::new(path, "change-event write input differs from its complete assignment or output"));
+                            }
+                        }
+                        (Some(_), None) => errors.push(ValidationError::new(
                             path,
-                            format!(
-                                "change-event assignment type differs from its output: output {:?}, expression {:?}",
-                                output.ty, expression.ty
-                            ),
-                        ));
+                            "unassigned change-event placeholder cannot carry a write input",
+                        )),
+                        (None, Some(expression)) => {
+                            if let (Some(output), Some(expression)) = (
+                                fragment.values().get(output),
+                                fragment.expressions().get(*expression),
+                            ) && !super::write_assignment_bindings_match(
+                                &output.ty,
+                                &expression.ty,
+                            ) {
+                                errors.push(ValidationError::new(path, format!(
+                                    "change-event assignment type differs from its output: output {:?}, expression {:?}", output.ty, expression.ty)));
+                            }
+                        }
+                        (None, None) => {}
                     }
                 }
                 for output in node
@@ -2582,16 +2660,16 @@ pub(crate) fn validate_writer_aggregate_ports(
     fragment: &Fragment,
     calls: &[crate::WriterAggregateCall],
     owner: NodeId,
-    child_values: &VisibleInputIndex,
+    input_contains: &impl Fn(&ValueId) -> bool,
     path: &str,
     errors: &mut ValidationContext,
 ) {
     let mut outputs = BTreeSet::new();
     for call in calls {
-        if !child_values.contains(&call.input) {
+        if !input_contains(&call.input) {
             errors.push(ValidationError::new(
                 path,
-                "writer aggregate input is absent from its exact child output",
+                "writer aggregate input is absent from its exact input port",
             ));
         }
         if !outputs.insert(call.output) {

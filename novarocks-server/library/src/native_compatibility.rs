@@ -180,7 +180,7 @@ mod tests {
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 9), ("paimon", 1)]
+            vec![("iceberg", 10), ("paimon", 1)]
         );
         assert!(
             declarations

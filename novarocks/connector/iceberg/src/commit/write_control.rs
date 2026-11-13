@@ -30,7 +30,7 @@
 //! * [`prepare_write`](super::write_preparation::prepare_write) runs the
 //!   Iceberg write-support guards and signs the Arrow input;
 //! * [`prepare_row_mutation`](super::row_mutation_preparation::prepare_row_mutation)
-//!   picks merge-on-read or copy-on-write and signs the match contract whose
+//!   admits merge-on-read and signs the match contract whose
 //!   effect column the session later reads; and
 //! * `preview_managed_partition_spec` answers which partitioning a managed
 //!   replacement would establish, without proposing it.

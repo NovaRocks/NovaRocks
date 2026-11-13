@@ -224,11 +224,10 @@ fn mv_target_physical_write_schema(
             if fact.is_some_and(|fact| fact.role() == ConnectorTableColumnRole::RowLineageSystem) {
                 return None;
             }
-            let data_type = fact
-                .and_then(|fact| fact.write_target_type())
-                .cloned()
-                .unwrap_or_else(|| field.data_type().clone());
-            Some(Arc::new(field.as_ref().clone().with_data_type(data_type)))
+            Some(Arc::new(match fact.and_then(|fact| fact.write_input()) {
+                Some(input) => input.field().clone(),
+                None => field.as_ref().clone(),
+            }))
         })
         .collect::<Vec<_>>();
     if fields.len() != field_ids.len() {
@@ -304,7 +303,19 @@ mod tests {
                     ConnectorTableColumnVisibility::Sql,
                     ConnectorTableColumnRole::Ordinary,
                 )
-                .with_write_target_type(Some(DataType::LargeBinary)),
+                .with_write_input(Some(
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        read_schema
+                            .field(1)
+                            .clone()
+                            .with_data_type(DataType::LargeBinary),
+                        novarocks_type_contract::FunctionValueType::new(
+                            DataType::LargeBinary,
+                            true,
+                        ),
+                    )
+                    .unwrap(),
+                )),
                 fact(
                     2,
                     ConnectorTableColumnVisibility::Hidden,

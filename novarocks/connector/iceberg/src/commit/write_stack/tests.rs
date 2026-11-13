@@ -700,7 +700,7 @@ fn neutral_plan(
     sealed: (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>),
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
-    session_plan_from_targets(adapter, handle, targets, None)
+    session_plan_from_targets(adapter, handle, targets, None, None)
 }
 
 fn effects(target: &ConnectorWriteTargetPlan) -> Vec<ConnectorRowMutationEffect> {

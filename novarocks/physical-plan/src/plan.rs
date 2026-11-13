@@ -39,6 +39,8 @@ pub enum WriterDerivedKind {
     RelationAuxiliary,
     WriteTargetOrdinal,
     GroupingKey,
+    /// A writer-private value produced by one checked input projection.
+    ProjectedInput,
 }
 
 pub const WRITER_MULTIPLEX_SCHEMA_REVISION: u32 = 1;
@@ -603,7 +605,11 @@ pub struct WriterTargetField {
     /// against the same private target before a runtime writer is created.
     pub provider_name: Box<str>,
     pub input: ValueId,
+    /// Exact output of this field's writer-private projection.
+    pub projected: ValueId,
     pub ty: ValueType,
+    /// Independent Provider storage target; absence permits only exact leaves.
+    pub storage_type: Option<ValueType>,
     pub hidden: bool,
 }
 
@@ -796,11 +802,30 @@ pub struct GroupingOutput {
     pub arguments: Box<[ValueId]>,
 }
 
+/// One selected event assignment. The global output may include nullable
+/// placeholders; write_input retains this assignment's actual required W.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangeAssignment {
+    pub output: ValueId,
+    pub expression: Option<ExprId>,
+    pub write_input: Option<novarocks_type_contract::WriteInputDeclaration>,
+}
+
+impl ChangeAssignment {
+    pub fn exact(output: ValueId, expression: Option<ExprId>) -> Self {
+        Self {
+            output,
+            expression,
+            write_input: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChangeEventSpec {
     pub predicate: Option<ExprId>,
     pub effect: ConnectorRowMutationEffect,
-    pub assignments: Box<[(ValueId, Option<ExprId>)]>,
+    pub assignments: Box<[ChangeAssignment]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1124,7 +1149,12 @@ impl NodeKind {
             Self::ChangeEventExpand { events, .. } => {
                 for event in events {
                     output.extend(event.predicate);
-                    output.extend(event.assignments.iter().filter_map(|(_, expr)| *expr));
+                    output.extend(
+                        event
+                            .assignments
+                            .iter()
+                            .filter_map(|assignment| assignment.expression),
+                    );
                 }
             }
             Self::TableFinish(spec) => {

@@ -453,6 +453,8 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
                         "token"
                     } else if field.field().name() != target.provider_name.as_ref() {
                         "name"
+                    } else if field.storage_type() != target.storage_type.as_ref() {
+                        "storage_type"
                     } else if let Some(actual) = field.execution_type() {
                         if actual.nullable() != target.ty.nullable() {
                             "nullable"

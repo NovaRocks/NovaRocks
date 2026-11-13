@@ -393,6 +393,24 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
     let writer = builder.reserve_node_id().unwrap();
     let fields = relation(&mut builder, writer, false);
     let input = draft.input().fields_iter().next().unwrap();
+    let projected_target_fields_0: Box<[novarocks_physical_plan::WriterTargetField]> =
+        Box::from([WriterTargetField {
+            storage_type: None,
+            projected: builder
+                .add_value(
+                    (int64()).clone(),
+                    novarocks_physical_plan::ValueOrigin::WriterDerived {
+                        writer_node: writer,
+                        kind: novarocks_physical_plan::WriterDerivedKind::ProjectedInput,
+                    },
+                )
+                .unwrap(),
+            provider_name: input.field().name().clone().into(),
+            token: input.token(),
+            input: value,
+            ty: int64(),
+            hidden: false,
+        }]);
     builder
         .insert_node_unchecked(PhysicalNode {
             id: writer,
@@ -409,13 +427,7 @@ pub(crate) fn writer_producer_package() -> (Vec<u8>, u32) {
                     write_target_ordinal: ordinal,
                     input: Box::from([value]),
                     required_distribution: Distribution::Singleton,
-                    target_fields: Box::from([WriterTargetField {
-                        provider_name: input.field().name().clone().into(),
-                        token: input.token(),
-                        input: value,
-                        ty: int64(),
-                        hidden: false,
-                    }]),
+                    target_fields: projected_target_fields_0,
                     output_schema: WriterRelationSchema {
                         revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
                         fields: fields.clone(),

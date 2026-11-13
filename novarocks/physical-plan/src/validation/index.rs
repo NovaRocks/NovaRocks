@@ -110,6 +110,7 @@ impl ValuePortIndex {
 pub(crate) struct FragmentValidationIndexes {
     pub(crate) output_ports: BTreeMap<NodeId, Arc<ValuePortIndex>>,
     pub(crate) visible_inputs: BTreeMap<NodeId, VisibleInputIndex>,
+    pub(crate) projected_inputs: BTreeMap<ValueId, (NodeId, usize)>,
 }
 
 pub(crate) enum VisibleInputIndex {
@@ -207,9 +208,50 @@ impl FragmentValidationIndexes {
                 owner.work.flush()?;
             }
         }
+        let mut projected_count = 0;
+        for node in fragment.nodes().values() {
+            if let NodeKind::TableWriter { target } = &node.kind {
+                projected_count =
+                    control_resource_add(projected_count, target.target_fields.len())?;
+            }
+            if let Some(owner) = admission.as_mut() {
+                owner.work.step()?;
+            }
+        }
+        if let Some(owner) = admission.as_mut() {
+            owner
+                .counter
+                .tree::<ValueId, (NodeId, usize)>(projected_count)?;
+            owner.counter.work(control_resource_mul(
+                projected_count,
+                ControlResourceCounter::lookup_work(projected_count)?,
+            )?)?;
+            owner.gate()?;
+        }
+        let mut projected_inputs = BTreeMap::new();
+        for node in fragment.nodes().values() {
+            if let NodeKind::TableWriter { target } = &node.kind {
+                for field in &target.target_fields {
+                    if let Some(owner) = admission.as_mut() {
+                        owner.work.flush()?;
+                    }
+                    let entry = projected_inputs
+                        .entry(field.projected)
+                        .or_insert((node.id, 0));
+                    entry.1 += 1;
+                    if let Some(owner) = admission.as_mut() {
+                        owner.work.step()?;
+                    }
+                }
+            }
+            if let Some(owner) = admission.as_mut() {
+                owner.work.step()?;
+            }
+        }
         Ok(Self {
             output_ports,
             visible_inputs,
+            projected_inputs,
         })
     }
 

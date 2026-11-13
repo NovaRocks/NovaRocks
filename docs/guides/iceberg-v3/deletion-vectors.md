@@ -69,8 +69,8 @@ DELETE FROM orders WHERE id IN (1, 2, 3);
 manifest EXISTING/DELETED 和依赖验证使用完整逻辑身份，保留原 data/file sequence、spec 和分区事实。
 
 例如 Puffin 中有 A、B 两个 data file 的 DV，DELETE 替换 A 的 blob 时，B 的 blob 继续存活。
-COW UPDATE 或动态分区覆盖移除 A 的 data file 时，也显式移除 A 的精确 DV，不能留下悬空引用；
-这两种情况均不授权删除承载 B 的 Puffin。快照摘要按逻辑 blob 字节和成员数计数，不能把整个物理
+动态分区覆盖或维护重写移除 A 的 data file 时，也显式移除 A 的精确 DV，不能留下悬空引用；
+这些操作均不授权删除承载 B 的 Puffin。快照摘要按逻辑 blob 字节和成员数计数，不能把整个物理
 Puffin 的大小重复算给每个 DV。
 
 物理清理只处理操作实际拥有且不再被保留发布引用的对象；外部引擎写出的对象永不纳入该清理登记。

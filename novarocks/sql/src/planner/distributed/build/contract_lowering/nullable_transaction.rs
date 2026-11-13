@@ -1378,7 +1378,9 @@ impl ContractLoweringVisitor<'_> {
                     } => {
                         if value.id != *effect_output {
                             for event in events.iter() {
-                                for (output, expr) in event.assignments.iter() {
+                                for assignment in event.assignments.iter() {
+                                    let (output, expr) =
+                                        (&assignment.output, &assignment.expression);
                                     self.work.step()?;
                                     if *output == value.id
                                         && let Some(expr) = expr

@@ -76,12 +76,16 @@ pub struct ConnectorWriteFieldBinding {
     token: ConnectorWriteFieldToken,
     field: WriterFieldStorage,
     execution_type: Option<novarocks_type_contract::FunctionValueType>,
+    // None is the original exact/NULL-only input relation. Some(T) explicitly
+    // licenses only the checked plain-Fixed-byte projection into input W.
+    storage_type: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl PartialEq for ConnectorWriteFieldBinding {
     fn eq(&self, other: &Self) -> bool {
         self.token == other.token
             && self.execution_type == other.execution_type
+            && self.storage_type == other.storage_type
             && crate::arrow_fields_exact(self.field(), other.field())
     }
 }
@@ -89,14 +93,14 @@ impl Eq for ConnectorWriteFieldBinding {}
 
 impl ConnectorWriteFieldBinding {
     pub fn new(token: ConnectorWriteFieldToken, field: Field) -> Self {
-        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Plain(field)), execution_type: None }
+        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Plain(field)), execution_type: None, storage_type: None }
     }
 
     pub(crate) fn from_owned_materialization(
         token: ConnectorWriteFieldToken,
         field: novarocks_type_contract::owned_resources::metadata_materialization::MaterializedField,
     ) -> Self {
-        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field)), execution_type: None }
+        Self { token, field: WriterFieldStorage::Pure(novarocks_type_contract::owned_resources::metadata_materialization::OriginalFieldMaterialization::Materialized(field)), execution_type: None, storage_type: None }
     }
 
     pub(crate) fn created_allocation_layout() -> Result<
@@ -119,6 +123,7 @@ impl ConnectorWriteFieldBinding {
                 _storage:storage,
             })),
             execution_type:None,
+            storage_type:None,
         }
     }
     /// Pair provider-owned source facts with their explicitly authored execution
@@ -147,12 +152,40 @@ impl ConnectorWriteFieldBinding {
                 "writer source facts conflict with their explicit execution projection",
             ));
         }
+        validate_write_input_projection_observed(
+            &execution_type,
+            self.storage_type.as_ref(),
+            || Ok::<(), ConnectorError>(()),
+        )?;
         self.execution_type = Some(execution_type);
         Ok(self)
     }
 
     pub fn execution_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
         self.execution_type.as_ref()
+    }
+
+    /// Add the original complete storage target to an explicitly typed input.
+    /// This is a closed raw-byte projection declaration, not a cast capability.
+    pub fn with_storage_type(
+        mut self,
+        storage_type: novarocks_type_contract::FunctionValueType,
+    ) -> Result<Self, ConnectorError> {
+        let input = self.execution_type.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "writer storage projection requires its complete input declaration",
+            )
+        })?;
+        validate_write_input_projection_observed(input, Some(&storage_type), || {
+            Ok::<(), ConnectorError>(())
+        })?;
+        self.storage_type = Some(storage_type);
+        Ok(self)
+    }
+
+    pub fn storage_type(&self) -> Option<&novarocks_type_contract::FunctionValueType> {
+        self.storage_type.as_ref()
     }
 
     /// Borrow the exact immutable writer-owned field and its constructor fact.
@@ -167,6 +200,56 @@ impl ConnectorWriteFieldBinding {
     pub fn field(&self) -> &Field {
         self.field.original().field()
     }
+}
+
+/// Emit complete normalized W/T identities without formatting a shadow
+/// tree or including storage lifetimes. Source Field attributes are separate.
+pub fn write_input_projection_identity_observed<E>(
+    input: Option<&novarocks_type_contract::FunctionValueType>,
+    storage: Option<&novarocks_type_contract::FunctionValueType>,
+    mut write: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    write(b"novarocks-write-input-projection-v1")?;
+    for value in [input, storage] {
+        write(&[u8::from(value.is_some())])?;
+        if let Some(value) = value {
+            novarocks_type_contract::write_value_type_identity_observed(
+                value.value_type(),
+                &mut write,
+            )?;
+            novarocks_type_contract::write_value_layout_identity_observed(
+                value.typed_binding().layout(),
+                &mut write,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the closed input W / storage T declaration using the neutral
+/// type author. Provider Field attributes remain a separate namespace.
+pub fn validate_write_input_projection_observed<E: From<ConnectorError>>(
+    input: &novarocks_type_contract::FunctionValueType,
+    storage: Option<&novarocks_type_contract::FunctionValueType>,
+    observe: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(storage) = storage else {
+        return Ok(());
+    };
+    let valid = novarocks_type_contract::CheckedWriteInputProjection::try_new_observed(
+        input.typed_binding().borrowed(),
+        input.typed_binding().borrowed(),
+        Some(storage.typed_binding().borrowed()),
+        observe,
+    )?;
+    if valid.is_none() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "writer input differs from its explicit storage projection",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Validate the physical part of an explicitly authored writer input. The
@@ -197,6 +280,7 @@ pub struct ConnectorWriteFieldRef<'a> {
     token: ConnectorWriteFieldToken,
     field: &'a Field,
     execution_type: Option<&'a novarocks_type_contract::FunctionValueType>,
+    storage_type: Option<&'a novarocks_type_contract::FunctionValueType>,
 }
 
 impl<'a> ConnectorWriteFieldRef<'a> {
@@ -205,6 +289,7 @@ impl<'a> ConnectorWriteFieldRef<'a> {
             token,
             field,
             execution_type: None,
+            storage_type: None,
         }
     }
 
@@ -219,13 +304,32 @@ impl<'a> ConnectorWriteFieldRef<'a> {
             token,
             field,
             execution_type: Some(execution_type),
+            storage_type: None,
         }
+    }
+    /// Borrow both namespaces; the recipe validates this explicit projection.
+    pub const fn new_typed_with_storage(
+        token: ConnectorWriteFieldToken,
+        field: &'a Field,
+        execution_type: &'a novarocks_type_contract::FunctionValueType,
+        storage_type: Option<&'a novarocks_type_contract::FunctionValueType>,
+    ) -> Self {
+        Self {
+            token,
+            field,
+            execution_type: Some(execution_type),
+            storage_type,
+        }
+    }
+    pub const fn storage_type(&self) -> Option<&'a novarocks_type_contract::FunctionValueType> {
+        self.storage_type
     }
     pub fn from_binding(binding: &'a ConnectorWriteFieldBinding) -> Self {
         Self {
             token: binding.token(),
             field: binding.field(),
             execution_type: binding.execution_type(),
+            storage_type: binding.storage_type(),
         }
     }
     pub const fn execution_type(&self) -> Option<&'a novarocks_type_contract::FunctionValueType> {
@@ -331,6 +435,15 @@ impl ConnectorWriteInputShape {
                 return Ok(false);
             }
             match (left.execution_type(), right.execution_type()) {
+                (Some(left), Some(right))
+                    if !left.exactly_equals_checked_observed(right, &mut observe)? =>
+                {
+                    return Ok(false);
+                }
+                (None, None) | (Some(_), Some(_)) => {}
+                _ => return Ok(false),
+            }
+            match (left.storage_type(), right.storage_type()) {
                 (Some(left), Some(right))
                     if !left.exactly_equals_checked_observed(right, &mut observe)? =>
                 {
@@ -560,10 +673,16 @@ impl<F> ConnectorWriteInput<F> {
                     if let Some(value) = binding.execution_type() {
                         copied.execution_type = Some(value.clone_observed(|| context.step())?);
                     }
+                    if let Some(value) = binding.storage_type() {
+                        copied.storage_type = Some(value.clone_observed(|| context.step())?);
+                    }
                     output.push(copied);
                 } else {
                     let _ = context.finish_field()?;
                     if binding.execution_type().is_some() {
+                        context.work(2)?;
+                    }
+                    if binding.storage_type().is_some() {
                         context.work(2)?;
                     }
                 }
@@ -664,7 +783,30 @@ impl<F> ConnectorWriteInput<F> {
         let reserved = names.try_reserve(count);
         context.reserve_exit(reserved)?;
         let mut longest_name = 0;
-        for binding in self.field_refs() {
+        let data_width = match self {
+            Self::Data { fields } => fields.len(),
+            Self::RowLineage { data_fields, .. } => data_fields.len(),
+            Self::EqualityDelete { .. }
+            | Self::PositionDelete { .. }
+            | Self::DeletionVector { .. } => 0,
+        };
+        for (ordinal, binding) in self.field_refs().enumerate() {
+            if let Some(storage) = binding.storage_type() {
+                if ordinal >= data_width {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "writer storage projection is only admitted for data fields",
+                    )
+                    .into());
+                }
+                let input = binding.execution_type().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "writer storage projection lost its complete input declaration",
+                    )
+                })?;
+                validate_write_input_projection_observed(input, Some(storage), || context.step())?;
+            }
             // Token Hash is the derived transparent [u8;32] body. Each table
             // had one fresh reserve, so its admitted bucket bound stays valid.
             if context.source_invoice().is_some() {

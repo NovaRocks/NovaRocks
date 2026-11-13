@@ -143,12 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn original_scope_and_cow_boundary_keep_the_original_fact_and_cause() {
+    fn original_scope_and_scoped_boundary_keep_the_original_fact_and_cause() {
         let fact = StopCause.failure_fact();
         let check = OriginalResultCheckError::new(OriginalResultCheckClass::Coverage, StopCause);
         // The check label is a diagnostic location, not a failure classifier.
         assert_eq!(check.failure_fact(), fact);
-        let cause = super::super::ConnectorCowBeginCause::OriginalResult(check);
+        let cause = super::super::ConnectorScopedBeginCause::OriginalResult(check);
         let error = super::super::ConnectorError::from_domain(
             super::super::ConnectorErrorKind::ResourceExhausted,
             cause,
@@ -160,7 +160,7 @@ mod tests {
             .downcast_ref::<SharedFailureCause>()
             .unwrap();
         let original = shared
-            .downcast_ref::<super::super::ConnectorCowBeginCause>()
+            .downcast_ref::<super::super::ConnectorScopedBeginCause>()
             .unwrap();
         assert!(
             original

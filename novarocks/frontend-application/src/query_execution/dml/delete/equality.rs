@@ -362,7 +362,7 @@ fn equality_delete_input_fields(
 /// The column set comes from `ConnectorTableMetadata` rather than the provider's
 /// Iceberg schema, the same substitution `insert_columns_from_connector_metadata`
 /// makes for INSERT: `schema` is the full physical Arrow schema with hidden
-/// columns marked rather than removed, and `write_target_type` is the
+/// columns marked rather than removed, and `write_input` is the
 /// provider-signed DML write type for the columns whose write encoding differs
 /// from their read encoding (ADR-0055 decision 5).
 fn resolve_equality_delete_key_columns(
@@ -393,7 +393,6 @@ fn resolve_equality_delete_key_columns(
         }
     }
 
-    let column_facts = table_metadata.planning_facts.column_facts();
     let mut delete_columns = Vec::with_capacity(column_names.len());
     for column_name in column_names {
         let (ordinal, field) = table_metadata
@@ -403,16 +402,10 @@ fn resolve_equality_delete_key_columns(
             .enumerate()
             .find(|(_, field)| field.name().eq_ignore_ascii_case(column_name))
             .ok_or_else(|| format!("column `{column_name}` not found in iceberg table schema"))?;
-        let data_type = column_facts
-            .get(ordinal)
-            .and_then(|fact| fact.write_target_type())
-            .cloned()
-            .unwrap_or_else(|| field.data_type().clone());
-        delete_columns.push(Field::new(
-            field.name().clone(),
-            data_type,
-            field.is_nullable(),
-        ));
+        // Equality keys retain their original read/storage declaration. The
+        // data writer's canonical Fixed licence never authorizes a delete key.
+        let _ = ordinal;
+        delete_columns.push(field.as_ref().clone());
     }
 
     Ok(delete_columns)
@@ -821,14 +814,14 @@ mod tests {
 
     /// A neutral `ConnectorTableMetadata` shaped the way the Iceberg provider
     /// reports one: the full physical Arrow schema plus per-column planning
-    /// facts, where `write_target_type` carries the provider-signed DML write
+    /// facts, where `write_input` carries the provider-signed DML write
     /// type for the columns whose write encoding differs from the read one.
     fn loaded_table(
         fields: Vec<(Field, Option<DataType>)>,
         declarations: Vec<novarocks_types::schema::SqlType>,
     ) -> ConnectorTableMetadata {
         assert_eq!(fields.len(), declarations.len());
-        let bindings = fields
+        let bindings: Vec<novarocks_type_contract::FunctionValueType> = fields
             .iter()
             .zip(&declarations)
             .map(|((field, _), declaration)| {
@@ -854,14 +847,20 @@ mod tests {
         let column_facts = fields
             .iter()
             .enumerate()
-            .map(|(ordinal, (_, write_target_type))| {
+            .map(|(ordinal, (field, write_target_type))| {
                 ConnectorTableColumnPlanningFact::new(
                     u32::try_from(ordinal).expect("ordinal"),
                     ConnectorTableColumnVisibility::Sql,
                     ConnectorTableColumnSemanticKind::None,
                     ConnectorTableColumnRole::Ordinary,
                 )
-                .with_write_target_type(write_target_type.clone())
+                .with_write_input(write_target_type.as_ref().map(|target| {
+                    novarocks_spi::connector::ConnectorWriteFieldRequest::try_new_typed(
+                        field.clone().with_data_type(target.clone()),
+                        bindings[ordinal].clone(),
+                    )
+                    .unwrap()
+                }))
             })
             .collect();
         let planning_facts = ConnectorTablePlanningFacts::try_new(

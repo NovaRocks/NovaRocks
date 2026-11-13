@@ -17,10 +17,10 @@
 
 //! Scoped rewrite preparation retaining the caller's original operation.
 
-use super::cow_begin_own as own;
+use super::rewrite_source as own;
 use super::*;
 use crate::metadata::existing_serde_projection::{self as projection, OriginalScope};
-pub(crate) use novarocks_spi::connector::ConnectorCowBeginCause as Cause;
+pub(crate) use novarocks_spi::connector::ConnectorScopedBeginCause as Cause;
 use novarocks_spi::connector::{
     ConnectorOriginalResultScope, ConnectorPayloadRetentionGuard, OriginalResultCheckError,
 };
@@ -28,7 +28,7 @@ use novarocks_spi::connector::{
 pub(crate) fn overflow() -> Cause {
     ConnectorError::new(
         ConnectorErrorKind::ResourceExhausted,
-        "COW construction arithmetic overflowed",
+        "rewrite construction arithmetic overflowed",
     )
     .into()
 }
@@ -37,13 +37,13 @@ pub(crate) fn projection_error(e: projection::Error<OriginalResultCheckError>) -
         projection::Error::Control(e) => e.into(),
         projection::Error::Json => ConnectorError::new(
             ConnectorErrorKind::CorruptData,
-            "Iceberg COW canonical projection failed",
+            "Iceberg rewrite canonical projection failed",
         )
         .into(),
         projection::Error::Overflow => overflow(),
         projection::Error::ShapeChanged => ConnectorError::new(
             ConnectorErrorKind::Internal,
-            "Iceberg COW canonical projection changed during serialization",
+            "Iceberg rewrite canonical projection changed during serialization",
         )
         .into(),
     }
@@ -56,16 +56,16 @@ pub(super) fn own_error(e: own::Failure<OriginalResultCheckError>) -> Cause {
         own::Failure::Overflow => overflow(),
         own::Failure::ShapeChanged => ConnectorError::new(
             ConnectorErrorKind::Internal,
-            "Iceberg COW constructor changed its exact output shape",
+            "Iceberg rewrite constructor changed its exact output shape",
         )
         .into(),
     }
 }
 /// Borrows the original operation's cancellation, deadline and retention.
-pub(crate) struct CowBeginScope<'a> {
+pub(crate) struct RewriteBeginScope<'a> {
     original: &'a ConnectorOriginalResultScope,
 }
-impl<'a> CowBeginScope<'a> {
+impl<'a> RewriteBeginScope<'a> {
     pub(crate) fn new(original: &'a ConnectorOriginalResultScope) -> Result<Self, Cause> {
         original.check_active()?;
         Ok(Self { original })
@@ -74,7 +74,7 @@ impl<'a> CowBeginScope<'a> {
         self.original
     }
 }
-impl OriginalScope<OriginalResultCheckError> for CowBeginScope<'_> {
+impl OriginalScope<OriginalResultCheckError> for RewriteBeginScope<'_> {
     fn check_active(&self) -> Result<(), OriginalResultCheckError> {
         self.original.check_active()
     }

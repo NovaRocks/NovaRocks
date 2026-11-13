@@ -1,8 +1,7 @@
 -- query 2
--- types	varchar	bigint	bigint	bigint
-mode	total_rows	unique_row_ids	null_row_ids
-copy-on-write	7	7	0
-merge-on-read	7	7	0
+-- types	bigint	bigint	bigint
+total_rows	unique_row_ids	null_row_ids
+7	7	0
 
 -- query 3
 -- types	bigint	bigint
@@ -10,22 +9,6 @@ source_rows	preserved_row_ids
 3	3
 
 -- query 4
--- types	bigint	bigint
-source_rows	preserved_row_ids
-3	3
-
--- query 5
--- types	bigint	varchar
-id	v
-1	a
-2	bb
-3	c
-4	d
-5	e
-6	f
-7	g
-
--- query 6
 -- types	bigint	varchar
 id	v
 1	a

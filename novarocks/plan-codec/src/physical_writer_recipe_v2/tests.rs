@@ -188,6 +188,16 @@ fn with_encoded<T>(
     control: &dyn PureCompileControl,
     run: impl FnOnce(WriterRecipeEncodeContext<'_, '_, '_>) -> T,
 ) -> T {
+    with_encoded_storage_roots(recipes, ids, control, None, false, run)
+}
+fn with_encoded_storage_roots<T>(
+    recipes: &[c::ConnectorWriteRecipeDraft],
+    ids: &[Vec<u32>],
+    control: &dyn PureCompileControl,
+    foreign_storage: Option<&novarocks_type_contract::FunctionValueType>,
+    duplicate_storage: bool,
+    run: impl FnOnce(WriterRecipeEncodeContext<'_, '_, '_>) -> T,
+) -> T {
     let providers = recipes
         .iter()
         .enumerate()
@@ -213,6 +223,15 @@ fn with_encoded<T>(
                             .execution_type()
                             .expect("complete independent fixture declaration"),
                     ));
+                    if let Some(storage) = binding.storage_type() {
+                        values.push((
+                            u32::try_from(values.len()).unwrap(),
+                            foreign_storage.unwrap_or(storage),
+                        ));
+                        if duplicate_storage {
+                            values.push((u32::try_from(values.len()).unwrap(), storage));
+                        }
+                    }
                     id
                 })
                 .collect::<Vec<_>>()
@@ -424,6 +443,7 @@ fn decode_run(
 }
 fn fb(token: u8, id: u32) -> wire::ConnectorWriteFieldBinding {
     wire::ConnectorWriteFieldBinding {
+        storage_value_type_id: None,
         field_token: vec![token; 32],
         source_field_id: Some(id),
         value_type_id: Some(u32::from(token)),
@@ -1132,4 +1152,266 @@ fn production_writer_policy_round_trips_wide_and_cumulative_field_tokens() {
             Err(E::Control(CompileControlError::ResourceExhausted))
         ));
     }
+}
+
+fn fixed_storage_field(token: u8, nested: bool) -> c::ConnectorWriteFieldBinding {
+    let (input, storage) = if nested {
+        (
+            DataType::Struct(vec![Field::new("leaf", DataType::Binary, false)].into()),
+            DataType::Struct(vec![Field::new("leaf", DataType::FixedSizeBinary(4), false)].into()),
+        )
+    } else {
+        (DataType::Binary, DataType::FixedSizeBinary(4))
+    };
+    c::ConnectorWriteFieldBinding::try_new_typed(
+        c::ConnectorWriteFieldToken::from_bytes([token; 32]),
+        Field::new("raw", input.clone(), false).with_metadata(std::collections::HashMap::from([(
+            "source-only".to_string(),
+            "untrusted-nominal-tag".to_string(),
+        )])),
+        novarocks_type_contract::FunctionValueType::new(input, false),
+    )
+    .unwrap()
+    .with_storage_type(novarocks_type_contract::FunctionValueType::new(
+        storage, false,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn complete_storage_targets_roundtrip_independently_from_input_and_metadata() {
+    for nested in [false, true] {
+        let recipes = [draft(c::ConnectorWriteInputShape::Data {
+            fields: vec![fixed_storage_field(31, nested)],
+        })];
+        let ids = [vec![7]];
+        let raw = raw(&recipes, &ids);
+        let input = raw.package.writes[0].input.as_ref().unwrap();
+        let wire::connector_write_input_shape::Kind::Data(data) = input.kind.as_ref().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_ne!(
+            data.fields[0].storage_value_type_id,
+            data.fields[0].value_type_id
+        );
+        assert!(data.fields[0].storage_value_type_id.is_some());
+        let (decoded, _) = decode_run(&raw, None, limits(), false);
+        let (decoded, _) = decoded.unwrap();
+        let actual = decoded[0].1.input().fields_iter().next().unwrap();
+        let expected = recipes[0].input().fields_iter().next().unwrap();
+        assert_eq!(actual.execution_type(), expected.execution_type());
+        assert_eq!(actual.storage_type(), expected.storage_type());
+        assert_eq!(
+            actual.field().metadata()["source-only"],
+            "untrusted-nominal-tag"
+        );
+        assert_ne!(actual.execution_type(), actual.storage_type());
+    }
+}
+
+#[test]
+fn storage_target_requires_its_original_source_author_even_for_an_equal_type() {
+    let recipes = [draft(c::ConnectorWriteInputShape::Data {
+        fields: vec![fixed_storage_field(32, false)],
+    })];
+    let ids = [vec![7]];
+    let foreign = recipes[0]
+        .input()
+        .fields_iter()
+        .next()
+        .unwrap()
+        .storage_type()
+        .unwrap()
+        .clone();
+    with_encoded_storage_roots(
+        &recipes,
+        &ids,
+        &Control::default(),
+        Some(&foreign),
+        false,
+        |context| {
+            let sources = [WriterRecipeSource {
+                node: NodeId::new(1),
+                recipe: &recipes[0],
+                field_ids: &ids[0],
+            }];
+            let mut work = CompileCheckpoints::try_new(
+                context.bindings.original_control(),
+                CompilePhase::Encode,
+            )
+            .unwrap();
+            let error = encode_writer_recipes_observed(
+                &sources,
+                context,
+                SOURCE,
+                limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                E::InvalidShape("writer storage value ID has no original execution author")
+            ));
+        },
+    );
+}
+
+#[test]
+fn unknown_storage_target_reference_is_rejected_in_original_preflight() {
+    let recipes = [draft(c::ConnectorWriteInputShape::Data {
+        fields: vec![fixed_storage_field(33, false)],
+    })];
+    let mut raw = raw(&recipes, &[vec![7]]);
+    first_field(&mut raw).storage_value_type_id = Some(u32::MAX);
+    let (result, _) = decode_run(&raw, None, limits(), false);
+    assert!(matches!(
+        result,
+        Err(E::InvalidShape(
+            "writer storage value binding ID is absent from execution namespace"
+        ))
+    ));
+}
+
+#[test]
+fn explicit_storage_declaration_is_not_lost_on_non_data_roles() {
+    let recipes = five();
+    let mut raw = raw(&recipes, &five_ids());
+    let input = raw.package.writes[4].input.as_mut().unwrap();
+    let wire::connector_write_input_shape::Kind::EqualityDelete(input) =
+        input.kind.as_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    input.equality_fields[0].storage_value_type_id = Some(0);
+    let (decoded, _) = decode_run(&raw, None, limits(), false);
+    assert!(
+        matches!(decoded, Err(E::Provider(ref error)) if error.message().contains("only admitted for data fields"))
+    );
+}
+
+#[test]
+fn shared_original_storage_loan_can_have_multiple_stable_root_ids() {
+    let recipes = [draft(c::ConnectorWriteInputShape::Data {
+        fields: vec![fixed_storage_field(34, false)],
+    })];
+    let ids = [vec![7]];
+    let control = Control::default();
+    with_encoded_storage_roots(&recipes, &ids, &control, None, true, |context| {
+        let storage = recipes[0]
+            .input()
+            .fields_iter()
+            .next()
+            .unwrap()
+            .storage_type()
+            .unwrap();
+        let mut work =
+            CompileCheckpoints::try_new(context.bindings.original_control(), CompilePhase::Encode)
+                .unwrap();
+        let mut aliases = Vec::new();
+        context
+            .types
+            .visit_value_type_sources(
+                &mut |id, value, _| -> Result<(), E> {
+                    if std::ptr::eq(storage, value) {
+                        aliases.push(id);
+                    }
+                    Ok(())
+                },
+                &mut work,
+            )
+            .unwrap();
+        assert_eq!(
+            aliases.len(),
+            2,
+            "both roots retain the same real immutable FVT loan"
+        );
+        let sources = [WriterRecipeSource {
+            node: NodeId::new(1),
+            recipe: &recipes[0],
+            field_ids: &ids[0],
+        }];
+        for _ in 0..2 {
+            let (encoded, _) = encode_writer_recipes_observed(
+                &sources,
+                WriterRecipeEncodeContext {
+                    bindings: context.bindings,
+                    payloads: context.payloads,
+                    types: context.types,
+                },
+                SOURCE,
+                limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            )
+            .unwrap();
+            let wire::connector_write_input_shape::Kind::Data(data) =
+                encoded[0].input.as_ref().unwrap().kind.as_ref().unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(data.fields[0].storage_value_type_id, Some(aliases[0]));
+            let raw = Raw {
+                type_roots: encoded.clone(),
+                providers: context.bindings.as_wire().to_vec(),
+                payloads: context.payloads.as_wire().to_vec(),
+                package: wire::FragmentPackage {
+                    types: Some(context.types.as_wire().clone()),
+                    source_fields: context.types.as_source_wire().cloned(),
+                    writes: encoded,
+                    ..Default::default()
+                },
+            };
+            let (decoded, _) = decode_run(&raw, None, limits(), false);
+            let (decoded, _) = decoded.unwrap();
+            assert_eq!(
+                decoded[0]
+                    .1
+                    .input()
+                    .fields_iter()
+                    .next()
+                    .unwrap()
+                    .storage_type(),
+                Some(storage)
+            );
+        }
+    });
+}
+
+#[test]
+fn explicit_storage_root_retains_nominal_identity_without_reading_field_tags() {
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    let nominal = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let field = c::ConnectorWriteFieldBinding::try_new_typed(
+        c::ConnectorWriteFieldToken::from_bytes([35; 32]),
+        Field::new("nominal", DataType::FixedSizeBinary(16), false).with_metadata(HashMap::from([
+            ("novarocks.logical_type".into(), "uuid".into()),
+        ])),
+        nominal.clone(),
+    )
+    .unwrap()
+    .with_storage_type(nominal)
+    .unwrap();
+    let recipes = [draft(c::ConnectorWriteInputShape::Data {
+        fields: vec![field],
+    })];
+    let raw = raw(&recipes, &[vec![7]]);
+    let (decoded, _) = decode_run(&raw, None, limits(), false);
+    let (decoded, _) = decoded.unwrap();
+    let actual = decoded[0].1.input().fields_iter().next().unwrap();
+    assert_eq!(
+        actual.execution_type().unwrap().logical_type(),
+        ValueLogicalType::LargeInt
+    );
+    assert_eq!(
+        actual.storage_type().unwrap().logical_type(),
+        ValueLogicalType::LargeInt
+    );
+    assert_eq!(actual.field().metadata()["novarocks.logical_type"], "uuid");
 }

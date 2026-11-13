@@ -34,7 +34,7 @@
 //!   both complete endpoint closures and owns every newly invisible row once.
 //!
 //! Replaying manifest entries instead would double count every row a
-//! copy-on-write rewrite touched, because the same logical row leaves one file
+//! file rewrite touched, because the same logical row leaves one file
 //! and enters another inside a single window. Anything this module cannot
 //! prove -- endpoint visibility, or the disjointness above -- fails closed:
 //! either as corrupt data, or as the same typed full-rebuild signal

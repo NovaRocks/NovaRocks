@@ -72,6 +72,7 @@ fn field(id: u32, carrier: u32) -> wire::FieldDefinition {
 }
 fn binding(id: u32) -> raw::ConnectorWriteFieldBinding {
     raw::ConnectorWriteFieldBinding {
+        storage_value_type_id: None,
         source_field_id: Some(id),
         field_token: vec![],
         value_type_id: None,

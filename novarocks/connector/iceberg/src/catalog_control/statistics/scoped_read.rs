@@ -17,7 +17,7 @@
 
 //! The original SQL statistics read, outside its borrowed I/O and CPU waiters.
 use super::*;
-use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
+use crate::read_snapshot::scoped_capture::{CaptureScope, ReadFailure};
 use novarocks_spi::connector::{
     ConnectorMetadata, ConnectorOriginalResultScope, ConnectorTableMetadata, ConnectorTableRequest,
     OriginalResultCheckClass, StatisticsMetricRequest, StatisticsReadOriginal,
@@ -61,10 +61,10 @@ impl novarocks_failure_contract::FailureProjection for ReadQuotaFailure {
     }
 }
 pub(super) fn checked_read(error: ReadFailure) -> ConnectorError {
-    use novarocks_spi::connector::ConnectorCowBeginCause;
+    use novarocks_spi::connector::ConnectorScopedBeginCause;
     match error.into_cause() {
-        ConnectorCowBeginCause::Provider(error) => error,
-        ConnectorCowBeginCause::OriginalResult(error) => {
+        ConnectorScopedBeginCause::Provider(error) => error,
+        ConnectorScopedBeginCause::OriginalResult(error) => {
             let kind = match error.class() {
                 OriginalResultCheckClass::Control => ConnectorErrorKind::Interrupted,
                 OriginalResultCheckClass::Admission | OriginalResultCheckClass::Coverage => {

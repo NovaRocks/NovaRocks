@@ -64,7 +64,8 @@ use crate::metadata_batch_reader::{
 };
 use crate::metadata_context::IcebergMetadataContext;
 use crate::planning_facts::{
-    IcebergTablePlanningFactsInput, snapshot_source_planning_facts, table_planning_facts,
+    IcebergTablePlanningFactsInput, snapshot_source_planning_facts,
+    table_planning_facts_with_write_inputs,
 };
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -1516,7 +1517,14 @@ pub(crate) fn build_table_metadata(
         if snapshot_source {
             snapshot_source_planning_facts(input)?
         } else {
-            table_planning_facts(input)?
+            let declarations =
+                crate::commit::write_shared::canonical_data_write_fields_from_declaration(
+                    &nominal_document,
+                    metadata.current_schema(),
+                    &execution_schema,
+                    creation,
+                )?;
+            table_planning_facts_with_write_inputs(input, &declarations)?
         }
     };
     let definition_facts = if payload.metadata_table_type.is_some() {
@@ -3437,9 +3445,10 @@ mod plan_splits_pruning_tests {
         }
         assert_eq!(to.planning_facts.partition_source_column_ordinals(), None);
         assert!(
-            to.planning_facts.column_facts().iter().all(|fact| {
-                fact.write_default().is_none() && fact.write_target_type().is_none()
-            })
+            to.planning_facts
+                .column_facts()
+                .iter()
+                .all(|fact| { fact.write_default().is_none() && fact.write_input().is_none() })
         );
         assert_eq!(
             current.planning_facts.partition_source_column_ordinals(),

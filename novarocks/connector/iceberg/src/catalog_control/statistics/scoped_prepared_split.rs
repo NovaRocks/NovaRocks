@@ -120,7 +120,7 @@ impl Work {
     fn run_phase(&mut self) -> Result<(), ConnectorError> {
         self.original.check_active().map_err(|error| {
             super::scoped_read::checked_read(
-                crate::read_snapshot::cow_capture::ReadFailure::Original(error.into()),
+                crate::read_snapshot::scoped_capture::ReadFailure::Original(error.into()),
             )
         })?;
         self.context.check_active()?;
@@ -237,9 +237,9 @@ pub(crate) fn validate_prepared_split_request(
     let context = boundary.prepared_source_request_context()?;
     context.check_active()?;
     preparation.original().check_active().map_err(|error| {
-        super::scoped_read::checked_read(crate::read_snapshot::cow_capture::ReadFailure::Original(
-            error.into(),
-        ))
+        super::scoped_read::checked_read(
+            crate::read_snapshot::scoped_capture::ReadFailure::Original(error.into()),
+        )
     })?;
     Ok(context)
 }

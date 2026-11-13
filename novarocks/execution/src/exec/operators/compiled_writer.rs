@@ -257,6 +257,7 @@ pub(crate) struct CompiledWriterProjection {
 struct WriterProjectionValueTypes {
     source: novarocks_type_contract::FunctionValueType,
     requirement: novarocks_type_contract::FunctionValueType,
+    storage: Option<novarocks_type_contract::FunctionValueType>,
 }
 
 impl CompiledWriterProjection {
@@ -346,9 +347,18 @@ impl CompiledWriterProjection {
             let requirement = required.execution_type().ok_or_else(|| {
                 failure::contract("writer input lost its original target requirement")
             })?;
+            let storage = projection.storage_types.get(ordinal).ok_or_else(|| {
+                failure::contract("writer projection lost its storage declaration occurrence")
+            })?;
+            if storage.as_ref() != required.storage_type() {
+                return Err(failure::contract(
+                    "writer projection storage declaration differs from its original Provider recipe",
+                ));
+            }
             value_types.push(WriterProjectionValueTypes {
                 source: source.clone(),
                 requirement: requirement.clone(),
+                storage: required.storage_type().cloned(),
             });
             sites.push(site);
         }
@@ -443,6 +453,7 @@ pub(crate) fn source_loan_test_projector(
         value_types: Arc::from([WriterProjectionValueTypes {
             source: value_type.clone(),
             requirement: value_type,
+            storage: None,
         }]),
         schema,
         layout,
@@ -517,7 +528,11 @@ impl WriterPageProjection for CompiledWriterProjector {
                 crate::exec::node::table_writer::TargetValueDeclaration {
                     column: ordinal,
                     name: self.schema.field(ordinal).name(),
-                    requirement: value_types.requirement.typed_binding().borrowed(),
+                    requirement: value_types.requirement.typed_binding(),
+                    storage: value_types
+                        .storage
+                        .as_ref()
+                        .map(|ty| ty.typed_binding().borrowed()),
                     output,
                     input_rows: None,
                 },

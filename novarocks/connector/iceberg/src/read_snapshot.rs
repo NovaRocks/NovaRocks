@@ -51,8 +51,8 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
 const MAX_STATS_FIELD_COMPARISONS: usize = 1024;
 use sha2::{Digest, Sha256};
-pub(crate) mod cow_capture;
-use cow_capture::{CaptureScope, ReadFailure, active as check_cow_active};
+pub(crate) mod scoped_capture;
+use scoped_capture::{CaptureScope, ReadFailure, active as check_scoped_active};
 
 /// Mint exactly once at the provider's pinned handle boundary. Standalone
 /// snapshot callers intentionally create an independent observation.
@@ -210,13 +210,13 @@ pub(crate) async fn build_read_snapshot_in_domain(
     })
 }
 
-/// COW needs the same validated read facts, but not the scan metadata graph.
+/// scoped needs the same validated read facts, but not the scan metadata graph.
 #[cfg(test)]
-pub(crate) async fn build_cow_read_files_at_with_control(
+pub(crate) async fn build_scoped_read_files_at_with_control(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<Vec<CowReadFile>, String> {
+) -> Result<Vec<ScopedReadFile>, String> {
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -225,7 +225,7 @@ pub(crate) async fn build_cow_read_files_at_with_control(
         .schema(metadata)
         .map_err(|e| format!("resolve snapshot schema: {e}"))?;
     let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
-    observe_read_files::<CowDataFileProjection>(table, domain, control, None)
+    observe_read_files::<ScopedDataFileProjection>(table, domain, control, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -290,7 +290,7 @@ pub(crate) async fn make_scoped_read_snapshot(
             .await?
         }
         SnapshotReadKind::Statistics => {
-            observe_read_files_original::<FrozenCowDataFileProjection>(
+            observe_read_files_original::<FrozenScopedDataFileProjection>(
                 &table,
                 domain,
                 Some(&context),
@@ -302,7 +302,7 @@ pub(crate) async fn make_scoped_read_snapshot(
             .await?
         }
         SnapshotReadKind::Rewrite => {
-            observe_read_files_original::<FrozenCowDataFileProjection>(
+            observe_read_files_original::<FrozenScopedDataFileProjection>(
                 &table,
                 domain,
                 Some(&context),
@@ -325,7 +325,7 @@ pub(crate) async fn make_scoped_read_snapshot(
 }
 
 /// One common observation retains the original entry, delete and lineage checks.
-/// Only the data-file storage projection differs between scan and COW callers.
+/// Only the data-file storage projection differs between scan and scoped callers.
 async fn observe_read_files<P: ObservedDataFileProjection>(
     table: &Table,
     domain: Arc<ReadDomain>,
@@ -373,7 +373,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     mut referenced_specs: Option<&mut crate::catalog_control::statistics::scoped_cpu::scoped_snapshot::ReferencedSpecInventory>,
 ) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
-    check_cow_active(capture)?;
+    check_scoped_active(capture)?;
     let metadata = table.metadata();
 
     if domain.endpoint().table_uuid() != metadata.uuid()
@@ -422,7 +422,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         inventory
             .reserve_slots(gate, manifest_list.entries().len(), || {
                 check_read_control(control)?;
-                check_cow_active(capture)
+                check_scoped_active(capture)
             })
             .await?;
     }
@@ -431,7 +431,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     let mut observed_data = Vec::new();
     for manifest_file in manifest_list.entries() {
         check_read_control(control)?;
-        check_cow_active(capture)?;
+        check_scoped_active(capture)?;
 
         let key = ManifestReferenceKey(manifest_file);
         if let Some(previous) = seen_manifests.get(&key) {
@@ -471,7 +471,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
                 })?,
         };
         check_read_control(control)?;
-        check_cow_active(capture)?;
+        check_scoped_active(capture)?;
         let spec = metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
             .ok_or_else(|| {
@@ -502,7 +502,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
 
         for entry in source.bind(&manifest).map_err(|error| error.to_string())? {
             check_read_control(control)?;
-            check_cow_active(capture)?;
+            check_scoped_active(capture)?;
             let entry = entry.map_err(|error| error.to_string())?;
             // Historical tombstones are excluded from the live read observation.
             if entry.raw.status == ManifestStatus::Deleted {
@@ -574,7 +574,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     }
 
     let observation = DeleteObservation::from_source_entries_checked(delete_manifests, || {
-        check_cow_active(capture)
+        check_scoped_active(capture)
     })
     .map_err(|e| match e {
         crate::delete_semantics::ConstructionFailure::Semantic(e) => {
@@ -592,7 +592,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
         receiving.extend(observation.facts().iter().cloned());
     }
     let index =
-        DeleteCandidateIndex::try_new_checked(domain, observation, || check_cow_active(capture))
+        DeleteCandidateIndex::try_new_checked(domain, observation, || check_scoped_active(capture))
             .map_err(|e| match e {
                 crate::delete_semantics::ConstructionFailure::Semantic(e) => {
                     ReadFailure::Semantic(e.to_string())
@@ -603,7 +603,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     let mut files = Vec::with_capacity(observed_data.len());
     for (df, data, partition_values, manifest_path, first_row_id) in observed_data {
         check_read_control(control)?;
-        check_cow_active(capture)?;
+        check_scoped_active(capture)?;
 
         let logical = index.for_data(&data).map_err(|error| {
             if error.kind == crate::delete_semantics::DeleteSemanticsErrorKind::InvalidPartition {
@@ -630,7 +630,7 @@ async fn observe_read_files_original<P: ObservedDataFileProjection>(
     if let Some(inventory) = referenced_specs {
         inventory.finish(|| {
             check_read_control(control)?;
-            check_cow_active(capture)
+            check_scoped_active(capture)
         })?;
     }
     Ok(files)
@@ -722,9 +722,9 @@ impl ObservedDataFileProjection for DataFile {
     }
 }
 
-/// Only fields consumed by the COW manifest projection are copied while the
+/// Only fields consumed by the scoped manifest projection are copied while the
 /// original SDK DataFile is borrowed. No DataFile or scan metadata is retained.
-struct CowDataFileProjection {
+struct ScopedDataFileProjection {
     path: String,
     file_size_in_bytes: u64,
     record_count: u64,
@@ -732,7 +732,7 @@ struct CowDataFileProjection {
 }
 
 #[derive(Debug)]
-pub(crate) struct CowReadFile {
+pub(crate) struct ScopedReadFile {
     pub path: String,
     pub size: i64,
     pub record_count: Option<i64>,
@@ -746,8 +746,8 @@ pub(crate) struct CowReadFile {
     pub deletes: LoadView,
 }
 
-impl ObservedDataFileProjection for CowDataFileProjection {
-    type File = CowReadFile;
+impl ObservedDataFileProjection for ScopedDataFileProjection {
+    type File = ScopedReadFile;
 
     fn capture(
         df: &DataFile,
@@ -760,7 +760,7 @@ impl ObservedDataFileProjection for CowDataFileProjection {
             record_count: df.record_count(),
             column_stats: column_stats_checked(df, field_id_to_name, capture)?,
         };
-        check_cow_active(capture)?;
+        check_scoped_active(capture)?;
         Ok(output)
     }
 
@@ -774,7 +774,7 @@ impl ObservedDataFileProjection for CowDataFileProjection {
             .map_err(|_| format!("file size too large: {}", self.path))?;
         let record_count =
             i64::try_from(self.record_count).map_err(|_| "record count too large")?;
-        Ok(CowReadFile {
+        Ok(ScopedReadFile {
             path: self.path,
             size,
             record_count: Some(record_count),
@@ -793,18 +793,18 @@ impl ObservedDataFileProjection for CowDataFileProjection {
 /// Keep the exact typed manifest remainder required by frozen read authority.
 /// Only public immutable fields of the original SDK entry are copied, and every
 /// source retains its original owner; no complete SDK DataFile is cloned.
-struct FrozenCowDataFileProjection {
-    stats: CowDataFileProjection,
+struct FrozenScopedDataFileProjection {
+    stats: ScopedDataFileProjection,
     manifest: Arc<IcebergDataFileMetadata>,
 }
-impl ObservedDataFileProjection for FrozenCowDataFileProjection {
+impl ObservedDataFileProjection for FrozenScopedDataFileProjection {
     type File = IcebergReadFile;
     fn capture(
         df: &DataFile,
         names: &HashMap<i32, String>,
         capture: Option<&CaptureScope<'_>>,
     ) -> Result<Self, ReadFailure> {
-        let stats = CowDataFileProjection::capture(df, names, capture)?;
+        let stats = ScopedDataFileProjection::capture(df, names, capture)?;
 
         // Rebuild insert-only maps from the exact original pairs. This gives a
         // exact owned copy from their known lengths even if the SDK input
@@ -812,14 +812,14 @@ impl ObservedDataFileProjection for FrozenCowDataFileProjection {
         let counts = |map: &HashMap<i32, u64>| -> Result<HashMap<i32, u64>, ReadFailure> {
             let mut output = HashMap::with_capacity(map.len());
             for (&id, &value) in map {
-                check_cow_active(capture)?;
+                check_scoped_active(capture)?;
                 output.insert(id, value);
             }
             Ok(output)
         };
         let bounds = |map: &HashMap<i32,crate::iceberg::spec::Datum>| -> Result<HashMap<i32,crate::iceberg::spec::Datum>,ReadFailure> {
             let mut output = HashMap::with_capacity(map.len());
-            for (&id,value) in map { check_cow_active(capture)?; output.insert(id,value.clone()); }
+            for (&id,value) in map { check_scoped_active(capture)?; output.insert(id,value.clone()); }
             Ok(output)
         };
         let manifest = Arc::new(IcebergDataFileMetadata {
@@ -832,7 +832,7 @@ impl ObservedDataFileProjection for FrozenCowDataFileProjection {
             lower_bounds: bounds(df.lower_bounds())?,
             upper_bounds: bounds(df.upper_bounds())?,
         });
-        check_cow_active(capture)?;
+        check_scoped_active(capture)?;
         Ok(Self { stats, manifest })
     }
     fn into_file(
@@ -951,7 +951,7 @@ fn manifest_metrics_checked(
     schema: &Schema,
     capture: Option<&CaptureScope<'_>>,
 ) -> Result<FileMetrics, ReadFailure> {
-    manifest_metrics_for_metadata(df, schema, || check_cow_active(capture))
+    manifest_metrics_for_metadata(df, schema, || check_scoped_active(capture))
 }
 
 /// The same manifest metric binding under the caller's original control owner.
@@ -1045,13 +1045,13 @@ fn column_stats_checked(
             .chain(lower.keys())
             .chain(upper.keys())
         {
-            check_cow_active(capture)?;
+            check_scoped_active(capture)?;
             all_ids.insert(*id);
         }
 
         let mut stats_map = HashMap::new();
         for &field_id in &all_ids {
-            check_cow_active(capture)?;
+            check_scoped_active(capture)?;
             if let Some(column_name) = field_id_to_name.get(&field_id) {
                 let lower_bound = lower
                     .get(&field_id)
@@ -1126,7 +1126,8 @@ mod tests {
     fn read_control_keeps_original_typed_fact_instead_of_semantic_text() {
         use novarocks_failure_contract::{FailureFact, FailureProjection, SharedFailureCause};
         use novarocks_spi::connector::{
-            ConnectorCowBeginCause, ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+            ConnectorError, ConnectorErrorKind, ConnectorOperationControl,
+            ConnectorScopedBeginCause,
         };
         use novarocks_type_contract::CompileControlError;
         #[derive(Debug)]
@@ -1160,7 +1161,7 @@ mod tests {
             let original = ConnectorError::compile_interruption(control);
             let checker = Refused(original.clone());
             let failure = check_read_control(Some(&checker)).unwrap_err();
-            let ConnectorCowBeginCause::Provider(actual) = failure.into_cause() else {
+            let ConnectorScopedBeginCause::Provider(actual) = failure.into_cause() else {
                 panic!("the original connector error must survive the read boundary");
             };
             assert_eq!(actual.failure_fact(), original.failure_fact());
@@ -2024,7 +2025,7 @@ mod tests {
         }
     }
     fn assert_descriptor_conflict(error: ReadFailure) {
-        let ReadFailure::Original(novarocks_spi::connector::ConnectorCowBeginCause::Provider(
+        let ReadFailure::Original(novarocks_spi::connector::ConnectorScopedBeginCause::Provider(
             error,
         )) = error
         else {
@@ -2045,9 +2046,9 @@ mod tests {
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].first_row_id, Some(0));
         assert_eq!(snapshot.files[0].data_sequence_number, Some(6));
-        let cow = compare_cow_extraction(&table).await;
-        assert_eq!(cow.len(), 1);
-        assert_eq!(cow[0].first_row_id, Some(0));
+        let scoped = compare_scoped_extraction(&table).await;
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].first_row_id, Some(0));
     }
 
     #[tokio::test]
@@ -2080,7 +2081,7 @@ mod tests {
                     read.files[0].first_row_id,
                     single.first_row_id.map(|id| i64::try_from(id).unwrap())
                 );
-                assert_eq!(compare_cow_extraction(&table).await.len(), 1);
+                assert_eq!(compare_scoped_extraction(&table).await.len(), 1);
             }
             for reversed in [false, true] {
                 let pair = if reversed {
@@ -2091,7 +2092,7 @@ mod tests {
                 write_descriptor_references(&table, pair).await;
                 assert_descriptor_conflict(descriptor_observation_error::<DataFile>(&table).await);
                 assert_descriptor_conflict(
-                    descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+                    descriptor_observation_error::<FrozenScopedDataFileProjection>(&table).await,
                 );
             }
         }
@@ -2105,12 +2106,12 @@ mod tests {
         write_descriptor_references(&table, vec![descriptor.clone(), changed.clone()]).await;
         assert_descriptor_conflict(descriptor_observation_error::<DataFile>(&table).await);
         assert_descriptor_conflict(
-            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+            descriptor_observation_error::<FrozenScopedDataFileProjection>(&table).await,
         );
         write_descriptor_references(&table, vec![changed, descriptor]).await;
         for error in [
             descriptor_observation_error::<DataFile>(&table).await,
-            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+            descriptor_observation_error::<FrozenScopedDataFileProjection>(&table).await,
         ] {
             let ReadFailure::Semantic(message) = error else {
                 panic!("first manifest header failure was replaced by a later conflict");
@@ -2140,7 +2141,7 @@ mod tests {
         output.close().await.unwrap();
         for error in [
             descriptor_observation_error::<DataFile>(&table).await,
-            descriptor_observation_error::<FrozenCowDataFileProjection>(&table).await,
+            descriptor_observation_error::<FrozenScopedDataFileProjection>(&table).await,
         ] {
             let ReadFailure::Semantic(message) = error else {
                 panic!("original decode failure was replaced by descriptor pre-scan");
@@ -2572,43 +2573,46 @@ mod tests {
         );
     }
 
-    fn assert_cow_data_file_parity(
+    fn assert_scoped_data_file_parity(
         ordinary: &crate::manifest::DataFileWithStats,
-        cow: &crate::manifest::DataFileWithStats,
+        scoped: &crate::manifest::DataFileWithStats,
     ) {
-        assert_eq!(ordinary.path, cow.path);
-        assert_eq!(ordinary.size, cow.size);
-        assert_eq!(ordinary.record_count, cow.record_count);
+        assert_eq!(ordinary.path, scoped.path);
+        assert_eq!(ordinary.size, scoped.size);
+        assert_eq!(ordinary.record_count, scoped.record_count);
         assert_eq!(
             serde_json::to_value(&ordinary.column_stats).unwrap(),
-            serde_json::to_value(&cow.column_stats).unwrap()
+            serde_json::to_value(&scoped.column_stats).unwrap()
         );
-        assert_eq!(ordinary.partition_spec_id, cow.partition_spec_id);
-        assert_eq!(ordinary.partition_key, cow.partition_key);
-        assert_eq!(ordinary.partition_values, cow.partition_values);
-        assert_eq!(ordinary.manifest_path, cow.manifest_path);
-        assert_eq!(ordinary.partition_field_values, cow.partition_field_values);
-        assert_eq!(ordinary.first_row_id, cow.first_row_id);
-        assert_eq!(ordinary.data_sequence_number, cow.data_sequence_number);
-        assert_eq!(ordinary.delete_files, cow.delete_files);
+        assert_eq!(ordinary.partition_spec_id, scoped.partition_spec_id);
+        assert_eq!(ordinary.partition_key, scoped.partition_key);
+        assert_eq!(ordinary.partition_values, scoped.partition_values);
+        assert_eq!(ordinary.manifest_path, scoped.manifest_path);
+        assert_eq!(
+            ordinary.partition_field_values,
+            scoped.partition_field_values
+        );
+        assert_eq!(ordinary.first_row_id, scoped.first_row_id);
+        assert_eq!(ordinary.data_sequence_number, scoped.data_sequence_number);
+        assert_eq!(ordinary.delete_files, scoped.delete_files);
     }
 
-    async fn compare_cow_extraction(table: &Table) -> Vec<crate::manifest::DataFileWithStats> {
+    async fn compare_scoped_extraction(table: &Table) -> Vec<crate::manifest::DataFileWithStats> {
         let ordinary = crate::manifest::extract_data_files_with_stats_at(table, 77)
             .await
             .unwrap();
-        let cow = crate::manifest::extract_cow_data_files_with_stats_at(table, 77)
+        let scoped = crate::manifest::extract_scoped_data_files_with_stats_at(table, 77)
             .await
             .unwrap();
-        assert_eq!(ordinary.len(), cow.len());
-        for (ordinary, cow) in ordinary.iter().zip(&cow) {
-            assert_cow_data_file_parity(ordinary, cow);
+        assert_eq!(ordinary.len(), scoped.len());
+        for (ordinary, scoped) in ordinary.iter().zip(&scoped) {
+            assert_scoped_data_file_parity(ordinary, scoped);
         }
-        cow
+        scoped
     }
 
     #[tokio::test]
-    async fn cow_extraction_matches_partition_statistics_and_attached_delete_facts() {
+    async fn scoped_extraction_matches_partition_statistics_and_attached_delete_facts() {
         use crate::iceberg::spec::Datum;
         let partition = || Struct::from_iter([Some(Literal::string("emea"))]);
         let mut a = file("a", DataContentType::Data, partition());
@@ -2645,7 +2649,7 @@ mod tests {
             true,
         )
         .await;
-        let files = compare_cow_extraction(&table).await;
+        let files = compare_scoped_extraction(&table).await;
         assert_eq!(
             files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             vec!["a", "b"]
@@ -2660,7 +2664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cow_extraction_keeps_all_live_files_and_inherited_first_row_ids() {
+    async fn scoped_extraction_keeps_all_live_files_and_inherited_first_row_ids() {
         let mut a = file("before", DataContentType::Data, Struct::empty());
         a.record_count(3);
         let mut b = file("after", DataContentType::Data, Struct::empty());
@@ -2671,7 +2675,7 @@ mod tests {
             false,
         )
         .await;
-        let files = compare_cow_extraction(&table).await;
+        let files = compare_scoped_extraction(&table).await;
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, "before");
         assert_eq!(files[1].path, "after");
@@ -2682,7 +2686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cow_extraction_retains_complete_attached_delete_validation_and_error_priority() {
+    async fn scoped_extraction_retains_complete_attached_delete_validation_and_error_priority() {
         for (variant, expected) in [
             (0, "older"),
             (1, "deletion vector"),
@@ -2729,18 +2733,18 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("ordinary extraction accepted invalid attached delete"),
             };
-            let cow = match crate::manifest::extract_cow_data_files_with_stats_at(&table, 77).await
-            {
-                Err(error) => error,
-                Ok(_) => panic!("COW extraction accepted invalid attached delete"),
-            };
+            let scoped =
+                match crate::manifest::extract_scoped_data_files_with_stats_at(&table, 77).await {
+                    Err(error) => error,
+                    Ok(_) => panic!("scoped extraction accepted invalid attached delete"),
+                };
             assert!(ordinary.contains(expected), "{ordinary}");
-            assert_eq!(cow, ordinary);
+            assert_eq!(scoped, ordinary);
         }
     }
 
     #[test]
-    fn cow_borrowed_projection_owns_only_final_fields_and_keeps_raw_size_until_finish() {
+    fn scoped_borrowed_projection_owns_only_final_fields_and_keeps_raw_size_until_finish() {
         use crate::iceberg::spec::Datum;
         let original = file("borrowed", DataContentType::Data, Struct::empty())
             .file_size_in_bytes(u64::MAX)
@@ -2751,10 +2755,10 @@ mod tests {
             .build()
             .unwrap();
         let names = HashMap::from([(1, "id".to_owned())]);
-        let projected = CowDataFileProjection::capture(&original, &names, None).unwrap();
+        let projected = ScopedDataFileProjection::capture(&original, &names, None).unwrap();
         // Enumerating every stored field prevents silently retaining a DataFile
         // or scan metadata Arc in this projection in a later refactor.
-        let CowDataFileProjection {
+        let ScopedDataFileProjection {
             path,
             file_size_in_bytes,
             record_count,
@@ -2795,7 +2799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cow_observation_preserves_delete_failure_before_fallible_final_projection() {
+    async fn scoped_observation_preserves_delete_failure_before_fallible_final_projection() {
         let valid = table(vec![vec![(data("a"), 5)]], None, false).await;
         let domain =
             mint_read_domain(valid.metadata(), 77, valid.metadata().current_schema()).unwrap();
@@ -2833,7 +2837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cow_final_size_conversion_matches_original_without_early_rejection() {
+    async fn scoped_final_size_conversion_matches_original_without_early_rejection() {
         let table = table(vec![vec![(data("a"), 5)]], None, false).await;
         let mut snapshot = build_read_snapshot_at(&table, 77).await.unwrap();
         let read = snapshot.files.pop().unwrap();
@@ -2842,15 +2846,15 @@ mod tests {
             .build()
             .unwrap();
         let names = HashMap::new();
-        let captured = CowDataFileProjection::capture(&original, &names, None).unwrap();
+        let captured = ScopedDataFileProjection::capture(&original, &names, None).unwrap();
         assert_eq!(captured.file_size_in_bytes, u64::MAX);
         let ordinary = original
             .into_file(final_facts_from_read(read.clone()), &names)
             .unwrap_err();
-        let cow = captured
+        let scoped = captured
             .into_file(final_facts_from_read(read), &names)
             .unwrap_err();
         assert_eq!(ordinary, "file size too large: a");
-        assert_eq!(cow, ordinary);
+        assert_eq!(scoped, ordinary);
     }
 }

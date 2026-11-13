@@ -165,6 +165,7 @@ impl DmlRowMutationEffectSet {
 
 fn mor_change_stream_input_request(
     target_columns: &[novarocks_types::schema::ColumnDef],
+    signed: &novarocks_spi::connector::ConnectorMutationMatchContract,
 ) -> Result<novarocks_spi::connector::ConnectorWriteInputRequest, String> {
     use novarocks_execution::exec::row_position::{
         ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
@@ -181,13 +182,33 @@ fn mor_change_stream_input_request(
             )
             .map_err(|error| error.to_string())
         };
+    if signed.after_fields().len() != target_columns.len() {
+        return Err("MOR write input width differs from its original signed target".into());
+    }
     let mut data_fields = target_columns
         .iter()
-        .map(|column| {
-            let value = column
-                .declared_value_type()
-                .map_err(|error| error.to_string())?;
-            field(&column.name, value)
+        .zip(signed.after_fields())
+        .map(|(column, signed)| {
+            let input = signed
+                .execution_type()
+                .ok_or_else(|| "MOR target lacks its complete write input".to_string())?;
+            if column.name != *signed.field().name()
+                || column
+                    .declared_value_type()
+                    .map_err(|error| error.to_string())?
+                    != *input
+            {
+                return Err("MOR write input differs from its original signed target".into());
+            }
+            let request =
+                ConnectorWriteFieldRequest::try_new_typed(signed.field().clone(), input.clone())
+                    .map_err(|error| error.to_string())?;
+            match signed.storage_type() {
+                Some(storage) => request
+                    .with_storage_type(storage.clone())
+                    .map_err(|error| error.to_string()),
+                None => Ok(request),
+            }
         })
         .collect::<Result<Vec<_>, String>>()?;
     data_fields.push(field(
@@ -718,10 +739,8 @@ fn finish_merge_mutation_preparation(
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
 ) -> Result<PreparedMergeMutation, crate::dml::error::DmlExecutionError> {
     let planning_pin = target_binding.planning_pin().clone();
-    // The clause composition is a statement fact; what it implies physically is
-    // not. A MERGE that can delete matched rows needs merge-on-read even on a
-    // copy-on-write table, and that rule now lives with the provider, which
-    // reads it off the intent's effect set.
+    // The clause composition is a statement fact. The Provider consumes this
+    // exact effect set when admitting the merge-on-read mutation.
     let effect_set = DmlRowMutationEffectSet::Merge {
         matched_update: matches!(
             stmt.matched.as_ref().map(|clause| &clause.action),
@@ -778,19 +797,6 @@ fn finish_merge_mutation_preparation(
         execution: execution.clone(),
         connector_context: connector_context.clone(),
     })
-}
-
-fn target_cast_expr(
-    expr: ast::Expr,
-    column: &novarocks_types::schema::ColumnDef,
-) -> Result<ast::Expr, String> {
-    let ty = column
-        .declared_value_type()
-        .map_err(|error| error.to_string())?;
-    Ok(build::cast(
-        expr,
-        novarocks_sql::sql_type_syntax(&ty).map_err(|error| error.to_string())?,
-    ))
 }
 
 fn generated_name(parts: &[&str], quote: Option<char>) -> Result<ast::ObjectName, String> {
@@ -895,7 +901,7 @@ fn update_assignment_projection(
                 })?;
             Ok((
                 build::ident_at(&column.name, None, assignment.column_span),
-                target_cast_expr(build::nested(assignment.value.clone()), column)?,
+                build::nested(assignment.value.clone()),
             ))
         })
         .collect()
@@ -1161,7 +1167,7 @@ fn build_merge_mor_producer(
                     })?;
                 Ok((
                     build::ident_at(&column.name, None, assignment.column_span),
-                    target_cast_expr(build::nested(assignment.value.clone()), column)?,
+                    build::nested(assignment.value.clone()),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -1171,15 +1177,8 @@ fn build_merge_mor_producer(
     if let (Some(columns), Some(clause)) = (insert_columns, stmt.not_matched.as_ref()) {
         for column in columns {
             if let Some(index) = column.value_index {
-                let target_column = target_columns
-                    .iter()
-                    .find(|target| target.name.eq_ignore_ascii_case(&column.name))
-                    .expect("resolved MERGE INSERT column exists in target columns");
                 let expr = clause.action.values[index].clone();
-                insert_values.push((
-                    build::ident(&column.name, None),
-                    target_cast_expr(build::nested(expr), target_column)?,
-                ));
+                insert_values.push((build::ident(&column.name, None), build::nested(expr)));
             }
         }
     }
@@ -1688,7 +1687,24 @@ mod tests {
         let catalog = novarocks_sql::planning::catalog::PlannerMemoryCatalog::default();
         let snapshot = SqlPlannerTableSnapshot::new(&catalog);
         let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap();
-        SqlCompiler::analyze(SqlAnalyzeRequest::new(
+        let assignment = match query.body.as_ref() {
+            ast::SetExpr::Select(select) => {
+                select
+                    .projection
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ordinal, item)| match item {
+                        ast::SelectItem::ExprWithAlias { alias, expr, .. }
+                            if alias.value == "__nr_new_v" =>
+                        {
+                            Some((ordinal, expr.span()))
+                        }
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let request = SqlAnalyzeRequest::new(
             SqlStatementInput::parsed_query(Box::new(query)),
             SqlCompileIntent::ChangeStreamWrite,
             SqlSessionContext {
@@ -1704,14 +1720,33 @@ mod tests {
             None,
             crate::application::test_constant_policy(),
             SqlCompileControl::unbounded(),
-        ))
-        .map(|_| ())
+        );
+        let request = match assignment {
+            Some((ordinal, span)) => {
+                let control = SqlCompileControl::unbounded();
+                let site = novarocks_sql::compiler::SqlWriteAssignmentSite::try_new(
+                    ordinal,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                    None,
+                    &control,
+                )?
+                .with_source_span(span);
+                request.with_write_assignments(Arc::new(
+                    novarocks_sql::compiler::SqlWriteAssignments::try_new(
+                        vec![site].into_boxed_slice(),
+                        &control,
+                    )?,
+                ))?
+            }
+            None => request,
+        };
+        SqlCompiler::analyze(request).map(|_| ())
     }
 
     #[test]
-    fn mor_generated_errors_point_to_user_expression_and_derived_cast() {
-        // Prove the standalone expression is admitted before wrapping it in
-        // the target CAST, so the second failure is authored by that wrapper.
+    fn mor_generated_errors_point_to_user_expression_and_typed_assignment() {
+        // The source expression is independently admitted. Its ordinary
+        // assignment conversion belongs to the complete-query typed projection.
         analyze_mutation_query(test_query("SELECT hll_hash('x')")).unwrap();
         for (value, code) in [
             ("s.missing", "sql.analyze.unknown_column"),
@@ -1776,11 +1811,7 @@ mod tests {
         validate_update_assignments(&assignments, &columns).unwrap();
         let projected = update_assignment_projection(&assignments, &columns).unwrap();
         assert_eq!(projected[0].0.value, "p");
-        assert!(
-            projected[0]
-                .1
-                .syntax_eq(&test_expr("CAST((NULL) AS BIGINT)"))
-        );
+        assert!(projected[0].1.syntax_eq(&test_expr("(NULL)")));
         let query = build_update_match_query(
             test_relation("ice.db.t AS t"),
             build::ident("t", None),
@@ -1789,7 +1820,7 @@ mod tests {
             Some(test_expr("t.id = 1")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((NULL) AS BIGINT) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (NULL) AS __nr_new_p FROM ice.db.t AS t WHERE t.id = 1")));
         for assignments in [
             vec![prepared_assignment("missing", "1")],
             vec![prepared_assignment("p", "1"), prepared_assignment("P", "2")],
@@ -1835,7 +1866,7 @@ mod tests {
         .expect("assignment projection");
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].0.value, "v");
-        assert!(projected[0].1.syntax_eq(&test_expr("CAST((src_v) AS INT)")));
+        assert!(projected[0].1.syntax_eq(&test_expr("(src_v)")));
     }
 
     #[test]
@@ -1857,7 +1888,7 @@ mod tests {
             Some(test_expr("t.id = s.id")),
         )
         .unwrap();
-        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, CAST((src_v) AS INT) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
+        assert!(query.syntax_eq(&test_query("SELECT t._file AS __nr_file, t._pos AS __nr_pos, t._row_id AS __nr_row_id, t._last_updated_sequence_number AS __nr_last_updated_sequence_number, t._spec_id AS __nr_spec_id, t._partition AS __nr_partition, t.*, (src_v) AS __nr_new_v FROM `ice`.`db1`.`t` AS t CROSS JOIN staging.s AS s WHERE t.id = s.id")));
     }
 
     fn typed_col(name: &str, data_type: DataType) -> ColumnDef {

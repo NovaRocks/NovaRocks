@@ -98,7 +98,7 @@ SELECT user_id, SUM(amount) AS total
 ## 5. UPDATE / MERGE INTO
 
 ```sql
--- COW UPDATE 默认行为
+-- UPDATE 使用 MOR，write-mode 属性不选择算法
 UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1001;
 
 -- MERGE INTO upsert

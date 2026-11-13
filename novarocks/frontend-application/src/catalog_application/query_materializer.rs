@@ -274,7 +274,7 @@ pub struct CatalogServiceMaterializer<'a> {
 
 /// One application-owned relation overlay for a generated query.
 ///
-/// The overlay is a binding factory, not a planner table definition: generated COW and MV
+/// The overlay is a binding factory, not a planner table definition: generated rewrite and MV
 /// reads must supply their frozen provider facts to the request-local store
 /// before SQL sees the resulting tokenized table.  Keeping the factory here
 /// prevents a synthetic relation from leaking into the shared catalog.
@@ -1661,7 +1661,7 @@ mod tests {
         QueryTableBinding {
             resolved: test_connector_read_materialization(
                 "ice",
-                "__nr_cow_orders",
+                "__nr_overlay_orders",
                 binding,
                 novarocks_spi::connector::ConnectorReadSelector::SnapshotId(7),
             ),
@@ -2032,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlx2_application_cow_overlay_is_tokenized_without_local_catalog_registration() {
+    fn sqlx2_application_query_overlay_is_tokenized_without_local_catalog_registration() {
         let service = crate::catalog_application::query_catalog::new_query_catalog_service();
         let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
         let materializer = CatalogServiceMaterializer::new_with_query_local_overlays(
@@ -2043,14 +2043,14 @@ mod tests {
             vec![QueryLocalTableOverlay::for_catalog(
                 "default_catalog",
                 "db",
-                "__nr_cow_orders",
+                "__nr_overlay_orders",
                 QueryTableBindingKey::snapshot("ice", "db", "orders", 7),
                 |binding| Ok(frozen_overlay_binding(binding)),
             )],
         );
 
         let resolved = materializer
-            .resolve_table_for_analysis(None, "db", "__nr_cow_orders")
+            .resolve_table_for_analysis(None, "db", "__nr_overlay_orders")
             .expect("query-local overlay resolves");
         let binding_id = novarocks_sql::planning::catalog::table_binding_id(&resolved);
         assert!(binding_id.belongs_to(bindings.scope()));
@@ -2067,8 +2067,12 @@ mod tests {
         );
         let local = service.local().read().expect("catalog read");
         assert!(
-            novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
-                .is_err()
+            novarocks_sql::planning::catalog::local_catalog_table(
+                &local,
+                "db",
+                "__nr_overlay_orders"
+            )
+            .is_err()
         );
     }
     fn original_schema_need(sql: &str) -> novarocks_sql::compiler::SqlCapturedCatalogPreparation {
@@ -2250,12 +2254,13 @@ mod tests {
             vec![QueryLocalTableOverlay::for_catalog(
                 "default_catalog",
                 "db",
-                "__nr_cow_orders",
+                "__nr_overlay_orders",
                 QueryTableBindingKey::snapshot("ice", "db", "orders", 7),
                 |binding| Ok(frozen_overlay_binding(binding)),
             )],
         );
-        let preparation = original_schema_need("SELECT * FROM default_catalog.db.__nr_cow_orders");
+        let preparation =
+            original_schema_need("SELECT * FROM default_catalog.db.__nr_overlay_orders");
         let [need] = preparation.needs() else {
             panic!("one actual overlay relation need");
         };
@@ -2265,27 +2270,27 @@ mod tests {
         let ordinary_catalog = preparation.capture(&[ordinary]).unwrap();
         let ordinary_table = ordinary_catalog
             .provider()
-            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_overlay_orders")
             .unwrap();
         let ordinary_token = novarocks_sql::planning::catalog::table_binding_id(&ordinary_table);
         let fact = materializer.resolve_relation_fact(need).unwrap();
         let catalog = preparation.capture(&[fact]).unwrap();
         let resolved = catalog
             .provider()
-            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_overlay_orders")
             .unwrap();
         let token = novarocks_sql::planning::catalog::table_binding_id(&resolved);
         assert_eq!(token, ordinary_token);
         assert!(token.belongs_to(bindings.scope()));
         assert_eq!(
             novarocks_sql::planning::catalog::materialization_identity_facts(&resolved).fqn(),
-            "default_catalog.db.__nr_cow_orders"
+            "default_catalog.db.__nr_overlay_orders"
         );
         let physical = bindings.binding(token).unwrap();
         assert_eq!(
             novarocks_sql::planning::catalog::materialization_identity_facts(&physical.resolved)
                 .fqn(),
-            "ice.db.__nr_cow_orders"
+            "ice.db.__nr_overlay_orders"
         );
         assert_eq!(
             novarocks_sql::planning::catalog::table_binding_id(&physical.resolved),
@@ -2300,7 +2305,7 @@ mod tests {
             Some(7)
         );
         let repeated = materializer
-            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_cow_orders")
+            .resolve_table_for_analysis(Some("default_catalog"), "db", "__nr_overlay_orders")
             .unwrap();
         assert_eq!(
             novarocks_sql::planning::catalog::table_binding_id(&repeated),
@@ -2308,10 +2313,10 @@ mod tests {
         );
         assert_eq!(
             novarocks_sql::planning::catalog::materialization_identity_facts(&repeated).fqn(),
-            "default_catalog.db.__nr_cow_orders"
+            "default_catalog.db.__nr_overlay_orders"
         );
         let mixed_case = materializer
-            .resolve_table_for_analysis(Some("default_catalog"), "DB", "__NR_Cow_Orders")
+            .resolve_table_for_analysis(Some("default_catalog"), "DB", "__NR_Overlay_Orders")
             .expect("the original case-insensitive overlay lookup remains supported");
         assert_eq!(
             novarocks_sql::planning::catalog::table_binding_id(&mixed_case),
@@ -2319,14 +2324,14 @@ mod tests {
         );
         assert_eq!(
             novarocks_sql::planning::catalog::materialization_identity_facts(&mixed_case).fqn(),
-            "default_catalog.db.__nr_cow_orders"
+            "default_catalog.db.__nr_overlay_orders"
         );
         assert_eq!(
             novarocks_sql::planning::catalog::frozen_input_snapshot_id(&mixed_case),
             Some(7)
         );
         let mixed_preparation =
-            original_schema_need("SELECT * FROM DEFAULT_CATALOG.DB.__NR_COW_ORDERS");
+            original_schema_need("SELECT * FROM DEFAULT_CATALOG.DB.__NR_OVERLAY_ORDERS");
         let [mixed_need] = mixed_preparation.needs() else {
             panic!("one normalized original overlay need");
         };
@@ -2335,8 +2340,12 @@ mod tests {
         assert!(bindings.scan_materialization(token).unwrap().is_none());
         let local = service.local().read().unwrap();
         assert!(
-            novarocks_sql::planning::catalog::local_catalog_table(&local, "db", "__nr_cow_orders")
-                .is_err()
+            novarocks_sql::planning::catalog::local_catalog_table(
+                &local,
+                "db",
+                "__nr_overlay_orders"
+            )
+            .is_err()
         );
     }
 }
