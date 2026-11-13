@@ -33,4 +33,3 @@ PROPERTIES (
     "aws.s3.endpoint"="${oss_endpoint}",
     "aws.s3.enable_path_style_access"="${oss_path_style}"
 );
-
