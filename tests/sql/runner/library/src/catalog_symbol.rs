@@ -973,38 +973,35 @@ mod tests {
         assert_eq!(out, s.rewrite_source(&out).unwrap());
     }
     #[test]
-    fn optimize_show_binds_the_same_catalog_as_submission() {
+    fn optimize_and_metadata_bind_the_same_catalog_without_rewriting_data() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();
         let source = "ALTER TABLE owned.ns.orders OPTIMIZE; \
-                      SHOW ALTER TABLE OPTIMIZE FROM `owned`.`ns` \
-                      WHERE TableName = 'owned'; \
-                      SHOW ALTER TABLE OPTIMIZE FROM owned;";
+                      SELECT name FROM system.metadata.materialized_views \
+                      WHERE catalog_name = 'owned' AND schema_name = 'owned' AND name = 'owned';";
         let rewritten = symbols.rewrite_source(source).unwrap();
         assert!(rewritten.contains(&format!("ALTER TABLE {catalog}.ns.orders OPTIMIZE")));
         assert!(
-            rewritten.contains(&format!("SHOW ALTER TABLE OPTIMIZE FROM `{catalog}`.`ns`")),
+            rewritten.contains(&format!("catalog_name = '{catalog}'")),
             "{rewritten}"
         );
-        assert!(rewritten.contains("WHERE TableName = 'owned'"));
-        assert!(rewritten.contains("SHOW ALTER TABLE OPTIMIZE FROM owned;"));
+        assert!(rewritten.contains("schema_name = 'owned' AND name = 'owned'"));
         assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
     }
 
     #[test]
-    fn optimize_show_only_rewrites_the_explicit_catalog_slot() {
+    fn optimize_only_rewrites_the_qualified_catalog_slot() {
         let symbols = symbols();
         let catalog = symbols.lookup("owned").unwrap();
         assert_eq!(
             symbols
-                .rewrite_source("SHOW ALTER TABLE OPTIMIZE IN owned.owned;")
+                .rewrite_source("ALTER TABLE owned.owned.orders OPTIMIZE;")
                 .unwrap(),
-            format!("SHOW ALTER TABLE OPTIMIZE IN {catalog}.owned;")
+            format!("ALTER TABLE {catalog}.owned.orders OPTIMIZE;")
         );
         for source in [
-            "SHOW ALTER TABLE OPTIMIZE;",
-            "SHOW ALTER TABLE OPTIMIZE FROM owned;",
-            "SHOW ALTER TABLE OPTIMIZE FROM external.owned;",
+            "ALTER TABLE ns.orders OPTIMIZE;",
+            "ALTER TABLE external.owned.orders OPTIMIZE;",
             "SELECT * FROM owned.orders;",
         ] {
             assert_eq!(symbols.rewrite_source(source).unwrap(), source);
@@ -1462,7 +1459,7 @@ mod tests {
         let bound = crate::parser::load_sql_case_from_file(hms_source, &meta, &marker, &hms_vars)
             .unwrap()
             .unwrap();
-        assert_eq!(bound.steps.len(), 61);
+        assert_eq!(bound.steps.len(), 59);
         assert!(
             bound.steps[1]
                 .sql
@@ -1479,44 +1476,44 @@ mod tests {
                 .contains(" FOR VERSION AS OF 731 ORDER BY id;")
         );
         assert!(!bound.steps[11].sql.contains("${hms_first_snapshot_id}"));
-        assert_eq!(bound.steps[57].query_number, 58);
+        assert_eq!(bound.steps[55].query_number, 56);
         assert!(
-            bound.steps[57]
+            bound.steps[55]
                 .sql
                 .contains(&format!("FROM {sealed_catalog}.information_schema.tables"))
         );
-        assert_eq!(bound.steps[58].query_number, 59);
+        assert_eq!(bound.steps[56].query_number, 57);
         assert!(
-            bound.steps[56]
+            bound.steps[54]
                 .sql
                 .contains("FROM system.metadata.materialized_views")
         );
         assert!(
-            bound.steps[56]
+            bound.steps[54]
                 .sql
                 .contains(&format!("catalog_name = '{sealed_catalog}'"))
         );
         assert!(
-            bound.steps[56]
+            bound.steps[54]
                 .sql
                 .contains(&format!("schema_name = '{}'", namespaces[&base]))
         );
         assert!(
-            bound.steps[58]
+            bound.steps[56]
                 .sql
                 .contains(&format!("FROM {sealed_catalog}.information_schema.tables"))
         );
-        assert!(bound.steps[58].sql.contains("table_type = 'VIEW'"));
+        assert!(bound.steps[56].sql.contains("table_type = 'VIEW'"));
         assert!(
-            bound.steps[58]
+            bound.steps[56]
                 .sql
                 .contains(&format!("table_schema = '{}'", namespaces[&base]))
         );
-        assert!(bound.steps[58].meta.expect_error.is_none());
-        assert_eq!(bound.steps[59].query_number, 60);
-        assert!(bound.steps[59].meta.cleanup);
-        assert_eq!(bound.steps[60].query_number, 61);
-        assert!(bound.steps[60].meta.cleanup);
+        assert!(bound.steps[56].meta.expect_error.is_none());
+        assert_eq!(bound.steps[57].query_number, 58);
+        assert!(bound.steps[57].meta.cleanup);
+        assert_eq!(bound.steps[58].query_number, 59);
+        assert!(bound.steps[58].meta.cleanup);
         let expected_uri = format!("{syntax_warehouse}/iru7/{}/v1/data", namespaces[&base]);
         assert!(
             bound.steps[39]

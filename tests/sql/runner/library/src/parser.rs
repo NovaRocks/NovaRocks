@@ -3371,7 +3371,7 @@ mod opt5_directive_tests {
         for (name, steps, contract_query) in [
             ("broadcast_risk_fallback_large_build_rejected_dist", 6, 6),
             ("broadcast_risk_zero_stats_dist", 6, 6),
-            ("broadcast_risk_narrow_build_medium_rows_kept_dist", 11, 11),
+            ("broadcast_risk_narrow_build_medium_rows_kept_dist", 10, 10),
             ("broadcast_risk_small_build_kept_dist", 11, 11),
             ("broadcast_risk_wide_build_uncertain_rejected_dist", 11, 11),
         ] {

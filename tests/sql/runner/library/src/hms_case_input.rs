@@ -174,7 +174,7 @@ impl Definition {
         );
         let case = crate::parser::load_sql_case_from_file(&self.path, meta, marker, &vars)?
             .context("bound HMS input has no executable case")?;
-        ensure!(case.steps.len() == 61, "bound HMS case changed step count");
+        ensure!(case.steps.len() == 59, "bound HMS case changed step count");
         // The existing loader above rewrites/parses the complete real SQL with
         // the sealed owned catalog. The declaration projection never reaches here.
         ensure!(
@@ -250,11 +250,13 @@ impl Definition {
         )?
         .context("HMS input definition has no steps")?;
         ensure!(
-            case.steps.len() == 61 && case.sequential,
-            "HMS recipe requires its sequential 61 steps"
+            case.steps.len() == 59 && case.sequential,
+            "HMS recipe requires its sequential 59 steps"
         );
-        // Queries 1-57 retain their original ordinals. The listing and view
-        // checks precede the original two cleanup steps, now queries 60-61.
+        // Queries 1-52 retain their original ordinals. Retired SHOW OPTIMIZE
+        // and SHOW ANALYZE observations are removed; the original inventory,
+        // rows, MV listing and table/view listings now occupy queries 53-57.
+        // The same two owned cleanup steps remain last, at queries 58-59.
         ensure!(
             case.steps
                 .iter()
@@ -867,7 +869,7 @@ mod tests {
         (dir, result)
     }
     #[test]
-    fn hms_definition_keeps_61_steps_without_starting_a_producer() {
+    fn hms_definition_keeps_59_steps_without_starting_a_producer() {
         let (dir, result) = definition(TEMPLATE);
         assert_eq!(result.unwrap().case_id(), CASE);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -1162,7 +1164,7 @@ print(json.dumps({'empty': {'remaining_objects':empty},
         let family = format!("iru7_{}", case.expected_variables["uuid0"]);
         assert_eq!(case.namespace_rewrites[&family], namespace);
         assert_eq!(case.namespace_rewrites[&format!("{family}_new")], sibling);
-        assert_eq!(case.steps.len(), 61);
+        assert_eq!(case.steps.len(), 59);
         assert_eq!(
             case.steps
                 .iter()
@@ -1219,52 +1221,52 @@ print(json.dumps({'empty': {'remaining_objects':empty},
                 .iter()
                 .map(|step| step.query_number)
                 .collect::<Vec<_>>(),
-            (1..=61).collect::<Vec<_>>()
+            (1..=59).collect::<Vec<_>>()
         );
         assert!(
-            case.steps[57]
+            case.steps[55]
                 .sql
                 .contains(&format!("FROM {catalog}.information_schema.tables"))
         );
-        assert!(!case.steps[57].meta.cleanup);
+        assert!(!case.steps[55].meta.cleanup);
         assert!(
-            case.steps[56]
+            case.steps[54]
                 .sql
                 .contains("FROM system.metadata.materialized_views")
         );
         assert!(
-            case.steps[56]
+            case.steps[54]
                 .sql
                 .contains(&format!("catalog_name = '{catalog}'"))
         );
         assert!(
-            case.steps[56]
+            case.steps[54]
                 .sql
                 .contains(&format!("schema_name = '{namespace}'"))
         );
         assert!(
-            case.steps[58]
+            case.steps[56]
                 .sql
                 .contains(&format!("FROM {catalog}.information_schema.tables"))
         );
-        assert!(case.steps[58].sql.contains("table_type = 'VIEW'"));
+        assert!(case.steps[56].sql.contains("table_type = 'VIEW'"));
         assert!(
-            case.steps[58]
+            case.steps[56]
                 .sql
                 .contains(&format!("table_schema = '{namespace}'"))
         );
-        assert!(case.steps[58].meta.expect_sql_code.is_none());
-        assert!(case.steps[58].meta.expect_sql_phase.is_none());
-        assert!(case.steps[58].meta.expect_error.is_none());
-        assert!(!case.steps[58].meta.cleanup);
-        assert!(case.steps[59].meta.cleanup);
+        assert!(case.steps[56].meta.expect_sql_code.is_none());
+        assert!(case.steps[56].meta.expect_sql_phase.is_none());
+        assert!(case.steps[56].meta.expect_error.is_none());
+        assert!(!case.steps[56].meta.cleanup);
+        assert!(case.steps[57].meta.cleanup);
         assert!(
-            case.steps[59]
+            case.steps[57]
                 .sql
                 .contains(&format!(" cleanup {namespace}"))
         );
-        assert!(case.steps[60].meta.cleanup);
-        assert_eq!(case.steps[60].sql, format!("DROP CATALOG {catalog};"));
+        assert!(case.steps[58].meta.cleanup);
+        assert_eq!(case.steps[58].sql, format!("DROP CATALOG {catalog};"));
         let attempt = read(&evidence.join("input.binding-attempt.json")).unwrap();
         assert_eq!(attempt["actual_uri"], expected_uri);
         assert_eq!(attempt["expected_uri"], expected_uri);
@@ -1751,7 +1753,7 @@ else:
                     let mut owner = model.register();
                     assert_eq!(model.actions("prepare"), 0);
                     let case = model.prepare(&mut owner).unwrap();
-                    assert_eq!(case.steps.len(), 61);
+                    assert_eq!(case.steps.len(), 59);
                     assert_eq!(
                         case.steps[10].meta.result_rows_where,
                         vec![("snapshot_id".into(), "731".into())]

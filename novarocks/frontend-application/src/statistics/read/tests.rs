@@ -242,12 +242,47 @@ fn residual_keeps_ordinary_cancellation_separate_from_real_request_exit() {
         permit.is_some(),
         "the exact request really obtained its grant"
     );
+    // Cancellation alone is not an I/O refusal. Submit another real request,
+    // then receive its original failed admission while the first grant lives.
+    let refused_request = io.request(SharedDependency::LocalHost).unwrap();
+    let mut refused_permit = None;
+    assert!(
+        refused_request
+            .poll_admitted_in(&mut refused_permit, &mut cx)
+            .is_pending()
+    );
     root.owner
         .cancel(novarocks_workload_control::CancellationReason::Requested);
+    let mut refusal = None;
+    for _ in 0..256 {
+        io.poll_continuing(&mut cx).unwrap();
+        drive_original(&mut driver);
+        match refused_request.poll_admitted_in(&mut refused_permit, &mut cx) {
+            Poll::Ready(Err(error)) => {
+                refusal = Some(error);
+                break;
+            }
+            Poll::Ready(Ok(())) => panic!("a cancelled pending request cannot obtain a grant"),
+            Poll::Pending => {}
+        }
+    }
+    assert_eq!(
+        refusal
+            .expect("receive the original admission refusal")
+            .kind(),
+        ConnectorErrorKind::Cancelled
+    );
+    assert!(refused_permit.is_none());
+    let cancelled = WorkError::Cancelled(novarocks_workload_control::CancellationReason::Requested);
+    assert_eq!(io.failure(), Some(cancelled.clone()));
+    drop(refused_request);
     let mut ordinary = None;
     let mut closed = false;
     assert!(poll_read_io_retirement(&io, &mut ordinary, &mut closed, &mut cx).is_pending());
-    assert!(matches!(ordinary, Some(WorkError::Cancelled(_))));
+    assert!(
+        ordinary.is_none(),
+        "the residual has not received actual quiescence yet"
+    );
     assert!(!closed);
     assert!(io.health_failure().is_none());
     drop(permit);
@@ -269,7 +304,7 @@ fn residual_keeps_ordinary_cancellation_separate_from_real_request_exit() {
         }
     }
     assert!(exited && closed);
-    assert!(matches!(ordinary, Some(WorkError::Cancelled(_))));
+    assert_eq!(ordinary, Some(cancelled));
     assert!(io.health_failure().is_none());
     // After positive exit, idempotence must not reopen business progress and
     // reinterpret its retained cancellation or Released state as raw health.

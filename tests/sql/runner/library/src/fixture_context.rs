@@ -1369,6 +1369,21 @@ pub(crate) fn test_variables(cases: &[&str]) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    fn load_namespace_bound_case(
+        case: &str,
+        source: &str,
+        variables: &HashMap<String, String>,
+    ) -> crate::types::SqlCase {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("{case}.sql"));
+        std::fs::write(&path, source).unwrap();
+        let meta = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let marker = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        crate::parser::load_sql_case_from_file(&path, &meta, &marker, variables)
+            .unwrap()
+            .unwrap()
+    }
+
     use super::*;
     fn typed_expected(source: &str) -> crate::types::ResultSet {
         let section = crate::golden::GoldenFile::parse(source)
@@ -1579,20 +1594,52 @@ mod tests {
                 ),
             ),
         ] {
-            let vars =
+            let mut vars =
                 crate::config::case_placeholder_variables(&test_variables(&[case]), case).unwrap();
+            // Syntax-only catalog properties are explicit, hermetic input;
+            // this test never starts a fixture or reads external environment.
+            for (key, value) in [
+                ("iceberg_rest_uri", "http://127.0.0.1:1"),
+                ("iceberg_rest_warehouse", "s3://syntax-only/warehouse"),
+                ("iceberg_object_store_credential_mode", "named"),
+                (
+                    "iceberg_object_store_metadata_credential_name",
+                    "syntax_metadata",
+                ),
+                ("iceberg_object_store_data_credential_name", "syntax_data"),
+                ("iceberg_object_store_credential_generation", "1"),
+                ("oss_endpoint", "http://127.0.0.1:1"),
+                ("oss_region", "us-east-1"),
+                ("oss_path_style", "true"),
+            ] {
+                vars.insert(key.into(), value.into());
+            }
             let rendered = render_expected(source, &vars);
             let old = format!("ns_{}", vars["uuid0"]);
             let map = namespace_mapping(&rendered, &vars).unwrap();
             let expected = &map[&old];
-            let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
+            // Exercise the real parser pipeline: syntax identifiers first,
+            // then metadata filters bound to each exact executable step.
+            let bound = load_namespace_bound_case(case, source, &vars);
+            let rewritten = bound
+                .steps
+                .iter()
+                .map(|step| step.sql.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             assert!(rewritten.contains(&format!(".{expected}.")));
             if case == "mv_catalog_isolation" {
                 assert!(rewritten.contains(&format!("schema_name = '{expected}'")));
                 assert!(!rewritten.contains(&format!("schema_name = '{old}'")));
             } else {
                 assert!(rewritten.contains(&format!(".{expected}.optimize_rows OPTIMIZE")));
-                assert!(rewritten.contains("-- @expect_error=dependency: RefUnchanged"));
+                assert!(
+                    bound
+                        .steps
+                        .iter()
+                        .any(|step| step.meta.expect_error.as_deref()
+                            == Some("dependency: RefUnchanged"))
+                );
             }
         }
     }
@@ -1643,14 +1690,20 @@ mod tests {
     fn mv_state_metadata_filters_bind_namespaces_without_rewriting_data() {
         let vars =
             crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
-        let source = "CREATE DATABASE owned.owned;\n\
-            SELECT name FROM system.runtime.materialized_view_states WHERE schema_name = 'owned';\n\
-            SELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary;\n\
-            SELECT * FROM owned.t;\n\
-            SELECT * FROM external.owned;\n";
+        let source = "-- query 1\nCREATE DATABASE owned.owned;\n\
+            -- query 2\nSELECT name FROM system.runtime.materialized_view_states WHERE schema_name = 'owned';\n\
+            -- query 3\nSELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary;\n\
+            -- query 4\nSELECT * FROM owned.t;\n\
+            -- query 5\nSELECT * FROM external.owned;\n";
         let map = namespace_mapping(source, &vars).unwrap();
         let expected = &map["owned"];
-        let rewritten = rewrite_namespaces(source, &vars).unwrap();
+        let bound = load_namespace_bound_case("case", source, &vars);
+        let rewritten = bound
+            .steps
+            .iter()
+            .map(|step| step.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(rewritten.contains(&format!("schema_name = '{expected}'")));
         assert!(rewritten.contains(&format!("SELECT * FROM {expected}.t")));
         assert!(rewritten.contains(
