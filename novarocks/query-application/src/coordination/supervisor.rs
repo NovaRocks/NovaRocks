@@ -2095,7 +2095,7 @@ async fn run_logical_role(
                 );
             }
         };
-        active.bind_failure_activation(initial.identity());
+        active.bind_failure_view(initial.accepted_failure_view());
         match (internal || result_schema.is_some(), rows_runtime) {
             (true, Some(rows_runtime)) => {
                 let running = match actor.activate(initial.ready()).await {
@@ -2113,7 +2113,6 @@ async fn run_logical_role(
                             &mut shutdown,
                             &requester,
                             config.remote_cleanup_timeout(),
-                            Some(&actor),
                         )
                         .await;
                         drop(active);
@@ -2203,7 +2202,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2240,7 +2238,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2278,7 +2275,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2340,7 +2336,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2360,7 +2355,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2380,7 +2374,6 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
-                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2561,7 +2554,6 @@ fn supervise_residual_rows_attempt(
             &mut shutdown,
             &requester,
             cleanup_timeout,
-            None,
         )
         .await;
         (participations, convergence)
@@ -2570,7 +2562,6 @@ fn supervise_residual_rows_attempt(
 
 async fn converge_rows_attempts(
     active: &mut SupervisedActiveNativeOwner,
-    actor: &super::LogicalExecutionActor,
     active_participations: &[novarocks_execution_contract::ParticipationRef],
     residuals: &mut ResidualRowsConvergence,
     cancellation: novarocks_workload_control::CancellationView,
@@ -2580,15 +2571,9 @@ async fn converge_rows_attempts(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
 ) -> Result<(), QueryExecutionError> {
-    let active_convergence = converge_supervised_active(
-        active,
-        cancellation,
-        shutdown,
-        requester,
-        cleanup_timeout,
-        Some(actor),
-    )
-    .await;
+    let active_convergence =
+        converge_supervised_active(active, cancellation, shutdown, requester, cleanup_timeout)
+            .await;
     let result = record_reported_active_convergence(
         registry,
         registration,
@@ -2960,7 +2945,6 @@ async fn supervise_rows_inner(
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
-        attempt.active.capture_accepted_failure(actor).await;
         // The result pump can finish while the borrowed Native run is still pending.
         if matches!(&pump_result, Ok(super::LogicalConclusion::Succeeded)) {
             attempt.active.retain_streamed_success(drive.identity())?;
@@ -2990,7 +2974,6 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 return converge_rows_attempts(
                     &mut attempt.active,
-                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3006,7 +2989,6 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3030,7 +3012,6 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3055,7 +3036,6 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
-                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3108,7 +3088,6 @@ async fn supervise_rows_inner(
 
                     let convergence = converge_rows_attempts(
                         &mut attempt.active,
-                        actor,
                         attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
@@ -3133,7 +3112,6 @@ async fn supervise_rows_inner(
                             .or_else(actor_terminal_refusal);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
-                            actor,
                             attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
@@ -3182,7 +3160,6 @@ async fn supervise_rows_inner(
                         let supervision = preparation_supervision_result(error, actor_outcome);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
-                            actor,
                             attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
@@ -3225,7 +3202,6 @@ async fn supervise_rows_inner(
                         converge_dormant(dormant, cancellation.clone(), shutdown, requester).await;
                     let old_convergence = converge_rows_attempts(
                         &mut attempt.active,
-                        actor,
                         attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
@@ -3269,7 +3245,6 @@ async fn supervise_rows_inner(
                                 };
                             let old_convergence = converge_rows_attempts(
                                 &mut attempt.active,
-                                actor,
                                 attempt.schedule.participations(),
                                 &mut residuals,
                                 scope.cancellation().map_err(work_error)?,
@@ -3286,8 +3261,6 @@ async fn supervise_rows_inner(
                             );
                         }
                     };
-
-                attempt.active.capture_accepted_failure(actor).await;
                 supervise_residual_rows_attempt(
                     &mut residuals,
                     attempt.active,
@@ -3528,7 +3501,7 @@ async fn supervise_rows_inner(
                     .expect("reserved before replacement activation")
                     .finish_activated_in(pending_activated)
                     .expect("same original replacement output");
-                active.bind_failure_activation(instantiation.identity());
+                active.bind_failure_view(instantiation.accepted_failure_view());
                 let Some(rows_runtime) = rows_runtime else {
                     session.retire_preparation();
                     let error =
@@ -3545,7 +3518,6 @@ async fn supervise_rows_inner(
                         shutdown,
                         requester,
                         config.remote_cleanup_timeout(),
-                        Some(actor),
                     )
                     .await;
                     drop(active);
@@ -3578,7 +3550,6 @@ async fn supervise_rows_inner(
                             shutdown,
                             requester,
                             config.remote_cleanup_timeout(),
-                            Some(actor),
                         )
                         .await;
                         let replacement_convergence = record_reported_active_convergence(
@@ -3979,14 +3950,8 @@ async fn converge_supervised_active(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
-    actor: Option<&super::LogicalExecutionActor>,
 ) -> ActiveAttemptConvergence {
-    // Freeze the original observation deadline before the metadata query.
-    let mut request = owner.request(cancellation, cleanup_timeout);
-    if let Some(actor) = actor {
-        owner.capture_accepted_failure(actor).await;
-        request = request.with_accepted_failure(owner.accepted_failure());
-    }
+    let request = owner.request(cancellation, cleanup_timeout);
     let failure_custody = owner.convergence_failure_custody();
     let (outcome, deadline) = converge_active_request(
         owner.as_mut(),

@@ -1130,7 +1130,7 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
-            failure_activation: None,
+            failure_view: None,
             accepted_failure: None,
             closed: false,
         };
@@ -1152,7 +1152,7 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
-            failure_activation: None,
+            failure_view: None,
             accepted_failure: None,
             closed: false,
         }
@@ -1185,7 +1185,7 @@ pub(crate) struct SupervisedActiveNativeOwner {
     remote_deadline: Option<Instant>,
     computation_ready: Option<crate::api::ComputationReadyToken>,
     streamed_success: Option<AttemptActivationIdentity>,
-    failure_activation: Option<AttemptActivationIdentity>,
+    failure_view: Option<super::actor::AcceptedAttemptFailureView>,
     accepted_failure: Option<crate::api::AcceptedAttemptFailure>,
     closed: bool,
 }
@@ -1231,29 +1231,26 @@ impl SupervisedActiveNativeOwner {
             root,
         )
     }
-    pub(crate) fn accepted_failure(&self) -> Option<crate::api::AcceptedAttemptFailure> {
-        self.accepted_failure.clone()
-    }
-
-    pub(crate) fn bind_failure_activation(&mut self, activation: AttemptActivationIdentity) {
+    pub(crate) fn bind_failure_view(&mut self, view: super::actor::AcceptedAttemptFailureView) {
+        let activation = view.activation();
         if activation.execution() == self.custody.key.execution
             && self
-                .failure_activation
-                .is_none_or(|original| original == activation)
+                .failure_view
+                .as_ref()
+                .is_none_or(|original| original.activation() == activation)
         {
-            self.failure_activation = Some(activation);
+            self.failure_view = Some(view);
         }
     }
-    pub(crate) async fn capture_accepted_failure(&mut self, actor: &super::LogicalExecutionActor) {
-        let Some(activation) = self.failure_activation else {
+
+    fn capture_accepted_failure(&mut self) {
+        let Some(view) = self.failure_view.as_ref() else {
             return;
         };
-        if activation.actor() != actor.id() {
-            return;
-        }
-        // An unavailable observation never becomes a business failure or a
-        // gate on original Native convergence. Keep any earlier exact receipt.
-        if let Ok(Some(failure)) = actor.accepted_attempt_failure(activation).await {
+        let activation = view.activation();
+        // Read only the independently held pure cell. No actor command,
+        // mailbox, cancellation or owner exit is required for this snapshot.
+        if let Ok(Some(failure)) = view.snapshot(activation) {
             let matches_original = failure.activation == activation
                 && match failure.input.site() {
                     crate::execution_error::ExecutionFailureSite::Task { identity, .. }
@@ -1294,6 +1291,7 @@ impl SupervisedActiveNativeOwner {
         // preparation or client/cleanup waits can lend a new observation budget.
         let cut = *self.terminal_cut.get_or_insert_with(Instant::now);
         let deadline = *self.remote_deadline.get_or_insert_with(|| cut + budget);
+        self.capture_accepted_failure();
         NativeActiveConvergenceRequest::new(cancellation, deadline)
             .with_computation_ready(self.computation_ready)
             .with_streamed_success(self.streamed_success)

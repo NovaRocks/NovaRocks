@@ -198,6 +198,83 @@ impl RootResultObserver {
     }
 }
 
+/// A bound read-only view of one attempt's already accepted pure failure.
+/// The cell cannot keep a permit, actor, Work or mailbox alive and never wakes.
+#[derive(Clone)]
+pub(crate) struct AcceptedAttemptFailureView {
+    activation: AttemptActivationIdentity,
+    cell: Arc<std::sync::Mutex<Option<Arc<crate::api::AcceptedAttemptFailure>>>>,
+}
+
+impl std::fmt::Debug for AcceptedAttemptFailureView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Formatting must not lock the cell or invoke payload formatting there.
+        formatter
+            .debug_struct("AcceptedAttemptFailureView")
+            .field("activation", &self.activation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcceptedAttemptFailureView {
+    pub(crate) const fn activation(&self) -> AttemptActivationIdentity {
+        self.activation
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        activation: AttemptActivationIdentity,
+    ) -> Result<Option<crate::api::AcceptedAttemptFailure>, LogicalExecutionActorError> {
+        verify_actor_activation(self.activation, activation)?;
+        let snapshot = {
+            let cell = self
+                .cell
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cell.clone()
+        };
+        // Payload clone and any allocation happen after releasing the cell.
+        Ok(snapshot.map(|failure| (*failure).clone()))
+    }
+}
+
+#[derive(Debug)]
+struct AcceptedAttemptFailurePublisher {
+    view: AcceptedAttemptFailureView,
+}
+
+impl AcceptedAttemptFailurePublisher {
+    fn new(activation: AttemptActivationIdentity) -> Self {
+        Self {
+            view: AcceptedAttemptFailureView {
+                activation,
+                cell: Arc::new(std::sync::Mutex::new(None)),
+            },
+        }
+    }
+
+    fn view(&self) -> AcceptedAttemptFailureView {
+        self.view.clone()
+    }
+
+    fn publish(&self, input: &crate::execution_error::ExecutionFailureInput) {
+        let next = Arc::new(crate::api::AcceptedAttemptFailure {
+            activation: self.view.activation,
+            input: input.clone(),
+        });
+        let previous = {
+            let mut cell = self
+                .view
+                .cell
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cell.replace(next)
+        };
+        // Final payload destruction and allocator callbacks stay outside the lock.
+        drop(previous);
+    }
+}
+
 /// Coalesced, actor-local abandonment signal shared by every typestate form of
 /// one attempt authority. It uses constant memory and never waits for mailbox
 /// capacity from `Drop`.
@@ -230,11 +307,19 @@ fn abandon_on_drop(lifetime: &mut Option<Arc<PermitLifetime>>) {
 #[must_use = "attempt instantiation must report readiness, failure, or cancellation"]
 pub struct AttemptInstantiationPermit {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
 }
 
 impl AttemptInstantiationPermit {
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -247,6 +332,7 @@ impl AttemptInstantiationPermit {
     /// actor's activation transition.
     pub fn ready(mut self) -> AttemptReadinessReceipt {
         AttemptReadinessReceipt {
+            accepted_failure: self.accepted_failure.take(),
             capability: self.capability.take(),
             lifetime: self.lifetime.take(),
             mailbox_liveness: self.mailbox_liveness.take(),
@@ -305,11 +391,19 @@ impl Drop for AttemptInstantiationPermit {
 #[must_use = "attempt readiness must be consumed by its owning actor"]
 pub struct AttemptReadinessReceipt {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
 }
 
 impl AttemptReadinessReceipt {
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -352,6 +446,7 @@ impl Drop for AttemptReadinessReceipt {
 #[must_use = "a running attempt must report completion or failure"]
 pub struct RunningAttemptPermit {
     capability: Option<AttemptCapability>,
+    accepted_failure: Option<AcceptedAttemptFailureView>,
     lifetime: Option<Arc<PermitLifetime>>,
     mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
     authorization_limits: AttemptAuthorizationLimits,
@@ -471,6 +566,14 @@ impl RunningAttemptDriveAuthority {
 }
 
 impl RunningAttemptPermit {
+    #[cfg(test)]
+    pub(crate) fn accepted_failure_view(&self) -> AcceptedAttemptFailureView {
+        self.accepted_failure
+            .as_ref()
+            .expect("the original attempt retains its failure view")
+            .clone()
+    }
+
     pub fn identity(&self) -> AttemptActivationIdentity {
         identity_of(
             self.capability
@@ -484,8 +587,10 @@ impl RunningAttemptPermit {
         lifetime: Arc<PermitLifetime>,
         mailbox_liveness: mpsc::Sender<ActorCommand>,
         authorization_limits: AttemptAuthorizationLimits,
+        accepted_failure: AcceptedAttemptFailureView,
     ) -> Self {
         Self {
+            accepted_failure: Some(accepted_failure),
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(mailbox_liveness),
@@ -744,6 +849,8 @@ impl RunningAttemptPermit {
             .mailbox_liveness
             .take()
             .expect("live running permit retains actor liveness");
+        // The original active owner already holds its independent pure view.
+        drop(self.accepted_failure.take());
         (capability, lifetime, mailbox_liveness)
     }
 }
@@ -1411,7 +1518,7 @@ struct AttemptLedgers {
     pre_ready_observation: Option<PreReadyObservationSource>,
     // A later preparation may choose another logical terminal cause. This
     // original attempt's accepted diagnostic input stays with its own ledger.
-    accepted_failure: Option<crate::api::AcceptedAttemptFailure>,
+    accepted_failure: AcceptedAttemptFailurePublisher,
 }
 
 impl AttemptLedgers {
@@ -1815,10 +1922,6 @@ enum ActorCommand {
         close_ingress: bool,
         reply: ActorReply<bool>,
     },
-    AcceptedAttemptFailure {
-        activation: AttemptActivationIdentity,
-        reply: ActorReply<Option<crate::api::AcceptedAttemptFailure>>,
-    },
     Snapshot {
         reply: ActorReply<LogicalExecutionActorSnapshot>,
     },
@@ -2092,18 +2195,6 @@ impl LogicalExecutionActor {
             .map_err(|_| LogicalExecutionActorError::MailboxClosed)?;
         pending_request.disarm();
         result
-    }
-
-    /// Observe only facts already accepted by this actor for this activation.
-    pub(crate) async fn accepted_attempt_failure(
-        &self,
-        activation: AttemptActivationIdentity,
-    ) -> Result<Option<crate::api::AcceptedAttemptFailure>, LogicalExecutionActorError> {
-        request(&self.sender, |reply| ActorCommand::AcceptedAttemptFailure {
-            activation,
-            reply,
-        })
-        .await
     }
 
     pub async fn snapshot(
@@ -2552,6 +2643,8 @@ pub(crate) fn spawn_logical_execution_actor(
             return Err(LogicalExecutionActorError::InvariantViolation);
         }
     };
+    let accepted_failure = AcceptedAttemptFailurePublisher::new(capability_identity);
+    let initial_failure_view = accepted_failure.view();
     let attempts = BTreeMap::from([(
         config.initial_execution,
         AttemptLedgers {
@@ -2566,7 +2659,7 @@ pub(crate) fn spawn_logical_execution_actor(
             attempt_obligation: Some(attempt_obligation),
             active_resources: None,
             pre_ready_observation: None,
-            accepted_failure: None,
+            accepted_failure,
         },
     )]);
     let clock = Arc::clone(&config.clock);
@@ -2613,6 +2706,7 @@ pub(crate) fn spawn_logical_execution_actor(
             join,
         },
         initial_attempt: AttemptInstantiationPermit {
+            accepted_failure: Some(initial_failure_view),
             capability: Some(capability),
             lifetime: Some(lifetime),
             mailbox_liveness: Some(sender),
@@ -3679,8 +3773,10 @@ fn try_activate_qualified_replacement(
                 })
             }
             .map(|ledgers| {
+                let accepted_failure = ledgers.accepted_failure.view();
                 attempts.insert(active.identity.replacement(), ledgers);
                 Ok(AttemptInstantiationPermit {
+                    accepted_failure: Some(accepted_failure),
                     capability: Some(capability),
                     lifetime: Some(Arc::clone(&pending_activation.lifetime)),
                     mailbox_liveness: Some(pending_activation.mailbox_liveness.clone()),
@@ -4740,6 +4836,7 @@ fn handle_command(
             }
         }
         ActorCommand::Activate { readiness, reply } => {
+            let accepted_failure = readiness.accepted_failure_view();
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
             match validate_attempt_command(state, &capability).and_then(|()| {
                 let activation = identity_of(&capability);
@@ -4755,8 +4852,13 @@ fn handle_command(
                 Ok(limits)
             }) {
                 Ok(limits) => {
-                    let running =
-                        RunningAttemptPermit::new(capability, lifetime, mailbox_liveness, limits);
+                    let running = RunningAttemptPermit::new(
+                        capability,
+                        lifetime,
+                        mailbox_liveness,
+                        limits,
+                        accepted_failure,
+                    );
                     if let Err(response) = reply.send(Ok(running)) {
                         drop(response);
                     }
@@ -5751,16 +5853,6 @@ fn handle_command(
         ActorCommand::RegistryJoinReadiness { .. } => {
             unreachable!("registry join readiness is handled by the actor loop")
         }
-        ActorCommand::AcceptedAttemptFailure { activation, reply } => {
-            let result = attempts
-                .get(&activation.execution())
-                .ok_or(LogicalExecutionActorError::WrongExecution)
-                .and_then(|attempt| {
-                    verify_actor_activation(attempt.activation, activation)?;
-                    Ok(attempt.accepted_failure.clone())
-                });
-            let _ = reply.send(result);
-        }
         ActorCommand::Snapshot { reply } => {
             let _ = reply.send(Ok(LogicalExecutionActorSnapshot {
                 phase: state.phase(),
@@ -5849,7 +5941,7 @@ fn new_attempt_ledgers(
         attempt_obligation: Some(attempt_obligation),
         active_resources,
         pre_ready_observation: None,
-        accepted_failure: None,
+        accepted_failure: AcceptedAttemptFailurePublisher::new(activation),
     })
 }
 
@@ -6104,10 +6196,7 @@ fn remember_accepted_attempt_input(
     if let Some(attempt) = attempts.get_mut(&activation.execution())
         && attempt.activation == activation
     {
-        attempt.accepted_failure = Some(crate::api::AcceptedAttemptFailure {
-            activation,
-            input: input.clone(),
-        });
+        attempt.accepted_failure.publish(input);
     }
 }
 
@@ -11529,17 +11618,26 @@ mod tests {
                 },
             ));
             let original_activation = running.identity();
-            let before_acceptance = actor
-                .accepted_attempt_failure(original_activation)
+            let accepted_view = running.accepted_failure_view();
+            let original_lifetime = Arc::downgrade(running.lifetime.as_ref().unwrap());
+            let before_acceptance = accepted_view.snapshot(original_activation).unwrap();
+            let original_input = original.execution_failure().unwrap();
+            let earlier = QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                original_input.fact(),
+                SafeDetail::truncating("the same original actor's earlier accepted detail"),
+                original_input.site(),
+            ));
+            running
+                .freeze_result_attempt_failure(earlier.clone())
                 .await
                 .unwrap();
+            let earlier_snapshot = accepted_view.snapshot(original_activation).unwrap();
             running
                 .freeze_result_attempt_failure(original.clone())
                 .await
                 .unwrap();
-            let accepted = actor
-                .accepted_attempt_failure(original_activation)
-                .await
+            let accepted = accepted_view
+                .snapshot(original_activation)
                 .unwrap()
                 .map(|failure| (failure.activation, failure.input));
             let foreign_activation = AttemptActivationIdentity::from_parts(
@@ -11547,7 +11645,7 @@ mod tests {
                 first,
                 original_activation.generation() + 1,
             );
-            let foreign = actor.accepted_attempt_failure(foreign_activation).await;
+            let foreign = accepted_view.snapshot(foreign_activation);
             let qualification = actor
                 .begin_replacement_with_error(
                     running,
@@ -11559,9 +11657,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let retained_during_replacement = actor
-                .accepted_attempt_failure(original_activation)
-                .await
+            let retained_during_replacement = accepted_view
+                .snapshot(original_activation)
                 .unwrap()
                 .map(|failure| (failure.activation, failure.input));
             let mut successor_failure = None;
@@ -11589,9 +11686,9 @@ mod tests {
                     .activate(activation.await.unwrap().ready())
                     .await
                     .unwrap();
-                successor_failure = actor
-                    .accepted_attempt_failure(successor.identity())
-                    .await
+                successor_failure = successor
+                    .accepted_failure_view()
+                    .snapshot(successor.identity())
                     .unwrap();
                 if outcome == 1 {
                     actor.fail_attempt(successor).await.unwrap();
@@ -11635,14 +11732,32 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), scope.wait_released())
                 .await
                 .expect("the original work scope releases after actor exit");
+            // The view remains readable after actual actor/Work exit. It must
+            // not retain PermitLifetime, a mailbox or the original Root.
+            let after_actor_exit = accepted_view
+                .snapshot(original_activation)
+                .unwrap()
+                .map(|failure| (failure.activation, failure.input));
+            assert!(original_lifetime.upgrade().is_none());
             // Assert the metadata only after the original actor and Work exit.
             assert!(before_acceptance.is_none());
+            assert_eq!(
+                earlier_snapshot.as_ref().map(|failure| &failure.input),
+                earlier.execution_failure()
+            );
+            // The same serialized author may update its accepted pure input;
+            // the view is not a first-Some latch or a OnceLock.
+            assert_ne!(
+                earlier_snapshot.as_ref().map(|failure| &failure.input),
+                original.execution_failure()
+            );
             let expected = Some((
                 original_activation,
                 original.execution_failure().unwrap().clone(),
             ));
             assert_eq!(accepted, expected);
             assert_eq!(retained_during_replacement, expected);
+            assert_eq!(after_actor_exit, expected);
             assert!(matches!(
                 foreign,
                 Err(LogicalExecutionActorError::StaleAuthority)
@@ -12379,7 +12494,7 @@ mod tests {
                 attempt_obligation: None,
                 active_resources: None,
                 pre_ready_observation: None,
-                accepted_failure: None,
+                accepted_failure: AcceptedAttemptFailurePublisher::new(activation),
             }
         };
         let mut attempts = BTreeMap::from([
@@ -13131,6 +13246,11 @@ mod tests {
                 establish_per_participation: config.max_establish_authorizations_per_participation,
                 abort_per_participation: config.max_abort_authorizations_per_participation,
             },
+            attempts
+                .get(&activation.execution())
+                .unwrap()
+                .accepted_failure
+                .view(),
         );
         let mut establish_error = None;
         let mut stand_down_error = None;
