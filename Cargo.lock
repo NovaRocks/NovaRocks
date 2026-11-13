@@ -3437,6 +3437,7 @@ dependencies = [
  "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-sql-testkit",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-value-arrays",
@@ -4122,6 +4123,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "novarocks-sql-testkit"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-functions",
+ "novarocks-parser",
+ "novarocks-physical-plan",
+ "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-types",
 ]
 
 [[package]]
