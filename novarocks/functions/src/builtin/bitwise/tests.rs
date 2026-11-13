@@ -800,3 +800,5 @@ fn allocation_representability_overflow_precedes_any_selected_row_read() {
         }
     }
 }
+
+mod shared_core;

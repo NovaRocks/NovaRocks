@@ -497,5 +497,4 @@ fn generic_legacy(
 }
 
 #[cfg(test)]
-#[path = "nullif_tests.rs"]
 mod tests;

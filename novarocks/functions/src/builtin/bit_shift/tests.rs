@@ -882,3 +882,5 @@ fn signed_minimum_bits_wrap_only_at_the_widened_width() {
         );
     }
 }
+
+mod shared_core;

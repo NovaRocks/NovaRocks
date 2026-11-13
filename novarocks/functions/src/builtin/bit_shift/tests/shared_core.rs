@@ -15,13 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual observer refusal points for the shared loop/materializers.
-use super::*;
-use crate::{KernelDiagnostic, ScalarEvaluationInstance, Selection};
-use novarocks_type_contract::ValueLogicalType;
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use super::super::*;
+use crate::{KernelDiagnostic, ScalarEvaluationInstance};
+use std::{sync::Mutex, time::Duration};
 #[derive(Default)]
 struct Trace {
     calls: Mutex<Vec<u32>>,
@@ -41,7 +37,7 @@ impl KernelEvaluationControl for Trace {
         Ok(())
     }
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
-        panic!("bitwise calls must not wait")
+        panic!("shifts must not wait")
     }
 }
 fn causes() -> [KernelFailure; 7] {
@@ -56,7 +52,7 @@ fn causes() -> [KernelFailure; 7] {
     ]
 }
 #[test]
-fn shared_bitwise_all_20_profiles_preserve_all_seven_actual_causes_and_failed_latch() {
+fn shared_shift_all_profiles_preserve_all_seven_actual_checkpoint_causes_and_latch() {
     let profiles: Vec<(FunctionValueType, ArrayRef)> = vec![
         (
             FunctionValueType::new(DataType::Int8, false),
@@ -72,7 +68,7 @@ fn shared_bitwise_all_20_profiles_preserve_all_seven_actual_causes_and_failed_la
         ),
         (
             FunctionValueType::new(DataType::Int64, false),
-            Arc::new(arrow_array::Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![1])),
         ),
         (
             FunctionValueType::try_with_logical_type(
@@ -84,35 +80,46 @@ fn shared_bitwise_all_20_profiles_preserve_all_seven_actual_causes_and_failed_la
             crate::largeint::array_from_i128(&[Some(1)]).unwrap(),
         ),
     ];
-    let selection = Selection::all(513);
-    for name in ["bitand", "bitor", "bitxor", "bitnot"] {
-        for (source, values) in &profiles {
-            let arity = if name == "bitnot" { 1 } else { 2 };
-            let types = vec![source.clone(); arity];
-            let args = vec![EvaluatedArgument::Scalar(values); arity];
+    let right: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let selection = crate::Selection::all(513);
+    for name in [
+        "bit_shift_left",
+        "bit_shift_right",
+        "bit_shift_right_logical",
+    ] {
+        for (source, left) in &profiles {
+            let types = [
+                source.clone(),
+                FunctionValueType::new(DataType::Int64, false),
+            ];
+            let args = [
+                EvaluatedArgument::Scalar(left),
+                EvaluatedArgument::Scalar(&right),
+            ];
             let prepare = || {
                 ScalarEvaluationInstance::instantiate(
-                    super::super::bitwise_owner::prepared_for_test(name, &types).unwrap(),
+                    super::super::super::bit_shift_owner::prepared_for_test(name, &types).unwrap(),
                 )
                 .unwrap()
             };
             let mut baseline = prepare();
             let trace = Trace::default();
             baseline.evaluate(selection, &args, &trace).unwrap();
-            let calls = trace.calls.lock().unwrap().clone();
-            assert!(calls.contains(&256));
+            let count = trace.calls.lock().unwrap().len();
+            assert!(trace.calls.lock().unwrap().contains(&256));
             for cause in causes() {
-                for at in 0..calls.len() {
+                for at in 0..count {
                     let mut instance = prepare();
-                    let refusal = Trace {
-                        calls: Mutex::new(Vec::new()),
+                    let failure = Trace {
+                        calls: Mutex::default(),
                         refusal: Some((at, cause.clone())),
                     };
                     assert_eq!(
-                        instance.evaluate(selection, &args, &refusal).unwrap_err(),
-                        cause
+                        instance.evaluate(selection, &args, &failure).unwrap_err(),
+                        cause,
+                        "{name} {source:?} checkpoint {at}"
                     );
-                    assert_eq!(refusal.calls.lock().unwrap().as_slice(), &calls[..=at]);
+                    assert_eq!(failure.calls.lock().unwrap().len(), at + 1);
                     let after = Trace::default();
                     assert_eq!(
                         instance.evaluate(selection, &args, &after).unwrap_err(),
@@ -123,4 +130,14 @@ fn shared_bitwise_all_20_profiles_preserve_all_seven_actual_causes_and_failed_la
             }
         }
     }
+}
+#[test]
+fn shared_bit_array_default_safe_conversion_keeps_invalid_rows_null() {
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    let source: ArrayRef =
+        std::sync::Arc::new(StringArray::from(vec![Some("-42"), Some("invalid"), None]));
+    assert_eq!(
+        crate::bit_array::to_i64_array(&source, 1).unwrap(),
+        Int64Array::from(vec![Some(-42), None, None])
+    );
 }

@@ -272,10 +272,6 @@ impl ScalarKernelInstance for NullifInstance {
     }
 }
 
-#[cfg(test)]
-#[path = "nullif_owner_tests.rs"]
-mod tests;
-
 impl NullifOwner {
     fn refine_selected_core(
         &self,
@@ -358,3 +354,6 @@ impl NullifOwner {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;

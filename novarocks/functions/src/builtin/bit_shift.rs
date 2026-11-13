@@ -272,9 +272,4 @@ fn output_capacity(rows: usize, width: usize) -> Result<(), KernelFailure> {
 }
 
 #[cfg(test)]
-#[path = "bit_shift_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "bit_shift_shared_core_tests.rs"]
-mod shared_core_tests;
