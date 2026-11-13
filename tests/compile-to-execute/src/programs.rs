@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Single real SQL source, its exact source-journal effects, package extraction,
-//! installed provider contract fixture, LocalCompiler and the actual Frame.
+//! SQL-authored package extraction and LocalCompiler inputs.
+//! These fixtures stop at LocalProgram; runtime assertions live in tests/it.
 //! This fixture does not execute a connector or claim a host memory grant.
 use arrow::{
     array::ArrayRef,

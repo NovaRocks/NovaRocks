@@ -16,7 +16,6 @@
 // under the License.
 
 //! Actual SQL author -> native package -> LocalCompiler -> mutable Frame.
-//! New fixtures are UNRUN until the root's serialized Execution test window.
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;

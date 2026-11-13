@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Permanent real SQL package and LocalCompiler complete Filter consumer contract.
+//! Real SQL package extraction and LocalCompiler results for seam consumers.
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_connector_contract::*;
 use novarocks_functions::*;

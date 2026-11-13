@@ -18,7 +18,7 @@
 // Chain inputs and their SQL-to-runtime assertions live in compile-to-execute.
 // Remove this bridge after the remaining consumers migrate.
 pub(super) use novarocks_test_compile_to_execute::programs::{
-    batch, frozen_reads_with_explicit_source_shape, producer_root, programs,
-    programs_with_catalogue, programs_with_catalogue_and_original_inlist_source,
+    batch, producer_root, programs, programs_with_catalogue,
+    programs_with_catalogue_and_original_inlist_source,
     programs_with_catalogue_and_original_scan_residuals,
 };
