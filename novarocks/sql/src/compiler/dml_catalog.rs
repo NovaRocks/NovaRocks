@@ -401,6 +401,203 @@ mod tests {
         matches!(node.kind, LogicalPlanKind::Union(_)) || node.children.iter().any(has_union)
     }
 
+    fn numeric_source_assignments(
+        paths: Vec<(
+            Vec<super::super::SqlConstantQueryStep>,
+            super::super::SqlConstantExpressionSite,
+        )>,
+    ) -> Arc<super::super::SqlWriteAssignments> {
+        let control = SqlCompileControl::unbounded();
+        let site = super::super::SqlWriteAssignmentSite::try_new(
+            0,
+            FunctionValueType::new(arrow::datatypes::DataType::Decimal128(18, 9), true),
+            None,
+            &control,
+        )
+        .unwrap();
+        Arc::new(
+            super::super::SqlWriteAssignments::try_new(vec![site].into_boxed_slice(), &control)
+                .unwrap()
+                .with_literal_contexts(
+                    paths
+                        .into_iter()
+                        .map(|(path, site)| {
+                            super::super::SqlWriteLiteralContext::new(path, site, 0)
+                                .with_source_assignment()
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+        )
+    }
+
+    #[test]
+    fn values_constrain_each_decimal_before_mixed_row_type_inference() {
+        use super::super::SqlConstantExpressionSite::ValuesCell;
+        use arrow::datatypes::DataType;
+        let text = "VALUES (123456789.123456789), (CAST(2.5 AS DOUBLE)), (NULL)";
+        let assignments = numeric_source_assignments(
+            (0..3)
+                .map(|row| (vec![], ValuesCell { row, column: 0 }))
+                .collect(),
+        );
+        let analyzed = analyze(
+            prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                .with_write_assignments(assignments)
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        fn values(node: &LogicalPlanNode) -> Option<&crate::planner::payload::PlanValuesNode> {
+            if let LogicalPlanKind::Values(values) = &node.kind
+                && !values.columns.is_empty()
+            {
+                return Some(values);
+            }
+            node.children.iter().find_map(values)
+        }
+        let rows = values(&analyzed.logical_plan).expect("original VALUES source");
+        assert_eq!(
+            rows.columns[0].value_type.data_type(),
+            &DataType::Decimal128(18, 9)
+        );
+        assert!(
+            rows.rows
+                .iter()
+                .all(|row| row[0].value_type.data_type() == &DataType::Decimal128(18, 9))
+        );
+        assert!(matches!(&rows.rows[0][0].kind,
+            ExprKind::Literal(crate::analysis::LiteralValue::Decimal(text))
+            if text.replace('.', "").parse::<i128>().unwrap() == 123456789123456789));
+        assert!(matches!(&rows.rows[1][0].kind,
+            ExprKind::Cast { expr, target: DataType::Decimal128(18, 9), .. }
+            if expr.value_type.data_type() == &DataType::Float64));
+    }
+
+    #[test]
+    fn constant_union_branches_are_typed_before_their_common_type() {
+        use super::super::{SqlConstantExpressionSite::SelectProjection, SqlConstantQueryStep};
+        use arrow::datatypes::DataType;
+        let text = "SELECT 123456789.123456789 UNION ALL SELECT 1e0";
+        let assignments = numeric_source_assignments(vec![
+            (
+                vec![SqlConstantQueryStep::UnionLeft],
+                SelectProjection { column: 0 },
+            ),
+            (
+                vec![SqlConstantQueryStep::UnionRight],
+                SelectProjection { column: 0 },
+            ),
+        ]);
+        let analyzed = analyze(
+            prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                .with_write_assignments(assignments)
+                .unwrap(),
+            &[],
+        )
+        .unwrap();
+        fn union(node: &LogicalPlanNode) -> Option<&crate::planner::logical::LogicalUnionNode> {
+            if let LogicalPlanKind::Union(union) = &node.kind {
+                return Some(union);
+            }
+            node.children.iter().find_map(union)
+        }
+        let union = union(&analyzed.logical_plan).expect("original UNION ALL source");
+        assert!(union.all);
+        assert_eq!(
+            union.output_columns[0].value_type.data_type(),
+            &DataType::Decimal128(18, 9)
+        );
+    }
+
+    #[test]
+    fn typed_literal_array_children_keep_decimal_coefficients_before_common_typing() {
+        use super::super::SqlConstantExpressionSite::ValuesCell;
+        use arrow::datatypes::{DataType, Field};
+        let decimal = DataType::Decimal128(18, 9);
+        for (text, input) in [
+            (
+                "VALUES ([123456789.123456789, 1e0])",
+                DataType::List(Arc::new(Field::new("item", decimal.clone(), true))),
+            ),
+            (
+                "VALUES ([[123456789.123456789, 1e0], [NULL]])",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", decimal.clone(), true))),
+                    true,
+                ))),
+            ),
+        ] {
+            let control = SqlCompileControl::unbounded();
+            let site = super::super::SqlWriteAssignmentSite::try_new(
+                0,
+                FunctionValueType::new(input.clone(), true),
+                None,
+                &control,
+            )
+            .unwrap();
+            let assignments = Arc::new(
+                super::super::SqlWriteAssignments::try_new(vec![site].into_boxed_slice(), &control)
+                    .unwrap()
+                    .with_literal_contexts(
+                        vec![
+                            super::super::SqlWriteLiteralContext::new(
+                                vec![],
+                                ValuesCell { row: 0, column: 0 },
+                                0,
+                            )
+                            .with_source_assignment(),
+                        ]
+                        .into_boxed_slice(),
+                    ),
+            );
+            let analyzed = analyze(
+                prepare(SqlStatementInput::parsed_query(Box::new(query(text))))
+                    .with_write_assignments(assignments)
+                    .unwrap(),
+                &[],
+            )
+            .unwrap();
+            fn values(node: &LogicalPlanNode) -> Option<&crate::planner::payload::PlanValuesNode> {
+                if let LogicalPlanKind::Values(values) = &node.kind
+                    && !values.columns.is_empty()
+                {
+                    return Some(values);
+                }
+                node.children.iter().find_map(values)
+            }
+            let values = values(&analyzed.logical_plan).expect("original literal VALUES");
+            let expected = FunctionValueType::new(input, true);
+            assert!(
+                values.columns[0]
+                    .value_type
+                    .same_physical_binding_ignoring_nullability_observed(&expected, || Ok::<
+                        _,
+                        std::convert::Infallible,
+                    >(
+                        ()
+                    ),)
+                    .unwrap()
+            );
+            // Inspect the real constructor, not a whole-array CAST that could
+            // conceal a Float64 common element. Explicit scalar casts remain.
+            fn literal_arrays(expression: &crate::analysis::TypedExpr) -> bool {
+                match &expression.kind {
+                    ExprKind::FunctionCall { name, args, .. } if name == "__array_literal" => {
+                        args.iter().all(literal_arrays)
+                    }
+                    ExprKind::Cast { expr, target, .. } => {
+                        !matches!(target, DataType::List(_) | DataType::LargeList(_))
+                            && literal_arrays(expr)
+                    }
+                    _ => true,
+                }
+            }
+            assert!(literal_arrays(&values.rows[0][0]));
+        }
+    }
+
     #[test]
     fn typed_write_assignment_cast_stays_outside_source_distinct_union_and_limit() {
         use arrow::datatypes::DataType;

@@ -205,6 +205,15 @@ impl<'a> super::AnalyzerContext<'a> {
             None => self.analyze_expr_impl(expr, scope)?,
         };
         self.check_control()?;
+        let resolved = match self
+            .materialized_values
+            .and_then(|source| source.write_assignment_at(expr))
+        {
+            // Analyze the whole cell, including its explicit CAST, before
+            // applying its producer-authored ordinary assignment.
+            Some(site) => self.bind_write_assignment_value(resolved, site, expr.span())?,
+            None => resolved,
+        };
         // Borrow only this root's original authored binding. Child analysis has
         // already used this same recursion; do not rescan or rebind its graph.
         let binding = match &resolved.kind {

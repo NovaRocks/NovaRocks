@@ -985,6 +985,28 @@ pub(crate) fn attach_write_literal_contexts(
 > {
     use novarocks_sql::compiler::{SqlCompileError, SqlConstantQueryStep};
     use novarocks_type_contract::PureCompileControl;
+    if source_assignment_before_common_type(query) {
+        let mut contexts = Vec::new();
+        for site in assignments.sites() {
+            append_write_literal_sites(
+                &query.body,
+                site.output_ordinal(),
+                site.output_ordinal(),
+                &mut Vec::new(),
+                &mut contexts,
+                control,
+                true,
+            )?;
+        }
+        let assignments = std::sync::Arc::try_unwrap(assignments).map_err(|_| {
+            SqlCompileError::InvalidRequest(
+                "INSERT source assignments require their original declaration owner".into(),
+            )
+        })?;
+        return Ok(std::sync::Arc::new(
+            assignments.with_literal_contexts(contexts.into_boxed_slice()),
+        ));
+    }
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(assignments);
     };
@@ -1077,6 +1099,7 @@ pub(crate) fn attach_write_literal_contexts(
             &mut path,
             &mut contexts,
             control,
+            source_assignment_before_common_type(subquery),
         )?;
     }
     if contexts.is_empty() {
@@ -1091,6 +1114,48 @@ pub(crate) fn attach_write_literal_contexts(
         assignments.with_literal_contexts(contexts.into_boxed_slice()),
     ))
 }
+/// Keep early assignment within the original literal INSERT sources. Source
+/// controls retain their independent inference above this boundary.
+fn source_assignment_before_common_type(query: &ast::Query) -> bool {
+    if query.with.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+    {
+        return false;
+    }
+    fn eligible(body: &ast::SetExpr) -> bool {
+        match body {
+            ast::SetExpr::Values(_) => true,
+            ast::SetExpr::Select(select) => {
+                select.from.is_empty()
+                    && !matches!(select.quantifier, ast::SelectQuantifier::Distinct { .. })
+                    && select.selection.is_none()
+                    && matches!(select.group_by, ast::GroupBy::None)
+                    && select.having.is_none()
+                    && select.qualify.is_none()
+                    && select.windows.is_empty()
+                    && select.projection.iter().all(|item| match item {
+                        ast::SelectItem::UnnamedExpr(expr)
+                        | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                            super::command::is_literal_expr(expr)
+                        }
+                        _ => false,
+                    })
+            }
+            ast::SetExpr::Query(query) => source_assignment_before_common_type(query),
+            ast::SetExpr::SetOperation(operation) => {
+                matches!(operation.operator, ast::SetOperator::Union)
+                    && operation.quantifier == ast::SetQuantifier::All
+                    && eligible(&operation.left)
+                    && eligible(&operation.right)
+            }
+        }
+    }
+    eligible(&query.body)
+}
+
 fn append_write_literal_sites(
     body: &ast::SetExpr,
     source_ordinal: usize,
@@ -1098,6 +1163,7 @@ fn append_write_literal_sites(
     path: &mut Vec<novarocks_sql::compiler::SqlConstantQueryStep>,
     contexts: &mut Vec<novarocks_sql::compiler::SqlWriteLiteralContext>,
     control: &novarocks_sql::compiler::SqlCompileControl,
+    assignment_before_common_type: bool,
 ) -> Result<(), novarocks_sql::compiler::SqlCompileError> {
     use novarocks_sql::compiler::{
         SqlConstantExpressionSite as Site, SqlConstantQueryStep as Step, SqlWriteLiteralContext,
@@ -1110,14 +1176,19 @@ fn append_write_literal_sites(
                 if source_ordinal >= values.len() {
                     continue;
                 }
-                contexts.push(SqlWriteLiteralContext::new(
+                let context = SqlWriteLiteralContext::new(
                     path.clone(),
                     Site::ValuesCell {
                         row,
                         column: source_ordinal,
                     },
                     output_ordinal,
-                ));
+                );
+                contexts.push(if assignment_before_common_type {
+                    context.with_source_assignment()
+                } else {
+                    context
+                });
             }
         }
         ast::SetExpr::Select(select) => {
@@ -1128,13 +1199,18 @@ fn append_write_literal_sites(
                 )
             }) && source_ordinal < select.projection.len()
             {
-                contexts.push(SqlWriteLiteralContext::new(
+                let context = SqlWriteLiteralContext::new(
                     path.clone(),
                     Site::SelectProjection {
                         column: source_ordinal,
                     },
                     output_ordinal,
-                ));
+                );
+                contexts.push(if assignment_before_common_type {
+                    context.with_source_assignment()
+                } else {
+                    context
+                });
             }
         }
         ast::SetExpr::Query(query) => {
@@ -1146,6 +1222,7 @@ fn append_write_literal_sites(
                 path,
                 contexts,
                 control,
+                assignment_before_common_type,
             )?;
             path.pop();
         }
@@ -1162,6 +1239,7 @@ fn append_write_literal_sites(
                     path,
                     contexts,
                     control,
+                    assignment_before_common_type,
                 )?;
                 path.pop();
             }

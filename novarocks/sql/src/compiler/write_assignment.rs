@@ -153,6 +153,7 @@ pub struct SqlWriteLiteralContext {
     pub(crate) body_path: Box<[super::SqlConstantQueryStep]>,
     pub(crate) site: super::SqlConstantExpressionSite,
     pub(crate) output_ordinal: usize,
+    pub(crate) assignment_before_common_type: bool,
 }
 impl SqlWriteLiteralContext {
     pub fn new(
@@ -164,7 +165,16 @@ impl SqlWriteLiteralContext {
             body_path: body_path.into_boxed_slice(),
             site,
             output_ordinal,
+            assignment_before_common_type: false,
         }
+    }
+
+    /// Apply an eligible INSERT cell's ordinary assignment before VALUES or
+    /// UNION ALL infers a common type. Required checks and Fixed byte
+    /// normalization remain with the selected write construction.
+    pub fn with_source_assignment(mut self) -> Self {
+        self.assignment_before_common_type = true;
+        self
     }
 }
 impl SqlWriteAssignments {

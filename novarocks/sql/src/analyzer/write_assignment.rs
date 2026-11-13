@@ -115,6 +115,140 @@ impl super::AnalyzerContext<'_> {
     }
 }
 
+/// Preserve the original literal constructor's child target context. The
+/// complete child declarations come from the same signed W/T author; this walk
+/// grants no constructor kernel or cast capability and never enters an explicit
+/// CAST or explicitly typed ARRAY.
+fn register_literal_assignments<'a>(
+    expression: &'a novarocks_parser::ast::Expr,
+    assignment: std::borrow::Cow<'a, SqlWriteAssignmentSite>,
+    source: &mut crate::compiler::materialized_values::MaterializedSourceBorrow<'a>,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<(), AnalyzeError> {
+    use arrow::datatypes::DataType;
+    use novarocks_parser::{ast, printer};
+    use novarocks_type_contract::ValueLogicalType;
+    control
+        .checkpoint(CompilePhase::Validate, 1)
+        .map_err(AnalyzeError::control)?;
+    if let ast::Expr::Nested(nested) = expression {
+        return register_literal_assignments(&nested.expression, assignment, source, control);
+    }
+    // A carrier cannot authorize child semantics for a nominal domain.
+    if assignment.input().logical_type() == ValueLogicalType::Physical {
+        let child = |ordinal| -> Result<SqlWriteAssignmentSite, AnalyzeError> {
+            control
+                .checkpoint(CompilePhase::Validate, 1)
+                .map_err(AnalyzeError::control)?;
+            let input = assignment.input().child_at(ordinal).ok_or_else(|| {
+                AnalyzeError::internal("literal assignment lost its signed input child")
+            })?;
+            let storage = assignment
+                .storage()
+                .map(|storage| {
+                    control
+                        .checkpoint(CompilePhase::Validate, 1)
+                        .map_err(AnalyzeError::control)?;
+                    storage.child_at(ordinal).ok_or_else(|| {
+                        AnalyzeError::internal("literal assignment lost its signed storage child")
+                    })
+                })
+                .transpose()?;
+            SqlWriteAssignmentSite::try_new(assignment.output_ordinal(), input, storage, control)
+                .map_err(original_analysis_error)
+        };
+        let mut visit = |value, ordinal| {
+            register_literal_assignments(
+                value,
+                std::borrow::Cow::Owned(child(ordinal)?),
+                source,
+                control,
+            )
+        };
+        match expression {
+            ast::Expr::Array(array)
+                if array.element_type.is_none()
+                    && matches!(
+                        assignment.input().data_type(),
+                        DataType::List(_) | DataType::LargeList(_)
+                    ) =>
+            {
+                for value in &array.elements {
+                    visit(value, 0)?;
+                }
+            }
+            ast::Expr::Map(map) if matches!(assignment.input().data_type(), DataType::Map(..)) => {
+                for entry in &map.entries {
+                    visit(&entry.key, 0)?;
+                    visit(&entry.value, 1)?;
+                }
+            }
+            ast::Expr::Tuple(tuple) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == tuple.expressions.len()) => {
+                for (ordinal, value) in tuple.expressions.iter().enumerate() {
+                    visit(value, ordinal)?;
+                }
+            }
+            ast::Expr::Struct(structure) if matches!(assignment.input().data_type(), DataType::Struct(fields) if fields.len() == structure.fields.len()) => {
+                for (ordinal, field) in structure.fields.iter().enumerate() {
+                    visit(&field.value, ordinal)?;
+                }
+            }
+            ast::Expr::FunctionCall(function)
+                if matches!(function.quantifier, ast::FunctionQuantifier::None)
+                    && function.order_by.is_empty()
+                    && function.separator.is_none()
+                    && function.filter.is_none()
+                    && function.null_treatment.is_none()
+                    && function.over.is_none() =>
+            {
+                // These are only the original INSERT literal syntax forms.
+                // Normal analysis still resolves or rejects the actual call.
+                match (
+                    printer::print_object_name(&function.name)
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    assignment.input().data_type(),
+                ) {
+                    ("array", DataType::List(_) | DataType::LargeList(_)) => {
+                        for value in &function.arguments {
+                            visit(value, 0)?;
+                        }
+                    }
+                    ("row", DataType::Struct(fields))
+                        if fields.len() == function.arguments.len() =>
+                    {
+                        for (ordinal, value) in function.arguments.iter().enumerate() {
+                            visit(value, ordinal)?;
+                        }
+                    }
+                    ("named_struct", DataType::Struct(fields))
+                        if fields.len() * 2 == function.arguments.len() =>
+                    {
+                        for (ordinal, pair) in
+                            function.arguments.as_chunks::<2>().0.iter().enumerate()
+                        {
+                            visit(&pair[1], ordinal)?;
+                        }
+                    }
+                    ("map", DataType::Map(..)) if function.arguments.len() % 2 == 0 => {
+                        for pair in function.arguments.as_chunks::<2>().0 {
+                            visit(&pair[0], 0)?;
+                            visit(&pair[1], 1)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // An explicit CAST or typed ARRAY owns its whole source inference.
+            // The containing cell still receives its ordinary outer assignment.
+            _ => {}
+        }
+    }
+    source
+        .insert_write_assignment(expression, assignment, control)
+        .map_err(original_analysis_error)
+}
+
 fn original_analysis_error(error: SqlCompileError) -> AnalyzeError {
     use novarocks_type_contract::CompileControlError;
     match error {
@@ -135,7 +269,7 @@ fn original_analysis_error(error: SqlCompileError) -> AnalyzeError {
 
 pub(super) fn materialize_write_literal_contexts<'a>(
     query: &'a novarocks_parser::ast::Query,
-    assignments: &crate::compiler::SqlWriteAssignments,
+    assignments: &'a crate::compiler::SqlWriteAssignments,
     source: &mut crate::compiler::materialized_values::MaterializedSourceBorrow<'a>,
     policy: novarocks_functions::ConstantPolicy,
     control: &crate::compiler::SqlCompileControl,
@@ -160,6 +294,14 @@ pub(super) fn materialize_write_literal_contexts<'a>(
             .ok_or_else(|| {
                 AnalyzeError::internal("literal context refers to an absent write assignment")
             })?;
+        if hint.assignment_before_common_type {
+            register_literal_assignments(
+                expression,
+                std::borrow::Cow::Borrowed(target),
+                source,
+                control,
+            )?;
+        }
         context_literal(expression, target.input(), source, policy, control)?;
     }
     work.finish().map_err(AnalyzeError::control)
