@@ -780,6 +780,19 @@ fn value_bindings_match_ignoring_root_nullability(
     left.same_value_domain(right) && left.typed_binding().layout() == right.typed_binding().layout()
 }
 
+/// A write assignment keeps its actual source declaration separately from the
+/// target requirement. Its constructing operator checks required values before
+/// publishing the exact target carrier; every fact except NULL remains exact.
+fn write_assignment_bindings_match(left: &crate::ValueType, right: &crate::ValueType) -> bool {
+    left.typed_binding()
+        .borrowed()
+        .same_physical_binding_ignoring_nullability_observed(
+            right.typed_binding().borrowed(),
+            || Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap_or(false)
+}
+
 /// Borrow a canonical primitive requirement without allocating a fake source
 /// FunctionValueType, semantic holder or layout projection for comparison.
 fn value_binding_is_primitive(

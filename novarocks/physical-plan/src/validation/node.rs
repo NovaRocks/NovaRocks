@@ -1518,13 +1518,11 @@ pub(crate) fn validate_node_semantics(
                 }
                 match fragment.values().get(&field.input) {
                     // A field states the type its target accepts, and the
-                    // value it reads must have that data type. Either side
-                    // may admit more nulls; whether this row can be written
-                    // is the target's answer when the row reaches it.
+                    // value it reads must have the same complete shape. NULL
+                    // differences are row obligations of the constructing
+                    // writer projection, before Provider I/O.
                     Some(value)
-                        if !super::value_bindings_match_ignoring_root_nullability(
-                            &value.ty, &field.ty,
-                        ) =>
+                        if !super::write_assignment_bindings_match(&value.ty, &field.ty) =>
                     {
                         errors.push(ValidationError::new(
                             path,
@@ -2202,10 +2200,7 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(output),
                             fragment.expressions().get(*expression),
                         )
-                        && (!super::value_bindings_match_ignoring_root_nullability(
-                            &output.ty,
-                            &expression.ty,
-                        ) || (expression.ty.nullable() && !output.ty.nullable()))
+                        && !super::write_assignment_bindings_match(&output.ty, &expression.ty)
                     {
                         errors.push(ValidationError::new(
                             path,

@@ -22,7 +22,7 @@ use std::sync::Arc;
 mod staged_paths;
 pub(crate) use staged_paths::{CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal};
 
-use super::write_adaptation::adapt_batch;
+use super::write_adaptation::{WriteAdaptationError, adapt_batch};
 use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
@@ -322,7 +322,9 @@ pub async fn write_record_batches(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<StagedDataFile>, String> {
-    write_record_batches_with_journal(ctx, batches, None).await
+    write_record_batches_with_journal(ctx, batches, None)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Actual BE writer path: its stable original inventory precedes every SDK
@@ -331,14 +333,14 @@ pub(crate) async fn write_record_batches_journaled(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
     journal: &StagedPathJournal,
-) -> Result<Vec<StagedDataFile>, String> {
+) -> Result<Vec<StagedDataFile>, WriteAdaptationError> {
     write_record_batches_with_journal(ctx, batches, Some(journal)).await
 }
 async fn write_record_batches_with_journal(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
     journal: Option<&StagedPathJournal>,
-) -> Result<Vec<StagedDataFile>, String> {
+) -> Result<Vec<StagedDataFile>, WriteAdaptationError> {
     let data_file_builder = ctx.data_file_writer_builder(journal)?;
     // Parquet checks its row-group byte threshold between RecordBatch writes.
     // The SQL sink can hand us a much larger batch, so preserve the configured
@@ -956,7 +958,7 @@ mod tests {
                 value.to_string(),
             )]))
             .expect_err("invalid row-group byte limit must fail");
-            assert!(error.contains("positive byte count"));
+            assert!(error.to_string().contains("positive byte count"));
         }
     }
 
@@ -1715,7 +1717,10 @@ mod tests {
         ]));
 
         let error = adapt_batch(&source, &annotated_schema).expect_err("missing projected column");
-        assert!(error.contains("column count mismatch"), "{error}");
+        assert!(
+            error.to_string().contains("column count mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1745,7 +1750,10 @@ mod tests {
 
         let error =
             adapt_batch(&source, &annotated_schema).expect_err("unprojected dropped column");
-        assert!(error.contains("column count mismatch"), "{error}");
+        assert!(
+            error.to_string().contains("column count mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1766,8 +1774,9 @@ mod tests {
 
         let err = adapt_batch(&source, &annotated_schema).expect_err("count mismatch");
 
+        assert!(matches!(&err, WriteAdaptationError::Contract(_)));
         assert_eq!(
-            err,
+            err.to_string(),
             "Iceberg write adaptation column count mismatch: input=1 target=2"
         );
     }

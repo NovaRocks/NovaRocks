@@ -103,9 +103,8 @@ pub(crate) fn prepare_row_mutation(
             ),
         ));
     }
-    // The strategy rule, the fail-fast write guards it runs first, and the
-    // merge-on-read override for a MERGE that can delete all live in the
-    // provider. A policy rejection here is a denial, not an internal fault.
+    // The strategy rule and its fail-fast write guards live in the provider.
+    // A policy rejection here is a denial, not an internal fault.
     let strategy = match row_mutation_strategy_from_metadata(
         &metadata,
         &request.intent,
@@ -448,9 +447,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::commit::types::{
-        NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW, NOVAROCKS_UPDATE_MODE_MOR,
-    };
     use crate::iceberg::spec::{
         NestedField, Operation, PartitionSpec, PrimitiveType, Schema as IcebergSchema, Snapshot,
         SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
@@ -905,25 +901,22 @@ mod tests {
             .expect("written version identity")
             .token();
         assert!(!contract.uniqueness_tokens().contains(&written));
-        assert_eq!(contract.identity_fields().len(), 4);
+        // MOR appends the file spec/partition roles for delete materialization;
+        // neither changes the original row-uniqueness tuple.
+        assert_eq!(contract.identity_fields().len(), 6);
         assert_eq!(contract.uniqueness_tokens().len(), 3);
     }
 
     #[test]
-    fn update_follows_the_table_write_mode_and_never_widens_nullability() {
+    fn update_uses_merge_on_read_and_never_widens_nullability() {
         let owner = owner();
-        for (props, expected) in [
-            (
-                vec![ROW_LINEAGE_ON],
-                ConnectorRowMutationStrategy::CopyOnWrite,
-            ),
-            (
-                vec![
-                    ROW_LINEAGE_ON,
-                    (NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_MOR),
-                ],
-                ConnectorRowMutationStrategy::MergeOnRead,
-            ),
+        for props in [
+            vec![],
+            vec![ROW_LINEAGE_ON],
+            vec![("novarocks.update.mode", "copy-on-write")],
+            vec![("novarocks.update.mode", "merge-on-read")],
+            vec![("write.update.mode", "copy-on-write")],
+            vec![("novarocks.update.mode", "sideways")],
         ] {
             let handle = PayloadSpec::new(&metadata(FormatVersion::V3, &props)).handle();
             let preparation = prepared(
@@ -933,7 +926,10 @@ mod tests {
                 )
                 .expect("prepare"),
             );
-            assert_eq!(preparation.strategy(), expected);
+            assert_eq!(
+                preparation.strategy(),
+                ConnectorRowMutationStrategy::MergeOnRead
+            );
             let contract = preparation.match_contract();
             // Update accepts Replace, never Insert: no field is widened.
             assert!(!contract.identity_fields()[0].field().is_nullable());
@@ -943,14 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_that_can_delete_is_forced_merge_on_read_even_under_copy_on_write() {
+    fn merge_that_can_delete_uses_merge_on_read_and_preserves_required_fields() {
         let owner = owner();
         let handle = PayloadSpec::new(&metadata(
             FormatVersion::V3,
-            &[
-                ROW_LINEAGE_ON,
-                (NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW),
-            ],
+            &[ROW_LINEAGE_ON, ("novarocks.update.mode", "copy-on-write")],
         ))
         .handle();
         let preparation = prepared(
@@ -1026,9 +1019,8 @@ mod tests {
             )
             .expect("prepare"),
         );
-        // An insert-only merge matches no live row, so it has no copy-on-write
-        // rewrite to express and no bounded selection to activate one with. It
-        // resolves to merge-on-read, whose insert route publishes data files.
+        // An insert-only merge matches no live row. Its merge-on-read insert
+        // route publishes data files while the match fields remain nullable.
         assert_eq!(
             preparation.strategy(),
             ConnectorRowMutationStrategy::MergeOnRead
@@ -1418,7 +1410,8 @@ mod tests {
     #[test]
     fn base_version_and_preparation_payload_strings_are_frozen() {
         let owner = owner();
-        let handle = PayloadSpec::new(&metadata(FormatVersion::V3, &[ROW_LINEAGE_ON])).handle();
+        let metadata = metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]);
+        let handle = PayloadSpec::new(&metadata).handle();
         let preparation = prepared(
             prepare_row_mutation(
                 request(handle, "main", ConnectorRowMutationIntent::Update),
@@ -1426,15 +1419,18 @@ mod tests {
             )
             .expect("prepare"),
         );
-        let expected_base =
-            "iceberg/row-mutation-base/v1/11111111-2222-3333-4444-555555555555/main/none";
+        let expected_base = format!(
+            "iceberg/position-mutation-base/v2/{}/main/none/none/{}",
+            metadata.uuid(),
+            crate::read_snapshot::metadata_identity(&metadata).expect("metadata identity"),
+        );
         assert_eq!(
             preparation.base_version(),
             &ConnectorWriteBaseVersion::try_new(Bytes::from(expected_base)).expect("base version")
         );
         assert_eq!(
             preparation.payload().as_ref(),
-            b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/CopyOnWrite"
+            b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/MergeOnRead"
         );
     }
     fn scalar_integer_metadata_with_older_base_schema(

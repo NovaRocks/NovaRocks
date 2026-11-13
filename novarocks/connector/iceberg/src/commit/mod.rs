@@ -93,10 +93,7 @@ pub use snapshot_lifecycle_helpers::{
     FileSet, build_dv_index, compute_live_snapshot_set, enumerate_files_for_snapshots,
     is_puffin_path, puffin_half_reference_protection,
 };
-pub use types::{
-    CommitOpKind, IcebergUpdateMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW,
-    NOVAROCKS_UPDATE_MODE_MOR, WrittenFile,
-};
+pub use types::{CommitOpKind, WrittenFile};
 pub use validation::{
     ensure_column_id_not_regressed, ensure_default_sort_order_resolvable,
     ensure_equality_delete_single_partition_spec, ensure_iceberg_write_supported,

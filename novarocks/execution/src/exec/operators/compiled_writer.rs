@@ -245,12 +245,18 @@ fn compiled_finish_core(
 pub(crate) struct CompiledWriterProjection {
     program: Arc<LocalProgram>,
     sites: Arc<[ProgramExpressionRootSite]>,
+    value_types: Arc<[WriterProjectionValueTypes]>,
     /// The complete execution projection. Provider requiredness remains an
     /// independent per-row obligation below.
     schema: SchemaRef,
     layout: novarocks_local_program::StaticLayout,
     /// Ordinals of NOT NULL provider fields: each is a row obligation.
     error: Arc<RuntimeErrorState>,
+}
+
+struct WriterProjectionValueTypes {
+    source: novarocks_type_contract::FunctionValueType,
+    requirement: novarocks_type_contract::FunctionValueType,
 }
 
 impl CompiledWriterProjection {
@@ -303,7 +309,8 @@ impl CompiledWriterProjection {
             ));
         }
         let mut sites = Vec::with_capacity(fields.len());
-        for ordinal in 0..fields.len() {
+        let mut value_types = Vec::with_capacity(fields.len());
+        for (ordinal, required) in recipe.draft().input().fields_iter().enumerate() {
             let site = ProgramExpressionRootSite::WriterProjection {
                 node: id,
                 expression: novarocks_local_program::checked_program_ordinal(ordinal)
@@ -326,6 +333,23 @@ impl CompiledWriterProjection {
                     ));
                 }
             }
+            let Some(novarocks_functions::FunctionArgumentType::Value(source)) =
+                program.checked().channels().expressions().definition_type(
+                    novarocks_local_program::ProgramExpressionArena::WriterProjection(id),
+                    projection.expressions[ordinal],
+                )
+            else {
+                return Err(failure::contract(
+                    "writer projection lost its complete source declaration",
+                ));
+            };
+            let requirement = required.execution_type().ok_or_else(|| {
+                failure::contract("writer input lost its original target requirement")
+            })?;
+            value_types.push(WriterProjectionValueTypes {
+                source: source.clone(),
+                requirement: requirement.clone(),
+            });
             sites.push(site);
         }
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
@@ -333,6 +357,7 @@ impl CompiledWriterProjection {
         Ok(Self {
             program,
             sites: Arc::from(sites),
+            value_types: Arc::from(value_types),
             schema,
             layout,
             error,
@@ -345,6 +370,7 @@ impl WriterProjectionFactory for CompiledWriterProjection {
         Box::new(CompiledWriterProjector {
             program: Arc::clone(&self.program),
             sites: Arc::clone(&self.sites),
+            value_types: Arc::clone(&self.value_types),
             schema: Arc::clone(&self.schema),
             layout: self.layout.clone(),
             chunk_schema: None,
@@ -359,6 +385,7 @@ impl WriterProjectionFactory for CompiledWriterProjection {
 struct CompiledWriterProjector {
     program: Arc<LocalProgram>,
     sites: Arc<[ProgramExpressionRootSite]>,
+    value_types: Arc<[WriterProjectionValueTypes]>,
     schema: SchemaRef,
     layout: novarocks_local_program::StaticLayout,
     chunk_schema: Option<ChunkSchemaRef>,
@@ -393,7 +420,7 @@ pub(crate) fn source_loan_test_projector(
     let layout = crate::exec::chunk::typed_fixture::layout(
         schema.clone(),
         &[novarocks_types::SlotId(100)],
-        &[value_type],
+        std::slice::from_ref(&value_type),
     );
     let tracker =
         crate::runtime::mem_tracker::MemTracker::new_root("writer source-loan construction");
@@ -413,6 +440,10 @@ pub(crate) fn source_loan_test_projector(
     let mut projector = CompiledWriterProjector {
         program,
         sites: Arc::from([site]),
+        value_types: Arc::from([WriterProjectionValueTypes {
+            source: value_type.clone(),
+            requirement: value_type,
+        }]),
         schema,
         layout,
         chunk_schema: None,
@@ -465,24 +496,48 @@ impl WriterPageProjection for CompiledWriterProjector {
         let owner = factory.begin_typed_construction(schema)?;
         owner.request(std::alloc::Layout::array::<ArrayRef>(self.sites.len())
             .map_err(|_| ConstructionFailure::from(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+        // This cache is confined to the original input batch. It cannot retain
+        // previous source aliases after their original funding has exited.
+        let mut conversions = novarocks_value_arrays::decode::ValueConversionContext::default();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.sites.len());
-        for (instance, site) in instances.iter_mut().zip(self.sites.iter()) {
-            columns.push(evaluate_chunk_all(instance, *site, chunk, &self.control)?);
+        for (ordinal, ((instance, site), value_types)) in instances
+            .iter_mut()
+            .zip(self.sites.iter())
+            .zip(self.value_types.iter())
+            .enumerate()
+        {
+            let array = evaluate_chunk_all(instance, *site, chunk, &self.control)?;
+            let output = self
+                .layout
+                .value_binding_at(ordinal)
+                .ok_or_else(|| failure::contract("writer output lost its complete declaration"))?;
+            columns.push(crate::exec::node::table_writer::materialize_target_value(
+                &array,
+                value_types.source.typed_binding().borrowed(),
+                crate::exec::node::table_writer::TargetValueDeclaration {
+                    column: ordinal,
+                    name: self.schema.field(ordinal).name(),
+                    requirement: value_types.requirement.typed_binding().borrowed(),
+                    output,
+                    input_rows: None,
+                },
+                &mut conversions,
+                owner.as_ref(),
+                &mut |_| self.control.checkpoint_execution(),
+            )?);
         }
-        crate::exec::node::table_writer::validate_writer_projection_requiredness(
-            &self.schema,
-            &columns,
-        )?;
         let rows = columns.first().map_or(chunk.len(), |array| array.len());
-        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
-            ConstructionFailure,
-            _,
-        >(
+        let storage = chunk
+            .source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+                owner.request(layout)
+            })?;
+        let projected = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
             Arc::clone(schema),
             columns,
             rows,
-            owner.storage_lifetime(),
+            storage,
             |step| owner.observe(0, &[], step),
-        )?)
+        )?;
+        Ok(projected)
     }
 }

@@ -17,19 +17,73 @@
 
 //! Lossless execution-carrier adaptation to an authoritative Iceberg SDK schema.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, DictionaryArray, Int8Array, Int16Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringBuilder, StructArray,
-    make_array,
+    Array, ArrayRef, BinaryArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
+    Int8Array, Int16Array, Int32Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
+    StringBuilder, StructArray, make_array,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_value_arrays::{reachability::SelectionSet, visit_reachable_child_rows_observed};
+
+/// Value failures remain distinct from broken writer contracts until the
+/// production append boundary assigns the connector failure kind.
+#[derive(Debug)]
+pub(crate) enum WriteAdaptationError {
+    ValueWidth {
+        path: String,
+        expected: usize,
+        actual: usize,
+    },
+    RequiredNull {
+        path: String,
+    },
+    Contract(String),
+}
+impl fmt::Display for WriteAdaptationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ValueWidth {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Iceberg write adaptation fixed-width value at `{path}` requires {expected} bytes, got {actual}"
+            ),
+            Self::RequiredNull { path } => write!(
+                f,
+                "Iceberg write adaptation required column `{path}` contains NULL; the upstream writer obligation must reject it before Provider I/O"
+            ),
+            Self::Contract(message) => message.fmt(f),
+        }
+    }
+}
+impl std::error::Error for WriteAdaptationError {}
+impl From<String> for WriteAdaptationError {
+    fn from(message: String) -> Self {
+        Self::Contract(message)
+    }
+}
+impl WriteAdaptationError {
+    pub(crate) fn into_connector_error(self) -> ConnectorError {
+        let kind = match self {
+            Self::ValueWidth { .. } => ConnectorErrorKind::InvalidRequest,
+            Self::RequiredNull { .. } | Self::Contract(_) => ConnectorErrorKind::Internal,
+        };
+        ConnectorError::new(kind, self.to_string())
+    }
+}
 
 /// The target has already been projected into input order by the frozen-schema
 /// owner. This boundary does not resolve fields, fill columns, or cast values.
-pub(super) fn adapt_batch(input: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch, String> {
+pub(super) fn adapt_batch(
+    input: &RecordBatch,
+    target: &SchemaRef,
+) -> Result<RecordBatch, WriteAdaptationError> {
     validate_batch_schema(input.schema().as_ref(), target.as_ref())?;
     let source = input.schema();
     let columns = input
@@ -37,36 +91,16 @@ pub(super) fn adapt_batch(input: &RecordBatch, target: &SchemaRef) -> Result<Rec
         .iter()
         .zip(source.fields())
         .zip(target.fields())
-        .map(|((array, from), to)| {
-            if !from.name().eq_ignore_ascii_case(to.name()) {
-                return Err(format!(
-                    "Iceberg write adaptation field name mismatch: input `{}` target `{}`",
-                    from.name(),
-                    to.name()
-                ));
-            }
-            if !to.is_nullable() && array.null_count() != 0 {
-                return Err(format!(
-                    "Iceberg write adaptation required column `{}` contains NULL",
-                    to.name()
-                ));
-            }
-            let adapted = adapt_array(array, from, to, to.name(), true)?;
-            if !to.is_nullable() && adapted.null_count() != 0 {
-                return Err(format!(
-                    "Iceberg write adaptation required column `{}` contains NULL",
-                    to.name()
-                ));
-            }
-            Ok(adapted)
-        })
+        .map(|((array, from), to)| adapt_array(array, from, to, to.name(), true, None))
         .collect::<Result<Vec<_>, _>>()?;
     RecordBatch::try_new_with_options(
         target.clone(),
         columns,
         &RecordBatchOptions::new().with_row_count(Some(input.num_rows())),
     )
-    .map_err(|error| format!("Iceberg write adaptation batch failed: {error}"))
+    .map_err(|error| {
+        WriteAdaptationError::Contract(format!("Iceberg write adaptation batch failed: {error}"))
+    })
 }
 
 fn nested_nullability(from: &Field, to: &Field, path: &str) -> Result<(), String> {
@@ -86,6 +120,7 @@ enum Adaptation {
     Int8,
     Int16,
     Binary,
+    FixedWidth(i32),
     Timezone,
     Dictionary,
     Struct,
@@ -104,6 +139,14 @@ fn adaptation(
         (DataType::Int8, DataType::Int32) if top_level => Adaptation::Int8,
         (DataType::Int16, DataType::Int32) if top_level => Adaptation::Int16,
         (DataType::Binary, DataType::LargeBinary) => Adaptation::Binary,
+        (DataType::Binary | DataType::FixedSizeBinary(_), DataType::FixedSizeBinary(width)) => {
+            if *width < 0 {
+                return Err(format!(
+                    "Iceberg write adaptation invalid fixed width at `{path}`: {width}"
+                ));
+            }
+            Adaptation::FixedWidth(*width)
+        }
         (DataType::Timestamp(u, None), DataType::Timestamp(v, Some(tz)))
             if u == v && tz.as_ref() == "+00:00" =>
         {
@@ -213,43 +256,160 @@ fn validate_field_schema(
     Ok(())
 }
 
+/// Schemas without fixed values or nested required fields retain the existing
+/// direct path. A top-level requirement is checked without a child selection.
+fn needs_child_rows(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeBinary(_) => true,
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| !field.is_nullable() || needs_child_rows(field.data_type())),
+        DataType::List(field) | DataType::Map(field, _) => {
+            !field.is_nullable() || needs_child_rows(field.data_type())
+        }
+        _ => false,
+    }
+}
+
+fn child_reachable_rows(
+    array: &ArrayRef,
+    reachable: Option<&SelectionSet>,
+    ordinal: usize,
+    child_len: usize,
+) -> Result<SelectionSet, WriteAdaptationError> {
+    let mut selected = SelectionSet::try_new(child_len).map_err(|error| error.to_string())?;
+    // Only value-arrays authors parent validity and actual child offsets.
+    let parent_rows =
+        (0..array.len()).filter(|row| reachable.is_none_or(|rows| rows.contains(*row)));
+    visit_reachable_child_rows_observed(
+        array,
+        parent_rows,
+        &mut |_| Ok::<_, String>(()),
+        &mut |index, rows| {
+            if index == ordinal {
+                for row in rows {
+                    selected.insert(row).map_err(|error| error.to_string())?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(selected)
+}
+
+fn check_required_values(
+    array: &ArrayRef,
+    to: &Field,
+    path: &str,
+    reachable: Option<&SelectionSet>,
+) -> Result<(), WriteAdaptationError> {
+    if !to.is_nullable()
+        && array.null_count() != 0
+        && (0..array.len())
+            .any(|row| reachable.is_none_or(|rows| rows.contains(row)) && array.is_null(row))
+    {
+        return Err(WriteAdaptationError::RequiredNull {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn adapt_fixed_width(
+    array: &ArrayRef,
+    to: &Field,
+    path: &str,
+    width: i32,
+    reachable: Option<&SelectionSet>,
+) -> Result<ArrayRef, WriteAdaptationError> {
+    let expected = usize::try_from(width)
+        .map_err(|_| format!("Iceberg write adaptation invalid fixed width at `{path}`"))?;
+    let mut out = FixedSizeBinaryBuilder::with_capacity(array.len(), width);
+    let placeholder = vec![0u8; expected];
+    for row in 0..array.len() {
+        if array.is_null(row) || reachable.is_some_and(|rows| !rows.contains(row)) {
+            // Inactive required slots must remain constructible even when a
+            // list's full values array contains unreferenced physical NULLs.
+            if array.is_null(row) && to.is_nullable() {
+                out.append_null();
+            } else {
+                out.append_value(&placeholder)
+                    .map_err(|error| error.to_string())?;
+            }
+            continue;
+        }
+        let bytes = match array.data_type() {
+            DataType::Binary => array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("Binary array")
+                .value(row),
+            DataType::FixedSizeBinary(_) => array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("FixedSizeBinary array")
+                .value(row),
+            _ => unreachable!("prepared fixed-width carrier"),
+        };
+        if bytes.len() != expected {
+            return Err(WriteAdaptationError::ValueWidth {
+                path: path.to_owned(),
+                expected,
+                actual: bytes.len(),
+            });
+        }
+        out.append_value(bytes).map_err(|error| error.to_string())?;
+    }
+    Ok(Arc::new(out.finish()))
+}
+
 fn adapt_array(
     array: &ArrayRef,
     from: &Field,
     to: &Field,
     path: &str,
     top_level: bool,
-) -> Result<ArrayRef, String> {
+    reachable: Option<&SelectionSet>,
+) -> Result<ArrayRef, WriteAdaptationError> {
     if !top_level {
         nested_nullability(from, to, path)?;
     }
+    check_required_values(array, to, path, reachable)?;
     let target = to.data_type();
-    match adaptation(array.data_type(), target, path, top_level)? {
-        Adaptation::Identity => Ok(array.clone()),
+    let kind = match (
+        adaptation(array.data_type(), target, path, top_level)?,
+        target,
+    ) {
+        (Adaptation::Identity, DataType::Struct(_)) if needs_child_rows(target) => {
+            Adaptation::Struct
+        }
+        (Adaptation::Identity, DataType::List(_)) if needs_child_rows(target) => Adaptation::List,
+        (Adaptation::Identity, DataType::Map(_, _)) if needs_child_rows(target) => Adaptation::Map,
+        (kind, _) => kind,
+    };
+    let output = match kind {
+        Adaptation::Identity => array.clone(),
         Adaptation::Int8 => {
             let a = array
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .expect("Int8 array");
-            Ok(Arc::new(Int32Array::from_iter(
-                a.iter().map(|v| v.map(i32::from)),
-            )))
+            Arc::new(Int32Array::from_iter(a.iter().map(|v| v.map(i32::from)))) as ArrayRef
         }
         Adaptation::Int16 => {
             let a = array
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .expect("Int16 array");
-            Ok(Arc::new(Int32Array::from_iter(
-                a.iter().map(|v| v.map(i32::from)),
-            )))
+            Arc::new(Int32Array::from_iter(a.iter().map(|v| v.map(i32::from)))) as ArrayRef
         }
         Adaptation::Binary => {
             let a = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("Binary array");
-            Ok(Arc::new(LargeBinaryArray::new(
+            Arc::new(LargeBinaryArray::new(
                 arrow::buffer::OffsetBuffer::new(
                     a.value_offsets()
                         .iter()
@@ -259,8 +419,9 @@ fn adapt_array(
                 ),
                 a.values().clone(),
                 a.nulls().cloned(),
-            )))
+            )) as ArrayRef
         }
+        Adaptation::FixedWidth(width) => adapt_fixed_width(array, to, path, width, reachable)?,
         Adaptation::Timezone => {
             let data = array
                 .to_data()
@@ -270,7 +431,7 @@ fn adapt_array(
                 .map_err(|error| {
                     format!("Iceberg write adaptation timezone label at `{path}` failed: {error}")
                 })?;
-            Ok(make_array(data))
+            make_array(data)
         }
         Adaptation::Dictionary => {
             let dictionary = array
@@ -282,9 +443,6 @@ fn adapt_array(
                     .map_err(|error| {
                         format!("Iceberg write adaptation dictionary at `{path}` failed: {error}")
                     })?;
-            // LargeUtf8 dictionaries are an admitted execution encoding. Convert
-            // their expanded strings explicitly; overflow must be an error, never
-            // truncation or a new NULL from Arrow's relaxed scalar casts.
             let unpacked = if matches!(unpacked.data_type(), DataType::LargeUtf8)
                 && *target == DataType::Utf8
             {
@@ -293,7 +451,7 @@ fn adapt_array(
                 unpacked
             };
             let unpacked_field = from.clone().with_data_type(unpacked.data_type().clone());
-            adapt_array(&unpacked, &unpacked_field, to, path, top_level)
+            adapt_array(&unpacked, &unpacked_field, to, path, top_level, reachable)?
         }
         Adaptation::Struct => {
             let (DataType::Struct(source_fields), DataType::Struct(target_fields)) =
@@ -308,8 +466,14 @@ fn adapt_array(
             if source_fields.len() != target_fields.len() {
                 return Err(format!(
                     "Iceberg write adaptation struct child count mismatch at `{path}`"
-                ));
+                )
+                .into());
             }
+            let rows = if needs_child_rows(target) && !target_fields.is_empty() {
+                Some(child_reachable_rows(array, reachable, 0, a.len())?)
+            } else {
+                None
+            };
             let columns = a
                 .columns()
                 .iter()
@@ -322,17 +486,30 @@ fn adapt_array(
                         target,
                         &format!("{path}.{}", target.name()),
                         false,
+                        rows.as_ref(),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            StructArray::try_new_with_length(
-                target_fields.clone(),
-                columns,
-                a.nulls().cloned(),
-                a.len(),
-            )
-            .map(|a| Arc::new(a) as ArrayRef)
-            .map_err(|error| format!("Iceberg write adaptation struct at `{path}` failed: {error}"))
+            if array.data_type() == target
+                && columns
+                    .iter()
+                    .zip(a.columns())
+                    .all(|(x, y)| Arc::ptr_eq(x, y))
+            {
+                array.clone()
+            } else {
+                Arc::new(
+                    StructArray::try_new_with_length(
+                        target_fields.clone(),
+                        columns,
+                        a.nulls().cloned(),
+                        a.len(),
+                    )
+                    .map_err(|error| {
+                        format!("Iceberg write adaptation struct at `{path}` failed: {error}")
+                    })?,
+                ) as ArrayRef
+            }
         }
         Adaptation::List => {
             let (DataType::List(source), DataType::List(target)) = (array.data_type(), target)
@@ -343,21 +520,34 @@ fn adapt_array(
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .expect("List array");
+            let rows = if !target.is_nullable() || needs_child_rows(target.data_type()) {
+                Some(child_reachable_rows(array, reachable, 0, a.values().len())?)
+            } else {
+                None
+            };
             let values = adapt_array(
                 a.values(),
                 source,
                 target,
                 &format!("{path}.{}", target.name()),
                 false,
+                rows.as_ref(),
             )?;
-            ListArray::try_new(
-                target.clone(),
-                a.offsets().clone(),
-                values,
-                a.nulls().cloned(),
-            )
-            .map(|a| Arc::new(a) as ArrayRef)
-            .map_err(|error| format!("Iceberg write adaptation list at `{path}` failed: {error}"))
+            if source == target && Arc::ptr_eq(&values, a.values()) {
+                array.clone()
+            } else {
+                Arc::new(
+                    ListArray::try_new(
+                        target.clone(),
+                        a.offsets().clone(),
+                        values,
+                        a.nulls().cloned(),
+                    )
+                    .map_err(|error| {
+                        format!("Iceberg write adaptation list at `{path}` failed: {error}")
+                    })?,
+                ) as ArrayRef
+            }
         }
         Adaptation::Map => {
             let (DataType::Map(source, _), DataType::Map(target, target_sorted)) =
@@ -369,28 +559,49 @@ fn adapt_array(
                 .as_any()
                 .downcast_ref::<MapArray>()
                 .expect("Map array");
+            let rows = if needs_child_rows(target.data_type()) {
+                Some(child_reachable_rows(
+                    array,
+                    reachable,
+                    0,
+                    a.entries().len(),
+                )?)
+            } else {
+                None
+            };
+            let original_entries = Arc::new(a.entries().clone()) as ArrayRef;
             let entries = adapt_array(
-                &(Arc::new(a.entries().clone()) as ArrayRef),
+                &original_entries,
                 source,
                 target,
                 &format!("{path}.{}", target.name()),
                 false,
+                rows.as_ref(),
             )?;
-            let entries = entries
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .expect("adapted map entries");
-            MapArray::try_new(
-                target.clone(),
-                a.offsets().clone(),
-                entries.clone(),
-                a.nulls().cloned(),
-                *target_sorted,
-            )
-            .map(|a| Arc::new(a) as ArrayRef)
-            .map_err(|error| format!("Iceberg write adaptation map at `{path}` failed: {error}"))
+            if source == target && Arc::ptr_eq(&entries, &original_entries) {
+                array.clone()
+            } else {
+                let entries = entries
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("adapted map entries");
+                Arc::new(
+                    MapArray::try_new(
+                        target.clone(),
+                        a.offsets().clone(),
+                        entries.clone(),
+                        a.nulls().cloned(),
+                        *target_sorted,
+                    )
+                    .map_err(|error| {
+                        format!("Iceberg write adaptation map at `{path}` failed: {error}")
+                    })?,
+                ) as ArrayRef
+            }
         }
-    }
+    };
+    check_required_values(&output, to, path, reachable)?;
+    Ok(output)
 }
 
 fn checked_utf8_total(total: usize, additional: usize, path: &str) -> Result<usize, String> {
@@ -435,7 +646,7 @@ mod tests {
         )]))
     }
 
-    fn adapt_one(array: ArrayRef, target: Field) -> Result<RecordBatch, String> {
+    fn adapt_one(array: ArrayRef, target: Field) -> Result<RecordBatch, WriteAdaptationError> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             target.name(),
             array.data_type().clone(),
@@ -806,7 +1017,9 @@ mod tests {
         ] {
             let error = adapt_one(array, field("bad", dtype, true, 60)).unwrap_err();
             assert!(
-                error.contains("unsupported Iceberg write adaptation at `bad`"),
+                error
+                    .to_string()
+                    .contains("unsupported Iceberg write adaptation at `bad`"),
                 "{error}"
             );
         }
@@ -824,7 +1037,7 @@ mod tests {
                 DataType::Int32
             };
             let error = adapt_one(array, field("id", dtype, false, 1)).unwrap_err();
-            assert!(error.contains("id"), "{error}");
+            assert!(error.to_string().contains("id"), "{error}");
         }
         // A non-null dictionary key can still select a NULL dictionary value.
         let array: ArrayRef = Arc::new(
@@ -856,7 +1069,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.contains("nested nullability mismatch at `l.element`"),
+            error
+                .to_string()
+                .contains("nested nullability mismatch at `l.element`"),
             "{error}"
         );
         let array: ArrayRef = Arc::new(ListArray::new(
@@ -876,6 +1091,7 @@ mod tests {
                 )
             )
             .unwrap_err()
+            .to_string()
             .contains("l.element")
         );
         let fields: Fields = vec![
@@ -901,7 +1117,7 @@ mod tests {
         ));
         let error =
             adapt_one(array, field("m", DataType::Map(entry_field, true), true, 1)).unwrap_err();
-        assert!(error.contains("at `m`"), "{error}");
+        assert!(error.to_string().contains("at `m`"), "{error}");
     }
 
     #[test]
@@ -914,6 +1130,7 @@ mod tests {
             assert!(
                 checked_utf8_total(total, additional, "s")
                     .unwrap_err()
+                    .to_string()
                     .contains("offsets exceed i32 range at `s`")
             );
         }
@@ -941,7 +1158,7 @@ mod tests {
             )])),
         )
         .unwrap_err();
-        assert!(error.contains("field name mismatch"));
+        assert!(error.to_string().contains("field name mismatch"));
         let output = adapt_batch(
             &input,
             &Arc::new(Schema::new(vec![field("input", DataType::Int32, true, 1)])),
@@ -969,7 +1186,9 @@ mod tests {
         let target_schema = Schema::new(vec![field("s", DataType::Struct(targets), true, 1)]);
         let error = validate_batch_schema(&input_schema, &target_schema).unwrap_err();
         assert!(
-            error.contains("struct field name mismatch at `s.left`"),
+            error
+                .to_string()
+                .contains("struct field name mismatch at `s.left`"),
             "{error}"
         );
         let array = Arc::new(StructArray::new(
@@ -984,7 +1203,248 @@ mod tests {
         assert!(
             adapt_batch(&input, &Arc::new(target_schema))
                 .unwrap_err()
+                .to_string()
                 .contains("struct field name mismatch at `s.left`")
         );
+    }
+    #[test]
+    fn fixed_width_values_preserve_bytes_nulls_and_identical_fixed_arrays() {
+        let input: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(&b"abcdefghijklmnop"[..]),
+            None,
+        ]));
+        let output =
+            adapt_one(input, field("raw", DataType::FixedSizeBinary(16), true, 1)).unwrap();
+        let fixed = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(fixed.value(0), b"abcdefghijklmnop");
+        assert!(fixed.is_null(1));
+        assert_eq!(fixed.value_length(), 16);
+        let original = output.column(0).clone();
+        let same = adapt_one(
+            original.clone(),
+            field("raw", DataType::FixedSizeBinary(16), true, 1),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&original, same.column(0)));
+    }
+
+    #[test]
+    fn fixed_width_preparation_accepts_byte_carriers_and_runtime_preserves_typed_length_failure() {
+        for input in [DataType::Binary, DataType::FixedSizeBinary(3)] {
+            validate_batch_schema(
+                &Schema::new(vec![Field::new("raw", input, true)]),
+                &Schema::new(vec![field("raw", DataType::FixedSizeBinary(4), true, 1)]),
+            )
+            .unwrap();
+        }
+        let mut builder = FixedSizeBinaryBuilder::with_capacity(1, 3);
+        builder.append_value(b"abc").unwrap();
+        let failure = adapt_one(
+            Arc::new(builder.finish()),
+            field("raw", DataType::FixedSizeBinary(4), true, 1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure, WriteAdaptationError::ValueWidth { ref path, expected: 4, actual: 3 } if path == "raw")
+        );
+        let failure = failure.into_connector_error();
+        assert_eq!(failure.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(failure.to_string().contains("requires 4 bytes, got 3"));
+    }
+
+    #[test]
+    fn fixed_width_struct_values_ignore_parent_nulls_and_keep_required_placeholders_valid() {
+        let sources: Fields = vec![Arc::new(Field::new("f", DataType::Binary, false))].into();
+        let input: ArrayRef = Arc::new(
+            StructArray::try_new(
+                sources,
+                vec![Arc::new(BinaryArray::from(vec![&b"abcd"[..], &b""[..]]))],
+                Some(NullBuffer::from(vec![true, false])),
+            )
+            .unwrap(),
+        );
+        let targets: Fields =
+            vec![Arc::new(field("f", DataType::FixedSizeBinary(4), false, 2))].into();
+        let output = adapt_one(input, field("obj", DataType::Struct(targets), true, 1)).unwrap();
+        let structure = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(structure.is_null(1));
+        let fixed = structure
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(fixed.value(0), b"abcd");
+        assert_eq!(fixed.value(1), &[0; 4]);
+        assert!(!fixed.is_null(1));
+        output.column(0).to_data().validate_full().unwrap();
+    }
+
+    #[test]
+    fn fixed_width_sliced_list_only_checks_values_of_visible_non_null_parents() {
+        let values: ArrayRef = Arc::new(BinaryArray::from(vec![
+            &b"bad"[..],
+            &b"abcd"[..],
+            &b"hidden"[..],
+            &b"wxyz"[..],
+            &b"tail"[..],
+        ]));
+        let input: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("item", DataType::Binary, false)),
+                OffsetBuffer::new(vec![0, 1, 2, 3, 4].into()),
+                values,
+                Some(NullBuffer::from(vec![true, true, false, true])),
+            )
+            .unwrap(),
+        );
+        let input = input.slice(1, 3);
+        let target_item = Arc::new(field("element", DataType::FixedSizeBinary(4), false, 2));
+        let output = adapt_one(input, field("l", DataType::List(target_item), true, 1)).unwrap();
+        let list = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[1, 2, 3, 4]);
+        assert!(list.is_null(1));
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), &[0; 4]);
+        assert_eq!(values.value(1), b"abcd");
+        assert_eq!(values.value(2), &[0; 4]);
+        assert_eq!(values.value(3), b"wxyz");
+        assert_eq!(values.value(4), &[0; 4]);
+        assert_eq!(values.null_count(), 0);
+        list.to_data().validate_full().unwrap();
+    }
+
+    #[test]
+    fn fixed_width_sliced_map_keeps_offsets_and_only_converts_referenced_keys_and_values() {
+        let fields: Fields = vec![
+            Arc::new(Field::new("key", DataType::Binary, false)),
+            Arc::new(Field::new("value", DataType::Binary, true)),
+        ]
+        .into();
+        let entries = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    &b"bad"[..],
+                    &b"hidden"[..],
+                    &b"wrong"[..],
+                    &b"key4"[..],
+                    &b"tail"[..],
+                ])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(&b"bad"[..]),
+                    None,
+                    Some(&b"hidden"[..]),
+                    Some(&b"ok"[..]),
+                    Some(&b"tail"[..]),
+                ])),
+            ],
+            None,
+        )
+        .unwrap();
+        let input: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                OffsetBuffer::new(vec![1, 3, 4].into()),
+                entries,
+                Some(NullBuffer::from(vec![false, true])),
+                false,
+            )
+            .unwrap(),
+        );
+        let fields: Fields = vec![
+            Arc::new(field("key", DataType::FixedSizeBinary(4), false, 2)),
+            Arc::new(field("value", DataType::FixedSizeBinary(2), true, 3)),
+        ]
+        .into();
+        let output = adapt_one(
+            input.slice(1, 1),
+            field(
+                "m",
+                DataType::Map(
+                    Arc::new(field("entries", DataType::Struct(fields), false, 4)),
+                    false,
+                ),
+                true,
+                1,
+            ),
+        )
+        .unwrap();
+        let map = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(map.value_offsets(), &[3, 4]);
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(3), b"key4");
+        assert_eq!(keys.value(0), &[0; 4]);
+        assert_eq!(keys.null_count(), 0);
+        let values = map
+            .values()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(3), b"ok");
+        assert!(values.is_null(1));
+        map.to_data().validate_full().unwrap();
+    }
+
+    #[test]
+    fn fixed_width_reachable_nested_mismatch_reports_the_exact_field_path() {
+        let source: Fields = vec![Arc::new(Field::new("f", DataType::Binary, true))].into();
+        let input: ArrayRef = Arc::new(
+            StructArray::try_new(
+                source,
+                vec![Arc::new(BinaryArray::from(vec![Some(&b"xx"[..])]))],
+                None,
+            )
+            .unwrap(),
+        );
+        let target: Fields =
+            vec![Arc::new(field("f", DataType::FixedSizeBinary(4), true, 2))].into();
+        let failure =
+            adapt_one(input, field("obj", DataType::Struct(target), true, 1)).unwrap_err();
+        assert!(
+            matches!(failure,WriteAdaptationError::ValueWidth { ref path, expected:4,actual:2 } if path == "obj.f")
+        );
+    }
+
+    #[test]
+    fn ordinary_same_type_structs_keep_the_original_array_without_child_work() {
+        let fields: Fields = vec![Arc::new(Field::new("n", DataType::Int32, true))].into();
+        let input: ArrayRef = Arc::new(
+            StructArray::try_new(
+                fields.clone(),
+                vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+                Some(NullBuffer::from(vec![true, false])),
+            )
+            .unwrap(),
+        );
+        let output = adapt_one(
+            input.clone(),
+            field("obj", DataType::Struct(fields), true, 1),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&input, output.column(0)));
     }
 }

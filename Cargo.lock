@@ -3285,6 +3285,7 @@ dependencies = [
  "novarocks-test-support",
  "novarocks-type-contract",
  "novarocks-types",
+ "novarocks-value-arrays",
  "opendal",
  "ordered-float",
  "parquet",

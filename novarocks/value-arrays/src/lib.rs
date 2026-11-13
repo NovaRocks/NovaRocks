@@ -62,5 +62,6 @@ pub mod hash_eq;
 pub mod compact;
 
 pub mod hydrate;
+pub use hydrate::visit_reachable_child_rows_observed;
 
 pub mod batch;

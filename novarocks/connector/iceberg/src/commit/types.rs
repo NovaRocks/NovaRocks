@@ -33,33 +33,6 @@ pub enum CommitOpKind {
     OverwritePartitions,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IcebergUpdateMode {
-    CopyOnWrite,
-    MergeOnRead,
-}
-
-impl IcebergUpdateMode {
-    pub fn as_property_value(self) -> &'static str {
-        match self {
-            Self::CopyOnWrite => NOVAROCKS_UPDATE_MODE_COW,
-            Self::MergeOnRead => NOVAROCKS_UPDATE_MODE_MOR,
-        }
-    }
-
-    pub fn from_property_value(value: &str) -> Option<Self> {
-        match value {
-            NOVAROCKS_UPDATE_MODE_COW => Some(Self::CopyOnWrite),
-            NOVAROCKS_UPDATE_MODE_MOR => Some(Self::MergeOnRead),
-            _ => None,
-        }
-    }
-}
-
-pub const NOVAROCKS_UPDATE_MODE: &str = "novarocks.update.mode";
-pub const NOVAROCKS_UPDATE_MODE_COW: &str = "copy-on-write";
-pub const NOVAROCKS_UPDATE_MODE_MOR: &str = "merge-on-read";
-
 /// Physical metadata for one staged Iceberg artifact. This stays provider
 /// private; Core transports terminal SPI receipts rather than this value.
 #[derive(Clone, Debug, PartialEq)]
@@ -131,16 +104,6 @@ impl WrittenFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn update_mode_properties_round_trip() {
-        assert_eq!(
-            IcebergUpdateMode::from_property_value(
-                IcebergUpdateMode::CopyOnWrite.as_property_value()
-            ),
-            Some(IcebergUpdateMode::CopyOnWrite)
-        );
-    }
 
     #[test]
     fn commit_kinds_are_distinct() {

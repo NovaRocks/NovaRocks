@@ -363,6 +363,17 @@ impl TypedValueBinding {
         )
     }
 
+    /// Compare complete semantics and plain layout, ignoring NULL declarations
+    /// at every level. All other semantic and physical facts remain exact.
+    pub fn same_physical_binding_ignoring_nullability_observed<E>(
+        &self,
+        other: &Self,
+        observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.borrowed()
+            .same_physical_binding_ignoring_nullability_observed(other.borrowed(), observe)
+    }
+
     pub fn nullable(&self) -> bool {
         self.value_type.nullable()
     }
@@ -1078,6 +1089,30 @@ impl<'a> BorrowedTypedValueBinding<'a> {
             return Ok(false);
         }
         crate::schema::arrow_validated_data_types_exact_observed(
+            self.data_type,
+            other.data_type,
+            work,
+        )
+    }
+    /// Ignore only logical NULL promises and plain physical Field NULL flags.
+    /// Nominal domains, names/order, scalar parameters and all layout choices
+    /// remain exact. Both inputs are complete validated bindings; comparison
+    /// neither constructs a carrier nor unwraps encoding. Only the caller's
+    /// original observation error can fail the comparison.
+    pub fn same_physical_binding_ignoring_nullability_observed<E>(
+        self,
+        other: Self,
+        mut work: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if !crate::function::typed_value::compatible(
+            self.value_type,
+            other.value_type,
+            crate::function::typed_value::Nullability::IgnoreAll,
+            &mut work,
+        )? {
+            return Ok(false);
+        }
+        crate::schema::arrow_validated_data_types_ignoring_nullability_observed(
             self.data_type,
             other.data_type,
             work,

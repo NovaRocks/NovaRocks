@@ -19,14 +19,10 @@
 //! (`engine/delete_flow.rs`) entry points before lowering.
 //! All errors returned here are user-visible — keep the messages action-oriented.
 
-use std::collections::HashMap;
-
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::iceberg::table::Table;
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-
-use crate::commit::{IcebergUpdateMode, NOVAROCKS_UPDATE_MODE, NOVAROCKS_UPDATE_MODE_COW};
 
 /// A data-file writer cannot encode these logical types, regardless of their
 /// physical Arrow carrier or depth in the target schema.
@@ -293,18 +289,15 @@ pub fn ensure_column_id_not_regressed(current: i32, next: i32) -> Result<(), Str
 ///   on the format version alone. A v2 table that declares
 ///   `write.row-lineage=true` gets position deletes, not a deletion vector it
 ///   could never commit.
-/// - A MERGE that can delete matched rows is served merge-on-read even when the
-///   table asks for copy-on-write, because the copy-on-write rewrite has no way
-///   to express a matched delete.
+/// - UPDATE and every MERGE shape use merge-on-read after the v3 and writable
+///   schema checks. Table write-mode properties do not choose execution policy.
 // Design: ADR-0055 (docs/adr/ADR-0055-row-dml-strategy-consumer-closeout.md)
 pub fn row_mutation_strategy_from_metadata(
     metadata: &TableMetadata,
     intent: &novarocks_spi::connector::ConnectorRowMutationIntent,
     table: &str,
 ) -> Result<novarocks_spi::connector::ConnectorRowMutationStrategy, ConnectorError> {
-    use novarocks_spi::connector::{
-        ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
-    };
+    use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorRowMutationStrategy};
 
     let invalid = |message| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
     ensure_iceberg_write_supported_from_metadata(metadata).map_err(invalid)?;
@@ -320,44 +313,9 @@ pub fn row_mutation_strategy_from_metadata(
         ConnectorRowMutationIntent::Update | ConnectorRowMutationIntent::Merge { .. } => {
             ensure_row_mutation_format_v3(metadata.format_version()).map_err(invalid)?;
             deny_unwritable_data_files(metadata.current_schema(), table)?;
-            // An insert-only MERGE rewrites nothing: no live row is matched, so
-            // there is no copy-on-write rewrite to express and the mutation is
-            // append-shaped. Resolving it before the update-mode property keeps
-            // a copy-on-write table from demanding a bounded selection that an
-            // insert-only merge can never produce.
-            if !intent.accepts(ConnectorRowMutationEffect::Delete)
-                && !intent.accepts(ConnectorRowMutationEffect::Replace)
-            {
-                return Ok(ConnectorRowMutationStrategy::MergeOnRead);
-            }
-            let mode = select_update_mode_from_properties(
-                metadata.format_version(),
-                metadata.properties(),
-            )
-            .map_err(invalid)?;
-            if intent.accepts(ConnectorRowMutationEffect::Delete) {
-                return Ok(ConnectorRowMutationStrategy::MergeOnRead);
-            }
-            Ok(match mode {
-                IcebergUpdateMode::CopyOnWrite => ConnectorRowMutationStrategy::CopyOnWrite,
-                IcebergUpdateMode::MergeOnRead => ConnectorRowMutationStrategy::MergeOnRead,
-            })
+            Ok(ConnectorRowMutationStrategy::MergeOnRead)
         }
     }
-}
-
-fn select_update_mode_from_properties(
-    format_version: FormatVersion,
-    props: &HashMap<String, String>,
-) -> Result<IcebergUpdateMode, String> {
-    ensure_row_mutation_format_v3(format_version)?;
-    let value = props
-        .get(NOVAROCKS_UPDATE_MODE)
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|| NOVAROCKS_UPDATE_MODE_COW.to_string());
-    IcebergUpdateMode::from_property_value(value.as_str()).ok_or_else(|| {
-        format!("unsupported write.update.mode `{value}`; expected copy-on-write or merge-on-read")
-    })
 }
 
 fn ensure_row_mutation_format_v3(format_version: FormatVersion) -> Result<(), String> {
@@ -539,7 +497,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::commit::NOVAROCKS_UPDATE_MODE_MOR;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 
     fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
@@ -578,58 +535,6 @@ mod tests {
         assert!(super::ensure_column_id_not_regressed(10, 10).is_ok());
         let err = super::ensure_column_id_not_regressed(10, 9).unwrap_err();
         assert!(err.contains("last-column-id"), "got: {err}");
-    }
-
-    #[test]
-    fn update_mode_defaults_to_copy_on_write() {
-        let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
-        assert_eq!(
-            select_update_mode_from_properties(FormatVersion::V3, &props).expect("mode"),
-            IcebergUpdateMode::CopyOnWrite
-        );
-    }
-
-    #[test]
-    fn update_mode_accepts_merge_on_read() {
-        let props = HashMap::from([
-            ("write.row-lineage".to_string(), "true".to_string()),
-            (
-                NOVAROCKS_UPDATE_MODE.to_string(),
-                NOVAROCKS_UPDATE_MODE_MOR.to_string(),
-            ),
-        ]);
-        assert_eq!(
-            select_update_mode_from_properties(FormatVersion::V3, &props).expect("mode"),
-            IcebergUpdateMode::MergeOnRead
-        );
-    }
-
-    #[test]
-    fn update_mode_ignores_row_lineage_property() {
-        for props in [
-            HashMap::new(),
-            HashMap::from([("write.row-lineage".to_string(), "false".to_string())]),
-        ] {
-            assert_eq!(
-                select_update_mode_from_properties(FormatVersion::V3, &props).unwrap(),
-                IcebergUpdateMode::CopyOnWrite
-            );
-        }
-        let props = HashMap::from([("write.row-lineage".to_string(), "true".to_string())]);
-        let error = select_update_mode_from_properties(FormatVersion::V2, &props)
-            .expect_err("a property cannot grant v3 semantics");
-        assert_eq!(error, "UPDATE and MERGE require an Iceberg v3 table");
-    }
-
-    #[test]
-    fn update_mode_rejects_invalid_property() {
-        let props = HashMap::from([
-            ("write.row-lineage".to_string(), "true".to_string()),
-            (NOVAROCKS_UPDATE_MODE.to_string(), "delta".to_string()),
-        ]);
-        let err =
-            select_update_mode_from_properties(FormatVersion::V3, &props).expect_err("must fail");
-        assert!(err.contains("unsupported write.update.mode"), "{err}");
     }
 
     #[test]
@@ -877,8 +782,8 @@ mod tests {
         }
     }
 
-    /// UPDATE and MERGE additionally require the row-lineage property, not just
-    /// format v3, so every non-DELETE strategy fixture carries it.
+    /// A legacy property retained in fixtures to prove that format v3 alone
+    /// grants the row-lineage semantics required by UPDATE and MERGE.
     const ROW_LINEAGE_ON: (&str, &str) = ("write.row-lineage", "true");
 
     /// Plain single-column table metadata at a chosen format version and
@@ -962,32 +867,30 @@ mod tests {
     }
 
     #[test]
-    fn update_strategy_follows_the_table_mode_and_requires_v3() {
-        use crate::iceberg::spec::FormatVersion;
+    fn update_strategy_is_merge_on_read_regardless_of_properties_and_requires_v3() {
         use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorRowMutationStrategy};
 
-        assert_eq!(
-            row_mutation_strategy_from_metadata(
-                &strategy_metadata(FormatVersion::V3, &[ROW_LINEAGE_ON]),
-                &ConnectorRowMutationIntent::Update,
-                "ice.db.t",
-            )
-            .expect("default is copy-on-write"),
-            ConnectorRowMutationStrategy::CopyOnWrite
-        );
-
-        assert_eq!(
-            row_mutation_strategy_from_metadata(
-                &strategy_metadata(
-                    FormatVersion::V3,
-                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "merge-on-read")]
-                ),
-                &ConnectorRowMutationIntent::Update,
-                "ice.db.t",
-            )
-            .expect("declared merge-on-read"),
-            ConnectorRowMutationStrategy::MergeOnRead
-        );
+        for properties in [
+            vec![],
+            vec![ROW_LINEAGE_ON],
+            vec![("write.row-lineage", "false")],
+            vec![("novarocks.update.mode", "copy-on-write")],
+            vec![("novarocks.update.mode", "merge-on-read")],
+            vec![("write.update.mode", "copy-on-write")],
+            vec![("novarocks.update.mode", "sideways")],
+            vec![("write.update.mode", "sideways")],
+        ] {
+            assert_eq!(
+                row_mutation_strategy_from_metadata(
+                    &strategy_metadata(FormatVersion::V3, &properties),
+                    &ConnectorRowMutationIntent::Update,
+                    "ice.db.t",
+                )
+                .expect("v3 UPDATE uses merge-on-read independently of properties"),
+                ConnectorRowMutationStrategy::MergeOnRead,
+                "properties: {properties:?}",
+            );
+        }
 
         let v2 = row_mutation_strategy_from_metadata(
             &strategy_metadata(FormatVersion::V2, &[ROW_LINEAGE_ON]),
@@ -995,30 +898,8 @@ mod tests {
             "ice.db.t",
         )
         .expect_err("UPDATE needs v3");
+        assert_eq!(v2.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(v2.message(), "UPDATE and MERGE require an Iceberg v3 table");
-
-        for properties in [vec![], vec![("write.row-lineage", "false")]] {
-            assert_eq!(
-                row_mutation_strategy_from_metadata(
-                    &strategy_metadata(FormatVersion::V3, &properties),
-                    &ConnectorRowMutationIntent::Update,
-                    "ice.db.t",
-                )
-                .expect("v3 does not require a row-lineage property"),
-                ConnectorRowMutationStrategy::CopyOnWrite,
-            );
-        }
-
-        let unsupported = row_mutation_strategy_from_metadata(
-            &strategy_metadata(
-                FormatVersion::V3,
-                &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "sideways")],
-            ),
-            &ConnectorRowMutationIntent::Update,
-            "ice.db.t",
-        )
-        .expect_err("unknown update mode must fail");
-        assert!(unsupported.message().contains("sideways"), "{unsupported}");
     }
 
     #[test]
@@ -1044,51 +925,41 @@ mod tests {
     }
 
     #[test]
-    fn spi5h_merge_that_can_delete_is_served_merge_on_read() {
-        use crate::iceberg::spec::FormatVersion;
+    fn every_merge_shape_is_merge_on_read_regardless_of_properties() {
         use novarocks_spi::connector::{
-            ConnectorRowMutationEffect, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
+            ConnectorRowMutationEffect as E, ConnectorRowMutationIntent as I,
+            ConnectorRowMutationStrategy,
         };
 
-        // Copy-on-write table, but the MERGE can delete matched rows: the
-        // rewrite cannot express that, so merge-on-read wins.
-        assert_eq!(
-            row_mutation_strategy_from_metadata(
-                &strategy_metadata(
-                    FormatVersion::V3,
-                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "copy-on-write")]
-                ),
-                &ConnectorRowMutationIntent::Merge {
-                    effects: vec![
-                        ConnectorRowMutationEffect::Delete,
-                        ConnectorRowMutationEffect::Insert,
-                    ],
-                },
-                "ice.db.t",
-            )
-            .expect("merge with delete"),
-            ConnectorRowMutationStrategy::MergeOnRead
-        );
-
-        // Same table, a MERGE that only replaces and inserts, stays on the
-        // table's declared copy-on-write mode.
-        assert_eq!(
-            row_mutation_strategy_from_metadata(
-                &strategy_metadata(
-                    FormatVersion::V3,
-                    &[ROW_LINEAGE_ON, (NOVAROCKS_UPDATE_MODE, "copy-on-write")]
-                ),
-                &ConnectorRowMutationIntent::Merge {
-                    effects: vec![
-                        ConnectorRowMutationEffect::Replace,
-                        ConnectorRowMutationEffect::Insert,
-                    ],
-                },
-                "ice.db.t",
-            )
-            .expect("merge without delete"),
-            ConnectorRowMutationStrategy::CopyOnWrite
-        );
+        for properties in [
+            vec![],
+            vec![("novarocks.update.mode", "copy-on-write")],
+            vec![("write.update.mode", "copy-on-write")],
+            vec![("write.merge.mode", "copy-on-write")],
+            vec![("novarocks.update.mode", "sideways")],
+        ] {
+            let metadata = strategy_metadata(FormatVersion::V3, &properties);
+            for effects in [
+                vec![E::Insert],
+                vec![E::Replace],
+                vec![E::Replace, E::Insert],
+                vec![E::Delete, E::Insert],
+                vec![E::Delete, E::Replace, E::Insert],
+            ] {
+                assert_eq!(
+                    row_mutation_strategy_from_metadata(
+                        &metadata,
+                        &I::Merge {
+                            effects: effects.clone()
+                        },
+                        "ice.db.t",
+                    )
+                    .expect("every v3 MERGE shape uses merge-on-read"),
+                    ConnectorRowMutationStrategy::MergeOnRead,
+                    "properties: {properties:?}, effects: {effects:?}",
+                );
+            }
+        }
     }
 
     #[test]

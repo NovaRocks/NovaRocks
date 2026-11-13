@@ -2229,7 +2229,7 @@ fn unsupported_writer_statistics_shapes_are_refused_by_name() {
 }
 
 #[test]
-fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_binding_drift() {
+fn actual_writer_compilation_keeps_source_types_and_checks_only_null_differences_at_output() {
     use novarocks_type_contract::{
         ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
         ValueTypeStorageLifetime,
@@ -2287,10 +2287,8 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
             .unwrap()
             .nullable()
     );
-    for (actual, expected) in [
-        (nested(false, true), nested(true, true)),
-        (nested(true, false), nested(true, true)),
-    ] {
+    {
+        let (actual, expected) = (nested(false, true), nested(true, true));
         let declared = draft_with_types([FunctionValueType::new(DataType::Int64, false), expected]);
         let actual_source = [FunctionValueType::new(DataType::Int64, false), actual];
         match fixture_with_types(actual_source, declared) {
@@ -2300,9 +2298,54 @@ fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_bin
             ),
             Ok(fixture) => assert!(
                 compile(&fixture.writer, 1, None).is_err(),
-                "writer must refuse complete nested domain/NULL drift"
+                "writer must refuse nested domain drift"
             ),
         }
+    }
+    for (source_nullable, required_nullable) in [(true, false), (false, true)] {
+        let source = nested(true, source_nullable);
+        let required = nested(true, required_nullable);
+        let declared = draft_with_types([
+            FunctionValueType::new(DataType::Int64, false),
+            required.clone(),
+        ]);
+        let fixture = fixture_with_types(
+            [
+                FunctionValueType::new(DataType::Int64, false),
+                source.clone(),
+            ],
+            declared,
+        )
+        .unwrap();
+        let program = compile(&fixture.writer, 1, None).unwrap();
+        let root = program.graph().root();
+        let ProgramNodeKind::TableWriter { projection, .. } =
+            program.graph().nodes()[root.index()].kind()
+        else {
+            panic!("actual writer")
+        };
+        assert!(
+            projection
+                .layout
+                .value_binding_at(1)
+                .unwrap()
+                .borrowed()
+                .exactly_equals_observed(required.typed_binding().borrowed(), || Ok::<_, ()>(()))
+                .unwrap(),
+            "the published projection must satisfy the original target requirement",
+        );
+        let Some(novarocks_type_contract::FunctionArgumentType::Value(original)) =
+            program.checked().channels().expressions().definition_type(
+                novarocks_local_program::ProgramExpressionArena::WriterProjection(root),
+                novarocks_local_program::ProgramExprId::new(1),
+            )
+        else {
+            panic!("the original projection expression remains typed")
+        };
+        assert_eq!(
+            original, &source,
+            "the source must not be restated as required"
+        );
     }
 }
 

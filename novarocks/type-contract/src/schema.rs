@@ -161,6 +161,7 @@ pub fn arrow_data_types_exact_with_profile_and_nullability_observed<
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability,
+        ignore_field_nullability: false,
     }
     .ty(expected, actual, crate::ArrowTypeDepth::ROOT)
 }
@@ -181,6 +182,7 @@ pub fn arrow_fields_exact_with_nullability_observed<E>(
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability,
+        ignore_field_nullability: false,
     }
     .field(expected, actual, crate::ArrowTypeDepth::ROOT)
 }
@@ -253,6 +255,7 @@ fn compare_types_with_profile<E: From<crate::ValueTypeError>>(
         mode,
         metadata_mode,
         nullability: crate::CarrierNullabilityPolicy::Exact,
+        ignore_field_nullability: false,
     }
     .ty(left, right, crate::ArrowTypeDepth::ROOT)
 }
@@ -335,6 +338,7 @@ fn compare_types_borrowed<E: From<crate::ValueTypeError>>(
         mode,
         metadata_mode: MetadataMode::BorrowedLinear,
         nullability: crate::CarrierNullabilityPolicy::Exact,
+        ignore_field_nullability: false,
     }
     .ty(left, right, crate::ArrowTypeDepth::ROOT)
 }
@@ -355,6 +359,7 @@ pub fn arrow_fields_exact_borrowed_observed<E>(
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::BorrowedLinear,
         nullability: crate::CarrierNullabilityPolicy::Exact,
+        ignore_field_nullability: false,
     }
     .field(left, right, crate::ArrowTypeDepth::ROOT)
 }
@@ -402,6 +407,7 @@ pub fn arrow_fields_exact_observed<E>(
         mode: FieldMode::Exact,
         metadata_mode: MetadataMode::Bucketed,
         nullability: crate::CarrierNullabilityPolicy::Exact,
+        ignore_field_nullability: false,
     }
     .field(left, right, crate::ArrowTypeDepth::ROOT)
 }
@@ -413,13 +419,14 @@ fn compare_types<E>(
     mut observe: impl FnMut() -> Result<(), E>,
     validate: impl FnMut(usize, usize) -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_weighted(left, right, mode, |_| observe(), validate)
+    compare_types_weighted(left, right, mode, false, |_| observe(), validate)
 }
 
 fn compare_types_weighted<E>(
     left: &DataType,
     right: &DataType,
     mode: FieldMode,
+    ignore_field_nullability: bool,
     mut observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
     mut validate: impl FnMut(usize, usize) -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -430,6 +437,7 @@ fn compare_types_weighted<E>(
         mode,
         metadata_mode: MetadataMode::Bucketed,
         nullability: crate::CarrierNullabilityPolicy::Exact,
+        ignore_field_nullability,
     }
     .ty(left, right, crate::ArrowTypeDepth::ROOT)
 }
@@ -439,7 +447,25 @@ pub(crate) fn arrow_validated_data_types_exact_weighted_observed<E>(
     right: &DataType,
     observe: impl FnMut(TypeComparisonStep) -> Result<(), E>,
 ) -> Result<bool, E> {
-    compare_types_weighted(left, right, FieldMode::Exact, observe, |_, _| Ok(()))
+    compare_types_weighted(left, right, FieldMode::Exact, false, observe, |_, _| Ok(()))
+}
+
+/// Compare already validated plain layouts while ignoring only Field NULL
+/// flags. This uses the same exact traversal, never encoding/carrier matching.
+/// The complete logical binding is compared separately by the binding owner.
+pub(crate) fn arrow_validated_data_types_ignoring_nullability_observed<E>(
+    left: &DataType,
+    right: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    compare_types_weighted(
+        left,
+        right,
+        FieldMode::Exact,
+        true,
+        |_| observe(),
+        |_, _| Ok(()),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -461,6 +487,7 @@ struct Walk<'a, F, B> {
     mode: FieldMode,
     metadata_mode: MetadataMode,
     nullability: crate::CarrierNullabilityPolicy,
+    ignore_field_nullability: bool,
 }
 impl<
     E,
@@ -587,7 +614,8 @@ impl<
             FieldMode::Compatibility => true,
         };
         if !self.bytes(left.name().as_bytes(), right.name().as_bytes())?
-            || (left.is_nullable() != right.is_nullable()
+            || (!self.ignore_field_nullability
+                && left.is_nullable() != right.is_nullable()
                 && !(self.nullability == crate::CarrierNullabilityPolicy::Permissive
                     && right.is_nullable()))
             || !self.metadata(left, right)?
@@ -944,6 +972,7 @@ mod tests {
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
                 nullability: crate::CarrierNullabilityPolicy::Exact,
+                ignore_field_nullability: false,
             }
             .metadata(&empty, &empty),
             Ok(true)
@@ -978,6 +1007,7 @@ mod tests {
                 mode: FieldMode::Exact,
                 metadata_mode: MetadataMode::Bucketed,
                 nullability: crate::CarrierNullabilityPolicy::Exact,
+                ignore_field_nullability: false,
             }
             .metadata_with_key_hash(&left, right, |walk, _| {
                 (walk.observe)(TypeComparisonStep::Header)?;

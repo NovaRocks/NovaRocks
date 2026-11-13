@@ -440,7 +440,7 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         }
         let staged = write_record_batches_journaled(&self.context, [batch], &self.staged_paths)
             .await
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+            .map_err(crate::commit::write_adaptation::WriteAdaptationError::into_connector_error)?;
         self.record(staged)
     }
 
@@ -564,7 +564,7 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
             &self.staged_paths,
         )
         .await
-        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        .map_err(crate::commit::write_adaptation::WriteAdaptationError::into_connector_error)?;
         let Some(written) = written else {
             return Ok(());
         };

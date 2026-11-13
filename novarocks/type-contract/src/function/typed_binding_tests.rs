@@ -215,3 +215,268 @@ fn physical_binding_comparison_ignores_only_root_nullability_and_keeps_original_
             .unwrap()
     );
 }
+
+fn nested_nullability_tree(nullable: bool) -> FunctionValueType {
+    let map = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new(
+                        "value",
+                        DataType::List(Arc::new(Field::new("item", DataType::Int64, nullable))),
+                        nullable,
+                    )),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let union = DataType::Union(
+        arrow_schema::UnionFields::try_new(
+            [3],
+            [Arc::new(Field::new("variant", DataType::Utf8, nullable))],
+        )
+        .unwrap(),
+        arrow_schema::UnionMode::Dense,
+    );
+    FunctionValueType::new(
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new(
+                    "payload",
+                    DataType::List(Arc::new(Field::new("item", map, nullable))),
+                    nullable,
+                )),
+                Arc::new(Field::new("choice", union, nullable)),
+            ]
+            .into(),
+        ),
+        nullable,
+    )
+}
+
+#[test]
+fn complete_binding_comparison_can_ignore_only_nullability_at_all_levels() {
+    let required = nested_nullability_tree(false);
+    let nullable = nested_nullability_tree(true);
+    for (left, right) in [(&required, &nullable), (&nullable, &required)] {
+        assert!(
+            left.same_physical_binding_ignoring_nullability_observed(right, || {
+                Ok::<(), &'static str>(())
+            })
+            .unwrap()
+        );
+        assert!(
+            left.typed_binding()
+                .same_physical_binding_ignoring_nullability_observed(
+                    right.typed_binding(),
+                    || Ok::<(), &'static str>(()),
+                )
+                .unwrap()
+        );
+        assert!(
+            left.typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_nullability_observed(
+                    right.typed_binding().borrowed(),
+                    || Ok::<(), &'static str>(()),
+                )
+                .unwrap()
+        );
+        assert!(
+            !left
+                .exactly_equals_checked_observed(right, || Ok::<(), &'static str>(()))
+                .unwrap()
+        );
+        assert!(
+            !left
+                .same_physical_binding_ignoring_root_nullability_observed(right, || {
+                    Ok::<(), &'static str>(())
+                })
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn ignoring_nullability_keeps_exact_layout_after_matching_logical_domains() {
+    use arrow_schema::{TimeUnit, UnionFields, UnionMode};
+    let item = || Arc::new(Field::new("item", DataType::Utf8, true));
+    let map = |sorted| {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            sorted,
+        )
+    };
+    let union = |mode| {
+        DataType::Union(
+            UnionFields::try_new([3], [Field::new("v", DataType::Utf8, true)]).unwrap(),
+            mode,
+        )
+    };
+    // Each pair has the same complete logical domain. The rejected difference
+    // belongs only to its frozen plain layout and cannot be inferred from it.
+    for (left, right) in [
+        (DataType::Utf8, DataType::LargeUtf8),
+        (DataType::Utf8, DataType::Utf8View),
+        (DataType::Binary, DataType::LargeBinary),
+        (DataType::List(item()), DataType::LargeList(item())),
+        (DataType::List(item()), DataType::ListView(item())),
+        (map(false), map(true)),
+        (union(UnionMode::Dense), union(UnionMode::Sparse)),
+    ] {
+        let left = FunctionValueType::new(left, false);
+        let right = FunctionValueType::new(right, true);
+        assert!(left.same_semantics_ignoring_nullability(&right));
+        assert!(
+            !left
+                .same_physical_binding_ignoring_nullability_observed(&right, || {
+                    Ok::<(), &'static str>(())
+                })
+                .unwrap(),
+            "layout differs: {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        );
+    }
+    for (left, right) in [
+        (DataType::FixedSizeBinary(4), DataType::FixedSizeBinary(8)),
+        (
+            DataType::FixedSizeList(item(), 2),
+            DataType::FixedSizeList(item(), 3),
+        ),
+        (DataType::Decimal128(12, 2), DataType::Decimal128(13, 2)),
+        (DataType::Decimal128(12, 2), DataType::Decimal128(12, 3)),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+        ),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ),
+    ] {
+        let left = FunctionValueType::new(left, false);
+        let right = FunctionValueType::new(right, true);
+        assert!(
+            !left
+                .same_physical_binding_ignoring_nullability_observed(&right, || {
+                    Ok::<(), &'static str>(())
+                })
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn ignoring_nullability_keeps_nominal_domains_and_named_field_identity() {
+    let json = list(ValueLogicalType::Json, false, false);
+    let text = list(ValueLogicalType::Physical, true, true);
+    assert!(
+        !json
+            .same_physical_binding_ignoring_nullability_observed(&text, || {
+                Ok::<(), &'static str>(())
+            })
+            .unwrap()
+    );
+    let structure = |names: [&str; 2], nullable| {
+        FunctionValueType::new(
+            DataType::Struct(
+                names
+                    .map(|name| Arc::new(Field::new(name, DataType::Int64, nullable)))
+                    .into(),
+            ),
+            nullable,
+        )
+    };
+    let original = structure(["first", "second"], false);
+    for other in [
+        structure(["renamed", "second"], true),
+        structure(["second", "first"], true),
+    ] {
+        assert!(
+            !original
+                .same_physical_binding_ignoring_nullability_observed(&other, || {
+                    Ok::<(), &'static str>(())
+                })
+                .unwrap()
+        );
+    }
+    let union = |id, name, nullable| {
+        FunctionValueType::new(
+            DataType::Union(
+                arrow_schema::UnionFields::try_new(
+                    [id],
+                    [Field::new(name, DataType::Int64, nullable)],
+                )
+                .unwrap(),
+                arrow_schema::UnionMode::Dense,
+            ),
+            nullable,
+        )
+    };
+    let original = union(3, "first", false);
+    for other in [union(4, "first", true), union(3, "second", true)] {
+        assert!(
+            !original
+                .same_physical_binding_ignoring_nullability_observed(&other, || {
+                    Ok::<(), &'static str>(())
+                })
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn ignoring_all_nullability_preserves_first_refusal_through_semantics_and_layout() {
+    let original = nested_nullability_tree(false);
+    let other = nested_nullability_tree(true);
+    let mut calls = 0;
+    assert!(
+        original
+            .typed_binding()
+            .borrowed()
+            .same_physical_binding_ignoring_nullability_observed(
+                other.typed_binding().borrowed(),
+                || {
+                    calls += 1;
+                    Ok::<(), &'static str>(())
+                },
+            )
+            .unwrap()
+    );
+    for stop in 1..=calls {
+        let mut seen = 0;
+        let result = original
+            .typed_binding()
+            .borrowed()
+            .same_physical_binding_ignoring_nullability_observed(
+                other.typed_binding().borrowed(),
+                || {
+                    seen += 1;
+                    assert!(seen <= stop, "observation after original refusal");
+                    if seen == stop {
+                        Err("original refusal")
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+        assert_eq!(result, Err("original refusal"));
+        assert_eq!(seen, stop);
+    }
+}

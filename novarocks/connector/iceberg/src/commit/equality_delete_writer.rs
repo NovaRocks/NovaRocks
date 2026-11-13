@@ -37,7 +37,7 @@ use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use super::types::WrittenFile;
-use super::write_adaptation::adapt_batch;
+use super::write_adaptation::{WriteAdaptationError, adapt_batch};
 use super::write_stack::equality_schema::EqualityDeleteFileTarget;
 
 use super::data_writer::StagedPathJournal;
@@ -59,6 +59,7 @@ pub(crate) async fn write_equality_delete_file(
         None,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn write_equality_delete_file_journaled(
@@ -68,7 +69,7 @@ pub(crate) async fn write_equality_delete_file_journaled(
     target: EqualityDeleteFileTarget,
     batch: RecordBatch,
     journal: &StagedPathJournal,
-) -> Result<Option<WrittenFile>, String> {
+) -> Result<Option<WrittenFile>, WriteAdaptationError> {
     write_equality_delete_file_with_journal(
         file_io,
         staging_dir,
@@ -87,13 +88,17 @@ async fn write_equality_delete_file_with_journal(
     target: EqualityDeleteFileTarget,
     batch: RecordBatch,
     journal: Option<&StagedPathJournal>,
-) -> Result<Option<WrittenFile>, String> {
+) -> Result<Option<WrittenFile>, WriteAdaptationError> {
     if batch.num_rows() == 0 {
         return Ok(None);
     }
     let schema = target.arrow_schema;
     if schema.fields().is_empty() {
-        return Err("equality-delete writer requires at least one equality column".to_string());
+        return Err(
+            "equality-delete writer requires at least one equality column"
+                .to_string()
+                .into(),
+        );
     }
     let equality_ids = schema
         .fields()

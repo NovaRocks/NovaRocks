@@ -697,14 +697,13 @@ impl ProgramTypedChannels {
                             role: Role::WriterProjection,
                             ordinal: ordinal_id(ordinal)?,
                         };
-                        same_value(
+                        same_write_assignment(
                             self.channel_type(site)
                                 .ok_or(ProgramChannelTypeError::WrongShape)?,
                             self.definition(
                                 ProgramExpressionArena::WriterProjection(node_id),
                                 *id,
                             )?,
-                            false,
                             work,
                         )?;
                     }
@@ -1144,6 +1143,24 @@ fn same_value(
         return Err(ProgramChannelTypeError::TypeMismatch);
     };
     same_carrier(actual.data_type(), expected.data_type(), work)
+}
+
+// Writer output has the target's nested NULL requirements. The expression
+// retains its source declaration until the writer checks the actual values.
+// Every other logical and physical binding fact must remain identical.
+fn same_write_assignment(
+    output: &FunctionValueType,
+    source: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), ProgramChannelTypeError> {
+    work.step()?;
+    if output.same_physical_binding_ignoring_nullability_observed(source, || {
+        work.step().map_err(ProgramChannelTypeError::from)
+    })? {
+        Ok(())
+    } else {
+        Err(ProgramChannelTypeError::TypeMismatch)
+    }
 }
 
 #[cfg(test)]

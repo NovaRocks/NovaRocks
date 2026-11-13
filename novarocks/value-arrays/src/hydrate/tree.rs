@@ -31,7 +31,7 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use novarocks_failure_contract::{RepresentationBoundary, RepresentationFacts};
 use novarocks_type_contract::BorrowedTypedValueBinding;
-use std::{alloc::Layout, sync::Arc};
+use std::{alloc::Layout, ops::Range, sync::Arc};
 
 pub(super) struct Node {
     pub source: ArrayRef,
@@ -543,6 +543,41 @@ pub(super) fn check_extent(
         Some(limit),
         Some(prefix as u64),
     )))
+}
+
+/// Visit immediate child coordinates reachable from the selected parent rows.
+///
+/// Parent rows use the array's current (possibly sliced) coordinate domain.
+/// NULL parents contribute no children. STRUCT child ordinals name its fields;
+/// LIST and fixed-size LIST use ordinal zero for their values; UNION uses the
+/// selected field's ordinal. MAP exposes its key and value arrays directly at
+/// ordinals zero and one, rather than an intermediate entries STRUCT. Ranges
+/// use those actual child arrays' coordinates, including list slice offsets.
+/// Leaf arrays, including encoded byte dictionaries, contribute no children;
+/// their logical NULL interpretation remains with the byte-access API.
+///
+/// Visits retain parent order and repeated occurrences and may contain empty
+/// ranges. No selection or bitmap is allocated. The caller may stop through
+/// either Work or the visitor, preserving the original caller failure.
+pub fn visit_reachable_child_rows_observed<E>(
+    source: &ArrayRef,
+    rows: impl IntoIterator<Item = usize>,
+    work: &mut Work<'_, E>,
+    visit: &mut impl FnMut(usize, Range<usize>) -> Result<(), E>,
+) -> Result<(), ValueFailure<E>> {
+    for row in rows {
+        work(1).map_err(ValueFailure::Caller)?;
+        if row >= source.len() {
+            return Err(ValueError::Invariant(ValueViolation::Bounds).into());
+        }
+        if source.is_null(row) {
+            continue;
+        }
+        child_rows(source, row, &mut |index, start, end| {
+            visit(index, start..end).map_err(ValueFailure::Caller)
+        })?;
+    }
+    Ok(())
 }
 
 /// Actual source geometry; no metadata or projected child length authors rows.
