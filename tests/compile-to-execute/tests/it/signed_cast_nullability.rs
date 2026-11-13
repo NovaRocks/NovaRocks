@@ -15,16 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::compiled_program::CompiledExpressionInstance;
-use super::filter_conjunction_actual_sql_compiler_tests::{compile_options, validate_package};
-use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use super::numeric_unary_owned_transaction_tests::frozen_reads_with_explicit_source_shape;
-use super::sql_test_source::sql_source_with_declared_fields;
 use arrow::{
     array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
+use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
 use novarocks_functions::{
     KernelEvaluationControl, KernelFailure, ScalarInvocationActivation, Selection,
 };
@@ -41,6 +37,10 @@ use novarocks_plan_codec::{
     resource_preflight_v2::FragmentDecodeResourceModel,
 };
 use novarocks_sql::compiler::{SqlAuthoredPhysicalPlan, author_fragment_package_semantics};
+use novarocks_sql_testkit::installed_builtin_owner_catalogue;
+use novarocks_sql_testkit::sql_source_with_declared_fields;
+use novarocks_test_compile_to_execute::compiler_results::{compile_options, validate_package};
+use novarocks_test_compile_to_execute::programs::frozen_reads_with_explicit_source_shape;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionArgumentType, FunctionValueType, PureCompileControl,
 };
@@ -286,15 +286,11 @@ fn check_array_source(
             vec![input_values.slice(1, expected_values.len())],
         )
         .unwrap();
-        let tracker =
-            crate::runtime::mem_tracker::MemTracker::new_root("signed-index-actual-frame");
-        tracker.install_limit_once(8 << 20).unwrap();
+        let allocator = Arc::new(super::fixtures::CountingAllocator::new(8 << 20));
         let all: Vec<_> = (0..expected_values.len()).collect();
         let sparse: Vec<_> = (0..expected_values.len()).step_by(2).collect();
         for rows in [&all[..], &sparse[..], &[1][..], &[][..]] {
-            let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
-                tracker.clone(),
-            );
+            let host = allocator.clone();
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
                 program.clone(),
                 site,
@@ -324,7 +320,7 @@ fn check_array_source(
                     .collect::<Vec<_>>()
             );
         }
-        assert_eq!(tracker.current(), 0);
+        assert_eq!(allocator.outstanding(), 0);
     }
 }
 
