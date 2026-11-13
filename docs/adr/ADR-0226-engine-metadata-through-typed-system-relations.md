@@ -6,7 +6,7 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0231
+  - id: ADR-0232
     scope: "Decision 11 retained SHOW MATERIALIZED VIEWS/BACKENDS/TABLE STATS and job SHOW surfaces; typed system relations and MV management procedures remain"
 date: 2026-11-10
 provenance:

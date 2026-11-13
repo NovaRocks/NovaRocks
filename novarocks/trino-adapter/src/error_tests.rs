@@ -27,9 +27,9 @@ use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserErrorLocation,
 };
 
-// Independent oracle transcribed from Trino tag 483 StandardErrorCode.java.
+// Independent oracle transcribed from the semantic baseline's Trino StandardErrorCode.
 // Each emitted name must have exactly this number and error type.
-const TRINO_483: &[(&str, i32, &str)] = &[
+const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("GENERIC_USER_ERROR", 0, "USER_ERROR"),
     ("SYNTAX_ERROR", 1, "USER_ERROR"),
     ("ABANDONED_QUERY", 2, "USER_ERROR"),
@@ -78,10 +78,10 @@ const TRINO_483: &[(&str, i32, &str)] = &[
     ("EXCEEDED_TIME_LIMIT", 131075, "INSUFFICIENT_RESOURCES"),
 ];
 fn assert_wire(error: &TrinoQueryError, name: &str) {
-    let (_, number, kind) = TRINO_483
+    let (_, number, kind) = TRINO_STANDARD_ERROR_CODES
         .iter()
         .find(|(candidate, _, _)| *candidate == name)
-        .expect("name in Trino 483 oracle");
+        .expect("name in Trino StandardErrorCode oracle");
     assert_eq!(
         (error.error_name, error.error_code, error.error_type),
         (name, *number, *kind)
@@ -126,7 +126,7 @@ fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
 }
 
 #[test]
-fn query_text_too_large_has_the_frozen_trino_483_identity_without_text_classification() {
+fn query_text_too_large_has_the_frozen_trino_identity_without_text_classification() {
     let error = query_error(TrinoErrorSource::QueryTextTooLarge {
         message: "opaque admission fact",
     });
@@ -580,7 +580,7 @@ fn integer_data_reasons_survive_execution_and_service_projection() {
     use novarocks_execution_contract::failure::{FailureReason, domain};
     use std::num::NonZeroU16;
 
-    // Stable function facts, independently paired with the Trino 483 oracle.
+    // Stable function facts, independently paired with the Trino oracle.
     for (reason, expected) in [(41, "NUMERIC_VALUE_OUT_OF_RANGE"), (43, "DIVISION_BY_ZERO")] {
         let error = QueryExecutionError::from_execution(ExecutionFailureInput::new(
             FailureFact::new(

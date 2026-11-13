@@ -1,5 +1,5 @@
 ---
-id: ADR-0231
+id: ADR-0232
 title: "Maintenance and statistics belong to their original statement, with typed state surfaces"
 domain: [table-maintenance, provider-spi, sql-language, frontend-mv]
 status: active

@@ -63,7 +63,7 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         BeginTransaction => "START TRANSACTION",
         Commit => "COMMIT",
         Rollback => "ROLLBACK",
-        // These NovaRocks statement forms have no Trino 483 task counterpart.
+        // These NovaRocks statement forms have no Trino task counterpart.
         ReorderColumn => "REORDER COLUMN",
         SetColumnNotNull => "SET NOT NULL",
         UnsetTableProperties => "UNSET PROPERTIES",

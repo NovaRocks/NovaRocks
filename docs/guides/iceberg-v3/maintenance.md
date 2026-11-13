@@ -54,7 +54,7 @@ StateStore 在维护领域仅可保存 GC first-observation Accelerator；该记
 同表 OPTIMIZE 沿原表级活动互斥，不同表可并行。取消先停止尚未派发的工作，并让原 Source 驱动取消、
 关闭与实际退出；业务终态、取消意图、shutdown 等待期限都不能代替 Provider/Native/CPU 的真实退出。
 publication 仍区分 KnownUncommitted、KnownCommitted 与 CommitUnknown；未知结果不自动重试或回滚。
-该边界不提供跨 FE 或外部 writer 的锁，正确性仍依赖 Catalog OCC。见 [ADR-0231](../../adr/ADR-0231-statement-owned-maintenance-statistics-and-state-surfaces.md)。
+该边界不提供跨 FE 或外部 writer 的锁，正确性仍依赖 Catalog OCC。见 [ADR-0232](../../adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)。
 
 ## ✅ OPTIMIZE
 

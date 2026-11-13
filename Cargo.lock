@@ -3437,6 +3437,8 @@ dependencies = [
  "novarocks-result-contract",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-sql-testkit",
+ "novarocks-test-compile-to-execute",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-value-arrays",
@@ -3919,6 +3921,7 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-failure-contract",
  "novarocks-function-contract",
+ "novarocks-functions",
  "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-resource-contract",
@@ -3926,6 +3929,7 @@ dependencies = [
  "novarocks-result-render",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-sql-testkit",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
@@ -4078,6 +4082,7 @@ dependencies = [
  "novarocks-physical-plan",
  "novarocks-result-contract",
  "novarocks-spi",
+ "novarocks-sql-testkit",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
@@ -4121,6 +4126,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "novarocks-sql-testkit"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-functions",
+ "novarocks-parser",
+ "novarocks-physical-plan",
+ "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-types",
 ]
 
 [[package]]
@@ -4314,6 +4332,24 @@ dependencies = [
  "novarocks-types",
  "prost 0.13.5",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "novarocks-test-compile-to-execute"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-connector-contract",
+ "novarocks-execution",
+ "novarocks-functions",
+ "novarocks-local-compiler",
+ "novarocks-local-program",
+ "novarocks-physical-plan",
+ "novarocks-plan-codec",
+ "novarocks-sql",
+ "novarocks-sql-testkit",
+ "novarocks-type-contract",
+ "prost 0.13.5",
 ]
 
 [[package]]

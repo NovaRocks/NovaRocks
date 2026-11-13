@@ -51,7 +51,7 @@ struct DirectInput {
     #[cfg(novarocks_dev_controls)]
     controls: Option<Arc<crate::table_maintenance::test_controls::MaintenanceTestControls>>,
 }
-// Design: ADR-0231 (docs/adr/ADR-0231-statement-owned-maintenance-statistics-and-state-surfaces.md)
+// Design: ADR-0232 (docs/adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)
 struct DirectRewriteAction {
     family: novarocks_result_contract::ClientPresentationFamily,
     starting: Option<Starting>,

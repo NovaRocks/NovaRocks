@@ -16,17 +16,16 @@
 // under the License.
 
 //! Actual SQL author -> native package -> LocalCompiler -> mutable Frame.
-//! New fixtures are UNRUN until the root's serialized Execution test window.
-use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
-use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
 };
+use novarocks_sql_testkit::sql_source;
+use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, ControlShape, PureCompileControl,
@@ -53,8 +52,7 @@ impl KernelEvaluationControl for Control {
 }
 fn compiled(sql: &str) -> (Arc<LocalProgram>, ProgramExpressionRootSite) {
     let source = sql_source(sql, DataType::Int64);
-    let functions =
-        super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
+    let functions = novarocks_sql_testkit::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue(&source, &functions);
     let mut found = None;
     for program in programs.values() {

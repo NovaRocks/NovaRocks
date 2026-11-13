@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Independent expectations follow Trino 483 JsonEncodingUtils.java:177-515,
-//! TimeZoneKey.java:261-322 and VariantUtil.java:1228-1304.
+//! Independent expectations follow the semantic baseline's Trino JsonEncodingUtils,
+//! TimeZoneKey and VariantUtil.
 use super::*;
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{Field, Schema, i256};
@@ -226,7 +226,7 @@ fn decimal256_support_remains_nested_only() {
 }
 
 #[test]
-fn scalar_type_values_and_nulls_follow_trino_483() {
+fn scalar_type_values_and_nulls_follow_trino() {
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(BooleanArray::from(vec![Some(true), None])),
         Arc::new(Int8Array::from(vec![Some(-8), None])),

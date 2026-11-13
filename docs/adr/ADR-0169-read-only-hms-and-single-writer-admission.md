@@ -6,7 +6,7 @@ status: active
 supersedes: []
 superseded-by: null
 partially-superseded-by:
-  - id: ADR-0231
+  - id: ADR-0232
     scope: "StatementJob/JobAttempt and catalog-dependent job completion/cancellation in decisions 4-6; owner admission, HMS read-only and publication separation remain"
 date: 2026-10-09
 provenance:

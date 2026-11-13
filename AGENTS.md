@@ -503,7 +503,7 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   `novarocks/frontend-application/src/server.rs` 组合静态注册表；`mv/domain/freshness.rs` 区分基表缺失、
   对象/版本变化和其它类型化读取失败。MV 管理状态由
   `system.runtime.materialized_view_states` 提供，统计由 `SHOW STATS FOR` 提供，BE 拓扑由管理 API
-  `GET /v1/frontend/backends` 提供；旧 SHOW 与作业列表已退出语句集合，见 ADR-0231。
+  `GET /v1/frontend/backends` 提供；旧 SHOW 与作业列表已退出语句集合，见 ADR-0232。
   元数据列举与任务传输的固定额度退役范围见 ADR-0227；Joint 只记责，不提供回复总字节容量。
 
 - `novarocks/types/src/{naming,schema}.rs`
@@ -1028,7 +1028,10 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 ```
 
 Suites are discovered from `tests/sql/correctness/`; ask the runner for the
-current list with `--list-suites`. `tests/sql/correctness/README.md` carries the
+current list with `--list-suites`.
+`trino-reference` is explicit-only and uses native 1FE+3BE with REST/MinIO.
+Its Trino reference is declared in `docker/fixture-inputs/versions.json` and
+created on demand by the common input builder; see ADR-0231. `tests/sql/correctness/README.md` carries the
 suite map — which engine area each suite covers, its typical change entry, and
 whether it needs the REST Catalog fixture or a cross-process topology — and is
 the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are explicit-only

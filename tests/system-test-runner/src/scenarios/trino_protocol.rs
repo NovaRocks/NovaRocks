@@ -1274,7 +1274,7 @@ fn assert_raw_query_size(actor: &TrinoClient, sql: &str, too_large: bool) -> Res
     finish_raw_registered(actor, cleanup_uri, phase)
 }
 fn statement_size(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
-    // Independent Trino483 default contract; do not import product constants.
+    // Independent Trino default contract; do not import product constants.
     const UTF16_UNITS: usize = 1_000_000;
     fn padded(bytes: usize) -> String {
         const PREFIX: &str = "SELECT 1 /*";

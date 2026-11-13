@@ -30,83 +30,60 @@ shaded by Iceberg's Spark runtime. The script verifies the exact Iceberg runtime
 Spark read/union the NovaRocks compact, copies a Spark-produced compact back out, and verifies it
 with Rust. It does not claim that a generic host-side Java process is Spark evidence.
 
-## Trino 483 Iceberg production aggregate
+## Trino Iceberg production aggregate
 
-Trino 483 is built for Java 25. Set `JAVA25_HOME` to a JDK 25 installation and run:
+The reference release comes from `images.trino.version` in
+`docker/fixture-inputs/versions.json`. With a JDK 25 installation, run:
 
 ```shell
-JAVA25_HOME=/path/to/jdk-25 \
-  tests/datasketches-tck/interop/trino/verify.sh
+JAVA25_HOME=/path/to/jdk-25 tests/datasketches-tck/interop/trino/verify.sh
 ```
 
-The harness depends on the released `io.trino:trino-iceberg:483` production jar, invokes
-`IcebergThetaSketchForStats.input`, `output`, and `combine`, then passes the Trino-produced compact
-to the Rust verifier. The script freezes the jar digest and checks its manifest commit
-`50b0b50b75abd47f830b7805ee1b51716eb4065e`. The three production classes exercised by the harness
-are byte-for-byte source-identical between Trino tag 483 and the NovaRocks review baseline
-`bbef87d76754593a9b9771d66d0950975c85d259`.
+The tool resolves the released `io.trino:trino-iceberg` Maven artifact using that
+version, invokes `IcebergThetaSketchForStats.input`, `output`, and `combine`, and
+passes the resulting compact to the Rust verifier. It requires JDK 25; another
+Java oracle does not provide Trino interoperability evidence.
 
-If JDK 25 is absent, this command fails before compiling with an explicit prerequisite error. A
-Java 21 run, or the Java 6.2.0 oracle above, must not be reported as Trino evidence.
+## Trino Iceberg REST/Puffin reader
 
-## Trino 483 Iceberg REST/Puffin reader
+The native `trino-reference/trino_rest_puffin_show_stats.sql` case runs Trino's
+production REST connector in temporary containers on the existing fixture network.
+Trino writes `{1,2}` and publishes parent Theta statistics with `ANALYZE`;
+NovaRocks appends `{2,3}` with collect-on-write; a fresh Trino process reads the
+current Puffin statistics and verifies NDV `3.0`, four physical rows, three distinct
+ids and the range `1..3`.
 
-`trino/verify_rest_catalog.sh` runs the released Trino 483 server and its production Iceberg REST
-connector in a transient Docker container. It does not use a host JDK, publish a host port, or add
-a service to the shared Compose project. The container joins the existing Iceberg REST/MinIO
-network, mounts the checked-in configuration read-only, and is removed on every success or error
-path. The image must carry the frozen Trino 483 manifest digest
-`sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534`.
-
-The check never pulls: that manifest must already be in the host's image store,
-and it is resolved there **under any local name** -- the pinned digest, not a
-repository path, is the identity. A mirror pull therefore needs no further
-setup, because the manifest is found under the mirror's own name. This matters
-because a mirror records `<mirror>/trinodb/trino@<digest>` rather than
-`trinodb/trino@<digest>`, and `docker tag` cannot create a digest reference to
-rewrite one into the other. A local image that is present but carries a
-different manifest is a hard failure, never a silent substitution.
-
-共享 REST 的 `create-parent` 必须继承调用者的 `NOVA_FIXTURE_RUN_CONTEXT`，namespace 使用该完整 run ID 加不超过五字符的 case suffix；schema、table 与实际 data file location 均核对原 scratch 根。`verify-current` 按传入的现有 namespace 只读核验，不重新命名。临时 Trino 使用 publication 的准确 network、已安装镜像的实际 argv 和原绝对期限；停止与查询都按准确 container ID 执行。
-
-SQL runner 的隔离 REST fixture 使用同一 helper：私有 publication 沿 `runtime.catalog` 的原 network 和生成的 REST warehouse 创建本次 schema/table，仍核对实际 data file 前缀；不构造共享 scratch context。共享 publication 继续沿 `runtime.machine` 和原 run 身份检查。两种路径都由原 `trino_run.py` 作者启动、执行和停止准确容器，保留镜像、NDV、数据事实与清理断言。
-
-The strongest product path is the native `statistics/trino_rest_puffin_show_stats.sql` regression:
-Trino creates an Iceberg v3 table, writes `{1,2}`, and publishes its parent Puffin with `ANALYZE`;
-NovaRocks enables collect-on-write and appends `{2,3}`; then a new Trino process reads the current
-snapshot and requires the `id` row from `SHOW STATS` to contain the numeric unioned NDV `3.0`.
-It also reads the data source and current snapshot, requiring four physical rows, three distinct
-ids, and range `1..3`.
-
-Run it against the canonical REST fixture and native `1FE+3BE` topology:
+Run the explicit suite with native `1FE+3BE`:
 
 ```shell
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite statistics \
-  --only trino_rest_puffin_show_stats \
-  --mode verify \
-  --cluster-mode cross-process \
-  --cluster-size 3 \
-  --query-timeout 300 \
-  --fail-fast -j 1
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite trino-reference --mode verify \
+  --cluster-mode cross-process --cluster-size 3 --query-timeout 300 -j 1
 ```
 
-Import the manifest once before the first run:
+The runner prepares the declared image only when selected cases need it, freezes
+its exact image ID once, and passes it to the shell steps. The builder checks the
+CLI version only when creating the local alias. Existing aliases are reused
+without a version or capability precheck. Actual supply failures remain failures.
+The default SQL suite set does not require this reference image.
+
+For manual use, obtain a reference with:
 
 ```shell
-docker pull 'trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
+docker/fixture-inputs/provision.sh --consumer image:trino --result /absolute/new/reference.json
 ```
 
-If Docker Hub is unavailable, pull the same digest through a reachable mirror; nothing else
-changes, because the manifest is then found under the mirror's own local name:
+Pass `images.trino.image_id` from that result as `NOVA_TRINO_REFERENCE_IMAGE`.
+The scripts do not select or validate a reference version. The result file is
+separate from command diagnostics; failed preparation does not publish a result.
 
-```shell
-docker pull 'dockerproxy.net/trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
-```
+The SQL runner's isolated REST publication uses its original `runtime.catalog` network and generated warehouse, with explicit schema/table locations and actual data-file prefix checks. Shared publications continue to use `runtime.machine`, the original run identity and scratch scope. Both paths use the original `trino_run.py` owner for exact-container start, execution and cleanup.
 
-`NOVA_TRINO_IMAGE` is optional and pins one specific local reference; it must retain the exact
-digest above. Leave it unset to let the check find the manifest under whatever name the host has.
+The caller must also supply the original `NOVA_FIXTURE_RUN_CONTEXT`. Shared REST
+namespaces use the original run identity and scratch scope. Temporary containers
+retain the publication's exact network, image command and original deadline;
+operations and cleanup address exact container IDs. Reference input preparation
+does not create a persistent Trino service or change the worktree publication.

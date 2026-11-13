@@ -532,7 +532,7 @@ fn write_field_name(out: &mut impl Write, name: &str) -> fmt::Result {
 }
 
 fn field_name_unquoted(name: &str) -> bool {
-    // Trino 483 TypeDescriptorTranslator uses its identifier grammar and reserved
+    // Trino TypeDescriptorTranslator uses its identifier grammar and reserved
     // identifier set before ProtocolUtil formats row fields. These are protocol
     // display rules, independent of NovaRocks SQL parser keywords.
     const RESERVED: &[&str] = &[
@@ -585,6 +585,7 @@ fn field_name_unquoted(name: &str) -> bool {
         "JSON_EXISTS",
         "JSON_OBJECT",
         "JSON_QUERY",
+        "JSON_SERIALIZE",
         "JSON_TABLE",
         "JSON_VALUE",
         "LEFT",
@@ -797,12 +798,16 @@ mod tests {
                     name: "a\"b".into(),
                     field: field(NativeRenderType::SignedInteger(64)),
                 },
+                NamedRenderField {
+                    name: "json_serialize".into(),
+                    field: field(NativeRenderType::Boolean),
+                },
             ]))),
         })));
         let columns = columns(&schema(vec![ty], TrinoJsonFacts::default())).unwrap();
         assert_eq!(
             columns[0].type_name,
-            "array(map(varchar, row(\"select\" boolean, \"a\"\"b\" bigint)))"
+            "array(map(varchar, row(\"select\" boolean, \"a\"\"b\" bigint, \"json_serialize\" boolean)))"
         );
         let value = serde_json::to_value(&columns[0]).unwrap();
         assert_eq!(value["typeSignature"]["arguments"][0]["kind"], "TYPE");
