@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, Float32Array, Float64Array};
 use arrow_schema::Field;
@@ -375,7 +375,10 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
         }
     }
     for source in sources() {
-        super::tests::assert_f3_admitted_preparation(source.clone(), DataType::Decimal128(10, 0));
+        super::super::tests::assert_f3_admitted_preparation(
+            source.clone(),
+            DataType::Decimal128(10, 0),
+        );
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
@@ -426,7 +429,7 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
         ),
         Err(CastPrepareError::TypeMismatch)
     );
-    super::tests::assert_f3_selected_literal_case(
+    super::super::tests::assert_f3_selected_literal_case(
         Arc::new(
             arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                 [

@@ -1113,3 +1113,25 @@ fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_ret
         }
     }
 }
+
+mod float;
+
+mod float_identity;
+
+mod bool;
+
+mod unsigned;
+
+mod timestamp;
+
+mod temporal_carrier;
+
+mod decimal_text;
+
+mod binary_text;
+
+mod decimal128_rescale;
+
+mod observed_list;
+
+mod nested_identity;

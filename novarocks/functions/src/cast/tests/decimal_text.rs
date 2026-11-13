@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact decimal text recipe admission and selected address/control contracts.
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::ArrayRef;
 use arrow_buffer::{NullBuffer, i256};
@@ -138,7 +138,7 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                     if !wide || target == DataType::Int64 {
                         // Approved Decimal128->integer/calendar and Decimal256->integer
                         // routes retain these exact p/s declarations, including -128.
-                        super::tests::assert_f3_admitted_preparation(ty.clone(), target);
+                        super::super::tests::assert_f3_admitted_preparation(ty.clone(), target);
                     } else {
                         assert_eq!(
                             PreparedCastRecipe::try_new(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::builtin::signature::declared_list;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 struct Control;

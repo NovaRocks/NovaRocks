@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, BooleanArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
 use arrow_schema::Field;
@@ -916,8 +916,11 @@ fn unsigned_cast_checks_class_full_constant_type_address_and_journal_before_null
             arrow_expected(EvaluatedArgument::Constant(&exact).array(), &target, 0).unwrap(),
         );
     }
-    super::tests::assert_f3_admitted_preparation(DataType::Boolean, DataType::Decimal128(10, 0));
-    super::tests::assert_f3_selected_literal_case(
+    super::super::tests::assert_f3_admitted_preparation(
+        DataType::Boolean,
+        DataType::Decimal128(10, 0),
+    );
+    super::super::tests::assert_f3_selected_literal_case(
         Arc::new(
             arrow_array::Decimal128Array::from(vec![Some(1200), Some(0), None])
                 .with_precision_and_scale(10, 2)
@@ -950,7 +953,7 @@ fn unsigned_cast_checks_class_full_constant_type_address_and_journal_before_null
         for (source, target) in [(&foreign, &unsigned), (&boolean, &foreign)] {
             if source == &boolean && target == &ty(DataType::FixedSizeBinary(16), true) {
                 // Exact Physical target only; nominal Fixed16 targets below still refuse.
-                super::tests::assert_f3_admitted_preparation(
+                super::super::tests::assert_f3_admitted_preparation(
                     DataType::Boolean,
                     DataType::FixedSizeBinary(16),
                 );

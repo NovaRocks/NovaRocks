@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
@@ -397,7 +397,7 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
             }
         }
     }
-    super::tests::assert_f3_selected_literal_case(
+    super::super::tests::assert_f3_selected_literal_case(
         Arc::new(arrow_array::TimestampSecondArray::from(vec![
             Some(123456),
             None,

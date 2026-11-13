@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::Field;
@@ -604,7 +604,10 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
         }
     }
     // Boolean->decimal is approved P05; the reverse D128->Boolean still refuses.
-    super::tests::assert_f3_admitted_preparation(DataType::Boolean, DataType::Decimal128(10, 0));
+    super::super::tests::assert_f3_admitted_preparation(
+        DataType::Boolean,
+        DataType::Decimal128(10, 0),
+    );
     assert_eq!(
         PreparedCastRecipe::try_new(
             CastOperation::Carrier,
@@ -624,8 +627,8 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
         .unwrap(),
     ) as ArrayRef;
     let bools = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef;
-    super::tests::assert_f3_selected_literal_case(Arc::clone(&bools), Arc::clone(&fixed));
-    super::tests::assert_f3_selected_literal_case(fixed, bools);
+    super::super::tests::assert_f3_selected_literal_case(Arc::clone(&bools), Arc::clone(&fixed));
+    super::super::tests::assert_f3_selected_literal_case(fixed, bools);
     for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
         assert_eq!(
             PreparedCastRecipe::try_new(

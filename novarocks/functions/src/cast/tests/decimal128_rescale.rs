@@ -16,7 +16,7 @@
 // under the License.
 
 //! Full Decimal128 raw carrier, exact policy/effects/address and refusal witnesses.
-use super::*;
+use super::super::*;
 use crate::{KernelDiagnostic, SelectedValues, Selection};
 use arrow_array::ArrayRef;
 use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};

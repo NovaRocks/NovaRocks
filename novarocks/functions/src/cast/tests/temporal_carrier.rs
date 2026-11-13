@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::Selection;
 use arrow_array::{ArrayRef, Date32Array};
 use std::{

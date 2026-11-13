@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, Float32Array, Float64Array};
 use arrow_schema::Field;
@@ -380,7 +380,10 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
                 Err(CastPrepareError::Unsupported)
             );
         }
-        super::tests::assert_f3_admitted_preparation(source.clone(), DataType::Decimal128(10, 0));
+        super::super::tests::assert_f3_admitted_preparation(
+            source.clone(),
+            DataType::Decimal128(10, 0),
+        );
         for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
             assert_eq!(
                 PreparedCastRecipe::try_new(

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact observed List cast profiles and actual selected addressing/refusal.
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Selection};
 use arrow_array::{ArrayRef, ListArray, NullArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};

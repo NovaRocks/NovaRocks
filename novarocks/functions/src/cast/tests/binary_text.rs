@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact Binary CAST type, address and first-failure observation contracts.
-use super::*;
+use super::super::*;
 use crate::{ConstantPolicy, ConstantPool, KernelDiagnostic, SelectedValues, Selection};
 use arrow_array::{ArrayRef, BinaryArray};
 use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
@@ -115,7 +115,7 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
     }
     // LargeBinary now uses the admitted Arrow byte-width route; Fixed->UTF8
     // remains outside Arrow's supported direct cast pairs.
-    super::tests::assert_f3_selected_literal_case(
+    super::super::tests::assert_f3_selected_literal_case(
         Arc::new(arrow_array::LargeBinaryArray::from(vec![
             Some(b"valid\0text".as_slice()),
             None,
