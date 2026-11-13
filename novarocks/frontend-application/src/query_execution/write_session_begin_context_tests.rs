@@ -17,7 +17,6 @@
 
 use super::*;
 use novarocks_spi::connector as spi;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 struct BeginSink;
@@ -96,40 +95,6 @@ fn exact_write_lease(
     .unwrap()
 }
 
-struct OriginalChecks {
-    control: spi::ConnectorOperationControlView,
-    exited: Arc<AtomicBool>,
-}
-impl spi::ConnectorOriginalResultScopeCheck for OriginalChecks {
-    fn original_deadline(&self) -> Instant {
-        self.control.deadline()
-    }
-    fn check_active(&self) -> Result<(), spi::OriginalResultCheckError> {
-        use spi::ConnectorOperationControl;
-        self.control.check_active().map_err(|error| {
-            spi::OriginalResultCheckError::new(spi::OriginalResultCheckClass::Control, error)
-        })
-    }
-}
-impl Drop for OriginalChecks {
-    fn drop(&mut self) {
-        self.exited.store(true, Ordering::SeqCst);
-    }
-}
-
-fn original_scope(
-    context: &ConnectorRequestContext,
-) -> (spi::ConnectorOriginalResultScope, Arc<AtomicBool>) {
-    let exited = Arc::new(AtomicBool::new(false));
-    (
-        spi::ConnectorOriginalResultScope::from_original(Arc::new(OriginalChecks {
-            control: context.original_operation_control(),
-            exited: Arc::clone(&exited),
-        })),
-        exited,
-    )
-}
-
 fn assert_attempt_at_provider(
     captured: &ConnectorRequestContext,
     original: &ConnectorRequestContext,
@@ -205,8 +170,8 @@ fn ordinary_and_pending_begin_bind_exact_catalog_to_original_attempt() {
 }
 
 #[test]
-fn control_only_ordinary_pending_and_cow_begin_do_not_mint_a_collection() {
-    for kind in ["ordinary", "pending", "cow"] {
+fn control_only_ordinary_and_pending_begin_do_not_mint_a_collection() {
+    for kind in ["ordinary", "pending"] {
         let (lease, recorded) = unopened_begin();
         let original_session = Arc::new(Mutex::new(None));
         let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
@@ -237,23 +202,7 @@ fn control_only_ordinary_pending_and_cow_begin_do_not_mint_a_collection() {
                 )
                 .unwrap()
             }
-            _ => {
-                let (original, _) = original_scope(&context);
-                // The existing scripted provider owns this fixed request; this
-                // probes the real checked FE entry, not COW recipe semantics.
-                let session =
-                    futures::executor::block_on(begin_cow_connector_write_session_async_in(
-                        lease,
-                        &write_lease,
-                        request,
-                        original,
-                        &receiving,
-                    ))
-                    .unwrap_or_else(|error| panic!("{}", error.retire_on_original_worker(None)));
-                let recorded = recorded.lock().unwrap();
-                drop(recorded);
-                session
-            }
+            _ => unreachable!("finite ordinary and pending fixture"),
         };
         drop(receiving);
         drop(original_session);
@@ -269,141 +218,4 @@ fn control_only_ordinary_pending_and_cow_begin_do_not_mint_a_collection() {
         drop(session);
         assert_eq!(recorded.lock().unwrap().source_drops, 1);
     }
-}
-
-fn cow_observed_context(
-    context: ConnectorRequestContext,
-    properties: &spi::CatalogProperties,
-) -> ConnectorRequestContext {
-    let (lease, recorded) = unopened_begin();
-    let original_session = Arc::new(Mutex::new(None));
-    let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
-    let write_lease = exact_write_lease(&lease, properties.clone());
-    let (original, _) = original_scope(&context);
-    let mut request = begin_request();
-    request.context = context;
-    let _session = futures::executor::block_on(begin_cow_connector_write_session_async_in(
-        lease,
-        &write_lease,
-        request,
-        original,
-        &receiving,
-    ))
-    .unwrap_or_else(|error| panic!("{}", error.retire_on_original_worker(None)));
-    drop(receiving);
-    drop(original_session);
-
-    recorded.lock().unwrap().begin_context.take().unwrap()
-}
-
-#[test]
-fn cow_begin_preserves_original_collection_and_attempt_control_without_layout_invoice() {
-    let properties = nonempty_properties();
-    let stop = spi::ConnectorStopOwner::new();
-    let (context, sink) = attempt_context(&stop);
-    let original = context.clone();
-    let captured = cow_observed_context(context, &properties);
-    assert_attempt_at_provider(&captured, &original, &sink, &properties);
-    assert!(original.vended_credential_lease_collection().is_none());
-    stop.request_stop();
-    assert!(captured.is_cancelled());
-}
-
-#[test]
-fn cow_begin_collection_retains_original_owner_until_the_actual_session_exit() {
-    let properties = nonempty_properties();
-    let stop = spi::ConnectorStopOwner::new();
-    let (context, _) = attempt_context(&stop);
-    let (original, exited) = original_scope(&context);
-    let (lease, recorded) = unopened_begin();
-    let original_session = Arc::new(Mutex::new(None));
-    let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
-    let write_lease = exact_write_lease(&lease, properties);
-    let mut request = begin_request();
-    request.context = context;
-    let session = futures::executor::block_on(begin_cow_connector_write_session_async_in(
-        lease,
-        &write_lease,
-        request,
-        original,
-        &receiving,
-    ))
-    .unwrap_or_else(|error| panic!("{}", error.retire_on_original_worker(None)));
-    drop(receiving);
-    drop(original_session);
-    assert_eq!(recorded.lock().unwrap().begin, 1);
-    assert!(!exited.load(Ordering::SeqCst));
-    drop(session);
-    assert!(exited.load(Ordering::SeqCst));
-}
-
-#[test]
-fn cow_begin_keeps_original_stop_failure_before_any_provider_call() {
-    let properties = nonempty_properties();
-    let stop = spi::ConnectorStopOwner::new();
-    let (context, _) = attempt_context(&stop);
-    let (original, exited) = original_scope(&context);
-    let (lease, recorded) = unopened_begin();
-    let original_session = Arc::new(Mutex::new(None));
-    let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
-    let write_lease = exact_write_lease(&lease, properties);
-    let mut request = begin_request();
-    request.context = context;
-    stop.request_stop();
-    let failure = match futures::executor::block_on(begin_cow_connector_write_session_async_in(
-        lease,
-        &write_lease,
-        request,
-        original,
-        &receiving,
-    )) {
-        Ok(_) => panic!("a stopped original scope cannot begin a provider session"),
-        Err(error) => error,
-    };
-    drop(receiving);
-    drop(original_session);
-    assert_eq!(recorded.lock().unwrap().begin, 0);
-    assert!(!exited.load(Ordering::SeqCst));
-    assert!(
-        failure
-            .retire_on_original_worker(None)
-            .contains("Cancelled")
-    );
-    assert!(exited.load(Ordering::SeqCst));
-}
-
-#[test]
-fn cow_begin_keeps_expired_original_deadline_before_any_provider_call() {
-    let stop = spi::ConnectorStopOwner::new();
-    let sink: Arc<dyn spi::ConnectorVendedCredentialLeaseSink> = Arc::new(BeginSink);
-    let context = ConnectorRequestContext::try_new(Instant::now(), stop.view(), 4096, 65536)
-        .unwrap()
-        .with_vended_credential_lease_sink(sink);
-    let (original, exited) = original_scope(&context);
-    let (lease, recorded) = unopened_begin();
-    let original_session = Arc::new(Mutex::new(None));
-    let receiving = WriteBeginReceiving::new(Arc::clone(&original_session));
-    let write_lease = exact_write_lease(&lease, nonempty_properties());
-    let mut request = begin_request();
-    request.context = context;
-    let failure = match futures::executor::block_on(begin_cow_connector_write_session_async_in(
-        lease,
-        &write_lease,
-        request,
-        original,
-        &receiving,
-    )) {
-        Ok(_) => panic!("an expired original scope cannot begin a provider session"),
-        Err(error) => error,
-    };
-    drop(receiving);
-    drop(original_session);
-    assert_eq!(recorded.lock().unwrap().begin, 0);
-    assert!(!exited.load(Ordering::SeqCst));
-    assert!(
-        failure
-            .retire_on_original_worker(None)
-            .contains("DeadlineExceeded")
-    );
-    assert!(exited.load(Ordering::SeqCst));
 }

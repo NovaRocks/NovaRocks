@@ -16,8 +16,3 @@ pub mod mutation;
 pub(crate) mod mutation_flow;
 mod mutation_match_read;
 pub mod truncate;
-
-pub(crate) mod cow_closed_ast;
-pub(crate) mod cow_closed_route;
-pub(crate) mod cow_materialized_values;
-pub(crate) mod cow_type_syntax;

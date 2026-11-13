@@ -934,10 +934,11 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod root_action_tests {
+    // Preserve the existing synthetic payload amount within this test fixture.
+    const TEST_PAYLOAD_BYTES: u64 = 1008 * 1024 * 1024;
+
     use super::*;
-    use crate::query_execution::internal_result_cpu::{
-        INTERNAL_PEAK_BYTES, InternalResultCpuOwner,
-    };
+    use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
     use crate::query_execution::statistics::StatisticsRootResultDecoder;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
@@ -1137,7 +1138,7 @@ pub(crate) mod root_action_tests {
             &work.owner,
             JointLane::Custody,
             JointResource::PayloadBytes,
-            INTERNAL_PEAK_BYTES,
+            TEST_PAYLOAD_BYTES,
             &mut driver,
         ));
         let mut payload = None;
@@ -1424,7 +1425,7 @@ pub(crate) mod root_action_tests {
             // responsibility quantity is not a new resource authorization.
             binding
                 .window_alias()
-                .check_backing_total(INTERNAL_PEAK_BYTES)
+                .check_backing_total(TEST_PAYLOAD_BYTES)
                 .unwrap();
             drop(original_payload);
             let next = paid_claim(

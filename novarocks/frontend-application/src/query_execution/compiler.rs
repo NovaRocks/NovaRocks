@@ -999,95 +999,6 @@ pub(crate) async fn prepare_query_as_iceberg_write_with_write_session_and_consta
     provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
     system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
-    prepare_query_as_iceberg_write_with_connector_binding_async(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        constants.map(DmlMaterializedWriteSource::Expressions),
-        sink,
-        table_bindings,
-        query_opts,
-        root_distribution,
-        execution,
-        connector_context,
-        write_session,
-        None,
-        overlays,
-        provider_source,
-        system_table_sources,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The target ordinal and original materialized source are independently frozen write facts."
-)]
-pub(crate) async fn prepare_query_as_iceberg_write_at_write_target_async(
-    state: &domain::DmlExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    materialized_site: novarocks_sql::compiler::SqlMaterializedValuesSite,
-    materialized_rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
-    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
-    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
-    provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
-) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
-    prepare_query_as_iceberg_write_with_connector_binding_async(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        Some(DmlMaterializedWriteSource::Complete(
-            materialized_site,
-            materialized_rows,
-        )),
-        sink,
-        table_bindings,
-        query_opts,
-        root_distribution,
-        execution,
-        connector_context,
-        write_session,
-        Some(ordinal),
-        overlays,
-        provider_source,
-        crate::query_execution::completion_facts::SystemTableSourcePolicy::Mutation,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The shared async author retains exact session, ordinal, materialized values and query-local overlays."
-)]
-async fn prepare_query_as_iceberg_write_with_connector_binding_async(
-    state: &domain::DmlExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    materialized: Option<DmlMaterializedWriteSource>,
-    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
-    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
-    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
-    provider_source: &crate::query_execution::completion_facts::FrontendCompletionCustody,
-    system_table_sources: crate::query_execution::completion_facts::SystemTableSourcePolicy,
-) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let query_opts = Some(query_opts.unwrap_or_else(|| {
         crate::query_execution::contract::synthetic_statement_query_options(execution)
     }));
@@ -1128,17 +1039,8 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     }
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
-    let statement = match materialized {
-        Some(DmlMaterializedWriteSource::Complete(site, rows)) => {
-            novarocks_sql::compiler::SqlStatementInput::materialized_values_query(
-                Box::new(prepared),
-                site,
-                rows,
-                &compile_control,
-            )
-            .map_err(crate::dml::error::DmlExecutionError::from_compile)?
-        }
-        Some(DmlMaterializedWriteSource::Expressions(constants)) => {
+    let statement = match constants {
+        Some(constants) => {
             novarocks_sql::compiler::SqlStatementInput::query_with_expression_constants(
                 Box::new(prepared),
                 constants,
@@ -1188,20 +1090,7 @@ async fn prepare_query_as_iceberg_write_with_connector_binding_async(
     let sealed = write_session
         .seal_write_targets()
         .map_err(|error| error.to_string())?;
-    let ordinal = match write_target_ordinal {
-        Some(ordinal)
-            if write_session
-                .targets()
-                .iter()
-                .any(|target| target.ordinal() == ordinal) =>
-        {
-            ordinal
-        }
-        Some(ordinal) => {
-            return Err(format!("write session did not seal target {}", ordinal.get()).into());
-        }
-        None => sealed.sole_target_ordinal()?,
-    };
+    let ordinal = sealed.sole_target_ordinal()?;
     let requirements = write_session
         .statistics_requirements(ordinal)
         .map_err(|error| error.to_string())?;
@@ -1336,14 +1225,6 @@ impl PreparedDmlWriteAssembly {
             runtime,
         )
     }
-}
-
-enum DmlMaterializedWriteSource {
-    Complete(
-        novarocks_sql::compiler::SqlMaterializedValuesSite,
-        std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
-    ),
-    Expressions(novarocks_sql::compiler::SqlExpressionConstants),
 }
 
 fn finish_prepared_iceberg_write_assembly(

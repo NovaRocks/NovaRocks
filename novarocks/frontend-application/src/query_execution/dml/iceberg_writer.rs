@@ -36,16 +36,8 @@ use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent,
 };
-#[cfg(test)]
-use novarocks_sql::literal::bytes_to_latin1_string;
-#[cfg(test)]
-use novarocks_sql::literal::latin1_string_to_bytes;
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
-#[cfg(test)]
-use novarocks_sql::semantic::Literal;
-#[cfg(test)]
-use novarocks_types::schema::SqlType;
 use novarocks_types::schema::{ColumnDef, ColumnDefault};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,253 +715,6 @@ fn insert_column_index_by_target_name(
     Ok(mapping)
 }
 
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
-    Ok(format!(
-        "CAST({expr_sql} AS {})",
-        value_type_to_sql_type_name(
-            &column
-                .declared_value_type()
-                .map_err(|error| error.to_string())?,
-        )?
-    ))
-}
-
-/// Render the original complete write declaration, including nominal children.
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-pub(crate) fn value_type_to_sql_type_name(
-    value: &novarocks_type_contract::FunctionValueType,
-) -> Result<String, String> {
-    sql_type_name(
-        &novarocks_types::sql_type_from_value_type(value).map_err(|error| error.to_string())?,
-    )
-}
-
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-fn sql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
-
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-fn literal_to_sql(literal: &Literal) -> Result<String, String> {
-    Ok(match literal {
-        Literal::Null => "NULL".to_string(),
-        Literal::Bool(value) => {
-            if *value {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        Literal::Int(value) => value.to_string(),
-        Literal::Float(value) => {
-            if !value.is_finite() {
-                return Err(format!(
-                    "non-finite floating literal is not supported: {value}"
-                ));
-            }
-            value.to_string()
-        }
-        Literal::String(value) | Literal::Date(value) => single_quoted_sql(value),
-        Literal::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(literal_to_sql)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ")
-        ),
-        Literal::Map(entries) => {
-            let mut args = Vec::with_capacity(entries.len() * 2);
-            for (key, value) in entries {
-                args.push(literal_to_sql(key)?);
-                args.push(literal_to_sql(value)?);
-            }
-            format!("map({})", args.join(", "))
-        }
-        Literal::Struct(values) => format!(
-            "row({})",
-            values
-                .iter()
-                .map(literal_to_sql)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ")
-        ),
-    })
-}
-
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-pub(crate) fn literal_to_sql_for_arrow_type(
-    literal: &Literal,
-    data_type: &arrow::datatypes::DataType,
-) -> Result<String, String> {
-    use arrow::datatypes::DataType;
-
-    match (literal, data_type) {
-        (
-            Literal::String(value) | Literal::Date(value),
-            DataType::Binary | DataType::LargeBinary,
-        ) => {
-            let bytes = latin1_string_to_bytes(value)?;
-            Ok(format!("X'{}'", hex::encode_upper(bytes)))
-        }
-        (Literal::Array(items), DataType::List(item_field)) => {
-            let values = items
-                .iter()
-                .map(|item| literal_to_sql_for_arrow_type(item, item_field.data_type()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("[{}]", values.join(", ")))
-        }
-        (Literal::Map(entries), DataType::Map(entries_field, _)) => {
-            let DataType::Struct(fields) = entries_field.data_type() else {
-                return literal_to_sql(literal);
-            };
-            if fields.len() != 2 {
-                return literal_to_sql(literal);
-            }
-            let mut args = Vec::with_capacity(entries.len() * 2);
-            for (key, value) in entries {
-                args.push(literal_to_sql_for_arrow_type(key, fields[0].data_type())?);
-                args.push(literal_to_sql_for_arrow_type(value, fields[1].data_type())?);
-            }
-            Ok(format!("map({})", args.join(", ")))
-        }
-        (Literal::Struct(values), DataType::Struct(fields)) if values.len() == fields.len() => {
-            let values = values
-                .iter()
-                .zip(fields.iter())
-                .map(|(value, field)| literal_to_sql_for_arrow_type(value, field.data_type()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("row({})", values.join(", ")))
-        }
-        _ => literal_to_sql(literal),
-    }
-}
-
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-fn single_quoted_sql(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    for ch in value.chars() {
-        match ch {
-            '\'' => escaped.push_str("''"),
-            '\\' => escaped.push_str(r"\\"),
-            _ => escaped.push(ch),
-        }
-    }
-    format!("'{escaped}'")
-}
-
-#[cfg(test)]
-fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlType, String> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    Ok(match dt {
-        DataType::Boolean => SqlType::Boolean,
-        DataType::Int8 => SqlType::TinyInt,
-        DataType::Int16 => SqlType::SmallInt,
-        DataType::Int32 => SqlType::Int,
-        DataType::Int64 => SqlType::BigInt,
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            SqlType::LargeInt
-        }
-        DataType::Float32 => SqlType::Float,
-        DataType::Float64 => SqlType::Double,
-        DataType::Decimal128(precision, scale) => SqlType::Decimal {
-            precision: *precision,
-            scale: *scale,
-        },
-        DataType::Utf8 | DataType::LargeUtf8 => SqlType::String,
-        DataType::Date32 => SqlType::Date,
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
-        DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
-        DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => SqlType::Time,
-        DataType::Binary => SqlType::Binary,
-        DataType::LargeBinary => SqlType::Variant,
-        DataType::List(element_field) => SqlType::Array(Box::new(arrow_data_type_to_sql_type(
-            element_field.data_type(),
-        )?)),
-        DataType::Map(entries_field, _) => {
-            let DataType::Struct(fields) = entries_field.data_type() else {
-                return Err(format!("unsupported Arrow map entries type: {dt:?}"));
-            };
-            if fields.len() != 2 {
-                return Err(format!("unsupported Arrow map entries field count: {dt:?}"));
-            }
-            SqlType::Map(
-                Box::new(arrow_data_type_to_sql_type(fields[0].data_type())?),
-                Box::new(arrow_data_type_to_sql_type(fields[1].data_type())?),
-            )
-        }
-        DataType::Struct(fields) => SqlType::Struct(
-            fields
-                .iter()
-                .map(|field| {
-                    Ok((
-                        field.name().clone(),
-                        arrow_data_type_to_sql_type(field.data_type())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
-        ),
-        other => {
-            return Err(format!(
-                "unsupported Arrow type for INSERT default conversion: {other:?}"
-            ));
-        }
-    })
-}
-
-#[cfg(test)]
-// Retained by COW tests until RWM-8 removes that path.
-fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
-    Ok(match sql_type {
-        SqlType::TinyInt => "TINYINT".to_string(),
-        SqlType::SmallInt => "SMALLINT".to_string(),
-        SqlType::Int => "INT".to_string(),
-        SqlType::BigInt => "BIGINT".to_string(),
-        SqlType::LargeInt => "LARGEINT".to_string(),
-        SqlType::Float => "FLOAT".to_string(),
-        SqlType::Double => "DOUBLE".to_string(),
-        SqlType::Decimal { precision, scale } => format!("DECIMAL({precision}, {scale})"),
-        SqlType::String => "STRING".to_string(),
-        SqlType::Json => "JSON".to_string(),
-        SqlType::Binary => "VARBINARY".to_string(),
-        SqlType::Bitmap => "BITMAP".to_string(),
-        SqlType::Hll => "HLL".to_string(),
-        SqlType::Object | SqlType::Percentile => {
-            return Err(
-                "internal opaque value domains have no public Iceberg SQL type name".into(),
-            );
-        }
-        SqlType::Boolean => "BOOLEAN".to_string(),
-        SqlType::Date => "DATE".to_string(),
-        SqlType::DateTime => "DATETIME".to_string(),
-        SqlType::DateTimeNs => "DATETIME_NS".to_string(),
-        SqlType::Time => "TIME".to_string(),
-        SqlType::Array(inner) => format!("ARRAY<{}>", sql_type_name(inner)?),
-        SqlType::Map(key, value) => {
-            format!("MAP<{}, {}>", sql_type_name(key)?, sql_type_name(value)?)
-        }
-        SqlType::Struct(fields) => format!(
-            "STRUCT<{}>",
-            fields
-                .iter()
-                .map(|(name, ty)| Ok(format!("{} {}", sql_identifier(name), sql_type_name(ty)?)))
-                .collect::<Result<Vec<_>, String>>()?
-                .join(", ")
-        ),
-        SqlType::Variant => "VARIANT".to_string(),
-        SqlType::Uuid => return Err("UUID has no SQL DDL type spelling".into()),
-    })
-}
-
 #[allow(
     dead_code,
     reason = "Retained for staged query-execution DML recovery and connector wiring."
@@ -981,7 +726,7 @@ fn target_string(t: &TargetBackend) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Fields};
     use novarocks_parser::{ast, printer};
     use novarocks_spi::connector::ConnectorTableHandle;
     use novarocks_types::schema::ColumnDefault;
@@ -1226,12 +971,18 @@ mod tests {
                 .expect("checked columns")
             );
             assert_eq!(
-                target_cast_expr_sql("v", &declared).expect("declared cast"),
-                format!("CAST(v AS {spelling})")
+                printer::print_type_name(
+                    &novarocks_sql::sql_type_syntax(&declared.declared_value_type().unwrap())
+                        .expect("declared type")
+                ),
+                spelling
             );
             assert_eq!(
-                target_cast_expr_sql("v", &plain).expect("plain cast"),
-                "CAST(v AS VARBINARY)"
+                printer::print_type_name(
+                    &novarocks_sql::sql_type_syntax(&plain.declared_value_type().unwrap())
+                        .expect("plain type")
+                ),
+                "VARBINARY"
             );
         }
         let uuid = ColumnDef::from_value_type(
@@ -1246,7 +997,9 @@ mod tests {
         )
         .expect("UUID column");
         assert_eq!(
-            target_cast_expr_sql("v", &uuid).expect_err("UUID is not a numeric DDL type"),
+            novarocks_sql::sql_type_syntax(&uuid.declared_value_type().unwrap())
+                .expect_err("UUID is not a numeric DDL type")
+                .to_string(),
             "UUID has no SQL DDL type spelling"
         );
     }
@@ -1273,23 +1026,8 @@ mod tests {
         )
     }
 
-    fn rows_query(rows: Vec<Vec<Literal>>) -> Query {
-        let sql = format!(
-            "VALUES {}",
-            rows.iter()
-                .map(|row| {
-                    format!(
-                        "({})",
-                        row.iter()
-                            .map(|value| literal_to_sql(value).unwrap())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        parse_query(&sql)
+    fn rows_query(rows: Vec<Vec<ast::Expr>>) -> Query {
+        build::query(build::values(rows).expect("nonempty VALUES fixture"))
     }
 
     fn test_struct_type(fields: Vec<(&str, DataType)>) -> DataType {
@@ -1318,21 +1056,16 @@ mod tests {
     }
 
     #[test]
-    fn arrow_data_type_to_sql_type_accepts_time64_for_insert_defaults() {
-        assert_eq!(
-            arrow_data_type_to_sql_type(&DataType::Time64(TimeUnit::Microsecond)).expect("type"),
-            novarocks_types::schema::SqlType::Time
-        );
-    }
-
-    #[test]
     fn append_source_to_query_values_reorders_columns_and_fills_defaults() {
         let target_columns = vec![
             test_column("a", DataType::Int32, None),
             test_column("b", DataType::Int32, Some(ColumnDefault::Int32(5))),
             test_column("c", DataType::Int32, None),
         ];
-        let source = rows_query(vec![vec![Literal::Int(30), Literal::Int(10)]]);
+        let source = rows_query(vec![vec![
+            build::number("30").unwrap(),
+            build::number("10").unwrap(),
+        ]]);
 
         let query = append_source_to_query_for_write(
             &source,
@@ -1357,16 +1090,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_size_binary_largeint_maps_to_largeint_sql_type() {
-        assert_eq!(
-            arrow_data_type_to_sql_type(&DataType::FixedSizeBinary(
-                novarocks_types::largeint::LARGEINT_BYTE_WIDTH
-            )),
-            Ok(SqlType::LargeInt)
-        );
-    }
-
-    #[test]
     fn append_source_to_query_values_casts_literals_to_target_types() {
         let target_columns = vec![
             test_column("id", DataType::Int64, None),
@@ -1375,14 +1098,14 @@ mod tests {
         ];
         let source = rows_query(vec![
             vec![
-                Literal::Int(1),
-                Literal::String("us".to_string()),
-                Literal::Float(10.5),
+                build::number("1").unwrap(),
+                build::string("us"),
+                build::number("10.5").unwrap(),
             ],
             vec![
-                Literal::Int(2),
-                Literal::String("eu".to_string()),
-                Literal::Float(20.0),
+                build::number("2").unwrap(),
+                build::string("eu"),
+                build::number("20").unwrap(),
             ],
         ]);
 
@@ -1427,7 +1150,10 @@ mod tests {
             test_column("category", DataType::Utf8, None),
             test_column("amount", DataType::Int32, None),
         ];
-        let source = rows_query(vec![vec![Literal::Int(1), Literal::Int(10)]]);
+        let source = rows_query(vec![vec![
+            build::number("1").unwrap(),
+            build::number("10").unwrap(),
+        ]]);
 
         let query = append_source_to_query_for_write(&source, &[], &source_columns, &write_columns)
             .expect("append source query");
@@ -1471,7 +1197,7 @@ mod tests {
     #[test]
     fn append_source_to_query_values_preserves_backslash_string_literals() {
         let target_columns = vec![test_column("region", DataType::Utf8, None)];
-        let source = rows_query(vec![vec![Literal::String(r"e\f".to_string())]]);
+        let source = rows_query(vec![vec![build::string(r"e\f")]]);
 
         let query =
             append_source_to_query_for_write(&source, &[], &target_columns, &target_columns)
@@ -1498,8 +1224,9 @@ mod tests {
     #[test]
     fn append_source_to_query_values_renders_binary_literals_as_hex() {
         let target_columns = vec![test_column("payload", DataType::Binary, None)];
-        let packed = bytes_to_latin1_string(&[0xab, 0x01]);
-        let source = rows_query(vec![vec![Literal::String(packed)]]);
+        let source = rows_query(vec![vec![build::string(
+            novarocks_sql::literal::bytes_to_latin1_string(&[0xab, 0x01]),
+        )]]);
 
         let query =
             append_source_to_query_for_write(&source, &[], &target_columns, &target_columns)
@@ -1524,31 +1251,15 @@ mod tests {
     }
 
     #[test]
-    fn target_cast_expr_sql_renders_large_binary_as_variant() {
-        let column = ColumnDef::from_value_type(
-            "v".into(),
-            novarocks_type_contract::FunctionValueType::try_with_logical_type(
-                DataType::LargeBinary,
-                true,
-                novarocks_type_contract::ValueLogicalType::Variant,
-            )
-            .expect("authored Variant"),
-            None,
-        )
-        .expect("Variant column");
-
-        let sql = target_cast_expr_sql("X'AB01'", &column).expect("cast sql");
-
-        assert_eq!(sql, "CAST(X'AB01' AS VARIANT)");
-    }
-
-    #[test]
     fn append_source_to_query_values_rejects_column_list_width_mismatch() {
         let target_columns = vec![
             test_column("a", DataType::Int32, None),
             test_column("b", DataType::Int32, None),
         ];
-        let source = rows_query(vec![vec![Literal::Int(1), Literal::Int(2)]]);
+        let source = rows_query(vec![vec![
+            build::number("1").unwrap(),
+            build::number("2").unwrap(),
+        ]]);
 
         let err = append_source_to_query_for_write(
             &source,

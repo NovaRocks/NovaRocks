@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fixed COW and statistics consumers; domain algorithms remain with their original authors.
+//! Statistics consumers; domain algorithms remain with their original authors.
 
 use novarocks_coordination_contract::{AttemptActivationIdentity, ExecutionEffect, RecoveryMode};
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultEnd};
@@ -30,7 +30,7 @@ use novarocks_query_application::{
     preparation::{ExecutionFinishBoundary, FrozenExecutionDescription},
 };
 use novarocks_result_contract::{InternalResultDomain, RootOutputKind};
-use novarocks_spi::connector::{ConnectorRowMutationSelection, StatisticsArtifactDraft};
+use novarocks_spi::connector::StatisticsArtifactDraft;
 use std::sync::{Arc, Mutex};
 
 use super::{
@@ -43,10 +43,9 @@ use crate::{
     query_execution::{
         internal_result_cpu::{InternalResultCpu, InternalResultValue},
         lifecycle_plan::AttemptCredentialStorage,
-        row_mutation::CowMatchRootConsumer,
         statistics::{StatisticsCollectionProgram, completion::StatisticsProtocolTracker},
     },
-    task_execution::protocol_facts::{AttemptProtocolFactsReceiver, AttemptProtocolProvenance},
+    task_execution::protocol_facts::AttemptProtocolFactsReceiver,
 };
 
 /// The stable statement owner retains this exact CPU custody alongside the
@@ -58,17 +57,6 @@ pub(crate) struct DecodedConsumerRuntime {
     pub(crate) cpu: InternalResultCpu,
     pub(crate) runtime: FrontendDataRuntime,
     pub(crate) cancellation: QueryCancellationView,
-}
-
-/// Original mutation facts consumed by the closed factory. The factory,
-/// rather than a caller, installs the exact current capacity into the actual
-/// collector and every resulting selection backing.
-pub(crate) struct CowMatchComputationSeed {
-    pub(crate) context: novarocks_spi::connector::ConnectorRequestContext,
-    pub(crate) signed_schema: arrow::datatypes::SchemaRef,
-    pub(crate) declarations: Vec<novarocks_type_contract::FunctionValueType>,
-    pub(crate) contract: novarocks_spi::connector::ConnectorMutationMatchContract,
-    pub(crate) intent: novarocks_spi::connector::ConnectorRowMutationIntent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,20 +80,17 @@ impl Binding {
 
 #[derive(Clone, Copy)]
 enum Domain {
-    Cow,
     Statistics,
 }
 impl Domain {
     fn kind(self) -> RootOutputKind {
         RootOutputKind::InternalFacts(match self {
-            Self::Cow => InternalResultDomain::CowSelectionArrowV1,
             Self::Statistics => InternalResultDomain::StatisticsArtifactV1,
         })
     }
 }
 
 enum Payload {
-    Cow(ConnectorRowMutationSelection),
     Statistics(Vec<StatisticsArtifactDraft>),
 }
 struct Staged {
@@ -156,7 +141,7 @@ impl Holder {
             Receiving::Staged(staged) if staged.binding.matches(token, staged.end) => {
                 if !matches!(
                     (domain, staged.payload.value()),
-                    (Domain::Cow, Payload::Cow(_)) | (Domain::Statistics, Payload::Statistics(_))
+                    (Domain::Statistics, Payload::Statistics(_))
                 ) {
                     return Err(domain_error("decoded output receiver has a foreign domain"));
                 }
@@ -178,64 +163,17 @@ impl Holder {
     }
 }
 
-pub(crate) struct CowComputationOutput {
-    // The Native launcher borrows a Weak; this original result holder keeps
-    // its same first-attempt credential author alive through projection.
-    initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
-    holder: Arc<Holder>,
-    // Alias of the actual consumer creator's admitted payload/window. The
-    // manifest capability is weak identity and creates no computation grant.
-    binding: QueryResultCapacityBinding,
-}
 pub(crate) struct StatisticsComputationOutput {
     holder: Arc<Holder>,
     binding: QueryResultCapacityBinding,
 }
 
-pub(crate) struct ReadyCowComputation {
-    pub(crate) binding: QueryResultCapacityBinding,
-    pub(crate) selection: ConnectorRowMutationSelection,
-    pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
-    _initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
-}
 pub(crate) struct ReadyStatisticsComputation {
     pub(crate) _binding: QueryResultCapacityBinding,
     pub(crate) artifacts: Vec<StatisticsArtifactDraft>,
     pub(crate) _credentials: Option<Arc<AttemptCredentialStorage>>,
 }
 
-impl CowComputationOutput {
-    pub(crate) fn take_ready(
-        &mut self,
-        token: ComputationReadyToken,
-    ) -> Result<ReadyCowComputation, QueryExecutionError> {
-        let staged = self.holder.take(token, Domain::Cow)?;
-        let selection = staged.payload.hand_off(|payload, _| match payload {
-            Payload::Cow(selection) => selection,
-            _ => unreachable!("closed COW receiver checked its payload before transfer"),
-        });
-        Ok(ReadyCowComputation {
-            binding: self.binding.clone().into_statement_retention().map_err(|error| {
-                use novarocks_execution_contract::failure::FailureProjection;
-                QueryExecutionError::from_execution(
-                    novarocks_query_application::execution_error::ExecutionFailureInput::new(
-                        error.failure_fact(),
-                        novarocks_execution_contract::SafeDetail::truncating(
-                            "COW result could not retain its original statement payload",
-                        ),
-                        novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
-                    ),
-                )
-            })?,
-            selection,
-            _credentials: staged._credentials,
-            _initial: Arc::clone(&self.initial),
-        })
-    }
-    pub(crate) fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
-        Arc::clone(&self.holder.cpu)
-    }
-}
 impl StatisticsComputationOutput {
     pub(crate) fn take_ready(
         &mut self,
@@ -262,7 +200,6 @@ impl StatisticsComputationOutput {
             })?;
         let artifacts = staged.payload.hand_off(|payload, _| match payload {
             Payload::Statistics(artifacts) => artifacts,
-            _ => unreachable!("closed statistics receiver checked its payload before transfer"),
         });
         Ok(ReadyStatisticsComputation {
             _binding: binding,
@@ -353,56 +290,6 @@ fn construct(
     Ok((consumer, offers, holder))
 }
 
-pub(crate) fn cow_computation_consumer(
-    description: &FrozenExecutionDescription,
-    plan: PlanSeal,
-    original: CowMatchComputationSeed,
-    runtime: DecodedConsumerRuntime,
-    initial: Arc<crate::query_execution::logical_execution::InitialComputationCredentials>,
-) -> Result<
-    (
-        Arc<dyn InternalComputationConsumer>,
-        AttemptHandoffOfferPort,
-        CowComputationOutput,
-    ),
-    QueryExecutionError,
-> {
-    validate_contract(description, plan, Domain::Cow)?;
-    let binding = runtime.binding.clone();
-    let original = CowMatchRootConsumer::try_new_declared_with_capacity(
-        original.context,
-        original.signed_schema,
-        original.declarations,
-        original.contract,
-        original.intent,
-        &runtime.binding,
-        description.output().fields(),
-    )
-    .map_err(|error| {
-        QueryExecutionError::from_execution(
-            super::domain_state::InternalDomainFailure::from(error)
-                .execution_input()
-                .expect("original Connector failure projection"),
-        )
-    })?;
-    let (consumer, offers, holder) = construct(
-        description,
-        plan,
-        Domain::Cow,
-        InternalDomainState::Cow(Box::new(original)),
-        runtime,
-    )?;
-    Ok((
-        consumer,
-        offers,
-        CowComputationOutput {
-            initial,
-            holder,
-            binding,
-        },
-    ))
-}
-
 pub(crate) fn statistics_computation_consumer(
     description: &FrozenExecutionDescription,
     plan: PlanSeal,
@@ -432,50 +319,6 @@ pub(crate) fn statistics_computation_consumer(
         offers,
         StatisticsComputationOutput { holder, binding },
     ))
-}
-
-/// Closed preparation keeps the decoder, Native offer and no-diagnostics
-/// contract together. The statement still owns publication and finalization.
-pub(crate) fn prepare_cow_computation(
-    description: FrozenExecutionDescription,
-    template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    options: Arc<crate::query_execution::contract::ResolvedQueryOptions>,
-    original: CowMatchComputationSeed,
-    initial: crate::query_execution::logical_execution::InitialComputationReservation,
-    runtime: DecodedConsumerRuntime,
-) -> Result<
-    (
-        crate::query_execution::logical_execution::PreparedLogicalComputation,
-        novarocks_query_application::api::ReservedExecutionIdentity,
-        CowComputationOutput,
-    ),
-    QueryExecutionError,
-> {
-    let description = description
-        .into_internal_computation()
-        .map_err(|_| domain_error("COW preparation has no frozen internal computation contract"))?;
-    let (consumer, offers, output) = cow_computation_consumer(
-        &description,
-        template.native_manifest_template().plan(),
-        original,
-        runtime,
-        initial.credentials(),
-    )?;
-    let prepared = crate::query_execution::logical_execution::PreparedLogicalComputation::new(
-        description,
-        template,
-        options,
-        consumer,
-        offers,
-        crate::query_execution::logical_execution::ComputationDiagnostics::None,
-    )
-    .map_err(|_| domain_error("COW preparation differs from its Native template"))?;
-    let (prepared, reserved) = prepared
-        .with_initial_reservation(initial)
-        .map_err(|error| {
-            QueryExecutionError::from_execution(error.into_execution_failure_input())
-        })?;
-    Ok((prepared, reserved, output))
 }
 
 pub(crate) fn prepare_statistics_computation(
@@ -587,11 +430,6 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                             domain_error("statistics initial Task provenance is invalid")
                         })?,
                     ),
-                    Domain::Cow => {
-                        AttemptProtocolProvenance::from_initial(&initial)
-                            .map_err(|_| domain_error("COW initial Task provenance is invalid"))?;
-                        None
-                    }
                 };
                 drop(initial);
                 let end = loop {
@@ -657,7 +495,6 @@ impl InternalComputationConsumer for DecodedComputationConsumer {
                     .cpu
                     .take()?
                     .try_transform(|slot, _| match domain {
-                        Domain::Cow => slot.into_cow().map(Payload::Cow),
                         Domain::Statistics => slot.into_statistics().map(Payload::Statistics),
                     })
                     .map_err(|_| {

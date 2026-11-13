@@ -22,8 +22,7 @@ use crate::query_execution::{
     compiler::PreparedDmlWriteAssembly,
     internal_consumer::{
         decoded::{
-            CowComputationOutput, DecodedConsumerRuntime, ReadyCowComputation,
-            ReadyStatisticsComputation, StatisticsComputationOutput,
+            DecodedConsumerRuntime, ReadyStatisticsComputation, StatisticsComputationOutput,
         },
         domain_cpu::DomainCpuCustody,
         write::{ReadyWriteComputation, WriteComputationOutput},
@@ -361,18 +360,6 @@ impl StatementComputationOutput for WriteComputationOutput {
         self.take_ready(token)
     }
 }
-impl StatementComputationOutput for CowComputationOutput {
-    type Ready = ReadyCowComputation;
-    fn cpu_custody(&self) -> Arc<DomainCpuCustody> {
-        self.cpu_custody()
-    }
-    fn take_ready(
-        &mut self,
-        token: ComputationReadyToken,
-    ) -> Result<Self::Ready, QueryExecutionError> {
-        self.take_ready(token)
-    }
-}
 
 impl StatementComputationOutput for StatisticsComputationOutput {
     type Ready = ReadyStatisticsComputation;
@@ -470,26 +457,8 @@ impl<A: StatementComputationAssembly> StatementComputation<A> {
             crate::preparation_diagnostics::StatementObservationHandle,
         >,
     ) -> Self {
-        Self::new_with_peak(
-            root,
-            initial,
-            launcher,
-            0,
-            #[cfg(novarocks_dev_controls)]
-            observation,
-        )
-    }
-    pub(crate) fn new_with_peak(
-        root: WorkScope,
-        initial: InitialComputationReservation,
-        launcher: Arc<dyn LogicalExecutionLauncher>,
-        peak_bytes: u64,
-        #[cfg(novarocks_dev_controls)] observation: Option<
-            crate::preparation_diagnostics::StatementObservationHandle,
-        >,
-    ) -> Self {
         Self {
-            admission: StatementStageAdmission::new(root, peak_bytes),
+            admission: StatementStageAdmission::new(root, 0),
             initial: Some(initial),
             assembly: None,
             computation: None,
@@ -868,13 +837,6 @@ pub(crate) struct StatementNativeTail {
     failed: bool,
 }
 impl StatementNativeTail {
-    pub(crate) fn retained_heap_bytes() -> Result<usize, WorkError> {
-        novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<
-            SourceExitUnproven,
-        >())
-        .map(|layout| layout.size())
-        .map_err(|_| WorkError::ArithmeticOverflow)
-    }
     pub(crate) fn poll_exit(
         &mut self,
         cx: &mut Context<'_>,
@@ -1031,10 +993,7 @@ mod tests {
         // The Ready boundary is already recorded; this test exercises its
         // distinct actual local-CPU join and the absent Native-observer guard.
         let mut helper = StatementComputation::<OriginalCpuAssembly> {
-            admission: StatementStageAdmission::new(
-                root.owner.scope(),
-                crate::query_execution::internal_result_cpu::INTERNAL_PEAK_BYTES,
-            ),
+            admission: StatementStageAdmission::new(root.owner.scope(), 0),
             initial: None,
             assembly: None,
             computation: None,

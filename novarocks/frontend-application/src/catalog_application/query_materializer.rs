@@ -289,21 +289,8 @@ pub struct QueryLocalTableOverlay {
 }
 
 impl QueryLocalTableOverlay {
-    pub fn new(
-        namespace: impl Into<String>,
-        table: impl Into<String>,
-        key: QueryTableBindingKey,
-        materialize: impl Fn(SqlTableBindingId) -> Result<QueryTableBinding, String>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self::for_catalog("default_catalog", namespace, table, key, materialize)
-    }
-
-    /// A frozen definition relation retains its canonical catalog identity.
-    /// Generated local relations use `new` instead; the two lookup domains do
-    /// not alias, even when their namespace and table names are identical.
+    /// Every generated relation retains its canonical catalog identity.
+    /// Identical namespace and table names in different catalogs do not alias.
     pub(crate) fn for_catalog(
         catalog: impl Into<String>,
         namespace: impl Into<String>,
@@ -2053,7 +2040,8 @@ mod tests {
             &service,
             Arc::clone(&bindings),
             Box::new(OverlayLoader),
-            vec![QueryLocalTableOverlay::new(
+            vec![QueryLocalTableOverlay::for_catalog(
+                "default_catalog",
                 "db",
                 "__nr_cow_orders",
                 QueryTableBindingKey::snapshot("ice", "db", "orders", 7),
@@ -2259,7 +2247,8 @@ mod tests {
             &service,
             Arc::clone(&bindings),
             Box::new(OverlayLoader),
-            vec![QueryLocalTableOverlay::new(
+            vec![QueryLocalTableOverlay::for_catalog(
+                "default_catalog",
                 "db",
                 "__nr_cow_orders",
                 QueryTableBindingKey::snapshot("ice", "db", "orders", 7),

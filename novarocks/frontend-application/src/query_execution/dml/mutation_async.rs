@@ -28,14 +28,14 @@ use crate::query_execution::write_session::WriteBeginReceiving;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorControlPlanningPin, ConnectorRequestContext, ConnectorRowMutationPreparation,
-    ConnectorRowMutationSelection, ConnectorRowMutationStrategy, ConnectorWriteOperationId,
+    ConnectorRowMutationStrategy, ConnectorWriteOperationId,
 };
 
 type DmlError = crate::dml::error::DmlExecutionError;
 type Target = crate::catalog_application::resolver::TargetBackend;
 
 /// Pure provider-signed preparation of the exact admitted UPDATE or MERGE.
-/// COW has not begun a write; its matching computation must run first.
+/// Its original signed facts remain stable through asynchronous preparation.
 pub(crate) enum PreparedMutationFacts {
     Update(Box<PreparedUpdateMutation>),
     Merge(Box<PreparedMergeMutation>),
@@ -125,9 +125,6 @@ impl PreparedMutationFacts {
             Self::Merge(p) => &p.target_ref,
         }
     }
-    pub(crate) fn is_copy_on_write(&self) -> bool {
-        self.strategy() == ConnectorRowMutationStrategy::CopyOnWrite
-    }
     pub(crate) fn execution(&self) -> &QueryExecutionContext {
         match self {
             Self::Update(p) => &p.execution,
@@ -169,8 +166,8 @@ impl PreparedMutationFacts {
     }
     fn signed(&self) -> Result<&ConnectorRowMutationPreparation, String> {
         let preparations = match self {
-            Self::Update(p) => p.cow_preparations.as_ref().or(p.mor_preparations.as_ref()),
-            Self::Merge(p) => p.cow_preparations.as_ref().or(p.mor_preparations.as_ref()),
+            Self::Update(p) => p.mor_preparations.as_ref(),
+            Self::Merge(p) => p.mor_preparations.as_ref(),
         }
         .ok_or_else(|| "mutation preparation lost its original signed provider facts".to_owned())?;
         Ok(&preparations.preparation)
@@ -257,120 +254,6 @@ impl PreparedMutationFacts {
             assertion,
             bindings: Arc::new(QueryTableBindingStore::try_new()?),
             match_read,
-        })
-    }
-
-    pub(crate) fn prepare_cow_selection(
-        self: &Arc<Self>,
-        state: &DmlExecutionKernel,
-    ) -> Result<PreparedCowSelection, DmlError> {
-        if !self.is_copy_on_write() {
-            return Err("COW selection requires its signed copy-on-write strategy".into());
-        }
-        match self.as_ref() {
-            Self::Update(prepared) => {
-                prepared
-                    .stmt
-                    .cow_text()
-                    .map_err(DmlError::DeferredLowering)?;
-            }
-            Self::Merge(prepared) => {
-                prepared
-                    .stmt
-                    .cow_text()
-                    .map_err(DmlError::DeferredLowering)?;
-            }
-        }
-        if let Self::Merge(prepared) = self.as_ref()
-            && matches!(
-                prepared.stmt.matched.as_ref().map(|clause| &clause.action),
-                Some(PreparedMergeMatchedAction::Delete)
-            )
-        {
-            // The original stage always required its MOR target for a matched
-            // delete. A disagreeing provider strategy must not enter COW.
-            return Err("MOR MERGE reached stage without an admitted frozen write target".into());
-        }
-        let preparation = self.signed()?;
-        let query = match self.as_ref() {
-            Self::Update(p) => {
-                let source_sql = mutation_source_to_sql(
-                    &p.stmt.cow_text()?.source,
-                    p.current_catalog.as_deref(),
-                    &p.target,
-                )?;
-                build_exact_cow_update_selection_query(
-                    &p.target,
-                    &p.stmt,
-                    source_sql.as_deref(),
-                    preparation,
-                )?
-            }
-            Self::Merge(p) => build_exact_cow_merge_selection_query(
-                &p.target,
-                &p.stmt,
-                p.current_catalog.as_deref(),
-                p.insert_columns_resolved.as_deref(),
-                preparation,
-            )?,
-        };
-        let (schema, _) = cow_selection_layout(preparation)?;
-        let declarations = cow_selection_execution_types(preparation)?;
-        Ok(PreparedCowSelection {
-            state: state.clone(),
-            facts: Arc::clone(self),
-            query,
-            schema,
-            declarations,
-            bindings: Arc::new(QueryTableBindingStore::try_new()?),
-        })
-    }
-
-    pub(crate) async fn prepare_cow_write_async(
-        self: &Arc<Self>,
-        state: &DmlExecutionKernel,
-        selection: ConnectorRowMutationSelection,
-        selection_execution: QueryExecutionContext,
-        receiving: Arc<WriteBeginReceiving>,
-    ) -> Result<PreparedCowMutationWrite, DmlError> {
-        if !self.is_copy_on_write() {
-            return Err("COW write requires its signed copy-on-write strategy".into());
-        }
-        if selection.row_count() == 0 {
-            return Err("empty COW selection has no write session to begin".into());
-        }
-        let input = prepare_cow_begin_input(
-            state,
-            self.target(),
-            self.signed()?,
-            selection,
-            self.planning_pin(),
-            &selection_execution,
-            self.context(),
-        )?;
-        let session =
-            crate::query_execution::write_session::begin_cow_connector_write_session_async_in(
-                input.write_stack_pin,
-                self.write(),
-                input.request,
-                input.original,
-                receiving.as_ref(),
-            )
-            .await?;
-        // Original receiving retains the exact checked session across every
-        // subsequent construction failure. The original scope is never reset.
-        let write = build_cow_update_distributed_write(
-            state.constant_policy(),
-            &CowMaterializedCompileControl(self.context()),
-            self.target(),
-            self.planning_pin().clone(),
-            self.signed()?,
-            Arc::clone(&session),
-        )?;
-        Ok(PreparedCowMutationWrite {
-            state: state.clone(),
-            facts: Arc::clone(self),
-            write,
         })
     }
 }
@@ -547,23 +430,6 @@ pub(crate) async fn compile_routed_mutation_write(
     )
 }
 
-fn install_fact_source(
-    state: &DmlExecutionKernel,
-    facts: &PreparedMutationFacts,
-    bindings: &Arc<QueryTableBindingStore>,
-    provider: &FrontendCompletionCustody,
-) -> Result<(), String> {
-    install_dml_fact_source(
-        state,
-        facts.execution(),
-        facts.target(),
-        facts.context(),
-        bindings,
-        &[],
-        provider,
-    )
-}
-
 fn install_dml_fact_source(
     state: &DmlExecutionKernel,
     execution: &QueryExecutionContext,
@@ -598,193 +464,4 @@ fn install_dml_fact_source(
         ),
         crate::query_execution::compiler::typed_connector_session()?,
     )
-}
-
-pub(crate) struct PreparedCowSelection {
-    state: DmlExecutionKernel,
-    facts: Arc<PreparedMutationFacts>,
-    query: novarocks_parser::ast::Query,
-    schema: arrow::datatypes::SchemaRef,
-    declarations: Vec<novarocks_type_contract::FunctionValueType>,
-    bindings: Arc<QueryTableBindingStore>,
-}
-impl PreparedCowSelection {
-    pub(crate) async fn compile_async(
-        &self,
-        provider: &FrontendCompletionCustody,
-        options: Option<QueryOptions>,
-    ) -> Result<PreparedCowMatchAssembly, DmlError> {
-        install_fact_source(&self.state, &self.facts, &self.bindings, provider)?;
-        let control = crate::query_execution::planning::sql_compile_control_from_execution(
-            self.facts.execution(),
-        );
-        let mut preparation =
-            novarocks_sql::compiler::SqlDmlCatalogPreparation::try_new_for_intent(
-                novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(
-                    self.query.clone(),
-                )),
-                novarocks_sql::compiler::SqlSessionContext {
-                    sql_semantics: self.facts.execution().sql_semantics().clone(),
-                    current_catalog: Some(self.facts.target().catalog.clone()),
-                    current_database: self.facts.target().namespace.clone(),
-                    optimizer_settings: self.facts.execution().optimizer_settings().clone(),
-                },
-                control.clone(),
-                novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
-                Some(self.declarations.clone()),
-            )
-            .map_err(DmlError::from_compile)?;
-        while !preparation.needs().is_empty() {
-            let facts = provider
-                .resolve_catalog_relations(preparation.needs())
-                .await
-                .map_err(DmlError::from_compile)?;
-            preparation = preparation
-                .continue_catalog(facts.into_boxed_slice())
-                .map_err(DmlError::from_compile)?;
-        }
-        let analyzed = preparation
-            .analyze(
-                &[],
-                self.state.function_catalog().as_ref(),
-                crate::query_execution::constant_eval::constant_evaluator(),
-                self.state.constant_policy(),
-            )
-            .map_err(DmlError::from_compile)?;
-        let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings_async(
-            &self.state, Arc::clone(&self.bindings), self.facts.context(),
-        ).await?;
-        let optimize = novarocks_sql::compiler::SqlOptimizeRequest::new(
-            analyzed,
-            &statistics,
-            control.clone(),
-        );
-        let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
-            optimize,
-            self.facts.execution().optimizer_settings(),
-        )?;
-        let sink = novarocks_query_application::preparation::ReadAccessSink::new();
-        let facts = provider.resolve_provider_reads(&needs, &sink).await?;
-        provider
-            .close()
-            .await
-            .map_err(|error| format!("{}: {}", error.detail(), error.cause()))?;
-        let access = sink
-            .try_into_access()
-            .map_err(|(error, _)| error.to_string())?;
-        let (description, template) = finish_cow_match_plan(
-            &self.state,
-            completion,
-            facts,
-            access,
-            &self.declarations,
-            options.as_ref(),
-            &control,
-            crate::query_execution::physical_encoding::encoding_capacity(self.facts.execution())?,
-        )?;
-        let signed = self.facts.signed()?;
-        Ok(PreparedCowMatchAssembly {
-            description,
-            template,
-            seed: crate::query_execution::internal_consumer::decoded::CowMatchComputationSeed {
-                context: self.facts.context().clone(),
-                signed_schema: Arc::clone(&self.schema),
-                declarations: self.declarations.clone(),
-                contract: signed.match_contract().clone(),
-                intent: signed.intent().clone(),
-            },
-        })
-    }
-}
-
-/// A completed COW selection plan is not a selection or a write result. Only
-/// the real closed consumer can produce its matching ComputationReady token.
-pub(crate) struct PreparedCowMatchAssembly {
-    description: novarocks_query_application::preparation::FrozenExecutionDescription,
-    template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-    seed: crate::query_execution::internal_consumer::decoded::CowMatchComputationSeed,
-}
-impl PreparedCowMatchAssembly {
-    pub(crate) fn prepare_computation(
-        self,
-        initial: crate::query_execution::logical_execution::InitialComputationReservation,
-        runtime: crate::query_execution::internal_consumer::decoded::DecodedConsumerRuntime,
-        options: Option<QueryOptions>,
-    ) -> Result<
-        (
-            crate::query_execution::logical_execution::PreparedLogicalComputation,
-            novarocks_query_application::api::ReservedExecutionIdentity,
-            crate::query_execution::internal_consumer::decoded::CowComputationOutput,
-        ),
-        novarocks_query_application::api::QueryExecutionError,
-    > {
-        crate::query_execution::internal_consumer::decoded::prepare_cow_computation(
-            self.description,
-            self.template,
-            Arc::new(
-                crate::query_execution::contract::ResolvedQueryOptions::from_upstream(options),
-            ),
-            self.seed,
-            initial,
-            runtime,
-        )
-    }
-}
-
-pub(crate) struct PreparedCowMutationWrite {
-    state: DmlExecutionKernel,
-    facts: Arc<PreparedMutationFacts>,
-    write: CowUpdateDistributedWrite,
-}
-impl PreparedCowMutationWrite {
-    pub(crate) fn target_count(&self) -> usize {
-        self.write.targets.len()
-    }
-    pub(crate) async fn compile_target_async(
-        &self,
-        index: usize,
-        execution: &QueryExecutionContext,
-        context: &ConnectorRequestContext,
-        provider: &FrontendCompletionCustody,
-        options: Option<QueryOptions>,
-    ) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, DmlError> {
-        let plan = self
-            .write
-            .targets
-            .get(index)
-            .ok_or_else(|| "COW target index is outside its sealed branch set".to_owned())?;
-        let (sink, bindings, overlays) = prepare_cow_target_binding(
-            self.facts.target(),
-            plan,
-            &self.write.planning_pin,
-            &self.write.write_session,
-        )?;
-        let assembly =
-            crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target_async(
-                &self.state,
-                Some(&self.facts.target().catalog),
-                &self.facts.target().namespace,
-                &plan.query,
-                plan.materialized_site,
-                plan.materialized_rows.clone(),
-                sink,
-                bindings,
-                options,
-                novarocks_sql::compiler::RootDistributionRequirement::Any,
-                execution,
-                context,
-                Arc::clone(&self.write.write_session),
-                plan.ordinal,
-                &overlays,
-                provider,
-            )
-            .await?;
-        plan.original.check_active().map_err(|error| {
-            CowFailure::construction(
-                super::super::cow_closed_ast::BuildError::Original(error),
-                plan.original.clone(),
-            )
-        })?;
-        Ok(assembly)
-    }
 }
