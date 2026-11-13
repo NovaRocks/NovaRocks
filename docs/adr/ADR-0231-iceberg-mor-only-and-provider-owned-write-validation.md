@@ -25,10 +25,11 @@ code-anchors:
   - "novarocks/connector/iceberg/src/commit/validation.rs (row_mutation_strategy_from_metadata)"
   - "novarocks/connector/iceberg/src/commit/write_shared.rs (canonical_data_write_fields)"
   - "novarocks/connector/iceberg/src/commit/row_mutation_preparation.rs (prepare_row_mutation)"
-  - "novarocks/sql/src/analyzer/write_assignment.rs (bind_write_source_query)"
+  - "novarocks/frontend-application/src/dml/insert/shaping.rs (source_assignment_before_common_type)"
+  - "novarocks/sql/src/analyzer/write_assignment.rs (bind_write_source_query, register_literal_assignments)"
   - "novarocks/type-contract/src/write_input_projection.rs (CheckedWriteInputProjection, WriteInputDeclaration)"
   - "novarocks/execution/src/exec/node/table_writer.rs (materialize_target_value, validate_target_requiredness)"
-  - "novarocks/execution/src/exec/operators/compiled_change_events.rs (materialize_target_value consumer)"
+  - "novarocks/execution/src/exec/operators/compiled_change_events.rs (materialize_target_value)"
   - "novarocks/connector/iceberg/src/commit/write_adaptation.rs (WriteAdaptationError)"
   - "novarocks/version/src/lib.rs (NATIVE_COMPAT_EPOCH)"
 ---
@@ -44,7 +45,7 @@ code-anchors:
 | UPDATE / MERGE 策略 | Provider 在原通用可写、v3、类型和 ref 准入后签发 MOR；所有 MERGE 效果形状使用同一规则 |
 | DELETE | v3 部分覆盖使用 deletion vector，完整覆盖沿原物化规则移除数据文件及独占旧位置项；非 v3 保留 position delete，不增加笼统行级拒绝 |
 | 匹配读取 | 原 admitted AST、Provider 签署的 match contract、target ref/base、planning pin 贯穿同一句；不混入后来的 main 或 generation |
-| S 与 V | S 为表达式真实源类型；完整 source query 完成 DISTINCT、UNION、ORDER/LIMIT 等语义后，SQL 原 value-conversion 作者执行普通赋值转换得到真实 V |
+| S 与 V | S 为表达式真实源类型；一般 source query 完成 DISTINCT、UNION、ORDER/LIMIT 等语义后，SQL 原 value-conversion 作者执行普通赋值转换得到真实 V；原已支持的 VALUES、常量 SELECT / UNION ALL 保留逐值目标上下文，先普通赋值再共同类型推导，避免丢失 decimal 精度 |
 | W 与 T | Provider 同一声明作者签发规范输入 W 和可选完整存储 T；Exact 不授予表示差异，显式许可仅在 T 的 plain physical Fixed 叶允许 W Binary，W 保留 T 各层 required 与其余完整事实 |
 | 赋值投影 | CheckedWriteInputProjection 证明 V/W/T 的合法关系，不授予值、容量或 NULL 承诺；在实际选中 event/writer assignment 上检查 required，再用原 scoped hydrate 构造 W |
 | 存储适配 | Provider 按 T 对可达非 NULL 原 bytes 检查 fixed(N) 宽度；data 和 equality-delete append 保留 typed Data 失败 |
@@ -71,7 +72,7 @@ DELETE 与 MOR UPDATE/MERGE 的 v3 删除效果保留 [ADR-0228](ADR-0228-iceber
 
 1. **单一策略。** UPDATE 和所有 MERGE 固定 MOR。`novarocks.update.mode`、`write.update.mode` 及其他 `write.*.mode` 的已有值、COW 字面值或非法值均不影响算法，也不绕过原 v3、类型与 ref 准入。DELETE 与其他写入 flavor 保留原规则。
 2. **同一来源。** match 与 begin 消费同一 preparation 的准确 base/ref；保留 MOR 非空 identity、binding、ordinal、分区与统计事实。COW uniqueness tuple、activation 和 frozen reread source 退出，不删除仍活跃的身份字段。
-3. **三声明。** S→V 仅复用普通 SQL conversion 作者，转换放在完整 source query 外层。V 保留真实 NULL 与获准 Fixed(m) 字节表示；W/T 关系来自 Provider 原完整声明，不借 COW RootPurpose 或表达式 intrinsic 推许可。NULL/空 literal 的 expected context 属原分析作者，已有 checked constant 保持原 pool/ordinal。
+3. **三声明。** 一般 source query 的 S→V 复用普通 SQL conversion 作者，转换放在完整查询外层。原已支持的 VALUES、无 FROM 的 literal SELECT 及仅由这些分支组成的 UNION ALL 保留逐单元目标上下文：SELECT 不含 DISTINCT、过滤、分组或窗口，容器不含 WITH、ORDER/LIMIT/OFFSET/FETCH；原分析作者先对原 literal 单元执行普通赋值，再共同类型推导，保留 decimal 系数与精度。该上下文不进入显式 CAST 或 typed ARRAY 的内部，也不扩展到一般 SELECT、UNION DISTINCT 或排序/限量查询。V 保留真实 NULL 与获准 Fixed(m) 字节表示；W/T 关系来自 Provider 原完整声明，不借 COW RootPurpose 或表达式 intrinsic 推许可。NULL/空 literal 的 expected context 属原分析作者，已有 checked constant 保持原 pool/ordinal。
 4. **选行后义务。** 普通 writer 与 change-event assignment 共用 CheckedWriteInputProjection；MERGE 未选中的 assignment 不提前执行 required/bytes normalization。原 Execution owner 在 Provider I/O 前把可达嵌套 required NULL 作为 Data 拒绝，再由 scoped hydrate 精确构造 W。父 NULL/未引用子槽不误拒绝；不可达槽使用合法布局占位。全局 event placeholder 可空不修改独立 W required。
 5. **原字节存储。** 只有显式 T plain Fixed(n)→W Binary 叶许可 V 的 Binary 或 Fixed(m)，m 不与 n 比较。Provider 消费原 bytes，逐个检查可达非 NULL 值的宽度；坏宽度为 typed Data，不截断或填充有效值。Provider 收到 required NULL 的兜底仍为 Internal；控制和契约错误保留原分类。
 6. **独立结果身份。** V 与构造后的 W 有独立 ValueId，统计消费实际写入投影。逻辑计数取原 Session Root/WriteCounts，不以物理行数或零占位替代。publication、取消、terminal 与实际退出不能互相替代。
