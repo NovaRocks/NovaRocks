@@ -494,7 +494,12 @@ async fn unexpected_original_join_sets_same_query_subscription_state_rejected() 
             panic!("original subscription panic canary");
         })
         .unwrap();
-    until(|| owner.failure_facts().original.is_some()).await;
+    // The join fact and state projection are published under different locks.
+    until(|| {
+        owner.failure_facts().original.is_some()
+            && *observed.lock().unwrap() == SubscriptionState::Rejected
+    })
+    .await;
     let state = *observed.lock().unwrap();
     let actual = owner
         .drain_until(Instant::now() + Duration::from_secs(2))
