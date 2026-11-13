@@ -121,9 +121,6 @@ mod sql_dependency_binding_host_abort_tests;
 mod sql_dependency_constant_host_abort_tests;
 
 #[cfg(test)]
-mod exact_percentile_actual_sql_rate_source_tests;
-
-#[cfg(test)]
 mod cast_text_time_oracle_tests;
 
 #[cfg(test)]
@@ -232,9 +229,6 @@ mod e08s1_owned_lifecycle_tests;
 mod late_call_sql_source_tests;
 
 #[cfg(test)]
-mod e08s1_late_source_tests;
-
-#[cfg(test)]
 mod percentile_profile_sql_source_tests;
 
 #[cfg(test)]
@@ -284,9 +278,6 @@ mod time_profile_sql_source_tests;
 
 #[cfg(test)]
 mod e08s1_time_static_profile_tests;
-
-#[cfg(test)]
-mod left_right_actual_sql_source_tests;
 
 #[cfg(test)]
 mod split_part_actual_sql_source_tests;

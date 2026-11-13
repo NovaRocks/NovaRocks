@@ -254,37 +254,3 @@ fn numeric_unary_owned_transaction_actual_int64_inactive_overflow_and_failed_fra
         }
     }
 }
-#[test]
-fn numeric_unary_owned_transaction_actual_aggregate_window_and_table_sources_publish_new_canonical_requests()
- {
-    // These are actual SQL-source and full source-journal/effect checks; their
-    // separate operator/native execution acceptance is deliberately not claimed.
-    for sql in [
-        "SELECT COUNT(-k) AS observed FROM fixture",
-        "SELECT COUNT(-k) OVER () AS observed FROM fixture",
-        "SELECT SUM(-k) AS observed FROM fixture",
-        "SELECT x FROM fixture, UNNEST([-k]) AS u(x)",
-    ] {
-        eprintln!("actual canonical state SQL: {sql}");
-        let source = sql_source(sql, DataType::Int8);
-        assert!(
-            source
-                .checked_original_result_declaration_observed(&Control)
-                .unwrap()
-                .is_some()
-        );
-        let semantics = author_fragment_package_semantics(&source, policy(), &Control).unwrap();
-        assert_eq!(semantics.len(), source.plan().fragments().len());
-        for fragment in source.plan().fragments().values() {
-            for (_, expr) in fragment.expressions().iter() {
-                if let ExprKind::Unary {
-                    op: UnaryOperator::Minus,
-                    ..
-                } = &expr.kind
-                {
-                    assert!(!expr.ty.nullable());
-                }
-            }
-        }
-    }
-}

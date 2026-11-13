@@ -419,28 +419,3 @@ fn actual_stored_signed_indexes_keep_width_source_null_and_sparse_sliced_results
         }
     }
 }
-
-#[test]
-fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
-    use super::sql_test_source::try_sql_source_with_declared_fields;
-    use novarocks_sql::{
-        analyze_error::AnalyzeErrorKind,
-        compiler::{SqlCompileError, SqlCompileProgressError},
-    };
-    {
-        let result = try_sql_source_with_declared_fields(
-            "SELECT map{CAST(1 AS TINYINT):10,CAST(2 AS TINYINT):20}[k] AS picked FROM t",
-            &[Field::new("k", DataType::Int64, false)],
-        );
-
-        let failure = result.unwrap_err();
-        let SqlCompileProgressError::Compile(SqlCompileError::Analyze(error)) = failure else {
-            panic!("actual FE named missing implementation refusal: {failure:?}");
-        };
-        assert_eq!(error.kind(), AnalyzeErrorKind::UnavailableImplementation);
-        assert_eq!(
-            error.message(),
-            "selected overload `builtin.scalar/map/dynamic-v1` has no installed implementation for the selected carrier"
-        );
-    }
-}

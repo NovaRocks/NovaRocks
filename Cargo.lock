@@ -4081,6 +4081,7 @@ dependencies = [
  "novarocks-physical-plan",
  "novarocks-result-contract",
  "novarocks-spi",
+ "novarocks-sql-testkit",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
