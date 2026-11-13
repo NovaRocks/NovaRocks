@@ -22,10 +22,8 @@
 
 use arrow::datatypes::{DataType, Field};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorExecutionResources, ConnectorInstanceId, ConnectorMutationEffectField,
-    ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorProviderBindingKey, ConnectorReservationBackend, ConnectorResourceCheckpoint,
-    ConnectorResourceClass, ConnectorResourceLedger, ConnectorTableHandle,
+    ConnectorError, ConnectorExecutionResources, ConnectorReservationBackend,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLedger,
     ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
     ConnectorWriteInputShape, ProviderBindingEpoch,
 };
@@ -370,84 +368,6 @@ pub(crate) fn merge_on_read_input_shape() -> ConnectorWriteInputShape {
     }
 }
 
-/// A row-lineage input whose identity is `_row_id`/`_last_updated_sequence_number`:
-/// the copy-on-write shape.
-pub(crate) fn copy_on_write_input_shape() -> ConnectorWriteInputShape {
-    ConnectorWriteInputShape::RowLineage {
-        data_fields: vec![binding("k1", 1, DataType::Int64)],
-        row_identity_fields: vec![
-            binding("_row_id", 5, DataType::Int64),
-            ConnectorWriteFieldBinding::new(
-                ConnectorWriteFieldToken::from_bytes([6; 32]),
-                Field::new("_last_updated_sequence_number", DataType::Int64, true),
-            ),
-        ],
-    }
-}
-
-pub(crate) fn copy_on_write_match_contract() -> ConnectorMutationMatchContract {
-    let instance = ConnectorInstanceId::parse("iceberg").expect("instance");
-    let identity = [
-        ("_file", DataType::Utf8, false, 0_u32, 21_u8),
-        ("_pos", DataType::Int64, false, 1, 22),
-        ("_row_id", DataType::Int64, false, 2, 23),
-        (
-            "_last_updated_sequence_number",
-            DataType::Int64,
-            true,
-            3,
-            24,
-        ),
-    ]
-    .into_iter()
-    .map(|(name, data_type, nullable, ordinal, tag)| {
-        ConnectorMutationSourceField::try_new_typed(
-            ConnectorWriteFieldToken::from_bytes([tag; 32]),
-            Field::new(name, data_type.clone(), nullable),
-            ordinal,
-            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
-        )
-        .expect("complete source role declaration")
-    })
-    .collect::<Vec<_>>();
-    ConnectorMutationMatchContract::try_new(
-        ConnectorProviderBindingKey {
-            instance_id: instance.clone(),
-            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
-        },
-        ConnectorTableHandle::try_new(instance, bytes::Bytes::from_static(b"table"))
-            .expect("table"),
-        ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base")).expect("base"),
-        identity.clone(),
-        vec![
-            ConnectorMutationTargetField::try_new_typed(
-                ConnectorWriteFieldToken::from_bytes([25; 32]),
-                Field::new("k1", DataType::Int64, false),
-                4,
-                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-            )
-            .expect("complete target declaration"),
-        ],
-        vec![
-            ConnectorMutationTargetField::try_new_typed(
-                ConnectorWriteFieldToken::from_bytes([26; 32]),
-                Field::new("k1", DataType::Int64, false),
-                5,
-                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
-            )
-            .expect("complete target declaration"),
-        ],
-        vec![identity[2].token()],
-        ConnectorMutationEffectField::try_new(
-            ConnectorWriteFieldToken::from_bytes([27; 32]),
-            Field::new("__row_mutation_effect", DataType::Int8, false),
-            6,
-        )
-        .expect("effect"),
-    )
-    .expect("COW match contract")
-}
-
 /// The frozen material a flavor's branch planning is cut from.
 ///
 /// It is deliberately built the same way `begin_write` builds it, so a test
@@ -540,5 +460,19 @@ pub(crate) fn delete_branch_plan(
         .expect("output"),
         position_rewrite,
         input: delete_input_shape(branch),
+    }
+}
+
+/// A lineage-only identity is insufficient to locate a physical delete row.
+pub(crate) fn lineage_only_input_shape() -> ConnectorWriteInputShape {
+    ConnectorWriteInputShape::RowLineage {
+        data_fields: vec![binding("k1", 1, DataType::Int64)],
+        row_identity_fields: vec![
+            binding("_row_id", 5, DataType::Int64),
+            ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([6; 32]),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ),
+        ],
     }
 }

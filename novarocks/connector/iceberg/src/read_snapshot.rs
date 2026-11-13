@@ -230,24 +230,6 @@ pub(crate) async fn build_cow_read_files_at_with_control(
         .map_err(|e| e.to_string())
 }
 
-/// Checked COW retains the original FE operation through its captured files.
-pub(crate) async fn build_cow_read_files_at_with_original_scope(
-    table: &Table,
-    snapshot_id: i64,
-    capture: &CaptureScope<'_>,
-) -> Result<Vec<IcebergReadFile>, ReadFailure> {
-    capture.active()?;
-    let metadata = table.metadata();
-    let snapshot = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
-    let schema = snapshot
-        .schema(metadata)
-        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
-    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
-    observe_read_files::<FrozenCowDataFileProjection>(table, domain, None, Some(capture)).await
-}
-
 pub(crate) async fn make_scoped_read_snapshot(
     table: Table,
     snapshot_id: i64,

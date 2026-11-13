@@ -28,15 +28,15 @@ use novarocks_spi::connector::{
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
     ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteBaseVersion,
-    ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
 
 use crate::commit::validation::row_mutation_strategy_from_metadata;
 use crate::commit::write_shared::{
-    exact_requested_write_fields_from_declaration, snapshot_token, write_target_schema,
-    write_target_snapshot_id, writer_value_with_nullable,
+    exact_requested_write_fields_from_declaration, snapshot_token, write_target_snapshot_id,
+    writer_value_with_nullable,
 };
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
@@ -136,15 +136,11 @@ pub(crate) fn prepare_row_mutation(
         )
     })?;
     let target_snapshot_id = write_target_snapshot_id(&metadata, request.target_ref.as_str())?;
-    let target_iceberg_schema = if strategy == ConnectorRowMutationStrategy::CopyOnWrite {
-        write_target_schema(&metadata, target_snapshot_id)?
-    } else {
-        super::write_shared::position_mutation_read_schema(
-            &metadata,
-            request.target_ref.as_str(),
-            target_snapshot_id,
-        )?
-    };
+    let target_iceberg_schema = super::write_shared::position_mutation_read_schema(
+        &metadata,
+        request.target_ref.as_str(),
+        target_snapshot_id,
+    )?;
     let mutation_metadata = if strategy == ConnectorRowMutationStrategy::MergeOnRead {
         crate::metadata::mutation_metadata_schema(&metadata, &target_iceberg_schema)?
     } else {
@@ -155,19 +151,12 @@ pub(crate) fn prepare_row_mutation(
     }
 
     let snapshot = snapshot_token(target_snapshot_id);
-    let base_version = if strategy == ConnectorRowMutationStrategy::CopyOnWrite {
-        ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-            "iceberg/row-mutation-base/v1/{table_uuid}/{}/{snapshot}",
-            request.target_ref.as_str()
-        )))?
-    } else {
-        super::write_shared::position_mutation_base(
-            &metadata,
-            payload.metadata_location.as_deref(),
-            request.target_ref.as_str(),
-            target_snapshot_id,
-        )?
-    };
+    let base_version = super::write_shared::position_mutation_base(
+        &metadata,
+        payload.metadata_location.as_deref(),
+        request.target_ref.as_str(),
+        target_snapshot_id,
+    )?;
     // The match layout is provider-signed rather than name-derived by SQL:
     // source identities precede target before/after values and the logical
     // effect field is last.  The source/target ordinals are the sole cross
@@ -235,7 +224,6 @@ pub(crate) fn prepare_row_mutation(
     let mut match_source_payload = payload.clone();
     match_source_payload.prepared_files.clear();
     match_source_payload.explicit_files = None;
-    match_source_payload.row_mutation_frozen_source = false;
     let match_table_info = match_source_payload.table_info.as_mut().ok_or_else(|| {
         ConnectorError::new(
             ConnectorErrorKind::CorruptData,
@@ -442,8 +430,8 @@ mod tests {
 
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorRequestContext, ConnectorRowMutationIntent,
-        ConnectorRowMutationStrategy, ConnectorWriteOperationId, ConnectorWriteTargetRef,
-        ProviderBindingEpoch,
+        ConnectorRowMutationStrategy, ConnectorWriteBaseVersion, ConnectorWriteOperationId,
+        ConnectorWriteTargetRef, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -494,7 +482,15 @@ mod tests {
     }
 
     fn metadata(format_version: FormatVersion, props: &[(&str, &str)]) -> TableMetadata {
-        let schema = Arc::new(iceberg_schema());
+        metadata_with_schema(format_version, props, iceberg_schema())
+    }
+
+    fn metadata_with_schema(
+        format_version: FormatVersion,
+        props: &[(&str, &str)],
+        schema: IcebergSchema,
+    ) -> TableMetadata {
+        let schema = Arc::new(schema);
         let partition_spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(0)
             .build()
@@ -614,6 +610,7 @@ mod tests {
     }
 
     struct PayloadSpec {
+        schema: Arc<IcebergSchema>,
         serialized_metadata: Option<String>,
         table_uuid: Option<String>,
         metadata_columns: Vec<String>,
@@ -624,6 +621,7 @@ mod tests {
     impl PayloadSpec {
         fn new(metadata: &TableMetadata) -> Self {
             Self {
+                schema: metadata.current_schema().clone(),
                 serialized_metadata: Some(
                     serde_json::to_string(metadata).expect("serialize metadata"),
                 ),
@@ -641,9 +639,9 @@ mod tests {
                 table: "t".to_string(),
                 table_uuid: self.table_uuid,
                 current_snapshot_id: None,
-                schema_id: 1,
+                schema_id: self.schema.schema_id(),
                 location: "file:///tmp/row-mutation".to_string(),
-                schema: iceberg_schema_def(&iceberg_schema()),
+                schema: iceberg_schema_def(&self.schema),
                 serialized_metadata: self.serialized_metadata,
             });
             let payload = IcebergTablePayload {
@@ -655,7 +653,6 @@ mod tests {
                 metadata_table_type: self.metadata_table_type,
                 prepared_files: Vec::new(),
                 explicit_files: None,
-                row_mutation_frozen_source: false,
                 hidden_columns: Vec::new(),
             };
             ConnectorTableHandle::try_new(
@@ -846,8 +843,11 @@ mod tests {
             .iter()
             .map(|field| field.field().name().as_str())
             .collect::<Vec<_>>();
-        let frozen_schema =
-            write_target_schema(&table_metadata, Some(41)).expect("frozen source schema");
+        let frozen_schema = table_metadata
+            .snapshot_by_id(41)
+            .expect("old branch snapshot")
+            .schema(&table_metadata)
+            .expect("frozen source schema");
         let frozen_names = frozen_schema
             .as_struct()
             .fields()
@@ -1214,6 +1214,172 @@ mod tests {
                     ),
                 )
             );
+        }
+    }
+
+    #[test]
+    fn mor_preparation_denials_preserve_their_typed_admission_facts() {
+        use crate::iceberg::spec::VariantType;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+
+        let invalid_identity = (
+            ConnectorErrorKind::InvalidRequest,
+            FailureClass::Data,
+            1,
+            "Iceberg row-mutation target has no admitted identity fields",
+            None,
+        );
+        let invalid_branch = (
+            ConnectorErrorKind::InvalidRequest,
+            FailureClass::Data,
+            1,
+            "iceberg ref: branch writes require Iceberg v3 tables (table t is v2)",
+            None,
+        );
+        let invalid_format = (
+            ConnectorErrorKind::InvalidRequest,
+            FailureClass::Data,
+            1,
+            "UPDATE and MERGE require an Iceberg v3 table",
+            None,
+        );
+        let uuid_message =
+            "Iceberg uuid writes are not supported yet: table ice.db.t, column payload";
+        let unsupported_uuid = (
+            ConnectorErrorKind::Unsupported,
+            FailureClass::Unsupported,
+            4,
+            uuid_message,
+            Some(uuid_message),
+        );
+        let variant_message =
+            "Iceberg Variant writes are not supported yet: table ice.db.t, column payload";
+        let unsupported_variant = (
+            ConnectorErrorKind::Unsupported,
+            FailureClass::Unsupported,
+            4,
+            variant_message,
+            Some(variant_message),
+        );
+        let owner = owner();
+        for (case, format, target_ref, intent, payload_type, empty_identity, expected) in [
+            (
+                "v3 UPDATE without identity",
+                FormatVersion::V3,
+                "main",
+                ConnectorRowMutationIntent::Update,
+                None,
+                true,
+                invalid_identity,
+            ),
+            (
+                "v2 branch UPDATE before strategy selection",
+                FormatVersion::V2,
+                "dev",
+                ConnectorRowMutationIntent::Update,
+                None,
+                false,
+                invalid_branch,
+            ),
+            (
+                "v2 main UPDATE",
+                FormatVersion::V2,
+                "main",
+                ConnectorRowMutationIntent::Update,
+                None,
+                false,
+                invalid_format,
+            ),
+            (
+                "v2 main insert-only MERGE",
+                FormatVersion::V2,
+                "main",
+                merge(&[ConnectorRowMutationEffect::Insert]),
+                None,
+                false,
+                invalid_format,
+            ),
+            (
+                "v3 uuid UPDATE",
+                FormatVersion::V3,
+                "main",
+                ConnectorRowMutationIntent::Update,
+                Some(Type::Primitive(PrimitiveType::Uuid)),
+                false,
+                unsupported_uuid,
+            ),
+            (
+                "v3 uuid insert-only MERGE",
+                FormatVersion::V3,
+                "main",
+                merge(&[ConnectorRowMutationEffect::Insert]),
+                Some(Type::Primitive(PrimitiveType::Uuid)),
+                false,
+                unsupported_uuid,
+            ),
+            (
+                "v3 Variant UPDATE",
+                FormatVersion::V3,
+                "main",
+                ConnectorRowMutationIntent::Update,
+                Some(Type::Variant(VariantType)),
+                false,
+                unsupported_variant,
+            ),
+            (
+                "v3 Variant insert-only MERGE",
+                FormatVersion::V3,
+                "main",
+                merge(&[ConnectorRowMutationEffect::Insert]),
+                Some(Type::Variant(VariantType)),
+                false,
+                unsupported_variant,
+            ),
+            (
+                "v1 main UPDATE",
+                FormatVersion::V1,
+                "main",
+                ConnectorRowMutationIntent::Update,
+                None,
+                false,
+                invalid_format,
+            ),
+            (
+                "v1 main insert-only MERGE",
+                FormatVersion::V1,
+                "main",
+                merge(&[ConnectorRowMutationEffect::Insert]),
+                None,
+                false,
+                invalid_format,
+            ),
+        ] {
+            let schema = match payload_type {
+                Some(data_type) => IcebergSchema::builder()
+                    .with_fields(vec![NestedField::optional(1, "payload", data_type).into()])
+                    .build()
+                    .expect("unsupported write type is a valid Iceberg schema"),
+                None => iceberg_schema(),
+            };
+            let metadata = metadata_with_schema(format, &[], schema);
+            let mut spec = PayloadSpec::new(&metadata);
+            if empty_identity {
+                spec.metadata_columns.clear();
+            }
+            let error = denial(
+                prepare_row_mutation(request(spec.handle(), target_ref, intent), &owner)
+                    .unwrap_or_else(|error| {
+                        panic!("{case}: policy rejection must be a Denied outcome, got {error}")
+                    }),
+            );
+            let (kind, class, reason_code, message, public_detail) = expected;
+            assert_eq!(error.kind(), kind, "{case}");
+            assert_eq!(error.message(), message, "{case}");
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), class, "{case}");
+            assert_eq!(fact.reason().domain(), domain::CONNECTOR.get(), "{case}");
+            assert_eq!(fact.reason().code(), reason_code, "{case}");
+            assert_eq!(error.public_failure_detail(), public_detail, "{case}");
         }
     }
 

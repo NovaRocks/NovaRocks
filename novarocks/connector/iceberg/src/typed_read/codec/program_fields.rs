@@ -340,11 +340,7 @@ fn visit_table(
         if mutation_partition::is_file_metadata(column.base_field_id()) {
             let metadata = opaque_source(work, || table.mutation_metadata())?
                 .ok_or_else(|| invalid("Iceberg table did not declare mutation file metadata"))?;
-            if table.frozen_cow_source().is_some() {
-                return Err(invalid(
-                    "Iceberg COW source cannot supply mutation file metadata",
-                ));
-            }
+
             let (declaration, carrier) = if column.base_field_id() == mutation_partition::SPEC_ID {
                 (metadata.spec_field(), DataType::Int32)
             } else {
@@ -404,18 +400,6 @@ fn source_column_field<'a>(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FieldRef, bool, Option<&'a NestedField>), Failure> {
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(column.base_field_id()) {
-        if let Some(source) = table.and_then(IcebergTableHandle::frozen_cow_source) {
-            let expected = source
-                .metadata_columns()
-                .iter()
-                .find(|expected| expected.base_field_id() == column.base_field_id());
-            work.step()?;
-            if expected != Some(column) {
-                return Err(invalid(
-                    "read metadata column differs from the original COW source",
-                ));
-            }
-        }
         let field = opaque_source(work, || metadata_target_field(column, metadata))?;
         return Ok((field, column.nullable(), None));
     }

@@ -60,7 +60,6 @@ pub(crate) mod staging;
 pub mod statistics;
 pub(crate) mod truncate;
 pub mod types;
-mod update_cow;
 pub mod validation;
 mod write_adaptation;
 pub mod write_control;
@@ -106,4 +105,3 @@ pub use write_control::IcebergWriteControl;
 
 pub(crate) use data_file::from_written_file as frozen_data_file_from_written;
 pub(crate) use fast_append::FastAppendPreparer;
-pub(crate) use update_cow::{CowUpdateRewriteSet, CowUpdateTouchedFile};

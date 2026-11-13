@@ -325,21 +325,6 @@ fn validate_column_declaration(
                 "Iceberg metadata column differs from its real source author",
             ));
         }
-        if let Some(cow) = table.and_then(IcebergTableHandle::frozen_cow_source) {
-            let mut found = false;
-            for expected in cow.metadata_columns() {
-                creation.work(1)?;
-                if expected == column {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return Err(invalid_creation(
-                    "Iceberg metadata column differs from its original COW source",
-                ));
-            }
-        }
     } else if mutation_partition::is_file_metadata(source.id) {
         let table = table
             .ok_or_else(|| invalid_creation("Iceberg mutation metadata needs a table source"))?;
@@ -353,7 +338,6 @@ fn validate_column_declaration(
             schema.partition_field()
         };
         if !matches!(relation, IcebergRuntimeRelation::Table(_))
-            || table.frozen_cow_source().is_some()
             || !column.is_base_column()
             || source.name != expected.name
             || source.required != expected.required

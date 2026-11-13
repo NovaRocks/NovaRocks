@@ -469,7 +469,6 @@ mod tests {
             Overwrite,
             RowDelta,
             RowMutation,
-            CopyOnWrite,
             Truncate,
             RegisterFiles,
             ExpireSnapshots,

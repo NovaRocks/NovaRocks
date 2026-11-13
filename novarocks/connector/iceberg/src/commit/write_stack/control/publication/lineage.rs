@@ -281,7 +281,6 @@ mod tests {
                 .contains_key(&ICEBERG_RESERVED_FIELD_ID_ROW_ID)
         );
         let validated = [ValidatedFragment {
-            ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
             fragment: &fragment,
         }];
         freeze_preserved_row_ids(&validated, &mut files).unwrap();
@@ -498,7 +497,6 @@ mod tests {
             }
             let before = files.clone();
             let validated = [ValidatedFragment {
-                ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
                 fragment: &fragment,
             }];
             assert!(
@@ -508,7 +506,6 @@ mod tests {
             assert_eq!(files, before);
         }
         let validated = [ValidatedFragment {
-            ordinal: WriteTargetOrdinal::try_new(0).unwrap(),
             fragment: &original,
         }];
         let mut files = vec![written_file_from_fragment(&original, &source).unwrap()];

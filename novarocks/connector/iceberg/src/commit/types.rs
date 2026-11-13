@@ -28,7 +28,6 @@ pub enum CommitOpKind {
     RowDelta,
     MaterializedRowDelta,
     SelectedRewrite,
-    CowUpdate,
     Truncate,
     OverwritePartitions,
 }
@@ -107,6 +106,6 @@ mod tests {
 
     #[test]
     fn commit_kinds_are_distinct() {
-        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::CowUpdate);
+        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::SelectedRewrite);
     }
 }

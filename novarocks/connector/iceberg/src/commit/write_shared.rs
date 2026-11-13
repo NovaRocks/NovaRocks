@@ -213,35 +213,6 @@ pub(crate) fn exact_metadata_write_fields(
     Ok(authored)
 }
 
-/// Resolve the exact schema owned by a previously resolved write base.
-///
-/// A missing snapshot denotes an empty table/ref and deliberately retains the
-/// admitted metadata's current schema. A concrete snapshot always owns the
-/// schema, including when that snapshot is an older branch head.
-pub(crate) fn write_target_schema(
-    metadata: &TableMetadata,
-    target_snapshot_id: Option<i64>,
-) -> Result<std::sync::Arc<Schema>, ConnectorError> {
-    match target_snapshot_id {
-        Some(snapshot_id) => metadata
-            .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "resolved Iceberg write base snapshot is absent from admitted metadata",
-                )
-            })?
-            .schema(metadata)
-            .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    format!("resolve admitted Iceberg write base schema: {error}"),
-                )
-            }),
-        None => Ok(metadata.current_schema().clone()),
-    }
-}
-
 pub(crate) fn position_mutation_base(
     metadata: &TableMetadata,
     location: Option<&str>,

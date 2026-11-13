@@ -23,13 +23,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int8Array, Int64Array, StringArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileIoSpawner};
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteRouteFacts, ConnectorWriteSelectionBindingRole, ConnectorWriteSessionFlavor,
-    ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
+    ConnectorWriteRouteFacts, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteRuntimeAdapter,
@@ -51,16 +51,14 @@ use crate::commit::write_stack::control::{
     release_session_state, session_plan_from_targets, settle_empty_write_without_commit,
     validate_prepared_set,
 };
-use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
     IcebergCommitFragment, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
     IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteCommitSession,
     IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
-    IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_copy_on_write_branches,
-    plan_distributed_rewrite_branches, plan_document_publication_branches, plan_ordinary_branches,
-    plan_row_mutation_branches,
+    IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_distributed_rewrite_branches,
+    plan_document_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::planning::{
     IcebergBranchSessionPlanInput, IcebergWriteBranchPlan, IcebergWriteSessionPlanInput,
@@ -68,11 +66,11 @@ use crate::commit::write_stack::planning::{
 };
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRuntime};
 use crate::commit::write_stack::test_support::{
-    binding, copy_on_write_input_shape, copy_on_write_match_contract, data_branch_plan,
-    data_input_shape, delete_branch_plan, delete_input_shape, document_publication_facts,
-    document_publication_facts_with_shape, dv_artifact, equality_delete_input_shape,
-    equality_delete_recipe, merge_on_read_input_shape, position_rewrite_target, sample_metrics,
-    sample_partition, session_material, table_facts,
+    binding, data_branch_plan, data_input_shape, delete_branch_plan, delete_input_shape,
+    document_publication_facts, document_publication_facts_with_shape, dv_artifact,
+    equality_delete_input_shape, equality_delete_recipe, lineage_only_input_shape,
+    merge_on_read_input_shape, position_rewrite_target, sample_metrics, sample_partition,
+    session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
@@ -667,21 +665,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         assert_eq!(handle.branch_of(ordinal(1)), Some(branch));
         seen.insert(flavor, plans.len());
     }
-    // Copy-on-write seals one branch per rewritten file rather than the
-    // canonical shape, so it is covered by its own branch-planning tests and
-    // deliberately cannot be sealed here.
-    let (handle, plans) = flavor_session(
-        plan_copy_on_write_branches(
-            &session_material(copy_on_write_input_shape()),
-            &cow_recipes(&["s3://b/wh/db/t/data/a.parquet"]),
-            &copy_on_write_match_contract(),
-        )
-        .expect("row-mutation-copy-on-write must plan"),
-    );
-    assert_eq!(plans.len(), 2);
-    assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
-    seen.insert(IcebergWriteFlavor::RowMutationCopyOnWrite, plans.len());
-    assert_eq!(seen.len(), 10, "every flavor must be covered");
+    assert_eq!(seen.len(), 9, "every flavor must be covered");
 }
 
 // -------------------------------------------------------------------------
@@ -701,221 +685,12 @@ fn flavor_session(
             document_publication: plan.document_publication,
             staged_metadata: None,
             rewrite_inputs: plan.rewrite_inputs,
-            copy_on_write: plan.copy_on_write,
             repartition: None,
             writer_table: None,
             branches: plan.branches,
         },
     )
     .expect("seal the flavor's branches")
-}
-
-/// The frozen copy-on-write recipes of a mutation that touched `old_files`,
-/// plus the trailing append branch a folded `MERGE` insert reaches.
-///
-/// The read contract is assembled directly rather than frozen from a catalog:
-/// these tests assert the branch structure a recipe set produces, and the
-/// freeze that produces the recipes has its own unit tests beside it.
-fn cow_recipes(old_files: &[&str]) -> Vec<IcebergCowBranchRecipe> {
-    let selection = cow_selection(old_files);
-    let mut recipes = old_files
-        .iter()
-        .enumerate()
-        .map(|(index, old_file)| {
-            IcebergCowBranchRecipe::for_test(
-                IcebergCowBranchInput::Rewrite {
-                    old_file: (*old_file).to_string(),
-                    matched_row_ids: vec![100],
-                },
-                Some(cow_rewrite_source(old_file)),
-                selection.digest(),
-                vec![
-                    novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(
-                        index as u64,
-                    ),
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
-    recipes.push(IcebergCowBranchRecipe::for_test(
-        IcebergCowBranchInput::Append,
-        None,
-        selection.digest(),
-        vec![
-            novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(
-                old_files.len() as u64
-            ),
-        ],
-    ));
-    recipes
-}
-
-fn cow_selection(old_files: &[&str]) -> novarocks_spi::connector::ConnectorRowMutationSelection {
-    let contract = copy_on_write_match_contract();
-    let mut fields = vec![None; 7];
-    for field in contract.identity_fields() {
-        fields[field.source_ordinal() as usize] = Some(field.field().clone());
-    }
-    for field in contract
-        .before_fields()
-        .iter()
-        .chain(contract.after_fields())
-    {
-        fields[field.target_ordinal() as usize] = Some(field.field().clone());
-    }
-    fields[contract.effect_field().target_ordinal() as usize] =
-        Some(contract.effect_field().field().clone());
-    let schema = Arc::new(Schema::new(
-        fields
-            .into_iter()
-            .map(|field| field.expect("dense contract"))
-            .collect::<Vec<_>>(),
-    ));
-    let rows = old_files.len() + 1;
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
-                old_files
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once("append"))
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
-            Arc::new(Int64Array::from_iter_values(100..100 + rows as i64)),
-            Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(1, rows))),
-            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
-            Arc::new(Int64Array::from_iter_values(10..10 + rows as i64)),
-            Arc::new(Int8Array::from_iter_values(
-                std::iter::repeat_n(ConnectorRowMutationEffect::Replace as i8, old_files.len())
-                    .chain(std::iter::once(ConnectorRowMutationEffect::Insert as i8)),
-            )),
-        ],
-    )
-    .expect("COW selection batch");
-    novarocks_spi::connector::ConnectorRowMutationSelection::try_new(
-        schema,
-        vec![batch],
-        1024,
-        1 << 20,
-    )
-    .expect("COW selection")
-}
-
-/// One rewrite branch's read contract, pinned to the single file it replaces.
-fn cow_rewrite_source(
-    old_file: &str,
-) -> novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource {
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
-        arrow::datatypes::Field::new("k1", DataType::Int64, true),
-        arrow::datatypes::Field::new("_row_id", DataType::Int64, true),
-        arrow::datatypes::Field::new("_last_updated_sequence_number", DataType::Int64, true),
-    ]));
-    let bindings = (0..3)
-        .map(|_| novarocks_type_contract::FunctionValueType::new(DataType::Int64, true))
-        .collect::<Vec<_>>();
-    let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
-        schema.clone(),
-        bindings.into_boxed_slice(),
-        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-    )
-    .expect("declared COW execution schema");
-    let mut request = |_| Ok(());
-    let mut work = |_| Ok(());
-    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
-        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-        &mut request,
-        &mut work,
-    );
-    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::try_new_typed(
-        novarocks_spi::connector::ConnectorTableHandle::try_new(
-            ConnectorInstanceId::parse("copy_on_write").expect("instance id"),
-            bytes::Bytes::from_static(b"frozen-source"),
-        )
-        .expect("frozen source handle"),
-        novarocks_spi::connector::ConnectorPinnedFileSet::try_new("db", "t", 77, [old_file])
-            .expect("pinned source"),
-        [5; 32],
-        schema,
-        execution,
-        vec![
-            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
-                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
-                0,
-            ),
-            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
-                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32]),
-                1,
-            ),
-            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
-                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32]),
-                2,
-            ),
-        ],
-        vec![novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32])],
-        Some(novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32])),
-        &mut creation,
-    )
-    .expect("typed frozen COW source")
-}
-
-/// A sealed copy-on-write session holding exactly these frozen branches.
-fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergWriteCommitSession {
-    IcebergWriteCommitSession::try_new_sealed(
-        IcebergWriteSessionId::new(),
-        table_facts(),
-        IcebergWriteFlavor::RowMutationCopyOnWrite,
-        crate::commit::write_stack::domain::IcebergSessionFacts {
-            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            base_version_digest: None,
-            document_publication: None,
-            staged_metadata: None,
-            rewrite_inputs: Vec::new(),
-            copy_on_write: branches.to_vec(),
-            repartition: None,
-        },
-        branches
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
-                    ordinal(u32::try_from(index).expect("ordinal")),
-                    IcebergWriteBranch::Data,
-                    None,
-                )
-            })
-            .collect(),
-    )
-    .expect("seal a copy-on-write session")
-}
-
-/// One replacement data file, as the commit half sees it after a fragment is
-/// interpreted against the target's metadata.
-fn written_data_file(path: &str) -> crate::commit::WrittenFile {
-    crate::commit::WrittenFile {
-        path: path.to_string(),
-        format: crate::iceberg::spec::DataFileFormat::Parquet,
-        content: crate::iceberg::spec::DataContentType::Data,
-        partition_values: crate::iceberg::spec::Struct::empty(),
-        partition_spec_id: 0,
-        record_count: 3,
-        file_size_in_bytes: 128,
-        split_offsets: Vec::new(),
-        column_sizes: std::collections::HashMap::new(),
-        value_counts: std::collections::HashMap::new(),
-        null_value_counts: std::collections::HashMap::new(),
-        nan_value_counts: std::collections::HashMap::new(),
-        lower_bounds: std::collections::HashMap::new(),
-        upper_bounds: std::collections::HashMap::new(),
-        key_metadata: None,
-        referenced_data_file: None,
-        equality_ids: None,
-        first_row_id: None,
-        content_offset: None,
-        content_size_in_bytes: None,
-        cardinality: None,
-    }
 }
 
 /// Take the neutral session plan the frontend actually receives, so a route the
@@ -925,22 +700,7 @@ fn neutral_plan(
     sealed: (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>),
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
-    session_plan_from_targets(adapter, handle, targets, None, None)
-}
-
-fn neutral_cow_plan(
-    adapter: &IcebergWriteAdapter,
-    sealed: (IcebergWriteCommitSession, Vec<IcebergWriteTargetPlan>),
-    old_files: &[&str],
-) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
-    let (handle, targets) = sealed;
-    session_plan_from_targets(
-        adapter,
-        handle,
-        targets,
-        None,
-        Some((cow_selection(old_files), copy_on_write_match_contract())),
-    )
+    session_plan_from_targets(adapter, handle, targets, None)
 }
 
 fn effects(target: &ConnectorWriteTargetPlan) -> Vec<ConnectorRowMutationEffect> {
@@ -1091,316 +851,6 @@ fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
     );
 }
 
-/// A copy-on-write mutation that touched three data files must seal three
-/// branches, not one.
-///
-/// One branch would have given every file's replacement rows the same writer,
-/// and the prepared write set cannot notice: every fragment would name a target
-/// the session really did seal. The branch order is the recipe order, so each
-/// file's ordinal is the only name it needs.
-#[test]
-fn a_copy_on_write_row_mutation_seals_one_branch_per_rewritten_file() {
-    let adapter = adapter("copy_on_write", 4);
-    let old_files = [
-        "s3://b/wh/db/t/data/a.parquet",
-        "s3://b/wh/db/t/data/b.parquet",
-    ];
-    let recipes = cow_recipes(&old_files);
-    let plan = plan_copy_on_write_branches(
-        &session_material(copy_on_write_input_shape()),
-        &recipes,
-        &copy_on_write_match_contract(),
-    )
-    .expect("plan a copy-on-write mutation");
-    assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationCopyOnWrite);
-
-    let sealed =
-        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral plan");
-    assert_eq!(
-        sealed.expected_targets(),
-        vec![ordinal(0), ordinal(1), ordinal(2)]
-    );
-    // Each rewrite branch replaces rows that already exist; only the trailing
-    // append branch may receive a net-new row.
-    assert_eq!(
-        effects(&sealed.targets()[0]),
-        vec![
-            ConnectorRowMutationEffect::Delete,
-            ConnectorRowMutationEffect::Replace
-        ]
-    );
-    assert_eq!(
-        effects(&sealed.targets()[1]),
-        vec![
-            ConnectorRowMutationEffect::Delete,
-            ConnectorRowMutationEffect::Replace
-        ]
-    );
-    assert_eq!(
-        effects(&sealed.targets()[2]),
-        vec![ConnectorRowMutationEffect::Insert]
-    );
-    // Two branches sharing a route key would make SQL's choice ambiguous and
-    // one file's rows would vanish.
-    let routes = sealed
-        .targets()
-        .iter()
-        .map(|target| target.route().expect("routed").route_id())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(routes.len(), 3);
-    assert_eq!(
-        sealed.targets()[0]
-            .route()
-            .expect("rewrite route")
-            .selection_bindings()
-            .iter()
-            .map(|binding| binding.source())
-            .collect::<Vec<_>>(),
-        vec![
-            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                token: copy_on_write_match_contract().after_fields()[0].token(),
-                ordinal: copy_on_write_match_contract().after_fields()[0].target_ordinal(),
-                role: ConnectorWriteSelectionBindingRole::AfterImage,
-            },
-            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                token: copy_on_write_match_contract().uniqueness_tokens()[0],
-                ordinal: 2,
-                role: ConnectorWriteSelectionBindingRole::Identity,
-            },
-            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::ProviderDerived(
-                novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit,
-            ),
-        ]
-    );
-    assert_eq!(
-        sealed.targets()[2]
-            .route()
-            .expect("append route")
-            .selection_bindings()
-            .iter()
-            .map(|binding| binding.source())
-            .collect::<Vec<_>>(),
-        vec![
-            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-                token: copy_on_write_match_contract().after_fields()[0].token(),
-                ordinal: copy_on_write_match_contract().after_fields()[0].target_ordinal(),
-                role: ConnectorWriteSelectionBindingRole::AfterImage,
-            }
-        ]
-    );
-    let append_binding = sealed.targets()[2]
-        .route()
-        .expect("append route")
-        .selection_bindings()[0];
-    let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
-        token: selection_token,
-        ..
-    } = append_binding.source()
-    else {
-        panic!("append must consume its signed after-image")
-    };
-    assert_ne!(append_binding.writer_token(), selection_token);
-}
-
-/// Each branch re-reads exactly the file it replaces.
-///
-/// A branch that replaced one file while reading another would silently drop or
-/// duplicate rows, so the read contract travels with the target rather than
-/// being re-derived beside it.
-#[test]
-fn each_copy_on_write_branch_carries_the_read_contract_of_its_own_file() {
-    let adapter = adapter("copy_on_write_source", 4);
-    let old_files = [
-        "s3://b/wh/db/t/data/a.parquet",
-        "s3://b/wh/db/t/data/b.parquet",
-    ];
-    let recipes = cow_recipes(&old_files);
-    let plan = plan_copy_on_write_branches(
-        &session_material(copy_on_write_input_shape()),
-        &recipes,
-        &copy_on_write_match_contract(),
-    )
-    .expect("plan a copy-on-write mutation");
-    let sealed =
-        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral plan");
-
-    let pinned = |index: usize| {
-        sealed.targets()[index]
-            .rewrite_source()
-            .expect("a rewrite branch carries its read contract")
-            .pinned_source()
-            .files()
-            .iter()
-            .map(|file| file.to_string())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(pinned(0), vec!["s3://b/wh/db/t/data/a.parquet".to_string()]);
-    assert_eq!(pinned(1), vec!["s3://b/wh/db/t/data/b.parquet".to_string()]);
-    // The append branch replaces nothing, so it reads nothing.
-    assert!(sealed.targets()[2].rewrite_source().is_none());
-}
-
-#[test]
-fn copy_on_write_routing_proof_preserves_provider_branch_order_not_file_order() {
-    let adapter = adapter("copy_on_write_provider_order", 4);
-    let old_files = [
-        "s3://b/wh/db/t/data/z-last.parquet",
-        "s3://b/wh/db/t/data/a-first.parquet",
-    ];
-    let recipes = cow_recipes(&old_files);
-    let plan = plan_copy_on_write_branches(
-        &session_material(copy_on_write_input_shape()),
-        &recipes,
-        &copy_on_write_match_contract(),
-    )
-    .expect("provider-ordered COW plan");
-    let sealed =
-        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral COW plan");
-
-    assert_eq!(
-        sealed.targets()[0]
-            .rewrite_source()
-            .expect("first rewrite")
-            .pinned_source()
-            .files()[0]
-            .as_ref(),
-        old_files[0]
-    );
-    assert_eq!(
-        sealed.targets()[1]
-            .rewrite_source()
-            .expect("second rewrite")
-            .pinned_source()
-            .files()[0]
-            .as_ref(),
-        old_files[1]
-    );
-    assert_eq!(
-        sealed.targets()[0]
-            .routing_proof()
-            .expect("first proof")
-            .selection_ordinals(),
-        [novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0)]
-    );
-    assert_eq!(
-        sealed.targets()[1]
-            .routing_proof()
-            .expect("second proof")
-            .selection_ordinals(),
-        [novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(1)]
-    );
-}
-
-/// The commit keys every replacement record by the write target ordinal.
-///
-/// Two rewritten files must reach two `CowUpdateTouchedFile` records, each
-/// holding only its own artifacts. Merging them would attribute one file's
-/// replacement to the other and retire a file nothing superseded.
-#[test]
-fn each_copy_on_write_branch_reaches_its_own_replacement_record() {
-    let handle = cow_handle(&[
-        IcebergCowBranchInput::Rewrite {
-            old_file: "s3://b/wh/db/t/data/a.parquet".to_string(),
-            matched_row_ids: vec![101, 100],
-        },
-        IcebergCowBranchInput::Rewrite {
-            old_file: "s3://b/wh/db/t/data/b.parquet".to_string(),
-            matched_row_ids: vec![300],
-        },
-        IcebergCowBranchInput::Append,
-    ]);
-    let rewrite = crate::commit::write_stack::control::cow_update_rewrite_set(
-        &handle,
-        &[
-            (ordinal(0), written_data_file("s3://b/new/a-0.parquet")),
-            (ordinal(1), written_data_file("s3://b/new/b-0.parquet")),
-            (ordinal(0), written_data_file("s3://b/new/a-1.parquet")),
-            (ordinal(2), written_data_file("s3://b/new/inserted.parquet")),
-        ],
-    )
-    .expect("copy-on-write rewrite set")
-    .expect("a copy-on-write session commits a rewrite set");
-
-    assert_eq!(rewrite.touched_data_files.len(), 2);
-    assert_eq!(
-        rewrite.touched_data_files[0].old_file,
-        "s3://b/wh/db/t/data/a.parquet"
-    );
-    assert_eq!(
-        rewrite.touched_data_files[0].new_files,
-        vec![
-            "s3://b/new/a-0.parquet".to_string(),
-            "s3://b/new/a-1.parquet".to_string()
-        ]
-    );
-    assert_eq!(
-        rewrite.touched_data_files[1].new_files,
-        vec!["s3://b/new/b-0.parquet".to_string()]
-    );
-    // The row ids reach the commit exactly as the selection reported them: the
-    // minimum becomes the replacement manifest's `first_row_id`, so a reordered
-    // or synthesized value would corrupt row lineage rather than fail a check.
-    assert_eq!(rewrite.touched_data_files[0].row_ids, vec![101, 100]);
-    assert_eq!(rewrite.touched_data_files[1].row_ids, vec![300]);
-    assert_eq!(rewrite.updated_row_ids, vec![100, 101, 300]);
-    // A net-new row belongs to no rewritten file and is added beside them.
-    assert_eq!(
-        rewrite
-            .appended_files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>(),
-        vec!["s3://b/new/inserted.parquet".to_string()]
-    );
-    assert_eq!(rewrite.base_snapshot_id, 77);
-}
-
-/// A copy-on-write session cannot be sealed from the canonical data shape.
-///
-/// Its branch count follows the files its match selection touched, so a session
-/// sealed without those recipes would have nothing to replace and would commit
-/// a rewrite that retires no file at all.
-#[test]
-fn a_copy_on_write_session_without_frozen_branches_is_refused() {
-    let error = plan_write_session(
-        IcebergWriteSessionId::new(),
-        IcebergWriteSessionPlanInput {
-            flavor: IcebergWriteFlavor::RowMutationCopyOnWrite,
-            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            table: table_facts(),
-            base_version_digest: None,
-            staged_metadata: None,
-            data: data_branch_plan(),
-            deletes: Vec::new(),
-        },
-    )
-    .expect_err("a copy-on-write session must carry its frozen branches");
-    assert!(
-        error
-            .message()
-            .contains("frozen copy-on-write branch per target"),
-        "unexpected message: {}",
-        error.message()
-    );
-}
-
-/// A copy-on-write mutation reaching the row-mutation flavor is refused.
-///
-/// The row-mutation flavor carries no match selection, so it cannot know how
-/// many files the statement touched. Admitting it would seal one branch for a
-/// statement that rewrites several.
-#[test]
-fn a_copy_on_write_identity_is_refused_by_the_row_mutation_flavor() {
-    let error = plan_row_mutation_branches(&session_material(copy_on_write_input_shape()))
-        .expect_err("a copy-on-write mutation needs its own session flavor");
-    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-    assert!(
-        error.message().contains("copy-on-write session flavor"),
-        "unexpected message: {}",
-        error.message()
-    );
-}
-
 #[test]
 fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
     // Two branches sharing a route key would make the router's choice
@@ -1443,7 +893,6 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
-            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: None,
             branches: vec![
@@ -1883,7 +1332,6 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
                 )
                 .expect("frozen rewrite input"),
             ],
-            copy_on_write: Vec::new(),
             repartition: None,
         },
         vec![
@@ -1916,7 +1364,6 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
         IcebergWriteFlavor::PartitionOverwrite,
         IcebergWriteFlavor::RowMutationPositionDelete,
         IcebergWriteFlavor::RowMutationDeletionVector,
-        IcebergWriteFlavor::RowMutationCopyOnWrite,
         IcebergWriteFlavor::StagedCreate,
         IcebergWriteFlavor::ManagedPublication,
         IcebergWriteFlavor::TableMaintenance,
@@ -2018,7 +1465,6 @@ fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_curr
             )),
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
-            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: Some(prospective.clone()),
             branches: vec![IcebergWriteBranchPlan::Data {
@@ -2233,22 +1679,20 @@ fn a_full_refresh_cannot_apply_a_change_stream() {
         error.message()
     );
 
-    // A copy-on-write change stream is refused for a sharper reason: it seals
-    // only a data branch, so its publication would resolve to a plain append and
-    // publish every after-image while the before-images stayed live.
+    // Lineage alone cannot locate the physical before-image to delete.
     let error = plan_document_publication_branches(
-        &session_material(copy_on_write_input_shape()),
+        &session_material(lineage_only_input_shape()),
         document_publication_facts_with_shape(
             ConnectorManagedPublicationTechnique::Incremental,
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ConnectorManagedPublicationShape::RowMutation,
         ),
     )
-    .expect_err("a copy-on-write refresh is not supported");
+    .expect_err("a publication needs a physical row identity");
     assert!(
         error
             .message()
-            .contains("copy-on-write refresh is not supported"),
+            .contains("requires a `_file`/`_pos` row identity"),
         "unexpected message: {}",
         error.message()
     );
@@ -3330,13 +2774,6 @@ fn all_write_admission_requests(
         ),
         ("row mutation", ConnectorWriteSessionFlavor::RowMutation),
         (
-            "copy on write",
-            ConnectorWriteSessionFlavor::CopyOnWrite {
-                selection: cow_selection(&[]),
-                match_contract: copy_on_write_match_contract(),
-            },
-        ),
-        (
             "data rewrite",
             ConnectorWriteSessionFlavor::DistributedRewrite {
                 shape: DATA_FILE_REWRITE,
@@ -3420,7 +2857,7 @@ fn assert_write_admission_refused_without_io(
     let requests = all_write_admission_requests(&runtime, incarnation, catalog_handle);
     assert_eq!(
         requests.len(),
-        12,
+        11,
         "all flavors, intents and equality delete"
     );
     for (name, mut request) in requests {
@@ -5476,7 +4913,6 @@ fn empty_artifact_row_deltas_settle_noop_before_any_catalog_io() {
                     document_publication: None,
                     staged_metadata: None,
                     rewrite_inputs: plan.rewrite_inputs,
-                    copy_on_write: plan.copy_on_write,
                     repartition: None,
                     writer_table: None,
                     branches: plan.branches,
@@ -5618,19 +5054,6 @@ fn empty_data_replacements_and_managed_publications_keep_their_own_decision() {
             IcebergEmptyWriteDecision::Commit
         );
     }
-    let (cow, _) = flavor_session(
-        plan_copy_on_write_branches(
-            &session_material(copy_on_write_input_shape()),
-            &cow_recipes(&["s3://b/wh/db/t/data/a.parquet"]),
-            &copy_on_write_match_contract(),
-        )
-        .unwrap(),
-    );
-    assert_eq!(
-        cow.empty_write_decision(),
-        IcebergEmptyWriteDecision::Commit,
-        "COW may retire the complete old file without new data"
-    );
     for disposition in [
         ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
         ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
@@ -6047,5 +5470,19 @@ fn partition_replace_routes_after_image_partition_and_old_file_identity() {
             .unwrap()
             .accepted_effects()
             .contains(&ConnectorRowMutationEffect::Replace)
+    );
+}
+
+#[test]
+fn a_row_mutation_requires_a_physical_row_identity() {
+    let error = plan_row_mutation_branches(&session_material(lineage_only_input_shape()))
+        .expect_err("lineage alone cannot locate a physical delete row");
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(
+        error
+            .message()
+            .contains("requires a `_file`/`_pos` row identity"),
+        "unexpected message: {}",
+        error.message()
     );
 }

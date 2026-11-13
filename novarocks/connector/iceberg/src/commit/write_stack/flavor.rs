@@ -38,26 +38,21 @@
 //! * `DistributedRewrite` seals one branch per frozen rewrite group: a data
 //!   branch when the frozen operation republishes data files, a deletion-vector
 //!   branch when it repacks position deletes.
-//! * `CopyOnWrite` seals one data branch per frozen copy-on-write recipe: one
-//!   per rewritten data file, plus a trailing append branch when the statement
-//!   also has net-new rows.
 
 use crate::commit::model::EntryIdentity;
 use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteProviderDerivedValue, ConnectorWriteRouteFacts, ConnectorWriteSelectionBinding,
-    ConnectorWriteSelectionBindingRole,
+    ConnectorWriteRouteFacts, ConnectorWriteSelectionBinding,
 };
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
-    ConnectorManagedPublicationTechnique, ConnectorMutationMatchContract,
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldBinding,
-    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteRouteId,
+    ConnectorManagedPublicationTechnique, ConnectorMutationRouteInput, ConnectorRowMutationEffect,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    ConnectorWriteRouteId,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::IcebergPositionRewriteTarget;
 use crate::commit::write_stack::domain::{
     IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
@@ -173,9 +168,6 @@ pub(crate) struct IcebergSessionFlavorPlan {
     /// Present exactly on a distributed rewrite: the exact input files each
     /// branch replaces, in the same order as `branches`.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
-    /// Present exactly on a copy-on-write mutation: what each branch replaces
-    /// and what it re-reads, in the same order as `branches`.
-    pub copy_on_write: Vec<IcebergCowBranchRecipe>,
     /// The branches, in ordinal order.
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
@@ -207,7 +199,6 @@ pub(crate) fn plan_ordinary_branches(
         flavor,
         document_publication: None,
         rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
         branches,
     })
 }
@@ -228,7 +219,6 @@ fn plan_equality_delete_branches(
         flavor,
         document_publication: None,
         rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
         branches: vec![IcebergWriteBranchPlan::EqualityDelete {
             plan: IcebergEqualityDeleteBranchPlan {
                 output: IcebergWriterOutput::try_new(
@@ -265,7 +255,6 @@ pub(crate) fn plan_document_publication_branches(
         flavor: IcebergWriteFlavor::ManagedPublication,
         document_publication: Some(publication),
         rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
         branches,
     })
 }
@@ -335,13 +324,7 @@ fn plan_publication_branch_list(
                     "Iceberg full-refresh publication republishes rows and does not apply a change stream",
                 ));
             }
-            // Copy-on-write rewrites whole data files, and a publication has no
-            // match selection to cut those rewrites from. Left admitted it
-            // would not fail closed: the publication's commit op would resolve
-            // to a plain append and publish every after-image while the
-            // before-images stayed live. It is refused here, before the row
-            // mutation is planned, so the refusal names the publication's own
-            // reason rather than the flavor-admission one.
+            // Publication mutations must address the original physical row.
             if let ConnectorWriteInputShape::RowLineage {
                 row_identity_fields,
                 ..
@@ -353,7 +336,7 @@ fn plan_publication_branch_list(
                 )
             {
                 return Err(unsupported(
-                    "Iceberg publication change stream requires a `_file`/`_pos` row identity; a copy-on-write refresh is not supported",
+                    "Iceberg publication change stream requires a `_file`/`_pos` row identity",
                 ));
             }
             plan_row_mutation_branches(material)?.branches
@@ -473,7 +456,6 @@ pub(crate) fn plan_distributed_rewrite_branches(
         flavor,
         document_publication: None,
         rewrite_inputs,
-        copy_on_write: Vec::new(),
         branches,
     })
 }
@@ -568,7 +550,6 @@ pub(crate) fn plan_row_mutation_branches(
                 flavor,
                 document_publication: None,
                 rewrite_inputs: Vec::new(),
-                copy_on_write: Vec::new(),
                 branches: vec![IcebergWriteBranchPlan::Delete {
                     plan: material.delete_plan(branch, material.input.clone())?,
                     route: Some(route),
@@ -581,23 +562,9 @@ pub(crate) fn plan_row_mutation_branches(
         } => {
             if identity_names_are(row_identity_fields, ICEBERG_FILE_COL, ICEBERG_POS_COL) {
                 plan_merge_on_read_branches(material, data_fields, row_identity_fields, &ordinals)
-            } else if identity_names_are(
-                row_identity_fields,
-                ICEBERG_ROW_ID_COL,
-                ICEBERG_LAST_UPDATED_SEQ_COL,
-            ) {
-                // A copy-on-write mutation cannot be planned from the input
-                // alone: its branch count follows the files its match selection
-                // touched, and only the copy-on-write flavor carries that
-                // selection. Admitting it here would seal one branch for a
-                // statement that rewrites several files and silently attribute
-                // every file's replacement rows to the first one.
-                Err(unsupported(
-                    "Iceberg copy-on-write row mutation must be admitted through the copy-on-write session flavor",
-                ))
             } else {
                 Err(unsupported(
-                    "Iceberg row mutation requires a `_file`/`_pos` or `_row_id`/`_last_updated_sequence_number` row identity",
+                    "Iceberg row mutation requires a `_file`/`_pos` row identity",
                 ))
             }
         }
@@ -690,7 +657,6 @@ fn plan_merge_on_read_branches(
         flavor,
         document_publication: None,
         rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
         branches: vec![
             IcebergWriteBranchPlan::Data {
                 plan: material.data_plan(data_input)?,
@@ -702,198 +668,6 @@ fn plan_merge_on_read_branches(
             },
         ],
     })
-}
-
-/// Copy-on-write: one data branch per frozen recipe.
-///
-/// A copy-on-write mutation rewrites whole data files, and each rewritten file
-/// is its own branch: the branch re-reads exactly that file and its commit
-/// replaces exactly that file. Sealing one branch for the whole mutation would
-/// give every file's replacement rows the same writer, and the prepared write
-/// set cannot notice — every fragment would name a target the session really
-/// did seal. The branch order is the recipe order, so a branch's ordinal is the
-/// only name it needs.
-///
-/// The net-new rows of a folded `MERGE` insert reach the trailing append branch,
-/// which replaces nothing. Its route is the only one that accepts an insert, so
-/// SQL cannot route a net-new row into a file rewrite.
-pub(crate) fn plan_copy_on_write_branches(
-    material: &IcebergSessionMaterial,
-    recipes: &[IcebergCowBranchRecipe],
-    match_contract: &ConnectorMutationMatchContract,
-) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
-    let flavor = IcebergWriteFlavor::RowMutationCopyOnWrite;
-    if recipes.is_empty() {
-        return Err(invalid(
-            "Iceberg copy-on-write session must seal at least one frozen branch",
-        ));
-    }
-    let ConnectorWriteInputShape::RowLineage { data_fields, .. } = &material.input else {
-        return Err(unsupported(
-            "Iceberg copy-on-write mutation requires a row-lineage input",
-        ));
-    };
-    // A net-new row has no prior version, so the append branch writes the
-    // target's own columns and lets the commit mint its lineage. A rewrite
-    // branch re-emits rows that already have one, so it carries the lineage
-    // columns through unchanged -- writing a fresh id for them would break the
-    // row identity the rewrite exists to preserve.
-    let append_input = ConnectorWriteInputShape::Data {
-        fields: data_fields.clone(),
-    };
-    append_input.validate()?;
-    let rewrite_selection_bindings: Arc<[ConnectorWriteSelectionBinding]> =
-        copy_on_write_selection_bindings(&material.input, &material.input, match_contract)?.into();
-    let append_selection_bindings: Arc<[ConnectorWriteSelectionBinding]> =
-        copy_on_write_selection_bindings(&material.input, &append_input, match_contract)?.into();
-    let ordinals = InputOrdinals::of(&material.input);
-    let mut branches = Vec::with_capacity(recipes.len());
-    for (index, recipe) in recipes.iter().enumerate() {
-        let (effects, input, selection_bindings) = match recipe.input() {
-            IcebergCowBranchInput::Rewrite { .. } => (
-                vec![
-                    ConnectorRowMutationEffect::Delete,
-                    ConnectorRowMutationEffect::Replace,
-                ],
-                material.input.clone(),
-                Arc::clone(&rewrite_selection_bindings),
-            ),
-            IcebergCowBranchInput::Append => (
-                vec![ConnectorRowMutationEffect::Insert],
-                append_input.clone(),
-                Arc::clone(&append_selection_bindings),
-            ),
-        };
-        let ordinal = u32::try_from(index)
-            .map_err(|_| invalid("Iceberg copy-on-write session exceeds its branch bound"))?;
-        let route = route_facts(
-            &material.table,
-            RouteKey::new(flavor, IcebergWriteBranch::Data, ordinal),
-            effects,
-            &ordinals,
-            input.fields().into_iter(),
-            &[],
-            selection_bindings,
-        )?;
-        branches.push(IcebergWriteBranchPlan::Data {
-            plan: material.data_plan(input)?,
-            route: Some(route),
-        });
-    }
-    Ok(IcebergSessionFlavorPlan {
-        flavor,
-        document_publication: None,
-        rewrite_inputs: Vec::new(),
-        copy_on_write: recipes.to_vec(),
-        branches,
-    })
-}
-
-/// Freeze the exact bridge from this session's writer tokens to the match
-/// contract's independently signed selection tokens. Target columns bind by
-/// provider-owned target ordinal; Iceberg lineage roles bind inside the
-/// provider's own vocabulary. The returned order is the route input order.
-fn copy_on_write_selection_bindings(
-    session_input: &ConnectorWriteInputShape,
-    route_input: &ConnectorWriteInputShape,
-    contract: &ConnectorMutationMatchContract,
-) -> Result<Vec<ConnectorWriteSelectionBinding>, ConnectorError> {
-    let ConnectorWriteInputShape::RowLineage {
-        data_fields,
-        row_identity_fields,
-    } = session_input
-    else {
-        return Err(invalid(
-            "Iceberg copy-on-write selection bindings require a row-lineage session input",
-        ));
-    };
-    if data_fields.len() != contract.after_fields().len() {
-        return Err(invalid(
-            "Iceberg copy-on-write writer data width differs from its signed after-image",
-        ));
-    }
-    let compatible = |writer: &ConnectorWriteFieldBinding, selection: &arrow::datatypes::Field| {
-        writer.field().data_type() == selection.data_type()
-            && (!selection.is_nullable() || writer.field().is_nullable())
-    };
-    let mut by_writer = std::collections::BTreeMap::new();
-    for (writer, selection) in data_fields.iter().zip(contract.after_fields()) {
-        if !compatible(writer, selection.field()) {
-            return Err(invalid(
-                "Iceberg copy-on-write writer data type differs from its signed after-image",
-            ));
-        }
-        by_writer.insert(
-            writer.token(),
-            ConnectorWriteSelectionBinding::new(
-                writer.token(),
-                selection.token(),
-                selection.target_ordinal(),
-                ConnectorWriteSelectionBindingRole::AfterImage,
-            ),
-        );
-    }
-    for writer in row_identity_fields {
-        if writer.field().name() == ICEBERG_LAST_UPDATED_SEQ_COL {
-            if writer.field().data_type() != &arrow::datatypes::DataType::Int64
-                || !writer.field().is_nullable()
-            {
-                return Err(invalid(
-                    "Iceberg copy-on-write inherited written-version field must be nullable INT64",
-                ));
-            }
-            by_writer.insert(
-                writer.token(),
-                ConnectorWriteSelectionBinding::provider_derived(
-                    writer.token(),
-                    ConnectorWriteProviderDerivedValue::Inherit,
-                ),
-            );
-            continue;
-        }
-        if writer.field().name() != ICEBERG_ROW_ID_COL {
-            return Err(invalid(
-                "Iceberg copy-on-write writer carries an unknown row-lineage role",
-            ));
-        }
-        let mut matches = contract
-            .identity_fields()
-            .iter()
-            .filter(|field| field.field().name() == writer.field().name());
-        let selection = matches.next().ok_or_else(|| {
-            invalid("Iceberg copy-on-write match contract omits a writer lineage role")
-        })?;
-        let nullable_is_compatible =
-            !selection.field().is_nullable() || writer.field().is_nullable();
-        let uniqueness_is_compatible = contract.uniqueness_tokens().contains(&selection.token());
-        if matches.next().is_some()
-            || writer.field().data_type() != selection.field().data_type()
-            || !nullable_is_compatible
-            || !uniqueness_is_compatible
-        {
-            return Err(invalid(
-                "Iceberg copy-on-write writer lineage role is ambiguous or differs from its signed type and uniqueness role",
-            ));
-        }
-        by_writer.insert(
-            writer.token(),
-            ConnectorWriteSelectionBinding::new(
-                writer.token(),
-                selection.token(),
-                selection.source_ordinal(),
-                ConnectorWriteSelectionBindingRole::Identity,
-            ),
-        );
-    }
-    route_input
-        .fields()
-        .into_iter()
-        .map(|writer| {
-            by_writer.get(&writer.token()).copied().ok_or_else(|| {
-                invalid("Iceberg copy-on-write route carries a foreign writer token")
-            })
-        })
-        .collect()
 }
 
 fn identity_names_are(fields: &[ConnectorWriteFieldBinding], first: &str, second: &str) -> bool {

@@ -61,7 +61,6 @@ struct WriteRecipe {
     files: Vec<WrittenFile>,
     materialized: Option<Arc<materialized::MaterializedDeleteStep>>,
     fixed_mutation: bool,
-    cow: Option<CowUpdateRewriteSet>,
     selected: Option<crate::commit::selected_rewrite::SelectedRewriteFiles>,
     start: Option<StartSnapshot>,
     target: TableTarget,
@@ -114,7 +113,6 @@ impl WriteRecipe {
             .transpose()?;
         let mut targets = BTreeMap::new();
         let mut files = Vec::new();
-        let mut located_files = Vec::new();
         for entry in validated {
             let fragment = entry.fragment;
             let target = match fragment.artifact() {
@@ -147,9 +145,7 @@ impl WriteRecipe {
                     writer_metadata,
                     historical_type,
                 )?;
-                if handle.flavor() == IcebergWriteFlavor::RowMutationCopyOnWrite {
-                    located_files.push((entry.ordinal, file.clone()));
-                }
+
                 files.push(file);
             }
             if let Some(target) = target {
@@ -174,20 +170,6 @@ impl WriteRecipe {
         }
         let materialized = (!targets.is_empty())
             .then(|| Arc::new(materialized::MaterializedDeleteStep::new(targets)));
-        let cow = cow_update_rewrite_set(handle, &located_files)?;
-        if let Some(rewrite) = &cow {
-            let markers = cow_output_row_ids(rewrite)?;
-            for file in &mut files {
-                file.first_row_id = *markers.get(&file.path).ok_or_else(|| {
-                    corrupt("COW output is not owned by a frozen replacement or append branch")
-                })?;
-            }
-            if markers.len() != files.len() {
-                return Err(corrupt(
-                    "COW output declarations do not exactly match staged files",
-                ));
-            }
-        }
         let selected = selected_rewrite_files(handle);
         if crate::schema_facts::row_lineage_enabled(&source)
             && selected.as_ref().is_some_and(|rewrite| {
@@ -248,7 +230,6 @@ impl WriteRecipe {
             files,
             materialized,
             fixed_mutation,
-            cow,
             selected,
             start: facts.base_snapshot_id().map(|id| StartSnapshot {
                 snapshot_id: id,
@@ -316,16 +297,6 @@ impl WriteRecipe {
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
             let live = inputs.compact_live_entries().await?;
             let mut identities: BTreeSet<_> = match self.op_kind {
-                CommitOpKind::CowUpdate => self
-                    .cow
-                    .as_ref()
-                    .ok_or_else(|| format_error(invalid("COW graph is absent")))?
-                    .touched_data_files
-                    .iter()
-                    .map(|file| EntryIdentity::DataFile {
-                        path: file.old_file.clone(),
-                    })
-                    .collect(),
                 CommitOpKind::SelectedRewrite => {
                     let selected = self
                         .selected
@@ -354,10 +325,7 @@ impl WriteRecipe {
                     .collect(),
                 _ => BTreeSet::new(),
             };
-            if matches!(
-                self.op_kind,
-                CommitOpKind::CowUpdate | CommitOpKind::OverwritePartitions
-            ) {
+            if matches!(self.op_kind, CommitOpKind::OverwritePartitions) {
                 // Deletion vectors follow their exact data file, including when
                 // their stored partition differs. Removing one blob grants no
                 // authority to delete a shared Puffin container.
@@ -439,12 +407,6 @@ impl WriteRecipe {
                 }
                 Box::new(crate::commit::fast_append::FastAppendPreparer)
             }
-            CommitOpKind::CowUpdate => Box::new(crate::commit::update_cow::CowUpdatePreparer {
-                rewrite: self
-                    .cow
-                    .clone()
-                    .ok_or_else(|| invalid("COW graph is absent"))?,
-            }),
             CommitOpKind::SelectedRewrite => {
                 Box::new(crate::commit::selected_rewrite::SelectedRewritePreparer {
                     files: self
@@ -459,35 +421,6 @@ impl WriteRecipe {
             CommitOpKind::Truncate => Box::new(crate::commit::truncate::TruncatePreparer),
         })
     }
-}
-
-fn cow_output_row_ids(
-    rewrite: &CowUpdateRewriteSet,
-) -> Result<BTreeMap<String, Option<i64>>, ConnectorError> {
-    let mut markers = BTreeMap::new();
-    for touched in &rewrite.touched_data_files {
-        let min = touched
-            .row_ids
-            .iter()
-            .copied()
-            .min()
-            .filter(|min| *min >= 0)
-            .ok_or_else(|| corrupt("COW replacement has no valid source row IDs"))?;
-        if touched.row_ids.iter().any(|id| *id < 0) {
-            return Err(corrupt("COW source row ID is negative"));
-        }
-        for path in &touched.new_files {
-            if markers.insert(path.clone(), Some(min)).is_some() {
-                return Err(corrupt("Duplicate COW replacement output"));
-            }
-        }
-    }
-    for file in &rewrite.appended_files {
-        if markers.insert(file.path.clone(), None).is_some() {
-            return Err(corrupt("COW append overlaps another output"));
-        }
-    }
-    Ok(markers)
 }
 
 struct KeyedPublicationPreparer(novarocks_spi::connector::KeyedPublication);

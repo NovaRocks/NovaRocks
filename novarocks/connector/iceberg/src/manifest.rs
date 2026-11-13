@@ -468,8 +468,10 @@ pub async fn extract_data_files_with_stats_at(
 /// This value is provider-private and never crosses a generic/native boundary.
 pub(crate) struct FrozenReadFileWithStats {
     pub stats: DataFileWithStats,
-    manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
-    deletes: crate::delete_semantics::LoadView,
+    // Retain the original typed facts through the shared rewrite capture's
+    // lifetime, even when only its statistics projection is read.
+    _manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+    _deletes: crate::delete_semantics::LoadView,
 }
 
 impl FrozenReadFileWithStats {
@@ -480,29 +482,8 @@ impl FrozenReadFileWithStats {
     ) -> Self {
         Self {
             stats,
-            manifest,
-            deletes,
-        }
-    }
-
-    /// Move the exact original fields after legacy statistics, match and
-    /// branch-source validation completed. No file fact is guessed from its
-    /// path, catalog delete DTO, current table, or partition spelling.
-    pub(crate) fn into_read_file(self) -> crate::read_model::IcebergReadFile {
-        let stats = self.stats;
-        crate::read_model::IcebergReadFile {
-            path: stats.path,
-            size: stats.size,
-            record_count: stats.record_count,
-            column_stats: stats.column_stats,
-            partition_spec_id: stats.partition_spec_id,
-            partition_key: stats.partition_key,
-            partition_values: stats.partition_values,
-            manifest_path: stats.manifest_path,
-            first_row_id: stats.first_row_id,
-            data_sequence_number: stats.data_sequence_number,
-            manifest: self.manifest,
-            deletes: self.deletes,
+            _manifest: manifest,
+            _deletes: deletes,
         }
     }
 }
@@ -681,31 +662,6 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
 pub(crate) struct CheckedCowDataFiles {
     pub files: Vec<FrozenReadFileWithStats>,
     pub _retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
-}
-
-pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
-    table: &Table,
-    snapshot_id: i64,
-    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
-) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
-    use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
-    let build = async {
-        let capture = CaptureScope::new(scope)?;
-        let captured = crate::read_snapshot::build_cow_read_files_at_with_original_scope(
-            table,
-            snapshot_id,
-            &capture,
-        )
-        .await?;
-        finish_checked_cow_data_files_from_original_files(
-            table.metadata(),
-            snapshot_id,
-            captured,
-            scope,
-            &capture,
-        )
-    };
-    build.await.map_err(ReadFailure::into_cause)
 }
 
 /// Pure checked projection of the same original raw files. The caller retains
