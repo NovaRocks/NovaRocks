@@ -4359,12 +4359,16 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "novarocks-connector-contract",
+ "novarocks-execution",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
  "novarocks-physical-plan",
+ "novarocks-plan-codec",
  "novarocks-sql",
+ "novarocks-sql-testkit",
  "novarocks-type-contract",
+ "prost 0.13.5",
 ]
 
 [[package]]

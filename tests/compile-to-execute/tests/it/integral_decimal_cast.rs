@@ -16,14 +16,14 @@
 // under the License.
 
 //! Actual required signed source binding; no name-based re-resolution or fake provider.
-use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
-use super::sql_test_source::sql_source;
 use arrow::array::{Array, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_execution::exec::expr::compiled_program::CompiledExpressionInstance;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{ProgramRootInput, StaticExprKind, root_input_layout};
+use novarocks_sql_testkit::sql_source;
+use novarocks_test_compile_to_execute::programs::programs_with_catalogue;
 
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, PureCompileControl,
@@ -70,8 +70,7 @@ fn integral_decimal128_actual_sql_required_i64_to_four_zero_bound_source_and_fra
         }
     }
     assert_eq!(count, 1);
-    let functions =
-        super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
+    let functions = novarocks_sql_testkit::installed_builtin_owner_catalogue();
     let programs = programs_with_catalogue(&source, &functions);
     let mut found = None;
     for program in programs.values() {

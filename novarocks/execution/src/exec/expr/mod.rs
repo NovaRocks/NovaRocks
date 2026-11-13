@@ -145,12 +145,6 @@ mod percentile_hash_corpus_sql_source_tests;
 mod between_actual_sql_compiler_tests;
 
 #[cfg(test)]
-mod integral_decimal128_actual_sql_tests;
-
-#[cfg(test)]
-mod between_actual_after_tests;
-
-#[cfg(test)]
 mod percentile_hash_native_n1_frame_tests;
 
 #[cfg(test)]
