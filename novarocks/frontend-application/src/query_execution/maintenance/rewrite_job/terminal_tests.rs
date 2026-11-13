@@ -593,6 +593,9 @@ async fn provider_terminal_message_and_original_cause_survive_statement_projecti
         .with_public_failure_detail(),
     ] {
         let message = error.public_failure_detail().unwrap().to_owned();
+        let error = error
+            .map_message(|_| "private later SDK diagnostic".into())
+            .with_cleanup_context("private cleanup context");
         let binding_failure = error.table_object_binding_failure();
         let fact = error.failure_fact();
         let terminal = from_connector_cause(error.clone());
@@ -607,13 +610,19 @@ async fn provider_terminal_message_and_original_cause_survive_statement_projecti
                 .table_object_binding_failure(),
             binding_failure
         );
-        assert_eq!(
-            cause.detail(),
-            "table-maintenance original operation failed"
-        );
+        assert_eq!(cause.detail(), message);
         let service = computation_service_error(terminal);
         assert_eq!(service.failure_cause(), Some(&cause));
-        assert_eq!(service.execution_failure().unwrap().fact(), fact);
+        let input = service.execution_failure().unwrap();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(input.detail().as_str(), message);
+        assert!(service.message().contains(&message));
+        assert!(!service.message().contains("private"));
+        assert!(!input.detail().as_str().contains("private"));
+        if binding_failure == Some(ConnectorTableObjectBindingFailure::Replaced) {
+            assert!(service.message().contains("TARGET_REPLACED"));
+            assert!(input.detail().as_str().contains("TARGET_REPLACED"));
+        }
     }
 }
 

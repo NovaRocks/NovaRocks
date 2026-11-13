@@ -4,7 +4,6 @@ id	user_id	amount
 1	10	100
 3	30	300
 
-
 -- query 3
 -- types	varchar	bigint
 metric_name	metric_value

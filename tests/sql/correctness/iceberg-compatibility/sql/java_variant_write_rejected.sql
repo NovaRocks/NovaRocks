@@ -43,7 +43,7 @@ MERGE INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid
 
 -- query 5
 -- OPTIMIZE reports the provider schema refusal within the statement.
--- @expect_error=Iceberg Variant writes are not supported
+-- @expect_trino_error=NOT_SUPPORTED,USER_ERROR
 ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_rejected_${uuid0} OPTIMIZE;
 
 -- query 6

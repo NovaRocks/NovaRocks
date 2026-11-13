@@ -219,12 +219,15 @@ pub(crate) fn computation_service_error(error: TerminalError) -> QueryServiceErr
 // Only the Provider's explicit public projection may replace the neutral
 // detail. Reading it invokes no foreign formatter or new failure selection.
 fn from_connector_cause(error: novarocks_spi::connector::ConnectorError) -> TerminalError {
-    let public_detail = error.public_failure_detail().map(str::to_owned);
-    let mut terminal = TerminalError::from_original_cause(error);
-    if let Some(detail) = public_detail {
-        terminal.message = detail;
-    }
-    terminal
+    let Some(detail) = error
+        .public_failure_detail()
+        .map(novarocks_failure_contract::BoundedDetail::truncating)
+    else {
+        return TerminalError::from_original_cause(error);
+    };
+    let message = detail.as_str().to_owned();
+    let cause = novarocks_failure_contract::SharedFailureCause::from_bounded_detail(error, detail);
+    TerminalError::pre_dispatch_failed(message).with_failure_cause(Some(cause))
 }
 fn health(
     detail: &'static str,

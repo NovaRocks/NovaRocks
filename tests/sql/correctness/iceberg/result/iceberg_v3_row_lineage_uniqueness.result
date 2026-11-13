@@ -17,12 +17,10 @@ added_data_files_count	1
 row_id_collisions
 0
 
-
 -- query 10
 -- types	bigint	bigint	bigint	bigint	bigint	bigint
 t1_collisions	t2_collisions	t3_collisions	t4_collisions	t5_collisions	t6_collisions
 0	0	0	0	0	0
-
 
 -- query 11
 -- types	bigint

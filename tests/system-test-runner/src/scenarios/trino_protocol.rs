@@ -916,7 +916,7 @@ pub(in crate::scenarios) fn assert_raw_completion(
         let columns = match expected {
             RawCompletionExpectation::Empty => json!([]),
             RawCompletionExpectation::OptimizeMetrics(_) => json!([
-                {"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[]}},
+                {"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},
                 {"name":"metric_value","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}},
             ]),
             RawCompletionExpectation::Counted(_) | RawCompletionExpectation::NoCount => {
