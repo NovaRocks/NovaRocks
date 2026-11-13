@@ -51,7 +51,7 @@ TBLPROPERTIES (
 v3 表中：
 - INSERT / OVERWRITE 的新逻辑行在实际提交时分配 `_row_id`
 - UPDATE 复用原行的 `_row_id`，仅推进 `_last_updated_sequence_number`
-- DELETE 不分配新 ID，DV / position-delete 上记录被删行
+- DELETE 不分配新 ID；部分覆盖写 DV，完整覆盖逻辑移除数据文件及独占旧位置删除项
 - 写指定 branch / MERGE INTO 等高级 DML 都依赖 row-lineage
 
 ## ✅ 元数据列读
@@ -85,14 +85,14 @@ next-row-id 分配。没有物理行 ID 时，读端从继承的 first_row_id �
 
 ## ✅ DELETE 与 DV 合并
 
-DELETE 写 V3 deletion vector blob（不是新 data file），现有 `_row_id` 不变；read 端把 DV 应用到 scan 后，被标记的行不会出现在结果里。
+v3 DELETE 将本次与旧删除位置按文件合并；部分覆盖写最终 DV，完整覆盖逻辑移除数据文件及它独占的旧位置删除项（含旧 DV），不新增 DV。DELETE 不写新 data file，保留行的 `_row_id` 不变；scan 应用当前 snapshot 的文件和删除效果。
 它不产生新的逻辑行 ID；若本次提交同时携带尚未赋值的历史文件，这些历史行仍需完成首次 ID 分配。
 
 ## ✅ MOR UPDATE
 
 UPDATE 与 MERGE 的更新分支统一使用 MOR，write-mode 属性不影响策略：
 
-- 旧 data file 写 DV 标删被改的行
+- 旧物理行按同一逐文件规则删除：部分覆盖写 DV；完整覆盖移除 data file 及它独占的旧位置删除项，不新增 DV。这不是 COW 整文件重写
 - 新 data file 中改后的行保留物理 `_row_id`
 - 改后行的 `_last_updated_sequence_number` 写 NULL，由新文件 data sequence 继承实际提交版本
 

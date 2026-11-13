@@ -102,7 +102,7 @@ DELETE FROM orders WHERE amount < 10.0;
 V2 / V3 双路径：
 
 - V2 表：写 position-delete 文件
-- V3 表：写 Puffin deletion vector blob，**不分配新 `_row_id`**（DV 合并保留语义）
+- V3 表：本次与旧删除位置的并集部分覆盖数据文件时写 Puffin DV；完整覆盖时逻辑移除数据文件及它独占的旧位置删除项，不新增 DV。两种效果均**不分配新 `_row_id`**
 
 入口：`novarocks/frontend-application/src/query_execution/dml/delete/`。
 
@@ -119,7 +119,7 @@ UPDATE orders t
  WHERE t.id = s.id;
 ```
 
-NovaRocks 的 UPDATE 与所有 MERGE 形状只走 MOR：写 DV 标删旧物理行，再写 after-image。
+NovaRocks 的 UPDATE 与所有 MERGE 形状只走 MOR。有删除效果时按上述逐文件规则物化：部分覆盖写 DV，完整覆盖移除数据文件及独占旧位置删除项；更新分支另写 after-image。完整覆盖移除属于同一 MOR 路径，不是 COW 整文件重写。
 `novarocks.update.mode`、`write.update.mode` 及其他 `write.*.mode` 不选择执行算法；已有值、
 `copy-on-write` 或非法值均不能改变原 v3、类型与 ref 准入。
 

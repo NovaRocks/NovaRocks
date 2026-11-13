@@ -42,7 +42,7 @@ code-anchors:
 | 事实 | 原作者与消费边界 |
 |---|---|
 | UPDATE / MERGE 策略 | Provider 在原通用可写、v3、类型和 ref 准入后签发 MOR；所有 MERGE 效果形状使用同一规则 |
-| DELETE | v3 保留 deletion vector，非 v3 保留 position delete；不增加非 v3 的笼统行级拒绝 |
+| DELETE | v3 部分覆盖使用 deletion vector，完整覆盖沿原物化规则移除数据文件及独占旧位置项；非 v3 保留 position delete，不增加笼统行级拒绝 |
 | 匹配读取 | 原 admitted AST、Provider 签署的 match contract、target ref/base、planning pin 贯穿同一句；不混入后来的 main 或 generation |
 | S 与 V | S 为表达式真实源类型；完整 source query 完成 DISTINCT、UNION、ORDER/LIMIT 等语义后，SQL 原 value-conversion 作者执行普通赋值转换得到真实 V |
 | W 与 T | Provider 同一声明作者签发规范输入 W 和可选完整存储 T；Exact 不授予表示差异，显式许可仅在 T 的 plain physical Fixed 叶允许 W Binary，W 保留 T 各层 required 与其余完整事实 |
@@ -52,7 +52,9 @@ code-anchors:
 
 W/T 的许可属于准确字段和完整签名。nominal、字段名/顺序、decimal/timezone、offset、Map 排序、Union 等保持精确；typed binding 的规范 namespace 与 Provider 原 Field/metadata 的精确比较各守原边界，不从 Arrow carrier 或已被规范化移除的注释推领域。metadata planning、prepare、begin、shared maintenance、seal 与 public recipe 消费同一声明，不能各自重建近似 W/T。
 
-MOR 删除旧物理行并写 after-image。`_file`、`_pos`、原分区/spec 仍是真实删除事实；`_row_id` 与 `_last_updated_sequence_number` 保留 lineage。替换行保留源 ID，新版本继承真实 data sequence；新行的 ID 由实际提交分配。
+MOR 的更新效果删除旧物理行并写 after-image。`_file`、`_pos`、原分区/spec 仍是真实删除事实；`_row_id` 与 `_last_updated_sequence_number` 保留 lineage。替换行保留源 ID，新版本继承真实 data sequence；新行的 ID 由实际提交分配。
+
+DELETE 与 MOR UPDATE/MERGE 的 v3 删除效果保留 [ADR-0228](ADR-0228-iceberg-position-delete-materialization.md) 的逐文件物化规则：本次与旧删除位置的并集未覆盖整个数据文件时，保留数据文件并写最终 DV；完整覆盖时逻辑移除数据文件及它独占的旧位置删除项（含旧 DV），不新增 DV。完整覆盖移除属于同一 MOR 路径，不恢复 COW，也不授权物理删除仍有引用的共享对象。
 
 共享 `ConnectorScopedBeginCause`、`RewriteBeginScope`、`IcebergSharedTargetSchemaBacking`、`read_snapshot/scoped_capture`、`CheckedDataFiles` / `ScopedDataFileProjection` 继续服务重写、统计、扫描和 MV 窗口；`analyzer/declaration_widening` 继续服务视图等真实消费者。中性改名不扩大能力或改变最后持有者责任。
 

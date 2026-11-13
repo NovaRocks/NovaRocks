@@ -268,7 +268,7 @@ under the License.
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
 | `deletion-vector-v1` blob 编解码 | ✅ | `novarocks/connector/iceberg/src/commit/puffin_dv.rs` |
-| DV 写入（DELETE / MOR UPDATE） | ✅ | |
+| DV 写入（DELETE / MOR UPDATE/MERGE） | ✅ | v3 部分覆盖写最终 DV；完整覆盖逻辑移除 data file 及独占旧位置删除项，不新增 DV |
 | DV 读取并应用到 scan | ✅ | |
 | 多次 DELETE 合并到同一 DV blob | ✅ | |
 | 跨 partition spec 的 DV 写入 | ✅ | |
