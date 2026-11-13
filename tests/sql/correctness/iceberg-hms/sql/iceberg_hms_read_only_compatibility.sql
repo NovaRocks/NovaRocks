@@ -193,7 +193,7 @@ DELETE FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 WHERE id = 2;
 ALTER TABLE ice_hms_${uuid0}.iru7_${uuid0}.v2 ADD EQUALITY DELETE (id) VALUES (2);
 
 -- query 36
--- Copy-on-write mutation
+-- DELETE against a v2 table
 -- @expect_error=Hive Metastore catalog is a read-only compatibility entry
 DELETE FROM ice_hms_${uuid0}.iru7_${uuid0}.v2 WHERE id = 2;
 
