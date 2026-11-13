@@ -214,13 +214,15 @@ pub struct StatementResult {
     pub update_count: Option<u64>,
 }
 impl StatementResult {
-    /// JDBC completion classification follows updateType, including commands
-    /// with the static rows bigint column. Column names never classify results.
+    /// Ordinary command count rows remain completions. Trino table execution
+    /// explicitly carries a relation together with its ALTER TABLE EXECUTE update type.
     pub fn is_completion(&self) -> bool {
-        self.update_type.is_some()
+        self.update_type.is_some() && !self.is_result_set()
     }
     pub fn is_result_set(&self) -> bool {
-        !self.is_completion() && self.has_columns()
+        self.has_columns()
+            && (self.update_type.is_none()
+                || self.update_type.as_deref() == Some("ALTER TABLE EXECUTE"))
     }
     pub fn has_columns(&self) -> bool {
         !self.columns.is_empty()

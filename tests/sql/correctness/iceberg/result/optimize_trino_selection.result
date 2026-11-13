@@ -32,10 +32,10 @@ removed_delete_files_count	0
 added_data_files_count	1
 
 -- query 10
--- types	varchar	bigint	bigint
-p	data_files	physical_rows
-a	1	2
-b	1	1
+-- types	row(p varchar)	bigint
+partition	physical_rows
+["a"]	2
+["b"]	1
 
 -- query 12
 -- types	varchar	bigint

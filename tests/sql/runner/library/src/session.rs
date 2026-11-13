@@ -1182,6 +1182,51 @@ mod session_tests {
     }
 
     #[test]
+    fn table_execute_rows_reach_the_runner_and_golden_with_update_type() {
+        let peer = Peer::start(vec![
+            Reply::queued("/v1/statement", "/metrics"),
+            Reply::json(
+                "GET",
+                "/metrics",
+                r#"{"id":"q","updateType":"ALTER TABLE EXECUTE","columns":[{"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"metric_value","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}}],"data":[["rewritten_data_files_count",3],["removed_delete_files_count",0],["added_data_files_count",1]],"nextUri":"$BASE/end"}"#,
+            ),
+            Reply::json(
+                "GET",
+                "/end",
+                r#"{"id":"q","updateType":"ALTER TABLE EXECUTE"}"#,
+            ),
+        ]);
+        let mut session = peer.session();
+        let outcome = session.execute_query(9, "ALTER TABLE t OPTIMIZE", None);
+        let (ok, execution, message) = outcome.summary();
+        assert!(ok, "{message}");
+        let execution = execution.unwrap();
+        assert_eq!(execution.typed_results.len(), 1);
+        let result = &execution.typed_results[0];
+        assert_eq!(result.update_type.as_deref(), Some("ALTER TABLE EXECUTE"));
+        assert_eq!(result.update_count, None);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(execution.rows.len(), 3);
+        let blocks = crate::golden::execution::blocks_from_results(&execution.typed_results).unwrap();
+        assert_eq!(blocks.len(), 1);
+        let crate::golden::Block::Typed { names, rows, .. } = &blocks[0] else {
+            panic!("the table-execute relation must produce a typed golden block");
+        };
+        assert_eq!(names, &["metric_name", "metric_value"]);
+        assert_eq!(
+            rows,
+            &vec![
+                vec!["rewritten_data_files_count".to_owned(), "3".to_owned()],
+                vec!["removed_delete_files_count".to_owned(), "0".to_owned()],
+                vec!["added_data_files_count".to_owned(), "1".to_owned()]
+            ]
+        );
+        let requests = peer.finish();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].path, "/end");
+    }
+
+    #[test]
     fn completed_set_effects_are_sent_with_the_next_statement() {
         let peer = Peer::start(vec![
             Reply::queued("/v1/statement", "/set"),
