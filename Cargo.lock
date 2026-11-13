@@ -3489,7 +3489,6 @@ version = "0.1.0"
 name = "novarocks-frontend-application"
 version = "0.1.0"
 dependencies = [
- "allocator-api2",
  "anyhow",
  "arrow",
  "async-trait",
@@ -3498,7 +3497,6 @@ dependencies = [
  "chrono",
  "futures",
  "h2",
- "hashbrown 0.14.5",
  "hex",
  "novarocks-arrow-batch-codec",
  "novarocks-attempt-protocol",
@@ -3541,7 +3539,6 @@ dependencies = [
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
- "novarocks-value-arrays",
  "novarocks-workload-control",
  "once_cell",
  "parquet",
