@@ -1,7 +1,7 @@
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements. See the NOTICE file for additional
 # information. Licensed under the Apache License, Version 2.0.
-"""Hermetic binding checks; actual Trino 483 execution belongs to P08."""
+"""Hermetic binding checks; actual Trino execution belongs to P08."""
 import json
 import os
 from pathlib import Path

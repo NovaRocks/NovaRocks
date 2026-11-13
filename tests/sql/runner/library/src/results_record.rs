@@ -303,6 +303,9 @@ pub(crate) fn declarations(suites: &BTreeMap<String, SuiteConfig>) -> Result<Val
             facts["disabled_reason"] = json!(suite.manifest.disabled_reason);
             facts["heavy"] = json!(suite.manifest.heavy);
             facts["prepared_dataset"] = json!(suite.manifest.prepared_dataset);
+            if !suite.manifest.reference_inputs.is_empty() {
+                facts["reference_inputs"] = json!(suite.manifest.reference_inputs);
+            }
             facts["tier"] = json!(if suite.manifest.explicit_only {
                 "full"
             } else {
@@ -616,11 +619,15 @@ impl SuiteRecorder {
             ),
             Err(_) => (Value::Null, false),
         };
-        self.writer.observe(json!({"kind":"suite","suite":self.config.name,"lifecycle_id":self.lifecycle,
+        let mut record = json!({"kind":"suite","suite":self.config.name,"lifecycle_id":self.lifecycle,
             "executed_cases":outcome.outcomes.iter().filter(|o| init_errors.is_empty() && o.status != crate::CaseStatus::Skipped).map(|o|o.case_id.clone()).collect::<Vec<_>>(),
             "inputs_end_sha256":end_hash,"inputs_stable":stable,
             "init":{"status":if init_errors.is_empty(){"ok"}else{"failed"},"error":if init_errors.is_empty(){Value::Null}else{json!(init_errors.join("; "))}},
-            "cleanup":{"status":if outcome.cleanup_errors.is_empty(){"ok"}else{"failed"},"errors":outcome.cleanup_errors},"aborted":aborted}));
+            "cleanup":{"status":if outcome.cleanup_errors.is_empty(){"ok"}else{"failed"},"errors":outcome.cleanup_errors},"aborted":aborted});
+        if let Some(reference) = self.start.get("reference") {
+            record["reference"] = reference.clone();
+        }
+        self.writer.observe(record);
     }
 }
 
@@ -971,6 +978,7 @@ mod lifecycle_tests {
         ));
         let ctx = SuiteRunContext {
             case_input: None,
+            reference: Default::default(),
             fixture_storage: None,
             fixture_writers_settled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
@@ -1029,6 +1037,41 @@ mod lifecycle_tests {
             writer,
         )
     }
+    #[test]
+    fn normal_and_failed_suite_settlements_retain_the_bound_reference() {
+        for failed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut ps, _) = prepared(dir.path());
+            let reference = json!({"trino_image":{"alias":"reference","image_id":"sha256:original","version":"declared-version"}});
+            Arc::get_mut(ps.ctx.results.as_mut().unwrap())
+                .unwrap()
+                .start["reference"] = reference.clone();
+            let outcome = crate::SuiteOutcome {
+                suite_name: "unit".into(),
+                total: 0,
+                outcomes: vec![],
+                cleanup_errors: if failed {
+                    vec!["original cleanup failure".into()]
+                } else {
+                    vec![]
+                },
+                wall_time: Default::default(),
+            };
+            ps.ctx
+                .results
+                .as_ref()
+                .unwrap()
+                .finish(&ps, &outcome, false, &[]);
+            let record = &rows(dir.path())[0];
+            assert_eq!(record["kind"], "suite");
+            assert_eq!(record["reference"], reference);
+            assert_eq!(
+                record["cleanup"]["status"],
+                if failed { "failed" } else { "ok" }
+            );
+        }
+    }
+
     #[test]
     fn case_diagnostics_are_retained_outside_correctness_oracles() {
         let dir = tempfile::tempdir().unwrap();

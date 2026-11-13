@@ -39,7 +39,7 @@ fn row_statements_and_empty_input_do_not_publish_an_update_type() {
 }
 
 #[test]
-fn task_names_match_trino_483_and_novarocks_extensions() {
+fn task_names_match_trino_and_novarocks_extensions() {
     use StatementKind::*;
     // Trino execution/*Task.java getName() is the name oracle, rather than
     // NovaRocks parser spelling (notably SCHEMA, SET COLUMN TYPE and COMMENT).

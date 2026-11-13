@@ -16,7 +16,7 @@
 -- under the License.
 
 -- @tags=subquery,json,mark_join,trino_semantics
--- Independent expected values: Trino 483 handoff 2.1/2.2; raw typed JSON preserves scale.
+-- Independent expected values: Trino handoff 2.1/2.2; raw typed JSON preserves scale.
 -- scale: False
 SELECT JSON '1.0' IN (SELECT JSON '1.00') AS included;
 -- exponent_integer: False

@@ -32,11 +32,6 @@ def run(env_file, image, directory, command, *, mounts=(), interrupt_metrics=Non
     _, _, budget = fixture_run.admit(env_file)
     if budget is None:
         raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "client requires original shared fixture budget")
-    image_info = runtime.Docker(timeout=min(90, budget.remaining_seconds(work=True))).inspect("image", image)
-    manifest = "sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534"
-    if not image_info or (image_info.get("Id") != manifest and not any(value.endswith("@" + manifest) for value in (image_info.get("RepoDigests") or []))):
-        raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "client image does not expose the frozen Trino483 manifest")
-    image = image_info["Id"]
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=False)
     cidfile = directory / "container-id"
@@ -154,6 +149,6 @@ def cli(env_file, image, directory, arguments, metrics):
 
 
 def jdbc(env_file, image, directory, source, driver, arguments):
-    # Java source-file mode reuses image-local Java/JDBC; it never fetches a driver or compiler.
-    command = ["java", "--class-path", driver, "/probe/JdbcProbe.java", *arguments]
-    return run(env_file, image, directory, command, mounts=[(source, "/probe/JdbcProbe.java")])
+    # Java source-file mode uses the declared host driver through a read-only mount.
+    command = ["java", "--class-path", "/probe/trino-jdbc.jar", "/probe/JdbcProbe.java", *arguments]
+    return run(env_file, image, directory, command, mounts=[(source, "/probe/JdbcProbe.java"), (driver, "/probe/trino-jdbc.jar")])

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Startup composition validates public names against the Trino 484 baseline.
+//! Startup composition validates public names against the Trino baseline.
 //! This is an external naming contract, not a source-shape guard.
 
 use super::SystemTableRegistryError;
@@ -73,7 +73,7 @@ pub struct SystemTableRegistry {
 
 impl SystemTableRegistry {
     /// Install the three supported standard tables, then compose extensions.
-    /// Extensions cannot claim any name reserved by the Trino 484 baseline.
+    /// Extensions cannot claim any name reserved by the Trino baseline.
     pub fn try_new(
         additional: impl IntoIterator<Item = SystemTableRegistration>,
     ) -> Result<Self, SystemTableRegistryError> {
@@ -230,7 +230,7 @@ fn validate_name(kind: &'static str, name: &str) -> Result<(), SystemTableRegist
     }
 }
 
-// JDBC names come from the thirteen Trino 484 JdbcTable declarations. The
+// JDBC names come from the thirteen Trino JdbcTable declarations. The
 // metadata/runtime/information-schema lists follow the accepted public spec.
 fn is_trino_standard_name(schema: &str, table: &str) -> bool {
     let names: &[&str] = match schema {
@@ -355,7 +355,7 @@ fn standard_registrations() -> [SystemTableRegistration; 3] {
 mod tests {
     use super::*;
     // These pure package tests protect startup naming and exact declarations.
-    // Independent expectations are the accepted schema and Trino 484 columns;
+    // Independent expectations are the accepted schema and Trino columns;
     // there are no external fixtures, processes, or cleanup obligations.
     fn extension(schema: &str, table: &str) -> SystemTableRegistration {
         SystemTableRegistration {

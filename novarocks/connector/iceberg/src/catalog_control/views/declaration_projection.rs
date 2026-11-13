@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Standard Iceberg view types, following Trino 483's TypeConverter.
+//! Standard Iceberg view types, following Trino's TypeConverter.
 //! SQL view types carry no non-null promise. Table declarations keep their
 //! independent required/nominal rules; no view summary can recover a type.
 
@@ -37,7 +37,7 @@ type Failure = PureProviderCompileError<ConnectorError>;
 fn unsupported_failure() -> Failure {
     ConnectorError::new(
         ConnectorErrorKind::Unsupported,
-        "Iceberg view type has no supported Trino 483 mapping",
+        "Iceberg view type has no supported Trino mapping",
     )
     .into()
 }
