@@ -6144,8 +6144,7 @@ fn cancelled_data_stack_aborts_open_streams_before_deleting_original_objects() {
     let error = lake
         .executor
         .block_on(writer.finish())
-        .err()
-        .expect("cancelled finish");
+        .expect_err("cancelled finish");
     assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     lake.executor.block_on(writer.abort()).unwrap();
     lake.executor.block_on(writer.abort()).unwrap();

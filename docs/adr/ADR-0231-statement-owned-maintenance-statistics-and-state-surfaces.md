@@ -21,6 +21,9 @@ code-anchors:
   - "novarocks/frontend-application/src/statistics/show_stats.rs (render_show_stats)"
   - "novarocks/frontend-application/src/system_tables/provider.rs (FrontendSystemTableProvider)"
   - "novarocks/frontend-application/src/metrics/management.rs (frontend_backends)"
+  - "novarocks/functions/src/array_projection.rs (merge_execution_carriers_observed)"
+  - "novarocks/execution/src/exec/operators/sort/creation.rs (SortCreation)"
+  - "novarocks/execution/src/exec/operators/compiled_sort.rs (sort_runs)"
 ---
 
 ## 问题
@@ -38,6 +41,8 @@ Root、查询许可、冻结会话设置、Provider Source 和实际退出属于
 | `SHOW STATS FOR t` | Iceberg 提供同一元数据观察下的统计事实，FE 归一化并呈现七列 | 原语句只读 Source；不创建采集或发布工作 |
 | `system.runtime.materialized_view_states` | MV 产品配置、发布记录、manageability 与依赖事实 | 复用原系统表快照、结果预算与实际退出 |
 | `GET /v1/frontend/backends` | 原 topology owner 的类型化行 | FE management HTTP 只读投影 |
+
+原生 Exchange 按既有规则允许物理载体的子字段 NULL 声明更宽，完整值声明保持不变。状态表数组经过排序或窗口时，沿 Functions 原元数据作者统一各批实际载体，保持完整 binding 与所有输入的存储保管；不把物理可空性当作逻辑可空性的授权，也不缩窄被父 NULL 遮住的子 NULL。实际类型完全一致的批次复用原路径，不重复创建包装。
 
 计算就绪、必要业务就绪、publication outcome 与原资源实际退出是独立事实。客户端仍须请求 Trino 终页确认，结果数据不能代替退出证明。GC first-observation 仅证明准确外部元组第一次被观察的时间，仍是可重建 Accelerator，不能成为执行或恢复 authority。
 
