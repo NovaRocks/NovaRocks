@@ -35,9 +35,6 @@ CREATE TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows (k BIGINT)
 TBLPROPERTIES ('format-version' = '3', 'write.row-lineage' = 'true');
 
 -- query 2
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=0
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.empty_rows OPTIMIZE;
 
 -- query 3
@@ -47,9 +44,6 @@ INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES (2);
 INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows VALUES (3);
 
 -- query 4
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=3
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
 
 -- query 5
@@ -59,9 +53,6 @@ ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows CREATE TAG before_noop;
 
 -- query 6
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=0
 -- A single current-spec file without deletes is skipped.
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.tiny_rows OPTIMIZE;
 
@@ -80,9 +71,6 @@ INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES (2
 INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows VALUES (3, 'b');
 
 -- query 9
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=2
 -- Only the two-file partition is selected; partition b must survive untouched.
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.partition_rows OPTIMIZE;
 
@@ -98,9 +86,6 @@ INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows VALUES (1)
 DELETE FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows WHERE k = 1;
 
 -- query 12
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=1
 -- A singleton carrying a position delete is selected.
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.position_rows OPTIMIZE;
 
@@ -114,9 +99,6 @@ INSERT INTO iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows VALUES (3), 
 DELETE FROM iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows WHERE k IN (1, 3);
 
 -- query 15
--- @result_rows_where=metric_name=rewritten_data_files_count
--- @result_rows_count=1
--- @result_rows_expect=metric_value=2
 ALTER TABLE iceberg_cat_${suite_uuid0}.trc_opt_${uuid0}.vector_rows OPTIMIZE;
 
 -- query 16

@@ -43,8 +43,8 @@ use novarocks_spi::connector::{
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::data_writer::{
-    StagedDataFile, StagedPathJournal, StagedWriteContext, staged_data_file_to_writer_report,
-    write_record_batches_journaled,
+    StagedDataFile, StagedPathJournal, StreamingStagedDataFileWriter,
+    staged_data_file_to_writer_report,
 };
 use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_with_file_io};
 use crate::commit::report::{IcebergPartitionReport, partition_path_from_struct};
@@ -274,6 +274,19 @@ fn with_creation_receipt(
     }
 }
 
+fn stage_data_error(cause: anyhow::Error) -> ConnectorError {
+    if let Some(original) = cause
+        .chain()
+        .find_map(|error| error.downcast_ref::<ConnectorError>())
+    {
+        return original.clone();
+    }
+    error(
+        ConnectorErrorKind::Internal,
+        format!("stage Iceberg data artifact: {cause:#}"),
+    )
+}
+
 fn stage_position_error(cause: anyhow::Error) -> ConnectorError {
     if let Some(original) = cause
         .chain()
@@ -290,7 +303,7 @@ fn stage_position_error(cause: anyhow::Error) -> ConnectorError {
 /// The per-driver data-file writer.
 struct IcebergDataStackWriter {
     adapter: IcebergWriteAdapter,
-    context: StagedWriteContext,
+    writer: StreamingStagedDataFileWriter,
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
     staged_paths: StagedPathJournal,
@@ -342,7 +355,8 @@ impl IcebergDataStackWriter {
         );
         Ok(Self {
             adapter: execution.adapter.clone(),
-            context,
+            writer: StreamingStagedDataFileWriter::new(context, &staged_paths)
+                .map_err(stage_data_error)?,
             request_context: request.context,
             fragments: Vec::new(),
             staged_paths,
@@ -438,17 +452,15 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let staged = write_record_batches_journaled(&self.context, [batch], &self.staged_paths)
-            .await
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
-        self.record(staged)
+        self.writer.append(batch).await.map_err(stage_data_error)
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         ensure_live(self.lifecycle, &self.request_context, "data")?;
+        self.lifecycle = WriterLifecycle::Finishing;
+        let staged = self.writer.finish().await.map_err(stage_data_error)?;
+        self.record(staged)?;
         self.lifecycle = WriterLifecycle::Sealed;
-        // A writer that staged nothing returns an empty vector; that is a
-        // legal outcome and is not a failure.
         Ok(std::mem::take(&mut self.fragments))
     }
 
@@ -457,9 +469,11 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
             return Ok(());
         }
         self.lifecycle = WriterLifecycle::Aborting;
+        self.writer.close_for_abort();
         // The same unsealed journal activates the Provider's existing cleanup
         // phase once; Task stop still forbids append/finish work.
         self.cleanup.run(&self.staged_paths).await?;
+        self.writer.complete_abort();
         self.fragments.clear();
         self.lifecycle = WriterLifecycle::Aborted;
         Ok(())

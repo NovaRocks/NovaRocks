@@ -69,6 +69,8 @@ different manifest is a hard failure, never a silent substitution.
 
 共享 REST 的 `create-parent` 必须继承调用者的 `NOVA_FIXTURE_RUN_CONTEXT`，namespace 使用该完整 run ID 加不超过五字符的 case suffix；schema、table 与实际 data file location 均核对原 scratch 根。`verify-current` 按传入的现有 namespace 只读核验，不重新命名。临时 Trino 使用 publication 的准确 network、已安装镜像的实际 argv 和原绝对期限；停止与查询都按准确 container ID 执行。
 
+SQL runner 的隔离 REST fixture 使用同一 helper：私有 publication 沿 `runtime.catalog` 的原 network 和生成的 REST warehouse 创建本次 schema/table，仍核对实际 data file 前缀；不构造共享 scratch context。共享 publication 继续沿 `runtime.machine` 和原 run 身份检查。两种路径都由原 `trino_run.py` 作者启动、执行和停止准确容器，保留镜像、NDV、数据事实与清理断言。
+
 The strongest product path is the native `statistics/trino_rest_puffin_show_stats.sql` regression:
 Trino creates an Iceberg v3 table, writes `{1,2}`, and publishes its parent Puffin with `ANALYZE`;
 NovaRocks enables collect-on-write and appends `{2,3}`; then a new Trino process reads the current

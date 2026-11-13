@@ -171,8 +171,12 @@ async fn first_partition_and_unknown_second_close_remain_in_the_original_journal
     let journal = StagedPathJournal::default();
     let (io, probe) = file_io(ctx.file_io.clone(), &journal, 2);
     ctx.file_io = io;
-    let failure =
-        write_record_batches_journaled(&ctx, [super::tests::test_batch(&[0, 1])], &journal).await;
+    let failure = write_record_batches_with_journal(
+        &ctx,
+        [super::tests::test_batch(&[0, 1])],
+        Some(&journal),
+    )
+    .await;
     assert!(failure.is_err());
     assert_eq!(
         probe.close_count.load(Ordering::SeqCst),
@@ -223,5 +227,25 @@ async fn equality_delete_unknown_close_keeps_its_actual_generated_path() {
     assert_eq!(probe.close_count.load(Ordering::SeqCst), 1);
     assert_eq!(journal.snapshot().len(), 1);
     cleanup(&io, &journal).await;
+    assert!(journal.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn streaming_partition_close_failure_retains_all_original_paths_for_abort() {
+    let table = super::tests::build_local_fs_test_table("stream_journal_close", true).await;
+    let mut ctx = StagedWriteContext::from_table(&table).unwrap();
+    let journal = StagedPathJournal::default();
+    let (io, probe) = file_io(ctx.file_io.clone(), &journal, 2);
+    ctx.file_io = io.clone();
+    let mut writer = StreamingStagedDataFileWriter::new(ctx, &journal).unwrap();
+    for ids in [&[0, 1][..], &[0][..], &[1][..]] {
+        writer.append(super::tests::test_batch(ids)).await.unwrap();
+    }
+    assert!(writer.finish().await.is_err());
+    assert_eq!(probe.close_count.load(Ordering::SeqCst), 2);
+    assert_eq!(journal.snapshot().len(), 2);
+    writer.close_for_abort();
+    cleanup(&io, &journal).await;
+    writer.complete_abort();
     assert!(journal.snapshot().is_empty());
 }

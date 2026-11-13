@@ -22,6 +22,10 @@ use std::sync::Arc;
 mod staged_paths;
 pub(crate) use staged_paths::{CreateClaim, ObjectContent, ObjectOwner, StagedPathJournal};
 
+#[path = "data_writer/streaming.rs"]
+mod streaming;
+pub(crate) use streaming::StreamingStagedDataFileWriter;
+
 use super::write_adaptation::adapt_batch;
 use crate as novarocks_connector_iceberg;
 use arrow::array::Array;
@@ -325,15 +329,6 @@ pub async fn write_record_batches(
     write_record_batches_with_journal(ctx, batches, None).await
 }
 
-/// Actual BE writer path: its stable original inventory precedes every SDK
-/// output, and outlives errors, cancellation and fallible post-write metadata.
-pub(crate) async fn write_record_batches_journaled(
-    ctx: &StagedWriteContext,
-    batches: impl IntoIterator<Item = RecordBatch>,
-    journal: &StagedPathJournal,
-) -> Result<Vec<StagedDataFile>, String> {
-    write_record_batches_with_journal(ctx, batches, Some(journal)).await
-}
 async fn write_record_batches_with_journal(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,

@@ -1207,7 +1207,8 @@ mod session_tests {
         assert_eq!(result.update_count, None);
         assert_eq!(result.rows.len(), 3);
         assert_eq!(execution.rows.len(), 3);
-        let blocks = crate::golden::execution::blocks_from_results(&execution.typed_results).unwrap();
+        let blocks =
+            crate::golden::execution::blocks_from_results(&execution.typed_results).unwrap();
         assert_eq!(blocks.len(), 1);
         let crate::golden::Block::Typed { names, rows, .. } = &blocks[0] else {
             panic!("the table-execute relation must produce a typed golden block");

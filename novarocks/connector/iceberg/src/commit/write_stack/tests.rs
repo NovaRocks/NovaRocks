@@ -6049,3 +6049,122 @@ fn partition_replace_routes_after_image_partition_and_old_file_identity() {
             .contains(&ConnectorRowMutationEffect::Replace)
     );
 }
+
+fn open_streaming_data_writer(
+    lake: &FrozenRewriteLake,
+    context: ConnectorRequestContext,
+) -> (
+    Box<dyn novarocks_spi::connector::write_stack::ConnectorBatchWriter>,
+    arrow::datatypes::SchemaRef,
+) {
+    use novarocks_spi::connector::write_stack::{
+        ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterPhysicalContext,
+    };
+    let session = lake
+        .executor
+        .block_on(
+            lake.control
+                .begin_write_async(ordinary_async_test_begin(context.clone())),
+        )
+        .unwrap();
+    let target = &session.targets()[0];
+    let ConnectorWriteInputShape::Data { fields } = target.input() else {
+        panic!("data writer input")
+    };
+    let schema = Arc::new(Schema::new(
+        fields
+            .iter()
+            .map(|field| field.field().clone())
+            .collect::<Vec<_>>(),
+    ));
+    let execution = super::execution::IcebergWriteStackExecution::new(
+        session.commit_session().binding().catalog_handle().clone(),
+        lake.adapter.clone(),
+        lake.runtime.resources().planning_binding().clone(),
+    );
+    let writer = lake
+        .executor
+        .block_on(execution.open_writer(ConnectorOpenWriterRequest {
+            resources: None,
+            handle: target.handle().clone(),
+            target: target.ordinal(),
+            expected_schema: schema.clone(),
+            physical: ConnectorWriterPhysicalContext::new([1; 16], 1, [2; 16], 0, 0),
+            context,
+        }))
+        .unwrap();
+    (writer, schema)
+}
+#[test]
+fn actual_data_stack_append_pages_share_one_file_until_finish() {
+    let lake = FrozenRewriteLake::new();
+    let (mut writer, schema) = open_streaming_data_writer(&lake, request_context());
+    for value in [7, 9, 11] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![value]))],
+        )
+        .unwrap();
+        lake.executor.block_on(writer.append(batch)).unwrap();
+    }
+    let fragments = lake.executor.block_on(writer.finish()).unwrap();
+    assert_eq!(
+        fragments.len(),
+        1,
+        "one driver consumes three pages into one data file"
+    );
+    let fragment = lake.adapter.commit_fragment(&fragments[0]).unwrap();
+    let super::domain::IcebergCommitArtifact::DataFile(artifact) = fragment.artifact() else {
+        panic!("data file fragment")
+    };
+    assert_eq!(artifact.metrics().record_count(), 3);
+    assert!(std::path::Path::new(artifact.path().trim_start_matches("file://")).is_file());
+}
+#[test]
+fn cancelled_data_stack_aborts_open_streams_before_deleting_original_objects() {
+    let lake = FrozenRewriteLake::new();
+    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(30),
+        stop.view(),
+        64 * 1024,
+        1024 * 1024,
+    )
+    .unwrap();
+    let (mut writer, schema) = open_streaming_data_writer(&lake, context);
+    for value in [7, 9, 11] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![value]))],
+        )
+        .unwrap();
+        lake.executor.block_on(writer.append(batch)).unwrap();
+    }
+    stop.request_stop();
+    let error = lake
+        .executor
+        .block_on(writer.finish())
+        .err()
+        .expect("cancelled finish");
+    assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+    lake.executor.block_on(writer.abort()).unwrap();
+    lake.executor.block_on(writer.abort()).unwrap();
+    // No data object may remain after the actual original abort. Catalog
+    // metadata files are independent, and are not this driver's objects.
+    fn parquet_paths(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(parquet_paths(&path));
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+    assert!(parquet_paths(lake._warehouse.path()).is_empty());
+}

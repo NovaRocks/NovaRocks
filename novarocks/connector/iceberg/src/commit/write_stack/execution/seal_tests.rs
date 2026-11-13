@@ -105,7 +105,16 @@ impl Fixture {
         let (handle, batch) = match branch {
             IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                 let handle = if branch == IcebergWriteBranch::Data {
-                    IcebergWriterHandle::try_new_data(table, output, data.recipe).unwrap()
+                    IcebergWriterHandle::try_new_data(table, output, data.recipe)
+                        .unwrap()
+                        .with_creation_scope(
+                            IcebergCreationScope::try_new(
+                                IcebergWriteSessionId::new(),
+                                [1; 16],
+                                [2; 32],
+                            )
+                            .unwrap(),
+                        )
                 } else {
                     IcebergWriterHandle::try_new_equality_delete(
                         table,
@@ -266,6 +275,56 @@ async fn unsealed_data_and_equality_delete_still_clean_their_own_objects() {
         assert!(writer.finish().await.is_err());
         writer.abort().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn rejected_append_keeps_the_open_data_stream_abortable() {
+    let fixture = Fixture::new();
+    let (mut writer, batch, _) = fixture.writer(IcebergWriteBranch::Data).await;
+    writer.append(batch).await.unwrap();
+    let original = fixture.files();
+    assert_eq!(
+        original.len(),
+        1,
+        "real conditional writer owns one private object before close"
+    );
+    let invalid = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("k1", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec!["invalid"]))],
+    )
+    .unwrap();
+    assert!(writer.append(invalid).await.is_err());
+    assert_eq!(
+        fixture.files(),
+        original,
+        "rejected input does not replace the original open stream"
+    );
+    writer.abort().await.unwrap();
+    assert!(fixture.files().is_empty());
+    writer.abort().await.unwrap();
+    assert!(writer.finish().await.is_err());
+}
+
+#[tokio::test]
+async fn failed_original_stream_abort_remains_a_failure_on_reentry() {
+    let fixture = Fixture::new();
+    let (mut writer, batch, stop) = fixture.writer(IcebergWriteBranch::Data).await;
+    writer.append(batch).await.unwrap();
+    let [private]: [PathBuf; 1] = fixture.files().try_into().unwrap();
+    // Fail the actual conditional local writer's unlink. The original abort
+    // must be awaited, and neither another caller nor a terminal flag can
+    // replace its retained raw exit failure with successful cleanup.
+    std::fs::remove_file(&private).unwrap();
+    std::fs::create_dir(&private).unwrap();
+    stop.request_stop();
+    assert!(writer.abort().await.is_err());
+    assert!(private.is_dir());
+    std::fs::remove_dir(&private).unwrap();
+    assert!(
+        writer.abort().await.is_err(),
+        "repairing the path cannot invent the lost original abort receipt"
+    );
+    assert!(writer.finish().await.is_err());
 }
 
 #[tokio::test]

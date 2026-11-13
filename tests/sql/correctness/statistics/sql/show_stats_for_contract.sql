@@ -35,8 +35,8 @@ TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 SHOW STATS FOR statistics_cat_${suite_uuid0}.trc_stats_${uuid0}.empty_rows;
 
 -- query 3
--- @result_rows_where=rows=NULL
--- @result_rows_count=1
+-- @skip_result_check=true
+-- Command completion shape is checked by the raw command-completion System scenario.
 ANALYZE TABLE statistics_cat_${suite_uuid0}.trc_stats_${uuid0}.empty_rows;
 
 -- query 4
@@ -46,12 +46,13 @@ INSERT INTO statistics_cat_${suite_uuid0}.trc_stats_${uuid0}.sample_rows VALUES
 
 -- query 5
 -- Manifest facts are visible even before any NDV file exists.
+-- Even an all-NULL column keeps unknown NDV until that column is analyzed.
 SHOW STATS FOR statistics_cat_${suite_uuid0}.trc_stats_${uuid0}.sample_rows;
 
 -- query 6
 -- Partial ANALYZE publishes before its rows=NULL completion.
--- @result_rows_where=rows=NULL
--- @result_rows_count=1
+-- @skip_result_check=true
+-- Command completion shape is checked by the raw command-completion System scenario.
 ANALYZE TABLE statistics_cat_${suite_uuid0}.trc_stats_${uuid0}.sample_rows (k);
 
 -- query 7

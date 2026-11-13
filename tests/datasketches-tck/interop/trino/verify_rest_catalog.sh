@@ -131,10 +131,29 @@ source "$runtime_env"
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
 export NOVA_FIXTURE_RUN_CONTEXT
 trino_owner=(python3 "$script_dir/../../../../docker/iceberg-rest/trino_run.py" --env-file "$runtime_env")
+[[ "${NOVA_ENV_READY:-}" == true ]] || fail "the generated Iceberg REST fixture is not ready"
+[[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
+[[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
+[[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
+[[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
+network="$(python3 - "$runtime_env" "$script_dir" <<'PYNETWORK'
+import pathlib,sys
+sys.path.insert(0,str(pathlib.Path(sys.argv[2]).resolve().parents[3]/"docker/iceberg-rest"))
+import fixture_run
+values,manifest,_ = fixture_run.admit(sys.argv[1])
+shared = manifest["shared_docker"]
+if not isinstance(shared,bool) or values.get("NOVA_ENV_SHARED_DOCKER") != str(shared).lower():
+    raise SystemExit("generated fixture storage owner differs from its manifest")
+record = manifest["runtime"]["machine" if shared else "catalog"]
+print(record["network"])
+PYNETWORK
+)"
+docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 schema_location=""
 if [[ "$action" == create-parent ]]; then
   python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$runtime_env" >&2
-  schema_location="$(python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$namespace" "$script_dir" <<'PYCTX'
+  if [[ "$NOVA_ENV_SHARED_DOCKER" == true ]]; then
+    schema_location="$(python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$namespace" "$script_dir" <<'PYCTX'
 import json,pathlib,sys
 sys.path.insert(0,str(pathlib.Path(sys.argv[3]).resolve().parents[3]/"docker/iceberg-rest"))
 from scratch import resource_run
@@ -144,15 +163,13 @@ if value is None or resource_run(sys.argv[2]) != value["identity"]["run_id"]:
 print(value["identity"]["scope_root"]+"/rest/"+sys.argv[2])
 PYCTX
 )"
+  else
+    # The original private publication owns this entire object store. Keep the
+    # explicit table location and the actual-file prefix check without minting a
+    # shared-machine scratch context.
+    schema_location="${NOVA_ENV_REST_WAREHOUSE_URI%/}/$namespace"
+  fi
 fi
-
-[[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "a shared Iceberg REST fixture is not active"
-[[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
-[[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
-[[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
-[[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
-network="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtime"]["machine"]["network"])' "$NOVA_ENV_MANIFEST")"
-docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 
 if [[ -n "${NOVA_TRINO_IMAGE:-}" ]]; then
   [[ "$NOVA_TRINO_IMAGE" == *@"$trino_manifest_digest" ]] || \
