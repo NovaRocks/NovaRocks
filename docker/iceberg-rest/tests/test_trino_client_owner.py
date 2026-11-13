@@ -38,9 +38,9 @@ class ClientIntentTests(unittest.TestCase):
 
     def test_jdbc_uses_only_recorded_image_driver_and_readonly_source(self):
         with patch.object(owner, "run") as run:
-            owner.jdbc("fixture.env", "exact-image", "evidence", "/source/JdbcProbe.java", "/usr/lib/trino/trino-jdbc-483.jar", ["http://127.0.0.1:8080", "root"])
-        self.assertEqual(run.call_args.args[3], ["java", "--class-path", "/usr/lib/trino/trino-jdbc-483.jar", "/probe/JdbcProbe.java", "http://127.0.0.1:8080", "root"])
-        self.assertEqual(run.call_args.kwargs["mounts"], [("/source/JdbcProbe.java", "/probe/JdbcProbe.java")])
+            owner.jdbc("fixture.env", "exact-image", "evidence", "/source/JdbcProbe.java", "/declared/trino-jdbc.jar", ["http://127.0.0.1:8080", "root"])
+        self.assertEqual(run.call_args.args[3], ["java", "--class-path", "/probe/trino-jdbc.jar", "/probe/JdbcProbe.java", "http://127.0.0.1:8080", "root"])
+        self.assertEqual(run.call_args.kwargs["mounts"], [("/source/JdbcProbe.java", "/probe/JdbcProbe.java"), ("/declared/trino-jdbc.jar", "/probe/trino-jdbc.jar")])
 
 
 if __name__ == "__main__":

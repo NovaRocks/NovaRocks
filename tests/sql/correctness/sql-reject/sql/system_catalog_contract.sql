@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=system_catalog,read_only,reserved_names
--- Correctness owner: sql-reject. Trino 484 B14/B15/B17/B20/E03/E13/E17
+-- Correctness owner: sql-reject. Trino B14/B15/B17/B20/E03/E13/E17
 -- freeze the lookup and read-only errors. The accepted spec additionally
 -- rejects INSERT as NOT_SUPPORTED and reserves system for catalog DDL.
 -- Rejection happens before catalog construction; no external fixture or

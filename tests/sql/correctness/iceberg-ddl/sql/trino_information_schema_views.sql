@@ -18,7 +18,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=iceberg,view,system_catalog
--- Correctness owner: iceberg-ddl. Trino 484 C03/E04/E06/E07 provide
+-- Correctness owner: iceberg-ddl. Trino C03/E04/E06/E07 provide
 -- independent row types, session binding and table_type filtering rules.
 -- Use an explicit REST catalog because Hadoop does not provide view listing.
 -- This case drops its view before the source table and restores suite context.

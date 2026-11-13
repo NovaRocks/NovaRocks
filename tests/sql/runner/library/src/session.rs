@@ -1896,6 +1896,7 @@ mod session_tests {
         let config = peer.config();
         let mut ctx = crate::SuiteRunContext {
             case_input: None,
+            reference: Default::default(),
             fixture_budget: RunBudget::admit(
                 FixturePolicy::default(),
                 ScratchIdentity::create("s3://novarocks/sql-test").unwrap(),

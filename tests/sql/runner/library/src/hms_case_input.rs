@@ -2164,6 +2164,7 @@ else:
                         case_input: Some(
                             crate::suite_manifest::CaseInputRecipe::HmsReadOnlyCompatibilityV1,
                         ),
+                        reference: Default::default(),
                         target_session_sql: vec![],
                         rewrite_explain_contains_as_not_contains: vec![],
                         fail_fast: true,

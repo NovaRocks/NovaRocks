@@ -16,13 +16,13 @@
 -- under the License.
 
 -- @sequential=true
--- Released Trino 483 creates and analyzes the nonempty parent through the
+-- The Trino reference creates and analyzes the nonempty parent through the
 -- real REST catalog. Nova then consumes that foreign Theta parent during a
 -- collect-on-write append. A fresh Trino process must resolve the new current
 -- snapshot and report the unioned numeric NDV through public SHOW STATS.
 
 -- query 1
--- @result_contains=TRINO_PUFFIN_PARENT_READY version=483
+-- @result_contains=TRINO_PUFFIN_PARENT_READY
 shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" create-parent ${suite_uuid0} trino_puffin_${uuid0}
 
 -- query 2
@@ -41,7 +41,7 @@ VALUES (2, 20), (3, 30);
 -- This starts a new released Trino process. Besides SHOW STATS NDV=3, it reads
 -- the current data and snapshot through the same REST/S3 connector and asserts
 -- four rows, three distinct ids, and the exact id range 1..3.
--- @result_contains=TRINO_NOVA_CURRENT_PUFFIN_OK version=483
+-- @result_contains=TRINO_NOVA_CURRENT_PUFFIN_OK
 shell: "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh" verify-current ${suite_uuid0} trino_puffin_${uuid0} id 4 3 1 3
 
 -- query 5

@@ -1,0 +1,9 @@
+explicit_only = true
+reference_inputs = ["trino-image"]
+heavy = { reason = "fixture", detail = "Requires the declared Trino reference image, the shared REST/MinIO fixture and native 1FE+3BE" }
+
+[impact]
+paths = ["novarocks/statistics-application/**", "novarocks/connector/iceberg/**", "docker/fixture-inputs/**", "docker/iceberg-rest/trino_run.py", "tests/datasketches-tck/interop/trino/**", "tests/cluster-harness/src/reference_inputs*"]
+
+[reuse]
+scope = "suite"

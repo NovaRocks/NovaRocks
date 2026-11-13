@@ -716,6 +716,7 @@ pub(super) fn for_module(
         ]);
     }
     let mut declaration = ScenarioDeclaration {
+        reference_inputs: Vec::new(),
         impact: ScenarioImpact { paths },
         env_inputs: Vec::new(),
         initial_state: Some("isolated"),

@@ -27,9 +27,6 @@ import fixture_run
 import fixture_runtime as runtime
 import trino_run
 
-TRINO_RELEASE = "483"
-TRINO_MANIFEST = "sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534"
-PIN = "trinodb/trino@" + TRINO_MANIFEST
 # Only temporal logical-type differences are accepted by the approved G1b route.
 DIFFERENCE_OWNERS = {
     "ts_ntz": "TRC-6c", "ts_zoned": "TRC-6c", "time_value": "TRC-6c",
@@ -160,7 +157,7 @@ class Probe:
         self.containers = []
         self.namespace_intent = False
         self.catalog_owned = False
-        self.image = None
+        self.image = args.trino_image
         self.oracle = None
         self.sequence = 0
         self.ledger()
@@ -200,26 +197,16 @@ class Probe:
             raise ProbeBlocked("Docker client is unavailable; no image pull attempted")
         if platform.system() != "Linux":
             raise ProbeBlocked("official client host-network execution requires a Linux Docker host")
-        candidates = [os.environ.get("NOVA_TRINO_IMAGE"), PIN, TRINO_MANIFEST]
-        for candidate in filter(None, candidates):
-            result = self.command(["docker", "image", "inspect", candidate], "image-inspect", check=False)
-            if result.returncode:
-                continue
-            info = json.loads(result.stdout)[0]
-            if info.get("Id") != TRINO_MANIFEST and not any(value.endswith("@" + TRINO_MANIFEST) for value in (info.get("RepoDigests") or [])):
-                raise ProbeFailure("present Trino candidate does not expose the frozen manifest digest")
-            self.image = info["Id"]
-            break
-        if self.image is None:
-            raise ProbeBlocked("released Trino483 frozen image is absent; no pull attempted")
-        # A host-network child must actually see a loopback socket, not merely accept the flag.
-        result = self.run_image(["/bin/sh", "-c", "command -v curl >/dev/null && test -x /usr/bin/trino && curl --silent --show-error --fail --max-time 5 -H 'Host: localhost' \"$1/v1/info\"",
-            "probe", self.args.nova], "host-network-prerequisite", check=False)
+        # Verify the actual host-network operation; image identity was resolved by the run entry.
+        result = self.run_image(["curl", "--silent", "--show-error", "--fail", "--max-time", "5",
+            "-H", "Host: localhost", self.args.nova + "/v1/info"], "host-network-prerequisite", check=False)
+        if result.returncode in (7, 28):
+            raise ProbeBlocked("host network cannot reach the original FE loopback listener; see retained command output")
         if result.returncode:
-            raise ProbeBlocked("pinned image lacks curl/CLI or host network cannot reach the original FE loopback listener")
+            raise ProbeFailure("host-network operation failed; see retained command output")
         self.ledger()
-        write_json(self.root / "preflight.json", {"status": "PASS", "release": TRINO_RELEASE, "manifest": TRINO_MANIFEST,
-                    "image_id": self.image, "host_network_verified_against": self.args.nova})
+        write_json(self.root / "preflight.json", {"status": "PASS", "reference": {"trino_image": {"image_id": self.image}},
+                    "host_network_verified_against": self.args.nova})
 
     def run_image(self, command, label, check=True):
         from private_deadline import command_guard
@@ -265,9 +252,7 @@ class Probe:
             result = self.command(["docker", "exec", identity, "curl", "--silent", "--show-error", "--fail", "http://localhost:8080/v1/info"], "oracle-ready", check=False)
             if result.returncode == 0 and not json.loads(result.stdout).get("starting", True):
                 info = json.loads(result.stdout)
-                if info.get("nodeVersion", {}).get("version") != TRINO_RELEASE:
-                    raise ProbeFailure("frozen image did not self-report released Trino483")
-                write_json(self.root / "oracle-info.json", info)
+                write_json(self.root / "oracle-info.json", {"reference": {"trino_image": {"image_id": self.image}}, "reported": info})
                 break
             time.sleep(min(0.5, self.timeout()))
 
@@ -550,18 +535,15 @@ SELECT CAST(id AS INT) id, repeat('x', 32768) payload FROM range(96);
             raise ProbeFailure("official CLI did not report interruption/cancellation")
 
     def jdbc(self):
-        result = self.run_image(["/bin/sh", "-c", "command -v java >/dev/null && find /usr/lib/trino -type f -name 'trino-jdbc-*.jar' -print"], "jdbc-prerequisite", check=False)
-        jars = result.stdout.decode().splitlines() if result.returncode == 0 else []
-        if not jars:
-            write_json(self.root / "jdbc-probe.json", {"status": "NOT_RUN", "reason": "pinned image has no Java runtime and JDBC driver jar pair; no download attempted"})
-            return
+        if not self.args.trino_jdbc_jar:
+            raise ProbeFailure("JDBC requires --trino-jdbc-jar from the run entry's declared reference inputs")
         source = self.repository / "tests/system-test-runner/src/scenarios/trino_interop/JdbcProbe.java"
         result = self.command([sys.executable, Path(__file__).with_name("trino_run.py"), "jdbc", "--env-file", self.env_file,
-            "--image", self.image, "--evidence-dir", self.root / "jdbc-container", "--source", source, "--jdbc-jar", jars[0],
+            "--image", self.image, "--evidence-dir", self.root / "jdbc-container", "--source", source, "--jdbc-jar", self.args.trino_jdbc_jar,
             "--", self.args.nova, self.args.user], "jdbc-probe")
-        if b"JDBC_PROBE_OK" not in result.stdout:
-            raise ProbeFailure("JDBC probe did not confirm isValid/version")
-        write_json(self.root / "jdbc-probe.json", {"status": "PASS", "jar": jars[0]})
+        if not re.search(rb"^JDBC_PROBE_OK validated=true server_version=\S[^\r\n]*$", result.stdout, re.MULTILINE):
+            raise ProbeFailure("JDBC probe did not confirm validated HEAD /v1/statement and /v1/info version")
+        write_json(self.root / "jdbc-probe.json", {"status": "PASS", "jar": str(self.args.trino_jdbc_jar)})
 
 
 def resume_cleanup(args):
@@ -607,12 +589,18 @@ def resume_cleanup(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("encoding-conformance", "official-cli", "jdbc-probe", "cleanup"))
+    parser.add_argument("--trino-image", help="exact image ID resolved by the run entry")
+    parser.add_argument("--trino-jdbc-jar", type=Path, help="declared host JDBC driver path")
     parser.add_argument("--env-file", required=True)
     parser.add_argument("--nova", required=True)
     parser.add_argument("--user", default="root")
     parser.add_argument("--output", required=True)
     parser.add_argument("--metrics", required=True)
     args = parser.parse_args(argv)
+    if args.mode != "cleanup" and not args.trino_image:
+        parser.error("--trino-image is required; resolve it with provision.sh --consumer image:trino --result <file>")
+    if args.mode == "jdbc-probe" and not args.trino_jdbc_jar:
+        parser.error("jdbc-probe requires --trino-jdbc-jar from the run entry's declared reference inputs")
     runtime.install_signal_handlers()
     probe = None
     primary = None

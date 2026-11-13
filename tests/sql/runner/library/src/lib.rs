@@ -40,6 +40,7 @@ mod parser;
 mod publication_catalog;
 mod publication_service;
 mod query_stats_contract;
+mod reference_binding;
 mod results;
 mod results_record;
 mod runner;
@@ -656,6 +657,7 @@ struct SuiteRunContext {
     update_expected: bool,
     session_defaults: suite_manifest::SuiteSessionDefaults,
     case_input: Option<suite_manifest::CaseInputRecipe>,
+    reference: novarocks_cluster_harness::reference_inputs::ResolvedReference,
     target_session_sql: Vec<String>,
     rewrite_explain_contains_as_not_contains: Vec<String>,
     fail_fast: bool,
@@ -723,13 +725,17 @@ impl SuiteRunContext {
                 }
             }
             (Ok(context), Ok(storage)) => {
-                SqlStepOutcome::from_shell(shell::execute_shell_step_observed(
+                SqlStepOutcome::from_shell(shell::execute_shell_step_observed_with_reference(
                     sql,
                     Some(deadline.map_or(limit, |d| d.min(limit))),
                     Some(&context),
                     storage.as_deref(),
                     cleanup,
                     Some(&self.fixture_writers_settled),
+                    self.reference
+                        .trino_image
+                        .as_ref()
+                        .map(|image| image.image_id.as_str()),
                 ))
             }
             (Err(error), _) | (_, Err(error)) => SqlStepOutcome::infrastructure((
@@ -7159,7 +7165,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             });
         }
 
-        let mut selected_suites = Vec::new();
         for input in &prepared_inputs {
             let mut effective = suite_configs[&input.suite_name].clone();
             effective.sql_dir = input.sql_dir.clone();
@@ -7189,9 +7194,41 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 .retain(|c| selected_ids.contains(c["case"].as_str().unwrap()));
             fact["verify_enabled"] = serde_json::json!(input.verify_enabled);
             fact["query_timeout_secs"] = serde_json::json!(input.query_timeout);
-            selected_suites.push(fact.clone());
             suite_facts.insert(input.suite_name.clone(), (effective, fact));
         }
+        let suite_references = reference_binding::bind_selected(
+            cli.dry_run,
+            prepared_inputs.iter().map(|input| {
+                (
+                    input.suite_name.clone(),
+                    !input.cases.is_empty(),
+                    suite_configs[&input.suite_name]
+                        .manifest
+                        .reference_inputs
+                        .clone(),
+                )
+            }),
+            |needed| {
+                novarocks_cluster_harness::reference_inputs::resolve_until(
+                    &base_dir,
+                    needed,
+                    &fixture_budget,
+                )
+            },
+        )?;
+        for (name, reference) in &suite_references {
+            let fact = &mut suite_facts.get_mut(name).expect("selected suite facts").1;
+            fact["reference"] = serde_json::to_value(reference)?;
+            failure_artifacts.record_provenance(
+                format!("reference:{name}"),
+                serde_json::to_value(reference)?,
+            );
+        }
+        // Selection and normal suite records retain exactly the same reference facts.
+        let selected_suites = prepared_inputs
+            .iter()
+            .map(|input| suite_facts[&input.suite_name].1.clone())
+            .collect::<Vec<_>>();
         let fixture_env = runner_config
             .values
             .get("fixture_env_file")
@@ -7486,6 +7523,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     update_expected: cli.update_expected,
                     session_defaults: suite.manifest.session.clone(),
                     case_input: suite.manifest.case_input,
+                    reference: suite_references
+                        .get(&suite.name)
+                        .cloned()
+                        .unwrap_or_default(),
                     target_session_sql: cli.target_session_sql.clone(),
                     rewrite_explain_contains_as_not_contains: cli
                         .rewrite_explain_contains_as_not_contains
@@ -9637,6 +9678,7 @@ mod tests {
             update_expected: false,
             session_defaults: crate::suite_manifest::SuiteSessionDefaults::default(),
             case_input: None,
+            reference: Default::default(),
             target_session_sql: vec![],
             rewrite_explain_contains_as_not_contains: vec![],
             fail_fast: false,

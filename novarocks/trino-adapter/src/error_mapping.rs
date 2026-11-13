@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Typed projection of application failures into the Trino 483 client contract.
+//! Typed projection of application failures into the Trino client contract.
 use crate::diagnostics::{self, BoundedMessage};
 use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
 use novarocks_query_application::{
@@ -79,7 +79,7 @@ pub(crate) struct TrinoErrorLocation {
     pub(crate) column_number: u32,
 }
 
-// Numeric identities and error types are frozen by Trino 483 StandardErrorCode.
+// Numeric identities and error types are frozen by Trino StandardErrorCode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Code {
     GenericUser,

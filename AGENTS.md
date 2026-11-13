@@ -1025,7 +1025,10 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 ```
 
 Suites are discovered from `tests/sql/correctness/`; ask the runner for the
-current list with `--list-suites`. `tests/sql/correctness/README.md` carries the
+current list with `--list-suites`.
+`trino-reference` is explicit-only and uses native 1FE+3BE with REST/MinIO.
+Its Trino reference is declared in `docker/fixture-inputs/versions.json` and
+created on demand by the common input builder; see ADR-0231. `tests/sql/correctness/README.md` carries the
 suite map — which engine area each suite covers, its typical change entry, and
 whether it needs the REST Catalog fixture or a cross-process topology — and is
 the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are explicit-only

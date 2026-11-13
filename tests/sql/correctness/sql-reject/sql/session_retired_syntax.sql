@@ -19,7 +19,7 @@
 -- @order_sensitive=true
 -- @tags=session,trc5c,session_registry
 -- Required typed session values, bounded evaluation and retired syntax.
--- Expected rules come from fixed Trino 484 source and approved NovaRocks differences.
+-- Expected rules come from fixed Trino source and approved NovaRocks differences.
 
 -- query 1
 -- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
