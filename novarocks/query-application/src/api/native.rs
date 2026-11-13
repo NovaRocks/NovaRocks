@@ -505,6 +505,14 @@ impl NativeAttemptConvergence {
     }
 }
 
+/// An immutable failure already accepted by one original actor activation.
+/// It confers no authority and is constructed only inside Query Application.
+#[derive(Clone, Debug)]
+pub(crate) struct AcceptedAttemptFailure {
+    pub(crate) activation: AttemptActivationIdentity,
+    pub(crate) input: crate::execution_error::ExecutionFailureInput,
+}
+
 /// Borrowed convergence future for an active Native owner. Resolution carries
 /// local closure plus remote evidence or finite tracking termination. No caller
 /// may time out/drop this whole future and infer local exit. An unprovable exit
@@ -520,6 +528,7 @@ pub struct NativeActiveConvergenceRequest {
     absolute_remote_deadline: std::time::Instant,
     computation_ready: Option<super::ComputationReadyToken>,
     streamed_success: Option<AttemptActivationIdentity>,
+    accepted_failure: Option<AcceptedAttemptFailure>,
 }
 impl NativeActiveConvergenceRequest {
     pub fn new(
@@ -531,6 +540,7 @@ impl NativeActiveConvergenceRequest {
             absolute_remote_deadline,
             computation_ready: None,
             streamed_success: None,
+            accepted_failure: None,
         }
     }
     pub fn cancellation(&self) -> &CancellationView {
@@ -549,6 +559,22 @@ impl NativeActiveConvergenceRequest {
     /// The original logical actor accepted the streamed result for this activation.
     pub const fn streamed_success(&self) -> Option<AttemptActivationIdentity> {
         self.streamed_success
+    }
+
+    /// The original actor-accepted failure for this exact active attempt.
+    pub fn accepted_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
+        self.accepted_failure.as_ref().map(|failure| &failure.input)
+    }
+
+    pub fn accepted_failure_activation(&self) -> Option<AttemptActivationIdentity> {
+        self.accepted_failure
+            .as_ref()
+            .map(|failure| failure.activation)
+    }
+
+    pub(crate) fn with_accepted_failure(mut self, failure: Option<AcceptedAttemptFailure>) -> Self {
+        self.accepted_failure = failure;
+        self
     }
 
     pub(crate) fn with_streamed_success(

@@ -1130,6 +1130,8 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
+            failure_activation: None,
+            accepted_failure: None,
             closed: false,
         };
         Ok((original, rows))
@@ -1150,6 +1152,8 @@ impl NativeActiveCustodyReservation {
             remote_deadline: None,
             computation_ready: None,
             streamed_success: None,
+            failure_activation: None,
+            accepted_failure: None,
             closed: false,
         }
     }
@@ -1181,6 +1185,8 @@ pub(crate) struct SupervisedActiveNativeOwner {
     remote_deadline: Option<Instant>,
     computation_ready: Option<crate::api::ComputationReadyToken>,
     streamed_success: Option<AttemptActivationIdentity>,
+    failure_activation: Option<AttemptActivationIdentity>,
+    accepted_failure: Option<crate::api::AcceptedAttemptFailure>,
     closed: bool,
 }
 impl fmt::Debug for SupervisedActiveNativeOwner {
@@ -1225,6 +1231,56 @@ impl SupervisedActiveNativeOwner {
             root,
         )
     }
+    pub(crate) fn accepted_failure(&self) -> Option<crate::api::AcceptedAttemptFailure> {
+        self.accepted_failure.clone()
+    }
+
+    pub(crate) fn bind_failure_activation(&mut self, activation: AttemptActivationIdentity) {
+        if activation.execution() == self.custody.key.execution
+            && self
+                .failure_activation
+                .is_none_or(|original| original == activation)
+        {
+            self.failure_activation = Some(activation);
+        }
+    }
+    pub(crate) async fn capture_accepted_failure(&mut self, actor: &super::LogicalExecutionActor) {
+        let Some(activation) = self.failure_activation else {
+            return;
+        };
+        if activation.actor() != actor.id() {
+            return;
+        }
+        // An unavailable observation never becomes a business failure or a
+        // gate on original Native convergence. Keep any earlier exact receipt.
+        if let Ok(Some(failure)) = actor.accepted_attempt_failure(activation).await {
+            let matches_original = failure.activation == activation
+                && match failure.input.site() {
+                    crate::execution_error::ExecutionFailureSite::Task { identity, .. }
+                    | crate::execution_error::ExecutionFailureSite::TaskControl { identity } => {
+                        identity.query_execution_id() == activation.execution()
+                    }
+                    crate::execution_error::ExecutionFailureSite::RootRead { root } => {
+                        root.query_execution_id() == activation.execution()
+                    }
+                    crate::execution_error::ExecutionFailureSite::Operation {
+                        participation,
+                        ..
+                    } => participation.query_execution_id() == activation.execution(),
+                    crate::execution_error::ExecutionFailureSite::Backend { process } => self
+                        .custody
+                        .slot
+                        .participations
+                        .iter()
+                        .any(|p| p.backend_process_id() == process),
+                    crate::execution_error::ExecutionFailureSite::Coordinator => true,
+                };
+            if matches_original {
+                self.accepted_failure = Some(failure);
+            }
+        }
+    }
+
     pub(crate) fn begin_terminal_cut(&mut self, cut: Instant) {
         self.terminal_cut.get_or_insert(cut);
     }
@@ -1241,6 +1297,7 @@ impl SupervisedActiveNativeOwner {
         NativeActiveConvergenceRequest::new(cancellation, deadline)
             .with_computation_ready(self.computation_ready)
             .with_streamed_success(self.streamed_success)
+            .with_accepted_failure(self.accepted_failure.clone())
     }
     pub(crate) fn retain_streamed_success(
         &mut self,

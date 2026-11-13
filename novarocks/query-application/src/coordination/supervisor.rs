@@ -2095,6 +2095,7 @@ async fn run_logical_role(
                 );
             }
         };
+        active.bind_failure_activation(initial.identity());
         match (internal || result_schema.is_some(), rows_runtime) {
             (true, Some(rows_runtime)) => {
                 let running = match actor.activate(initial.ready()).await {
@@ -2112,6 +2113,7 @@ async fn run_logical_role(
                             &mut shutdown,
                             &requester,
                             config.remote_cleanup_timeout(),
+                            Some(&actor),
                         )
                         .await;
                         drop(active);
@@ -2201,6 +2203,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2237,6 +2240,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2274,6 +2278,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2335,6 +2340,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2354,6 +2360,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2373,6 +2380,7 @@ async fn run_logical_role(
                     &mut shutdown,
                     &requester,
                     config.remote_cleanup_timeout(),
+                    Some(&actor),
                 )
                 .await;
                 drop(active);
@@ -2553,6 +2561,7 @@ fn supervise_residual_rows_attempt(
             &mut shutdown,
             &requester,
             cleanup_timeout,
+            None,
         )
         .await;
         (participations, convergence)
@@ -2561,6 +2570,7 @@ fn supervise_residual_rows_attempt(
 
 async fn converge_rows_attempts(
     active: &mut SupervisedActiveNativeOwner,
+    actor: &super::LogicalExecutionActor,
     active_participations: &[novarocks_execution_contract::ParticipationRef],
     residuals: &mut ResidualRowsConvergence,
     cancellation: novarocks_workload_control::CancellationView,
@@ -2570,9 +2580,15 @@ async fn converge_rows_attempts(
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
 ) -> Result<(), QueryExecutionError> {
-    let active_convergence =
-        converge_supervised_active(active, cancellation, shutdown, requester, cleanup_timeout)
-            .await;
+    let active_convergence = converge_supervised_active(
+        active,
+        cancellation,
+        shutdown,
+        requester,
+        cleanup_timeout,
+        Some(actor),
+    )
+    .await;
     let result = record_reported_active_convergence(
         registry,
         registration,
@@ -2944,6 +2960,7 @@ async fn supervise_rows_inner(
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
+        attempt.active.capture_accepted_failure(actor).await;
         // The result pump can finish while the borrowed Native run is still pending.
         if matches!(&pump_result, Ok(super::LogicalConclusion::Succeeded)) {
             attempt.active.retain_streamed_success(drive.identity())?;
@@ -2973,6 +2990,7 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 return converge_rows_attempts(
                     &mut attempt.active,
+                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -2988,6 +3006,7 @@ async fn supervise_rows_inner(
                 session.retire_preparation();
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
+                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3011,6 +3030,7 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
+                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3035,6 +3055,7 @@ async fn supervise_rows_inner(
 
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
+                    actor,
                     attempt.schedule.participations(),
                     &mut residuals,
                     scope.cancellation().map_err(work_error)?,
@@ -3087,6 +3108,7 @@ async fn supervise_rows_inner(
 
                     let convergence = converge_rows_attempts(
                         &mut attempt.active,
+                        actor,
                         attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
@@ -3111,6 +3133,7 @@ async fn supervise_rows_inner(
                             .or_else(actor_terminal_refusal);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
+                            actor,
                             attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
@@ -3159,6 +3182,7 @@ async fn supervise_rows_inner(
                         let supervision = preparation_supervision_result(error, actor_outcome);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
+                            actor,
                             attempt.schedule.participations(),
                             &mut residuals,
                             cancellation,
@@ -3201,6 +3225,7 @@ async fn supervise_rows_inner(
                         converge_dormant(dormant, cancellation.clone(), shutdown, requester).await;
                     let old_convergence = converge_rows_attempts(
                         &mut attempt.active,
+                        actor,
                         attempt.schedule.participations(),
                         &mut residuals,
                         cancellation,
@@ -3244,6 +3269,7 @@ async fn supervise_rows_inner(
                                 };
                             let old_convergence = converge_rows_attempts(
                                 &mut attempt.active,
+                                actor,
                                 attempt.schedule.participations(),
                                 &mut residuals,
                                 scope.cancellation().map_err(work_error)?,
@@ -3261,6 +3287,7 @@ async fn supervise_rows_inner(
                         }
                     };
 
+                attempt.active.capture_accepted_failure(actor).await;
                 supervise_residual_rows_attempt(
                     &mut residuals,
                     attempt.active,
@@ -3496,11 +3523,12 @@ async fn supervise_rows_inner(
                 dormant
                     .retire()
                     .expect("successful original activation has no dormant failure");
-                let (active, rows_runtime) = replacement_custody
+                let (mut active, rows_runtime) = replacement_custody
                     .as_mut()
                     .expect("reserved before replacement activation")
                     .finish_activated_in(pending_activated)
                     .expect("same original replacement output");
+                active.bind_failure_activation(instantiation.identity());
                 let Some(rows_runtime) = rows_runtime else {
                     session.retire_preparation();
                     let error =
@@ -3517,6 +3545,7 @@ async fn supervise_rows_inner(
                         shutdown,
                         requester,
                         config.remote_cleanup_timeout(),
+                        Some(actor),
                     )
                     .await;
                     drop(active);
@@ -3549,6 +3578,7 @@ async fn supervise_rows_inner(
                             shutdown,
                             requester,
                             config.remote_cleanup_timeout(),
+                            Some(actor),
                         )
                         .await;
                         let replacement_convergence = record_reported_active_convergence(
@@ -3949,8 +3979,14 @@ async fn converge_supervised_active(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     cleanup_timeout: Duration,
+    actor: Option<&super::LogicalExecutionActor>,
 ) -> ActiveAttemptConvergence {
-    let request = owner.request(cancellation, cleanup_timeout);
+    // Freeze the original observation deadline before the metadata query.
+    let mut request = owner.request(cancellation, cleanup_timeout);
+    if let Some(actor) = actor {
+        owner.capture_accepted_failure(actor).await;
+        request = request.with_accepted_failure(owner.accepted_failure());
+    }
     let failure_custody = owner.convergence_failure_custody();
     let (outcome, deadline) = converge_active_request(
         owner.as_mut(),
@@ -5715,6 +5751,15 @@ mod tests {
         reply_captured: AtomicBool,
         release_convergence: tokio::sync::Notify,
         trigger_failure: tokio::sync::Notify,
+        root_failure: AtomicBool,
+        run_polled: AtomicBool,
+        run_exited: AtomicBool,
+        run_returned: AtomicBool,
+        run_activation:
+            std::sync::Mutex<Option<novarocks_coordination_contract::AttemptActivationIdentity>>,
+        original_root_failure:
+            std::sync::Mutex<Option<crate::execution_error::ExecutionFailureInput>>,
+        convergence_request: std::sync::Mutex<Option<NativeActiveConvergenceRequest>>,
         reply: std::sync::Mutex<Option<crate::api::RetainedRootReply>>,
         transport: std::sync::Mutex<Option<novarocks_workload_control::ResultWindowAlias>>,
     }
@@ -5823,6 +5868,13 @@ mod tests {
         }
     }
 
+    struct PreparationExitRunFrame(Arc<PreparationExitSignals>);
+    impl Drop for PreparationExitRunFrame {
+        fn drop(&mut self) {
+            self.0.run_exited.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[derive(Debug)]
     struct PreparationExitActive {
         inner: Box<dyn ActiveNativeAttemptOwner>,
@@ -5835,14 +5887,20 @@ mod tests {
             cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
             let signals = Arc::clone(&self.signals);
+            let activation = drive.identity();
             let run = self.inner.run(drive, cancellation);
             Box::pin(async move {
-                tokio::select! {
+                *signals.run_activation.lock().unwrap() = Some(activation);
+                signals.run_polled.store(true, Ordering::SeqCst);
+                let _frame = PreparationExitRunFrame(Arc::clone(&signals));
+                let terminal = tokio::select! {
                     terminal = run => terminal,
                     _ = signals.trigger_failure.notified() => {
                         NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(fixture_execution_input("held-convergence fixture execution failure")))
                     }
-                }
+                };
+                signals.run_returned.store(true, Ordering::SeqCst);
+                terminal
             })
         }
         fn converge<'a>(
@@ -5851,6 +5909,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             let signals = Arc::clone(&self.signals);
             Box::pin(async move {
+                *signals.convergence_request.lock().unwrap() = Some(cancellation.clone());
                 signals.convergence_entered.store(true, Ordering::SeqCst);
                 signals.release_convergence.notified().await;
                 let result = self.inner.converge(cancellation).await;
@@ -5884,6 +5943,22 @@ mod tests {
                 use novarocks_execution_contract::root_result::{
                     RootReadOutcome, RootResultData, RootResultReply,
                 };
+                if signals.root_failure.load(Ordering::SeqCst) {
+                    use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
+                    let input = ExecutionFailureInput::new(
+                        fixture_execution_input("original root-port failure").fact(),
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "original root-port failure",
+                        ),
+                        ExecutionFailureSite::Task {
+                            identity: request.root_task(),
+                            phase: novarocks_execution_contract::TaskFailurePhase::Execution,
+                        },
+                    );
+                    *signals.original_root_failure.lock().unwrap() = Some(input.clone());
+                    signals.reply_captured.store(true, Ordering::SeqCst);
+                    return Err(super::super::RootResultFetchFailure::from_input(input));
+                }
                 // This reply is deliberately held by an independent decode owner.
                 // It is never delivered as a synthetic valid MySQL row or ACKed.
                 let reply = RootResultReply {
@@ -5942,10 +6017,15 @@ mod tests {
     }
 
     async fn terminal_preparation_exit_fixture(fail: bool) {
-        let mut control = {
+        terminal_preparation_exit_fixture_with_root_failure(fail, false).await;
+    }
+
+    async fn terminal_preparation_exit_fixture_with_root_failure(fail: bool, root_failure: bool) {
+        let (mut control, assertions) = {
             let (control, root) = governance().await;
             let scope = root.owner.scope();
             let signals = Arc::new(PreparationExitSignals::default());
+            signals.root_failure.store(root_failure, Ordering::SeqCst);
             let attempts = PreparationExitPort {
                 state: Arc::new(PreparationExitState {
                     window: None,
@@ -5978,8 +6058,17 @@ mod tests {
                 else {
                     return Err("original request did not hand off Rows");
                 };
+                if root_failure {
+                    stream
+                        .begin_schema()
+                        .ok_or("missing original schema")?
+                        .complete();
+                }
                 wait_preparation_exit_fact(&signals.reply_captured).await?;
-                if fail {
+                if root_failure {
+                    // The original root read itself provides the failure;
+                    // the Native run remains borrowed and Pending.
+                } else if fail {
                     signals.trigger_failure.notify_one();
                 } else {
                     handle
@@ -6065,41 +6154,92 @@ mod tests {
             acknowledge_all_control(&control);
             let settled = tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await;
 
-            // All assertions happen after the original owner has been released/joined.
-            assert!(
-                shutdown.is_ok(),
-                "original supervisor did not shut down: {shutdown:?}"
-            );
-            assert!(settled.is_ok(), "original scope did not settle");
-            assert!(
-                convergence_exit.is_ok(),
-                "original convergence did not exit"
-            );
-            let facts = observations.expect("all bounded lifetime observations must complete");
-            assert_eq!(original_client_positions, 1);
-            assert!(
-                facts.factory_exited,
-                "terminal supervisor retained its preparation factory: {facts:?}"
-            );
-            assert!(
-                facts.convergence_still_held,
-                "fixture released remote convergence too early"
-            );
-            assert_eq!(facts.held_with_reply_and_transport, 1);
-            assert_eq!(
-                facts.held_after_reply_exit, 1,
-                "actual transport alias must keep the window"
-            );
-            assert_eq!(
-                facts.held_after_last_transport_exit, 0,
-                "last actual alias must return capacity before remote convergence"
-            );
-            assert!(signals.convergence_completed.load(Ordering::SeqCst));
-
-            control
+            // Retain only pure facts: the original request's CancellationView
+            // must actually drop before the fixture authority can drain.
+            let observed_request =
+                signals
+                    .convergence_request
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|request| {
+                        (
+                            request.accepted_failure().cloned(),
+                            request.accepted_failure_activation(),
+                        )
+                    });
+            // Preserve complete WorkloadControl exit before any RED assertion.
+            let assertions = move || {
+                assert!(
+                    shutdown.is_ok(),
+                    "original supervisor did not shut down: {shutdown:?}"
+                );
+                assert!(settled.is_ok(), "original scope did not settle");
+                assert!(
+                    convergence_exit.is_ok(),
+                    "original convergence did not exit"
+                );
+                let facts = observations.expect("all bounded lifetime observations must complete");
+                assert_eq!(original_client_positions, 1);
+                assert!(
+                    facts.factory_exited,
+                    "terminal supervisor retained its preparation factory: {facts:?}"
+                );
+                assert!(
+                    facts.convergence_still_held,
+                    "fixture released remote convergence too early"
+                );
+                assert_eq!(
+                    facts.held_with_reply_and_transport,
+                    usize::from(!root_failure)
+                );
+                assert_eq!(
+                    facts.held_after_reply_exit,
+                    usize::from(!root_failure),
+                    "actual transport alias must keep the window"
+                );
+                assert_eq!(
+                    facts.held_after_last_transport_exit, 0,
+                    "last actual alias must return capacity before remote convergence"
+                );
+                assert!(signals.convergence_completed.load(Ordering::SeqCst));
+                if root_failure {
+                    let original = signals
+                        .original_root_failure
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("the original root port must supply its typed failure");
+                    let (accepted_failure, accepted_activation) = observed_request
+                        .expect("the original active owner must receive convergence");
+                    assert!(signals.run_polled.load(Ordering::SeqCst));
+                    assert!(signals.run_exited.load(Ordering::SeqCst));
+                    assert!(
+                        !signals.run_returned.load(Ordering::SeqCst),
+                        "the root pump must decide while the real Native run is still Pending"
+                    );
+                    assert_eq!(accepted_failure.as_ref(), Some(&original));
+                    assert_eq!(accepted_activation, *signals.run_activation.lock().unwrap());
+                    let activation = accepted_activation
+                        .expect("accepted failure must retain its original activation");
+                    let crate::execution_error::ExecutionFailureSite::Task { identity, .. } =
+                        original.site()
+                    else {
+                        panic!("the original root fixture must retain its actual Task site");
+                    };
+                    assert_eq!(activation.execution(), identity.query_execution_id());
+                }
+            };
+            (control, assertions)
         };
         acknowledge_all_control(&control);
         control.finish().await;
+        assertions();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_pump_failure_reaches_original_convergence_while_native_run_is_pending() {
+        terminal_preparation_exit_fixture_with_root_failure(true, true).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6246,6 +6386,7 @@ mod tests {
             drive: &'a NativeAttemptDrive,
             cancellation: novarocks_workload_control::CancellationView,
         ) -> NativeAttemptRunFuture<'a> {
+            *self.signals.run_activation.lock().unwrap() = Some(drive.identity());
             match self.phase {
                 // Delegate the existing exact Establish/admission fixture rather
                 // than returning an unqualified synthetic Completed verdict.
@@ -6274,6 +6415,7 @@ mod tests {
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             let signals = Arc::clone(&self.signals);
             Box::pin(async move {
+                *signals.convergence_request.lock().unwrap() = Some(cancellation.clone());
                 signals.convergence_entered.store(true, Ordering::SeqCst);
                 signals.release_convergence.notified().await;
                 let result = self.inner.converge(cancellation).await;
@@ -6688,7 +6830,7 @@ mod tests {
     }
 
     async fn initial_terminal_preparation_fixture(phase: InitialTerminalPhase) {
-        let mut control = {
+        let (mut control, accepted_observation) = {
             let (control, root) = governance().await;
             let scope = root.owner.scope();
             let capacity = scope
@@ -6814,6 +6956,22 @@ mod tests {
             } else {
                 Some(tokio::time::timeout(Duration::from_secs(2), scope.wait_released()).await)
             };
+            // Drop the original request before returning the test authority;
+            // only immutable accepted facts survive to the final assertions.
+            let accepted_request =
+                signals
+                    .convergence_request
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|request| {
+                        (
+                            request.accepted_failure().cloned(),
+                            request.accepted_failure_activation(),
+                        )
+                    });
+            let accepted_observation = matches!(phase, InitialTerminalPhase::CompletionFailure)
+                .then(|| (accepted_request, *signals.run_activation.lock().unwrap()));
             assert!(
                 convergence_exit.is_ok(),
                 "original convergence did not exit: {phase:?}"
@@ -6925,7 +7083,7 @@ mod tests {
                 assert_eq!(capacity.snapshot().held_positions[2], 0);
             }
 
-            control
+            (control, accepted_observation)
         };
         if matches!(
             phase,
@@ -6937,6 +7095,18 @@ mod tests {
         } else {
             acknowledge_all_control(&control);
             control.finish().await;
+        }
+        if let Some((request, original_activation)) = accepted_observation {
+            let (failure, activation) =
+                request.expect("original nonrows active owner received convergence");
+            assert_eq!(
+                failure,
+                Some(fixture_execution_input(
+                    "initial terminal fixture run failure"
+                ))
+            );
+            assert!(original_activation.is_some());
+            assert_eq!(activation, original_activation);
         }
     }
 
