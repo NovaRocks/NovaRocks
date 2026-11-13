@@ -28,6 +28,72 @@ mkdir -p "$interop_root"
 umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/created-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
+cat > "$interop_root/fixed_width_mor_oracle.scala" <<'SCALA'
+object FixedWidthMorOracle {
+  def filesAt(table: Table, snapshotId: Long): Vector[(String,Long,Vector[(String,Long,String)])] = {
+    val tasks=table.newScan().useSnapshot(snapshotId).planFiles()
+    try tasks.asScala.map(t => (t.file().path().toString,t.file().recordCount(),
+      t.deletes().asScala.map(d => (d.path().toString,d.recordCount(),d.referencedDataFile())).toVector)).toVector
+    finally tasks.close()
+  }
+  def verify(table: Table): Unit = {
+    val initialId=table.properties().get("rwm7.fixed.initial-snapshot").toLong
+    val source=table.properties().get("rwm7.fixed.initial-data-file")
+    val initial=Option(table.snapshot(initialId))
+    val children=table.snapshots().asScala.filter(s => s.parentId()!=null && s.parentId().longValue()==initialId).toVector
+    val audit=table.snapshots().asScala.toVector.sortBy(_.sequenceNumber()).map(s =>
+      (s.snapshotId(),s.parentId(),s.summary(),
+       s.addedDataFiles(table.io()).asScala.map(f => (f.path().toString,f.recordCount())).toVector,
+       s.removedDataFiles(table.io()).asScala.map(f => (f.path().toString,f.recordCount())).toVector,
+       s.addedDeleteFiles(table.io()).asScala.map(d =>
+         (d.path().toString,d.recordCount(),d.referencedDataFile(),d.format(),d.content())).toVector,
+       s.removedDeleteFiles(table.io()).asScala.map(d =>
+         (d.path().toString,d.recordCount(),d.referencedDataFile())).toVector))
+    println("FIXED_WIDTH_MOR_SNAPSHOT_AUDIT="+(initialId,source,children.map(_.snapshotId()),audit))
+    require(initial.isDefined,"Remembered single-file initial snapshot is absent")
+    require(children.size==1,"Expected one direct child of the single-file initial snapshot")
+    val partial=children.head
+    val originalFiles=filesAt(table,initialId)
+    val partialFiles=filesAt(table,partial.snapshotId())
+    val added=partial.addedDataFiles(table.io()).asScala.toVector
+    val removed=partial.removedDataFiles(table.io()).asScala.toVector
+    val deletes=partial.addedDeleteFiles(table.io()).asScala.toVector
+    println("FIXED_WIDTH_MOR_PARTIAL_FILE_AUDIT="+(originalFiles,partialFiles))
+    val fullChildren=table.snapshots().asScala.filter(s => s.parentId()!=null && s.parentId().longValue()==partial.snapshotId()).toVector
+    println("FIXED_WIDTH_MOR_FULL_CHILD_AUDIT="+(partial.snapshotId(),fullChildren.map(_.snapshotId())))
+    require(fullChildren.size==1,"Expected one full-coverage UPDATE child of the partial snapshot")
+    val full=fullChildren.head
+    val fullAdded=full.addedDataFiles(table.io()).asScala.toVector
+    val fullRemoved=full.removedDataFiles(table.io()).asScala.toVector
+    val fullAddedDeletes=full.addedDeleteFiles(table.io()).asScala.toVector
+    val fullRemovedDeletes=full.removedDeleteFiles(table.io()).asScala.toVector
+    println("FIXED_WIDTH_MOR_FULL_COVERAGE_AUDIT="+(full.snapshotId(),
+      fullAdded.map(f => (f.path().toString,f.recordCount())),
+      fullRemoved.map(f => (f.path().toString,f.recordCount())),
+      fullAddedDeletes.map(d => (d.path().toString,d.recordCount(),d.referencedDataFile())),
+      fullRemovedDeletes.map(d => (d.path().toString,d.recordCount(),d.referencedDataFile()))))
+    require(table.properties().get("write.update.mode")=="copy-on-write","Fixture lost the conflicting COW property")
+    require(originalFiles.size==1 && originalFiles.head._1==source && originalFiles.head._2==2L && originalFiles.head._3.isEmpty,
+      "Initial snapshot must contain exactly one two-row data file without deletes")
+    require(partialFiles.exists(f => f._1==source && f._2==2L),"Partial UPDATE must retain the unmatched row's source file")
+    require(removed.isEmpty,"Partial UPDATE must not rewrite/remove the two-row source file")
+    require(added.nonEmpty && added.map(_.recordCount()).sum==1L,"Partial UPDATE must add exactly the one matched replacement row")
+    require(deletes.size==1 && deletes.head.referencedDataFile()==source && deletes.head.recordCount()==1L &&
+      deletes.head.format()==FileFormat.PUFFIN && deletes.head.content()==FileContent.POSITION_DELETES,
+      "Partial UPDATE must add a one-position DV for the retained source file despite the COW property")
+    require(partialFiles.find(_._1==source).get._3==Vector((deletes.head.path().toString,1L,source)),
+      "Partial snapshot scan must apply that exact DV to the original source file")
+    require(partialFiles.size==2,"Partial snapshot must contain the source and one replacement data file")
+    require(fullAdded.nonEmpty && fullAdded.map(_.recordCount()).sum==2L,
+      "Full-coverage UPDATE must add exactly two replacement rows")
+    require(fullRemoved.map(_.path().toString).sorted==partialFiles.map(_._1).sorted,
+      "Full-coverage UPDATE must retire exactly both partial-snapshot data files")
+    require(fullAddedDeletes.isEmpty,"Full coverage must remove data files instead of adding DVs")
+    require(fullRemovedDeletes.map(_.path().toString).sorted==deletes.map(_.path().toString).sorted,
+      "Full coverage must retire exactly the partial snapshot's exclusive old DV")
+  }
+}
+SCALA
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
@@ -38,8 +104,22 @@ try {
     Types.NestedField.required(2,"raw",Types.FixedType.ofLength(16)),
     Types.NestedField.optional(3,"st",Types.StructType.of(Types.NestedField.required(5,"f",Types.FixedType.ofLength(4)))),
     Types.NestedField.required(4,"n",Types.IntegerType.get()))
-  VariantFixture.create(fixedSchema,properties=Map("write.update.mode"->"copy-on-write","write.row-lineage"->"true"))
-  session.sql("INSERT INTO ice_rest.${case_db}.spark_fixed_width_${uuid0} VALUES (1,unhex('00112233445566778899AABBCCDDEEFF'),named_struct('f',unhex('01020304')),10),(2,unhex('FFEEDDCCBBAA99887766554433221100'),NULL,20)")
+  val fixedTable=VariantFixture.create(fixedSchema,properties=Map("write.update.mode"->"copy-on-write","write.row-lineage"->"true"))
+  def fixedBytes(hex: String): Array[Byte] = hex.grouped(2).map(pair => Integer.parseInt(pair,16).toByte).toArray
+  val nested=GenericRecord.create(fixedSchema.findType("st").asStructType())
+  nested.setField("f",fixedBytes("01020304"))
+  val originalFile=VariantFixture.write(fixedTable,Seq(
+    Seq[Any](Int.box(1),fixedBytes("00112233445566778899AABBCCDDEEFF"),nested,Int.box(10)),
+    Seq[Any](Int.box(2),fixedBytes("FFEEDDCCBBAA99887766554433221100"),null,Int.box(20))))
+  val initialSnapshot=fixedTable.currentSnapshot().snapshotId()
+  val initialTasks=fixedTable.newScan().useSnapshot(initialSnapshot).planFiles()
+  val initialFiles=try initialTasks.asScala.map(t => (t.file().path().toString,t.file().recordCount(),t.deletes().size())).toVector finally initialTasks.close()
+  val membership=session.sql("SELECT id,_file FROM ice_rest.${case_db}.spark_fixed_width_${uuid0} ORDER BY id").collect().toVector.map(r => (r.getInt(0),r.getString(1)))
+  println("FIXED_WIDTH_INITIAL_FILE_AUDIT="+(initialSnapshot,initialFiles,membership))
+  require(initialFiles==Vector((originalFile.path().toString,2L,0)),"Fixed fixture must have exactly one two-row file without deletes")
+  require(membership==Vector((1,originalFile.path().toString),(2,originalFile.path().toString)),"Both initial row identities must share the declared source file")
+  fixedTable.updateProperties().set("rwm7.fixed.initial-snapshot",initialSnapshot.toString)
+    .set("rwm7.fixed.initial-data-file",originalFile.path().toString).commit()
   require(VariantFixture.load().schema().asStruct()==fixedSchema.asStruct(),"Spark changed the fixed declaration")
   val initial=session.sql("SELECT id,hex(raw),hex(st.f),n FROM ice_rest.${case_db}.spark_fixed_width_${uuid0} ORDER BY id").collect().toVector
   require(initial.size==2 && initial(0).getString(1)=="00112233445566778899AABBCCDDEEFF" && initial(0).getString(2)=="01020304" && initial(1).getString(1)=="FFEEDDCCBBAA99887766554433221100" && initial(1).isNullAt(2),"Spark fixture payload differs")
@@ -78,12 +158,14 @@ SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n+
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} ORDER BY id;
 
 -- query 3
-UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0}
-SET n=n+1;
-
--- query 4
+-- The first update is provably partial-file: id=2 shares the pinned source file.
 UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0}
 SET raw=raw,st=st WHERE id=1;
+
+-- query 4
+-- Full coverage may legitimately retire data files instead of adding new DVs.
+UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0}
+SET n=n+1;
 
 -- query 5
 SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,st IS NULL AS nested_is_null,n
@@ -98,6 +180,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/original_updates-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -113,9 +196,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==2,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
 
   println("FIXED_WIDTH_ORIGINAL_UPDATES_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
@@ -148,6 +229,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/null_parent-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -163,9 +245,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==3,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
 
   println("FIXED_WIDTH_NULL_PARENT_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
@@ -197,6 +277,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/insert-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -212,9 +293,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21),(3,"000102030405060708090A0B0C0D0E0F",Some("AABBCCDD"),30))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==3,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
 
   println("FIXED_WIDTH_INSERT_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
@@ -248,6 +327,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/merge-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -263,9 +343,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21),(3,"000102030405060708090A0B0C0D0E0F",Some("AABBCCDD"),30),(4,"F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF",Some("05060708"),40))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==3,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
   VariantFixture.remember(table)
   println("FIXED_WIDTH_MERGE_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
@@ -301,6 +379,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/width_rejected-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -316,9 +395,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21),(3,"000102030405060708090A0B0C0D0E0F",Some("AABBCCDD"),30),(4,"F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF",Some("05060708"),40))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==3,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
   VariantFixture.unchanged()
   println("FIXED_WIDTH_WIDTH_REJECTED_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
@@ -356,6 +433,7 @@ umask 077
 spark_diag_dir="$(mktemp -d "$interop_root/required_rejected-XXXXXX")"
 tmp_scala="$spark_diag_dir/input.scala"
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
+cat "$interop_root/fixed_width_mor_oracle.scala" >> "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
   val session = org.apache.spark.sql.SparkSession.active
@@ -371,9 +449,7 @@ try {
   val actual=rows.map(r => (r.getInt(0),r.getString(1),if(r.isNullAt(2)) None else Some(r.getString(2)),r.getInt(3)))
   val expected:Vector[(Int,String,Option[String],Int)]=Vector((1,"00112233445566778899AABBCCDDEEFF",Some("01020304"),11),(2,"FFEEDDCCBBAA99887766554433221100",None,21),(3,"000102030405060708090A0B0C0D0E0F",Some("AABBCCDD"),30),(4,"F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF",Some("05060708"),40))
   require(actual==expected,"Spark fixed-width row oracle differs: "+actual)
-  val withDeletes=table.snapshots().asScala.filter(s => s.addedDeleteFiles(table.io()).iterator().hasNext()).toVector
-  require(withDeletes.size==3,"UPDATE must add deletion artifacts despite write.update.mode=copy-on-write")
-  require(withDeletes.forall(s => s.addedDataFiles(table.io()).iterator().hasNext()),"MOR UPDATE must add new data beside the deletes")
+  FixedWidthMorOracle.verify(table)
   VariantFixture.unchanged()
   println("FIXED_WIDTH_REQUIRED_REJECTED_OK")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
