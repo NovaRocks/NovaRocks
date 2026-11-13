@@ -366,7 +366,7 @@ printf 'Spark merge evidence retained at %s\n' "$spark_diag_dir"
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 4:1)
 UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0}
 SET raw=X'0011' WHERE id=1;
 
@@ -418,7 +418,7 @@ printf 'Spark width_rejected evidence retained at %s\n' "$spark_diag_dir"
 -- @expect_error_tier=target
 -- @expect_sql_code=query.execution.invalid_data
 -- @expect_sql_phase=Execution
--- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 7:498)
 UPDATE iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_width_${uuid0} AS t
 SET st=s.st
 FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_fixed_source_${uuid0} AS s
