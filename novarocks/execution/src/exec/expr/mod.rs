@@ -52,9 +52,6 @@ mod cast_decimal_float_oracle_tests;
 mod numeric_unary_owned_transaction_tests;
 
 #[cfg(test)]
-mod numeric_unary_public_transport_tests;
-
-#[cfg(test)]
 mod cast_decimal_float32_oracle_tests;
 
 #[cfg(test)]
