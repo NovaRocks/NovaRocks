@@ -475,13 +475,16 @@ mod owned_catalog_cpu_tests {
         )
         .unwrap()
         .unwrap();
-        cpu.stage_system_row(&[
-            Some("ice"),
-            Some("actual_schema"),
-            Some("utf8"),
-            Some("utf8_general_ci"),
-            None,
-        ])
+        cpu.stage_system_row(
+            &[
+                Some("ice"),
+                Some("actual_schema"),
+                Some("utf8"),
+                Some("utf8_general_ci"),
+                None,
+            ]
+            .map(crate::system_tables::SystemValueRef::from),
+        )
         .unwrap()
         .unwrap();
         gate.armed.store(true, Ordering::Release);

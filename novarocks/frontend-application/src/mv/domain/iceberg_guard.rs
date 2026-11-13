@@ -26,6 +26,18 @@ use std::sync::Arc;
 use crate::catalog_application::resolver::TargetBackend;
 use novarocks_types::naming::normalize_identifier;
 
+/// Read-only classification from the document owner's actual managed facts.
+pub(crate) fn is_materialized_view_documents(
+    view: &novarocks_spi::connector::KeyedDocumentView,
+) -> bool {
+    view.management.is_some()
+        || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
+        || view
+            .versions
+            .values()
+            .any(|version| version.owner() == "novarocks.mv")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IcebergMvUserMutation {
     Insert,
@@ -158,10 +170,7 @@ pub fn reject_if_iceberg_mv_table_with_planning_pin_and_context(
         }
         Err(error) => return Err(format!("observe MV mutation guard: {error}")),
     };
-    if view.management.is_some()
-        || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
-        || view.versions.values().any(|v| v.owner() == "novarocks.mv")
-    {
+    if is_materialized_view_documents(&view) {
         // The Provider marker decides denial. Keep its actual negative
         // management observation, without refreshing an unrelated Accelerator.
         readiness
@@ -332,10 +341,7 @@ async fn reject_bound_iceberg_mv_table_async(
             return Err(super::readiness::connector_application_error(error));
         }
     };
-    if view.management.is_some()
-        || view.slots.keys().any(|slot| slot.owner == "novarocks.mv")
-        || view.versions.values().any(|v| v.owner() == "novarocks.mv")
-    {
+    if is_materialized_view_documents(&view) {
         // Denial needs no projection install, evidence resolution or reload.
         // Existing unsettled effects remain with their original management owner.
         readiness.revoke_foreign_current_management(&view, &request.catalog_handle)?;

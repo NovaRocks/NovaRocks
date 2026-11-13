@@ -26,18 +26,7 @@ INSERT INTO probe_5m_wide
 INSERT INTO build_500k
     SELECT generate_series FROM TABLE(generate_series(1, 500000));
 ANALYZE TABLE build_500k;
--- Wait for this case's own job. SHOW ANALYZE JOBS lists every job the
--- frontend holds, so whole-output checks would let another case's job satisfy
--- or fail this wait. The table is analyzed exactly once in this case database.
--- @retry_count=120
--- @retry_interval_ms=500
--- @result_rows_where=catalog=iceberg_opt
--- @result_rows_where=namespace=${case_db}
--- @result_rows_where=table=build_500k
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
+-- ANALYZE publishes before the following query is admitted.
 SET cbo_broadcast_node_mem_budget_bytes = 268435456;
 -- @explain_contains=HASH JOIN (BROADCAST
 -- @explain_contains=bcast_verdict=feasible

@@ -111,7 +111,6 @@ const KEYWORDS: &[(&str, Keyword)] = &[
     ("AT", Keyword::At),
     ("ASYNC", Keyword::Async),
     ("BACKEND", Keyword::Backend),
-    ("BACKENDS", Keyword::Backends),
     ("BASIC", Keyword::Basic),
     ("BETWEEN", Keyword::Between),
     ("BRANCH", Keyword::Branch),
@@ -263,11 +262,10 @@ mod tests {
     #[test]
     fn lookup_is_ascii_case_insensitive_without_normalizing_identifiers() {
         assert_eq!(lookup("sHoW"), Some(Keyword::Show));
-        assert_eq!(lookup("backends"), Some(Keyword::Backends));
+        assert_eq!(lookup("backends"), None);
         assert_eq!(lookup("SeLeCt"), Some(Keyword::Select));
         assert_eq!(lookup("try_cast"), Some(Keyword::TryCast));
         assert_eq!(lookup("backends_x"), None);
-        assert_eq!(class(Keyword::Backends), KeywordClass::NonReserved);
         assert_eq!(class(Keyword::Window), KeywordClass::NonReserved);
         assert_eq!(class(Keyword::Select), KeywordClass::Reserved);
         assert_eq!(class(Keyword::Show), KeywordClass::Reserved);

@@ -714,45 +714,6 @@ fn writer_boundary_summary(result: &StatementResult) -> Result<(i64, i64, i64, i
         }
     }
 }
-fn writer_statistics_rows(result: &StatementResult) -> Result<Vec<TableStatisticsRow>> {
-    writer_shape(
-        result,
-        &[
-            "varchar", "varchar", "varchar", "varchar", "varchar", "varchar", "varchar",
-        ],
-    )?;
-    result
-        .rows
-        .iter()
-        .map(|row| match row.as_slice() {
-            [
-                TrinoValue::Text(metric),
-                scalar,
-                TrinoValue::Text(status),
-                TrinoValue::Text(basis),
-                TrinoValue::Text(source),
-                TrinoValue::Text(nature),
-                TrinoValue::Text(relation),
-            ] => {
-                let scalar = match scalar {
-                    TrinoValue::Null => None,
-                    TrinoValue::Text(value) => Some(value.clone()),
-                    value => bail!("provider statistic is not declared nullable text: {value:?}"),
-                };
-                Ok((
-                    metric.clone(),
-                    scalar,
-                    status.clone(),
-                    basis.clone(),
-                    source.clone(),
-                    nature.clone(),
-                    relation.clone(),
-                ))
-            }
-            row => bail!("provider statistics row changed its declared text shape: {row:?}"),
-        })
-        .collect()
-}
 fn writer_partition_values(result: &StatementResult) -> Result<Vec<(String, serde_json::Value)>> {
     use novarocks_test_trino_client::TypeArgument;
     writer_shape(result, &["varchar", "row"])?;
@@ -1609,7 +1570,6 @@ impl Scenario for DistributedStatisticsDataflow {
         control
             .execute(format!("ANALYZE TABLE {source}"))
             .context("run native distributed ANALYZE")?;
-        wait_for_statistics_job_success(context, &mut control, CATALOG, DATABASE, SOURCE)?;
 
         let analyze_tasks_after = task_admission_counts(context)?;
         let analyze_task_delta = assert_every_backend_accepted_task(
@@ -1873,107 +1833,6 @@ impl Scenario for DistributedStatisticsDataflow {
     }
 }
 
-type TableStatisticsRow = (
-    String,
-    Option<String>,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
-
-/// Wait for the accepted ANALYZE job's business conclusion before observing
-/// effects that belong to its background attempt. `ANALYZE` itself only proves
-/// submission; a terminal `SUCCEEDED` record is the semantic precondition for
-/// inspecting BE task admission and provider publication evidence.
-fn wait_for_statistics_job_success(
-    context: &mut ScenarioContext,
-    control: &mut SqlSession,
-    catalog: &str,
-    namespace: &str,
-    table: &str,
-) -> Result<()> {
-    context.action("wait for the submitted ANALYZE job to reach SUCCEEDED");
-    loop {
-        let rows = control
-            .execute("SHOW ANALYZE JOBS")
-            .context("observe submitted native distributed ANALYZE job")?;
-        let mut matches = Vec::new();
-        for row in &rows.rows {
-            if analyze_job_field(&rows, row, "catalog")?.as_deref() == Some(catalog)
-                && analyze_job_field(&rows, row, "namespace")?.as_deref() == Some(namespace)
-                && analyze_job_field(&rows, row, "table")?.as_deref() == Some(table)
-            {
-                matches.push(row);
-            }
-        }
-        let Some(job) = matches.pop() else {
-            context.remaining("wait for submitted ANALYZE job to become observable")?;
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        };
-        if !matches.is_empty() {
-            bail!(
-                "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
-            );
-        }
-        let job_id = analyze_job_field(&rows, job, "job_id")?
-            .filter(|value| !value.is_empty())
-            .context("ANALYZE job observation has no job_id")?;
-        let state = analyze_job_field(&rows, job, "state")?
-            .filter(|value| !value.is_empty())
-            .context("ANALYZE job observation has no state")?;
-        match state.as_str() {
-            "SUCCEEDED" => return Ok(()),
-            "SUBMITTED" | "PREPARING" | "COLLECTING" | "PUBLISHING" => {
-                context.remaining(&format!(
-                    "wait for ANALYZE job {job_id} to reach its business conclusion"
-                ))?;
-                thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let detail = analyze_job_field(&rows, job, "error_message")?.unwrap_or_default();
-                bail!(
-                    "ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
-                );
-            }
-        }
-    }
-}
-
-fn analyze_job_field(
-    result: &StatementResult,
-    row: &[TrinoValue],
-    name: &str,
-) -> Result<Option<String>> {
-    anyhow::ensure!(result.is_result_set(), "ANALYZE jobs must be a result set");
-    let indices = result
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        indices.len() == 1,
-        "ANALYZE job observation omitted or duplicated column {name}"
-    );
-    let index = indices[0];
-    anyhow::ensure!(
-        result.columns[index].type_signature.raw_type == "varchar",
-        "ANALYZE job column {name} is not its declared text"
-    );
-    match row
-        .get(index)
-        .context("ANALYZE job observation value is missing")?
-    {
-        TrinoValue::Null => Ok(None),
-        TrinoValue::Text(value) => Ok(Some(value.clone())),
-        _ => bail!("ANALYZE job observation column {name} has an unsupported value type"),
-    }
-}
-
 fn assert_show_theta_statistics(
     control: &mut SqlSession,
     table: &str,
@@ -1981,34 +1840,65 @@ fn assert_show_theta_statistics(
     expected_ndv: f64,
     label: &str,
 ) -> Result<()> {
-    let rows: Vec<TableStatisticsRow> = writer_statistics_rows(
-        &control
-            .execute(format!("SHOW TABLE STATS {table}"))
-            .with_context(|| format!("read {label} statistics through the provider"))?,
+    let result = control
+        .execute(format!("SHOW STATS FOR {table}"))
+        .with_context(|| format!("read {label} statistics through the provider"))?;
+    writer_shape(
+        &result,
+        &[
+            "varchar", "double", "double", "double", "double", "varchar", "varchar",
+        ],
     )?;
-    let metric = format!("theta_ndv:{column}");
-    let Some((_, value, status, basis_version, source, numeric_nature, basis_relation)) =
-        rows.into_iter().find(|row| row.0 == metric)
-    else {
-        bail!("{label} did not expose {metric} through SHOW TABLE STATS");
-    };
-    let value = value
-        .with_context(|| format!("{label} {metric} is AVAILABLE but has no scalar value"))?
-        .parse::<f64>()
-        .with_context(|| format!("parse {label} {metric} value"))?;
-    assert_theta_estimate(value, expected_ndv, label)?;
-    if status != "AVAILABLE"
-        || basis_version != "SAME"
-        || source != "PROVIDER_ARTIFACT"
-        || numeric_nature != "APPROXIMATE"
-        || basis_relation != "IDENTICAL"
-    {
+    let expected_names = [
+        "column_name",
+        "data_size",
+        "distinct_values_count",
+        "nulls_fraction",
+        "row_count",
+        "low_value",
+        "high_value",
+    ];
+    anyhow::ensure!(
+        result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .eq(expected_names),
+        "{label} SHOW STATS FOR changed its declared column order"
+    );
+    let matching = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.first(),Some(TrinoValue::Text(name)) if name == column))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        matching.len() == 1,
+        "{label} statistics omitted or duplicated column {column}"
+    );
+    let Some(TrinoValue::Double(value)) = matching[0].get(2) else {
         bail!(
-            "{label} {metric} has unexpected provider evidence: status={status:?} \
-             basis_version={basis_version:?} source={source:?} \
-             numeric_nature={numeric_nature:?} basis_relation={basis_relation:?}"
+            "{label} distinct_values_count is not a typed double: {:?}",
+            matching[0]
         );
-    }
+    };
+    assert_theta_estimate(*value, expected_ndv, label)?;
+    anyhow::ensure!(
+        matches!(matching[0].get(3),Some(TrinoValue::Double(value)) if *value==0.0),
+        "{label} non-null source column has a different nulls_fraction"
+    );
+    let summary = result
+        .rows
+        .iter()
+        .filter(|row| matches!(row.first(), Some(TrinoValue::Null)))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        summary.len() == 1,
+        "{label} statistics omitted its single table summary"
+    );
+    anyhow::ensure!(
+        matches!(summary[0].get(4),Some(TrinoValue::Double(value)) if *value==expected_ndv),
+        "{label} row_count differs from the independently seeded rows"
+    );
     Ok(())
 }
 

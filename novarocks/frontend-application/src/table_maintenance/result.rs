@@ -23,7 +23,7 @@ use novarocks_query_application::api::{
 };
 use std::sync::Arc;
 
-use novarocks_table_maintenance::{MaintenanceActionOutcome, OptimizeJob, OptimizeJobOutcome};
+use novarocks_table_maintenance::MaintenanceActionOutcome;
 
 pub fn action_result(
     outcome: MaintenanceActionOutcome,
@@ -134,102 +134,39 @@ pub fn action_result(
     Ok(MaintenanceStatementResult::Query(result))
 }
 
-pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStatementResult, String> {
-    let column_names = [
-        "JobId",
-        "TableName",
-        "State",
-        "CreateTime",
-        "FinishTime",
-        "Msg",
-        "BaseSnapshotId",
-        "TargetSnapshotId",
-        "InputDataFiles",
-        "OutputDataFiles",
-        "InputDeleteFiles",
-        "OutputDeleteFiles",
-    ];
-    let mut values = column_names
-        .iter()
-        .map(|_| Vec::with_capacity(jobs.len()))
-        .collect::<Vec<Vec<String>>>();
-    for job in jobs {
-        let outcome = job.outcome.as_ref();
-        values[0].push(job.job_id.to_string());
-        values[1].push(job.target.table);
-        values[2].push(job.state.as_str().to_string());
-        values[3].push(job.created_at_ms.to_string());
-        values[4].push(
-            job.finished_at_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        values[5].push(
-            job.error_message
-                .unwrap_or_else(|| outcome.map(optimize_outcome_message).unwrap_or_default()),
-        );
-        values[6].push(job.base_snapshot_id.to_string());
-        values[7].push(
-            outcome
-                .and_then(|value| value.target_snapshot_id)
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        values[8].push(
-            outcome
-                .map(|value| value.rewritten_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        values[9].push(
-            outcome
-                .and_then(|value| value.added_data_files)
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-        values[10].push(
-            outcome
-                .map(|value| value.deleted_data_files.to_string())
-                .unwrap_or_default(),
-        );
-        values[11].push(
-            outcome
-                .and_then(|value| value.added_delete_files)
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        );
-    }
-    let result = build_query_result(
-        column_names
-            .iter()
-            .map(|name| column(name, DataType::Utf8, false))
-            .collect(),
-        values
-            .into_iter()
-            .map(|column| Arc::new(StringArray::from(column)) as ArrayRef)
-            .collect(),
-        "build SHOW ALTER TABLE OPTIMIZE result",
-    )?;
-    Ok(MaintenanceStatementResult::Query(result))
-}
-
-fn optimize_outcome_message(outcome: &OptimizeJobOutcome) -> String {
-    format!(
-        "rewrote {} data files and {} delete files into {} data files and {} delete files ({} rows)",
-        outcome.rewritten_data_files,
-        outcome.deleted_data_files,
-        outcome
-            .added_data_files
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        outcome
-            .added_delete_files
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        outcome
-            .output_record_count
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+/// The optimize table procedure returns Trino's fixed three metric rows.
+pub(crate) fn optimize_result(
+    outcome: MaintenanceActionOutcome,
+) -> Result<MaintenanceStatementResult, String> {
+    let MaintenanceActionOutcome::RewriteDataFiles {
+        rewritten_data_files_count,
+        removed_delete_files_count,
+        added_data_files_count,
+        ..
+    } = outcome
+    else {
+        return Err("OPTIMIZE requires data rewrite outcome facts".into());
+    };
+    build_query_result(
+        vec![
+            column("metric_name", DataType::Utf8, false),
+            column("metric_value", DataType::Int64, true),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec![
+                "rewritten_data_files_count",
+                "removed_delete_files_count",
+                "added_data_files_count",
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(i64::from(rewritten_data_files_count)),
+                Some(i64::from(removed_delete_files_count)),
+                added_data_files_count.map(i64::from),
+            ])) as ArrayRef,
+        ],
+        "build Iceberg optimize metrics",
     )
+    .map(MaintenanceStatementResult::Query)
 }
 
 fn build_query_result(

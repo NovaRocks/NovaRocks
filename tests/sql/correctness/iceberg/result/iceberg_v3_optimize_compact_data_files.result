@@ -4,6 +4,14 @@ id	user_id	amount
 1	10	100
 3	30	300
 
+
+-- query 3
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	2
+added_data_files_count	1
+
 -- query 4
 -- types	integer	integer	integer
 id	user_id	amount

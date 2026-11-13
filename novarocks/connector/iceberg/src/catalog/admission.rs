@@ -26,8 +26,6 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorRequ
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogInitiation {
     Statement,
-    StatementJob,
-    JobAttempt,
     Background,
 }
 
@@ -35,7 +33,6 @@ impl From<ConnectorRequestInitiation> for CatalogInitiation {
     fn from(value: ConnectorRequestInitiation) -> Self {
         match value {
             ConnectorRequestInitiation::Statement => Self::Statement,
-            ConnectorRequestInitiation::JobAttempt => Self::JobAttempt,
             ConnectorRequestInitiation::Background => Self::Background,
         }
     }
@@ -173,7 +170,6 @@ impl CatalogAdmissionRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogAdmission {
     Admitted,
-    AdmittedAwaitingCompletion,
 }
 
 pub(crate) fn connector_unsupported(reason: CatalogUnsupported) -> ConnectorError {

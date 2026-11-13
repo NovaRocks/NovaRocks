@@ -1,12 +1,28 @@
+-- query 5
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	0
+removed_delete_files_count	0
+added_data_files_count	0
+
+-- query 7
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
 -- query 9
 -- types	bigint
 row_id_collisions
 0
 
+
 -- query 10
 -- types	bigint	bigint	bigint	bigint	bigint	bigint
 t1_collisions	t2_collisions	t3_collisions	t4_collisions	t5_collisions	t6_collisions
 0	0	0	0	0	0
+
 
 -- query 11
 -- types	bigint

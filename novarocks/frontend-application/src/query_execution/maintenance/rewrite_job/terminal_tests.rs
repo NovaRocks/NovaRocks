@@ -18,16 +18,15 @@
 use super::*;
 use novarocks_coordination_contract::ExecutionEffect;
 use novarocks_execution_contract::failure::FailureProjection;
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_table_maintenance::{
-    MaintenanceTargetRebind,
     activity::MaintenanceActivityFamily,
     product::{
         CleanupSession, DistributedRewriteSession, MaintenanceFuture, RewriteAbort, RewriteCommit,
         RewriteFailure, RewriteIntent, RewritePlanFacts, RewriteReceiptFacts,
         TableMaintenanceEffectPort, TableMaintenanceProduct,
     },
-    runtime::{JobCreate, MaintenanceJobState},
-    worker::{OptimizeJobExecution, execute_claimed_job},
+    runtime::MaintenanceJobState,
 };
 use novarocks_workload_control::{
     ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
@@ -222,39 +221,8 @@ impl TableMaintenanceEffectPort for ProductExecution {
         Box::pin(async { panic!("business terminal does not run unrelated GC") })
     }
 }
-impl OptimizeJobExecution for ProductExecution {
-    fn run_original_job<'a>(
-        self: Box<Self>,
-        _: Arc<OptimizeProcessRuntime>,
-        _: OptimizeJobOriginals,
-        _: OptimizeJob,
-    ) -> MaintenanceFuture<'a, Result<OptimizeJobOutcome, TerminalError>> {
-        Box::pin(async { panic!("this component calls the original claimed-job author directly") })
-    }
-    fn original_effect<'a>(&'a self) -> MaintenanceFuture<'a, Option<ExecutionEffect>> {
-        Box::pin(async move { Some(self.effect) })
-    }
-    fn rebind_target<'a>(
-        &'a self,
-        _: &'a OptimizeJob,
-    ) -> MaintenanceFuture<'a, Result<MaintenanceTargetRebind, String>> {
-        Box::pin(async { Ok(MaintenanceTargetRebind::Bound) })
-    }
-    fn execute<'a>(
-        &'a self,
-        job: &'a OptimizeJob,
-        _: &'a QueryResultCapacityBinding,
-    ) -> MaintenanceFuture<'a, Result<MaintenanceActionOutcome, TerminalError>> {
-        Box::pin(self.product.execute_rewrite_terminal(
-            self,
-            &job.target,
-            RewriteIntent::DataFiles { rewrite_all: true },
-        ))
-    }
-}
-
 #[tokio::test]
-async fn job_product_ready_survives_a_real_late_capacity_refusal() {
+async fn product_ready_survives_a_real_late_capacity_refusal() {
     for effect in [ExecutionEffect::External, ExecutionEffect::None] {
         exercise_original_terminal(effect, ProviderOutcome::Complete).await;
     }
@@ -324,32 +292,17 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
         .product
         .acquire_activity(&target, MaintenanceActivityFamily::Optimize)
         .unwrap();
-    let jobs = OptimizeProcessRuntime::new();
-    jobs.submit(
-        JobCreate {
-            target,
-            effect_id: None,
-            object_id: vec![1],
-            base_snapshot_id: 1,
-            created_at_ms: 1,
-        },
-        activity,
-    )
-    .await
-    .unwrap();
-    let job = jobs.claim_next(2).await.unwrap().unwrap();
-    let id = job.job_id;
-    let original = execute_claimed_job(&jobs, &execution, &scope, capacity.clone(), job);
+    let original = execution.product.execute_rewrite_terminal(
+        &execution,
+        &target,
+        RewriteIntent::DataFiles { rewrite_all: true },
+    );
     tokio::pin!(original);
     assert!(futures::poll!(original.as_mut()).is_pending());
     assert_eq!(execution.finalizer.calls.load(Ordering::SeqCst), 1);
     assert_eq!(execution.finalizer.cohorts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        jobs.get(id).await.unwrap().unwrap().state,
-        MaintenanceJobState::Running
-    );
     execution.finalizer.allow.store(true, Ordering::SeqCst);
-    let result = original.await.map(OriginalProductOutcome::Job);
+    let result = original.await;
     assert_eq!(execution.finalizer.calls.load(Ordering::SeqCst), 1);
 
     // The Product terminal is already returned. The same original result
@@ -378,11 +331,6 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
         );
     }
     let terminal = select_product_terminal(result, &mut selected, &mut stopped, Some(effect));
-    let terminal = match terminal {
-        Ok(OriginalProductOutcome::Job(outcome)) => Ok(outcome),
-        Ok(OriginalProductOutcome::Direct(_)) => panic!("the actual worker returned a Job outcome"),
-        Err(error) => Err(error),
-    };
     if outcome == ProviderOutcome::DerivedAbortUnknown {
         let error = terminal.as_ref().unwrap_err();
         let original = selected_before.as_ref().unwrap();
@@ -410,12 +358,15 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
         assert_eq!(error.message, "original necessary finalizer failed");
     } else {
         let outcome = terminal.as_ref().unwrap();
+        let MaintenanceActionOutcome::RewriteDataFiles {
+            output_record_count,
+            ..
+        } = outcome
+        else {
+            panic!("rewrite data files receipt");
+        };
         assert_eq!(
-            outcome.commit_occurred,
-            Some(effect == ExecutionEffect::External)
-        );
-        assert_eq!(
-            outcome.output_record_count,
+            *output_record_count,
             Some(if effect == ExecutionEffect::External {
                 7
             } else {
@@ -433,25 +384,7 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
         assert_eq!(selected, selected_before);
     }
     assert_eq!(stopped, selected_before);
-    let observed_effect = match outcome {
-        ProviderOutcome::Complete | ProviderOutcome::FinalizationFailure => Some(effect),
-        ProviderOutcome::CommitUnknown | ProviderOutcome::DerivedAbortUnknown => None,
-    };
-    let record = jobs
-        .finish_with_effect(id, terminal, observed_effect, 3)
-        .await
-        .unwrap();
-    assert_eq!(
-        record.state,
-        match outcome {
-            ProviderOutcome::Complete => MaintenanceJobState::Finished,
-            ProviderOutcome::FinalizationFailure =>
-                MaintenanceJobState::KnownCommittedFinalizationFailed,
-            ProviderOutcome::CommitUnknown | ProviderOutcome::DerivedAbortUnknown =>
-                MaintenanceJobState::CommitUnknown,
-        }
-    );
-    assert_eq!(record.effect, observed_effect);
+    drop(activity);
     drop(original_buffer);
     drop(original_bytes);
     assert_eq!(capacity.window_alias().retained_payload_bytes(), 0);
@@ -464,7 +397,7 @@ async fn exercise_original_terminal(effect: ExecutionEffect, outcome: ProviderOu
 // The actual Provider outcome feeds the production projection and Product.
 // No Ready/Native/physical-exit capability is fabricated by this component.
 #[tokio::test]
-async fn originating_mutation_failure_keeps_one_cause_through_product_job_attached_and_direct() {
+async fn originating_mutation_failure_keeps_one_cause_through_product_and_statement() {
     use novarocks_failure_contract::SharedFailureCause;
     use novarocks_spi::connector::write_stack::ConnectorWritePublicationCompletion;
     use novarocks_spi::connector::{
@@ -472,7 +405,6 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_job_attach
         ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
         LakePublicationFamily, LakePublicationId, LakePublicationTarget,
     };
-    use novarocks_table_maintenance::runtime::JobHandle;
     use novarocks_type_contract::{
         CompileControlError, owned_resources::layout::LayoutResourceError,
     };
@@ -591,21 +523,6 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_job_attach
             .product
             .acquire_activity(&target, MaintenanceActivityFamily::Optimize)
             .unwrap();
-        let jobs = OptimizeProcessRuntime::new();
-        let submitted = jobs
-            .submit(
-                JobCreate {
-                    target: target.clone(),
-                    effect_id: None,
-                    object_id: vec![1],
-                    base_snapshot_id: 1,
-                    created_at_ms: 1,
-                },
-                activity,
-            )
-            .await
-            .unwrap();
-        jobs.claim_next(2).await.unwrap().unwrap();
         let error = execution
             .product
             .execute_rewrite_terminal(
@@ -634,21 +551,9 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_job_attach
         };
         assert_eq!(error.failure_cause.as_ref(), Some(&cause));
         assert_eq!(error.state, expected_state);
-        jobs.finish(submitted.job_id, Err(error), 3).await.unwrap();
-        let job = jobs.wait_for_completion(submitted.job_id).await.unwrap();
-        assert_eq!(job.failure_cause.as_ref(), Some(&cause));
-        assert_eq!(job.effect, expected_effect);
-        let attached = crate::table_maintenance::optimize_statement_terminal_result(
-            JobHandle::new(job.job_id),
-            job,
-            true,
-            Some("late cancellation request".into()),
-        )
-        .unwrap_err();
-        assert_eq!(attached.failure_cause.as_ref(), Some(&cause));
-        assert_eq!(attached.state, expected_state);
-        assert_eq!(attached.effect, expected_effect);
-        let service = computation_service_error(attached);
+        assert_eq!(error.effect, expected_effect);
+        let service = computation_service_error(error);
+        drop(activity);
         assert_eq!(service.failure_cause(), Some(&cause));
         assert_eq!(service.execution_failure().unwrap().fact(), expected);
         assert!(service.compile_control_error().is_none());
@@ -666,15 +571,29 @@ async fn originating_mutation_failure_keeps_one_cause_through_product_job_attach
 }
 
 #[tokio::test]
-async fn provider_terminal_message_and_original_cause_survive_the_actual_job_record() {
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-    use novarocks_table_maintenance::runtime::ProcessRuntime;
-    for message in [
-        "Iceberg Variant writes are not supported yet: table ice.ns.orders, column v",
-        "the original provider refuses this different exact operation",
+async fn provider_terminal_message_and_original_cause_survive_statement_projection() {
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
+    };
+    for error in [
+        ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg Variant writes are not supported yet: table ice.ns.orders, column v",
+        )
+        .with_public_failure_detail(),
+        ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "the original provider refuses this different exact operation",
+        )
+        .with_public_failure_detail(),
+        ConnectorError::table_object_binding(
+            ConnectorTableObjectBindingFailure::Replaced,
+            "TARGET_REPLACED: Iceberg optimize target changed before rewrite planning",
+        )
+        .with_public_failure_detail(),
     ] {
-        let error = ConnectorError::new(ConnectorErrorKind::Unsupported, message)
-            .with_public_failure_detail();
+        let message = error.public_failure_detail().unwrap().to_owned();
+        let binding_failure = error.table_object_binding_failure();
         let fact = error.failure_fact();
         let terminal = from_connector_cause(error.clone());
         assert_eq!(terminal.message, message);
@@ -682,32 +601,19 @@ async fn provider_terminal_message_and_original_cause_survive_the_actual_job_rec
         let cause = terminal.failure_cause.clone().unwrap();
         assert_eq!(cause.downcast_ref::<ConnectorError>(), Some(&error));
         assert_eq!(
+            cause
+                .downcast_ref::<ConnectorError>()
+                .unwrap()
+                .table_object_binding_failure(),
+            binding_failure
+        );
+        assert_eq!(
             cause.detail(),
             "table-maintenance original operation failed"
         );
-        let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
-        let job = runtime
-            .submit(
-                JobCreate {
-                    target: "orders".into(),
-                    effect_id: None,
-                    object_id: vec![1],
-                    base_snapshot_id: 1,
-                    created_at_ms: 1,
-                },
-                (),
-            )
-            .await
-            .unwrap();
-        runtime.claim_next(2).await.unwrap().unwrap();
-        runtime.finish(job.job_id, Err(terminal), 3).await.unwrap();
-        let record = runtime.wait_for_completion(job.job_id).await.unwrap();
-        assert_eq!(record.error_message.as_deref(), Some(message));
-        assert_eq!(record.state, MaintenanceJobState::PreDispatchFailed);
-        assert_eq!(record.failure_cause.as_ref(), Some(&cause));
-        assert_eq!(record.failure_cause.as_ref().unwrap().failure_fact(), fact);
-        assert!(record.execution_failure.is_none());
-        assert!(record.compile_control.is_none());
+        let service = computation_service_error(terminal);
+        assert_eq!(service.failure_cause(), Some(&cause));
+        assert_eq!(service.execution_failure().unwrap().fact(), fact);
     }
 }
 

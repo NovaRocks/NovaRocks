@@ -358,6 +358,8 @@ impl CatalogSymbols {
                 && let Some(new) = self.lookup(value)
             {
                 *value = new.into();
+            } else if control_relation_column(&output, column) {
+                *value = self.relation_array(value)?;
             }
         }
         if let Some(control) = &mut meta.mv_resume_management
@@ -383,13 +385,7 @@ impl CatalogSymbols {
             *error = self.display(error, Display::Error)?;
         }
         let upper = sql.trim_start().to_ascii_uppercase();
-        let display = if upper.starts_with("SHOW MATERIALIZED VIEWS") {
-            Some(Display::MvIdentity)
-        } else if upper.starts_with("EXPLAIN ") {
-            Some(Display::Explain)
-        } else {
-            None
-        };
+        let display = upper.starts_with("EXPLAIN ").then_some(Display::Explain);
         if let Some(display) = display {
             for value in meta
                 .result_contains
@@ -431,10 +427,28 @@ impl CatalogSymbols {
             })
             .into_owned())
     }
+    fn relation_array(&self, cell: &str) -> Result<String> {
+        use crate::golden::{parse_cell, parse_type, render_cell};
+        use novarocks_test_trino_client::TrinoValue;
+        let signature = parse_type("array(varchar)")?;
+        let mut value = parse_cell(&signature, cell)?;
+        if let TrinoValue::Array(values) = &mut value {
+            for value in values {
+                if let TrinoValue::Text(identity) = value
+                    && let Some((catalog, rest)) = identity.split_once('.')
+                    && let Some(mapped) = self.lookup(catalog)
+                {
+                    *identity = format!("{mapped}.{rest}");
+                }
+            }
+        }
+        render_cell(&signature, &value)
+    }
     pub fn render_expected(&self, sql: &str, result: &mut crate::types::ResultSet) -> Result<()> {
         let upper = sql.trim_start().to_ascii_uppercase();
         let output = catalog_output_plan(sql);
-        let positions = output_catalog_positions(&output, &result.header);
+        let positions = output_positions(&output, &result.header, false);
+        let arrays = output_positions(&output, &result.header, true);
         for (index, header) in result.header.iter().enumerate() {
             for row in &mut result.rows {
                 if let Some(cell) = row.get_mut(index) {
@@ -442,6 +456,8 @@ impl CatalogSymbols {
                         if let Some(new) = self.lookup(cell) {
                             *cell = new.into();
                         }
+                    } else if arrays.contains(&index) {
+                        *cell = self.relation_array(cell)?;
                     } else if upper.starts_with("SHOW CREATE ") {
                         // Only the returned DDL column contains catalog syntax.
                         if header.to_ascii_lowercase().starts_with("create ") {
@@ -531,13 +547,6 @@ impl Visit for CatalogEdits<'_> {
             Statement::Session(SessionStatement::Use(s)) => {
                 if let Some(c) = &s.catalog {
                     self.ident(c);
-                }
-            }
-            Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
-                if let Some(from) = &show.from
-                    && from.parts.len() == 2
-                {
-                    self.ident(&from.parts[0]);
                 }
             }
             Statement::Maintenance(MaintenanceStatement::Call(call)) => {
@@ -692,19 +701,48 @@ fn metadata_query(q: &Query) -> bool {
     })
 }
 
+const RELATION_ARRAY_COLUMNS: &[&str] = &["base_tables", "upstream_materialized_views"];
+fn relation_array_column(expr: &Expr) -> Option<&Ident> {
+    let ident = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(name) => name.parts.last()?,
+        _ => return None,
+    };
+    RELATION_ARRAY_COLUMNS
+        .contains(&ident.value.to_ascii_lowercase().as_str())
+        .then_some(ident)
+}
+fn materialized_view_state_query(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.from.len() == 1
+        && select.from[0].joins.is_empty()
+        && matches!(&select.from[0].relation, TableFactor::Table { name, .. }
+            if name.parts.len() == 3
+                && name.parts[0].value.eq_ignore_ascii_case("system")
+                && name.parts[1].value.eq_ignore_ascii_case("runtime")
+                && name.parts[2].value.eq_ignore_ascii_case("materialized_view_states"))
+}
+
 #[derive(Clone, Debug)]
 enum OutputColumn {
-    Named { header: String, catalog: bool },
-    MetadataWildcard,
+    Named {
+        header: String,
+        catalog: bool,
+        relations: bool,
+    },
+    MetadataWildcard {
+        relations: bool,
+    },
 }
 fn known_show_catalog_column(sql: &str, header: &str) -> bool {
     let upper = sql.trim_start().to_ascii_uppercase();
-    (upper.starts_with("SHOW ANALYZE JOBS") && header == "catalog")
-        || (upper.starts_with("SHOW CATALOGS")
-            && matches!(
-                header.to_ascii_lowercase().as_str(),
-                "catalog" | "catalog_name" | "catalogname" | "name"
-            ))
+    upper.starts_with("SHOW CATALOGS")
+        && matches!(
+            header.to_ascii_lowercase().as_str(),
+            "catalog" | "catalog_name" | "catalogname" | "name"
+        )
 }
 fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
     let mut result = Vec::new();
@@ -712,6 +750,7 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
         for statement in statements {
             if let Statement::Query(query) = statement {
                 let metadata = metadata_query(&query);
+                let state_table = materialized_view_state_query(&query);
                 if let SetExpr::Select(select) = query.body.as_ref() {
                     result.clear();
                     for item in &select.projection {
@@ -723,7 +762,9 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                             SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. }
                                 if metadata =>
                             {
-                                result.push(OutputColumn::MetadataWildcard);
+                                result.push(OutputColumn::MetadataWildcard {
+                                    relations: state_table,
+                                });
                                 continue;
                             }
                             _ => {
@@ -741,7 +782,12 @@ fn catalog_output_plan(sql: &str) -> Vec<OutputColumn> {
                             }
                             _ => sql[expr.span().start()..expr.span().end()].to_string(),
                         });
-                        result.push(OutputColumn::Named { header, catalog });
+                        let relations = state_table && relation_array_column(expr).is_some();
+                        result.push(OutputColumn::Named {
+                            header,
+                            catalog,
+                            relations,
+                        });
                     }
                 }
             }
@@ -755,8 +801,10 @@ fn control_catalog_column(sql: &str, plan: &[OutputColumn], column: &str) -> boo
     }
     for entry in plan {
         match entry {
-            OutputColumn::Named { header, catalog } if header == column => return *catalog,
-            OutputColumn::MetadataWildcard if CATALOG_COLUMNS.contains(&column) => {
+            OutputColumn::Named {
+                header, catalog, ..
+            } if header == column => return *catalog,
+            OutputColumn::MetadataWildcard { .. } if CATALOG_COLUMNS.contains(&column) => {
                 return true;
             }
             _ => {}
@@ -764,10 +812,20 @@ fn control_catalog_column(sql: &str, plan: &[OutputColumn], column: &str) -> boo
     }
     false
 }
-fn output_catalog_positions(plan: &[OutputColumn], header: &[String]) -> BTreeSet<usize> {
+fn control_relation_column(plan: &[OutputColumn], column: &str) -> bool {
+    plan.iter().any(|entry| match entry {
+        OutputColumn::Named {
+            header, relations, ..
+        } => header == column && *relations,
+        OutputColumn::MetadataWildcard { relations } => {
+            *relations && RELATION_ARRAY_COLUMNS.contains(&column)
+        }
+    })
+}
+fn output_positions(plan: &[OutputColumn], header: &[String], relations: bool) -> BTreeSet<usize> {
     let wildcard_count = plan
         .iter()
-        .filter(|entry| matches!(entry, OutputColumn::MetadataWildcard))
+        .filter(|entry| matches!(entry, OutputColumn::MetadataWildcard { .. }))
         .count();
     if wildcard_count > 1 {
         return BTreeSet::new();
@@ -776,19 +834,27 @@ fn output_catalog_positions(plan: &[OutputColumn], header: &[String]) -> BTreeSe
     let mut index = 0;
     for entry in plan {
         match entry {
-            OutputColumn::Named { catalog, .. } => {
-                if *catalog {
+            OutputColumn::Named {
+                catalog,
+                relations: array,
+                ..
+            } => {
+                let selected = if relations { *array } else { *catalog };
+                if selected {
                     positions.insert(index);
                 }
                 index += 1;
             }
-            OutputColumn::MetadataWildcard => {
+            OutputColumn::MetadataWildcard { relations: array } => {
                 let width = header.len().saturating_sub(plan.len() - 1);
                 for position in index..index + width {
-                    if header
-                        .get(position)
-                        .is_some_and(|name| CATALOG_COLUMNS.contains(&name.as_str()))
-                    {
+                    if header.get(position).is_some_and(|name| {
+                        if relations {
+                            *array && RELATION_ARRAY_COLUMNS.contains(&name.as_str())
+                        } else {
+                            CATALOG_COLUMNS.contains(&name.as_str())
+                        }
+                    }) {
                         positions.insert(position);
                     }
                 }
@@ -808,43 +874,6 @@ mod tests {
             "owned".into(),
             "nc_1792540800000_0123456789abcdef0123456789abcdef_0000".into(),
         )]))
-    }
-    #[test]
-    fn optimize_status_binds_only_the_catalog_in_qualified_from() {
-        let symbols = symbols();
-        let mapped = symbols.lookup("owned").unwrap();
-        for (sql, expected) in [
-            (
-                "SHOW ALTER TABLE OPTIMIZE FROM owned.ns WHERE TableName = 'owned' ORDER BY CreateTime DESC LIMIT 1",
-                format!(
-                    "SHOW ALTER TABLE OPTIMIZE FROM {mapped}.ns WHERE TableName = 'owned' ORDER BY CreateTime DESC LIMIT 1"
-                ),
-            ),
-            (
-                "SHOW ALTER TABLE OPTIMIZE FROM `owned`.`namespace.with.dot` WHERE TableName = 'owned.ns.t'",
-                format!(
-                    "SHOW ALTER TABLE OPTIMIZE FROM `{mapped}`.`namespace.with.dot` WHERE TableName = 'owned.ns.t'"
-                ),
-            ),
-            (
-                "SHOW ALTER TABLE OPTIMIZE FROM owned WHERE TableName = 'owned.ns.t'",
-                "SHOW ALTER TABLE OPTIMIZE FROM owned WHERE TableName = 'owned.ns.t'".into(),
-            ),
-            (
-                "SHOW ALTER TABLE OPTIMIZE FROM `owned.ns`",
-                "SHOW ALTER TABLE OPTIMIZE FROM `owned.ns`".into(),
-            ),
-            (
-                "SHOW ALTER TABLE OPTIMIZE FROM external.ns WHERE TableName = 'owned'",
-                "SHOW ALTER TABLE OPTIMIZE FROM external.ns WHERE TableName = 'owned'".into(),
-            ),
-            (
-                "SHOW ALTER TABLE OPTIMIZE WHERE TableName = 'owned'",
-                "SHOW ALTER TABLE OPTIMIZE WHERE TableName = 'owned'".into(),
-            ),
-        ] {
-            assert_eq!(symbols.rewrite_source(sql).unwrap(), expected);
-        }
     }
     #[test]
     fn qualified_database_control_maps_only_its_typed_catalog_span() {
@@ -1026,19 +1055,64 @@ mod tests {
             .unwrap();
         assert_eq!(data.result_rows_where[0].1, "owned");
         let mut meta = crate::types::QueryMeta {
-            result_rows_where: vec![("catalog".into(), "owned".into())],
-            result_contains: vec!["owned.ns.t".into(), "literal owned".into()],
+            result_rows_where: vec![("catalog_name".into(), "owned".into())],
+            result_rows_expect: vec![("base_tables".into(), r#"["owned.ns.t"]"#.into())],
+            result_contains: vec!["owned.ns.literal".into()],
             ..Default::default()
         };
-        s.rewrite_meta(&mut meta, "SHOW MATERIALIZED VIEWS")
-            .unwrap();
-        assert_eq!(meta.result_rows_where[0].1, "owned");
-        s.rewrite_meta(&mut meta, "SHOW ANALYZE JOBS").unwrap();
+        s.rewrite_meta(
+            &mut meta,
+            "SELECT catalog_name, base_tables FROM system.runtime.materialized_view_states",
+        )
+        .unwrap();
         assert_eq!(meta.result_rows_where[0].1, name);
+        assert_eq!(meta.result_rows_expect[0].1, format!(r#"["{name}.ns.t"]"#));
+        assert_eq!(meta.result_contains, vec!["owned.ns.literal".to_string()]);
+    }
+    #[test]
+    fn mv_state_relation_arrays_bind_only_their_projected_positions() {
+        let symbols = symbols();
+        let mapped = symbols.lookup("owned").unwrap();
+        let sql = "SELECT base_tables AS x, upstream_materialized_views AS x, ARRAY['owned.ns.literal'] AS x FROM system.runtime.materialized_view_states";
+        let mut result = crate::types::ResultSet {
+            golden: None,
+            header: vec!["x".into(); 3],
+            rows: vec![vec![
+                r#"["owned.ns.t","external.ns.t"]"#.into(),
+                "NULL".into(),
+                r#"["owned.ns.literal"]"#.into(),
+            ]],
+        };
+        symbols.render_expected(sql, &mut result).unwrap();
         assert_eq!(
-            meta.result_contains,
-            vec![format!("{name}.ns.t"), "literal owned".into()]
+            result.rows[0],
+            vec![
+                format!(r#"["{mapped}.ns.t","external.ns.t"]"#),
+                "NULL".into(),
+                r#"["owned.ns.literal"]"#.into()
+            ]
         );
+        let mut wildcard = crate::types::ResultSet {
+            golden: None,
+            header: vec!["base_tables".into(), "upstream_materialized_views".into()],
+            rows: vec![vec![r#"["owned.ns.t"]"#.into(), "[]".into()]],
+        };
+        symbols
+            .render_expected(
+                "SELECT * FROM system.runtime.materialized_view_states",
+                &mut wildcard,
+            )
+            .unwrap();
+        assert_eq!(wildcard.rows[0][0], format!(r#"["{mapped}.ns.t"]"#));
+        let mut data = crate::types::ResultSet {
+            golden: None,
+            header: vec!["base_tables".into()],
+            rows: vec![vec![r#"["owned.ns.t"]"#.into()]],
+        };
+        symbols
+            .render_expected("SELECT base_tables FROM business", &mut data)
+            .unwrap();
+        assert_eq!(data.rows[0][0], r#"["owned.ns.t"]"#);
     }
     #[test]
     fn standard_mv_metadata_maps_catalog_literals_and_projected_cells_only() {

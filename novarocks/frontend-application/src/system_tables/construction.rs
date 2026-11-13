@@ -17,7 +17,7 @@
 
 //! Snapshot data inside the original planning CPU body. This is retained input,
 //! not a task owner: the existing CPU source owns execution, close and health.
-use super::source::{MaterializedSystemTableBatch, SystemTableRow};
+use super::source::{MaterializedSystemTableBatch, SystemTableRow, SystemValue, SystemValueRef};
 use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_query_application::system_tables::{SystemTableError, SystemTableSnapshot};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -72,12 +72,81 @@ pub(crate) enum RowStage {
     FlushRequired,
 }
 
+pub(super) fn validate_value(
+    value: SystemValueRef<'_>,
+    ty: &arrow::datatypes::DataType,
+    nullable: bool,
+) -> Result<(), SystemTableError> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    let valid = match value {
+        SystemValueRef::Null => nullable,
+        SystemValueRef::Utf8(_) => *ty == DataType::Utf8,
+        SystemValueRef::Int64(_) => *ty == DataType::Int64,
+        SystemValueRef::Boolean(_) => *ty == DataType::Boolean,
+        SystemValueRef::TimestampMillis(_) => {
+            matches!(ty, DataType::Timestamp(TimeUnit::Millisecond, _))
+        }
+        SystemValueRef::Utf8List(_) => {
+            matches!(ty, DataType::List(child) if *child.data_type() == DataType::Utf8 && !child.is_nullable())
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(SystemTableError::Internal(
+            "system-table value violates its declared type or nullability".into(),
+        ))
+    }
+}
+fn value_extent(value: SystemValueRef<'_>) -> Result<(usize, usize, usize), SystemTableError> {
+    match value {
+        SystemValueRef::Utf8(value) => Ok((value.len(), 0, value.len())),
+        SystemValueRef::Utf8List(values) => {
+            let payload = values
+                .iter()
+                .try_fold(0usize, |n, value| extent_add(n, value.len()))?;
+            Ok((
+                payload,
+                values.len(),
+                extent_add(array_layout::<String>(values.len())?.size(), payload)?,
+            ))
+        }
+        _ => Ok((0, 0, 0)),
+    }
+}
+fn copy_text(value: &str) -> Result<String, SystemTableError> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
+    owned.push_str(value);
+    Ok(owned)
+}
+pub(super) fn copy_value(value: SystemValueRef<'_>) -> Result<SystemValue, SystemTableError> {
+    Ok(match value {
+        SystemValueRef::Null => SystemValue::Null,
+        SystemValueRef::Utf8(value) => SystemValue::Utf8(copy_text(value)?),
+        SystemValueRef::Int64(value) => SystemValue::Int64(value),
+        SystemValueRef::Boolean(value) => SystemValue::Boolean(value),
+        SystemValueRef::TimestampMillis(value) => SystemValue::TimestampMillis(value),
+        SystemValueRef::Utf8List(values) => {
+            let mut copied = Vec::new();
+            copied
+                .try_reserve_exact(values.len())
+                .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
+            for value in values {
+                copied.push(copy_text(value)?);
+            }
+            SystemValue::Utf8List(copied)
+        }
+    })
+}
 pub(crate) struct SystemTableCpuStaging {
     // Destruction order matters: real containers die before the input receipt.
     rows: Vec<SystemTableRow>,
     batches: Vec<MaterializedSystemTableBatch>,
     required_columns: Vec<usize>,
-    column_bytes: Vec<usize>,
+    column_bytes: Vec<(usize, usize)>,
     input_bytes: ResultPayloadBytes,
     live_row_bytes: usize,
     declaration: Arc<SystemTableDeclaration>,
@@ -114,10 +183,10 @@ impl SystemTableCpuStaging {
         let mut input_bytes = window.reserve_payload_bytes(0).map_err(work_error)?;
         reserve(
             &mut input_bytes,
-            array_layout::<usize>(required.len())?
-                .size()
-                .checked_mul(2)
-                .ok_or_else(overflow)?,
+            extent_add(
+                array_layout::<usize>(required.len())?.size(),
+                array_layout::<(usize, usize)>(required.len())?.size(),
+            )?,
         )?;
         let mut required_columns = Vec::new();
         required_columns
@@ -128,7 +197,7 @@ impl SystemTableCpuStaging {
         column_bytes
             .try_reserve_exact(required.len())
             .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
-        column_bytes.resize(required.len(), 0);
+        column_bytes.resize(required.len(), (0, 0));
         Ok(Self {
             rows: Vec::new(),
             batches: Vec::new(),
@@ -144,7 +213,7 @@ impl SystemTableCpuStaging {
     }
     pub(crate) fn stage_row(
         &mut self,
-        values: &[Option<&str>],
+        values: &[SystemValueRef<'_>],
     ) -> Result<RowStage, SystemTableError> {
         self.root.check().map_err(work_error)?;
         novarocks_type_contract::PureCompileControl::checkpoint(
@@ -153,27 +222,28 @@ impl SystemTableCpuStaging {
             0,
         )
         .map_err(control_error)?;
-        let mut row_bytes = array_layout::<Option<String>>(self.required_columns.len())?.size();
+        let mut row_bytes = array_layout::<SystemValue>(self.required_columns.len())?.size();
         for (column, &ordinal) in self.required_columns.iter().enumerate() {
             let value = values.get(ordinal).ok_or_else(|| {
                 SystemTableError::InvalidRequest(
                     "system table row is narrower than its declaration".into(),
                 )
             })?;
-            if let Some(value) = value {
-                if value.len() > i32::MAX as usize {
-                    return Err(SystemTableError::InvalidRequest(
-                        "system table UTF8 value exceeds Arrow offset width".into(),
-                    ));
+            let declared = &self.declaration.columns[ordinal].value_type;
+            validate_value(*value, declared.data_type(), declared.nullable())?;
+            let (payload, items, owned_bytes) = value_extent(*value)?;
+            let (old_payload, old_items) = self.column_bytes[column];
+            if extent_add(old_payload, payload)? > i32::MAX as usize
+                || extent_add(old_items, items)? > i32::MAX as usize
+            {
+                if !self.rows.is_empty() {
+                    return Ok(RowStage::FlushRequired);
                 }
-                if extent_add(self.column_bytes[column], value.len())? > i32::MAX as usize {
-                    if !self.rows.is_empty() {
-                        return Ok(RowStage::FlushRequired);
-                    }
-                    return Err(overflow());
-                }
-                row_bytes = extent_add(row_bytes, value.len())?;
+                return Err(SystemTableError::InvalidRequest(
+                    "system table value exceeds Arrow offset width".into(),
+                ));
             }
+            row_bytes = extent_add(row_bytes, owned_bytes)?;
         }
         let old_capacity = self.rows.capacity();
         let grow = self.rows.len() == old_capacity;
@@ -200,19 +270,13 @@ impl SystemTableCpuStaging {
         let mut row = Vec::new();
         row.try_reserve_exact(self.required_columns.len())
             .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
+        for &ordinal in &self.required_columns {
+            row.push(copy_value(values[ordinal])?);
+        }
         for (column, &ordinal) in self.required_columns.iter().enumerate() {
-            let value = if let Some(value) = values[ordinal] {
-                let mut owned = String::new();
-                owned
-                    .try_reserve_exact(value.len())
-                    .map_err(|_| control_error(CompileControlError::ResourceExhausted))?;
-                owned.push_str(value);
-                self.column_bytes[column] += value.len();
-                Some(owned)
-            } else {
-                None
-            };
-            row.push(value);
+            let (payload, items, _) = value_extent(values[ordinal])?;
+            self.column_bytes[column].0 += payload;
+            self.column_bytes[column].1 += items;
         }
         self.live_row_bytes = extent_add(self.live_row_bytes, row_bytes)?;
         self.rows.push(row);
@@ -260,8 +324,15 @@ impl SystemTableCpuStaging {
         self.rows.clear();
         release(&mut self.input_bytes, self.live_row_bytes);
         self.live_row_bytes = 0;
-        self.column_bytes.fill(0);
+        self.column_bytes.fill((0, 0));
         Ok(())
+    }
+    #[cfg(test)]
+    fn stage_text_row<const N: usize>(
+        &mut self,
+        values: &[Option<&str>; N],
+    ) -> Result<RowStage, SystemTableError> {
+        self.stage_row(&values.map(SystemValueRef::from))
     }
     #[cfg(test)]
     pub(crate) fn first_field_for_test(&self) -> Option<std::sync::Weak<arrow::datatypes::Field>> {
@@ -358,12 +429,12 @@ mod tests {
         .unwrap();
         for _ in 0..3 {
             staging
-                .stage_row(&[Some("ice"), Some("db"), Some("orders"), Some("BASE TABLE")])
+                .stage_text_row(&[Some("ice"), Some("db"), Some("orders"), Some("BASE TABLE")])
                 .unwrap();
         }
         staging.flush().unwrap();
         staging
-            .stage_row(&[Some("ice"), Some("other"), Some("orders"), Some("VIEW")])
+            .stage_text_row(&[Some("ice"), Some("other"), Some("orders"), Some("VIEW")])
             .unwrap();
         let snapshot = staging.finish().unwrap();
         assert_eq!(
@@ -405,7 +476,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..7 {
-            staging.stage_row(&[]).unwrap();
+            staging.stage_text_row(&[]).unwrap();
         }
         let snapshot = staging.finish().unwrap();
         assert_eq!(snapshot.batches.len(), 1);
@@ -429,7 +500,7 @@ mod tests {
         )
         .unwrap();
         staging
-            .stage_row(&[
+            .stage_text_row(&[
                 Some("ice"),
                 Some("db"),
                 Some("original"),
@@ -445,7 +516,7 @@ mod tests {
             Err(SystemTableError::Provider(_))
         ));
         assert_eq!(staging.rows.len(), 1);
-        assert_eq!(staging.rows[0][0].as_deref(), Some("original"));
+        assert_eq!(staging.rows[0][0], SystemValue::Utf8("original".into()));
         assert!(staging.batches.is_empty());
         assert_eq!(
             window.retained_payload_bytes(),
@@ -456,6 +527,134 @@ mod tests {
         let snapshot = staging.finish().unwrap();
         assert_eq!(snapshot.batches[0].num_rows(), 1);
         drop(snapshot);
+        assert_eq!(window.retained_payload_bytes(), 0);
+    }
+    fn state_declaration() -> Arc<SystemTableDeclaration> {
+        let registry = novarocks_query_application::system_tables::SystemTableRegistry::try_new([
+            crate::system_tables::materialized_view_states_registration(),
+        ])
+        .unwrap();
+        let novarocks_query_application::system_tables::SystemTableLookup::Declared(declaration) =
+            registry.declare(
+                &novarocks_sql::system_table::SystemTableBinding::System,
+                "runtime",
+                "materialized_view_states",
+            )
+        else {
+            panic!("state table declaration")
+        };
+        declaration
+    }
+    #[test]
+    fn typed_batches_keep_values_child_nullability_and_original_window_until_alias_exit() {
+        use arrow::array::{
+            Array, BooleanArray, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
+        };
+        let (_control, root, capacity, _positions) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = capacity.try_window_alias().unwrap();
+        let mut staging = SystemTableCpuStaging::new(
+            state_declaration(),
+            &[4, 5, 6, 7, 10, 11],
+            root.owner.scope(),
+            window.clone(),
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let names = vec!["ice.db.base".into(), "ice.db.other".into()];
+        let values = [
+            SystemValueRef::Null,
+            SystemValueRef::Null,
+            SystemValueRef::Null,
+            SystemValueRef::Null,
+            SystemValueRef::Int64(60000),
+            SystemValueRef::Boolean(true),
+            SystemValueRef::TimestampMillis(1234),
+            SystemValueRef::Null,
+            SystemValueRef::Null,
+            SystemValueRef::Null,
+            SystemValueRef::Utf8List(&names),
+            SystemValueRef::Null,
+        ];
+        staging.stage_row(&values).unwrap();
+        assert!(
+            window.retained_payload_bytes() > names.iter().map(String::len).sum::<usize>() as u64
+        );
+        let snapshot = staging.finish().unwrap();
+        let batch = &snapshot.batches[0];
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            60000
+        );
+        assert!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(0),
+            1234
+        );
+        assert!(batch.column(3).is_null(0));
+        assert!(batch.column(5).is_null(0));
+        let array = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let child = array.value(0);
+        let child = child.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            child.iter().collect::<Vec<_>>(),
+            [Some("ice.db.base"), Some("ice.db.other")]
+        );
+        let alias = snapshot.clone();
+        let retained = window.retained_payload_bytes();
+        drop(snapshot);
+        assert_eq!(window.retained_payload_bytes(), retained);
+        drop(alias);
+        assert_eq!(window.retained_payload_bytes(), 0);
+    }
+    #[test]
+    fn typed_input_rejects_wrong_types_and_nullability_before_copy_and_flushes_list_geometry() {
+        let (_control, root, capacity, _positions) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let window = capacity.try_window_alias().unwrap();
+        let mut staging = SystemTableCpuStaging::new(
+            state_declaration(),
+            &[10],
+            root.owner.scope(),
+            window.clone(),
+            SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let mut values = [SystemValueRef::Null; 12];
+        assert!(staging.stage_row(&values).is_err());
+        values[10] = SystemValueRef::Utf8("not an array");
+        assert!(staging.stage_row(&values).is_err());
+        let names = vec!["x".into()];
+        values[10] = SystemValueRef::Utf8List(&names);
+        staging.stage_row(&values).unwrap();
+        staging.column_bytes[0].1 = i32::MAX as usize;
+        assert_eq!(staging.stage_row(&values).unwrap(), RowStage::FlushRequired);
+        assert_eq!(staging.rows.len(), 1);
+        staging.column_bytes[0].1 = 1;
+        staging.flush().unwrap();
+        assert_eq!(staging.stage_row(&values).unwrap(), RowStage::Staged);
+        drop(staging);
         assert_eq!(window.retained_payload_bytes(), 0);
     }
 }

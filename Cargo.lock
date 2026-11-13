@@ -3533,7 +3533,6 @@ dependencies = [
  "novarocks-state-store-runtime",
  "novarocks-state-store-sqlite",
  "novarocks-state-store-testkit",
- "novarocks-statistics-application",
  "novarocks-table-maintenance",
  "novarocks-task-codec",
  "novarocks-trino-adapter",
@@ -4229,20 +4228,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-statistics-application"
-version = "0.1.0"
-dependencies = [
- "novarocks-failpoint",
- "novarocks-failure-contract",
- "novarocks-query-application",
- "novarocks-resource-contract",
- "novarocks-type-contract",
- "novarocks-workload-control",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "novarocks-system-test-cli"
 version = "0.1.0"
 dependencies = [
@@ -4306,14 +4291,10 @@ dependencies = [
  "novarocks-coordination-contract",
  "novarocks-failure-contract",
  "novarocks-query-application",
- "novarocks-resource-contract",
- "novarocks-sql",
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
  "novarocks-type-contract",
- "novarocks-types",
- "novarocks-workload-control",
  "serde",
  "serde_json",
  "tokio",

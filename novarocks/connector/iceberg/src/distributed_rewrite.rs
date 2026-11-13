@@ -58,9 +58,6 @@ use crate::scan_model::{
 };
 
 pub(crate) const ARTIFACT_VERSION: u16 = 3;
-pub(crate) const REWRITE_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const REWRITE_ARTIFACT_MAX_GROUPS: usize = 4096;
-pub(crate) const REWRITE_GROUP_MAX_BYTES: usize = 1024 * 1024;
 
 const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v2\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
@@ -149,6 +146,7 @@ impl IcebergDistributedRewriteControl {
         let live_delete_paths = if matches!(
             request.operation(),
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+                | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. }
         ) {
             live_delete_file_paths(&self.runtime, &table, &request.context)?
         } else {
@@ -175,6 +173,7 @@ impl IcebergDistributedRewriteControl {
         if matches!(
             request.operation(),
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+                | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. }
         ) {
             crate::commit::validation::deny_unwritable_data_files(
                 metadata.current_schema(),
@@ -186,6 +185,17 @@ impl IcebergDistributedRewriteControl {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
                 plan_data_file_groups(files, live_delete_paths)?
             }
+            ConnectorDistributedRewriteOperation::OptimizeDataFiles {
+                file_size_threshold_bytes,
+                ..
+            } => plan_optimize_groups(
+                files
+                    .into_iter()
+                    .map(data_file_with_stats_to_iceberg_data_file_info)
+                    .collect(),
+                metadata.default_partition_spec_id(),
+                *file_size_threshold_bytes,
+            )?,
             ConnectorDistributedRewriteOperation::RewritePositionDeletes {
                 rewrite_all,
                 min_input_files,
@@ -351,7 +361,8 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             return Err(invalid("Iceberg distributed rewrite requires a base table handle").into());
         }
         let operation = match request.operation() {
-            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+            ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+            | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. } => {
                 CatalogOperation::RewriteDataFiles
             }
             ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
@@ -489,34 +500,12 @@ impl FrozenRewritePlanContent {
     }
 }
 
-// Encoded only to preserve the existing per-group size boundary.
-#[derive(Serialize)]
-struct GroupSizeInput<'a> {
-    version: u16,
-    groups: [&'a IcebergFrozenRewriteGroupV1; 1],
-}
-
 impl IcebergFrozenRewriteArtifactV1 {
     fn canonical_bytes(&self) -> Result<Bytes, ConnectorError> {
-        if self.version != ARTIFACT_VERSION || self.groups.len() > REWRITE_ARTIFACT_MAX_GROUPS {
+        if self.version != ARTIFACT_VERSION {
             return Err(invalid("Iceberg rewrite artifact is invalid"));
         }
-        for group in &self.groups {
-            if canonical_json(&GroupSizeInput {
-                version: ARTIFACT_VERSION,
-                groups: [group],
-            })?
-            .len()
-                > REWRITE_GROUP_MAX_BYTES
-            {
-                return Err(exhausted("Iceberg rewrite group exceeds 1 MiB"));
-            }
-        }
-        let bytes = canonical_json(self)?;
-        if bytes.len() > REWRITE_ARTIFACT_MAX_BYTES {
-            return Err(exhausted("Iceberg rewrite artifact exceeds 64 MiB"));
-        }
-        Ok(bytes)
+        canonical_json(self)
     }
 }
 
@@ -542,6 +531,45 @@ pub(crate) fn plan_data_file_groups(
         .collect::<Vec<_>>();
     let mut groups = group_data_files(files, false, None)?;
     assign_unattached_delete_owners(&mut groups, live_delete_paths)?;
+    refresh_data_group_digests(&mut groups)?;
+    bounded_groups(groups)
+}
+
+/// Trino optimize selects candidates before eliminating singleton partitions.
+/// A candidate from an older spec causes every candidate to be rewritten.
+fn plan_optimize_groups(
+    files: Vec<IcebergDataFileInfo>,
+    current_spec_id: i32,
+    threshold_bytes: u64,
+) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
+    let files = files
+        .into_iter()
+        .filter(|file| {
+            !file.delete_files.is_empty()
+                || u64::try_from(file.size).is_ok_and(|size| size <= threshold_bytes)
+        })
+        .collect::<Vec<_>>();
+    let old_spec = files
+        .iter()
+        .any(|file| file.partition_spec_id != Some(current_spec_id));
+    let groups = group_data_files(files, false, None)?;
+    // Attached delete ownership is assigned after selection, so one logical
+    // delete entry has exactly one selected owner even across partitions.
+    let mut groups = groups
+        .into_iter()
+        .filter(|group| {
+            old_spec
+                || group.data_files.len() > 1
+                || group
+                    .data_files
+                    .iter()
+                    .any(|file| !file.delete_files.is_empty())
+        })
+        .collect::<Vec<_>>();
+    for group in &mut groups {
+        group.owned_data_delete_files.clear();
+    }
+    assign_attached_delete_owners(&mut groups)?;
     refresh_data_group_digests(&mut groups)?;
     bounded_groups(groups)
 }
@@ -726,9 +754,6 @@ fn bounded_groups(
     mut groups: Vec<IcebergFrozenRewriteGroupV1>,
 ) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
     groups.sort_by(|left, right| left.group_digest_hex.cmp(&right.group_digest_hex));
-    if groups.len() > REWRITE_ARTIFACT_MAX_GROUPS {
-        return Err(exhausted("Iceberg rewrite exceeds 4096 cohorts"));
-    }
     if groups
         .windows(2)
         .any(|pair| pair[0].group_digest_hex == pair[1].group_digest_hex)
@@ -753,7 +778,8 @@ fn cohort_plans_from_artifact(
     novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
 > {
     let intent = match request.operation() {
-        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. } => {
             ConnectorWriteIntent::Overwrite
         }
         ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
@@ -788,7 +814,8 @@ fn cohort_plans_from_artifact(
             // frozen group instead -- the same group its commit resolves the
             // replaced Puffin files from.
             let read = match request.operation() {
-                ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+                ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+                | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. } => {
                     let base_snapshot_id = artifact.base_snapshot_id.ok_or_else(|| {
                         invalid("Iceberg rewrite group has no base snapshot to pin its files to")
                     })?;
@@ -837,6 +864,7 @@ fn rewrite_execution_schema(
     if matches!(
         operation,
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+            | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. }
     ) {
         let mut pseudo = creation.reserve::<String>(if row_lineage { 2 } else { 0 })?;
         if row_lineage {
@@ -930,7 +958,10 @@ fn rewrite_preparation(
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     let input = match request.operation() {
-        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } if row_lineage => {
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. }
+            if row_lineage =>
+        {
             let row_identity_fields = fields
                 .iter()
                 .filter(|field| {
@@ -955,7 +986,8 @@ fn rewrite_preparation(
                 row_identity_fields,
             }
         }
-        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+        | ConnectorDistributedRewriteOperation::OptimizeDataFiles { .. } => {
             ConnectorWriteInputShape::Data { fields }
         }
         ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
@@ -1577,10 +1609,6 @@ fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message)
 }
 
-fn exhausted(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1701,6 +1729,109 @@ mod tests {
             error.message().contains("42"),
             "the refusal must name the pinned snapshot: {}",
             error.message()
+        );
+    }
+
+    #[test]
+    fn optimize_planning_rejects_a_replaced_captured_object_before_dispatch() {
+        let uuid = uuid::Uuid::from_u128(42);
+        let expected = novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from(
+            uuid.to_string(),
+        ))
+        .unwrap();
+        async_plan::validate_expected_rewrite_object(Some(&expected), uuid).unwrap();
+        let error = async_plan::validate_expected_rewrite_object(
+            Some(&expected),
+            uuid::Uuid::from_u128(43),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.table_object_binding_failure(),
+            Some(novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced)
+        );
+        assert!(error.to_string().contains("TARGET_REPLACED"));
+        assert_eq!(
+            error.public_failure_detail(),
+            Some("TARGET_REPLACED: Iceberg optimize target changed before rewrite planning")
+        );
+    }
+
+    fn optimize_file(path: &str, size: i64, spec: i32, partition: &str) -> IcebergDataFileInfo {
+        let mut file = IcebergDataFileInfo::for_test(path, size, 1);
+        file.partition_spec_id = Some(spec);
+        file.partition_key = Some(partition.to_owned());
+        file
+    }
+
+    #[test]
+    fn optimize_selects_multiple_small_files_and_skips_singleton_partitions() {
+        let groups = plan_optimize_groups(
+            vec![
+                optimize_file("a1", 10, 0, "a"),
+                optimize_file("a2", 10, 0, "a"),
+                optimize_file("b1", 10, 0, "b"),
+                optimize_file("large", 101, 0, "a"),
+            ],
+            0,
+            100,
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]
+                .data_files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a1", "a2"]
+        );
+        assert!(groups[0].owned_data_delete_files.is_empty());
+    }
+
+    #[test]
+    fn optimize_includes_delete_bearing_files_regardless_of_size_and_only_attached_deletes() {
+        let mut file = optimize_file("s3://bucket/data-1.parquet", 1000, 0, "a");
+        file.delete_files.push(dv("s3://bucket/attached.puffin"));
+        let groups =
+            plan_optimize_groups(vec![file, optimize_file("singleton", 1, 0, "b")], 0, 100)
+                .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].data_files.len(), 1);
+        assert_eq!(
+            groups[0].owned_data_delete_files,
+            live(&["s3://bucket/attached.puffin"])
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn optimize_old_spec_rewrites_all_candidates_but_keeps_size_exclusions() {
+        let groups = plan_optimize_groups(
+            vec![
+                optimize_file("old", 10, 0, "a"),
+                optimize_file("current", 10, 1, "b"),
+                optimize_file("large", 101, 0, "c"),
+            ],
+            1,
+            100,
+        )
+        .unwrap();
+        let files = groups
+            .iter()
+            .flat_map(|g| &g.data_files)
+            .map(|f| f.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(files, BTreeSet::from(["old", "current"]));
+    }
+
+    #[test]
+    fn optimize_zero_selection_is_a_noop() {
+        assert!(plan_optimize_groups(Vec::new(), 0, 100).unwrap().is_empty());
+        assert!(
+            plan_optimize_groups(vec![optimize_file("only", 100, 0, "a")], 0, 100)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2413,7 +2544,7 @@ mod tests {
         }
     }
     #[test]
-    fn frozen_rewrite_limits_keep_the_previous_single_group_size_boundary() {
+    fn frozen_rewrite_artifacts_accept_large_groups_and_many_cohorts() {
         let mut artifact = IcebergFrozenRewriteArtifactV1 {
             version: ARTIFACT_VERSION,
             operation_kind: REWRITE_POSITION_DELETES_KIND.to_string(),
@@ -2429,17 +2560,13 @@ mod tests {
         artifact.groups[0]
             .data_files
             .push(IcebergDataFileInfo::for_test(
-                &"x".repeat(REWRITE_GROUP_MAX_BYTES),
+                &"x".repeat(1024 * 1024 + 1),
                 1,
                 1,
             ));
-        assert_eq!(
-            artifact.canonical_bytes().unwrap_err().kind(),
-            ConnectorErrorKind::ResourceExhausted
-        );
-        artifact.groups =
-            vec![IcebergFrozenRewriteGroupV1::default(); REWRITE_ARTIFACT_MAX_GROUPS + 1];
-        assert!(artifact.canonical_bytes().is_err());
+        assert!(artifact.canonical_bytes().unwrap().len() > 1024 * 1024);
+        artifact.groups = vec![IcebergFrozenRewriteGroupV1::default(); 4097];
+        assert!(artifact.canonical_bytes().is_ok());
     }
 }
 

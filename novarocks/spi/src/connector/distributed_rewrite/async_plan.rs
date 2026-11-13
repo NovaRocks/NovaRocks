@@ -24,6 +24,9 @@ use std::task::{Context, Poll};
 /// freezes its real table handle and planning digest after original observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorRewriteSelection {
+    Optimize {
+        file_size_threshold_bytes: u64,
+    },
     DataFiles {
         rewrite_all: bool,
     },
@@ -37,6 +40,7 @@ pub struct ConnectorRewriteSourceRequest {
     pub operation_id: ConnectorWriteOperationId,
     pub table: crate::connector::ConnectorTableIdentity,
     pub selection: ConnectorRewriteSelection,
+    pub expected_object_id: Option<crate::connector::ConnectorTableObjectId>,
     pub context: ConnectorRequestContext,
 }
 impl ConnectorRewriteSourceRequest {

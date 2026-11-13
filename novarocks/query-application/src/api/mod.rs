@@ -28,7 +28,6 @@ mod plan_scheduling;
 pub(crate) mod result;
 mod root_delivery;
 mod statement_native;
-mod topology;
 
 pub use backend_topology::*;
 pub use binding_receipt::*;
@@ -42,6 +41,5 @@ pub use plan_scheduling::*;
 pub use result::*;
 pub use root_delivery::*;
 pub use statement_native::*;
-pub use topology::*;
 
 pub use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite};

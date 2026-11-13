@@ -404,7 +404,9 @@ async fn indivisible_system_value_above_the_empty_original_window_keeps_typed_re
     let input = "x".repeat(9 << 20);
     let mut values = [None; 10];
     values[9] = Some(input.as_str());
-    let error = source.stage_row(&values).unwrap_err();
+    let error = source
+        .stage_row(&values.map(crate::system_tables::SystemValueRef::from))
+        .unwrap_err();
     let SqlCompileError::CompilationSource(cause) = sql_error(error) else {
         panic!("original resource author must survive the snapshot adapter")
     };

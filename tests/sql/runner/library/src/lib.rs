@@ -799,186 +799,6 @@ struct PreparedSuite {
 }
 
 // ---------------------------------------------------------------------------
-// wait_alter helper – polls SHOW ALTER TABLE until the latest job is terminal
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Eq, PartialEq)]
-enum AlterJobPollState {
-    Pending,
-    Finished,
-    Failed(String),
-}
-
-fn classify_alter_job_poll(execution: &crate::types::QueryExecution) -> AlterJobPollState {
-    let Some(state_index) = execution
-        .header
-        .iter()
-        .position(|column| column.eq_ignore_ascii_case("State"))
-    else {
-        return AlterJobPollState::Pending;
-    };
-    let message_index = execution
-        .header
-        .iter()
-        .position(|column| column.eq_ignore_ascii_case("Msg"));
-    let Some(row) = execution.rows.first() else {
-        return AlterJobPollState::Pending;
-    };
-    match row.get(state_index).map(String::as_str) {
-        Some("FINISHED") => AlterJobPollState::Finished,
-        Some("FAILED") => AlterJobPollState::Failed(
-            message_index
-                .and_then(|index| row.get(index))
-                .filter(|message| !message.is_empty())
-                .cloned()
-                .unwrap_or_else(|| "ALTER job failed without an error message".to_string()),
-        ),
-        _ => AlterJobPollState::Pending,
-    }
-}
-
-struct WaitAlterRequest<'a> {
-    db_name: &'a str,
-    table_name: &'a str,
-    kind: &'a str,
-    max_retries: usize,
-    interval: Duration,
-}
-
-fn execute_wait_alter(
-    session: &mut TrinoCaseSession,
-    query_timeout: u64,
-    request: WaitAlterRequest<'_>,
-    log: &mut String,
-) -> (bool, Duration, Vec<SqlExecutionOutcome>) {
-    let WaitAlterRequest {
-        db_name,
-        table_name,
-        kind,
-        max_retries,
-        interval,
-    } = request;
-    // Test cases may scope @db as `catalog.db` to switch catalog before running
-    // the wrapped statement. SHOW ALTER TABLE OPTIMIZE FROM <name> expects the
-    // engine to receive each identifier part quoted independently — wrapping
-    // `catalog.db` in a single backtick group flattens it into one db name and
-    // makes the lookup miss.
-    let show_sql = if db_name.is_empty() {
-        format!(
-            "SHOW ALTER TABLE {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
-            kind, table_name,
-        )
-    } else {
-        let qualified_from = match db_name.split_once('.') {
-            Some((catalog, db)) => format!("`{}`.`{}`", catalog, db),
-            None => format!("`{}`", db_name),
-        };
-        format!(
-            "SHOW ALTER TABLE {} FROM {} WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
-            kind, qualified_from, table_name,
-        )
-    };
-    let mut total_elapsed = Duration::ZERO;
-    let mut polls = Vec::new();
-    for attempt in 0..max_retries {
-        let outcome = session.execute_query(query_timeout, &show_sql, None);
-        let (ok, execution, _err) = outcome.summary();
-        polls.push(outcome);
-        if let Some(ref exec) = execution {
-            total_elapsed += exec.elapsed;
-        }
-        if ok && let Some(exec) = &execution {
-            match classify_alter_job_poll(exec) {
-                AlterJobPollState::Finished => {
-                    let _ = writeln!(
-                        log,
-                        "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
-                        kind.to_lowercase(),
-                        table_name,
-                        attempt + 1,
-                        max_retries,
-                    );
-                    return (true, total_elapsed, polls);
-                }
-                AlterJobPollState::Failed(message) => {
-                    let _ = writeln!(
-                        log,
-                        "    ❌ wait_alter_{} on `{}` failed (attempt {}/{}): {}",
-                        kind.to_lowercase(),
-                        table_name,
-                        attempt + 1,
-                        max_retries,
-                        message,
-                    );
-                    return (false, total_elapsed, polls);
-                }
-                AlterJobPollState::Pending => {}
-            }
-        }
-        if attempt + 1 < max_retries {
-            let _ = writeln!(
-                log,
-                "    ⏳ wait_alter_{} on `{}`: attempt {}/{}, retrying after {}ms",
-                kind.to_lowercase(),
-                table_name,
-                attempt + 1,
-                max_retries,
-                interval.as_millis(),
-            );
-            sleep(session.original_deadline().map_or(interval, |deadline| {
-                interval.min(deadline.saturating_duration_since(Instant::now()))
-            }));
-        }
-    }
-    let _ = writeln!(
-        log,
-        "    ❌ wait_alter_{} on `{}` timed out after {} retries",
-        kind.to_lowercase(),
-        table_name,
-        max_retries,
-    );
-    (false, total_elapsed, polls)
-}
-
-/// Retain every actual polling invocation alongside its original summary.
-fn run_step_wait_alters(
-    step: &SqlStep,
-    session: &mut TrinoCaseSession,
-    query_timeout: u64,
-    log: &mut String,
-) -> (bool, Duration, Vec<SqlExecutionOutcome>) {
-    let mut total = Duration::ZERO;
-    let mut polls = Vec::new();
-    let db = step.meta.db.as_deref().unwrap_or("");
-    for (table, kind, default_retries) in [
-        (&step.meta.wait_alter_column, "COLUMN", 60usize),
-        (&step.meta.wait_alter_rollup, "ROLLUP", 120usize),
-        (&step.meta.wait_alter_optimize, "OPTIMIZE", 300usize),
-    ] {
-        if let Some(table_name) = table {
-            let (ok, elapsed, mut actual) = execute_wait_alter(
-                session,
-                query_timeout,
-                WaitAlterRequest {
-                    db_name: db,
-                    table_name,
-                    kind,
-                    max_retries: default_retries,
-                    interval: Duration::from_secs(1),
-                },
-                log,
-            );
-            total += elapsed;
-            polls.append(&mut actual);
-            if !ok {
-                return (false, total, polls);
-            }
-        }
-    }
-    (true, total, polls)
-}
-
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // @imv_equivalence_check helpers
 // ---------------------------------------------------------------------------
@@ -1074,9 +894,9 @@ fn execute_required_oracle_query(
 }
 
 /// Capture the MV's current (incremental) contents, derive a full recompute by
-/// running the MV's `SelectText` query directly against the base tables (obtained
-/// from `SHOW MATERIALIZED VIEWS`), and assert multiset equality of results.
-/// MV is qualified by `db` like wait_alter_*. No side effects on the MV.
+/// running the persisted definition from `system.metadata.materialized_views`
+/// directly against the base tables, and assert multiset equality of results.
+/// MV is qualified by `db`. No side effects on the MV.
 fn run_imv_equivalence_check(
     mv: &str,
     session: &mut crate::session::TrinoCaseSession,
@@ -1108,57 +928,65 @@ fn run_imv_equivalence_check(
         "@imv_equivalence_check: incremental SELECT returned no result".to_string()
     })?;
 
-    // Derive the full-recompute result by running the MV's defining SELECT
-    // directly against the base tables. We obtain the SELECT SQL from
-    // `SHOW MATERIALIZED VIEWS`, which exposes `SelectText` for each MV.
-    // This avoids `REFRESH MATERIALIZED VIEW ... FULL`, which is intentionally
-    // disabled pending redesign.
+    // Use the same catalog as the target SELECT; the standard metadata table
+    // lists every catalog and cannot inherit SHOW's former session filtering.
+    let catalog = session.state.catalog.as_deref().ok_or_else(|| {
+        "@imv_equivalence_check: current catalog is required to read the persisted definition"
+            .to_string()
+    })?;
+    let catalog = format!("'{}'", catalog.replace('\'', "''"));
+    let metadata_sql = format!(
+        "SELECT name, schema_name, definition FROM system.metadata.materialized_views WHERE catalog_name = {catalog}"
+    );
     let _ = writeln!(
         log,
-        "    @imv_equivalence_check: deriving full recompute via SelectText"
+        "    @imv_equivalence_check: deriving full recompute via persisted definition"
     );
-    let outcome = session.execute_query(query_timeout, "SHOW MATERIALIZED VIEWS", None);
+    let outcome = session.execute_query(query_timeout, &metadata_sql, None);
     let (ok, show_result, msg) = outcome.summary();
     if !ok {
         return Err(DomainOracleFailure::from_execution(
-            format!("@imv_equivalence_check: SHOW MATERIALIZED VIEWS failed: {msg}"),
+            format!("@imv_equivalence_check: materialized view metadata failed: {msg}"),
             show_result,
-            "SHOW MATERIALIZED VIEWS",
+            &metadata_sql,
             outcome,
         ));
     }
     let show_result = show_result.ok_or_else(|| {
-        "@imv_equivalence_check: SHOW MATERIALIZED VIEWS returned no result".to_string()
+        "@imv_equivalence_check: materialized view metadata returned no result".to_string()
     })?;
-
-    // Find the column indices for "Name", "SelectText", and optionally "Database".
-    let name_col = show_result
-        .header
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case("Name"))
-        .ok_or_else(|| {
-            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'Name' column"
-                .to_string()
-        })?;
-    let select_text_col = show_result
-        .header
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case("SelectText"))
-        .ok_or_else(|| {
-            "@imv_equivalence_check: SHOW MATERIALIZED VIEWS result has no 'SelectText' column"
-                .to_string()
-        })?;
-    // Database column is optional — if absent we fall back to bare-name match
-    // but still apply the ambiguity check below.
-    let db_col = show_result
-        .header
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case("Database"));
-
-    // Find all rows whose name matches `mv` AND, when `db` is known and the
-    // Database column is present, whose Database column also matches `db`.
-    // This prevents silently binding the wrong SelectText when two MVs in
-    // different databases of the same catalog share a bare name.
+    let column = |name: &str| {
+        show_result
+            .header
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!("@imv_equivalence_check: materialized view metadata has no '{name}' column")
+            })
+    };
+    let name_col = column("name")?;
+    let select_text_col = column("definition")?;
+    let db_col = column("schema_name")?;
+    let schema = db
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let statements = novarocks_parser::parse(&format!("USE {value}")).map_err(|error| {
+                format!("@imv_equivalence_check: invalid database context: {error}")
+            })?;
+            let [
+                novarocks_parser::ast::Statement::Session(
+                    novarocks_parser::ast::SessionStatement::Use(context),
+                ),
+            ] = statements.as_slice()
+            else {
+                return Err(
+                    "@imv_equivalence_check: database context must be one USE namespace"
+                        .to_string(),
+                );
+            };
+            Ok(context.database.value.clone())
+        })
+        .transpose()?;
     let matched: Vec<&Vec<String>> = show_result
         .rows
         .iter()
@@ -1170,10 +998,8 @@ fn run_imv_equivalence_check(
             if !name_matches {
                 return false;
             }
-            // Apply db-qualification when both the caller supplied a non-empty
-            // db and the SHOW output has a Database column.
-            if let (Some(d), Some(dc)) = (db.filter(|d| !d.is_empty()), db_col) {
-                row.get(dc)
+            if let Some(d) = schema.as_deref() {
+                row.get(db_col)
                     .map(|dbname| dbname.eq_ignore_ascii_case(d))
                     .unwrap_or(false)
             } else {
@@ -1185,26 +1011,26 @@ fn run_imv_equivalence_check(
     let select_sql = match matched.len() {
         0 => {
             return Err(format!(
-                "@imv_equivalence_check: MV `{mv}` not found in SHOW MATERIALIZED VIEWS output"
+                "@imv_equivalence_check: MV `{mv}` not found in materialized view metadata"
             )
             .into());
         }
         1 => matched[0]
             .get(select_text_col)
             .ok_or_else(|| {
-                format!("@imv_equivalence_check: MV `{mv}` row has no SelectText value")
+                format!("@imv_equivalence_check: MV `{mv}` row has no definition value")
             })?
             .clone(),
         n => {
             return Err(format!(
-                "@imv_equivalence_check: MV `{mv}` is ambiguous in SHOW MATERIALIZED VIEWS \
+                "@imv_equivalence_check: MV `{mv}` is ambiguous in materialized view metadata \
                  (qualify with a unique db); matched {n} rows"
             )
             .into());
         }
     };
 
-    // SelectText is the canonical persisted, re-parseable CREATE-MV query body.
+    // The persisted definition is the re-parseable CREATE-MV query body.
     // The native parser re-admits it on every refresh, so it is safe to re-run.
     let outcome = session.execute_query(query_timeout, &select_sql, None);
     let (ok, full, msg) = outcome.summary();
@@ -1284,7 +1110,7 @@ fn parse_available_stateless_level(
 /// server's reported available fidelity level covers the requested level,
 /// and (b) the MV's read face (`SELECT * FROM <fqn>`) is unchanged by the
 /// rebuild — the trigger must not alter what the MV returns, only how it is
-/// physically backed. MV is qualified by `db` like wait_alter_*.
+/// physically backed. MV is qualified by `db`.
 fn run_imv_stateless_rebuild_check(
     directive: &ImvStatelessDirective,
     session: &mut crate::session::TrinoCaseSession,
@@ -3028,12 +2854,12 @@ fn run_successful_step_domain_oracles(
         }
     }
     // @imv_equivalence_check: assert MV incremental contents
-    // == a full recompute derived by running the MV's SelectText
+    // == a full recompute derived by running the MV's persisted definition
     // directly against the base tables (no MV side effects).
     // Verification and strict migration share this original oracle; ordinary
     // recording does not run it. Diff mode compares against a
     // reference engine (no full-recompute oracle here), and the
-    // check retains the MV's original SelectText.
+    // check retains the MV's original definition.
     if let Some(mv) = step.meta.imv_equivalence_check.as_deref() {
         let oracle_result = run_imv_equivalence_check(
             mv,
@@ -4281,20 +4107,7 @@ fn run_case_observed(
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
-                    // Run wait_alter post-execution polling if annotated.
-                    let (wait_ok, wait_elapsed, wait_outcomes) = run_step_wait_alters(
-                        step,
-                        &mut target_session,
-                        ctx.query_timeout,
-                        &mut log,
-                    );
-                    case_elapsed += wait_elapsed;
-                    if results_record::required(step).contains(&"wait_alter") {
-                        evidence.record(step, "wait_alter", wait_ok, serde_json::json!({"polls":wait_outcomes.iter().map(SqlExecutionOutcome::evidence).collect::<Vec<_>>()}));
-                    }
-                    if !wait_ok {
-                        case_failed = true;
-                    } else {
+                    {
                         let be_log_ok = run_be_log_directives_for_successful_step(
                             step,
                             &ctx.cluster_owner,
@@ -4841,18 +4654,7 @@ fn run_case_observed(
                         }
                         let _ = writeln!(log, "    @iceberg_orphan_fixture_absent PASS");
                     }
-                    // Run wait_alter post-execution polling if annotated.
-                    let (wait_ok, wait_elapsed, wait_outcomes) = run_step_wait_alters(
-                        step,
-                        &mut target_session,
-                        ctx.query_timeout,
-                        &mut log,
-                    );
-                    case_elapsed += wait_elapsed;
-                    if !wait_ok {
-                        case_failed = true;
-                        evidence.record(step, "wait_alter", false, serde_json::json!({"polls":wait_outcomes.iter().map(SqlExecutionOutcome::evidence).collect::<Vec<_>>()}));
-                    } else {
+                    {
                         let be_log_ok = {
                             match run_be_log_directives_for_successful_step(
                                 step,
@@ -7941,13 +7743,13 @@ mod tests {
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
         ConnectionConfig, PublicationCatalogAction, PublicationCatalogFault,
-        PublicationCatalogFaultDirective, PublicationCatalogFaultTarget, QueryExecution,
+        PublicationCatalogFaultDirective, PublicationCatalogFaultTarget,
         QueryLifecycleStructuredAssertion, QueryMeta, RuntimeFilterDetailExpectation, SqlCase,
         SqlErrorLocation, SqlErrorTier, SqlStep, SuiteHook,
     };
     use crate::{
-        AlterJobPollState, CaseStatus, Cli, Mode, annotate_failure_with_engine_error_code,
-        bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
+        CaseStatus, Cli, Mode, annotate_failure_with_engine_error_code,
+        bounded_fault_query_timeout, evaluate_expected_error_branch,
         evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
         expected_engine_error_code_result, finish_expected_error_step,
         sql_text_has_query_lifecycle_fault_directive, statement_starts_dml_operation,
@@ -8303,36 +8105,6 @@ mod tests {
             ClusterMode::CrossProcess,
         )
         .expect("read-only suites stay parallel");
-    }
-
-    #[test]
-    fn alter_job_poll_uses_structured_state_and_preserves_failure_message() {
-        let execution = |state: &str, message: &str| QueryExecution {
-            shell_result: None,
-            result_statements: Vec::new(),
-            typed_results: Vec::new(),
-            header: vec!["JobId".to_string(), "State".to_string(), "Msg".to_string()],
-            rows: vec![vec![
-                "1".to_string(),
-                state.to_string(),
-                message.to_string(),
-            ]],
-            text_output: format!("JobId\tState\tMsg\n1\t{state}\t{message}"),
-            elapsed: Duration::ZERO,
-        };
-
-        assert_eq!(
-            classify_alter_job_poll(&execution("RUNNING", "")),
-            AlterJobPollState::Pending
-        );
-        assert_eq!(
-            classify_alter_job_poll(&execution("FINISHED", "done")),
-            AlterJobPollState::Finished
-        );
-        assert_eq!(
-            classify_alter_job_poll(&execution("FAILED", "exact engine failure")),
-            AlterJobPollState::Failed("exact engine failure".to_string())
-        );
     }
 
     #[test]

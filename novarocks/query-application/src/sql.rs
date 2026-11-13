@@ -21,13 +21,12 @@ use std::{fmt, sync::Arc};
 
 use novarocks_parser::{ParserError, ast::Statement};
 use novarocks_sql::semantic::command::{
-    AlterIcebergTableSqlCommand, AnalyzeModeSql, CatalogCreateCommand, ColumnPositionSql,
-    CommandLiteral, CommandProperty, CreateTableSqlCommand, ExpireSnapshotsOptionSql,
-    IcebergColumnSqlAction, IcebergPartitionSqlChange, IcebergPropertiesSqlAction,
-    IcebergReferenceKindSql, IcebergReferenceSqlAction, IcebergSchemaSqlChange,
-    IcebergTableSqlAction, MaintenanceValueSql, ProcedureArgumentModeSql, ProcedureArgumentSql,
-    ReferenceAnchorSql, ShowOptimizeFilterSql, ShowOptimizeOrderSql, ShowOptimizeSqlCommand,
-    SortDirectionSql, TableColumnSqlCommand, TableDistributionSqlCommand, TablePartitionSqlCommand,
+    AlterIcebergTableSqlCommand, CatalogCreateCommand, ColumnPositionSql, CommandLiteral,
+    CommandProperty, CreateTableSqlCommand, ExpireSnapshotsOptionSql, IcebergColumnSqlAction,
+    IcebergPartitionSqlChange, IcebergPropertiesSqlAction, IcebergReferenceKindSql,
+    IcebergReferenceSqlAction, IcebergSchemaSqlChange, IcebergTableSqlAction, MaintenanceValueSql,
+    ProcedureArgumentModeSql, ProcedureArgumentSql, ReferenceAnchorSql, TableColumnSqlCommand,
+    TableDistributionSqlCommand, TablePartitionSqlCommand,
 };
 use novarocks_sql::semantic::{
     CatalogSqlCommand, ColumnAggregation, IcebergPartitionFieldExpr, MaintenanceSqlCommand,
@@ -62,23 +61,9 @@ pub mod catalog;
 /// closed product-command vocabulary.
 ///
 /// Product statements use [`ProductCommandRouter`] after semantic lowering.
-/// This route admits only the explicit MV, View, `SHOW BACKENDS`, and
+/// This route admits only the explicit MV, View, and
 /// test-only maintenance-call shapes; it is not a generic parser-AST route.
 pub trait SpecializedStatementRoute: Send + Sync {
-    /// Executes the role-gated `SHOW BACKENDS` command.
-    fn execute_show_backends(
-        &self,
-        _context: &RequestContext,
-        _command_context: &CommandContext,
-    ) -> CommandFuture {
-        Box::pin(async {
-            Err(crate::api::CommandError::new(
-                crate::api::CommandErrorKind::Unsupported,
-                "SHOW BACKENDS command route is unavailable",
-            ))
-        })
-    }
-
     /// Executes the test-only stateless-rebuild procedure when it owns this
     /// exact CALL. `None` leaves the already-lowered maintenance command to
     /// its normal product consumer.
@@ -191,7 +176,7 @@ impl ProductCommandRouter {
         match command {
             ProductSqlCommand::Catalog(command) => {
                 self.catalog
-                    .execute(command, request_context, command_context)
+                    .execute(*command, request_context, command_context)
             }
             ProductSqlCommand::Statistics(command) => {
                 self.statistics
@@ -212,7 +197,7 @@ impl ProductCommandRouter {
 /// particular, this is not a generic wrapper around parser `Statement`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProductSqlCommand {
-    Catalog(CatalogSqlCommand),
+    Catalog(Box<CatalogSqlCommand>),
     Statistics(StatisticsSqlCommand),
     Maintenance(MaintenanceSqlCommand),
 }
@@ -227,25 +212,24 @@ pub fn lower_product_sql_command(
     use novarocks_parser::ast::Statement as ParsedStatement;
 
     match statement {
-        ParsedStatement::Catalog(statement) => Ok(Some(ProductSqlCommand::Catalog(
+        ParsedStatement::Catalog(statement) => Ok(Some(ProductSqlCommand::Catalog(Box::new(
             lower_catalog_command(statement)?,
-        ))),
+        )))),
         ParsedStatement::Statistics(statement) => Ok(Some(ProductSqlCommand::Statistics(
             lower_statistics_command(statement)?,
         ))),
         ParsedStatement::Maintenance(statement) => Ok(Some(ProductSqlCommand::Maintenance(
             lower_maintenance_command(statement)?,
         ))),
-        ParsedStatement::Table(statement) => Ok(Some(ProductSqlCommand::Catalog(
+        ParsedStatement::Table(statement) => Ok(Some(ProductSqlCommand::Catalog(Box::new(
             lower_table_command(statement)?,
-        ))),
-        ParsedStatement::Iceberg(statement) => Ok(Some(ProductSqlCommand::Catalog(
+        )))),
+        ParsedStatement::Iceberg(statement) => Ok(Some(ProductSqlCommand::Catalog(Box::new(
             lower_iceberg_command(statement)?,
-        ))),
+        )))),
         ParsedStatement::Dml(_)
         | ParsedStatement::MaterializedView(_)
         | ParsedStatement::View(_)
-        | ParsedStatement::ShowBackends(_)
         | ParsedStatement::ShowProcessList(_)
         | ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
@@ -807,34 +791,9 @@ fn lower_sql_type(type_name: &novarocks_parser::ast::TypeName) -> Result<SqlType
 fn lower_statistics_command(
     statement: &novarocks_parser::ast::StatisticsStatement,
 ) -> Result<StatisticsSqlCommand, String> {
-    use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
-
+    use novarocks_parser::ast::StatisticsStatement;
     Ok(match statement {
         StatisticsStatement::AnalyzeTable(statement) => StatisticsSqlCommand::AnalyzeTable {
-            mode: match statement.mode {
-                AnalyzeMode::Default => AnalyzeModeSql::Default,
-                AnalyzeMode::Full => AnalyzeModeSql::Full,
-                AnalyzeMode::Sample => AnalyzeModeSql::Sample,
-            },
-            table: lower_object_name(&statement.name),
-            columns: statement
-                .columns
-                .iter()
-                .map(|column| column.value.clone())
-                .collect(),
-            with_sync_mode: statement.with_sync_mode,
-        },
-        StatisticsStatement::ShowAnalyzeJobs(_) => StatisticsSqlCommand::ShowAnalyzeJobs,
-        StatisticsStatement::CancelAnalyze(statement) => StatisticsSqlCommand::CancelAnalyze {
-            job_id: statement.job_id.clone(),
-        },
-        StatisticsStatement::ShowTableStats(statement) => StatisticsSqlCommand::ShowTableStats {
-            table: lower_object_name(&statement.name),
-        },
-        StatisticsStatement::DropStats(statement) => StatisticsSqlCommand::DropStats {
-            table: lower_object_name(&statement.name),
-        },
-        StatisticsStatement::DropHistogram(statement) => StatisticsSqlCommand::DropHistogram {
             table: lower_object_name(&statement.name),
             columns: statement
                 .columns
@@ -842,11 +801,9 @@ fn lower_statistics_command(
                 .map(|column| column.value.clone())
                 .collect(),
         },
-        StatisticsStatement::DropMultipleColumnsStats(statement) => {
-            StatisticsSqlCommand::DropMultipleColumnsStats {
-                table: lower_object_name(&statement.name),
-            }
-        }
+        StatisticsStatement::ShowStats(statement) => StatisticsSqlCommand::ShowStats {
+            table: lower_object_name(&statement.name),
+        },
     })
 }
 
@@ -854,7 +811,7 @@ fn lower_maintenance_command(
     statement: &novarocks_parser::ast::MaintenanceStatement,
 ) -> Result<MaintenanceSqlCommand, String> {
     use novarocks_parser::ast::{
-        ExpireSnapshotsOption, MaintenanceStatement, ProcedureArgumentMode, SortDirection,
+        ExpireSnapshotsOption, MaintenanceStatement, ProcedureArgumentMode,
     };
 
     Ok(match statement {
@@ -906,36 +863,6 @@ fn lower_maintenance_command(
                 table: lower_object_name(&statement.table),
                 older_than: lower_maintenance_value(&statement.older_than)?,
             }
-        }
-        MaintenanceStatement::ShowOptimize(statement) => {
-            MaintenanceSqlCommand::ShowOptimize(ShowOptimizeSqlCommand {
-                from: statement.from.as_ref().map(lower_object_name),
-                filter: statement
-                    .filter
-                    .as_ref()
-                    .map(|filter| {
-                        Ok::<_, String>(ShowOptimizeFilterSql {
-                            column: filter.column.value.clone(),
-                            value: lower_command_literal(&filter.value)?,
-                        })
-                    })
-                    .transpose()?,
-                order_by: statement
-                    .order_by
-                    .as_ref()
-                    .map(|order| ShowOptimizeOrderSql {
-                        column: order.column.value.clone(),
-                        direction: order.direction.map(|direction| match direction {
-                            SortDirection::Asc => SortDirectionSql::Asc,
-                            SortDirection::Desc => SortDirectionSql::Desc,
-                        }),
-                    }),
-                limit: statement
-                    .limit
-                    .as_ref()
-                    .map(lower_command_literal)
-                    .transpose()?,
-            })
         }
     })
 }
@@ -1205,7 +1132,7 @@ mod tests {
     };
     use crate::session_error::QueryServiceErrorKind;
     use novarocks_sql::semantic::command::{
-        AnalyzeModeSql, CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceValueSql,
+        CommandLiteral, ExpireSnapshotsOptionSql, MaintenanceValueSql,
     };
     use novarocks_sql::semantic::{CatalogSqlCommand, MaintenanceSqlCommand, StatisticsSqlCommand};
 
@@ -1292,7 +1219,7 @@ mod tests {
 
         assert_eq!(
             lower_product_sql_command(&statement).expect("lower command"),
-            Some(ProductSqlCommand::Catalog(
+            Some(ProductSqlCommand::Catalog(Box::new(
                 CatalogSqlCommand::DropDatabase {
                     name: novarocks_sql::semantic::ObjectName {
                         parts: vec!["analytics".to_string()],
@@ -1300,26 +1227,23 @@ mod tests {
                     if_exists: true,
                     force: true,
                 }
-            ))
+            )))
         );
     }
 
     #[test]
-    fn statistics_lowering_preserves_mode_columns_and_sync_option() {
-        let statement =
-            parse_single_statement("ANALYZE FULL TABLE ice.db.events (id, kind) WITH SYNC MODE")
-                .expect("parse statistics command");
+    fn statistics_lowering_preserves_table_and_explicit_columns() {
+        let statement = parse_single_statement("ANALYZE TABLE ice.db.events (id, kind)")
+            .expect("parse statistics command");
 
         assert_eq!(
             lower_product_sql_command(&statement).expect("lower command"),
             Some(ProductSqlCommand::Statistics(
                 StatisticsSqlCommand::AnalyzeTable {
-                    mode: AnalyzeModeSql::Full,
                     table: novarocks_sql::semantic::ObjectName {
                         parts: vec!["ice".to_string(), "db".to_string(), "events".to_string()],
                     },
                     columns: vec!["id".to_string(), "kind".to_string()],
-                    with_sync_mode: true,
                 }
             ))
         );
@@ -1361,9 +1285,12 @@ mod tests {
         )
         .expect("parse create table");
 
-        let Some(ProductSqlCommand::Catalog(CatalogSqlCommand::CreateTable(command))) =
+        let Some(ProductSqlCommand::Catalog(boxed_command)) =
             lower_product_sql_command(&statement).expect("lower command")
         else {
+            panic!("expected semantic CREATE TABLE command");
+        };
+        let CatalogSqlCommand::CreateTable(command) = *boxed_command else {
             panic!("expected semantic CREATE TABLE command");
         };
         assert!(command.if_not_exists);
@@ -1388,9 +1315,12 @@ mod tests {
             "ALTER TABLE ice.db.orders ADD COLUMN profile STRUCT<name STRING, attributes MAP<STRING, ARRAY<DECIMAL(10, 2)>>> FIRST",
         )
         .expect("parse schema action");
-        let Some(ProductSqlCommand::Catalog(CatalogSqlCommand::AlterIcebergTable(command))) =
+        let Some(ProductSqlCommand::Catalog(boxed_command)) =
             lower_product_sql_command(&statement).expect("lower schema action")
         else {
+            panic!("expected semantic Iceberg ALTER command");
+        };
+        let CatalogSqlCommand::AlterIcebergTable(command) = *boxed_command else {
             panic!("expected semantic Iceberg ALTER command");
         };
         assert_eq!(command.table.parts, ["ice", "db", "orders"]);
@@ -1408,9 +1338,12 @@ mod tests {
             "ALTER TABLE ice.db.orders SET TBLPROPERTIES ('format' = 'parquet', 'owner' = 'ops')",
         )
         .expect("parse property action");
-        let Some(ProductSqlCommand::Catalog(CatalogSqlCommand::AlterIcebergTable(command))) =
+        let Some(ProductSqlCommand::Catalog(boxed_command)) =
             lower_product_sql_command(&statement).expect("lower property action")
         else {
+            panic!("expected semantic Iceberg ALTER command");
+        };
+        let CatalogSqlCommand::AlterIcebergTable(command) = *boxed_command else {
             panic!("expected semantic Iceberg ALTER command");
         };
         assert!(matches!(
@@ -1455,7 +1388,7 @@ mod tests {
             else {
                 panic!("{expected} must lower to a catalog command");
             };
-            let actual = match command {
+            let actual = match *command {
                 CatalogSqlCommand::TruncateTable { .. } => "TRUNCATE TABLE",
                 CatalogSqlCommand::CreateCatalog(_) => "CREATE CATALOG",
                 CatalogSqlCommand::DropCatalog { .. } => "DROP CATALOG",
@@ -1472,40 +1405,20 @@ mod tests {
     }
 
     #[test]
-    fn statistics_lowering_selects_every_parser_command_variant() {
-        let cases = [
+    fn statistics_lowering_selects_statement_owned_commands() {
+        for (sql, expected) in [
             ("ANALYZE TABLE lake.db.events", "ANALYZE"),
-            ("SHOW ANALYZE JOBS", "SHOW ANALYZE"),
-            ("CANCEL ANALYZE job-7", "CANCEL ANALYZE"),
-            ("SHOW TABLE STATS lake.db.events", "SHOW TABLE STATS"),
-            ("DROP STATS lake.db.events", "DROP STATS"),
-            (
-                "DROP HISTOGRAM ON lake.db.events (event_type)",
-                "DROP HISTOGRAM",
-            ),
-            (
-                "DROP MULTIPLE COLUMNS STATS lake.db.events",
-                "DROP MULTIPLE COLUMNS STATS",
-            ),
-        ];
-
-        for (sql, expected) in cases {
-            let statement = parse_single_statement(sql).expect("parse statistics command");
+            ("SHOW STATS FOR lake.db.events", "SHOW STATS FOR"),
+        ] {
+            let statement = parse_single_statement(sql).unwrap();
             let Some(ProductSqlCommand::Statistics(command)) =
-                lower_product_sql_command(&statement).expect("lower statistics command")
+                lower_product_sql_command(&statement).unwrap()
             else {
-                panic!("{expected} must lower to a statistics command");
+                panic!("statistics command");
             };
             let actual = match command {
                 StatisticsSqlCommand::AnalyzeTable { .. } => "ANALYZE",
-                StatisticsSqlCommand::ShowAnalyzeJobs => "SHOW ANALYZE",
-                StatisticsSqlCommand::CancelAnalyze { .. } => "CANCEL ANALYZE",
-                StatisticsSqlCommand::ShowTableStats { .. } => "SHOW TABLE STATS",
-                StatisticsSqlCommand::DropStats { .. } => "DROP STATS",
-                StatisticsSqlCommand::DropHistogram { .. } => "DROP HISTOGRAM",
-                StatisticsSqlCommand::DropMultipleColumnsStats { .. } => {
-                    "DROP MULTIPLE COLUMNS STATS"
-                }
+                StatisticsSqlCommand::ShowStats { .. } => "SHOW STATS FOR",
             };
             assert_eq!(actual, expected);
         }
@@ -1528,7 +1441,6 @@ mod tests {
                 "ALTER TABLE lake.db.events REMOVE ORPHAN FILES OLDER THAN 1700000000000",
                 "REMOVE ORPHAN FILES",
             ),
-            ("SHOW ALTER TABLE OPTIMIZE", "SHOW OPTIMIZE"),
         ];
 
         for (sql, expected) in cases {
@@ -1544,7 +1456,6 @@ mod tests {
                 MaintenanceSqlCommand::RewriteManifests { .. } => "REWRITE MANIFESTS",
                 MaintenanceSqlCommand::ExpireSnapshots { .. } => "EXPIRE SNAPSHOTS",
                 MaintenanceSqlCommand::RemoveOrphanFiles { .. } => "REMOVE ORPHAN FILES",
-                MaintenanceSqlCommand::ShowOptimize(_) => "SHOW OPTIMIZE",
             };
             assert_eq!(actual, expected);
         }
@@ -1609,9 +1520,12 @@ mod tests {
 
         for (sql, expected) in cases {
             let statement = parse_single_statement(sql).expect("parse Iceberg command");
-            let Some(ProductSqlCommand::Catalog(CatalogSqlCommand::AlterIcebergTable(command))) =
+            let Some(ProductSqlCommand::Catalog(boxed_command)) =
                 lower_product_sql_command(&statement).expect("lower Iceberg command")
             else {
+                panic!("{expected} must lower to an Iceberg catalog command");
+            };
+            let CatalogSqlCommand::AlterIcebergTable(command) = *boxed_command else {
                 panic!("{expected} must lower to an Iceberg catalog command");
             };
             let actual = match command.action {

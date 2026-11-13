@@ -865,3 +865,16 @@ fn nulls_of_every_supported_native_family_are_json_null() {
         vec![expected]
     );
 }
+
+#[test]
+fn public_java_float_text_preserves_show_statistics_spellings() {
+    for (value, expected) in [
+        (1.5, "1.5"),
+        (1e-5, "1.0E-5"),
+        (12345678.9, "1.23456789E7"),
+        (1234567890123456800.0, "1.2345678901234568E18"),
+    ] {
+        assert_eq!(crate::java_double_text(value).unwrap(), expected);
+    }
+    assert_eq!(crate::java_float_text(3.4e10).unwrap(), "3.4E10");
+}

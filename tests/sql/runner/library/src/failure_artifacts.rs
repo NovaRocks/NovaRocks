@@ -1298,7 +1298,7 @@ mod tests {
         };
         let step = crate::types::SqlStep {
             query_number: 3,
-            sql: "SHOW MATERIALIZED VIEWS".into(),
+            sql: "SELECT name, manageability FROM system.runtime.materialized_view_states".into(),
             meta: crate::types::QueryMeta {
                 result_contains: vec!["UNAVAILABLE".into()],
                 ..Default::default()

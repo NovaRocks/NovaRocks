@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn materialized_view_command_retains_the_parser_admitted_shape() {
-        let statements = novarocks_parser::parse("SHOW MATERIALIZED VIEWS FROM analytics")
+        let statements = novarocks_parser::parse("DROP MATERIALIZED VIEW analytics.mv")
             .expect("MV statement should parse");
         let [novarocks_parser::ast::Statement::MaterializedView(statement)] = statements.as_slice()
         else {
@@ -653,7 +653,7 @@ mod tests {
         let command = MaterializedViewCommand::new(statement.clone());
         assert!(matches!(
             command.statement(),
-            novarocks_parser::ast::MaterializedViewStatement::Show(_)
+            novarocks_parser::ast::MaterializedViewStatement::Drop(_)
         ));
     }
 }

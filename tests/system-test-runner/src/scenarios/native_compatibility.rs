@@ -243,7 +243,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let target = rows
             .iter()
             .find(|row| row.grpc_port == target_port)
-            .context("SHOW BACKENDS omitted raw Establish target BE")?;
+            .context("backend topology omitted raw Establish target BE")?;
         ensure!(
             target.is_eligible_live(),
             "raw Establish target BE must be eligible and live, row={target:?}"
@@ -1026,7 +1026,7 @@ fn assert_other_island_admission_cut(
     let target = rows
         .iter()
         .find(|row| row.grpc_port == target_port)
-        .context("SHOW BACKENDS omitted OtherIsland admission target")?;
+        .context("backend topology omitted OtherIsland admission target")?;
     let backend = target.process_id.parse::<BackendProcessId>()?;
     let heartbeat: proto::HeartbeatResponse = raw_unary(
         control_connector,
@@ -1103,7 +1103,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let backend = rows
         .iter()
         .find(|row| row.grpc_port == target_port)
-        .context("SHOW BACKENDS omitted raw Exchange ingress target")?
+        .context("backend topology omitted raw Exchange ingress target")?
         .process_id
         .parse::<BackendProcessId>()?;
     let endpoint = context.handle().native_be_endpoint(2)?;

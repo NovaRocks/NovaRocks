@@ -100,6 +100,12 @@ pub(crate) struct CompletionFactOwners {
 }
 
 impl CompletionFactOwners {
+    fn materialized_view_management(
+        &self,
+    ) -> Arc<novarocks_mv_application::management::ManagementEntrance> {
+        Arc::clone(self.mv_readiness.management())
+    }
+
     pub(crate) fn with_state_store_original(
         mut self,
         binding: Option<crate::state_store::execution::StateStoreOriginalBinding>,

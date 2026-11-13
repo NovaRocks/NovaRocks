@@ -46,8 +46,8 @@ use crate::dependency::MvDependencyObjectRef;
 use crate::persistence::dependency::StoredMvDependency;
 use crate::product::MvTarget;
 use crate::repository::{
-    MvDependencyReadBound, MvProjectionInventoryBuilder, MvProjectionInventoryEntry,
-    MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
+    MvProjectionInventoryBuilder, MvProjectionInventoryEntry, MvRepositoryError,
+    MvRepositoryErrorKind, MvTargetLookup,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
 use novarocks_state_store_runtime::StateStoreRunPolicy;
@@ -710,15 +710,6 @@ impl StateStoreMvRepositoryExecution<'_> {
             .await
     }
 
-    pub async fn list_keyed_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &keyed::LoadedKeyedMvProjection,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.read_repository()
-            .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
-            .await
-    }
     pub async fn find_keyed_by_target_object(
         &self,
         object: &novarocks_spi::connector::ConnectorTableObjectId,
@@ -839,7 +830,7 @@ impl ReadRepository<'_> {
                     object_id: root.facts.source_revision().target_object_id.clone(),
                 })
                 .collect::<Vec<_>>();
-            crate::bounded_dependencies::classify(&mut dependencies, &inventory);
+            crate::dependency_validation::classify(&mut dependencies, &inventory);
             Ok(dependencies)
         }
         .await;
@@ -941,72 +932,6 @@ impl ReadRepository<'_> {
         }
     }
 
-    pub async fn list_keyed_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &keyed::LoadedKeyedMvProjection,
-        bound: MvDependencyReadBound,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        use crate::bounded_dependencies::{
-            DependencyCollector, classify, validate_canonical_parts,
-        };
-        let mut tx = self.begin_read().await?;
-        let result = async {
-            let root = projection_by_id_key(loaded.projection.mv_id).map_err(corruption)?;
-            let row = tx
-                .read_get(&root)
-                .await?
-                .ok_or_else(|| corruption("keyed dependency root disappeared"))?;
-            if row.version != *loaded.version.store_version() {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::Conflict,
-                    "keyed dependency root changed",
-                ));
-            }
-            let projection = codec::decode_keyed_projection(&root, &row.value)
-                .map_err(corruption)?
-                .value;
-            drop(row);
-            let mut collector = DependencyCollector::new(bound)?;
-            let mut range = BoundedRecordRange::new(
-                dependency_by_downstream_prefix(projection.mv_id).map_err(corruption)?,
-            )?;
-            while let Some(row) = range.next(&mut tx).await? {
-                let dependency = decode_dependency(&row.key, &row.value)
-                    .map_err(corruption)?
-                    .value;
-                if row.key
-                    != dependency_by_downstream_key(
-                        dependency.downstream_mv_id,
-                        &dependency.upstream,
-                        dependency.occurrence_id,
-                    )
-                    .map_err(corruption)?
-                {
-                    return Err(corruption(
-                        "keyed dependency index key differs from occurrence",
-                    ));
-                }
-                collector.push(dependency)?;
-            }
-            let mut dependencies = collector.finish();
-            validate_canonical_parts(
-                projection.mv_id,
-                projection.facts.definition(),
-                &dependencies,
-            )?;
-            drop(projection);
-            let inventory = keyed::projection_inventory(&mut tx).await?;
-            classify(&mut dependencies, &inventory);
-            Ok(dependencies)
-        }
-        .await;
-        let close = tx.read_close().await;
-        match (result, close) {
-            (Err(e), _) => Err(e),
-            (_, Err(e)) => Err(e),
-            (Ok(v), Ok(())) => Ok(v),
-        }
-    }
     pub async fn find_keyed_by_target_object(
         &self,
         object: &novarocks_spi::connector::ConnectorTableObjectId,
@@ -1028,60 +953,67 @@ impl ReadRepository<'_> {
         &self,
         loaded: &keyed::LoadedKeyedMvProjection,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        let current = self
-            .find_keyed_by_target(&loaded.projection.facts.target())
-            .await?;
-        if current.as_ref().map(|v| &v.version) != Some(&loaded.version) {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "keyed dependency root changed",
-            ));
-        }
-        let mut dependencies = Vec::new();
-        for row in self
-            .scan_prefix(
-                dependency_by_downstream_prefix(loaded.projection.mv_id).map_err(corruption)?,
-            )
-            .await?
-        {
-            let dependency: DecodedMvRecord<StoredMvDependency> =
-                decode_record(&row.key, &row.value).map_err(corruption)?;
-            if row.key
-                != dependency_by_downstream_key(
-                    dependency.value.downstream_mv_id,
-                    &dependency.value.upstream,
-                    dependency.value.occurrence_id,
+        use crate::dependency_validation::{classify, validate_canonical_parts};
+        // The root version, its occurrence rows and classification inventory
+        // come from one original read snapshot. Collection has no local quota.
+        let mut tx = self.begin_read().await?;
+        let result = async {
+            let root = projection_by_id_key(loaded.projection.mv_id).map_err(corruption)?;
+            let row = tx.read_get(&root).await?.ok_or_else(|| {
+                MvRepositoryError::new(
+                    MvRepositoryErrorKind::Conflict,
+                    "keyed dependency root changed",
                 )
-                .map_err(corruption)?
-            {
-                return Err(corruption(
-                    "keyed dependency key differs from canonical occurrence",
+            })?;
+            if row.version != *loaded.version.store_version() {
+                return Err(MvRepositoryError::new(
+                    MvRepositoryErrorKind::Conflict,
+                    "keyed dependency root changed",
                 ));
             }
-            dependencies.push(dependency.value);
+            let projection = codec::decode_keyed_projection(&root, &row.value)
+                .map_err(corruption)?
+                .value;
+            drop(row);
+            let mut dependencies = Vec::new();
+            let mut range = BoundedRecordRange::new(
+                dependency_by_downstream_prefix(projection.mv_id).map_err(corruption)?,
+            )?;
+            while let Some(row) = range.next(&mut tx).await? {
+                let dependency = decode_dependency(&row.key, &row.value)
+                    .map_err(corruption)?
+                    .value;
+                if row.key
+                    != dependency_by_downstream_key(
+                        dependency.downstream_mv_id,
+                        &dependency.upstream,
+                        dependency.occurrence_id,
+                    )
+                    .map_err(corruption)?
+                {
+                    return Err(corruption(
+                        "keyed dependency key differs from canonical occurrence",
+                    ));
+                }
+                dependencies.push(dependency);
+            }
+            validate_canonical_parts(
+                projection.mv_id,
+                projection.facts.definition(),
+                &dependencies,
+            )?;
+            drop(projection);
+            let inventory = keyed::projection_inventory(&mut tx).await?;
+            classify(&mut dependencies, &inventory);
+            Ok(dependencies)
         }
-        crate::bounded_dependencies::validate_canonical_parts(
-            loaded.projection.mv_id,
-            loaded.projection.facts.definition(),
-            &dependencies,
-        )?;
-        let inventory = self
-            .list_keyed_projections()
-            .await?
-            .into_iter()
-            .map(|p| MvProjectionInventoryEntry {
-                mv_id: p.projection.mv_id,
-                target: p.projection.facts.target(),
-                object_id: p
-                    .projection
-                    .facts
-                    .source_revision()
-                    .target_object_id
-                    .clone(),
-            })
-            .collect::<Vec<_>>();
-        crate::bounded_dependencies::classify(&mut dependencies, &inventory);
-        Ok(dependencies)
+        .await;
+        let close = tx.read_close().await;
+        match (result, close) {
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+            (Ok(dependencies), Ok(())) => Ok(dependencies),
+        }
     }
 }
 

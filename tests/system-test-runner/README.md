@@ -94,8 +94,9 @@ Most scenarios build their Iceberg warehouse on the local filesystem under
 the harness runtime directory. The vended credential scenarios and the default
 `table-maintenance/target-replacement` scenario start an isolated Iceberg REST
 and MinIO fixture and require the prepared fixture inputs and Docker service.
-Target replacement uses REST because it deliberately overlaps a detached
-OPTIMIZE job with another writer; Hadoop OPTIMIZE waits for completion.
+Target replacement uses REST because it deliberately overlaps a held
+OPTIMIZE statement with another writer. OPTIMIZE and ANALYZE finish inside
+ordinary statements on all supported writable catalogs; no job polling is needed.
 The base config supplies SQLite StateStore and no shared
 `[connector.object_store]` credentials. The generated
 `$NOVAROCKS_FE_CONFIG` / `$NOVAROCKS_BE_CONFIG` pair also works

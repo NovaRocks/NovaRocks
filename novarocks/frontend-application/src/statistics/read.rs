@@ -15,8 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SHOW TABLE STATS runs in the original SQL Source, never the job worker.
-use super::*;
+//! SHOW STATS runs in the original SQL Source, with its exact metadata binding.
+use crate::statistics::application;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+#[derive(Debug, Default)]
+struct StatisticsReadWake(futures::task::AtomicWaker);
+impl crate::wake::StatusIntakeWake for StatisticsReadWake {
+    fn wake(&self) {
+        self.0.wake();
+    }
+}
+
+pub(crate) struct StatisticsReadService {
+    target_resolver: Arc<dyn application::StatisticsTargetResolver>,
+    blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+    runtime: tokio::runtime::Handle,
+    views: Arc<dyn novarocks_query_application::view::ViewService>,
+}
+impl StatisticsReadService {
+    pub(crate) fn new(
+        target_resolver: Arc<dyn application::StatisticsTargetResolver>,
+        blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
+        runtime: tokio::runtime::Handle,
+        views: Arc<dyn novarocks_query_application::view::ViewService>,
+    ) -> Self {
+        Self {
+            target_resolver,
+            blocking,
+            runtime,
+            views,
+        }
+    }
+}
+
 use crate::query_execution::maintenance::io_admission::MetadataIoAdmission;
 use novarocks_failure_contract::FailureProjection;
 use novarocks_query_application::{
@@ -33,8 +69,8 @@ use novarocks_spi::connector::{
     ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, ConnectorRequestContext,
     ConnectorStatisticsSession, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution, OriginalResultCheckClass as Class,
-    OriginalResultCheckError as ScopeFailure, StatisticsCpuPort, StatisticsEvidence,
-    StatisticsReadOriginal,
+    OriginalResultCheckError as ScopeFailure, StatisticsCpuPort, StatisticsSummaryReadOriginal,
+    TableStatisticsSummary,
 };
 use novarocks_workload_control::{ResultWindowAlias, WorkError};
 use std::task::{Context, Poll};
@@ -70,12 +106,13 @@ struct StatisticsReadAction {
     blocking: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
     runtime: tokio::runtime::Handle,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    wake: Arc<StatisticsSubmitWake>,
+    wake: Arc<StatisticsReadWake>,
     cpu: Option<Arc<dyn StatisticsCpuPort>>,
     metadata_cpu: Option<Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>>,
-    source: Option<Arc<dyn StatisticsReadOriginal>>,
+    source: Option<Arc<dyn StatisticsSummaryReadOriginal>>,
     future: Option<novarocks_spi::connector::StatisticsSessionFuture<'static, ()>>,
-    outcome: Option<Result<StatisticsEvidence, novarocks_spi::connector::ConnectorError>>,
+    outcome: Option<Result<TableStatisticsSummary, novarocks_spi::connector::ConnectorError>>,
+    receiver: Arc<Mutex<Option<Result<TableStatisticsSummary, ConnectorError>>>>,
     io_failure: Option<WorkError>,
     health_failure: Option<StatementNativeHealthFailure>,
     started: bool,
@@ -116,32 +153,66 @@ fn connector_error(error: novarocks_spi::connector::ConnectorError) -> QueryServ
             cause = original.source();
         }
     }
-    QueryServiceError::from_execution_failure(
-        novarocks_query_application::execution_error::ExecutionFailureInput::new(
-            error.failure_fact(),
-            novarocks_execution_contract::SafeDetail::truncating(
-                "statistics read source refused its original request",
-            ),
-            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+    QueryServiceError::from_failure_cause(
+        novarocks_failure_contract::SharedFailureCause::from_static_detail(
+            error,
+            "statistics read source refused its original request",
         ),
     )
 }
-impl FrontendStatisticsApplicationPort {
-    pub(super) fn prepare_read_action(
+impl StatisticsReadService {
+    pub(crate) fn prepare_action(
         &self,
         target: application::StatisticsTableTarget,
         execution: &QueryExecutionContext,
         context: &ConnectorRequestContext,
         family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<Box<dyn GovernedStatementAction>, application::StatisticsApplicationError> {
-        let fail = |e: WorkError| application::StatisticsApplicationError::new(e.to_string());
+        let fail = |e: WorkError| {
+            application::StatisticsApplicationError::from_connector_error(
+                ConnectorError::compile_interruption(
+                    novarocks_type_contract::CompileControlError::Source(
+                        novarocks_failure_contract::SharedFailureCause::new(e),
+                    ),
+                ),
+            )
+        };
+        reject_system_relation(&target)
+            .map_err(application::StatisticsApplicationError::from_connector_error)?;
+        let views = self
+            .views
+            .catalog_snapshot()
+            .map_err(application::StatisticsApplicationError::new)?;
+        if views
+            .get(&novarocks_types::naming::TableIdentity::new(
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+            ))
+            .is_some()
+        {
+            return Err(
+                application::StatisticsApplicationError::from_connector_error(
+                    unsupported_relation("views"),
+                ),
+            );
+        }
+
         let capacity = execution.result_capacity().ok_or_else(|| {
             application::StatisticsApplicationError::new(
-                "SHOW TABLE STATS requires its original result capacity",
+                "SHOW STATS FOR requires its original result capacity",
             )
         })?;
         let origin = capacity.try_window_alias().map_err(fail)?;
         let planning = self.target_resolver.planning_pin(&target)?;
+        if planning.binding().descriptor().provider_id.as_str() != "iceberg" {
+            return Err(
+                application::StatisticsApplicationError::from_connector_error(
+                    unsupported_relation("non-Iceberg tables"),
+                ),
+            );
+        }
+
         let statistics_session = planning
             .derive_statistics_lease()
             .map_err(application::StatisticsApplicationError::from_connector_error)?;
@@ -165,12 +236,13 @@ impl FrontendStatisticsApplicationPort {
             blocking: self.blocking.clone(),
             runtime: self.runtime.clone(),
             cancellation: execution.cancellation().clone(),
-            wake: Arc::new(StatisticsSubmitWake::default()),
+            wake: Arc::new(StatisticsReadWake::default()),
             cpu: None,
             metadata_cpu: None,
             source: None,
             future: None,
             outcome: None,
+            receiver: Arc::new(Mutex::new(None)),
             io_failure: None,
             health_failure: None,
             started: false,
@@ -215,11 +287,25 @@ impl StatisticsReadAction {
             self.statistics_session
                 .as_ref()
                 .unwrap()
-                .prepare_scoped_read(request, ConnectorOriginalResultScope::from_original(check))
+                .prepare_scoped_summary_read(
+                    request,
+                    ConnectorOriginalResultScope::from_original(check),
+                )
                 .map_err(connector_error)?,
         );
         // The whole Source is installed independently before the F exists.
-        self.future = Some(self.source.as_ref().unwrap().clone().read(cpu, metadata));
+        let source = self.source.as_ref().unwrap().clone();
+        let planning = self.planning.as_ref().unwrap().clone();
+        let target = self.target.clone();
+        let context = self.context.as_ref().unwrap().clone();
+        let receiver = self.receiver.clone();
+        self.future = Some(Box::pin(async move {
+            let result = read_summary(source, cpu, metadata, planning, target, context).await;
+            let mut slot = receiver.lock().unwrap_or_else(|poison| poison.into_inner());
+            assert!(slot.is_none(), "one original SHOW STATS result");
+            *slot = Some(result);
+            Ok(())
+        }));
         Ok(())
     }
     fn origin_scope(&self) -> &novarocks_workload_control::WorkScope {
@@ -245,11 +331,14 @@ impl StatisticsReadAction {
             std::task::ready!(cpu.poll_closed(cx)).map_err(connector_error)?;
         }
         if self.outcome.is_none() {
-            self.source
-                .as_ref()
-                .unwrap()
-                .take_result_in(&mut self.outcome)
-                .map_err(connector_error)?;
+            self.outcome = self
+                .receiver
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take();
+            if self.outcome.is_none() {
+                return Poll::Ready(Err(service_error("statistics summary receiver is empty")));
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -293,7 +382,7 @@ impl GovernedStatementAction for StatisticsReadAction {
             .outcome
             .take()
             .expect("original read evidence receiver")
-            .map_err(connector_error)?;
+            .map_err(|error| target_error(error, &self.target))?;
         if let Some(failure) = self.io_failure.as_ref() {
             return Poll::Ready(Err(work_error(failure.clone())));
         }
@@ -304,26 +393,7 @@ impl GovernedStatementAction for StatisticsReadAction {
             .map_err(service_error)?;
         Poll::Ready(
             producer
-                .produce(|| {
-                    let version = evidence.data_version().clone();
-                    let rows = evidence
-                        .into_metrics()
-                        .into_iter()
-                        .map(|(metric, state)| {
-                            application::statistics_table_stat_view(metric, state, &version)
-                        })
-                        .collect();
-                    let result = crate::statistics::command::statistics_application_result(
-                        application::StatisticsApplicationResult::TableStats(rows),
-                    )?;
-                    let novarocks_query_application::protocol_delivery::QuerySessionOutput::Query(
-                        result,
-                    ) = result
-                    else {
-                        return Err("statistics read produced a foreign result".into());
-                    };
-                    Ok(result)
-                })
+                .produce(|| result_from_summary(&evidence))
                 .map(StatementActionValue::Local)
                 .map_err(service_error),
         )
@@ -381,6 +451,7 @@ impl GovernedStatementAction for StatisticsReadAction {
                 source: self.source.take(),
                 future: self.future.take(),
                 outcome: self.outcome.take(),
+                receiver: self.receiver.clone(),
                 io_failure: self.io_failure.take(),
                 health_failure: self.health_failure.take(),
                 started: self.started,
@@ -421,18 +492,12 @@ impl GovernedStatementResidual for StatisticsReadResidual {
         if let Some(failure) = original.health_failure.as_ref() {
             return Poll::Ready(Err(failure.clone()));
         }
-        // No job was dispatched before positive MIO bootstrap. There is no F
-        // to cancel/drop or a false worker-exit receipt to manufacture here.
-        if !original.started {
-            original.dispose_inputs()?;
-            return Poll::Ready(Ok(()));
+        if original.future.is_some()
+            && !original.closed
+            && let Err(error) = original.io.poll_continuing(cx)
+        {
+            original.io_failure.get_or_insert(error);
         }
-        original.io.poll_continuing(cx).map_err(|e| {
-            StatementNativeHealthFailure::actual_exit_unproven(
-                "statistics read residual admission failed",
-                Arc::new(e),
-            )
-        })?;
         if let Some(future) = original.future.as_mut() {
             let result = std::task::ready!(future.as_mut().poll(cx));
             if let Err(error) = result {
@@ -449,12 +514,179 @@ impl GovernedStatementResidual for StatisticsReadResidual {
                 )
             })?;
         }
-        let observed = std::task::ready!(original.io.poll_actual_quiescent_continuing(cx))?;
-        if let Some(failure) = observed.into_ordinary_failure() {
-            original.io_failure.get_or_insert(failure);
-        }
+        std::task::ready!(poll_read_io_retirement(
+            &original.io,
+            &mut original.io_failure,
+            &mut original.closed,
+            cx
+        ))?;
         original.dispose_inputs()?;
         original.closed = true;
         Poll::Ready(Ok(()))
     }
 }
+
+/// The same source's original bootstrap and request cells prove their own
+/// retirement. Business refusal never substitutes for health or actual exit.
+fn poll_read_io_retirement(
+    io: &Arc<MetadataIoAdmission>,
+    ordinary: &mut Option<WorkError>,
+    closed: &mut bool,
+    cx: &mut Context<'_>,
+) -> Poll<Result<(), StatementNativeHealthFailure>> {
+    if *closed {
+        return Poll::Ready(Ok(()));
+    }
+    let observed = match io.withdraw_unstarted_in().map_err(|error| {
+        StatementNativeHealthFailure::actual_exit_unproven(
+            "statistics read bootstrap withdrawal is unproven",
+            Arc::new(error),
+        )
+    })? {
+        Some(observed) => observed,
+        None => {
+            if let Err(error) = io.poll_continuing(cx) {
+                ordinary.get_or_insert(error);
+            }
+            std::task::ready!(io.poll_actual_quiescent_continuing(cx))?
+        }
+    };
+    if let Some(failure) = observed.into_ordinary_failure() {
+        ordinary.get_or_insert(failure);
+    }
+    *closed = true;
+    Poll::Ready(Ok(()))
+}
+
+fn unsupported_relation(kind: &str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        format!("SHOW STATS FOR does not support {kind}"),
+    )
+}
+fn reject_system_relation(
+    target: &application::StatisticsTableTarget,
+) -> Result<(), ConnectorError> {
+    if target.catalog.eq_ignore_ascii_case("system")
+        || target.namespace.eq_ignore_ascii_case("information_schema")
+    {
+        return Err(unsupported_relation("system relations"));
+    }
+    Ok(())
+}
+fn target_error(
+    error: ConnectorError,
+    target: &application::StatisticsTableTarget,
+) -> QueryServiceError {
+    if error.kind() == ConnectorErrorKind::NotFound {
+        let user = novarocks_sql::analyze_error::AnalyzeError::unknown_table(
+            format!(
+                "Table '{}.{}.{}' does not exist",
+                target.catalog, target.namespace, target.table
+            ),
+            novarocks_parser::Span::new(0, 0),
+        )
+        .to_user_error(None);
+        QueryServiceError::from_user_error_with_cause(
+            user,
+            novarocks_failure_contract::SharedFailureCause::from_static_detail(
+                error,
+                "statistics target was not found",
+            ),
+        )
+    } else {
+        connector_error(error)
+    }
+}
+fn result_from_summary(
+    summary: &TableStatisticsSummary,
+) -> Result<novarocks_query_application::api::QueryResult, String> {
+    let batch = super::show_stats::render_show_stats(summary).map_err(|error| error.to_string())?;
+    let columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            novarocks_query_application::api::ResultField::new(
+                field.name().as_str(),
+                novarocks_type_contract::FunctionValueType::new(
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ),
+            )
+        })
+        .collect();
+    novarocks_query_application::api::build_arrow_query_result(columns, batch.columns().to_vec())
+}
+async fn read_summary(
+    source: Arc<dyn StatisticsSummaryReadOriginal>,
+    cpu: Arc<dyn StatisticsCpuPort>,
+    metadata: Arc<dyn novarocks_spi::connector::ProviderMetadataCpuPort>,
+    planning: novarocks_spi::connector::ConnectorControlPlanningPin,
+    target: application::StatisticsTableTarget,
+    context: ConnectorRequestContext,
+) -> Result<TableStatisticsSummary, ConnectorError> {
+    let mut read = source.clone().read(cpu.clone(), metadata);
+    let returned = read.as_mut().await;
+    drop(read);
+    returned?;
+    std::future::poll_fn(|cx| cpu.poll_closed(cx)).await?;
+    let mut received = None;
+    source.take_result_in(&mut received)?;
+    let result = match received.expect("original summary result") {
+        Ok(result) => result,
+        Err(error) if error.kind() == ConnectorErrorKind::NotFound => {
+            // A table miss is not evidence of a view. Ask the original view
+            // metadata author through the same exact generation and context.
+            if let Some(views) = planning.binding().view_metadata() {
+                let request = novarocks_spi::connector::ConnectorViewRequest {
+                    view: novarocks_spi::connector::ConnectorViewIdentity {
+                        instance_id: planning.binding().descriptor().instance_id.clone(),
+                        namespace: target.namespace.as_str().into(),
+                        view: target.table.as_str().into(),
+                    },
+                    context,
+                };
+                match views.prepare_view(request).await {
+                    Ok(prepared) => {
+                        drop(prepared);
+                        return Err(unsupported_relation("views"));
+                    }
+                    Err(view_error)
+                        if matches!(
+                            view_error.kind(),
+                            ConnectorErrorKind::NotFound | ConnectorErrorKind::Unsupported
+                        ) => {}
+                    Err(view_error) => return Err(view_error),
+                }
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let documents = planning.derive_document_storage_lease()?;
+    let request = crate::mv::domain::staged_create::keyed_request(
+        &documents,
+        result.binding.metadata.identity.clone(),
+        result.binding.object_id,
+        context,
+    );
+    let view = documents
+        .observe_keyed_documents_async(request)
+        .await
+        .map_err(|error| match error {
+            novarocks_spi::connector::document_storage::KeyedDocumentReadError::Invalid(error) => {
+                error
+            }
+            novarocks_spi::connector::document_storage::KeyedDocumentReadError::LegacyFormat {
+                ..
+            } => unsupported_relation("legacy application documents"),
+        })?;
+    if crate::mv::domain::iceberg_guard::is_materialized_view_documents(&view) {
+        return Err(unsupported_relation("materialized views"));
+    }
+    Ok(result.summary)
+}
+
+#[cfg(test)]
+mod tests;

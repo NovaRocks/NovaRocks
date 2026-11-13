@@ -100,10 +100,10 @@ printf '%s\n' "$spark_out" | grep -F MV_EXTERNAL_CLEANUP_OK
 -- metadata log or document sidecar is needed. Counts remain cumulative at REST.
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.cleanup_mv,publications=1,slot-changes=0,table-commits=4
--- @result_rows_where=Name=cleanup_mv
+-- @result_rows_where=name=cleanup_mv
 -- @result_rows_count=1
--- @result_rows_expect=Manageability=MANAGEABLE
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=manageability=MANAGEABLE
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvclean_${uuid0}';
 
 -- query 8
 -- @skip_result_check=true

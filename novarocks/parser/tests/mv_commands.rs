@@ -150,14 +150,12 @@ fn mv_command_family_round_trips_through_the_typed_ast() {
         ALTER MATERIALIZED VIEW analytics.mv RESUME REFRESH; \
         ALTER MATERIALIZED VIEW analytics.mv REPARTITION BY (truncate(name, 4)); \
         REFRESH MATERIALIZED VIEW analytics.mv FULL WITH SYNC MODE; \
-        SHOW MATERIALIZED VIEWS FROM analytics; \
         EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv; \
         EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW analytics.mv; \
         EXPLAIN COSTS REFRESH MATERIALIZED VIEW analytics.mv";
     let statements = parse(source).expect("MV command family should parse");
-    assert_eq!(statements.len(), 10);
+    assert_eq!(statements.len(), 9);
     let [
-        _,
         _,
         _,
         _,
@@ -183,8 +181,7 @@ fn mv_command_family_round_trips_through_the_typed_ast() {
          ALTER MATERIALIZED VIEW analytics.mv RESUME REFRESH; \
          ALTER MATERIALIZED VIEW analytics.mv REPARTITION BY (truncate(name, 4)); \
          REFRESH MATERIALIZED VIEW analytics.mv FULL WITH SYNC MODE; \
-         SHOW MATERIALIZED VIEWS FROM analytics; \
-         EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv; \
+          EXPLAIN REFRESH MATERIALIZED VIEW analytics.mv; \
          EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW analytics.mv; \
          EXPLAIN COSTS REFRESH MATERIALIZED VIEW analytics.mv"
     );
@@ -274,4 +271,21 @@ fn empty_primary_key_keeps_the_command_specific_diagnostic() {
         error.contains("PRIMARY KEY clause requires at least one column"),
         "{error}"
     );
+}
+
+#[test]
+fn show_materialized_views_is_retired_syntax() {
+    for source in [
+        "SHOW MATERIALIZED VIEWS",
+        "SHOW MATERIALIZED VIEWS FROM analytics",
+    ] {
+        assert_eq!(
+            parse(source)
+                .unwrap_err()
+                .to_user_error(source)
+                .code()
+                .as_str(),
+            "sql.parse.unexpected_token"
+        );
+    }
 }

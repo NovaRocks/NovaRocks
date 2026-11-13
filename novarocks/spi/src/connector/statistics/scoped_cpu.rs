@@ -118,8 +118,9 @@ pub trait StatisticsCpuPort: Send + Sync {
 }
 
 /// A borrowed waiter never owns the original request, partial projection or
-/// final evidence. The admitted Action keeps this same Source independently.
-pub trait StatisticsReadOriginal: Send + Sync + std::any::Any {
+/// final summary. The admitted Action keeps this same Source independently,
+/// including its named pure CPU phase and original close obligation.
+pub trait StatisticsSummaryReadOriginal: Send + Sync + std::any::Any {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
     fn read(
@@ -130,6 +131,6 @@ pub trait StatisticsReadOriginal: Send + Sync + std::any::Any {
     fn close_original(&self) -> Result<(), ConnectorError>;
     fn take_result_in(
         &self,
-        target: &mut Option<Result<StatisticsEvidence, ConnectorError>>,
+        target: &mut Option<Result<StatisticsSummaryReadResult, ConnectorError>>,
     ) -> Result<(), ConnectorError>;
 }

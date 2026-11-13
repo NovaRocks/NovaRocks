@@ -19,18 +19,20 @@
 use super::*;
 use crate::read_snapshot::cow_capture::{CaptureScope, ReadFailure};
 use novarocks_spi::connector::{
-    ConnectorMetadata, ConnectorOriginalResultScope, ConnectorTableMetadata, ConnectorTableRequest,
-    OriginalResultCheckClass, StatisticsMetricRequest, StatisticsReadOriginal,
+    ConnectorOriginalResultScope, ConnectorTableMetadata, ConnectorTableRequest,
+    OriginalResultCheckClass, StatisticsSummaryReadOriginal, StatisticsSummaryReadResult,
 };
+
+#[path = "scoped_read/summary.rs"]
+mod summary;
 
 pub(super) struct ReadBody {
     provider: Option<IcebergMetadata>,
     request: Option<ConnectorTableRequest>,
     facts: Option<crate::metadata::IcebergPreparedTableFacts>,
     metadata: Option<ConnectorTableMetadata>,
-    read_request: Option<StatisticsReadRequest>,
     files: Option<Vec<crate::read_model::IcebergReadFile>>,
-    result: Option<Result<StatisticsEvidence, ConnectorError>>,
+    summary_result: Option<Result<StatisticsSummaryReadResult, ConnectorError>>,
     pub(super) phase: u8,
     snapshot: Option<Arc<IcebergMetadataCpuOriginal>>,
     payload: Option<IcebergTablePayload>,
@@ -81,13 +83,19 @@ pub(super) fn checked_read(error: ReadFailure) -> ConnectorError {
     }
 }
 impl ReadBody {
+    fn result_ready(&self) -> bool {
+        self.summary_result.is_some()
+    }
+    fn fail(&mut self, error: ConnectorError) {
+        self.summary_result = Some(Err(error));
+    }
     pub(super) fn run(&mut self) {
         // CPU work retains the same original operation and stable receiver.
         let original_scope = self.original.clone();
         let capture = match CaptureScope::new(&original_scope) {
             Ok(value) => value,
             Err(error) => {
-                self.result = Some(Err(checked_read(error)));
+                self.fail(checked_read(error));
                 return;
             }
         };
@@ -98,7 +106,7 @@ impl ReadBody {
         };
         if let Err(error) = result {
             tracing::debug!(phase = self.phase, "statistics read CPU phase refused");
-            self.result = Some(Err(error));
+            self.fail(error);
         }
     }
     fn prepare_request(&mut self, scope: &CaptureScope<'_>) -> Result<(), ConnectorError> {
@@ -119,88 +127,37 @@ impl ReadBody {
         );
         self.snapshot_id =
             base_table_info(self.payload.as_ref().unwrap(), "statistics read")?.current_snapshot_id;
-        let data_version = metadata
-            .statistics_data_version
-            .clone()
-            .ok_or_else(|| invalid("statistics read metadata has no pinned data version"))?;
-        let schema = metadata.schema();
-        let columns = || {
-            schema.fields().iter().filter(|field| {
-                field
-                    .metadata()
-                    .get(novarocks_spi::connector::CONNECTOR_FIELD_HIDDEN_FROM_SQL)
-                    .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
-            })
-        };
-        let count = columns()
-            .count()
-            .checked_mul(5)
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(|| invalid("statistics read metric count overflow"))?;
-        if count.saturating_sub(1) > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_METRICS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "SHOW TABLE STATS exceeds the supported column metric count",
-            ));
-        }
-        let mut metrics = Vec::with_capacity(count);
-        metrics.push(StatisticsMetric::RowCount);
-        for column in columns() {
-            let column: Arc<str> = Arc::from(column.name().as_str());
-            metrics.extend([
-                StatisticsMetric::NullCount {
-                    column: column.clone(),
-                },
-                StatisticsMetric::Minimum {
-                    column: column.clone(),
-                },
-                StatisticsMetric::Maximum {
-                    column: column.clone(),
-                },
-                StatisticsMetric::AverageSize {
-                    column: column.clone(),
-                },
-                StatisticsMetric::ThetaNdv { column },
-            ]);
-        }
-        self.read_request = Some(StatisticsReadRequest {
-            narrowed_read: None,
-            table: metadata.table.clone(),
-            data_version,
-            metrics: StatisticsMetricRequest::try_new(metrics)?,
-            context: self.request.as_ref().unwrap().context.clone(),
-        });
         Ok(())
     }
     fn project(&mut self, scope: &CaptureScope<'_>) -> Result<(), ConnectorError> {
         scope.active().map_err(checked_read)?;
-        let request = self.read_request.as_ref().expect("original read request");
-        let facts = self.facts.as_ref().expect("original physical table");
-        let table = IcebergMetadata::statistics_read_physical(facts);
-        let info = base_table_info(self.payload.as_ref().unwrap(), "statistics read")?;
-        let snapshot = info.current_snapshot_id.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "Iceberg table has no current snapshot for statistics",
-            )
-        })?;
-        let files = self
-            .files
+        let facts = self
+            .facts
             .as_ref()
-            .expect("original manifest read receiver");
-        self.result = Some(project_statistics_evidence(
-            table.metadata(),
-            info,
-            snapshot,
-            &request.data_version,
-            request,
-            files,
-        ));
+            .expect("original summary physical table");
+        let physical = IcebergMetadata::statistics_read_physical(facts);
+        self.summary_result = Some((|| {
+            let summary = summary::project(
+                physical.metadata(),
+                self.metadata.as_ref().expect("original summary metadata"),
+                self.files.as_ref().expect("original summary files"),
+                scope,
+            )?;
+            let binding = self
+                .provider
+                .as_ref()
+                .expect("original summary provider")
+                .table_object_binding_from_metadata(
+                    self.metadata.take().expect("original summary metadata"),
+                )?;
+            Ok(StatisticsSummaryReadResult { summary, binding })
+        })());
         Ok(())
     }
 }
+
 impl IcebergMetadataCpuOriginal {
-    pub(crate) fn read_source(
+    pub(crate) fn summary_read_source(
         provider: IcebergMetadata,
         request: ConnectorTableRequest,
         original: ConnectorOriginalResultScope,
@@ -214,9 +171,8 @@ impl IcebergMetadataCpuOriginal {
                 original,
                 facts: None,
                 metadata: None,
-                read_request: None,
                 files: None,
-                result: None,
+                summary_result: None,
                 phase: 1,
                 snapshot: None,
                 payload: None,
@@ -239,8 +195,8 @@ impl IcebergMetadataCpuOriginal {
             let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
                 unreachable!()
             };
-            if body.result.is_none() {
-                body.result = Some(Err(error));
+            if !body.result_ready() {
+                body.fail(error);
             }
         }
         Ok(())
@@ -261,7 +217,7 @@ impl IcebergMetadataCpuOriginal {
                 .provider
                 .as_ref()
                 .unwrap()
-                .prepare_table(body.request.as_ref().unwrap().clone())
+                .prepare_statistics_summary_table(body.request.as_ref().unwrap().clone())
                 .await?;
             body.facts = Some(
                 preparation.into_facts::<crate::metadata::IcebergPreparedTableFacts>(
@@ -274,15 +230,32 @@ impl IcebergMetadataCpuOriginal {
         ));
         metadata.submit_metadata_in(&mut input)?;
         std::future::poll_fn(|cx| metadata.poll_finished(cx)).await?;
-        {
+        let empty_summary = {
             let mut loan = BodyLoan::take(self);
             let original = loan.body.as_mut().unwrap();
             let CpuBody::Read(body) = &mut original.body else {
                 unreachable!()
             };
-            if body.result.is_some() {
+            if body.result_ready() {
                 return Ok(());
             }
+            if body.snapshot_id.is_none() {
+                body.files = Some(Vec::new());
+                body.phase = 3;
+                original.started = false;
+                true
+            } else {
+                false
+            }
+        };
+        if empty_summary {
+            return run_read(cpu, self).await;
+        }
+        {
+            let mut loan = BodyLoan::take(self);
+            let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
+                unreachable!()
+            };
             let snapshot = body.snapshot_id.ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
@@ -337,7 +310,7 @@ async fn run_read(
     cpu.submit_in(&mut input)?;
     futures::future::poll_fn(|cx| cpu.poll_finished(cx)).await
 }
-impl StatisticsReadOriginal for IcebergMetadataCpuOriginal {
+impl StatisticsSummaryReadOriginal for IcebergMetadataCpuOriginal {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -366,7 +339,6 @@ impl StatisticsReadOriginal for IcebergMetadataCpuOriginal {
         let inputs = (
             body.snapshot.take(),
             body.files.take(),
-            body.read_request.take(),
             body.metadata.take(),
             body.payload.take(),
             body.facts.take(),
@@ -379,19 +351,19 @@ impl StatisticsReadOriginal for IcebergMetadataCpuOriginal {
     }
     fn take_result_in(
         &self,
-        target: &mut Option<Result<StatisticsEvidence, ConnectorError>>,
+        target: &mut Option<Result<StatisticsSummaryReadResult, ConnectorError>>,
     ) -> Result<(), ConnectorError> {
         if target.is_some() {
-            return Err(invalid("statistics read receiver is occupied"));
+            return Err(invalid("statistics summary receiver is occupied"));
         }
         let mut loan = BodyLoan::take(self);
         let CpuBody::Read(body) = &mut loan.body.as_mut().unwrap().body else {
-            return Err(invalid("foreign statistics read body"));
+            return Err(invalid("foreign statistics summary body"));
         };
-        if body.result.is_none() {
-            return Err(invalid("statistics read result is not ready"));
+        if body.summary_result.is_none() {
+            return Err(invalid("statistics summary result is not ready"));
         }
-        *target = body.result.take();
+        *target = body.summary_result.take();
         Ok(())
     }
 }
@@ -497,3 +469,7 @@ mod failure_geometry_tests {
         assert_eq!(output.message(), original.detail());
     }
 }
+
+#[cfg(test)]
+#[path = "scoped_read/tests.rs"]
+mod tests;

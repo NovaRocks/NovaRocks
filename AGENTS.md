@@ -228,10 +228,11 @@ SQL client
   计数，COW 取原 selection，CTAS 等最终 CREATE；无真实计数时为 NULL，不能填零。
   计数数据页之后仍须请求终页确认；完成数据不替代原 visibility、取消与实际退出。见 ADR-0217。
 
-- `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`
-  Stats 的前台 capture 与后台 governed Action：capture 的 CPU/Provider 实际关闭后，原 query permit
-  静默移交给同 job 的稳定接收格，再通知原串行 worker。计算沿共享 `statement_computation.rs`，
-  Ready 在 payload 移交前保留原 statement retention；publication 与 residual 继续保管同原 Session。
+- `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`
+  ANALYZE 在原语句的 Internal Root、冻结会话设置与 query permit 下完成 capture、计算与发布，
+  首次 capture 的完整 binding 原样交给 attempt；没有后台 job、串行 worker 或 permit 移交。
+  计算沿共享 `statement_computation.rs`，Ready 在 payload 移交前保留原 statement retention；
+  publication 与 residual 继续保管同原 Session，空表无统计产物时不发布 Puffin。
   scoped CPU 作者在 `query_execution/internal_result_cpu/scoped_statistics.rs`，准备访问保管在
   `query_execution/statistics/preparation.rs`。普通业务拒绝、actual quiescence 与 raw health 分别保留，
   不能用其中一项代替另一项；这些源码入口不证明整族或原生验收完成。
@@ -253,7 +254,7 @@ SQL client
 
 - `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs` 与
   `novarocks/frontend-application/src/mv/service/background_original.rs`
-  MV 的 CREATE、DROP、普通 ALTER、Refresh/Repartition 与 SHOW/EXPLAIN 分别走原 Root 的
+  MV 的 CREATE、DROP、普通 ALTER、Refresh/Repartition 与 EXPLAIN 分别走原 Root 的
   控制、数据或只读 Action；后台沿原 scheduler/runtime 的稳定 Source 提交同一执行 owner。
   `novarocks/mv-application/src/service.rs` 的 `MvProductOperations` 保同一业务闸门与调度状态，
   process wrapper 独持 `process_runtime.rs` 的异步后台任务和原 Join；不让活动 Source 强持
@@ -500,7 +501,9 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   分别拥有系统表 Provider 与原语句快照 Source。目录行来自原 catalog generation，MV 行来自原产品事实；
   Source 保留原 typed pin、IO、CPU、Root 与结果窗口，借用取消后继续等真实退出。
   `novarocks/frontend-application/src/server.rs` 组合静态注册表；`mv/domain/freshness.rs` 区分基表缺失、
-  对象/版本变化和其它类型化读取失败。SHOW MATERIALIZED VIEWS、SHOW BACKENDS、SHOW TABLE STATS 保留。
+  对象/版本变化和其它类型化读取失败。MV 管理状态由
+  `system.runtime.materialized_view_states` 提供，统计由 `SHOW STATS FOR` 提供，BE 拓扑由管理 API
+  `GET /v1/frontend/backends` 提供；旧 SHOW 与作业列表已退出语句集合，见 ADR-0231。
   元数据列举与任务传输的固定额度退役范围见 ADR-0227；Joint 只记责，不提供回复总字节容量。
 
 - `novarocks/types/src/{naming,schema}.rs`
@@ -1233,9 +1236,9 @@ differ.
   `novarocks/execution/src/exec/operators/exchange_source.rs`, and
   `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,exchange_grant_subscription}.rs`.
 - **Statistics collection/publication**: inspect
-  `novarocks/frontend-application/src/statistics_jobs/{service,attempt_executor}.rs`,
+  `novarocks/frontend-application/src/statistics/{application,attempt_executor,service,read,publication}.rs`,
   `query_execution/statistics/preparation.rs`, and `query_execution/internal_result_cpu/scoped_statistics.rs`.
-  Follow the original Root, query-permit handoff, CPU/Provider source and retained result through actual exit;
+  Follow the original statement Root, query permit, captured binding, CPU/Provider source and retained result through actual exit;
   `query_execution/maintenance/io_admission.rs` separates ordinary refusal from actual quiescence.
   Structural migration does not establish whole-family Native qualification or resolve recorded failures.
 - **Materialized views**: inspect `novarocks/frontend-application/src/query/{mv_action,mv_read_action}.rs`,

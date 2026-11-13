@@ -136,7 +136,6 @@ async fn native_subscription_responsibility_keeps_the_original_workload_class() 
     for class in [
         WorkClass::Query,
         WorkClass::MaterializedView,
-        WorkClass::Statistics,
         WorkClass::TableMaintenance,
         WorkClass::Management,
     ] {

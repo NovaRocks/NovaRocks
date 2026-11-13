@@ -73,8 +73,8 @@ pub(crate) fn statistics_publication_owned_bytes(
             )
             .and_then(|n| n.checked_add(draft.identity().blob_type().len()))
             .ok_or_else(overflow)?;
-        // The only normalized property is the NDV value. Include its missing
-        // value's f64 display buffer even when the actual input has no entry.
+        // The only normalized property is the integer NDV value. Retain the
+        // existing numeric text backing even when the input has no entry.
         metadata = metadata
             .checked_add(
                 size_of::<(String, String)>()

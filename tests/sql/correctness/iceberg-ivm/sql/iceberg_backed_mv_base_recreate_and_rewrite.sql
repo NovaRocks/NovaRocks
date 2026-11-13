@@ -97,8 +97,7 @@ SELECT dt, sum(col_int) FROM mv_ice_tbl_${uuid0} GROUP BY dt ORDER BY dt;
 
 -- query 6
 -- @result_contains=test_mv1
--- @result_contains=iceberg
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_iceberg_${uuid0}';
 
 -- query 7
 SELECT name

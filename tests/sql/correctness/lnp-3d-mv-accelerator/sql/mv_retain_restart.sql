@@ -73,10 +73,9 @@ SELECT 1;
 -- SHOW is served from the replacement FE's readiness-filtered Accelerator.
 -- @skip_result_check=true
 -- @result_contains=orders_mv
--- @result_contains=iceberg
--- @result_contains=ASYNC_INTERVAL
+-- @result_contains=INTERVAL
 USE lnp3d_retain_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_retain_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
 -- A fully-qualified target read avoids depending on the old session catalog

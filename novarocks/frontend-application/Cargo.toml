@@ -51,6 +51,7 @@ novarocks-proto-models.workspace = true
 novarocks-physical-plan.workspace = true
 novarocks-query-application.workspace = true
 novarocks-result-contract.workspace = true
+novarocks-result-render.workspace = true
 novarocks-parser.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-spi.workspace = true
@@ -59,7 +60,6 @@ novarocks-state-store-runtime.workspace = true
 novarocks-mv-application.workspace = true
 novarocks-trino-adapter.workspace = true
 novarocks-native-adapter.workspace = true
-novarocks-statistics-application.workspace = true
 novarocks-table-maintenance.workspace = true
 novarocks-sql.workspace = true
 novarocks-task-codec.workspace = true
@@ -84,7 +84,6 @@ novarocks-plan-codec = { workspace = true }
 novarocks-mv-application = { workspace = true }
 novarocks-catalog-application = { workspace = true }
 novarocks-query-application = { workspace = true }
-novarocks-result-render.workspace = true
 novarocks-secret.workspace = true
 novarocks-state-store-sqlite.workspace = true
 novarocks-state-store-testkit.workspace = true

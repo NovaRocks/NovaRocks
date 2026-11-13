@@ -19,7 +19,7 @@
 use novarocks_failpoint::scope::{ActionClaim, GrantHandle, ProcessBinding};
 use novarocks_failpoint::target_binding::{StatementInputNomination, StatementWorkNomination};
 use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
-use novarocks_table_maintenance::{MaintenanceTarget, OptimizeJob};
+use novarocks_table_maintenance::MaintenanceTarget;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -59,7 +59,6 @@ struct State {
     nomination: Option<StatementWorkNomination>,
     submission_started: bool,
     captured_object: Option<Vec<u8>>,
-    job_id: Option<i64>,
     work_id: Option<u64>,
     abandoned: bool,
 }
@@ -70,7 +69,7 @@ struct Slot {
     state: Mutex<State>,
     changed: Notify,
 }
-pub(crate) struct MaintenanceTestControls {
+pub struct MaintenanceTestControls {
     process: ProcessBinding,
     slots: Vec<Arc<Slot>>,
 }
@@ -237,7 +236,7 @@ impl MaintenanceTestControls {
         }
         Ok(())
     }
-    pub(crate) fn begin_submission(
+    fn begin_submission(
         self: &Arc<Self>,
         nomination: &StatementWorkNomination,
         target: &MaintenanceTarget,
@@ -270,84 +269,48 @@ impl MaintenanceTestControls {
         }
         Ok(None)
     }
-    pub(crate) async fn before_rebind(
-        &self,
-        job: &OptimizeJob,
+    pub(crate) fn claim_statement(
+        self: &Arc<Self>,
+        nomination: &StatementWorkNomination,
+        target: &MaintenanceTarget,
+        object: &novarocks_spi::connector::ConnectorTableObjectId,
         capacity: &QueryResultCapacityBinding,
-    ) -> Result<Option<AuthorizedJob>, String> {
-        'slots: for slot in &self.slots {
-            if slot.parameters.target() != job.target {
-                continue;
+    ) -> Result<Option<AuthorizedStatement>, String> {
+        let Some(mut receipt) = self.begin_submission(nomination, target)? else {
+            return Ok(None);
+        };
+        receipt.capture(object.as_bytes())?;
+        let slot = receipt.slot.clone();
+        let deadline = (Instant::now() + BARRIER_LIMIT).min(slot.hold.cancellation().deadline());
+        check_live(&slot, capacity, deadline)?;
+        {
+            let mut state = slot
+                .state
+                .lock()
+                .map_err(|_| "maintenance statement association lock failed")?;
+            if state.work_id.replace(capacity.scope().id().get()).is_some() {
+                return Err("maintenance statement was already bound to its original scope".into());
             }
-            let deadline = {
-                let state = slot
-                    .state
-                    .lock()
-                    .map_err(|_| "maintenance association lock failed")?;
-                // Publication cannot precede capture. Only this captured incarnation
-                // may wait for its already-running submit operation to return its ID.
-                if state.captured_object.as_deref() != Some(job.object_id.as_slice())
-                    || state.abandoned
-                {
-                    continue;
-                }
-                (Instant::now() + BARRIER_LIMIT).min(slot.hold.cancellation().deadline())
-            };
-            loop {
-                // Register before reading State so bind/close cannot be lost
-                // between checking the original receipt and yielding this poll.
-                let changed = slot.changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                let bound = {
-                    let mut state = slot
-                        .state
-                        .lock()
-                        .map_err(|_| "maintenance association lock failed")?;
-                    if state.job_id.is_none() && !state.abandoned {
-                        check_live(slot, capacity, deadline)?;
-                        false
-                    } else {
-                        if state.abandoned || state.job_id != Some(job.job_id) {
-                            continue 'slots;
-                        }
-                        check_live(slot, capacity, deadline)?;
-                        let work_id = capacity.scope().id().get();
-                        if work_id == 0 || state.work_id.replace(work_id).is_some() {
-                            return Err("maintenance job was already bound to a work scope".into());
-                        }
-                        true
-                    }
-                };
-                if bound {
-                    break;
-                }
-                tokio::select! {
-                    _ = changed => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-            let hold = slot
-                .hold
-                .claim_once(self.process)
-                .map_err(|error| error.to_string())?;
-            let observe = slot
-                .observe
-                .claim_once(self.process)
-                .map_err(|error| error.to_string())?;
-            let mut authorized = AuthorizedJob {
-                slot: slot.clone(),
-                job: job.clone(),
-                capacity: capacity.clone(),
-                hold,
-                observe,
-                dispatches: 0,
-            };
-            authorized.wait_before_rebind(deadline).await?;
-            return Ok(Some(authorized));
         }
-        Ok(None)
+        let hold = slot
+            .hold
+            .claim_once(self.process)
+            .map_err(|e| e.to_string())?;
+        let observe = slot
+            .observe
+            .claim_once(self.process)
+            .map_err(|e| e.to_string())?;
+        receipt.finished = true;
+        Ok(Some(AuthorizedStatement {
+            slot,
+            capacity: capacity.clone(),
+            hold,
+            observe,
+            deadline,
+            dispatches: 0,
+        }))
     }
+
     pub(crate) fn close(&self) -> Result<(), String> {
         for slot in &self.slots {
             let mut state = slot
@@ -362,12 +325,12 @@ impl MaintenanceTestControls {
     }
 }
 
-pub(crate) struct SubmissionReceipt {
+struct SubmissionReceipt {
     slot: Arc<Slot>,
     finished: bool,
 }
 impl SubmissionReceipt {
-    pub(crate) fn capture(&self, object: &[u8]) -> Result<(), String> {
+    fn capture(&self, object: &[u8]) -> Result<(), String> {
         if object.is_empty()
             || object.len() > novarocks_spi::connector::MAX_CONNECTOR_TABLE_OBJECT_ID_BYTES
         {
@@ -387,26 +350,6 @@ impl SubmissionReceipt {
         state.captured_object = Some(object.to_vec());
         Ok(())
     }
-    pub(crate) fn bind(mut self, job_id: i64) -> Result<(), String> {
-        let mut state = self
-            .slot
-            .state
-            .lock()
-            .map_err(|_| "maintenance receipt lock failed")?;
-        if job_id <= 0
-            || state.captured_object.is_none()
-            || state.job_id.is_some()
-            || state.abandoned
-            || !self.slot.hold.cancellation().is_active()
-        {
-            return Err("maintenance receipt lacks its exact captured submission".into());
-        }
-        state.job_id = Some(job_id);
-        self.finished = true;
-        drop(state);
-        self.slot.changed.notify_waiters();
-        Ok(())
-    }
 }
 impl Drop for SubmissionReceipt {
     fn drop(&mut self) {
@@ -421,106 +364,93 @@ impl Drop for SubmissionReceipt {
     }
 }
 
-pub(crate) struct AuthorizedJob {
+pub(crate) struct AuthorizedStatement {
     slot: Arc<Slot>,
-    job: OptimizeJob,
     capacity: QueryResultCapacityBinding,
     hold: ActionClaim,
     observe: ActionClaim,
+    deadline: Instant,
     dispatches: u64,
 }
-impl AuthorizedJob {
+impl AuthorizedStatement {
     fn path(&self, suffix: &str) -> PathBuf {
         self.slot.parameters.root.join(format!(
             "{}.{}",
             self.slot.parameters.statement_run_token, suffix
         ))
     }
-    async fn wait_before_rebind(&mut self, deadline: Instant) -> Result<(), String> {
-        check_live(&self.slot, &self.capacity, deadline)?;
+    pub(crate) async fn wait_before_planning(&mut self) -> Result<(), String> {
+        check_live(&self.slot, &self.capacity, self.deadline)?;
         if self.path("before-rebind.resume").exists() {
             return Err("maintenance resume existed before its exact barrier".into());
         }
         write_fresh(&self.path("dispatch-count"), b"0\n")?;
-        self.hold.record_hit().map_err(|error| error.to_string())?;
-        let nomination = self
-            .slot
-            .state
-            .lock()
-            .map_err(|_| "maintenance receipt nomination lock failed")?
-            .nomination
-            .clone()
-            .ok_or("maintenance receipt lost its exact nomination")?;
-        let ready = serde_json::json!({
-            "schema_version":1,"job_id":self.job.job_id,"work_id":self.capacity.scope().id().get(),
-            "phase":"after-claim-before-rebind","catalog":self.job.target.catalog,
-            "namespace":self.job.target.namespace,"table":self.job.target.table,
-            "object_id":self.job.object_id,
-            "launch_id":self.slot.hold.cancellation().launch_id(),
-            "nomination": {
-                "target_session_id": nomination.target_session_id,
-                "statement_run_token": nomination.statement_run_token,
-                "frontend_process_id": nomination.frontend_process_id,
-                "session_key": nomination.session_key,
-                "statement_generation": nomination.statement_generation,
-            },
-        });
-        let ready_bytes = serde_json::to_vec(&ready).map_err(|error| error.to_string())?;
-        let staged_ready = self.path("before-rebind.ready.pending");
-        write_fresh(&staged_ready, &ready_bytes)?;
-        // Publish only complete immutable bytes. The canonical name is exclusive;
-        // the staging hard link remains in this attempt as original evidence.
-        fs::hard_link(&staged_ready, self.path("before-rebind.ready"))
-            .map_err(|error| format!("publish exact maintenance receipt: {error}"))?;
+        self.hold.record_hit().map_err(|e| e.to_string())?;
+        let ready = {
+            let state = self
+                .slot
+                .state
+                .lock()
+                .map_err(|_| "maintenance statement receipt lock failed")?;
+            let nomination = state
+                .nomination
+                .as_ref()
+                .ok_or("maintenance statement lost its exact nomination")?;
+            serde_json::json!({
+                "schema_version":2, "work_id":self.capacity.scope().id().get(),
+                "phase":"after-capture-before-planning", "catalog":self.slot.parameters.catalog,
+                "namespace":self.slot.parameters.namespace, "table":self.slot.parameters.table,
+                "object_id":state.captured_object,
+                "launch_id":self.slot.hold.cancellation().launch_id(),
+                "nomination": {
+                    "target_session_id":nomination.target_session_id,
+                    "statement_run_token":nomination.statement_run_token,
+                    "frontend_process_id":nomination.frontend_process_id,
+                    "session_key":nomination.session_key,
+                    "statement_generation":nomination.statement_generation,
+                }
+            })
+        };
+        let staged = self.path("before-rebind.ready.pending");
+        write_fresh(
+            &staged,
+            &serde_json::to_vec(&ready).map_err(|e| e.to_string())?,
+        )?;
+        fs::hard_link(staged, self.path("before-rebind.ready"))
+            .map_err(|e| format!("publish exact maintenance statement receipt: {e}"))?;
+        let session_cancellation = self.slot.hold.cancellation();
+        let work_cancellation = self
+            .capacity
+            .scope()
+            .cancellation()
+            .map_err(|error| error.to_string())?;
         while !self.path("before-rebind.resume").exists() {
+            check_live(&self.slot, &self.capacity, self.deadline)?;
             let changed = self.slot.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            check_live(&self.slot, &self.capacity, deadline)?;
+            if self
+                .slot
+                .state
+                .lock()
+                .map_err(|_| "maintenance statement barrier lock failed")?
+                .abandoned
             {
-                let state = self
-                    .slot
-                    .state
-                    .lock()
-                    .map_err(|_| "maintenance barrier lock failed")?;
-                if state.abandoned {
-                    return Err("maintenance observation closed during hold".into());
-                }
+                return Err("maintenance observation closed during hold".into());
             }
-            // Resume is an external file; retain the original finite 10 ms
-            // observation policy without blocking the common Action poll.
             tokio::select! {
                 _ = changed => {},
+                _ = session_cancellation.cancelled() => {},
+                _ = work_cancellation.cancelled() => {},
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {},
             }
         }
-        check_live(&self.slot, &self.capacity, deadline)
+        check_live(&self.slot, &self.capacity, self.deadline)
     }
-    pub(crate) fn record_dispatch(
-        &mut self,
-        job: &OptimizeJob,
-        capacity: &QueryResultCapacityBinding,
-    ) -> Result<(), String> {
-        if self.job.job_id != job.job_id
-            || self.job.target != job.target
-            || self.job.object_id != job.object_id
-            || !capacity.window_alias().is_for_scope(self.capacity.scope())
-            || capacity.scope().id() != self.capacity.scope().id()
-        {
-            return Err("maintenance dispatch differs from its exact job/work owner".into());
-        }
-        if self
-            .slot
-            .state
-            .lock()
-            .map_err(|_| "maintenance dispatch state lock failed")?
-            .abandoned
-        {
-            return Err("maintenance owner closed before dispatch observation".into());
-        }
+    pub(crate) fn record_dispatch(&mut self) -> Result<(), String> {
         check_live(
             &self.slot,
-            capacity,
+            &self.capacity,
             self.slot.observe.cancellation().deadline(),
         )?;
         self.dispatches = self
@@ -531,15 +461,14 @@ impl AuthorizedJob {
             self.path("dispatch-count"),
             format!("{}\n", self.dispatches),
         )
-        .map_err(|error| format!("write exact maintenance dispatch count: {error}"))?;
+        .map_err(|e| format!("write exact maintenance statement dispatch count: {e}"))?;
         if self.dispatches == 1 {
-            self.observe
-                .record_hit()
-                .map_err(|error| error.to_string())?;
+            self.observe.record_hit().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 }
+
 fn check_live(
     slot: &Slot,
     capacity: &QueryResultCapacityBinding,
@@ -606,9 +535,6 @@ mod tests {
     use novarocks_failpoint::liveness::{PreparedRoleSession, RoleSessionOwner, RunnerSession};
     use novarocks_failpoint::session::{
         DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole,
-    };
-    use novarocks_table_maintenance::job_service::{
-        CapturedOptimizeTarget, OptimizeJobService, OptimizeTargetCapturePort,
     };
     use novarocks_workload_control::{
         CancellationReason, PendingQueryRoot, QueryConcurrencyPermit, ResourceConfig,
@@ -839,59 +765,6 @@ mod tests {
             drop(self.window.take());
         }
     }
-    struct Capture<'a> {
-        receipt: Option<&'a SubmissionReceipt>,
-    }
-    impl OptimizeTargetCapturePort for Capture<'_> {
-        fn capture(&self, _: &MaintenanceTarget) -> Result<CapturedOptimizeTarget, String> {
-            let object_id = vec![1, 2, 3];
-            if let Some(receipt) = self.receipt {
-                receipt.capture(&object_id)?;
-            }
-            Ok(CapturedOptimizeTarget {
-                object_id,
-                base_snapshot_id: -1,
-                completion: novarocks_table_maintenance::OptimizeCompletionMode::Detached,
-            })
-        }
-    }
-    struct RealJobs {
-        service: OptimizeJobService,
-        runtime: tokio::runtime::Runtime,
-    }
-    impl RealJobs {
-        fn new() -> Self {
-            Self {
-                service: OptimizeJobService::new(),
-                runtime: tokio::runtime::Runtime::new().unwrap(),
-            }
-        }
-        fn claim(&self, table: &str, receipt: Option<&SubmissionReceipt>) -> OptimizeJob {
-            let submission = self
-                .runtime
-                .block_on(
-                    self.service
-                        .submit_optimize(target(table), &Capture { receipt }),
-                )
-                .unwrap();
-            let job = self
-                .runtime
-                .block_on(self.service.runtime().claim_next(1))
-                .unwrap()
-                .unwrap();
-            assert_eq!(job.job_id, submission.handle().unwrap().job_id());
-            job
-        }
-    }
-    fn pending(fixture: &Fixture, jobs: &RealJobs) -> (SubmissionReceipt, OptimizeJob) {
-        let receipt = fixture
-            .controls
-            .begin_submission(&fixture.nomination, &target("orders"))
-            .unwrap()
-            .unwrap();
-        let job = jobs.claim("orders", Some(&receipt));
-        (receipt, job)
-    }
     #[test]
     fn constructor_rejects_mixed_unknown_and_observation_without_hold() {
         assert!(
@@ -1064,181 +937,121 @@ mod tests {
         );
         assert!(!fixture.ready().exists());
     }
+    fn claim(fixture: &Fixture, admitted: &Admitted) -> AuthorizedStatement {
+        let object = novarocks_spi::connector::ConnectorTableObjectId::try_new(
+            bytes::Bytes::from_static(b"original-object"),
+        )
+        .unwrap();
+        fixture
+            .controls
+            .claim_statement(
+                &fixture.nomination,
+                &target("orders"),
+                &object,
+                admitted.capacity(),
+            )
+            .unwrap()
+            .unwrap()
+    }
     #[test]
-    fn pending_receipt_binds_real_job_scope_and_closed_owner_refuses_dispatch() {
+    fn statement_claim_keeps_the_exact_scope_and_counts_original_dispatch() {
         let fixture = Fixture::new();
         let admitted = Admitted::new();
-        let jobs = RealJobs::new();
-        let (receipt, job) = pending(&fixture, &jobs);
-        let other = jobs.claim("other", None);
+        let mut authorized = claim(&fixture, &admitted);
+        assert_eq!(
+            authorized.capacity.scope().id(),
+            admitted.capacity().scope().id()
+        );
         assert!(
-            drive(fixture.controls.before_rebind(&other, admitted.capacity()))
-                .unwrap()
-                .is_none()
+            fixture
+                .controls
+                .claim_statement(
+                    &fixture.nomination,
+                    &target("orders"),
+                    &novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                        bytes::Bytes::from_static(b"replacement-object")
+                    )
+                    .unwrap(),
+                    admitted.capacity()
+                )
+                .is_err()
         );
         std::thread::scope(|threads| {
-            let controls = &fixture.controls;
-            let selected_job = &job;
-            let capacity = admitted.capacity();
-            let worker =
-                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
-            receipt.bind(job.job_id).unwrap();
+            let worker = threads.spawn(move || {
+                drive(authorized.wait_before_planning()).unwrap();
+                authorized.record_dispatch().unwrap();
+            });
             fixture.wait_until_held();
-            fs::write(fixture.resume(), "resume\n").unwrap();
-            let mut authorized = worker.join().unwrap().unwrap().unwrap();
-            let foreign = Admitted::new();
-            assert_eq!(
-                foreign.capacity().scope().id(),
-                admitted.capacity().scope().id()
-            );
-            assert!(
-                authorized
-                    .record_dispatch(&job, foreign.capacity())
-                    .is_err()
-            );
-            authorized
-                .record_dispatch(&job, admitted.capacity())
-                .unwrap();
-            assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "1\n");
-            fixture.controls.close().unwrap();
-            assert!(
-                fixture
-                    .controls
-                    .nominate_statement(&fixture.input(), &fixture.nomination)
-                    .is_err()
-            );
-            assert!(
-                fixture
-                    .controls
-                    .begin_submission(&fixture.nomination, &target("orders"))
-                    .is_err()
-            );
-            assert!(
-                authorized
-                    .record_dispatch(&job, admitted.capacity())
-                    .is_err()
-            );
-            assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "1\n");
+            write_fresh(&fixture.resume(), b"resume\n").unwrap();
+            worker.join().unwrap();
         });
+        assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "1\n");
     }
     #[test]
-    fn one_async_poll_owner_can_bind_receipt_and_resume_its_original_hold() {
+    fn maintenance_owner_close_wakes_the_actual_statement_hold() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let fixture = Fixture::new();
         let admitted = Admitted::new();
-        let jobs = RealJobs::new();
-        let (receipt, job) = pending(&fixture, &jobs);
-        drive(async {
-            let hold = fixture.controls.before_rebind(&job, admitted.capacity());
-            tokio::pin!(hold);
-            assert!(futures::poll!(hold.as_mut()).is_pending());
-            assert!(!fixture.ready().exists());
-            assert!(!fixture.count().exists());
-            let resume = async {
-                receipt.bind(job.job_id).unwrap();
-                let failure_watchdog =
-                    (Instant::now() + Duration::from_secs(2)).min(fixture.role.scope().deadline());
-                while !fixture.ready().exists() {
-                    assert!(
-                        Instant::now() < failure_watchdog,
-                        "actual hold was not reached"
-                    );
-                    tokio::task::yield_now().await;
-                }
-                assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "0\n");
-                fs::write(fixture.resume(), "resume\n").unwrap();
-            };
-            let (authorized, ()) = tokio::join!(hold, resume);
-            let mut authorized = authorized.unwrap().unwrap();
-            authorized
-                .record_dispatch(&job, admitted.capacity())
-                .unwrap();
-            assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "1\n");
-        });
+        let mut authorized = claim(&fixture, &admitted);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut held = Box::pin(authorized.wait_before_planning());
+        assert!(held.as_mut().poll(&mut cx).is_pending());
+        assert!(fixture.ready().exists());
+        let before = wake.0.load(Ordering::SeqCst);
+        fixture.controls.close().unwrap();
+        assert!(
+            wake.0.load(Ordering::SeqCst) > before,
+            "closing the original owner must wake its registered statement wait"
+        );
+        assert!(
+            matches!(held.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error.contains("observation closed"))
+        );
     }
     #[test]
-    fn session_close_ends_actual_hold_and_joins_original_worker() {
+    fn session_close_ends_the_actual_statement_hold() {
         let fixture = Fixture::new();
         let admitted = Admitted::new();
-        let jobs = RealJobs::new();
-        let (receipt, job) = pending(&fixture, &jobs);
-        receipt.bind(job.job_id).unwrap();
+        let mut authorized = claim(&fixture, &admitted);
         std::thread::scope(|threads| {
-            let controls = &fixture.controls;
-            let selected_job = &job;
-            let capacity = admitted.capacity();
-            let worker =
-                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
+            let worker = threads.spawn(move || drive(authorized.wait_before_planning()));
             fixture.wait_until_held();
             fixture.role.close();
-            let error = worker
-                .join()
-                .unwrap()
-                .err()
-                .expect("session close ended actual hold");
+            let error = worker.join().unwrap().unwrap_err();
             assert!(error.contains("session closed"), "{error}");
-            assert!(!fixture.resume().exists());
             assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "0\n");
         });
     }
     #[test]
-    fn real_work_cancellation_ends_actual_hold_and_joins_original_worker() {
+    fn real_work_cancellation_ends_the_actual_statement_hold() {
         let fixture = Fixture::new();
         let admitted = Admitted::new();
-        let jobs = RealJobs::new();
-        let (receipt, job) = pending(&fixture, &jobs);
-        receipt.bind(job.job_id).unwrap();
+        let mut authorized = claim(&fixture, &admitted);
         std::thread::scope(|threads| {
-            let controls = &fixture.controls;
-            let selected_job = &job;
-            let capacity = admitted.capacity();
-            let worker =
-                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
+            let worker = threads.spawn(move || drive(authorized.wait_before_planning()));
             fixture.wait_until_held();
             admitted.cancel();
-            let error = worker
-                .join()
-                .unwrap()
-                .err()
-                .expect("real work cancellation ended actual hold");
+            let error = worker.join().unwrap().unwrap_err();
             assert!(error.to_lowercase().contains("cancel"), "{error}");
             assert!(fixture.role.scope().is_active());
-            assert!(!fixture.resume().exists());
             assert_eq!(fs::read_to_string(fixture.count()).unwrap(), "0\n");
-        });
-    }
-    #[test]
-    fn receipt_wait_expires_at_original_session_deadline_without_entering_hold() {
-        let fixture = Fixture::with_lifetime(3_000);
-        let original_deadline = fixture.role.scope().deadline();
-        let admitted = Admitted::new();
-        let jobs = RealJobs::new();
-        let (_unbound_receipt, job) = pending(&fixture, &jobs);
-        std::thread::scope(|threads| {
-            let controls = &fixture.controls;
-            let selected_job = &job;
-            let capacity = admitted.capacity();
-            let worker =
-                threads.spawn(move || drive(controls.before_rebind(selected_job, capacity)));
-            let error = worker
-                .join()
-                .unwrap()
-                .err()
-                .expect("original deadline ended receipt wait");
-            assert!(Instant::now() >= original_deadline);
-            assert!(
-                error.contains("timed out") || error.contains("session closed"),
-                "{error}"
-            );
-            assert!(!fixture.ready().exists());
-            assert!(!fixture.count().exists());
-            assert!(
-                fixture.controls.slots[0]
-                    .state
-                    .lock()
-                    .unwrap()
-                    .work_id
-                    .is_none()
-            );
         });
     }
 }

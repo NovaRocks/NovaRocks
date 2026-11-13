@@ -244,35 +244,12 @@ pub enum ReferenceAnchorSql {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatisticsSqlCommand {
     AnalyzeTable {
-        mode: AnalyzeModeSql,
-        table: ObjectName,
-        columns: Vec<String>,
-        with_sync_mode: bool,
-    },
-    ShowAnalyzeJobs,
-    CancelAnalyze {
-        job_id: String,
-    },
-    ShowTableStats {
-        table: ObjectName,
-    },
-    DropStats {
-        table: ObjectName,
-    },
-    DropHistogram {
         table: ObjectName,
         columns: Vec<String>,
     },
-    DropMultipleColumnsStats {
+    ShowStats {
         table: ObjectName,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnalyzeModeSql {
-    Default,
-    Full,
-    Sample,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,7 +273,6 @@ pub enum MaintenanceSqlCommand {
         table: ObjectName,
         older_than: MaintenanceValueSql,
     },
-    ShowOptimize(ShowOptimizeSqlCommand),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,30 +299,4 @@ pub enum MaintenanceValueSql {
 pub enum ExpireSnapshotsOptionSql {
     OlderThan(MaintenanceValueSql),
     RetainLast(MaintenanceValueSql),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowOptimizeSqlCommand {
-    pub from: Option<ObjectName>,
-    pub filter: Option<ShowOptimizeFilterSql>,
-    pub order_by: Option<ShowOptimizeOrderSql>,
-    pub limit: Option<CommandLiteral>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowOptimizeFilterSql {
-    pub column: String,
-    pub value: CommandLiteral,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShowOptimizeOrderSql {
-    pub column: String,
-    pub direction: Option<SortDirectionSql>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortDirectionSql {
-    Asc,
-    Desc,
 }

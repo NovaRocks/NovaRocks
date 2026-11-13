@@ -74,11 +74,10 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 -- query 5
 -- A full publication contains the three declared seed rows. Processed input
 -- and physical write counts are not the oracle for LastRefreshRows.
--- @result_rows_where=Name=orders_mv
+-- @result_rows_where=name=orders_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=3
--- @result_rows_expect=StorageEngine=iceberg
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=3
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_ice_${uuid0}';
 
 -- query 6
 -- @skip_result_check=true
@@ -105,11 +104,10 @@ REFRESH MATERIALIZED VIEW orders_mv FULL;
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 12
--- @result_rows_where=Name=orders_mv
+-- @result_rows_where=name=orders_mv
 -- @result_rows_count=1
--- @result_rows_expect=LastRefreshRows=4
--- @result_rows_expect=StorageEngine=iceberg
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_expect=last_refresh_rows=4
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_ice_${uuid0}';
 
 -- query 13
 -- @cleanup=true

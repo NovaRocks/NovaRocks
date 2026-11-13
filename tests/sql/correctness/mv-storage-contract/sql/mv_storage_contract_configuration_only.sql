@@ -77,8 +77,10 @@ ALTER MATERIALIZED VIEW mv_config PAUSE REFRESH;
 
 -- query 8
 -- @result_contains=mv_config
--- @result_contains=PAUSED
-SHOW MATERIALIZED VIEWS;
+-- @result_rows_where=name=mv_config
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_paused=true
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcfg_${uuid0}';
 
 -- query 9
 -- @skip_result_check=true
@@ -87,9 +89,11 @@ ALTER MATERIALIZED VIEW mv_config SET REFRESH ASYNC ON CHANGE;
 
 -- query 10
 -- @result_contains=mv_config
--- @result_contains=ASYNC_ON_CHANGE
--- @result_contains=PAUSED
-SHOW MATERIALIZED VIEWS;
+-- @result_contains=ON_CHANGE
+-- @result_rows_where=name=mv_config
+-- @result_rows_count=1
+-- @result_rows_expect=refresh_paused=true
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcfg_${uuid0}';
 
 -- query 11
 -- @skip_result_check=true
@@ -110,7 +114,7 @@ SELECT k, v FROM mv_config ORDER BY k, v;
 -- @result_contains=mv_config
 -- @result_contains=MANUAL
 -- @result_contains=false
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcfg_${uuid0}';
 
 -- query 15
 -- A later publication observes the revised C but still uses the same D/L/P
@@ -123,7 +127,7 @@ REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
 -- @result_contains=mv_config
 -- @result_contains=MANUAL
 -- @result_contains=false
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcfg_${uuid0}';
 
 -- query 17
 -- A metadata-only user property update must not require a legacy package.
@@ -145,7 +149,7 @@ SELECT k, v FROM mv_config ORDER BY k, v;
 -- @result_contains=mv_config
 -- @result_contains=MANUAL
 -- @result_contains=false
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvcfg_${uuid0}';
 
 -- query 21
 -- @cleanup=true

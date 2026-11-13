@@ -322,7 +322,7 @@ pub(crate) async fn prepare_physical_rewrite(
     .await?;
     let mut summary = super::overwrite::snapshot_file_summary(&intent.changes().added, &deleted)?;
     if data_rewrite {
-        summary.insert("total-records".into(), summary["added-records"].clone());
+        super::overwrite::set_physical_rows_after_removal(view, &mut summary)?;
     }
     if !data_rewrite {
         summary.insert("rewritten-delete-files".into(), removed.len().to_string());

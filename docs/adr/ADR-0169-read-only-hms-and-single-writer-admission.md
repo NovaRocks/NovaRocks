@@ -5,6 +5,9 @@ domain: [provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0231
+    scope: "StatementJob/JobAttempt and catalog-dependent job completion/cancellation in decisions 4-6; owner admission, HMS read-only and publication separation remain"
 date: 2026-10-09
 provenance:
   - "discussion: 2026-10-09 HMS read-only compatibility and single-writer statement job completion"
@@ -13,9 +16,9 @@ code-anchors:
   - "novarocks/connector/iceberg/src/catalog/mod.rs (NovaRocksCatalog::admit)"
   - "novarocks/connector/iceberg/src/catalog/hive.rs (NovaRocksHiveCatalog::admit_operation)"
   - "novarocks/connector/iceberg/src/catalog/hadoop.rs (NovaRocksHadoopCatalog::admit_initiation)"
-  - "novarocks/frontend-application/src/query_execution/maintenance.rs (capture_admitted_optimize_target_with_ports)"
-  - "novarocks/frontend-application/src/statistics_jobs/service.rs (await_statistics_conclusion)"
-  - "novarocks/table-maintenance/src/worker.rs (run_worker)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs (prepare_optimize)"
+  - "novarocks/frontend-application/src/statistics/attempt_executor/statement.rs (StatementStatisticsAction)"
+  - "novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs (DirectRewriteAction)"
 ---
 
 ## 问题

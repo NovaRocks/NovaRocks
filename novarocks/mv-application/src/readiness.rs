@@ -336,15 +336,7 @@ impl MvKeyedReadinessService {
     {
         self.legacy().list_ready_projections().await
     }
-    pub async fn list_ready_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
-        bound: crate::repository::MvDependencyReadBound,
-    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
-        self.legacy()
-            .list_ready_dependencies_by_downstream_bounded(loaded, bound)
-            .await
-    }
+
     pub async fn ensure_no_ready_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectIdentity,
@@ -814,26 +806,7 @@ impl MvKeyedReadinessExecution {
         }
         Ok(values)
     }
-    pub async fn list_ready_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
-        bound: crate::repository::MvDependencyReadBound,
-    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
-        let target = loaded.projection.facts.target();
-        let order = self.runtime.projection_order(target.clone());
-        let cell = order.lock().await;
-        if !matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
-            || cell.installed.as_ref() != Some(&loaded.version)
-        {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Unavailable,
-                "keyed dependency root is not ready",
-            ));
-        }
-        self.repository
-            .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
-            .await
-    }
+
     pub async fn ensure_no_ready_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectIdentity,
@@ -1068,7 +1041,6 @@ impl MvKeyedReadinessExecution {
 mod keyed_tests {
     use super::*;
     use crate::persistence::keyed_documents::*;
-    use crate::repository::MvDependencyReadBound;
     struct Source(MvKeyedObservedCurrentDocuments);
     #[async_trait::async_trait]
     impl MvKeyedCurrentProjectionSource for Source {
@@ -1165,13 +1137,7 @@ mod keyed_tests {
         assert!(inventory.next_ready().await.unwrap().is_some());
         assert!(inventory.next_ready().await.unwrap().is_none());
         let dependencies = service
-            .list_ready_dependencies_by_downstream_bounded(
-                &loaded,
-                MvDependencyReadBound {
-                    entries: 8,
-                    collection_bytes: 64 * 1024,
-                },
-            )
+            .list_ready_dependencies_by_downstream(&loaded)
             .await
             .unwrap();
         assert_eq!(dependencies.len(), 2);
@@ -1333,25 +1299,7 @@ impl ReadinessRepository {
             }
         }
     }
-    async fn list_keyed_dependencies_by_downstream_bounded(
-        &self,
-        loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,
-        bound: crate::repository::MvDependencyReadBound,
-    ) -> Result<Vec<crate::persistence::dependency::StoredMvDependency>, MvRepositoryError> {
-        match &self.execution {
-            ReadinessExecution::Legacy => {
-                self.repository
-                    .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
-                    .await
-            }
-            ReadinessExecution::Original(execution) => {
-                self.repository
-                    .in_requests(execution.as_ref())
-                    .list_keyed_dependencies_by_downstream_bounded(loaded, bound)
-                    .await
-            }
-        }
-    }
+
     async fn list_keyed_dependencies_by_downstream(
         &self,
         loaded: &crate::state_store_repository::keyed::LoadedKeyedMvProjection,

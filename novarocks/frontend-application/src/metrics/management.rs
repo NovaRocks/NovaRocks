@@ -73,7 +73,7 @@ struct FrontendIslandManagementSnapshot {
     ready: bool,
 }
 
-/// The management and SQL exits consume the same typed topology rows.
+/// Management consumes the topology owner's typed rows.
 #[derive(serde::Serialize)]
 struct FrontendBackendsSnapshot {
     schema_version: u8,
@@ -664,12 +664,11 @@ mod tests {
     }
 
     #[test]
-    fn management_backend_projection_matches_show_backends() {
+    fn management_backend_projection_preserves_original_typed_rows() {
         use novarocks_execution::task_execution::AdmissionEpochCapability;
         use novarocks_execution_contract::{
             BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
         };
-        use novarocks_query_application::api::BackendTopologyCommandPort;
         use novarocks_types::{BackendProcessId, NativeCompatibilityId};
 
         let service = Arc::new(crate::topology::ClusterBackendService::new_transient_for_test(1));
@@ -694,7 +693,8 @@ mod tests {
             AdmissionEpochCapability::try_from_bytes([0x61; 16]).unwrap(),
             17,
         );
-        let sql = service.show_backends().expect("SHOW BACKENDS");
+        let expected =
+            serde_json::to_value(service.backend_rows().expect("typed topology rows")).unwrap();
         let app = frontend_management_router_with_readers(
             FrontendMetricsRegistry::new().unwrap(),
             Arc::new(FrontendServingLifecycle::new()),
@@ -748,19 +748,7 @@ mod tests {
             "status_detail",
         ];
         assert_eq!(backend.as_object().unwrap().len(), fields.len());
-        for (index, field) in fields.iter().enumerate() {
-            let actual = &backend[field];
-            let text = actual
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| actual.to_string());
-            let sql_column = sql.batches[0]
-                .column(index)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
-            assert_eq!(text, sql_column.value(0), "field {field}");
-        }
+        assert_eq!(json["backends"], expected);
         assert_eq!(backend["process_id"], descriptor.process_id().to_string());
         assert_eq!(backend["eligible"], true);
         assert_eq!(backend["last_heartbeat_ms"], 17);

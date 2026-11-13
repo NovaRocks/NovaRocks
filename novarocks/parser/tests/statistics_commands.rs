@@ -23,57 +23,90 @@ use novarocks_parser::{
 
 #[test]
 fn statistics_command_corpus_is_typed_and_round_trips() {
-    let source = "analyze full table `ice`.db.t (`a`, b) with sync mode; SHOW ANALYZE JOBS; KILL ANALYZE 018f8c30-8a95-7b4e-b515-4da6f2aeb419; SHOW TABLE STATS db.t; DROP STATS db.t; DROP HISTOGRAM ON db.t (`a`, b); DROP MULTIPLE COLUMNS STATS db.t";
+    let source =
+        "analyze table `ice`.db.t (`a`, b); SHOW STATS FOR db.t; SHOW STATS FOR `ice`.`db`.`t`";
     let statements = parse(source).expect("statistics corpus parse");
-    assert!(matches!(
-        statements[0],
-        Statement::Statistics(StatisticsStatement::AnalyzeTable(_))
-    ));
-    assert!(matches!(
-        statements[1],
-        Statement::Statistics(StatisticsStatement::ShowAnalyzeJobs(_))
-    ));
-    assert!(matches!(
-        statements[2],
-        Statement::Statistics(StatisticsStatement::CancelAnalyze(_))
-    ));
-    assert!(matches!(
-        statements[3],
-        Statement::Statistics(StatisticsStatement::ShowTableStats(_))
-    ));
-    assert!(matches!(
-        statements[4],
-        Statement::Statistics(StatisticsStatement::DropStats(_))
-    ));
-    assert!(matches!(
-        statements[5],
-        Statement::Statistics(StatisticsStatement::DropHistogram(_))
-    ));
-    assert!(matches!(
-        statements[6],
-        Statement::Statistics(StatisticsStatement::DropMultipleColumnsStats(_))
-    ));
+    let Statement::Statistics(StatisticsStatement::AnalyzeTable(analyze)) = &statements[0] else {
+        panic!("ANALYZE");
+    };
+    assert_eq!(
+        analyze
+            .columns
+            .iter()
+            .map(|value| value.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    let Statement::Statistics(StatisticsStatement::ShowStats(show)) = &statements[1] else {
+        panic!("SHOW STATS");
+    };
+    assert_eq!(
+        show.name
+            .parts
+            .iter()
+            .map(|value| value.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["db", "t"]
+    );
     let printed = print_statements(&statements);
-    let reparsed = parse(&printed).expect("printed statistics corpus parse");
-    assert_eq!(print_statements(&reparsed), printed);
+    assert_eq!(
+        printed,
+        "ANALYZE TABLE `ice`.db.t (`a`, b); SHOW STATS FOR db.t; SHOW STATS FOR `ice`.`db`.`t`"
+    );
+    assert_eq!(print_statements(&parse(&printed).unwrap()), printed);
 }
 
 #[test]
-fn malformed_statistics_forms_have_parse_errors() {
-    let error = parse("ANALYZE TABLE t (a,").expect_err("unterminated columns");
-    assert_eq!(
-        error.to_user_error("ANALYZE TABLE t (a,").code().as_str(),
-        "sql.parse.unexpected_token"
-    );
+fn retired_statistics_forms_are_syntax_errors() {
     for source in [
-        "SHOW BASIC STATS",
+        "SHOW ANALYZE",
+        "SHOW ANALYZE JOBS",
+        "CANCEL ANALYZE 1",
+        "KILL ANALYZE 1",
+        "SHOW TABLE STATS t",
+        "DROP STATS t",
+        "DROP HISTOGRAM ON t (c)",
+        "DROP MULTIPLE COLUMNS STATS t",
+        "ANALYZE FULL TABLE t",
+        "ANALYZE SAMPLE TABLE t",
+        "ANALYZE TABLE t WITH SYNC MODE",
         "SHOW BASIC STATS META",
         "SHOW HISTOGRAM STATS META",
     ] {
-        let error = parse(source).expect_err("retired metadata command must fail in parsing");
         assert_eq!(
-            error.to_user_error(source).code().as_str(),
-            "sql.parse.unexpected_token"
+            parse(source)
+                .unwrap_err()
+                .to_user_error(source)
+                .code()
+                .as_str(),
+            "sql.parse.unexpected_token",
+            "{source}"
         );
     }
+}
+#[test]
+fn malformed_statistics_forms_have_parse_errors() {
+    for source in ["ANALYZE TABLE t (a,", "SHOW STATS t", "SHOW STATS FOR"] {
+        assert_eq!(
+            parse(source)
+                .unwrap_err()
+                .to_user_error(source)
+                .code()
+                .as_str(),
+            "sql.parse.unexpected_token",
+            "{source}"
+        );
+    }
+}
+#[test]
+fn show_stats_subqueries_are_explicitly_unsupported() {
+    let source = "SHOW STATS FOR (SELECT 1)";
+    assert_eq!(
+        parse(source)
+            .unwrap_err()
+            .to_user_error(source)
+            .code()
+            .as_str(),
+        "sql.parse.unsupported_statement"
+    );
 }

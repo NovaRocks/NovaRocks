@@ -639,6 +639,32 @@ pub fn build_final_frozen_connector_write_plan(
     let physical = source
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
+    // This input is one provider-frozen rewrite group, not one independent
+    // writer per scan split. Gather its rows through the existing exchange so
+    // one streaming writer can coalesce files while retaining normal backpressure.
+    // Scan placement remains ScanWork and can use every admitted backend.
+    let output_columns = physical.output_columns.clone();
+    let physical = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Redistribute(
+            crate::planner::physical::RedistributeNode {
+                mode: crate::planner::physical::RedistributeMode::Gather,
+                partition_exprs: Vec::new(),
+                output_columns: output_columns.clone(),
+            },
+        ),
+        stats: physical.stats.clone(),
+        children: vec![physical],
+        output_columns,
+        probe_runtime_filters: Vec::new(),
+    };
+    // A group has one streaming writer. This is the algorithm's physical
+    // layout, not a resource quota or a claim about cluster membership.
+    let mut final_write = final_write;
+    final_write.plan.dop_domain = novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max: 1,
+        requires_power_of_two: false,
+    };
     let target_schema =
         crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
             &sink.0, control,
@@ -4032,6 +4058,118 @@ mod tests {
                 ),
             ),
         )
+    }
+
+    #[test]
+    fn frozen_cohort_gathers_distributed_scans_into_one_streaming_writer() {
+        use super::*;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use novarocks_physical_plan::{Distribution, NodeKind, StagePlacementPolicy};
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+            ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceId,
+            ConnectorProviderId, ConnectorWriteFieldToken,
+        };
+        use std::sync::Arc;
+        let binding = crate::binding::SqlTableBindingId::new_for_test(1);
+        let source = crate::planning::query_execution::build_frozen_connector_scan_plan(
+            &crate::planning::query_execution::FrozenConnectorScanIdentity::new(
+                "iceberg", "db", "t",
+            ),
+            &Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            binding,
+        );
+        let column = novarocks_types::schema::ColumnDef {
+            name: "id".into(),
+            data_type: DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        };
+        let sink = DmlWritePlanInput::try_new(
+            DmlWriteSinkMode::Data,
+            DmlWriteTarget {
+                binding: crate::binding::SqlTableBindingId::new_for_test(2),
+                catalog: "iceberg".into(),
+                namespace: "db".into(),
+                table: "t".into(),
+                fields: vec![DmlWriteTargetField {
+                    token: ConnectorWriteFieldToken::from_bytes([4; 32]),
+                    column: column.clone(),
+                    is_hidden: false,
+                }],
+            },
+            vec![column],
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+        )
+        .unwrap();
+        let ordinal =
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).unwrap();
+        let handle = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("statistics").unwrap(),
+                    CatalogVersion::from_bytes([3; 32]),
+                ),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            vec![7].into(),
+        );
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let authored = build_final_frozen_connector_write_plan(
+            source,
+            sink,
+            ordinal,
+            &[],
+            crate::functions::builtin_sql_function_catalog().snapshot(),
+            &SessionOptimizerSettings::default(),
+            DmlFinalWritePlanContext::new(
+                statistics_final_context(),
+                DmlFinalizedWriteTargetSet::try_new([DmlFinalizedWriteTarget { ordinal, handle }])
+                    .unwrap(),
+            ),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        let plan = authored.plan();
+        let scan = plan
+            .fragments()
+            .values()
+            .find(|fragment| {
+                fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::Scan { .. }))
+            })
+            .unwrap();
+        let writer = plan
+            .fragments()
+            .values()
+            .find(|fragment| {
+                fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::TableWriter { .. }))
+            })
+            .unwrap();
+        assert_eq!(scan.stage_placement(), &StagePlacementPolicy::ScanWork);
+        assert_ne!(scan.id(), writer.id());
+        assert_eq!(writer.stage_placement(), &StagePlacementPolicy::Singleton);
+        assert_eq!((writer.dop_domain().min, writer.dop_domain().max), (1, 1));
+        let edge = plan
+            .edges()
+            .values()
+            .find(|edge| {
+                edge.source.fragment == scan.id() && edge.destination.fragment == writer.id()
+            })
+            .unwrap();
+        assert_eq!(edge.partitioning.destination, Distribution::Singleton);
+        assert!(scan.nodes().values().any(|node| matches!(node.kind, NodeKind::Scan { occurrence, .. } if occurrence == novarocks_physical_plan::ProviderReadOccurrenceId::new(37))));
     }
 
     #[test]

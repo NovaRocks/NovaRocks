@@ -499,11 +499,13 @@ Trino 呈现对宽整数、无符号整数、opaque 与精度大于 38 的 decim
 
 查看后端：
 
-```sql
-SHOW BACKENDS;
+```bash
+curl --noproxy '*' -fsS "http://<fe-management-host>:<server.http_port>/v1/frontend/backends"
 ```
 
-检查每个 BE 的 `ProcessId`、`Endpoint`、`IdentityVerified` 与 `Eligible` 等字段。`Endpoint` 展示 Data endpoint；至少应有一个 BE `Eligible=true` 后再执行查询。
+使用 FE 的管理 HTTP 端口 `[server].http_port`。响应的 `backends` 数组包含每个 BE 的
+`process_id`、`endpoint`、`identity_verified` 与 `eligible`；`endpoint` 为 Data endpoint。
+至少应有一个 BE `eligible=true` 后再执行查询。
 
 执行最小查询：
 
@@ -534,7 +536,7 @@ BE advertised Control 不依赖可选的 bounded-root 支持字段。
 FE 按该 descriptor 的 Control endpoint 反向 `Heartbeat`，并比较完整 descriptor。
 Data 或 Control endpoint 漂移都不能通过 exact heartbeat verification；同一 process
 identity 的不同 descriptor announce 也会拒绝。二者完全一致才调度新查询。
-`SHOW BACKENDS` 只读展示 `ProcessId`、lease、identity verification、reported state、compatibility 和 derived `Eligible`。`ADD BACKEND`、`DROP BACKEND`、`[cluster].backends` 均不是产品接口。
+管理 API `GET /v1/frontend/backends` 只读展示 process identity、lease、identity verification、reported state、compatibility 和 derived `eligible`。`ADD BACKEND`、`DROP BACKEND`、`[cluster].backends` 均不是产品接口。
 
 ## 启停顺序
 
@@ -542,8 +544,8 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 
 1. 启动对象存储、catalog、HDFS 等外部依赖。
 2. 启动 FE 节点，等待 `NOVAROCKS_READY role=fe trino_port=...`。
-3. 启动所有 BE 节点，等待 `NOVAROCKS_READY role=be` 及 `SHOW BACKENDS` 中 `Eligible=true`。
-4. 连接 FE 并执行 `SHOW BACKENDS`。
+3. 启动所有 BE 节点，等待 `NOVAROCKS_READY role=be` 及管理 API 中 `eligible=true`。
+4. 访问 FE 管理 API `GET /v1/frontend/backends`，核对全部预期 BE。
 5. 执行最小查询和一条真实数据查询。
 
 推荐停止顺序：
@@ -561,7 +563,7 @@ identity 的不同 descriptor announce 也会拒绝。二者完全一致才调�
 
 | 现象 | 处理方式 |
 | --- | --- |
-| `SHOW BACKENDS` 为空 | 确认 BE 已启动、`frontend_endpoint` 指向 FE Native listener，且所有 role 的 Native trust 配置一致。 |
+| 管理 API 的 `backends` 数组为空 | 确认 BE 已启动、`frontend_endpoint` 指向 FE Native listener，且所有 role 的 Native trust 配置一致。 |
 | BE 一直不 Eligible | 确认 FE 能访问 BE 的两个 advertised endpoint，特别是 Heartbeat 的 Control 端口；检查 announce 与完整 heartbeat descriptor、process identity 和 build diagnostics。 |
 | `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
 | TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |

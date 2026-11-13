@@ -234,6 +234,12 @@ impl InventoryFixture {
         // one admitted Root and the SAME already-installed ordinary QB pool.
         let old = resources.source.take().unwrap();
         let mut owners = old.owners.clone();
+        owners.system_relations = Arc::new(
+            novarocks_query_application::system_tables::SystemTableRegistry::try_new([
+                crate::system_tables::materialized_view_states_registration(),
+            ])
+            .unwrap(),
+        );
         owners.materialized_views = readiness_port.candidate_reader();
         owners.mv_readiness = readiness_port;
         owners.state_store = Some(binding);
@@ -482,4 +488,99 @@ async fn cancelled_actual_sqlite_inventory_retains_operation_and_original_range_
     );
     drop(source);
     fixture.finish(true).await;
+}
+
+#[tokio::test]
+async fn actual_sqlite_state_table_uses_frozen_projection_and_only_reads_projected_dependencies() {
+    use arrow::array::{Array, BooleanArray, ListArray, StringArray};
+    let mut fixture = InventoryFixture::new().await;
+    let source = fixture.resources.source();
+    let registry = Arc::clone(source.owners.system_relations());
+    let novarocks_query_application::system_tables::SystemTableLookup::Declared(declaration) =
+        registry.declare(
+            &novarocks_sql::system_table::SystemTableBinding::System,
+            "runtime",
+            "materialized_view_states",
+        )
+    else {
+        panic!("registered MV state table")
+    };
+    let provider = FrontendSystemTableProvider::new(registry, source.clone());
+    let mut read_counts = Vec::new();
+    for columns in [vec![0, 1, 2, 3, 5, 10], vec![11]] {
+        let start = fixture.trace.begins.load(Ordering::SeqCst);
+        let request = SystemTableRequest::try_new(
+            declaration.clone(),
+            columns.clone(),
+            Default::default(),
+            &source.scope.connector_context,
+            4,
+        )
+        .unwrap();
+        let result = driven(
+            &fixture.resources.control,
+            &mut fixture.resources.driver,
+            provider.snapshot(&request),
+        )
+        .await
+        .unwrap();
+        read_counts.push(fixture.trace.begins.load(Ordering::SeqCst) - start);
+        assert_eq!(
+            result.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            1
+        );
+        let b = &result.batches[0];
+        if columns.len() > 1 {
+            assert_eq!(
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "ice.main"
+            );
+            assert_eq!(
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "db"
+            );
+            assert_eq!(
+                b.column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "mv_inventory"
+            );
+            assert!(b.column(4).as_any().is::<BooleanArray>());
+            assert!(b.column(5).as_any().is::<ListArray>());
+        } else {
+            let upstream = b.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+            assert!(upstream.is_valid(0));
+            assert_eq!(upstream.value(0).len(), 0);
+        }
+        drop(result);
+    }
+    assert_eq!(
+        read_counts[1],
+        read_counts[0] + 1,
+        "only the projected dependency column begins its extra read transaction"
+    );
+    drop(provider);
+    driven(
+        &fixture.resources.control,
+        &mut fixture.resources.driver,
+        source.close(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.trace.begins.load(Ordering::SeqCst),
+        fixture.trace.closes.load(Ordering::SeqCst)
+    );
+    drop(source);
+    fixture.finish(false).await;
 }

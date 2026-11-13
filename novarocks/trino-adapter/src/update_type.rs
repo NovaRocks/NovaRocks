@@ -18,21 +18,17 @@
 //! Protocol task names derived only from the application's admitted statement kind.
 use novarocks_query_application::statement_kind::StatementKind;
 
-/// Returns a candidate update type. The actual row carrier suppresses this
-/// candidate, including CALL procedures that return rows.
+/// Returns a candidate update type. Row carriers suppress it except when
+/// Trino explicitly reports rows and an update type, as OPTIMIZE does.
 pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
     use StatementKind::*;
     Some(match kind {
         Empty
         | Query
         | Explain
-        | ShowBackends
         | ShowProcessList
-        | ShowAnalyzeJobs
-        | ShowTableStats
+        | ShowStats
         | ShowCreateTable
-        | ShowOptimize
-        | ShowMaterializedViews
         | ExplainMaterializedViewRefresh
         | ShowCreateView => return None,
         Analyze => "ANALYZE",
@@ -68,10 +64,6 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         Commit => "COMMIT",
         Rollback => "ROLLBACK",
         // These NovaRocks statement forms have no Trino 483 task counterpart.
-        CancelAnalyze => "CANCEL ANALYZE",
-        DropStats => "DROP STATS",
-        DropHistogram => "DROP HISTOGRAM",
-        DropMultipleColumnsStats => "DROP MULTIPLE COLUMNS STATS",
         ReorderColumn => "REORDER COLUMN",
         SetColumnNotNull => "SET NOT NULL",
         UnsetTableProperties => "UNSET PROPERTIES",
@@ -80,7 +72,7 @@ pub(crate) fn update_type(kind: StatementKind) -> Option<&'static str> {
         CreateTag => "CREATE TAG",
         DropTag => "DROP TAG",
         AddFiles => "ADD FILES",
-        Optimize => "OPTIMIZE",
+        Optimize => "ALTER TABLE EXECUTE",
         RewriteManifests => "REWRITE MANIFESTS",
         ExpireSnapshots => "EXPIRE SNAPSHOTS",
         RemoveOrphanFiles => "REMOVE ORPHAN FILES",

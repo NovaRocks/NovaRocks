@@ -16,7 +16,7 @@
 // under the License.
 
 use super::construction::RowStage;
-use super::source::StatementSystemTableSource;
+use super::source::{StatementSystemTableSource, SystemValueRef};
 use async_trait::async_trait;
 use novarocks_mv_application::freshness::mv_publication_freshness;
 use novarocks_query_application::system_tables::{
@@ -28,6 +28,71 @@ use novarocks_sql::system_table::{SystemTableBinding, SystemTableKeyValues};
 use novarocks_types::naming::DEFAULT_CATALOG;
 use std::sync::Arc;
 
+pub(crate) fn materialized_view_states_registration()
+-> novarocks_query_application::system_tables::SystemTableRegistration {
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use novarocks_query_application::system_tables::{SystemTableRegistration, SystemTableScope};
+    use novarocks_sql::system_table::SystemTableColumn;
+    use novarocks_type_contract::FunctionValueType;
+    let text_list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+    let columns = [
+        ("catalog_name", DataType::Utf8, false),
+        ("schema_name", DataType::Utf8, false),
+        ("name", DataType::Utf8, false),
+        ("refresh_policy", DataType::Utf8, false),
+        ("refresh_interval_ms", DataType::Int64, true),
+        ("refresh_paused", DataType::Boolean, false),
+        (
+            "last_refresh_time",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            true,
+        ),
+        ("last_refresh_rows", DataType::Int64, true),
+        ("manageability", DataType::Utf8, false),
+        ("manageability_reason", DataType::Utf8, true),
+        ("base_tables", text_list.clone(), false),
+        ("upstream_materialized_views", text_list, true),
+    ]
+    .into_iter()
+    .map(|(name, ty, nullable)| SystemTableColumn {
+        name: name.into(),
+        value_type: FunctionValueType::new(ty, nullable),
+    })
+    .collect::<Vec<_>>();
+    SystemTableRegistration {
+        scope: SystemTableScope::System,
+        schema: "runtime".into(),
+        table: "materialized_view_states".into(),
+        columns: columns.into(),
+        key_columns: Arc::from([0, 1, 2]),
+    }
+}
+fn manageability_parts(
+    manageability: &novarocks_mv_application::readiness::MvListedManageability,
+    phase: novarocks_mv_application::management::MvManagementPhase,
+) -> (&'static str, Option<&str>) {
+    use novarocks_mv_application::{
+        management::MvManagementPhase as P, readiness::MvListedManageability as R,
+    };
+    match manageability {
+        R::ReadOnly(reason) => ("READ_ONLY", Some(reason)),
+        R::Unavailable(reason) => ("UNAVAILABLE", Some(reason)),
+        R::Manageable => match phase {
+            P::Manageable | P::NotObserved => ("MANAGEABLE", None),
+            P::Managing => ("MANAGING", None),
+            other => ("READ_ONLY", Some(other.as_str())),
+        },
+    }
+}
+fn signed_fact(value: u64, fact: &str) -> Result<i64, SystemTableError> {
+    i64::try_from(value).map_err(|_| {
+        novarocks_spi::connector::ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            format!("materialized-view {fact} exceeds signed SQL width"),
+        )
+        .into()
+    })
+}
 pub(crate) struct FrontendSystemTableProvider {
     registry: Arc<SystemTableRegistry>,
     source: Arc<dyn StatementSystemTableSource>,
@@ -53,7 +118,13 @@ impl<'a> Batches<'a> {
             rows: 0,
         }
     }
-    async fn push(&mut self, values: &[Option<&str>]) -> Result<(), SystemTableError> {
+    async fn push<const N: usize>(
+        &mut self,
+        values: &[Option<&str>; N],
+    ) -> Result<(), SystemTableError> {
+        self.push_values(&values.map(SystemValueRef::from)).await
+    }
+    async fn push_values(&mut self, values: &[SystemValueRef<'_>]) -> Result<(), SystemTableError> {
         self.request
             .context
             .original_operation_control()
@@ -154,6 +225,97 @@ impl SystemTableProvider for FrontendSystemTableProvider {
                             None,
                             Some(""),
                             Some(&facts.definition),
+                        ])
+                        .await?;
+                }
+            }
+            (SystemTableBinding::System, "runtime", "materialized_view_states") => {
+                let mut inventory = self
+                    .source
+                    .materialized_view_states(request.context)
+                    .await?;
+                while let Some(facts) = inventory.next().await? {
+                    if !request.key_constraint.allows(0, &facts.catalog)
+                        || !request.key_constraint.allows(1, &facts.schema)
+                        || !request.key_constraint.allows(2, &facts.name)
+                    {
+                        continue;
+                    }
+                    let state = facts.state.as_ref().ok_or_else(|| {
+                        SystemTableError::Internal(
+                            "materialized-view inventory omitted requested state facts".into(),
+                        )
+                    })?;
+                    let projection = &state.loaded.projection.facts;
+                    let configuration = projection.configuration();
+                    use novarocks_mv_application::persistence::codec::RefreshPolicy;
+                    let policy = match configuration.refresh_policy {
+                        RefreshPolicy::Manual => "MANUAL",
+                        RefreshPolicy::AsyncOnChange => "ON_CHANGE",
+                        RefreshPolicy::AsyncInterval => "INTERVAL",
+                    };
+                    let interval = if request.requires(4)
+                        && configuration.refresh_policy == RefreshPolicy::AsyncInterval
+                    {
+                        configuration
+                            .refresh_interval_ms
+                            .map(|v| signed_fact(v, "refresh interval"))
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    let published = projection.publication();
+                    let last_time = published
+                        .filter(|_| request.requires(6))
+                        .map(|p| {
+                            signed_fact(p.publication_prepared_at_ms, "publication prepared time")
+                        })
+                        .transpose()?;
+                    let last_rows = published
+                        .filter(|_| request.requires(7))
+                        .and_then(|p| p.logical_result_rows)
+                        .map(|v| signed_fact(v, "publication row count"))
+                        .transpose()?;
+                    let (manageability, reason) =
+                        manageability_parts(&state.manageability, state.phase);
+                    let mut bases = Vec::new();
+                    if request.requires(10) {
+                        let mut seen = std::collections::BTreeSet::new();
+                        for occurrence in &projection.definition().relation_occurrences {
+                            let name = format!(
+                                "{}.{}.{}",
+                                occurrence.catalog_at_binding,
+                                occurrence.namespace_at_binding,
+                                occurrence.relation_at_binding
+                            );
+                            if seen.insert((
+                                &occurrence.catalog_at_binding,
+                                &occurrence.namespace_at_binding,
+                                &occurrence.relation_at_binding,
+                            )) {
+                                bases.push(name);
+                            }
+                        }
+                    }
+                    let upstream = if request.requires(11) && state.manageability == novarocks_mv_application::readiness::MvListedManageability::Manageable {
+                        Some(self.source.upstream_materialized_views(&state.loaded, request.context).await?)
+                    } else { None };
+                    batches
+                        .push_values(&[
+                            SystemValueRef::Utf8(&facts.catalog),
+                            SystemValueRef::Utf8(&facts.schema),
+                            SystemValueRef::Utf8(&facts.name),
+                            SystemValueRef::Utf8(policy),
+                            interval.map_or(SystemValueRef::Null, SystemValueRef::Int64),
+                            SystemValueRef::Boolean(configuration.paused),
+                            last_time.map_or(SystemValueRef::Null, SystemValueRef::TimestampMillis),
+                            last_rows.map_or(SystemValueRef::Null, SystemValueRef::Int64),
+                            SystemValueRef::Utf8(manageability),
+                            reason.into(),
+                            SystemValueRef::Utf8List(&bases),
+                            upstream
+                                .as_deref()
+                                .map_or(SystemValueRef::Null, SystemValueRef::Utf8List),
                         ])
                         .await?;
                 }

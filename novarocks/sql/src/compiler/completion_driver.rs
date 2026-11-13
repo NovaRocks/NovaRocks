@@ -3374,8 +3374,8 @@ mod tests {
         *binding = needs[0].binding();
         *label = "iceberg.db.all_t0".into();
         *statistics_columns = columns;
-        // Declared key metrics from SHOW TABLE STATS after the original three
-        // INSERTs. These are explicit fixture inputs, not guessed NDV values.
+        // Historical evidence-model key metrics captured after three INSERTs,
+        // before TRC-5d2 retired their SQL projection. These are explicit inputs.
         // Missing bounds and other omitted metrics stay explicitly Missing.
         use novarocks_spi::connector::{
             StatisticsBasisRelation, StatisticsEvidence, StatisticsMetricObservation,

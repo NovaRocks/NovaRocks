@@ -35,8 +35,7 @@ ALTER MATERIALIZED VIEW reject_mv SET FOO;
 -- @expect_error=[sql.parse.unexpected_token] expected SYNC or ASYNC
 REFRESH MATERIALIZED VIEW reject_mv WITH BROKEN;
 
--- @expect_error_tier=drift
--- @expect_error=[sql.parse.unexpected_token] expected unfiltered SHOW MATERIALIZED VIEWS
+-- @expect_trino_error=SYNTAX_ERROR,USER_ERROR
 SHOW MATERIALIZED VIEWS LIKE 'reject%';
 
 -- Backend membership is owned by external orchestration, so ADD BACKEND and

@@ -24,7 +24,7 @@ use crate::{
         ExplainRefreshMaterializedView, MaterializedViewAlterAction, MaterializedViewDistribution,
         MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
         MaterializedViewPartitionField, MaterializedViewProperty, MaterializedViewRefreshMode,
-        MaterializedViewRefreshPolicy, RefreshMaterializedView, ShowMaterializedViews,
+        MaterializedViewRefreshPolicy, RefreshMaterializedView,
     },
     ast::{Ident, Literal, LiteralKind, MaterializedViewStatement, Statement},
     token::Symbol,
@@ -44,9 +44,6 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
     }
     if parser.current_is_word("REFRESH") && parser.peek_word(1, "MATERIALIZED") {
         return parse_refresh(parser).map(Some);
-    }
-    if parser.current_is_word("SHOW") && parser.peek_word(1, "MATERIALIZED") {
-        return parse_show(parser).map(Some);
     }
     if parser.current_is_word("EXPLAIN")
         && (parser.peek_word(1, "REFRESH")
@@ -227,24 +224,6 @@ fn parse_refresh(parser: &mut StatementParser<'_, '_>) -> Result<Statement, Pars
             mode,
             span,
         }),
-    ))
-}
-
-fn parse_show(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
-    let start = parser.consume_word("SHOW")?.start();
-    parser.consume_word("MATERIALIZED")?;
-    parser.consume_word("VIEWS")?;
-    let database = if parser.consume_if_word("FROM") || parser.consume_if_word("IN") {
-        Some(parser.parse_object_name()?)
-    } else {
-        None
-    };
-    if parser.current_is_word("LIKE") || parser.current_is_word("WHERE") {
-        return Err(parser.unexpected("unfiltered SHOW MATERIALIZED VIEWS"));
-    }
-    let span = Span::new(start, parser.current_offset());
-    Ok(Statement::MaterializedView(
-        MaterializedViewStatement::Show(ShowMaterializedViews { database, span }),
     ))
 }
 

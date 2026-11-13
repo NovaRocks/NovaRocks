@@ -15,44 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    ParseError,
-    ast::{ShowBackends, Statement},
-    token::Keyword,
-};
-
+//! Transitional retired-head rejection, until the Trino grammar replaces it.
 use super::StatementParser;
-
-/// `show-backends ::= SHOW BACKENDS`
+use crate::{ParseError, ast::Statement};
 pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
-    if !parser.current_is_word("SHOW") {
-        return Ok(None);
+    if parser.current_is_word("ADMIN") || parser.current_is_word("CANCEL") {
+        return Err(parser.unexpected("SQL statement"));
     }
-    if !parser.peek_word(1, "BACKENDS")
-        && ["ANALYZE", "TABLE", "CREATE", "ALTER", "MATERIALIZED"]
+    if parser.current_is_word("DROP")
+        && ["STATS", "HISTOGRAM", "MULTIPLE"]
             .iter()
             .any(|word| parser.peek_word(1, word))
     {
+        parser.consume_word("DROP")?;
+        return Err(parser.unexpected("TABLE, DATABASE, CATALOG, VIEW or MATERIALIZED VIEW"));
+    }
+    Ok(None)
+}
+pub(super) fn show(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
+    if !parser.current_is_word("SHOW") || parser.peek_word(1, "CREATE") {
         return Ok(None);
     }
-    let start = parser.current_span().start();
-    parser.advance(); // SHOW
-    skip_trivia(parser);
-    if !parser.current_is_keyword(Keyword::Backends) {
-        return Err(parser.unexpected("BACKENDS"));
-    }
-    let end = parser.current_span().end();
-    parser.advance();
-    Ok(Some(Statement::ShowBackends(ShowBackends {
-        span: crate::Span::new(start, end),
-    })))
-}
-
-fn skip_trivia(parser: &mut StatementParser<'_, '_>) {
-    while matches!(
-        parser.current().map(|token| &token.kind),
-        Some(crate::TokenKind::Trivia(_))
-    ) {
-        parser.advance();
-    }
+    parser.consume_word("SHOW")?;
+    Err(parser.unexpected("CREATE, PROCESSLIST or STATS FOR"))
 }

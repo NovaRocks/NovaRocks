@@ -125,6 +125,62 @@ pub(crate) fn resolve_ancestor_ndv_from_metadata(
     resolved
 }
 
+/// SHOW STATS follows Trino's first-statistics-file rule, independently of
+/// the optimizer's per-column and bounded ancestry policy above. Registered
+/// metadata is sufficient; this never opens a Puffin object.
+pub(crate) fn resolve_summary_ndv_from_metadata(
+    metadata: &TableMetadata,
+    current_snapshot_id: i64,
+    field_ids: &BTreeSet<i32>,
+    mut active: impl FnMut() -> Result<(), novarocks_spi::connector::ConnectorError>,
+) -> Result<HashMap<i32, u64>, novarocks_spi::connector::ConnectorError> {
+    let mut cursor = Some(current_snapshot_id);
+    while let Some(snapshot_id) = cursor {
+        active()?;
+        if let Some(statistics) = metadata.statistics_for_snapshot(snapshot_id) {
+            let mut resolved = HashMap::new();
+            let mut seen = BTreeSet::new();
+            for blob in &statistics.blob_metadata {
+                active()?;
+                if blob.r#type != crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1 {
+                    continue;
+                }
+                let [field_id] = blob.fields.as_slice() else {
+                    continue;
+                };
+                if !field_ids.contains(field_id) {
+                    continue;
+                }
+                let Some(rendered) = blob.properties.get(crate::stats_loader::NDV_PROPERTY) else {
+                    continue;
+                };
+                if !seen.insert(*field_id) {
+                    return Err(novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                        format!(
+                            "statistics metadata contains duplicate Theta blobs for field {field_id}"
+                        ),
+                    ));
+                }
+                resolved.insert(
+                    *field_id,
+                    crate::stats_loader::parse_ndv_property(rendered).map_err(|error| {
+                        novarocks_spi::connector::ConnectorError::new(
+                            novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                            error,
+                        )
+                    })?,
+                );
+            }
+            return Ok(resolved);
+        }
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    Ok(HashMap::new())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap as StdHashMap;
@@ -328,5 +384,102 @@ mod tests {
             "ancestor metadata resolves even when its body path is unreadable"
         );
         assert_eq!(StatsLoader::theta_body_reads(), 0);
+    }
+    fn summary_statistics(snapshot_id: i64, fields: &[(i32, Option<&str>)]) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id,
+            statistics_path: "file:///never-opened.puffin".into(),
+            file_size_in_bytes: 1,
+            file_footer_size_in_bytes: 1,
+            key_metadata: None,
+            blob_metadata: fields
+                .iter()
+                .map(|(field_id, ndv)| crate::iceberg::spec::BlobMetadata {
+                    r#type: crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1.into(),
+                    snapshot_id,
+                    sequence_number: snapshot_id,
+                    fields: vec![*field_id],
+                    properties: ndv
+                        .map(|value| {
+                            StdHashMap::from([(
+                                crate::stats_loader::NDV_PROPERTY.into(),
+                                value.into(),
+                            )])
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn summary_recent_partial_file_masks_an_older_complete_file() {
+        let metadata = chain(
+            3,
+            vec![
+                summary_statistics(1, &[(5, Some("400")), (7, Some("100"))]),
+                summary_statistics(3, &[(7, Some("900"))]),
+            ],
+        );
+        assert_eq!(
+            resolve_summary_ndv_from_metadata(&metadata, 3, &BTreeSet::from([5, 7]), || Ok(()))
+                .unwrap(),
+            HashMap::from([(7, 900)])
+        );
+    }
+
+    #[test]
+    fn summary_skips_missing_properties_and_walks_beyond_optimizer_depth() {
+        let metadata = chain(
+            70,
+            vec![summary_statistics(1, &[(5, None), (7, Some("100"))])],
+        );
+        assert_eq!(
+            resolve_summary_ndv_from_metadata(&metadata, 70, &BTreeSet::from([5, 7]), || Ok(()))
+                .unwrap(),
+            HashMap::from([(7, 100)])
+        );
+        assert!(resolve_ancestor_ndv_from_metadata(&metadata, 70, &BTreeSet::from([7])).is_empty());
+    }
+    #[test]
+    fn summary_skips_absent_ndv_before_duplicate_column_validation() {
+        let metadata = chain(
+            1,
+            vec![summary_statistics(1, &[(7, None), (7, Some("100"))])],
+        );
+        assert_eq!(
+            resolve_summary_ndv_from_metadata(&metadata, 1, &BTreeSet::from([7]), || Ok(()))
+                .unwrap(),
+            HashMap::from([(7, 100)])
+        );
+        let invalid = chain(
+            1,
+            vec![summary_statistics(1, &[(7, Some("100")), (7, Some("101"))])],
+        );
+        assert_eq!(
+            resolve_summary_ndv_from_metadata(&invalid, 1, &BTreeSet::from([7]), || Ok(()))
+                .unwrap_err()
+                .kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
+    }
+    #[test]
+    fn summary_ancestry_preserves_original_cancellation() {
+        let metadata = chain(70, Vec::new());
+        let original = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Interrupted,
+            "original summary cancelled",
+        );
+        let mut checks = 0;
+        let error = resolve_summary_ndv_from_metadata(&metadata, 70, &BTreeSet::from([7]), || {
+            checks += 1;
+            if checks == 2 {
+                Err(original.clone())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, original);
     }
 }

@@ -884,7 +884,7 @@ impl FrontendPlanningCpuSource {
     }
     pub(crate) fn stage_system_row(
         &self,
-        values: &[Option<&str>],
+        values: &[crate::system_tables::SystemValueRef<'_>],
     ) -> Result<
         Result<
             crate::system_tables::RowStage,

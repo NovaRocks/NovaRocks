@@ -19,7 +19,7 @@
 
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvCreateDistribution, MvCreatePartitionField,
-    MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest, MvShowStatement,
+    MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
 };
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use novarocks_parser::ast::{
@@ -94,34 +94,24 @@ impl MvCommandExecutor {
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         novarocks_query_application::api::CommandError,
     > {
-        if matches!(
-            statement,
-            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_)
-        ) {
+        if let MaterializedViewStatement::ExplainRefresh(explain) = statement {
             let services = self.execution_services.clone().ok_or_else(|| {
                 novarocks_query_application::api::CommandError::new(
                     novarocks_query_application::api::CommandErrorKind::Unsupported,
                     "MV execution services are unavailable",
                 )
             })?;
-            let request = match statement {
-                MaterializedViewStatement::Show(show) => crate::query::mv_read_action::ReadRequest::Show {
-                    catalog: context.session().current_catalog().map(str::to_owned),
-                    statement: lower_typed_show(show)?,
+            let request = Box::new(
+                crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
+                    ports: self.ports.clone(),
+                    current_catalog: context.session().current_catalog().map(str::to_owned),
+                    current_database: context.session().current_database().to_owned(),
+                    statement: lower_typed_refresh(&explain.refresh)?,
+                    level: lower_typed_explain_level(explain.level),
+                    context: command_context.connector_context().clone(),
                 },
-                MaterializedViewStatement::ExplainRefresh(explain) => crate::query::mv_read_action::ReadRequest::Explain(Box::new(
-                    crate::query_execution::mv_assembly::refresh_explain::MvExplainPreparationInput {
-                        ports: self.ports.clone(),
-                        current_catalog: context.session().current_catalog().map(str::to_owned),
-                        current_database: context.session().current_database().to_owned(),
-                        statement: lower_typed_refresh(&explain.refresh)?,
-                        level: lower_typed_explain_level(explain.level),
-                        context: command_context.connector_context().clone(),
-                    })),
-                _ => unreachable!(),
-            };
+            );
             return crate::query::mv_read_action::prepare(
-                self.ports.clone(),
                 services,
                 request,
                 context.execution().clone(),
@@ -187,7 +177,7 @@ impl MvCommandExecutor {
                     statement,
                 })
             }
-            MaterializedViewStatement::Show(_) | MaterializedViewStatement::ExplainRefresh(_) => {
+            MaterializedViewStatement::ExplainRefresh(_) => {
                 unreachable!("MV read statements were selected before the mutation action")
             }
         };
@@ -528,20 +518,6 @@ fn lower_typed_explain_level(
     }
 }
 
-fn lower_typed_show(
-    statement: &novarocks_parser::ast::ShowMaterializedViews,
-) -> Result<MvShowStatement, String> {
-    let database = statement
-        .database
-        .as_ref()
-        .map(|database| match database.parts.as_slice() {
-            [database] => Ok(database.value.clone()),
-            _ => Err("SHOW MATERIALIZED VIEWS FROM expects one database identifier".to_string()),
-        })
-        .transpose()?;
-    Ok(MvShowStatement { database })
-}
-
 fn lower_typed_refresh_policy(
     policy: &TypedRefreshPolicy,
 ) -> Result<MvCreateRefreshPolicy, String> {
@@ -873,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_typed_alter_and_show_without_raw_command_parse() {
+    fn lowers_typed_alter_without_raw_command_parse() {
         let alter = typed_mv(
             "ALTER MATERIALIZED VIEW `analytics`.`orders_mv` \
              SET TBLPROPERTIES ('refresh_priority' = 'high')",
@@ -889,17 +865,6 @@ mod tests {
                 "refresh_priority".to_string(),
                 "high".to_string(),
             )])
-        );
-
-        let show = typed_mv("SHOW MATERIALIZED VIEWS FROM analytics");
-        let MaterializedViewStatement::Show(show) = show else {
-            panic!("expected typed SHOW MATERIALIZED VIEWS");
-        };
-        assert_eq!(
-            lower_typed_show(&show).expect("typed show should lower"),
-            MvShowStatement {
-                database: Some("analytics".to_string())
-            }
         );
     }
 

@@ -414,6 +414,7 @@ pub(super) fn publish(
         session.provider.runtime().resources().catalog_runtime(),
     );
     let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
+        expected_table_uuid: None,
         catalog_operation: crate::catalog::admission::CatalogOperation::Statistics,
         catalog: Arc::clone(session.provider.runtime().novarocks_catalog()),
         ident: projection.target.clone(),

@@ -888,7 +888,7 @@ pub(crate) fn render_expected(value: &str, variables: &HashMap<String, String>) 
     rendered
 }
 fn metadata_projection(sql: &str) -> Option<String> {
-    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|task_runs)|system\.metadata\.materialized_views)\b").ok()?;
+    let re = Regex::new(r"(?is)\bSELECT\s+(.*?)\s+FROM\s+(?:(?:[A-Za-z0-9_`.$\{\}]+\.)?information_schema\.(?:schemata|tables|columns|task_runs)|system\.metadata\.materialized_views|system\.runtime\.materialized_view_states)\b").ok()?;
     re.captures(sql).map(|c| c[1].to_string())
 }
 fn metadata_columns(sql: &str) -> BTreeSet<String> {
@@ -1029,8 +1029,16 @@ pub(crate) fn render_expected_for_execution(
             for ((cell, text), sig) in original.iter_mut().zip(content).zip(&signatures) {
                 // The flat sentinel "NULL" cannot establish string ownership.
                 // Only an original text value may accept a metadata rewrite.
-                if matches!(parse_cell(sig, cell)?, TrinoValue::Text(_)) {
-                    *cell = render_cell(sig, &TrinoValue::Text(text))?;
+                match parse_cell(sig, cell)? {
+                    TrinoValue::Text(_) => {
+                        *cell = render_cell(sig, &TrinoValue::Text(text))?;
+                    }
+                    TrinoValue::Array(_) if *cell != text => {
+                        // Only the statement-owned metadata array positions were
+                        // changed by the catalog adapter; validate the original type.
+                        *cell = render_cell(sig, &parse_cell(sig, &text)?)?;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1126,8 +1134,7 @@ fn namespace_observation_references(
     sql: &str,
 ) -> (BTreeMap<usize, (usize, String)>, BTreeMap<usize, usize>) {
     use novarocks_parser::ast::{
-        LiteralKind, MaintenanceStatement, MaintenanceValue, MaterializedViewStatement,
-        ProcedureArgumentMode, Statement,
+        LiteralKind, MaintenanceStatement, MaintenanceValue, ProcedureArgumentMode, Statement,
     };
     let mut namespaces = BTreeMap::new();
     let mut protected = BTreeMap::new();
@@ -1178,32 +1185,6 @@ fn namespace_observation_references(
                     }
                 }
                 continue;
-            }
-            let (name, qualified) = match &statement {
-                Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
-                    (show.from.as_ref(), true)
-                }
-                Statement::MaterializedView(MaterializedViewStatement::Show(show)) => {
-                    (show.database.as_ref(), false)
-                }
-                _ => continue,
-            };
-            let Some(name) = name else { continue };
-            let namespace = match name.parts.as_slice() {
-                [database] => Some(database),
-                [_, database] if qualified => Some(database),
-                _ => None,
-            };
-            for part in &name.parts {
-                let start = range.start + part.span.start();
-                let end = range.start + part.span.end();
-                if namespace.is_some_and(|database| database.span == part.span) {
-                    namespaces.insert(start, (end, part.value.clone()));
-                } else {
-                    // Catalog slots and unsupported SHOW arities are never
-                    // guessed to be namespace-qualified table references.
-                    protected.insert(start, end);
-                }
             }
         }
     }
@@ -1583,21 +1564,19 @@ mod tests {
     }
 
     #[test]
-    fn native_lake_and_mv_show_cases_use_the_owned_namespace() {
-        for (case, source, show) in [
+    fn native_lake_and_mv_cases_use_the_owned_namespace() {
+        for (case, source) in [
             (
                 "iru5_read_dependency_conflict",
                 include_str!(
                     "../../../correctness/lake-publication/sql/iru5_read_dependency_conflict.sql"
                 ),
-                "SHOW ALTER TABLE OPTIMIZE FROM lake_publication_${suite_uuid0}.",
             ),
             (
                 "mv_catalog_isolation",
                 include_str!(
                     "../../../correctness/lnp-3d-mv-accelerator/sql/mv_catalog_isolation.sql"
                 ),
-                "SHOW MATERIALIZED VIEWS FROM ",
             ),
         ] {
             let vars =
@@ -1607,49 +1586,77 @@ mod tests {
             let map = namespace_mapping(&rendered, &vars).unwrap();
             let expected = &map[&old];
             let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
-            let show = render_expected(show, &vars);
-            assert!(rewritten.contains(&format!("{show}{expected}")));
-            assert!(!rewritten.contains(&format!("{show}{old}")));
             assert!(rewritten.contains(&format!(".{expected}.")));
+            if case == "mv_catalog_isolation" {
+                assert!(rewritten.contains(&format!("schema_name = '{expected}'")));
+                assert!(!rewritten.contains(&format!("schema_name = '{old}'")));
+            } else {
+                assert!(rewritten.contains(&format!(".{expected}.optimize_rows OPTIMIZE")));
+                assert!(rewritten.contains("-- @expect_error=dependency: RefUnchanged"));
+            }
         }
     }
 
     #[test]
-    fn show_namespace_slots_preserve_catalogs_literals_and_rejected_shapes() {
+    fn typed_mv_state_arrays_bind_catalog_elements_and_preserve_business_arrays() {
+        use crate::golden::Block;
+        let mut vars = test_variables(&["case"]);
+        let symbols = crate::catalog_symbol::CatalogSymbols::seal(
+            &vars["run_id"],
+            &[format!(
+                "CREATE EXTERNAL CATALOG owned_{} PROPERTIES ('type'='iceberg')",
+                vars["run_id"]
+            )],
+        )
+        .unwrap();
+        symbols.extend_variables(&mut vars).unwrap();
+        let catalog = format!("owned_{}", vars["run_id"]);
+        let mapped = symbols.lookup(&catalog).unwrap();
+        let source = format!(
+            "-- query 1\n-- types\tarray(varchar)\tarray(varchar)\nbases\tbusiness\n[\"{catalog}.ns.t\"]\t[\"{catalog}.ns.literal\"]\n"
+        );
+        let mut result = typed_expected(&source);
+        let statement = format!(
+            "SELECT base_tables AS bases, ARRAY['{catalog}.ns.literal'] AS business FROM system.runtime.materialized_view_states"
+        );
+        render_expected_for_execution(
+            &statement,
+            &mut result,
+            &vars,
+            &BTreeMap::new(),
+            std::slice::from_ref(&statement),
+        )
+        .unwrap();
+        let Block::Typed { rows, .. } = &result.golden.unwrap().expanded.blocks[0] else {
+            panic!("typed block expected")
+        };
+        assert_eq!(
+            rows[0],
+            vec![
+                format!(r#"["{mapped}.ns.t"]"#),
+                format!(r#"["{catalog}.ns.literal"]"#)
+            ]
+        );
+    }
+
+    #[test]
+    fn mv_state_metadata_filters_bind_namespaces_without_rewriting_data() {
         let vars =
             crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
         let source = "CREATE DATABASE owned.owned;\n\
-            SHOW ALTER TABLE OPTIMIZE FROM `owned`.`owned` WHERE TableName = 'owned';\n\
-            SHOW ALTER TABLE OPTIMIZE FROM owned;\n\
-            SHOW MATERIALIZED VIEWS FROM `owned`;\n\
-            SHOW MATERIALIZED VIEWS FROM owned.owned;\n\
-            SHOW ALTER TABLE OPTIMIZE FROM owned.owned.owned;\n\
-            SELECT owned, 'owned', 'SHOW MATERIALIZED VIEWS FROM owned' FROM ordinary;\n\
+            SELECT name FROM system.runtime.materialized_view_states WHERE schema_name = 'owned';\n\
+            SELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary;\n\
             SELECT * FROM owned.t;\n\
-            SELECT * FROM external.owned;\n\
-            -- SHOW ALTER TABLE OPTIMIZE FROM owned.owned\n";
+            SELECT * FROM external.owned;\n";
         let map = namespace_mapping(source, &vars).unwrap();
         let expected = &map["owned"];
         let rewritten = rewrite_namespaces(source, &vars).unwrap();
-        for expected_text in [
-            format!(
-                "SHOW ALTER TABLE OPTIMIZE FROM `owned`.`{expected}` WHERE TableName = 'owned'"
-            ),
-            format!("SHOW ALTER TABLE OPTIMIZE FROM {expected};"),
-            format!("SHOW MATERIALIZED VIEWS FROM `{expected}`;"),
-            format!("SELECT * FROM {expected}.t;"),
-        ] {
-            assert!(rewritten.contains(&expected_text), "{rewritten}");
-        }
-        for unchanged in [
-            "SHOW MATERIALIZED VIEWS FROM owned.owned;",
-            "SHOW ALTER TABLE OPTIMIZE FROM owned.owned.owned;",
-            "SELECT owned, 'owned', 'SHOW MATERIALIZED VIEWS FROM owned' FROM ordinary;",
-            "SELECT * FROM external.owned;",
-            "-- SHOW ALTER TABLE OPTIMIZE FROM owned.owned",
-        ] {
-            assert!(rewritten.contains(unchanged), "{rewritten}");
-        }
+        assert!(rewritten.contains(&format!("schema_name = '{expected}'")));
+        assert!(rewritten.contains(&format!("SELECT * FROM {expected}.t")));
+        assert!(rewritten.contains(
+            "SELECT owned, 'owned', 'system.runtime.materialized_view_states' FROM ordinary"
+        ));
+        assert!(rewritten.contains("SELECT * FROM external.owned"));
     }
 
     #[test]

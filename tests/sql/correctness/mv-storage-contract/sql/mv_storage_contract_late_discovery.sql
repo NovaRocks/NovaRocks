@@ -100,7 +100,7 @@ REFRESH MATERIALIZED VIEW z_count WITH SYNC MODE;
 -- @result_contains=a_total
 -- @result_contains=z_count
 USE mvsc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 12
 -- Restart with a listing that does not name everything in the namespace.
@@ -114,7 +114,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_not_contains=a_mv
 USE mvsc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 14
 -- Its published result is still exactly what it published.
@@ -140,7 +140,7 @@ SELECT 1;
 -- @result_contains=z_count
 -- @result_contains=a_total
 USE mvsc_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 17
 -- Its management is closed behind the restart barrier, not lost: the

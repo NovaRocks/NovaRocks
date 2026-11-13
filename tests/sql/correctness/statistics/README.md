@@ -22,8 +22,9 @@ under the License.
 Focused statistics regressions for the 128-bit `LARGEINT` path inherited from
 the former low-cardinality companion suite. The suite is runner-managed native
 `1FE+3BE`, backed by SQLite StateStore and the shared Iceberg REST fixture: an
-`ANALYZE` assertion therefore exercises durable job ownership and distributed
-collection instead of the standalone convenience path.
+`ANALYZE` assertion therefore exercises collection and publication within the
+original statement Root and query permit, including distributed execution and
+actual resource exit.
 
 The suite deliberately uses small tables. Its purpose is statistics collection
 and plan visibility, not aggregate or low-cardinality runtime behavior.

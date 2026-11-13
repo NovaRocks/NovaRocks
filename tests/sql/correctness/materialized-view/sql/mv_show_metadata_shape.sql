@@ -18,26 +18,16 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,lake_native,c1
--- Test Objective:
--- Freeze the user-facing `SHOW MATERIALIZED VIEWS` projection.
---
--- The first SHOW runs against a database with no materialized views: the row
--- set is empty, so the recorded golden is exactly the column projection — every
--- column name, its order, and by construction the column count. That keeps the
--- shape assertion free of the per-run catalog/database/name identifiers that
--- would otherwise make a populated row unstable.
---
--- The second SHOW then covers the per-column values that are stable across
--- runs. The volatile cells (names, base-table paths, timestamps) are
--- deliberately not asserted here; `mv_lifecycle_edges` and the ivm suite own
--- the behaviour those cells describe.
+-- Test Objective: freeze the typed state-table projection with WHERE false.
+-- Stable populated facts are asserted below; timestamps and runtime identities
+-- remain under the MV lifecycle owners. Column types come from spec5.6.
 
 -- query 1
 -- @skip_result_check=true
 CREATE DATABASE IF NOT EXISTS ${case_db};
 
 -- query 2
-SHOW MATERIALIZED VIEWS FROM ${case_db};
+SELECT * FROM system.runtime.materialized_view_states WHERE false;
 
 -- query 3
 -- @skip_result_check=true
@@ -57,11 +47,9 @@ AS SELECT k1, v2 FROM ${case_db}.orders_shape;
 
 -- query 4
 -- @result_contains=orders_shape_mv
--- @result_contains=iceberg
--- @result_contains=DEFERRED_MANUAL
 -- @result_contains=MANUAL
 -- @result_contains=false
-SHOW MATERIALIZED VIEWS FROM ${case_db};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'materialized_view_cat_${suite_uuid0}' AND schema_name = '${case_db}';
 
 -- query 5
 -- @cleanup=true

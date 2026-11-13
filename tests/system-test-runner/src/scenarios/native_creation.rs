@@ -468,7 +468,7 @@ impl RawBackendSession {
         let row = rows
             .iter()
             .find(|row| row.grpc_port == port)
-            .with_context(|| format!("SHOW BACKENDS omitted BE[{index}]"))?;
+            .with_context(|| format!("backend topology omitted BE[{index}]"))?;
         ensure!(
             row.is_eligible_live(),
             "BE[{index}] must be eligible and live, row={row:?}"

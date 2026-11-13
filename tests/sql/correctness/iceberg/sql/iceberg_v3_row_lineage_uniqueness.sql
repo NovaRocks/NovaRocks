@@ -70,8 +70,6 @@ UPDATE uniq_${uuid0}.ns_${uuid0}.uniq SET v = v + 1 WHERE id = 1;
 ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t3;
 
 -- query 5
--- @skip_result_check=true
--- @wait_alter_optimize=uniq
 -- @db=uniq_${uuid0}.ns_${uuid0}
 ALTER TABLE uniq OPTIMIZE;
 
@@ -82,8 +80,6 @@ INSERT INTO uniq_${uuid0}.ns_${uuid0}.uniq VALUES (10, 100), (20, 200);
 ALTER TABLE uniq_${uuid0}.ns_${uuid0}.uniq CREATE TAG t5;
 
 -- query 7
--- @skip_result_check=true
--- @wait_alter_optimize=uniq
 -- @db=uniq_${uuid0}.ns_${uuid0}
 ALTER TABLE uniq OPTIMIZE;
 

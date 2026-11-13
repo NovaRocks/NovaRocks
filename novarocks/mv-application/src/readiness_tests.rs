@@ -895,20 +895,15 @@ async fn bounded_listing_preserves_large_reasons_without_a_decode_quota() {
 }
 
 #[tokio::test]
-async fn bounded_dependency_display_requires_ready_and_exact_installed_root_version() {
-    use crate::repository::MvDependencyReadBound;
+async fn dependency_read_requires_ready_and_exact_installed_root_version() {
     let (repository, service) = service().await;
     service
         .observe_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
         .await
         .unwrap();
     let loaded = service.load_ready(&target()).await.unwrap().unwrap();
-    let bound = MvDependencyReadBound {
-        entries: 4096,
-        collection_bytes: 4 * 1024 * 1024,
-    };
     let rows = service
-        .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+        .list_ready_dependencies_by_downstream(&loaded)
         .await
         .unwrap();
     assert_eq!(
@@ -917,18 +912,6 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
             .list_ready_dependencies_by_downstream(&loaded)
             .await
             .unwrap()
-    );
-    let tiny = MvDependencyReadBound {
-        collection_bytes: 1,
-        ..bound
-    };
-    assert_eq!(
-        service
-            .list_ready_dependencies_by_downstream_bounded(&loaded, tiny)
-            .await
-            .unwrap_err()
-            .kind(),
-        MvRepositoryErrorKind::InvalidRequest
     );
     let fresh = repository
         .install_keyed_projection(
@@ -940,7 +923,7 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         .unwrap();
     assert_eq!(
         service
-            .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+            .list_ready_dependencies_by_downstream(&loaded)
             .await
             .unwrap_err()
             .kind(),
@@ -948,7 +931,7 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
     );
     assert_eq!(
         service
-            .list_ready_dependencies_by_downstream_bounded(&fresh, bound)
+            .list_ready_dependencies_by_downstream(&fresh)
             .await
             .unwrap_err()
             .kind(),
@@ -960,13 +943,13 @@ async fn bounded_dependency_display_requires_ready_and_exact_installed_root_vers
         .unwrap();
     assert!(
         service
-            .list_ready_dependencies_by_downstream_bounded(&fresh, bound)
+            .list_ready_dependencies_by_downstream(&fresh)
             .await
             .is_ok()
     );
     assert_eq!(
         service
-            .list_ready_dependencies_by_downstream_bounded(&loaded, bound)
+            .list_ready_dependencies_by_downstream(&loaded)
             .await
             .unwrap_err()
             .kind(),

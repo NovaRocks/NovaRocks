@@ -18,7 +18,7 @@
 explicit_only = false
 
 [impact]
-paths = [
+paths = ["novarocks/table-maintenance/**", "novarocks/frontend-application/src/query_execution/maintenance/**", "novarocks/frontend-application/src/table_maintenance/**",
     "novarocks/mv-application/**",
     "novarocks/execution/src/exec/mv/**",
     "docker/iceberg-rest/spark-sql.sh",

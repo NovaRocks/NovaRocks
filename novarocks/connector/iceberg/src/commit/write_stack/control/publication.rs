@@ -721,6 +721,7 @@ impl IcebergWriteSessionControl {
         );
         let catalog = Arc::clone(self.runtime.novarocks_catalog());
         let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
+            expected_table_uuid: recipe.selected.as_ref().map(|_| recipe.source.uuid()),
             catalog_operation: handle.flavor().catalog_operation(),
             catalog,
             ident: recipe.target.ident.clone(),

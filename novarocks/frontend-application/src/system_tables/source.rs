@@ -30,7 +30,45 @@ use std::sync::Arc;
 
 /// A single batch of requested scalar facts, transferred to the original CPU
 /// creator. It is never a complete, separately materialized system-table copy.
-pub(crate) type SystemTableRow = Vec<Option<String>>;
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SystemValue {
+    Null,
+    Utf8(String),
+    Int64(i64),
+    Boolean(bool),
+    TimestampMillis(i64),
+    Utf8List(Vec<String>),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SystemValueRef<'a> {
+    Null,
+    Utf8(&'a str),
+    Int64(i64),
+    Boolean(bool),
+    TimestampMillis(i64),
+    Utf8List(&'a [String]),
+}
+impl<'a> From<Option<&'a str>> for SystemValueRef<'a> {
+    fn from(value: Option<&'a str>) -> Self {
+        value.map_or(Self::Null, Self::Utf8)
+    }
+}
+impl SystemValue {
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+    pub(crate) fn as_ref(&self) -> SystemValueRef<'_> {
+        match self {
+            Self::Null => SystemValueRef::Null,
+            Self::Utf8(value) => SystemValueRef::Utf8(value),
+            Self::Int64(value) => SystemValueRef::Int64(*value),
+            Self::Boolean(value) => SystemValueRef::Boolean(*value),
+            Self::TimestampMillis(value) => SystemValueRef::TimestampMillis(*value),
+            Self::Utf8List(value) => SystemValueRef::Utf8List(value),
+        }
+    }
+}
+pub(crate) type SystemTableRow = Vec<SystemValue>;
 pub(crate) struct MaterializedSystemTableBatch {
     pub batch: RecordBatch,
     pub storage: ValueTypeStorageLifetime,
@@ -45,6 +83,13 @@ pub(crate) struct MaterializedViewFacts {
     pub unavailable: bool,
     pub occurrences: Vec<RelationOccurrence>,
     pub publication: Option<Vec<PublicationInput>>,
+    pub state: Option<MaterializedViewStateFacts>,
+}
+#[derive(Clone)]
+pub(crate) struct MaterializedViewStateFacts {
+    pub loaded: novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+    pub manageability: MvListedManageability,
+    pub phase: novarocks_mv_application::management::MvManagementPhase,
 }
 #[async_trait]
 pub(crate) trait MaterializedViewInventory: Send {
@@ -57,6 +102,7 @@ pub(crate) struct ListableMaterializedViews {
     inventory: MvKeyedProjectionInventory,
     include_freshness: bool,
     include_definition: bool,
+    management: Option<Arc<novarocks_mv_application::management::ManagementEntrance>>,
 }
 impl ListableMaterializedViews {
     pub(crate) fn new(
@@ -68,7 +114,15 @@ impl ListableMaterializedViews {
             inventory,
             include_freshness,
             include_definition,
+            management: None,
         }
+    }
+    pub(crate) fn with_state_facts(
+        mut self,
+        management: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    ) -> Self {
+        self.management = Some(management);
+        self
     }
 }
 #[async_trait]
@@ -85,7 +139,11 @@ impl MaterializedViewInventory for ListableMaterializedViews {
         let facts = &listed.loaded.projection.facts;
         let target = &facts.source_revision().target;
         let unavailable = matches!(listed.manageability, MvListedManageability::Unavailable(_));
-        Ok(Some(MaterializedViewFacts {
+        let phase = self
+            .management
+            .as_ref()
+            .map(|entrance| entrance.management_phase(target));
+        let mut output = MaterializedViewFacts {
             catalog: target.instance_id.as_str().to_owned(),
             schema: target.namespace.to_string(),
             name: target.table.to_string(),
@@ -100,12 +158,21 @@ impl MaterializedViewInventory for ListableMaterializedViews {
             } else {
                 vec![]
             },
+            state: None,
             publication: if self.include_freshness && !unavailable {
                 facts.publication().map(|p| p.inputs.clone())
             } else {
                 None
             },
-        }))
+        };
+        if let Some(phase) = phase {
+            output.state = Some(MaterializedViewStateFacts {
+                loaded: listed.loaded,
+                manageability: listed.manageability,
+                phase,
+            });
+        }
+        Ok(Some(output))
     }
 }
 pub(crate) fn repository_error(
@@ -158,6 +225,15 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
         include_definition: bool,
         context: &ConnectorRequestContext,
     ) -> Result<Box<dyn MaterializedViewInventory>, SystemTableError>;
+    async fn materialized_view_states(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<Box<dyn MaterializedViewInventory>, SystemTableError>;
+    async fn upstream_materialized_views(
+        &self,
+        projection: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+        context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, SystemTableError>;
     async fn current_sources(
         &self,
         occurrences: &[RelationOccurrence],
@@ -172,7 +248,7 @@ pub(crate) trait StatementSystemTableSource: Send + Sync {
     /// Reserve the original window before copying borrowed row facts into that body.
     fn stage_row(
         &self,
-        values: &[Option<&str>],
+        values: &[SystemValueRef<'_>],
     ) -> Result<super::construction::RowStage, SystemTableError>;
     /// Construct and retain a batch in the original CPU body after actual turn exit.
     async fn materialize_batch(&self) -> Result<(), SystemTableError>;

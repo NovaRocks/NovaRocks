@@ -1,0 +1,63 @@
+-- query 2
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	0
+removed_delete_files_count	0
+added_data_files_count	0
+
+-- query 4
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	3
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 6
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	0
+removed_delete_files_count	0
+added_data_files_count	0
+
+-- query 7
+-- types	bigint
+main_matches_before_noop
+1
+
+-- query 9
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	0
+added_data_files_count	1
+
+-- query 10
+-- types	varchar	bigint	bigint
+p	data_files	physical_rows
+a	1	2
+b	1	1
+
+-- query 12
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	1
+removed_delete_files_count	1
+added_data_files_count	1
+
+-- query 13
+-- types	bigint
+k
+2
+
+-- query 15
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	2
+removed_delete_files_count	2
+added_data_files_count	1
+
+-- query 16
+-- types	bigint
+k
+2
+4

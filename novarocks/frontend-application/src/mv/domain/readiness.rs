@@ -71,6 +71,12 @@ pub(crate) struct MvReadinessExecution<'a> {
 }
 
 impl MvReadinessPort {
+    pub(crate) fn management(
+        &self,
+    ) -> &std::sync::Arc<novarocks_mv_application::management::ManagementEntrance> {
+        &self.management
+    }
+
     /// A mutation guard already holds the exact Provider observation. Revoke
     /// foreign local management without reading or refreshing an Accelerator.
     pub(crate) fn revoke_foreign_current_management(
@@ -352,20 +358,7 @@ impl MvReadinessExecution<'_> {
             .list_ready_dependencies_by_downstream(projection)
             .await
     }
-    pub(crate) async fn list_local_dependencies_by_downstream(
-        &self,
-        projection: &LoadedKeyedMvProjection,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.service
-            .list_ready_dependencies_by_downstream_bounded(
-                projection,
-                novarocks_mv_application::repository::MvDependencyReadBound {
-                    entries: 4096,
-                    collection_bytes: 4 * 1024 * 1024,
-                },
-            )
-            .await
-    }
+
     pub(crate) async fn prepare_drop(
         &self,
         target: &MvTarget,

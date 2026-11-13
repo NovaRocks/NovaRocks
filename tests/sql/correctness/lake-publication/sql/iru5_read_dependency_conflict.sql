@@ -19,7 +19,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- Read-derived DELETE and OPTIMIZE cannot rebase computed output onto a new
--- main. REST OPTIMIZE is detached; its terminal job is the failure authority.
+-- main. OPTIMIZE reports the typed commit refusal within the statement.
 
 -- query 1
 -- @skip_result_check=true
@@ -62,23 +62,13 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.delete_rows OR
 -- Two seed files ensure this is an actual rewrite, not a no-op.
 -- @publication_catalog_fault=table-commit,before-requirement-check-hold-for-concurrent-shell
 -- @publication_catalog_concurrent_shell=set -eu; tmp_sql=$(mktemp "${TMPDIR:-/tmp}/iru5-optimize-companion-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "INSERT INTO ice_rest.ns_${uuid0}.optimize_rows VALUES (3, 30);" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
--- @skip_result_check=true
+-- @expect_error=dependency: RefUnchanged
 ALTER TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows OPTIMIZE;
 
 -- query 6
--- Poll only the read-only job presentation. Generic wait_alter_optimize
--- expects FINISHED and would wrongly fail this intended typed refusal.
--- @retry_count=60
--- @retry_interval_ms=500
--- @result_contains=KNOWN_UNCOMMITTED
--- @result_contains=dependency: RefUnchanged
--- @skip_result_check=true
-SHOW ALTER TABLE OPTIMIZE FROM lake_publication_${suite_uuid0}.ns_${uuid0} WHERE TableName = 'optimize_rows';
-
--- query 7
 SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.optimize_rows ORDER BY id;
 
--- query 8
+-- query 7
 -- @result_contains=IRU5_READ_DEPENDENCY_CONFLICT_OK
 shell: set -eu
 artifact_dir="${NOVAROCKS_WORKSPACE_ROOT:-.}/logs/iru-5/native-lake-${uuid0}"
@@ -127,6 +117,6 @@ printf '%s\n' "$spark_out"
 [ "$spark_status" -eq 0 ]
 printf '%s\n' "$spark_out" | grep -F IRU5_READ_DEPENDENCY_CONFLICT_OK
 
--- query 9
+-- query 8
 -- @skip_result_check=true
 DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;

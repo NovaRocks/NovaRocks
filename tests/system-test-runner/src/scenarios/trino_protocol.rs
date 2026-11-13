@@ -882,6 +882,7 @@ pub(in crate::scenarios) enum RawCompletionExpectation {
     Empty,
     Counted(u64),
     NoCount,
+    OptimizeMetrics([u64; 3]),
 }
 
 pub(in crate::scenarios) fn assert_raw_completion(
@@ -914,12 +915,17 @@ pub(in crate::scenarios) fn assert_raw_completion(
             .context("POST omitted original continuation")?;
         let columns = match expected {
             RawCompletionExpectation::Empty => json!([]),
+            RawCompletionExpectation::OptimizeMetrics(_) => json!([
+                {"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[]}},
+                {"name":"metric_value","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}},
+            ]),
             RawCompletionExpectation::Counted(_) | RawCompletionExpectation::NoCount => {
                 json!([{"name":"rows","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}}])
             }
         };
         let mut admitted = false;
         let mut data_seen = false;
+        let mut metrics_seen = 0usize;
         loop {
             // Only this current page and its same-token replay are in memory;
             // no complete-query Vec<RawResponse> is retained by this oracle.
@@ -985,6 +991,38 @@ pub(in crate::scenarios) fn assert_raw_completion(
                             );
                         }
                     }
+                    RawCompletionExpectation::OptimizeMetrics(counts) => {
+                        ensure!(
+                            value.get("updateCount").is_none(),
+                            "OPTIMIZE fabricated an updateCount"
+                        );
+                        if let Some(data) = value.get("data") {
+                            let rows = data
+                                .as_array()
+                                .context("OPTIMIZE data is not a row array")?;
+                            ensure!(
+                                !rows.is_empty() && next.is_some(),
+                                "OPTIMIZE data omitted its acknowledgement URI"
+                            );
+                            let names = [
+                                "rewritten_data_files_count",
+                                "removed_delete_files_count",
+                                "added_data_files_count",
+                            ];
+                            for row in rows {
+                                ensure!(
+                                    metrics_seen < names.len(),
+                                    "OPTIMIZE repeated a metric row"
+                                );
+                                ensure!(
+                                    *row == json!([names[metrics_seen], counts[metrics_seen]]),
+                                    "OPTIMIZE metric differs from independent expectation: {row}"
+                                );
+                                metrics_seen += 1;
+                            }
+                            data_seen = true;
+                        }
+                    }
                     RawCompletionExpectation::NoCount => {
                         ensure!(
                             value.get("updateCount").is_none(),
@@ -1018,6 +1056,10 @@ pub(in crate::scenarios) fn assert_raw_completion(
             );
             match expected {
                 RawCompletionExpectation::Empty => ensure!(!data_seen, "Empty produced a row"),
+                RawCompletionExpectation::OptimizeMetrics(_) => ensure!(
+                    data_seen && metrics_seen == 3,
+                    "OPTIMIZE omitted its three metric rows"
+                ),
                 RawCompletionExpectation::Counted(_) | RawCompletionExpectation::NoCount => {
                     ensure!(data_seen, "rows-bigint completion omitted its one data row")
                 }
@@ -1029,7 +1071,7 @@ pub(in crate::scenarios) fn assert_raw_completion(
 }
 
 fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Result<()> {
-    use RawCompletionExpectation::{Counted, Empty, NoCount};
+    use RawCompletionExpectation::{Counted, Empty, NoCount, OptimizeMetrics};
     // Same original local Hadoop warehouse owner as the existing session/DDL
     // cases. Format3 row lineage is the already supported P01 DML input.
     for (sql, update_type, expected) in [
@@ -1063,9 +1105,20 @@ fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Res
             "UPDATE",
             Counted(0),
         ),
-        // Hadoop's StatementJob admission is AwaitTerminal. The supported
-        // plain ANALYZE waits for actual executor exit, then JobSubmitted is
-        // genuinely NoCount. WITH SYNC MODE/FULL are currently unsupported.
+        // An empty table has no files to rewrite: all three procedure
+        // metrics are independently known zeros, with no update count.
+        (
+            "CREATE TABLE trc1_catalog.first.completion_optimize_empty (id INT)",
+            "CREATE TABLE",
+            Empty,
+        ),
+        (
+            "ALTER TABLE trc1_catalog.first.completion_optimize_empty OPTIMIZE",
+            "ALTER TABLE EXECUTE",
+            OptimizeMetrics([0, 0, 0]),
+        ),
+        // ANALYZE finishes its original collection/publication in this same
+        // statement and retains Trino's NULL count result.
         (
             "ANALYZE TABLE trc1_catalog.first.completion_items",
             "ANALYZE",
@@ -1091,7 +1144,7 @@ fn command_completion(context: &mut ScenarioContext, actor: &TrinoClient) -> Res
         actual == vec![json!([1, 100]), json!([3, 300])],
         "ordinary DML changed independently expected surviving rows"
     );
-    context.action("raw Empty/INSERT2/UPDATE1/DELETE1/MERGE2/UPDATE0/ANALYZE-NULL passed; raw CTAS remains mandatory in the original explicit fenced REST supplement");
+    context.action("raw Empty/INSERT2/UPDATE1/DELETE1/MERGE2/UPDATE0/OPTIMIZE-metrics/ANALYZE-NULL passed; raw CTAS remains mandatory in the original explicit fenced REST supplement");
     Ok(())
 }
 

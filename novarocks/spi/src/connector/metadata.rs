@@ -1367,12 +1367,10 @@ pub struct ConnectorTableRequest {
     pub context: ConnectorRequestContext,
 }
 
-/// A statement-submitted mutation job that must be admitted before its root
-/// is created. Running attempts retain their own request-context initiation.
+/// An ANALYZE capability check before collection starts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorTableJobKind {
     Statistics,
-    RewriteDataFiles,
 }
 
 #[derive(Clone)]
@@ -1380,13 +1378,6 @@ pub struct ConnectorTableJobAdmissionRequest {
     pub table: ConnectorTableIdentity,
     pub job: ConnectorTableJobKind,
     pub context: ConnectorRequestContext,
-}
-
-/// Whether the submitting statement may return before its admitted job exits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorTableJobAdmission {
-    Detached,
-    AwaitTerminal,
 }
 
 /// A current metadata binding paired with the provider's physical table object
@@ -1732,13 +1723,11 @@ pub trait ConnectorMetadata: Send + Sync {
         .into())
     }
 
-    /// Admit a statement-submitted table job before any job state or external
-    /// mutation is created. AwaitTerminal requires waiting for actual exit,
-    /// including when cancellation is requested by the submitting statement.
+    /// Admit ANALYZE before any external mutation is created.
     fn admit_table_job(
         &self,
         _request: ConnectorTableJobAdmissionRequest,
-    ) -> Result<ConnectorTableJobAdmission, ConnectorError> {
+    ) -> Result<(), ConnectorError> {
         Err(ConnectorError::new(
             super::ConnectorErrorKind::Unsupported,
             "connector metadata does not support table job admission",
@@ -2297,10 +2286,8 @@ mod tests {
         let metadata = MetadataWithoutObjectBinding {
             instance_id: instance_id.clone(),
         };
-        for job in [
-            ConnectorTableJobKind::Statistics,
-            ConnectorTableJobKind::RewriteDataFiles,
-        ] {
+        {
+            let job = ConnectorTableJobKind::Statistics;
             let error = metadata
                 .admit_table_job(ConnectorTableJobAdmissionRequest {
                     table: ConnectorTableIdentity {

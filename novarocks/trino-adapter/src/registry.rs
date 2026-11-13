@@ -599,6 +599,12 @@ fn command_update_type(
     use novarocks_query_application::session::StatementOutputShape;
     match admission.shape {
         StatementOutputShape::Rows | StatementOutputShape::Empty => update_type(admission.kind),
+        StatementOutputShape::ResultSet
+            if admission.kind
+                == novarocks_query_application::statement_kind::StatementKind::Optimize =>
+        {
+            update_type(admission.kind)
+        }
         StatementOutputShape::ResultSet | StatementOutputShape::UndeterminedCall => None,
     }
 }
