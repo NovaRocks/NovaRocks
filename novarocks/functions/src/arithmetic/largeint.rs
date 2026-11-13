@@ -176,5 +176,4 @@ impl LargeIntArithmetic {
 }
 
 #[cfg(test)]
-#[path = "arithmetic_largeint_tests.rs"]
 mod tests;

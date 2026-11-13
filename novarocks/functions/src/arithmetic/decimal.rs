@@ -426,5 +426,4 @@ fn divide_half_away(numerator: i128, denominator: i128) -> Option<i128> {
 }
 
 #[cfg(test)]
-#[path = "arithmetic_decimal_tests.rs"]
 mod tests;

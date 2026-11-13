@@ -158,7 +158,6 @@ impl FloatArithmetic {
     }
 }
 #[cfg(test)]
-#[path = "arithmetic_float_tests.rs"]
 mod tests;
 
 /// Reuse the original complete scalar constructor with a real independent
