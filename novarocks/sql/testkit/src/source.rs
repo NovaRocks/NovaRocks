@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Independent original SQL completion over non-null Connector input facts.
+//! Shared real SQL completion over explicit Connector input facts; no value evaluator.
 //! The completed public guarantee follows the existing NULL-policy author;
 //! these declarations neither replay runtime data nor claim runtime execution.
 use arrow::datatypes::DataType;
@@ -43,27 +43,21 @@ use novarocks_sql::planning::dml::DmlStatisticsEvidence;
 use novarocks_types::schema::ColumnDef;
 use std::sync::Arc;
 
-use novarocks_functions::ConstantPolicy;
-use novarocks_physical_plan::{
-    ExprKind, PipelineDopDomain, PlanVersionId, ScanReadBudget, UnaryOperator,
-};
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId, ScanReadBudget};
 use novarocks_sql::compiler::{
     DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
     SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest, SqlPlanningEnvironment,
     SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog, noop_constant_evaluator,
 };
 
-pub(super) fn sql_source(
-    sql: &str,
-    dtype: DataType,
-) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
+pub fn sql_source(sql: &str, dtype: DataType) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     sql_source_with_semantics(
         sql,
         dtype,
         novarocks_sql::sql_mode::SqlSemanticSettings::default(),
     )
 }
-pub(super) fn sql_source_with_semantics(
+pub fn sql_source_with_semantics(
     sql: &str,
     dtype: DataType,
     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
@@ -71,7 +65,7 @@ pub(super) fn sql_source_with_semantics(
     sql_source_with_explicit_single_field(sql, Field::new("k", dtype, false), sql_semantics, None)
 }
 /// A fixture source fact is explicit; it is never inferred from test data.
-pub(super) fn sql_source_with_single_field(
+pub fn sql_source_with_single_field(
     sql: &str,
     field: Field,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -84,7 +78,7 @@ pub(super) fn sql_source_with_single_field(
 }
 /// Same SQL semantics, with a real admitted optimizer setting preserving a
 /// Core ScanResidual. This is not the original native default plan/site.
-pub(super) fn sql_source_with_single_field_and_core_residuals(
+pub fn sql_source_with_single_field_and_core_residuals(
     sql: &str,
     field: Field,
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -105,7 +99,7 @@ fn sql_source_with_explicit_single_field(
 }
 /// Explicit original relation declarations for multi-column SQL fixtures.
 /// This shares the one original fact/resume/provider author, never a second plan.
-pub(super) fn sql_source_with_declared_fields(
+pub fn sql_source_with_declared_fields(
     sql: &str,
     fields: &[Field],
 ) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
@@ -125,7 +119,7 @@ fn sql_source_with_explicit_fields(
     try_sql_source_with_explicit_fields(sql, fields, sql_semantics, static_predicate_offer).unwrap()
 }
 
-pub(super) fn try_sql_source_with_declared_fields(
+pub fn try_sql_source_with_declared_fields(
     sql: &str,
     fields: &[Field],
 ) -> Result<
@@ -152,7 +146,7 @@ fn try_sql_source_with_explicit_fields(
     let control = SqlCompileControl::unbounded();
     let request = SqlFinalPlanCompileRequest::new(
         PlanVersionId::try_new([91; 16]).unwrap(),
-        SqlStatementInput::parsed_query(crate::exec::expr::test_support::parse_query(sql)),
+        SqlStatementInput::parsed_query(crate::parse_query(sql)),
         SqlCompileIntent::Query,
         SqlSessionContext {
             sql_semantics,
@@ -169,18 +163,7 @@ fn try_sql_source_with_explicit_fields(
         builtin_sql_function_catalog().snapshot(),
         noop_constant_evaluator(),
         // Explicit fixture admission; neither capacity grant nor defaults.
-        ConstantPolicy {
-            max_rows: 64,
-            max_array_nodes: 1024,
-            max_logical_elements: 4096,
-            max_retained_buffer_bytes: 1 << 20,
-            max_type_depth: 64,
-            max_type_nodes: 4096,
-            max_dictionary_depth: 64,
-            max_metadata_bytes: 1 << 20,
-            max_library_validation_work: 1 << 20,
-            max_library_validation_bytes: 1 << 20,
-        },
+        crate::sql_fixture_constant_policy(),
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -273,87 +256,6 @@ fn try_sql_source_with_explicit_fields(
     }
 }
 
-fn assert_original_same_owner(
-    port: &novarocks_physical_plan::ResultPort,
-    source: &novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
-) {
-    let fragment = &source.plan().fragments()[&port.fragment];
-    let node = &fragment.nodes()[&port.output.node];
-    assert_eq!(node.output, port.output);
-    assert_eq!(port.fields.len(), port.output.columns.len());
-    for (ordinal, field) in port.fields.iter().enumerate() {
-        assert_eq!(field.value, port.output.columns[ordinal]);
-        assert_eq!(field.ty, fragment.values()[&field.value].ty);
-    }
-}
-#[test]
-fn numeric_unary_original_nonnull_sql_baseline_three_narrow_widths_remain_nonnullable() {
-    for (ty, min, dtype) in [
-        ("TINYINT", "-128", DataType::Int8),
-        ("SMALLINT", "-32768", DataType::Int16),
-        ("INT", "-2147483648", DataType::Int32),
-    ] {
-        let _ = (ty, min); // Values are runtime inputs, never used to manufacture plan types.
-        let source = sql_source("SELECT -k AS original_negated FROM fixture", dtype.clone());
-        let port = source.plan().result_port().unwrap();
-        assert_original_same_owner(port, &source);
-        assert_eq!(port.fields.len(), 1);
-        assert_eq!(port.fields[0].alias.as_deref(), Some("original_negated"));
-        assert_eq!(port.fields[0].ty.data_type().clone(), dtype);
-        // The required input remains required. Negating its minimum may yield
-        // NULL under the original checked arithmetic policy in either mode.
-        assert!(port.fields[0].ty.nullable());
-        let mut actual_minus = 0;
-        for fragment in source.plan().fragments().values() {
-            for (_, expr) in fragment.expressions().iter() {
-                if matches!(
-                    expr.kind,
-                    ExprKind::Unary {
-                        op: UnaryOperator::Minus,
-                        ..
-                    }
-                ) {
-                    actual_minus += 1;
-                    assert_eq!(expr.ty.data_type().clone(), dtype);
-                    assert!(expr.ty.nullable());
-                    let ExprKind::Unary { expr: input, .. } = &expr.kind else {
-                        unreachable!();
-                    };
-                    let input = fragment.expressions().get(*input).unwrap();
-                    assert_eq!(input.ty.data_type(), &dtype);
-                    assert!(!input.ty.nullable());
-                }
-            }
-        }
-        assert!(
-            actual_minus > 0,
-            "fixture must retain the actual original Minus definition"
-        );
-    }
-}
-#[test]
-fn numeric_unary_original_nonnull_sql_baseline_ordered_labels_and_values_are_actual_root() {
-    let source = sql_source(
-        "SELECT -k AS first_alias, k AS original_source, -k AS repeated_alias FROM fixture",
-        DataType::Int8,
-    );
-    let port = source.plan().result_port().unwrap();
-    assert_original_same_owner(port, &source);
-    assert_eq!(port.fields.len(), 3);
-    for (ordinal, (field, alias)) in port
-        .fields
-        .iter()
-        .zip(["first_alias", "original_source", "repeated_alias"])
-        .enumerate()
-    {
-        assert_eq!(field.alias.as_deref(), Some(alias));
-        assert_eq!(field.ty.data_type().clone(), DataType::Int8);
-        assert_eq!(field.ty.nullable(), ordinal != 1);
-    }
-    // Whether optimization reused an expression/ValueId is the actual plan's
-    // choice. Each ordered output occurrence above is checked individually.
-}
-
 fn connector_binding() -> ConnectorReadBinding {
     let provider_id = ConnectorProviderId::parse("iceberg").expect("provider id");
     let instance_id = ConnectorInstanceId::parse("lakehouse").expect("instance id");
@@ -405,7 +307,6 @@ fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
             )
             .expect("fixture metadata kind")
         }),
-
         selection_digest: [8; 32],
         schema: need
             .columns()

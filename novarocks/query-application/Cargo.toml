@@ -38,6 +38,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+novarocks-sql-testkit.workspace = true
+novarocks-functions.workspace = true
 novarocks-resource-contract.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-sql = { workspace = true }
