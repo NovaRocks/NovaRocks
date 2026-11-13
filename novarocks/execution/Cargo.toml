@@ -51,6 +51,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-test-compile-to-execute.workspace = true
 novarocks-sql-testkit.workspace = true
 novarocks-coordination-contract.workspace = true
 chrono.workspace = true

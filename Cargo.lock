@@ -3438,6 +3438,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-sql-testkit",
+ "novarocks-test-compile-to-execute",
  "novarocks-type-contract",
  "novarocks-types",
  "novarocks-value-arrays",
@@ -4347,6 +4348,20 @@ dependencies = [
  "novarocks-types",
  "prost 0.13.5",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "novarocks-test-compile-to-execute"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "novarocks-connector-contract",
+ "novarocks-functions",
+ "novarocks-local-compiler",
+ "novarocks-local-program",
+ "novarocks-physical-plan",
+ "novarocks-sql",
+ "novarocks-type-contract",
 ]
 
 [[package]]
