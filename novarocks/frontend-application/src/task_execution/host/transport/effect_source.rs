@@ -1253,6 +1253,13 @@ impl EffectSource for AttemptTransportSource {
                 },
             )
         });
+        if let Some(refused) = self
+            .subscriptions
+            .as_mut()
+            .and_then(AttemptSubscriptions::take_publication_refusal)
+        {
+            self.other.retain_transport_failure(Box::new(refused));
+        }
         if let Some(progress) = &subscription_progress {
             units += progress.units;
             progressed |= progress.progressed;

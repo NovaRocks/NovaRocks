@@ -893,6 +893,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
         None
     };
     let mut phases = Vec::new();
+    let mut final_opened_observed = false;
     let phase_work = if let Some(rows) = &ordinary_cut {
         // Subscription progress and exit share the same original Source as
         // the earlier Ordinary read hint. Observe filled custody before
@@ -972,31 +973,28 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
             .await
             .unwrap();
     }
-    let queued_exit = if let Some(rows) = &ordinary_cut {
+    if let Some(rows) = &ordinary_cut {
         let (phase, work) = phase_work.unwrap();
-        Some(
-            tokio::time::timeout(wait, async {
-                loop {
-                    drive();
-                    assert_eq!(filled_ordinary(), *rows);
-                    let filled = lifecycle_filled();
-                    if let [first, exit] = filled.as_slice() {
-                        assert_eq!(*first, phase);
-                        assert!(matches!(
-                            scope.work_lifecycle(work.work).unwrap(),
-                            Some((_, true, true, _)),
-                        ));
-                        return *exit;
-                    }
-                    tokio::task::yield_now().await;
+        // The real producer and captures may exit while this Source's first
+        // phase is still queued. The original exit event must wait for the
+        // complete phase instead of enabling a replacement ahead of it.
+        tokio::time::timeout(wait, async {
+            loop {
+                drive();
+                assert_eq!(filled_ordinary(), *rows);
+                assert_eq!(lifecycle_filled(), [phase]);
+                if matches!(
+                    scope.work_lifecycle(work.work).unwrap(),
+                    Some((_, true, true, _)),
+                ) {
+                    return;
                 }
-            })
-            .await
-            .unwrap(),
-        )
-    } else {
-        None
-    };
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     let mut exit_input = None;
     let drained = tokio::time::timeout(wait, async {
         loop {
@@ -1013,9 +1011,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
                             (id(1), participation, request.generation)
                         );
                         assert!(exit_input.replace(input).is_none());
-                        if let Some(queued) = queued_exit {
-                            assert_eq!(input, queued);
-                        } else {
+                        if !saturate_ordinary {
                             return;
                         }
                     }
@@ -1024,6 +1020,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
                             (phase.participation, phase.generation),
                             (participation, request.generation)
                         );
+                        final_opened_observed |= phase.opened_at.is_some();
                         phases.push(input);
                     }
                     other => panic!("expected an original subscription phase or exit: {other:?}"),
@@ -1108,6 +1105,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
     assert!(host.is_empty() && runtime.is_empty());
     assert!(scope.snapshot().is_err() && control_scope.snapshot().is_err());
     assert!(membership_registry.is_empty());
+    let mut complete_phase_precedes_exit = None;
     if let Some(history) = history {
         let history = history.drain(4096);
         assert!(
@@ -1155,6 +1153,7 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
             assert!(preceding < next);
             preceding = next;
         }
+        complete_phase_precedes_exit = Some(preceding < exit);
         for role in ordinary_cut.unwrap() {
             let ordinary = consumed(role.in_flight.unwrap());
             assert!(captures < ordinary);
@@ -1191,4 +1190,16 @@ async fn run_installed_subscription(saturate_ordinary: bool) {
         .await
         .unwrap();
     assert!(peer.settle().await);
+    // The real Source must deliver its complete phase before the actual exit
+    // can enable a replacement. Check only after every original owner exits.
+    if let Some(ordered) = complete_phase_precedes_exit {
+        assert!(
+            final_opened_observed,
+            "the complete final opened phase was not observed"
+        );
+        assert!(
+            ordered,
+            "the actual exit enabled replacement before the final phase was consumed"
+        );
+    }
 }

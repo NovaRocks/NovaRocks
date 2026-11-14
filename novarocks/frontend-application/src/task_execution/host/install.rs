@@ -90,6 +90,11 @@ impl StatusIntakeWake for SourceWake {
 }
 
 pub(crate) struct InstalledAttemptHost {
+    #[cfg(test)]
+    pub(crate) fixture_sources: (
+        novarocks_control_runtime_core::identity::ActorId,
+        novarocks_control_runtime_core::identity::ActorId,
+    ),
     pub(crate) bridge: RegisteredActiveAttempt,
     publication: Weak<AttemptPublicationOwner>,
     registered_cut: Option<novarocks_query_application::api::ComputationReadyToken>,
@@ -467,6 +472,11 @@ impl InstallAttemptHost<'_> {
             ),
         };
         let executor: Arc<dyn EffectExecutor> = Arc::new(AttemptAuxiliaryExecutor);
+        #[cfg(test)]
+        let fixture_sources = (
+            registered.original.actor(),
+            registered.subscription_source_for_test(),
+        );
         let mut prepared = registered
             .prepare_host(
                 runtime,
@@ -487,6 +497,8 @@ impl InstallAttemptHost<'_> {
                 route.publish_registered(startup, abort_ingress)
             });
         Ok(InstalledAttemptHost {
+            #[cfg(test)]
+            fixture_sources,
             bridge,
             publication: Arc::downgrade(&publication),
             registered_cut: None,

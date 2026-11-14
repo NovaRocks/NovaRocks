@@ -91,6 +91,7 @@ fn manual_process(
     data: &FrontendDataRuntime,
     clock: Arc<dyn MonotonicClock>,
     peer: BackendProcessDescriptor,
+    history: Option<novarocks_control_runtime::history::HistoryCapture>,
 ) -> FrontendAttemptRuntime {
     let layout = data.transport_capacity().clone();
     let clock: Arc<dyn Clock> = Arc::new(FrontendClock(clock));
@@ -107,11 +108,11 @@ fn manual_process(
         limits,
         layout.keyed_families(),
         [],
-        None,
+        history.clone(),
         observation.clone(),
     )
     .unwrap();
-    let runtime = ActorRuntime::with_observation(None, observation.clone());
+    let runtime = ActorRuntime::with_observation(history, observation.clone());
     let host_observation = Arc::new(FrontendHostObservations::new(clock.clone()));
     let host = Arc::new(HostRegistry::new(
         runtime.clone(),
@@ -349,7 +350,7 @@ async fn installed_unstarted_single_participation_closes_all_original_sources() 
     let drive = logical.native_attempt_drive();
     let route = Arc::new(router.reserve_route(execution).unwrap());
     let clock = Arc::new(ManualClock::new());
-    let process = manual_process(&data, clock.clone(), descriptor.clone());
+    let process = manual_process(&data, clock.clone(), descriptor.clone(), None);
     let staged = stage_subscription_endpoints(
         &[crate::control_runtime::membership::FrozenMember {
             participation: manifest.participations()[0].participation(),
@@ -463,6 +464,15 @@ async fn installed_unstarted_single_participation_closes_all_original_sources() 
 
 #[tokio::test]
 async fn installed_live_single_root_subscription_normally_converges_and_really_closes() {
+    run_installed_live(false).await;
+}
+
+#[tokio::test]
+async fn installed_reopen_retires_original_final_phase_before_reusing_paid_source() {
+    run_installed_live(true).await;
+}
+
+async fn run_installed_live(controlled_reopen: bool) {
     let wait = Duration::from_secs(5);
     let handle = tokio::runtime::Handle::current();
     let mut data = FrontendDataRuntime::new(handle.clone());
@@ -518,7 +528,11 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
     // declaration is not inferred from the package's Binary carrier.
     let kind = novarocks_result_contract::RootOutputKind::CountOnly;
     let root_task = manifest.root();
-    peer.enable_single_root_lifecycle(root_task, kind);
+    if controlled_reopen {
+        peer.enable_single_root_first_subscription_eof_before_create(root_task, kind);
+    } else {
+        peer.enable_single_root_lifecycle(root_task, kind);
+    }
     let participations = manifest
         .participations()
         .iter()
@@ -647,7 +661,13 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
     let drive = logical.native_attempt_drive();
     let route = Arc::new(router.reserve_route(execution).unwrap());
     let clock = Arc::new(ManualClock::new());
-    let process = manual_process(&data, clock.clone(), descriptor.clone());
+    let history = novarocks_control_runtime::history::HistoryCapture::new(32_768);
+    let process = manual_process(
+        &data,
+        clock.clone(),
+        descriptor.clone(),
+        controlled_reopen.then(|| history.clone()),
+    );
     let staged = stage_subscription_endpoints(
         &[crate::control_runtime::membership::FrozenMember {
             participation: manifest.participations()[0].participation(),
@@ -685,7 +705,7 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
     let mut installed = InstallAttemptHost {
         process: &process,
         data: &data,
-        clock,
+        clock: clock.clone(),
         drive: &drive,
         prepared,
         establish: &establish,
@@ -717,8 +737,17 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
     // loopback subscription. The consumer below obtains exact empty EOS and
     // ACK through the native codec and original retained result window before
     // requesting the serialized owner's success decision.
+    let (actor_id, subscription_source) = installed.fixture_sources;
+    let (allow_consumer, consumer_allowed) = tokio::sync::oneshot::channel::<()>();
+    let mut allow_consumer = Some(allow_consumer);
+    if !controlled_reopen {
+        let _ = allow_consumer.take().unwrap().send(());
+    }
     let mut normal_future = Box::pin(async {
         let consume_and_seal = async {
+            consumer_allowed
+                .await
+                .map_err(|_| "fixture consumer gate withdrawn".to_owned())?;
             use novarocks_execution_contract::root_result::RootResultRead;
             use novarocks_query_application::api::BoundedRootReadPort;
             use novarocks_query_application::coordination::{RootRelayFrontier, RootRelayStep};
@@ -772,13 +801,181 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
         };
         tokio::join!(installed.bridge.run(cancellation.clone()), consume_and_seal)
     });
-    let normal_first = drive_until(
-        &process,
-        &mut joint,
-        normal_future.as_mut(),
-        Instant::now() + wait,
-    )
-    .await;
+    use novarocks_control_runtime::actor_turn::{ActorTurnError, InputPhase};
+    use novarocks_control_runtime_core::{history::HistoryFact, mailbox::InputClass};
+    let mut early_normal = None;
+    let mut setup = None;
+    let mut body_exit = false;
+    let mut blocked = None;
+    let mut second_subscribe = !controlled_reopen;
+    let mut captured_history = Vec::new();
+    if controlled_reopen {
+        let mut first_open = None;
+        let deadline = Instant::now() + wait;
+        // Stop Core before handing off its first real Open. No phase or
+        // input is assigned: the Host and original transport still progress.
+        while Instant::now() < deadline {
+            source_cohort::tests::drive(&mut joint);
+            process
+                .runtime
+                .advance_time(process.clock.now(), 64)
+                .unwrap();
+            if first_open.is_none() {
+                process
+                    .runtime
+                    .poll_one_with_clock(process.clock.as_ref())
+                    .unwrap();
+                first_open = fixture_pending_open(&process, actor_id, None);
+            }
+            if let Some(turn) = process.runtime.claim_host_actor() {
+                process.host.drive(process.clock.now(), turn);
+            }
+            if early_normal.is_none()
+                && let Poll::Ready(value) = futures::poll!(normal_future.as_mut())
+            {
+                early_normal = Some(value);
+            }
+            if first_open.is_some() && peer.single_root_first_subscription_waiting() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let inputs = process
+            .runtime
+            .input_inventory(actor_id, None, 4096)
+            .unwrap();
+        let phases = inputs
+            .iter()
+            .filter(|row| {
+                row.source == subscription_source
+                    && row.class == InputClass::Lifecycle
+                    && row.phase == InputPhase::Filled
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if let (Some(open), [phase]) = (first_open, phases.as_slice()) {
+            let authors = process
+                .runtime
+                .input_header_authors(actor_id, phase.input, 4)
+                .unwrap();
+            if let [work] = authors.as_slice() {
+                setup = Some((open, *phase, *work));
+            }
+        }
+        peer.release_single_root_first_subscription();
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            source_cohort::tests::drive(&mut joint);
+            if let Some(turn) = process.runtime.claim_host_actor() {
+                process.host.drive(process.clock.now(), turn);
+            }
+            captured_history.extend(history.drain(4096).entries);
+            if let Some((_, _, original)) = setup {
+                body_exit = captured_history.iter().any(|e| matches!(e.fact,
+                    HistoryFact::BodyExited { scope, work } if (scope, work) == (original.scope, original.work)))
+                    && captured_history.iter().any(|e| matches!(e.fact,
+                    HistoryFact::CapturesExited { scope, work } if (scope, work) == (original.scope, original.work)));
+                if body_exit {
+                    // The result was published before these actual reports;
+                    // drain its original Host without polling the paused Core.
+                    for _ in 0..8 {
+                        if let Some(turn) = process.runtime.claim_host_actor() {
+                            process.host.drive(process.clock.now(), turn);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        // The actual EOF was received at the frozen original clock reading.
+        // Let its first retry (100 ms with at most 20% jitter in
+        // CoveredRetryBudget) become due while Core still has queued work.
+        // This advances only the injected clock, never an input or phase.
+        if body_exit {
+            clock.advance(Duration::from_millis(120));
+        }
+        // Never require the old early Exit publication. A fixed Source can
+        // hold that original result until the final phase actually retires.
+        let deadline = Instant::now() + wait;
+        let mut advanced_retry = false;
+        while Instant::now() < deadline {
+            source_cohort::tests::drive(&mut joint);
+            process
+                .runtime
+                .advance_time(process.clock.now(), 64)
+                .unwrap();
+            let core_ran = process
+                .runtime
+                .poll_one_with_clock(process.clock.as_ref())
+                .unwrap();
+            let mut host_ran = false;
+            if let Some(turn) = process.runtime.claim_host_actor() {
+                host_ran = true;
+                if let Some((first, phase, _)) = setup
+                    && let Some(open) = fixture_pending_open(&process, actor_id, Some(first.3))
+                {
+                    let inputs = process
+                        .runtime
+                        .input_inventory(actor_id, None, 4096)
+                        .unwrap();
+                    if let Some(last) = inputs.iter().find(|row| {
+                        row.source == subscription_source
+                            && row.standing_input_id == phase.standing_input_id
+                            && row.input != phase.input
+                            && row.phase == InputPhase::Filled
+                    }) && process.runtime.pending_timer_input(actor_id).unwrap() == Some(open.0)
+                        && process
+                            .runtime
+                            .effect_ready_for(&turn, open.0, open.1)
+                            .unwrap_or(false)
+                        && process.runtime.input_retirement_status(actor_id, open.0)
+                            == Err(ActorTurnError::EffectsRemain)
+                    {
+                        blocked = Some((open, last.input));
+                    }
+                }
+                process.host.drive(process.clock.now(), turn);
+            }
+            captured_history.extend(history.drain(4096).entries);
+            if early_normal.is_none()
+                && let Poll::Ready(value) = futures::poll!(normal_future.as_mut())
+            {
+                early_normal = Some(value);
+            }
+            if peer.subscription_requests().len() >= 2 {
+                second_subscribe = true;
+                break;
+            }
+            // Advance only an original indexed future deadline, once, after
+            // actual queued Core/Host work ran out. No Timer fact is authored.
+            if !core_ran
+                && !host_ran
+                && !advanced_retry
+                && let Some(next) = process.runtime.next_deadline()
+                && next > process.clock.now()
+            {
+                clock.advance(Duration::from_nanos(next.0 - process.clock.now().0));
+                advanced_retry = true;
+            }
+            tokio::task::yield_now().await;
+        }
+        peer.release_single_root_first_subscription();
+        peer.release_single_root_create();
+        let _ = allow_consumer.take().unwrap().send(());
+    }
+    let normal_first = if early_normal.is_some() {
+        early_normal
+    } else {
+        drive_until(
+            &process,
+            &mut joint,
+            normal_future.as_mut(),
+            Instant::now() + wait,
+        )
+        .await
+    };
     let normal_within_watchdog = normal_first.is_some();
     let normal = if normal_first.is_some() {
         normal_first
@@ -988,10 +1185,22 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
         && process.members.is_empty();
 
     // Assertions follow actual host/Source/QA/Workload/channel/peer cleanup.
-    assert!(clean);
+    assert!(
+        clean,
+        "original host cleanup failed: setup={setup:?}, body_exit={body_exit}, blocked={blocked:?}, second_subscribe={second_subscribe}, normal={normal:?}, original_terminal={original_terminal:?}, closure={closure:?}, host_exit={host_exit:?}, qa={qa_exit:?}, scope={scope_released:?}, workload_ok={}, subscriptions={subscriptions_exit:?}, apply={apply_exit:?}, outgoing={outgoing_exit:?}, peer={peer_exit}",
+        workload_exit.is_ok()
+    );
+    if controlled_reopen {
+        assert!(history.is_complete());
+        assert!(setup.is_some() && body_exit);
+        assert!(
+            second_subscribe,
+            "next original Open was stranded: {blocked:?}"
+        );
+    }
     assert!(
         qa_exit.is_ok() && scope_released.is_ok() && workload_exit.is_ok(),
-        "saved live fixture outcomes: qa={qa_exit:?}, scope={scope_released:?}, workload_ok={},, normal={normal:?}, original_terminal={original_terminal:?}, convergence={closure:?}, normal_first={normal_within_watchdog}, convergence_first={convergence_within_watchdog}, host_exit={host_exit:?}, subscribed={subscribed}, released={released}, read_closed={read_closed}, subscriptions={subscriptions_exit:?}, apply={apply_exit:?}, outgoing={outgoing_exit:?}, peer={peer_exit}, qa_completion={qa_completion:?}, qa_convergence={qa_convergence:?}",
+        "saved live fixture outcomes: qa={qa_exit:?}, scope={scope_released:?}, workload_ok={},, normal={normal:?}, original_terminal={original_terminal:?}, convergence={closure:?}, normal_first={normal_within_watchdog}, convergence_first={convergence_within_watchdog}, host_exit={host_exit:?}, subscribed={subscribed}, released={released}, read_closed={read_closed}, subscriptions={subscriptions_exit:?}, apply={apply_exit:?}, outgoing={outgoing_exit:?}, peer={peer_exit}, qa_completion={qa_completion:?}, qa_convergence={qa_convergence:?}, setup={setup:?}, body_exit={body_exit}, blocked={blocked:?}, second_subscribe={second_subscribe}",
         workload_exit.is_ok()
     );
     assert!(subscriptions_exit.is_ok() && apply_exit.is_ok() && outgoing_exit.is_ok() && peer_exit);
@@ -1017,4 +1226,48 @@ async fn installed_live_single_root_subscription_normally_converges_and_really_c
             novarocks_query_application::api::NativeActiveConvergenceClosure::Evidence(_)
         ))
     ));
+}
+
+fn fixture_pending_open(
+    process: &FrontendAttemptRuntime,
+    actor: novarocks_control_runtime_core::identity::ActorId,
+    after: Option<std::num::NonZeroU64>,
+) -> Option<(
+    novarocks_control_runtime_core::identity::InputId,
+    novarocks_control_runtime_core::identity::ActionId,
+    novarocks_execution_contract::ParticipationRef,
+    std::num::NonZeroU64,
+)> {
+    use crate::control_runtime::actor::FrontendEffect;
+    use novarocks_attempt_protocol::effect::EffectBody;
+    use novarocks_control_runtime_core::effect::EffectState;
+    for (_, input) in process.runtime.committed_batches(actor, None, 256).unwrap() {
+        for (descriptor, state) in process
+            .runtime
+            .effect_inventory(actor, input, None, 32)
+            .unwrap()
+        {
+            if state != EffectState::Pending {
+                continue;
+            }
+            let Some(FrontendEffect::Attempt(effect)) = process
+                .runtime
+                .pending_effect_metadata(actor, input, descriptor.id)
+                .unwrap()
+            else {
+                continue;
+            };
+            if let EffectBody::OpenSubscription(request) = &effect.protocol.body
+                && after.is_none_or(|old| request.generation > old)
+            {
+                return Some((
+                    input,
+                    descriptor.id,
+                    request.participation,
+                    request.generation,
+                ));
+            }
+        }
+    }
+    None
 }

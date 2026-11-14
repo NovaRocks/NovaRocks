@@ -494,7 +494,64 @@ enum SubscribeAnswer {
 
 /// One fixed healthy external peer script for the installed-host test. These
 /// are wire facts authored by this peer, never FE local-work exit reports.
+/// Only the fixed external test peer waits here. A release is persistent;
+/// registration precedes checking it, and canceled RPCs drop their waiter.
+struct SingleRootIoGate {
+    released: std::sync::atomic::AtomicBool,
+    waiters: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+struct SingleRootIoWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for SingleRootIoWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl SingleRootIoGate {
+    fn new() -> Self {
+        Self {
+            released: std::sync::atomic::AtomicBool::new(false),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        use std::sync::atomic::Ordering;
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = SingleRootIoWaiter(&self.waiters);
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiters.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
+struct SingleRootIoGates {
+    first_subscription_selected: bool,
+    first_subscription: Arc<SingleRootIoGate>,
+    create: Arc<SingleRootIoGate>,
+}
+
 struct SingleRootLifecycle {
+    io_gates: Option<SingleRootIoGates>,
     root: TaskIdentity,
     kind: novarocks_result_contract::RootOutputKind,
     participation: Option<ParticipationRef>,
@@ -643,7 +700,29 @@ impl TaskWirePeer {
         request: Request<proto::ApplyTaskOperationsRequest>,
     ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
         let request = request.into_inner();
-        let scripted = { self.state.lock().expect("peer state").single_root.is_some() };
+        let (scripted, create_gate) = {
+            let state = self.state.lock().expect("peer state");
+            let script = state.single_root.as_ref();
+            let create = request.operations.iter().any(|operation| {
+                matches!(
+                    operation.operation.as_ref(),
+                    Some(proto::task_operation::Operation::CreateTask(_))
+                )
+            });
+            let gate = create
+                .then(|| {
+                    script
+                        .and_then(|script| script.io_gates.as_ref())
+                        .map(|gates| Arc::clone(&gates.create))
+                })
+                .flatten();
+            (script.is_some(), gate)
+        };
+        if let Some(gate) = create_gate {
+            // The actual Create RPC remains pending. No model mutation or ACK
+            // happens before the fixture releases this original I/O future.
+            gate.wait().await;
+        }
         if scripted {
             return self.apply_single_root(request);
         }
@@ -1019,6 +1098,7 @@ impl TaskWirePeer {
     fn subscribe_single_root(
         &self,
         request: proto::SubscribeTaskStatusRequest,
+        close_after_initial: bool,
     ) -> Result<Response<StatusStream>, Status> {
         let decoded = decode_covered_subscribe_task_status(
             &request,
@@ -1137,9 +1217,11 @@ impl TaskWirePeer {
                 None,
             )))
             .expect("fixed catch-up cut fits the original channel");
-        if !script.released {
+        if !script.released && !close_after_initial {
             held.push(sender);
         }
+        // In the selected first-response mode, dropping this actual sender
+        // yields real server EOF after the queued typed catch-up frames.
         drop(state);
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
@@ -1343,9 +1425,27 @@ impl NovaRocksGrpc for TaskWirePeer {
         if !NativeRpcMethod::SubscribeTaskStatus.is_allowed_at(self.domain) {
             return Err(Self::rejected("wrong endpoint domain"));
         }
-        let scripted = { self.state.lock().expect("peer state").single_root.is_some() };
+        let (scripted, first_response) = {
+            let mut state = self.state.lock().expect("peer state");
+            let script = state.single_root.as_mut();
+            let configured = script.is_some();
+            let first = script
+                .and_then(|script| script.io_gates.as_mut())
+                .filter(|gates| !gates.first_subscription_selected)
+                .map(|gates| {
+                    gates.first_subscription_selected = true;
+                    Arc::clone(&gates.first_subscription)
+                });
+            (configured, first)
+        };
+        let first_eof = first_response.is_some();
+        if let Some(gate) = first_response {
+            // Actual request arrival is observable, but response headers and
+            // the original catch-up stream are held until explicit release.
+            gate.wait().await;
+        }
         if scripted {
-            return self.subscribe_single_root(request.into_inner());
+            return self.subscribe_single_root(request.into_inner(), first_eof);
         }
         let answer = {
             let mut state = self.state.lock().expect("peer state");
@@ -1663,6 +1763,7 @@ impl Loopback {
             "configure the fixed peer before the original runtime starts"
         );
         state.single_root = Some(SingleRootLifecycle {
+            io_gates: None,
             root,
             kind,
             participation: None,
@@ -1681,6 +1782,79 @@ impl Loopback {
             released: false,
             abort_cause: None,
         });
+    }
+
+    /// Two explicit test I/O gates. Configure before the original runtime.
+    pub(crate) fn enable_single_root_first_subscription_eof_before_create(
+        &self,
+        root: TaskIdentity,
+        kind: novarocks_result_contract::RootOutputKind,
+    ) {
+        self.enable_single_root_lifecycle(root, kind);
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_mut()
+            .expect("the exact single-root script was configured")
+            .io_gates = Some(SingleRootIoGates {
+            first_subscription_selected: false,
+            first_subscription: Arc::new(SingleRootIoGate::new()),
+            create: Arc::new(SingleRootIoGate::new()),
+        });
+    }
+
+    pub(crate) fn single_root_first_subscription_waiting(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .and_then(|script| script.io_gates.as_ref())
+            .is_some_and(|gates| gates.first_subscription.waiting())
+    }
+
+    pub(crate) fn release_single_root_first_subscription(&self) {
+        let gate = {
+            let state = self.peer.state.lock().expect("peer state");
+            Arc::clone(
+                &state
+                    .single_root
+                    .as_ref()
+                    .and_then(|script| script.io_gates.as_ref())
+                    .expect("release only the configured fixed test gate")
+                    .first_subscription,
+            )
+        };
+        gate.release();
+    }
+
+    pub(crate) fn single_root_create_waiting(&self) -> bool {
+        self.peer
+            .state
+            .lock()
+            .expect("peer state")
+            .single_root
+            .as_ref()
+            .and_then(|script| script.io_gates.as_ref())
+            .is_some_and(|gates| gates.create.waiting())
+    }
+
+    pub(crate) fn release_single_root_create(&self) {
+        let gate = {
+            let state = self.peer.state.lock().expect("peer state");
+            Arc::clone(
+                &state
+                    .single_root
+                    .as_ref()
+                    .and_then(|script| script.io_gates.as_ref())
+                    .expect("release only the configured fixed test gate")
+                    .create,
+            )
+        };
+        gate.release();
     }
 
     pub(crate) fn single_root_release_observed(&self) -> bool {

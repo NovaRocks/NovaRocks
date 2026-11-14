@@ -634,6 +634,14 @@ impl AttemptCallSource {
         assert!(self.idle.replace(result).is_none());
     }
 
+    /// Check the same original result before the subscription Source retains
+    /// it across final-phase retirement. This grants no result or exit right.
+    pub(super) fn matches_original_result(&self, original: &ReturnedActorTransportResult) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(&original.effect, &live.effect))
+    }
+
     pub(super) fn owns(&self, effect: AttemptActionId) -> bool {
         self.live
             .as_ref()
