@@ -586,3 +586,6 @@ impl FrontendControlRuntime {
 }
 
 pub(crate) mod transport_withdrawal;
+
+#[cfg(test)]
+mod installed_subscription_tests;
