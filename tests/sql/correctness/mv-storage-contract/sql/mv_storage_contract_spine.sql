@@ -103,47 +103,54 @@ GROUP BY region, channel;
 -- this case asked for.
 -- @skip_result_check=true
 -- @result_contains=orders_rollup
--- @result_contains=mvsc_${uuid0}.ns_${uuid0}.orders
--- @result_contains=SUM(amount)
--- @result_contains=DEFERRED_MANUAL
+-- @result_rows_where=name=orders_rollup
+-- @result_rows_count=1
+-- @result_rows_expect=base_identity_matches=true
+-- @result_contains=MANUAL
 -- @result_contains=MANAGEABLE
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT name, refresh_policy, manageability, base_tables[1] = concat(catalog_name, '.', schema_name, '.orders') AS base_identity_matches FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
+
 
 -- query 9
+-- @result_contains=SUM(amount)
+-- @skip_result_check=true
+SELECT definition FROM system.metadata.materialized_views WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}' AND name = 'orders_rollup';
+
+-- query 10
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
 
--- query 10
+-- query 11
 SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, channel;
 
--- query 11
+-- query 12
 -- The published result is cheap enough that a base query is rewritten onto it.
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: orders_rollup
 SELECT region, channel, SUM(amount) FROM orders GROUP BY region, channel;
 
--- query 12
+-- query 13
 -- Clear this fixture's Accelerator and restart the frontend. Everything below
 -- can only come from REST Catalog and MinIO.
 -- @imv_accelerator_wipe_restart=orders_rollup,catalog=mvsc_${uuid0}
 -- @skip_result_check=true
 SELECT 1;
 
--- query 13
+-- query 14
 -- @retry_count=40
 -- @retry_interval_ms=250
 SELECT region, channel, total, rows_in
 FROM mvsc_${uuid0}.ns_${uuid0}.orders_rollup
 ORDER BY region, channel;
 
--- query 14
+-- query 15
 -- The restart replaced the session with a new connection, so the statements
 -- below name their catalog again rather than relying on a session that no
 -- longer exists.
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
 
--- query 15
+-- query 16
 -- The restart left a barrier: the previous process could have had a dispatch
 -- in flight, and the documents cannot say otherwise.
 -- Startup rediscovery installs the barrier behind catalog admission rather
@@ -156,23 +163,23 @@ USE mvsc_${uuid0}.ns_${uuid0};
 -- @result_contains=UnsettledEffects
 CALL novarocks_mv_management_status('mvsc_${uuid0}', 'ns_${uuid0}', 'orders_rollup');
 
--- query 16
+-- query 17
 -- Reading is unaffected; writing is not this process's to do yet.
 -- @retry_count=40
 -- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=orders_rollup
 -- @result_contains=READ_ONLY
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
--- query 17
+-- query 18
 -- @skip_result_check=true
 -- @expect_error_tier=drift
 -- @expect_error=MV target requires a successful fresh Current observation
 USE mvsc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
 
--- query 18
+-- query 19
 -- The operator declares the previous process isolated. The directive reads the
 -- challenge and the incarnation out of the status above and then runs the real
 -- command, so nothing here is a shortcut around it.
@@ -180,26 +187,26 @@ REFRESH MATERIALIZED VIEW orders_rollup WITH SYNC MODE;
 -- @skip_result_check=true
 SELECT 1;
 
--- query 19
+-- query 20
 -- @skip_result_check=true
 -- @result_contains=MANAGEABLE
 -- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=1,slot-changes=1,table-commits=3
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
--- query 20
+-- query 21
 -- @skip_result_check=true
 INSERT INTO mvsc_${uuid0}.ns_${uuid0}.orders VALUES ('east', 'online', 1000), ('west', 'store', 2000);
 
--- query 21
+-- query 22
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.orders_rollup,publications=2,slot-changes=1,table-commits=4,full-overwrite-last=true
 USE mvsc_${uuid0}.ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_rollup FULL WITH SYNC MODE;
 
--- query 22
+-- query 23
 SELECT region, channel, total, rows_in FROM orders_rollup ORDER BY region, channel;
 
--- query 23
+-- query 24
 -- @skip_result_check=true
 USE mvsc_${uuid0}.ns_${uuid0};
 DROP MATERIALIZED VIEW orders_rollup;

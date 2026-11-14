@@ -42,29 +42,35 @@ INSERT INTO statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_$
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (k);
 
 -- query 5
+-- The REST ANALYZE has published before the next statement can read NDV.
+-- @result_rows_where=column_name=k
+-- @result_rows_count=1
+-- @result_rows_expect=distinct_values_count=1.0
+-- @result_rows_expect=low_value=37
+-- @result_rows_expect=high_value=37
+-- @skip_result_check=true
+SHOW STATS FOR statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0};
+
+-- query 6
 -- @skip_result_check=true
 DROP TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} FORCE;
 
--- query 6
+-- query 7
 -- @skip_result_check=true
 CREATE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (
     k BIGINT NOT NULL
 ) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 
--- query 7
+-- query 8
 -- @skip_result_check=true
 INSERT INTO statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} VALUES
     (99);
 
--- query 8
--- The current table has a new physical identity. It must not inherit the
--- predecessor's published provider artifact or its row count of 37.
--- @result_contains=row_count
--- @result_not_contains=PROVIDER_ARTIFACT
--- @result_not_contains=37
--- @skip_result_check=true
-SHOW TABLE STATS statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0};
-
 -- query 9
+-- The current table has a new physical identity. It must not inherit the
+-- predecessor's NDV or bounds for the former value 37.
+SHOW STATS FOR statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0};
+
+-- query 10
 -- @skip_result_check=true
 DROP TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0};

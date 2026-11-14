@@ -234,12 +234,6 @@ impl MvRefreshRequest {
     }
 }
 
-/// Frontend-owned request for listing materialized views.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvShowStatement {
-    pub database: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MvCreateStatement {
     pub name_parts: Vec<String>,

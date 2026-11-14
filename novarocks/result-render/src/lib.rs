@@ -22,8 +22,10 @@
 
 mod encoder;
 pub use encoder::ArrowTrinoJsonEncoder as ClientRowEncoder;
-pub use encoder::render_session_double;
 pub use encoder::{ArrowTrinoJsonEncoder, ValidatedClientInput};
+pub use encoder::{
+    java_float_text, render_session_double, render_session_double as java_double_text,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderErrorKind {

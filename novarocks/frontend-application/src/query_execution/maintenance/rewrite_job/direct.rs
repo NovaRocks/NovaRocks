@@ -18,8 +18,9 @@
 //! Direct SQL borrows the same original Rewrite Domain and poll kernel.
 use super::*;
 use novarocks_query_application::{
+    admitted_query_context::QueryExecutionContext,
     api::LocalResultProducer,
-    session_control::{GovernedStatementAction, StatementActionValue},
+    session_control::{GovernedStatementAction, GovernedStatementResidual, StatementActionValue},
 };
 use novarocks_table_maintenance::{
     activity::{MaintenanceActivityFamily, MaintenanceActivityPermit},
@@ -36,6 +37,8 @@ struct Starting {
     dependencies: Vec<novarocks_spi::connector::SharedDependency>,
     #[cfg(novarocks_dev_controls)]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+    #[cfg(novarocks_dev_controls)]
+    controls: Option<Arc<crate::table_maintenance::test_controls::MaintenanceTestControls>>,
 }
 // The F borrows this exact immutable input; cancellation never moves its
 // unique target/product facts into an otherwise unobserved async frame.
@@ -45,7 +48,10 @@ struct DirectInput {
     target: MaintenanceTarget,
     intent: RewriteIntent,
     product: Arc<TableMaintenanceProduct>,
+    #[cfg(novarocks_dev_controls)]
+    controls: Option<Arc<crate::table_maintenance::test_controls::MaintenanceTestControls>>,
 }
+// Design: ADR-0232 (docs/adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)
 struct DirectRewriteAction {
     family: novarocks_result_contract::ClientPresentationFamily,
     starting: Option<Starting>,
@@ -55,6 +61,7 @@ struct DirectRewriteAction {
     activity: Option<MaintenanceActivityPermit>,
     local: Option<LocalResultProducer>,
     delivered: bool,
+    optimize: bool,
 }
 struct DirectResidual {
     original: DirectRewriteAction,
@@ -96,6 +103,57 @@ pub(crate) fn prepare(
     >,
 ) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
     let intent = closed_intent(action)?;
+    prepare_intent(
+        kernel,
+        names,
+        intent,
+        context,
+        execution,
+        connector,
+        family,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    )
+}
+
+pub(crate) fn prepare_optimize(
+    kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
+    names: &[String],
+    context: MaintenanceRequestContext<'_>,
+    execution: &QueryExecutionContext,
+    connector: &ConnectorRequestContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
+) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
+    prepare_intent(
+        kernel,
+        names,
+        RewriteIntent::Optimize {
+            file_size_threshold_bytes: 100 * 1024 * 1024,
+        },
+        context,
+        execution,
+        connector,
+        family,
+        #[cfg(novarocks_dev_controls)]
+        observation,
+    )
+}
+
+fn prepare_intent(
+    kernel: &crate::query_execution::kernels::MaintenanceExecutionKernel,
+    names: &[String],
+    intent: RewriteIntent,
+    context: MaintenanceRequestContext<'_>,
+    execution: &QueryExecutionContext,
+    connector: &ConnectorRequestContext,
+    family: novarocks_result_contract::ClientPresentationFamily,
+    #[cfg(novarocks_dev_controls)] observation: Option<
+        crate::preparation_diagnostics::StatementObservationHandle,
+    >,
+) -> Result<Box<dyn GovernedStatementAction>, TerminalError> {
     let engine =
         RequestScopedMaintenanceEngine::new(kernel.clone(), execution.clone(), connector.clone());
     let target = engine
@@ -134,13 +192,15 @@ pub(crate) fn prepare(
             .map_err(TerminalError::from_original_cause)?,
     );
     // Borrow the existing Product; this neither creates nor submits a job.
-    let product = kernel
+    let host = kernel
         .service()
         .original_optimize_host()
-        .map_err(TerminalError::pre_dispatch_failed)?
-        .product;
+        .map_err(TerminalError::pre_dispatch_failed)?;
+    let product = host.product;
+    let optimize = matches!(intent, RewriteIntent::Optimize { .. });
     Ok(Box::new(DirectRewriteAction {
         family,
+        optimize,
         starting: Some(Starting {
             engine,
             target,
@@ -150,6 +210,8 @@ pub(crate) fn prepare(
             dependencies,
             #[cfg(novarocks_dev_controls)]
             observation,
+            #[cfg(novarocks_dev_controls)]
+            controls: kernel.service().statement_test_controls(),
         }),
         input: None,
         state: None,
@@ -163,7 +225,7 @@ pub(crate) fn prepare(
 async fn run_direct_product(
     input: Arc<DirectInput>,
     source: RewriteDomainView,
-) -> Result<OriginalProductOutcome, TerminalError> {
+) -> Result<MaintenanceActionOutcome, TerminalError> {
     let binding_cpu = {
         let domain = upgrade_original(&source)?;
         let original = domain.lock().await;
@@ -174,7 +236,7 @@ async fn run_direct_product(
         }
         original.binding_cpu.clone()
     };
-    let effects = GovernedRewriteEffectPort::new(source);
+    let effects = GovernedRewriteEffectPort::new(source.clone());
     // Same original Product checks and rewrite algorithm as the Job path;
     // no legacy coordinator, callback runner or session accumulation bridge.
     input
@@ -182,15 +244,57 @@ async fn run_direct_product(
         .reject_direct_rewrite_on_mv_governed(
             &input.target,
             &input.rewrite.planning_pin(),
-            binding_cpu,
+            binding_cpu.clone(),
         )
         .await
         .map_err(crate::query_execution::maintenance::rewrite_job::guard_terminal_error)?;
+    if matches!(input.intent, RewriteIntent::Optimize { .. }) {
+        let identity = RequestScopedMaintenanceEngine::target_identity(&input.target)
+            .map_err(TerminalError::pre_dispatch_failed)?;
+        let metadata = input.rewrite.metadata().clone();
+        let (binding, _snapshot) = metadata
+            .capture_table_object_with_snapshot_cpu(
+                novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                    table: identity,
+                    resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                    selector: novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                    context: input.engine.connector_context.clone(),
+                },
+                binding_cpu.clone(),
+            )
+            .await
+            .map_err(from_connector_cause)?;
+        let domain = upgrade_original(&source)?;
+        domain.lock().await.expected_object_id = Some(binding.object_id.clone());
+        #[cfg(novarocks_dev_controls)]
+        if let Some(controls) = &input.controls
+            && let Some(nomination) = input.engine.execution.test_statement_nomination()
+        {
+            let capacity = input.engine.execution.result_capacity().ok_or_else(|| {
+                TerminalError::pre_dispatch_failed("OPTIMIZE lost its original result capacity")
+            })?;
+            let observed = controls
+                .claim_statement(
+                    nomination.as_ref(),
+                    &input.target,
+                    &binding.object_id,
+                    capacity,
+                )
+                .map_err(TerminalError::pre_dispatch_failed)?;
+            let mut original = domain.lock().await;
+            original.maintenance_observation = observed;
+            if let Some(observed) = original.maintenance_observation.as_mut() {
+                observed
+                    .wait_before_planning()
+                    .await
+                    .map_err(TerminalError::pre_dispatch_failed)?;
+            }
+        }
+    }
     input
         .product
         .execute_rewrite_terminal(&effects, &input.target, input.intent.clone())
         .await
-        .map(OriginalProductOutcome::Direct)
 }
 
 impl DirectRewriteAction {
@@ -255,7 +359,14 @@ impl DirectRewriteAction {
             self.activity = Some(
                 original
                     .product
-                    .acquire_activity(&original.target, MaintenanceActivityFamily::Metadata)
+                    .acquire_activity(
+                        &original.target,
+                        if self.optimize {
+                            MaintenanceActivityFamily::Optimize
+                        } else {
+                            MaintenanceActivityFamily::Metadata
+                        },
+                    )
                     .map_err(service)?,
             );
         }
@@ -280,6 +391,8 @@ impl DirectRewriteAction {
             target: original.target.clone(),
             intent: original.intent.clone(),
             product: original.product.clone(),
+            #[cfg(novarocks_dev_controls)]
+            controls: original.controls.clone(),
         });
         self.input = Some(input.clone());
         let wake = domain
@@ -304,19 +417,23 @@ impl DirectRewriteAction {
         std::task::ready!(self.poll_start(owner, cx))?;
         let state = self.state.as_mut().unwrap();
         let result = std::task::ready!(state.poll_product(owner, cx));
-        // The actual Product F already exited. Its target gate is not held
-        // behind remote/GC residual; the same source keeps all actual tails.
-        drop(self.activity.take());
+        // OPTIMIZE retains its exact target gate through actual Source exit.
+        // Direct procedure custody otherwise keeps its existing release frontier.
+        if !self.optimize {
+            drop(self.activity.take());
+        }
         result?;
         let mut domain = state
             .domain
             .try_lock()
             .map_err(|_| service("direct Rewrite completed Domain is borrowed"))?;
         let outcome = match domain.result.take() {
-            Some(Ok(OriginalProductOutcome::Direct(outcome))) => outcome,
+            Some(Ok(outcome)) => outcome,
             Some(other) => {
                 domain.result = Some(other);
-                return Poll::Ready(Err(service("direct Rewrite received a Job outcome")));
+                return Poll::Ready(Err(service(
+                    "direct Rewrite received a failed product outcome",
+                )));
             }
             None => {
                 return Poll::Ready(Err(service(
@@ -333,7 +450,7 @@ impl DirectRewriteAction {
         // Every Arrow/schema/result graph is formed only inside the original
         // positively admitted Local factory, using the original result author.
         Poll::Ready(
-            produce_local(producer, outcome)
+            produce_local(producer, outcome, self.optimize)
                 .map(StatementActionValue::Local)
                 .map_err(service),
         )
@@ -398,6 +515,7 @@ impl GovernedStatementAction for DirectRewriteAction {
         }
         let original = Self {
             family: self.family,
+            optimize: self.optimize,
             starting: self.starting.take(),
             input: self.input.take(),
             state: self.state.take(),
@@ -425,13 +543,18 @@ impl GovernedStatementResidual for DirectResidual {
 fn produce_local(
     producer: LocalResultProducer,
     outcome: MaintenanceActionOutcome,
+    optimize: bool,
 ) -> Result<novarocks_query_application::api::OwnedLocalResult, String> {
-    producer.produce(
-        || match crate::table_maintenance::result::action_result(outcome)? {
+    producer.produce(|| {
+        match if optimize {
+            crate::table_maintenance::result::optimize_result(outcome)?
+        } else {
+            crate::table_maintenance::result::action_result(outcome)?
+        } {
             MaintenanceStatementResult::Query(result) => Ok(result),
             MaintenanceStatementResult::Ok => Err("direct Rewrite has no local row result".into()),
-        },
-    )
+        }
+    })
 }
 
 #[cfg(test)]
@@ -441,6 +564,235 @@ mod tests {
         ResourceConfig, ResultCapacityConfig, WorkClass, WorkRequest, WorkloadConfig,
         WorkloadControl,
     };
+
+    #[test]
+    fn optimize_gate_follows_residual_until_actual_metadata_work_and_alias_exit() {
+        use novarocks_resource_contract::SharedDependency;
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorIoAdmissionPort, ConnectorIoCleanupFuture,
+        };
+        use novarocks_table_maintenance::activity::TableMaintenanceActivity;
+        use novarocks_workload_control::{
+            CancellationReason, ControlStorageConfig, ResponsibilityConfig,
+            joint_admission::{JointProgress, JointProgressDriver},
+        };
+        use std::{
+            future::Future,
+            num::NonZeroUsize,
+            pin::Pin,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+            task::Waker,
+        };
+        fn drive(driver: &mut JointProgressDriver) {
+            for _ in 0..100000 {
+                if matches!(driver.step(), JointProgress::Idle(_)) {
+                    return;
+                }
+            }
+            panic!("original responsibility driver must quiesce");
+        }
+        struct ActualCleanup {
+            released: Arc<AtomicBool>,
+            exits: Arc<AtomicUsize>,
+        }
+        impl Future for ActualCleanup {
+            type Output = Result<(), ConnectorError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.released.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for ActualCleanup {
+            fn drop(&mut self) {
+                self.exits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let count = 8;
+        let control = WorkloadControl::try_new_counted(WorkloadConfig {
+            root_limit: count,
+            business_limit: count,
+            query_concurrency_limit: count,
+            scope_records_limit: count,
+            ..WorkloadConfig::default()
+        })
+        .unwrap()
+        .owner;
+        control
+            .configure_result_capacity(ResultCapacityConfig::V1)
+            .unwrap();
+        let (_, mut driver) = control
+            .configure_responsibility(ResponsibilityConfig {
+                work_per_turn: NonZeroUsize::new(7).unwrap(),
+            })
+            .unwrap();
+        control
+            .configure_control_storage(ControlStorageConfig::new(count, &[]))
+            .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let io = MetadataIoAdmission::for_original_source(
+            &root.owner,
+            vec![SharedDependency::LocalHost],
+        )
+        .unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut ready = false;
+        for _ in 0..256 {
+            ready = io.poll_progress(&root.owner, &mut cx).unwrap();
+            if ready {
+                break;
+            }
+            drive(&mut driver);
+        }
+        assert!(ready);
+        let mut request = Box::pin(io.request(SharedDependency::LocalHost).unwrap().admitted());
+        let mut permit = None;
+        for _ in 0..256 {
+            drive(&mut driver);
+            io.poll_progress(&root.owner, &mut cx).unwrap();
+            if let Poll::Ready(result) = request.as_mut().poll(&mut cx) {
+                permit = Some(result.unwrap());
+                break;
+            }
+        }
+        let permit = permit.expect("same original AsyncIo grant");
+        drop(request);
+        let released = Arc::new(AtomicBool::new(false));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let mut cleanup: Option<ConnectorIoCleanupFuture> = Some(Box::pin(ActualCleanup {
+            released: released.clone(),
+            exits: exits.clone(),
+        }));
+        permit
+            .begin_stream()
+            .unwrap()
+            .install_cleanup_in(&mut cleanup)
+            .unwrap_or_else(|_| panic!("same cleanup receiver"));
+        let target = MaintenanceTarget {
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+        };
+        let activity = TableMaintenanceActivity::default();
+        let mut action = DirectRewriteAction {
+            family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
+                novarocks_result_contract::TrinoJsonFacts {
+                    parametric_datetime: true,
+                    variant: true,
+                    variant_binary: true,
+                },
+            ),
+            starting: None,
+            input: None,
+            state: None,
+            io: Some(io.clone()),
+            activity: Some(
+                activity
+                    .acquire(&target, MaintenanceActivityFamily::Optimize)
+                    .unwrap(),
+            ),
+            local: None,
+            delivered: false,
+            optimize: true,
+        };
+        let mut retirement = None;
+        action.handoff_residual_in(&mut retirement).unwrap();
+        drop(action);
+        root.owner.cancel(CancellationReason::Requested);
+        let residual = retirement.as_mut().unwrap();
+        assert!(residual.poll_retirement(&mut cx).is_pending());
+        assert!(
+            activity
+                .acquire(&target, MaintenanceActivityFamily::Optimize)
+                .is_err()
+        );
+        assert_eq!(exits.load(Ordering::SeqCst), 0);
+        released.store(true, Ordering::SeqCst);
+        io.poll_continuing(&mut cx).unwrap();
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert!(
+            residual.poll_retirement(&mut cx).is_pending(),
+            "an original I/O permit alias is still live"
+        );
+        assert!(
+            activity
+                .acquire(&target, MaintenanceActivityFamily::Optimize)
+                .is_err()
+        );
+        drop(permit);
+        assert!(matches!(
+            residual.poll_retirement(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        drop(
+            activity
+                .acquire(&target, MaintenanceActivityFamily::Optimize)
+                .unwrap(),
+        );
+        drop(io);
+        // The residual's original Source exits before its Root can retire.
+        drop(retirement.take());
+        root.business.release();
+        root.owner.complete_after_terminal_cancel_settled();
+        control.close_admission();
+        drive(&mut driver);
+        assert!(control.shutdown().is_ok());
+    }
+
+    #[test]
+    fn optimize_metric_rows_preserve_noop_zeroes_and_unknown_output() {
+        use arrow::array::{Array, Int64Array, StringArray};
+        for output in [Some(0), None] {
+            let MaintenanceStatementResult::Query(result) =
+                crate::table_maintenance::result::optimize_result(
+                    MaintenanceActionOutcome::RewriteDataFiles {
+                        target_snapshot_id: None,
+                        rewritten_data_files_count: 0,
+                        added_data_files_count: output,
+                        added_delete_files_count: None,
+                        rewritten_bytes_count: 0,
+                        failed_data_files_count: 0,
+                        removed_delete_files_count: 0,
+                        output_record_count: None,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("optimize is a metric rowset")
+            };
+            assert_eq!(result.row_count(), 3);
+            let batch = &result.batches[0];
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(
+                names.iter().collect::<Vec<_>>(),
+                vec![
+                    Some("rewritten_data_files_count"),
+                    Some("removed_delete_files_count"),
+                    Some("added_data_files_count")
+                ]
+            );
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(counts.value(0), 0);
+            assert_eq!(counts.value(1), 0);
+            assert_eq!(counts.is_null(2), output.is_none());
+            if output.is_some() {
+                assert_eq!(counts.value(2), 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn direct_result_uses_a_separate_positive_local_ticket_on_the_same_sql_root() {
@@ -511,6 +863,7 @@ mod tests {
                 removed_delete_files_count: 0,
                 output_record_count: None,
             },
+            false,
         )
         .unwrap();
         assert_eq!(result.row_count(), 1);

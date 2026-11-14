@@ -40,11 +40,7 @@ INSERT INTO statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0} (k);
 
 -- query 5
--- @result_contains=row_count
--- @result_contains=theta_ndv:k
--- @result_contains=AVAILABLE
--- @skip_result_check=true
-SHOW TABLE STATS statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0};
+SHOW STATS FOR statistics_cat_${suite_uuid0}.nr_synchronous_${suite_uuid0}.terminal_${uuid0};
 
 -- query 6
 -- @skip_result_check=true

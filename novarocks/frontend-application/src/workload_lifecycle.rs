@@ -254,9 +254,7 @@ fn frontend_workload_snapshot(
         if scope.parent.is_none() {
             match scope.class {
                 WorkClass::Query | WorkClass::Management => active.statement += 1,
-                WorkClass::MaterializedView
-                | WorkClass::Statistics
-                | WorkClass::TableMaintenance => active.background += 1,
+                WorkClass::MaterializedView | WorkClass::TableMaintenance => active.background += 1,
             }
         }
     }
@@ -301,7 +299,6 @@ fn frontend_totals_from_root(totals: &WorkClassTotals) -> FrontendWorkloadTotals
         statement: totals.query.saturating_add(totals.management),
         background: totals
             .materialized_view
-            .saturating_add(totals.statistics)
             .saturating_add(totals.table_maintenance),
     }
 }

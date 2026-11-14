@@ -1,3 +1,3 @@
 -- query 2
--- types	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar	varchar
-Name	Database	StorageEngine	RefreshMode	LastRefreshTime	LastRefreshRows	BaseTables	SelectText	Dependencies	RefreshPaused	NextRefreshTime	LastSchedulerError	MaxStalenessMs	RefreshState	RetryAfterTime	Manageability
+-- types	varchar	varchar	varchar	varchar	bigint	boolean	timestamp(3) with time zone	bigint	varchar	varchar	array(varchar)	array(varchar)
+catalog_name	schema_name	name	refresh_policy	refresh_interval_ms	refresh_paused	last_refresh_time	last_refresh_rows	manageability	manageability_reason	base_tables	upstream_materialized_views

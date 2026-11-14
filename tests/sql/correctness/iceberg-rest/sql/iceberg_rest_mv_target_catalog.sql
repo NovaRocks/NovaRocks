@@ -59,8 +59,7 @@ SELECT id, name FROM analytics_${uuid0}.mv_orders_${uuid0} ORDER BY id;
 
 -- query 6
 -- @result_contains=mv_orders_
--- @result_contains=iceberg
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'iceberg_rest_${suite_uuid0}';
 
 -- query 7
 -- @expect_error=Iceberg MV target table iceberg_rest_${suite_uuid0}.analytics_${uuid0}.mv_conflict_${uuid0} already exists

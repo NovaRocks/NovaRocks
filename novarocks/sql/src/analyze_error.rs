@@ -65,6 +65,11 @@ const INVALID_ARGUMENT: ErrorCodeDescriptor = ErrorCodeDescriptor {
     phase: ErrorPhase::Analyze,
     status: ErrorCodeStatus::Active,
 };
+const INVALID_ANALYZE_PROPERTY: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.analyze.invalid_analyze_property"),
+    phase: ErrorPhase::Analyze,
+    status: ErrorCodeStatus::Active,
+};
 const TOO_MANY_ARGUMENTS: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.analyze.too_many_arguments"),
     phase: ErrorPhase::Analyze,
@@ -137,6 +142,7 @@ pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     TYPE_MISMATCH,
     INVALID_LITERAL,
     INVALID_ARGUMENT,
+    INVALID_ANALYZE_PROPERTY,
     TOO_MANY_ARGUMENTS,
     INVALID_QUERY_SHAPE,
     UNSUPPORTED_EXPRESSION,
@@ -162,6 +168,7 @@ pub enum AnalyzeErrorKind {
     TypeMismatch,
     InvalidLiteral,
     InvalidArgument,
+    InvalidAnalyzeProperty,
     TooManyArguments,
     InvalidQueryShape,
     UnsupportedExpression,
@@ -189,6 +196,7 @@ impl AnalyzeErrorKind {
             Self::TypeMismatch => TYPE_MISMATCH,
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
+            Self::InvalidAnalyzeProperty => INVALID_ANALYZE_PROPERTY,
             Self::TooManyArguments => TOO_MANY_ARGUMENTS,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
             Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
@@ -490,6 +498,10 @@ impl AnalyzeError {
 
     pub fn unknown_table(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::UnknownTable, message, span)
+    }
+
+    pub fn invalid_analyze_property(message: impl Into<String>) -> Self {
+        Self::at_optional(AnalyzeErrorKind::InvalidAnalyzeProperty, message, None)
     }
 
     pub fn unknown_column(message: impl Into<String>, span: Span) -> Self {
@@ -850,6 +862,7 @@ mod tests {
                 "sql.analyze.type_mismatch",
                 "sql.analyze.invalid_literal",
                 "sql.analyze.invalid_argument",
+                "sql.analyze.invalid_analyze_property",
                 "sql.analyze.too_many_arguments",
                 "sql.analyze.invalid_query_shape",
                 "sql.analyze.unsupported_expression",

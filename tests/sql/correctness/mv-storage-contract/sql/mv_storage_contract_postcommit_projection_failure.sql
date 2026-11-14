@@ -105,7 +105,7 @@ USE mvsc_${uuid0}.ns_${uuid0};
 -- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=orders_total
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mvsc_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 12
 -- Dropping it is a management write, and management is closed for the same

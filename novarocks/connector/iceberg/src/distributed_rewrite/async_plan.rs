@@ -30,6 +30,22 @@ use novarocks_spi::connector::{
 };
 use std::sync::Mutex;
 
+pub(super) fn validate_expected_rewrite_object(
+    expected: Option<&novarocks_spi::connector::ConnectorTableObjectId>,
+    actual: uuid::Uuid,
+) -> Result<(), ConnectorError> {
+    if expected
+        .is_some_and(|expected| expected.as_bytes().as_ref() != actual.to_string().as_bytes())
+    {
+        return Err(ConnectorError::table_object_binding(
+            novarocks_spi::connector::ConnectorTableObjectBindingFailure::Replaced,
+            "TARGET_REPLACED: Iceberg optimize target changed before rewrite planning",
+        )
+        .with_public_failure_detail());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CpuPhase {
     Metadata,
@@ -143,7 +159,21 @@ impl RewritePlanCpuSource for RewritePlanOriginal {
                             "Rewrite metadata differs from its selected original target",
                         ));
                     }
+                    validate_expected_rewrite_object(
+                        body.source_request.expected_object_id.as_ref(),
+                        body.table
+                            .as_ref()
+                            .expect("loaded original rewrite table")
+                            .metadata()
+                            .uuid(),
+                    )?;
                     let operation = match body.source_request.selection {
+                        ConnectorRewriteSelection::Optimize {
+                            file_size_threshold_bytes,
+                        } => ConnectorDistributedRewriteOperation::OptimizeDataFiles {
+                            table: metadata.table.clone(),
+                            file_size_threshold_bytes,
+                        },
                         ConnectorRewriteSelection::DataFiles { rewrite_all } => {
                             ConnectorDistributedRewriteOperation::RewriteDataFiles {
                                 table: metadata.table.clone(),
@@ -282,7 +312,8 @@ pub(super) fn prepare_source_in(
         return Err(invalid("rewrite source request has a foreign generation"));
     }
     let operation = match original.selection {
-        ConnectorRewriteSelection::DataFiles { .. } => CatalogOperation::RewriteDataFiles,
+        ConnectorRewriteSelection::DataFiles { .. }
+        | ConnectorRewriteSelection::Optimize { .. } => CatalogOperation::RewriteDataFiles,
         ConnectorRewriteSelection::PositionDeletes { .. } => {
             CatalogOperation::RewritePositionDeletes
         }

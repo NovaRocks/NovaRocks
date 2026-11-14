@@ -41,13 +41,6 @@ pub enum EngineErrorDetail {
     WriteCoordinatorGone {
         query_id: UniqueId,
     },
-    ProtocolDecode {
-        message: String,
-    },
-    UnsupportedDistributedDmlShape {
-        operation: &'static str,
-        reason: String,
-    },
     DistributedWriteOutputMismatch {
         operation: &'static str,
         reason: String,
@@ -86,28 +79,6 @@ impl EngineError {
         Self::new(
             EngineErrorCode::WriteCoordinatorGone,
             EngineErrorDetail::WriteCoordinatorGone { query_id },
-        )
-    }
-
-    pub fn protocol_decode(message: impl Into<String>) -> Self {
-        Self::new(
-            EngineErrorCode::ProtocolDecodeError,
-            EngineErrorDetail::ProtocolDecode {
-                message: message.into(),
-            },
-        )
-    }
-
-    pub fn unsupported_distributed_dml_shape(
-        operation: &'static str,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            EngineErrorCode::UnsupportedDistributedDmlShape,
-            EngineErrorDetail::UnsupportedDistributedDmlShape {
-                operation,
-                reason: reason.into(),
-            },
         )
     }
 
@@ -163,17 +134,6 @@ impl EngineError {
         Self::static_message(EngineErrorCode::QueryTimeout, message)
     }
 
-    pub fn iceberg_write_descriptor_mismatch(message: impl Into<String>) -> Self {
-        Self::static_message(EngineErrorCode::IcebergWriteDescriptorMismatch, message)
-    }
-
-    pub fn unsupported_position_delete_descriptor(message: impl Into<String>) -> Self {
-        Self::static_message(
-            EngineErrorCode::UnsupportedPositionDeleteDescriptor,
-            message,
-        )
-    }
-
     pub fn to_user_message(&self) -> String {
         match &self.detail {
             EngineErrorDetail::WriteCoordinatorGone { query_id } => {
@@ -182,10 +142,6 @@ impl EngineError {
                     query_id.high(),
                     query_id.low()
                 )
-            }
-            EngineErrorDetail::ProtocolDecode { message } => message.clone(),
-            EngineErrorDetail::UnsupportedDistributedDmlShape { operation, reason } => {
-                format!("{operation}: {reason}")
             }
             EngineErrorDetail::DistributedWriteOutputMismatch { operation, reason } => {
                 format!("{operation}: {reason}")
@@ -254,16 +210,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_decode_error_has_stable_code_and_message() {
-        let err = EngineError::protocol_decode("failed to deserialize payload");
-        assert_eq!(err.code().as_str(), "ProtocolDecodeError");
-        assert!(
-            err.to_user_message()
-                .contains("failed to deserialize payload")
-        );
-    }
-
-    #[test]
     fn named_message_constructors_return_stable_codes() {
         let known_uncommitted = EngineError::commit_known_uncommitted("commit was aborted");
         assert_eq!(
@@ -290,44 +236,6 @@ mod tests {
             timeout.to_bracketed_user_message(),
             "[QueryTimeout] query timed out after 1000 ms"
         );
-
-        let descriptor =
-            EngineError::iceberg_write_descriptor_mismatch("writer output slot changed");
-        assert_eq!(
-            descriptor.code(),
-            EngineErrorCode::IcebergWriteDescriptorMismatch
-        );
-        assert!(
-            descriptor
-                .to_user_message()
-                .contains("writer output slot changed")
-        );
-    }
-
-    #[test]
-    fn iceberg_write_descriptor_helper_preserves_specific_code() {
-        let err = EngineError::iceberg_write_descriptor_mismatch("missing partition descriptor");
-
-        assert_eq!(err.code(), EngineErrorCode::IcebergWriteDescriptorMismatch);
-        assert_eq!(
-            err.to_bracketed_user_message(),
-            "[IcebergWriteDescriptorMismatch] missing partition descriptor"
-        );
-    }
-
-    #[test]
-    fn unsupported_position_delete_descriptor_formats_bracketed_message() {
-        let err = EngineError::unsupported_position_delete_descriptor(
-            "position delete output descriptor missing file_path field",
-        );
-        assert_eq!(
-            err.code(),
-            EngineErrorCode::UnsupportedPositionDeleteDescriptor
-        );
-        assert_eq!(
-            err.to_bracketed_user_message(),
-            "[UnsupportedPositionDeleteDescriptor] position delete output descriptor missing file_path field"
-        );
     }
 
     #[test]
@@ -342,17 +250,6 @@ mod tests {
 
     #[test]
     fn distributed_dml_helpers_use_stable_codes() {
-        let unsupported =
-            EngineError::unsupported_distributed_dml_shape("delete", "missing coordinator");
-        assert_eq!(
-            unsupported.code(),
-            EngineErrorCode::UnsupportedDistributedDmlShape
-        );
-        assert_eq!(
-            unsupported.to_bracketed_user_message(),
-            "[UnsupportedDistributedDmlShape] delete: missing coordinator"
-        );
-
         let mismatch =
             EngineError::distributed_write_output_mismatch("insert", "slot 3 changed type");
         assert_eq!(

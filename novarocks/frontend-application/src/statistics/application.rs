@@ -19,25 +19,19 @@
 //!
 //! This module deliberately contains no parser AST or raw-SQL interception.
 //! The frontend owns SQL/connector adaptation and target resolution. The
-//! statistics application crate owns current-process job state and worker
-//! composition.
+//! original statement owns capture, computation, publication and actual close.
 
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningPin, ConnectorControlRegistry,
     ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution, LakePublicationId,
-    StatisticsBasisRelation, StatisticsDataVersion, StatisticsMetric, StatisticsMetricSource,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
+    StatisticsDataVersion,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTableTarget {
@@ -46,32 +40,26 @@ pub struct StatisticsTableTarget {
     pub table: String,
 }
 
-/// Column-selection intent retained by a current-process ANALYZE job.
+/// Column-selection intent retained by the original ANALYZE statement.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StatisticsColumnIntent {
-    /// The attempt expands all SQL-visible columns from its freshly rebound schema.
+    /// The attempt expands all SQL-visible columns from its captured schema.
     AllColumns,
     /// Explicit SQL column names supplied by the statement.
     Explicit(Vec<String>),
 }
 
-/// Submission-time observation of an ANALYZE target.
-///
-/// `sql_columns` is only for immediate statement validation. It must never be
-/// persisted: an attempt derives its own column set after identity-gated rebind.
+/// The first complete target capture, retained through collection and publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTargetCapture {
-    pub job_admission: novarocks_spi::connector::ConnectorTableJobAdmission,
     pub connector_instance_id: String,
     pub namespace: String,
     pub table: String,
     pub object_id: Vec<u8>,
-    pub sql_columns: Vec<String>,
+    pub binding: StatisticsAttemptBinding,
 }
 
-/// One current-process worker request. It carries only logical identity, physical
-/// object identity, and collection intent; provider handles and versions are
-/// strictly attempt-local.
+/// Identity and column intent retained by one original ANALYZE statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptRequest {
     pub operation_id: LakePublicationId,
@@ -82,8 +70,8 @@ pub struct StatisticsAttemptRequest {
     pub columns: StatisticsColumnIntent,
 }
 
-/// Identity-gated current binding retained only within one attempt and its
-/// planning pin lifetime. It must never be retained by the process runtime.
+/// The original captured binding, retained with its exact planning generation
+/// through collection, publication and actual close.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptBinding {
     pub table: novarocks_spi::connector::ConnectorTableHandle,
@@ -91,7 +79,7 @@ pub struct StatisticsAttemptBinding {
     pub sql_columns: Vec<arrow::datatypes::FieldRef>,
 }
 
-/// The frontend captures a logical ANALYZE target before job creation.
+/// The frontend captures the original ANALYZE target once.
 pub trait StatisticsTargetResolver: Send + Sync {
     fn planning_pin(
         &self,
@@ -186,8 +174,8 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
                     cpu,
                 )
                 .await
-                .map_err(StatisticsApplicationError::from_connector_error)?;
-            let job_admission = lease
+                .map_err(|error| StatisticsApplicationError::from_target_error(error, target))?;
+            lease
                 .binding()
                 .metadata()
                 .admit_table_job(
@@ -205,58 +193,18 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
                 )
                 .map_err(StatisticsApplicationError::from_connector_error)?;
             Ok(StatisticsTargetCapture {
-                job_admission,
                 connector_instance_id: captured.metadata.table.owner().as_str().to_string(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),
                 object_id: captured.object_id.as_bytes().to_vec(),
-                sql_columns: sql_visible_column_names(captured.metadata.schema()),
+                binding: StatisticsAttemptBinding {
+                    data_version: captured.metadata.statistics_data_version.clone().ok_or_else(|| StatisticsApplicationError::new("connector metadata did not provide a statistics data-version for captured table"))?,
+                    sql_columns: sql_visible_columns(captured.metadata.schema()),
+                    table: captured.metadata.table,
+                },
             })
         })
     }
-}
-
-pub(crate) async fn rebind_table_object_async(
-    lease: &ConnectorControlPlanningPin,
-    context: ConnectorRequestContext,
-    request: &StatisticsAttemptRequest,
-    cpu: Arc<dyn novarocks_spi::connector::StatisticsCpuPort>,
-) -> Result<StatisticsAttemptBinding, StatisticsApplicationError> {
-    let instance_id = ConnectorInstanceId::parse(&request.connector_instance_id)
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-    let expected_object_id =
-        ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&request.object_id))
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-    let ConnectorTableObjectBinding { metadata, .. } = lease
-        .binding()
-        .metadata()
-        .rebind_table_object_binding_for_statistics_async(
-            ConnectorTableObjectRebindRequest {
-                table: ConnectorTableIdentity {
-                    instance_id,
-                    namespace: Arc::from(request.namespace.as_str()),
-                    table: Arc::from(request.table.as_str()),
-                },
-                expected_object_id,
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                selector: ConnectorTableObjectSelector::Current,
-                context,
-            },
-            cpu,
-        )
-        .await
-        .map_err(StatisticsApplicationError::from_connector_error)?;
-    let data_version = metadata.statistics_data_version.clone().ok_or_else(|| {
-        StatisticsApplicationError::new(
-            "connector metadata did not provide a statistics data-version for rebound table",
-        )
-    })?;
-    let sql_columns = sql_visible_columns(metadata.schema());
-    Ok(StatisticsAttemptBinding {
-        table: metadata.table,
-        data_version,
-        sql_columns,
-    })
 }
 
 /// The SQL-visible fields, carrying their types.
@@ -278,198 +226,37 @@ fn sql_visible_columns(schema: &arrow::datatypes::Schema) -> Vec<arrow::datatype
         .collect()
 }
 
-fn sql_visible_column_names(schema: &arrow::datatypes::Schema) -> Vec<String> {
-    sql_visible_columns(schema)
-        .iter()
-        .map(|field| field.name().clone())
-        .collect()
-}
-
-/// Placeholder for the per-metric columns of a row that has no measured value.
-const NO_OBSERVATION: &str = "-";
-
-pub(crate) fn statistics_table_stat_view(
-    metric: StatisticsMetric,
-    state: StatisticsMetricState,
-    queried_version: &StatisticsDataVersion,
-) -> StatisticsTableStatView {
-    let metric = match metric {
-        StatisticsMetric::RowCount => "row_count".to_string(),
-        StatisticsMetric::NullCount { column } => format!("null_count:{column}"),
-        StatisticsMetric::Minimum { column } => format!("minimum:{column}"),
-        StatisticsMetric::Maximum { column } => format!("maximum:{column}"),
-        StatisticsMetric::AverageSize { column } => format!("average_size:{column}"),
-        StatisticsMetric::ThetaNdv { column } => format!("theta_ndv:{column}"),
-    };
-    let observation = match state {
-        StatisticsMetricState::Available(observation) => observation,
-        StatisticsMetricState::Missing(missing) => {
-            return unobserved_stat_view(metric, format!("MISSING:{:?}", missing.kind));
-        }
-        StatisticsMetricState::Error(error) => {
-            return unobserved_stat_view(metric, format!("ERROR:{:?}", error.kind));
-        }
-    };
-    StatisticsTableStatView {
-        metric,
-        value: Some(statistics_metric_value(observation.value().clone())),
-        status: "AVAILABLE".into(),
-        basis_version: statistics_basis_version(observation.basis_version(), queried_version),
-        source: match observation.source() {
-            StatisticsMetricSource::CurrentManifest => "CURRENT_MANIFEST".into(),
-            StatisticsMetricSource::ProviderArtifact => "PROVIDER_ARTIFACT".into(),
-            StatisticsMetricSource::VisibleRowScan => "VISIBLE_ROW_SCAN".into(),
-            StatisticsMetricSource::Provider(name) => format!("PROVIDER:{name}"),
-        },
-        numeric_nature: match observation.numeric_nature() {
-            StatisticsNumericNature::Exact => "EXACT",
-            StatisticsNumericNature::UpperBound => "UPPER_BOUND",
-            StatisticsNumericNature::LowerBound => "LOWER_BOUND",
-            StatisticsNumericNature::TwoSidedApproximate => "APPROXIMATE",
-        }
-        .into(),
-        basis_relation: match observation.basis_relation() {
-            StatisticsBasisRelation::Identical => "IDENTICAL",
-            StatisticsBasisRelation::BasisIsSubset => "BASIS_IS_SUBSET",
-            StatisticsBasisRelation::BasisIsSuperset => "BASIS_IS_SUPERSET",
-            StatisticsBasisRelation::Incomparable => "INCOMPARABLE",
-        }
-        .into(),
-    }
-}
-
-fn unobserved_stat_view(metric: String, status: String) -> StatisticsTableStatView {
-    StatisticsTableStatView {
-        metric,
-        value: None,
-        status,
-        basis_version: NO_OBSERVATION.into(),
-        source: NO_OBSERVATION.into(),
-        numeric_nature: NO_OBSERVATION.into(),
-        basis_relation: NO_OBSERVATION.into(),
-    }
-}
-
-/// Renders which table state a value was measured on without leaking the
-/// provider's private version encoding through SQL.
-///
-/// `SAME` is the common case and the one users need to distinguish; when the
-/// basis differs, a stable digest is enough to see *that* it differs and to
-/// tell two bases apart, while `basis_relation` says how it differs.
-fn statistics_basis_version(
-    basis: &StatisticsDataVersion,
-    queried: &StatisticsDataVersion,
-) -> String {
-    if basis == queried {
-        return "SAME".to_string();
-    }
-    let digest: [u8; 32] = Sha256::digest(basis.as_bytes()).into();
-    let mut rendered = String::from("sha256:");
-    for byte in &digest[..8] {
-        rendered.push_str(&format!("{byte:02x}"));
-    }
-    rendered
-}
-
-fn statistics_metric_value(value: StatisticsMetricValue) -> String {
-    match value {
-        StatisticsMetricValue::U64(value) => value.to_string(),
-        StatisticsMetricValue::I64(value) => value.to_string(),
-        StatisticsMetricValue::F64(value) => value.to_string(),
-        // Do not surface opaque connector bytes through SQL. Providers that
-        // choose a byte metric must publish a user-safe scalar representation.
-        StatisticsMetricValue::Bytes(_) => "<opaque>".to_string(),
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsApplicationCommand {
     AnalyzeTable {
         target: StatisticsTableTarget,
         columns: StatisticsColumnIntent,
     },
-    ShowAnalyzeJobs,
-    CancelAnalyze {
-        job_id: Uuid,
-    },
-    ShowTableStats {
+    ShowStats {
         target: StatisticsTableTarget,
     },
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsJobView {
-    pub job_id: Uuid,
-    pub operation_id: LakePublicationId,
-    pub state: String,
-    pub attempt: u32,
-    pub target: StatisticsTableTarget,
-    pub error_kind: Option<String>,
-    pub error_message: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsTableStatView {
-    pub metric: String,
-    pub value: Option<String>,
-    pub status: String,
-    /// Which table state the value was measured on, relative to the one being
-    /// shown. `SAME` when they are the same state; otherwise a digest, because
-    /// the version token is a provider-private encoding.
-    pub basis_version: String,
-    pub source: String,
-    pub numeric_nature: String,
-    pub basis_relation: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StatisticsApplicationResult {
-    /// The job was accepted and left running: the statement did not wait for
-    /// it, so its outcome is not known yet.
-    JobSubmitted(StatisticsJobView),
-    JobCancellationRequested(StatisticsJobView),
-    AnalyzeJobs(Vec<StatisticsJobView>),
-    TableStats(Vec<StatisticsTableStatView>),
-}
-
 pub trait StatisticsApplicationPort: Send + Sync {
     fn prepare_statement_action(
         &self,
-        _command: StatisticsApplicationCommand,
-        _execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        _context: &novarocks_spi::connector::ConnectorRequestContext,
-        _family: novarocks_result_contract::ClientPresentationFamily,
+        command: StatisticsApplicationCommand,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+        context: &ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
     ) -> Result<
         Box<dyn novarocks_query_application::session_control::GovernedStatementAction>,
         StatisticsApplicationError,
-    > {
-        Err(StatisticsApplicationError::new(
-            "statistics application has no governed statement source",
-        ))
-    }
-    fn execute<'a>(
-        &'a self,
-        command: StatisticsApplicationCommand,
-        execution: Option<
-            &'a novarocks_query_application::admitted_query_context::QueryExecutionContext,
-        >,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<StatisticsApplicationResult, StatisticsApplicationError>,
-                > + Send
-                + 'a,
-        >,
     >;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
+    user_error: Option<novarocks_user_error::UserError>,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
     source: Option<ConnectorError>,
-    statistics_failure: Option<novarocks_statistics_application::StatisticsFailure>,
-    publication_failure: Option<novarocks_statistics_application::StatisticsPublicationFailure>,
+    statistics_failure: Option<super::publication::StatisticsFailure>,
+    publication_failure: Option<super::publication::StatisticsPublicationFailure>,
     publication_terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
 }
 
@@ -477,6 +264,7 @@ impl StatisticsApplicationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            user_error: None,
             target_binding_failure: None,
             source: None,
             statistics_failure: None,
@@ -489,6 +277,7 @@ impl StatisticsApplicationError {
         let target_binding_failure = error.table_object_binding_failure();
         Self {
             message: error.to_string(),
+            user_error: None,
             target_binding_failure,
             source: Some(error),
             statistics_failure: None,
@@ -497,9 +286,31 @@ impl StatisticsApplicationError {
         }
     }
 
+    fn from_target_error(error: ConnectorError, target: &StatisticsTableTarget) -> Self {
+        let mut projected = Self::from_connector_error(error);
+        if projected.source.as_ref().is_some_and(|source| {
+            source.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound
+        }) {
+            projected.user_error = Some(
+                novarocks_sql::analyze_error::AnalyzeError::unknown_table(
+                    format!(
+                        "Table '{}.{}.{}' does not exist",
+                        target.catalog, target.namespace, target.table
+                    ),
+                    novarocks_parser::Span::new(0, 0),
+                )
+                .to_user_error(None),
+            );
+        }
+        projected
+    }
+
     /// Preserve the original connector fact at synchronous command admission.
     pub(crate) fn into_command_error(self) -> novarocks_query_application::api::CommandError {
         use novarocks_query_application::api::{CommandError, CommandErrorKind};
+        if let Some(user) = self.user_error {
+            return CommandError::from_user_error(user);
+        }
         match self.source {
             Some(source) => CommandError::from_failure_cause(
                 novarocks_failure_contract::SharedFailureCause::new(source),
@@ -508,38 +319,52 @@ impl StatisticsApplicationError {
         }
     }
 
-    pub(crate) fn from_statistics_job(
-        job: &novarocks_statistics_application::StatisticsJob,
-    ) -> Self {
+    pub(crate) fn from_statistics_attempt(
+        publication_id: LakePublicationId,
+        target: &StatisticsTableTarget,
+        result: &Result<
+            super::publication::StatisticsPublicationOutcome,
+            super::publication::StatisticsAttemptError,
+        >,
+    ) -> Option<Self> {
+        use super::publication::StatisticsPublicationOutcome as O;
         use novarocks_spi::connector::{
             LakePublicationDisposition as D, LakePublicationFamily, LakePublicationMarkerHeader,
             LakePublicationNextAction, LakePublicationTarget, LakePublicationTerminal,
         };
-        use novarocks_statistics_application::StatisticsPublicationFact as P;
-        let failure = job.failure.clone();
-        let publication_failure = job
-            .publication_failure
-            .or(job.publication_finalization_failure);
-        let disposition = match job.publication {
-            P::KnownUncommitted => Some(D::KnownUncommitted),
-            P::KnownCommitted => Some(D::KnownCommitted),
-            P::CommitUnknown => Some(D::CommitUnknown),
-            P::NotStarted | P::NoOp => None,
+        let (failure, publication_failure, disposition) = match result {
+            Ok(O::NoOp {
+                finalization_failure: None,
+                ..
+            })
+            | Ok(O::KnownCommitted {
+                finalization_failure: None,
+                ..
+            }) => return None,
+            Ok(O::NoOp {
+                finalization_failure: Some(failure),
+                ..
+            }) => (None, Some(*failure), None),
+            Ok(O::KnownCommitted {
+                finalization_failure: Some(failure),
+                ..
+            }) => (None, Some(*failure), Some(D::KnownCommitted)),
+            Ok(O::KnownUncommitted { failure, .. }) => {
+                (None, Some(*failure), Some(D::KnownUncommitted))
+            }
+            Ok(O::CommitUnknown { failure }) => (None, Some(*failure), Some(D::CommitUnknown)),
+            Err(error) => (Some(error.failure()), None, None),
         };
         let publication_terminal = disposition.map(|disposition| {
             LakePublicationTerminal::new(
-                LakePublicationMarkerHeader::new(
-                    LakePublicationId::try_from_uuid(job.publication_id.as_uuid())
-                        .expect("original statistics UUIDv7"),
-                    LakePublicationFamily::Statistics,
-                ),
+                LakePublicationMarkerHeader::new(publication_id, LakePublicationFamily::Statistics),
                 LakePublicationTarget::try_new(
-                    job.target.catalog.as_ref().to_owned(),
-                    job.target.namespace.as_ref().to_owned(),
-                    Some(job.target.table.as_ref().to_owned()),
+                    target.catalog.clone(),
+                    target.namespace.clone(),
+                    Some(target.table.clone()),
                     None,
                 )
-                .expect("published statistics retained its provider-admitted target"),
+                .expect("captured statistics target"),
                 disposition,
                 if disposition.do_not_retry() {
                     LakePublicationNextAction::InspectPublishedState
@@ -549,31 +374,29 @@ impl StatisticsApplicationError {
                 None,
             )
         });
-        Self {
+        Some(Self {
             message: publication_failure
                 .as_ref()
                 .map(|failure| failure.public_message())
-                .or_else(|| failure.as_ref().map(|f| f.message.to_string()))
-                .unwrap_or_else(|| format!("statistics job completed with {:?}", job.state)),
+                .or_else(|| failure.as_ref().map(|f| f.error.message().to_string()))
+                .unwrap_or_else(|| "statistics statement failed".into()),
+            user_error: None,
             target_binding_failure: None,
             source: None,
             statistics_failure: failure,
             publication_failure,
             publication_terminal,
+        })
+    }
+
+    pub(super) fn invalid_analyze_property(message: impl Into<String>) -> Self {
+        let user = novarocks_sql::analyze_error::AnalyzeError::invalid_analyze_property(message)
+            .to_user_error(None);
+        Self {
+            message: user.message().to_string(),
+            user_error: Some(user),
+            ..Self::new("")
         }
-    }
-
-    pub(crate) fn publication_disposition(
-        &self,
-    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
-        self.publication_terminal
-            .as_ref()
-            .map(|terminal| terminal.disposition())
-    }
-
-    pub(crate) fn with_observer_message(mut self, message: impl Into<String>) -> Self {
-        self.message = message.into();
-        self
     }
 
     pub(crate) fn to_query_service_error(
@@ -591,12 +414,19 @@ impl StatisticsApplicationError {
                 ExecutionFailureSite::Coordinator,
             ))
             .with_compile_control_provenance(failure.compile_control())
-        } else if let Some(control) = self
-            .statistics_failure
-            .as_ref()
-            .and_then(|f| f.compile_control.as_ref())
-        {
-            QueryServiceError::from_compile_control(control.clone())
+        } else if let Some(failure) = &self.statistics_failure {
+            failure.error.clone()
+        } else if let (Some(user), Some(source)) = (&self.user_error, &self.source) {
+            QueryServiceError::from_user_error_with_cause(
+                user.clone(),
+                novarocks_failure_contract::SharedFailureCause::new(source.clone()),
+            )
+        } else if let Some(source) = &self.source {
+            QueryServiceError::from_failure_cause(
+                novarocks_failure_contract::SharedFailureCause::new(source.clone()),
+            )
+        } else if let Some(user) = &self.user_error {
+            QueryServiceError::from_user_error(user.clone())
         } else {
             QueryServiceError::new(QueryServiceErrorKind::Internal, &self.message)
         };
@@ -647,5 +477,154 @@ impl std::error::Error for StatisticsApplicationError {
         self.source
             .as_ref()
             .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::publication::{
+        StatisticsPublicationFailure, StatisticsPublicationOutcome as O,
+    };
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    fn target() -> StatisticsTableTarget {
+        StatisticsTableTarget {
+            catalog: "ice".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+        }
+    }
+    fn failed() -> StatisticsPublicationFailure {
+        let original = novarocks_type_contract::CompileControlError::ResourceExhausted;
+        StatisticsPublicationFailure::capture(
+            original.failure_fact(),
+            Some(original.provenance()),
+            &"private Puffin path and credential",
+        )
+    }
+    #[test]
+    fn no_op_and_committed_success_do_not_manufacture_statement_failures() {
+        for outcome in [
+            O::NoOp {
+                finalization_failure: None,
+                cleanup_failure: Some(failed()),
+            },
+            O::KnownCommitted {
+                finalization_failure: None,
+                cleanup_failure: Some(failed()),
+            },
+        ] {
+            assert!(
+                StatisticsApplicationError::from_statistics_attempt(
+                    LakePublicationId::new_v7(),
+                    &target(),
+                    &Ok(outcome)
+                )
+                .is_none()
+            );
+        }
+    }
+    #[test]
+    fn publication_errors_keep_no_op_committed_unknown_and_retry_dispositions_distinct() {
+        use novarocks_spi::connector::LakePublicationDisposition as D;
+        for (outcome, disposition) in [
+            (
+                O::NoOp {
+                    finalization_failure: Some(failed()),
+                    cleanup_failure: None,
+                },
+                None,
+            ),
+            (
+                O::KnownCommitted {
+                    finalization_failure: Some(failed()),
+                    cleanup_failure: None,
+                },
+                Some(D::KnownCommitted),
+            ),
+            (
+                O::KnownUncommitted {
+                    failure: failed(),
+                    cleanup_failure: None,
+                },
+                Some(D::KnownUncommitted),
+            ),
+            (
+                O::CommitUnknown { failure: failed() },
+                Some(D::CommitUnknown),
+            ),
+        ] {
+            let id = LakePublicationId::new_v7();
+            let error =
+                StatisticsApplicationError::from_statistics_attempt(id, &target(), &Ok(outcome))
+                    .unwrap()
+                    .to_query_service_error();
+            assert_eq!(
+                error
+                    .publication_terminal()
+                    .map(|terminal| terminal.disposition()),
+                disposition
+            );
+            if let Some(terminal) = error.publication_terminal() {
+                assert_eq!(terminal.header().publication_id(), id);
+                assert_eq!(terminal.do_not_retry(), disposition.unwrap().do_not_retry());
+            }
+            assert_eq!(error.execution_failure().unwrap().fact(), failed().fact());
+            assert!(!error.message().contains("private Puffin"));
+            assert!(error.compile_control_provenance().is_some());
+        }
+    }
+    #[test]
+    fn missing_analyze_target_preserves_both_table_not_found_and_original_cause() {
+        let original = ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::NotFound,
+            "opaque original miss",
+        );
+        let error = StatisticsApplicationError::from_target_error(original.clone(), &target())
+            .to_query_service_error();
+        assert_eq!(
+            error.user_error().unwrap().code().as_str(),
+            "sql.analyze.unknown_table"
+        );
+        assert_eq!(
+            error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<ConnectorError>()
+                .unwrap(),
+            &original
+        );
+        assert!(error.message().contains("ice.db.t"));
+        let unsupported = ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "unsupported relation",
+        );
+        assert!(
+            StatisticsApplicationError::from_target_error(unsupported, &target())
+                .to_query_service_error()
+                .execution_failure()
+                .is_some()
+        );
+    }
+    #[test]
+    fn connector_source_survives_statement_error_projection() {
+        let original = ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "source relation is unsupported",
+        );
+        let error = StatisticsApplicationError::from_connector_error(original.clone())
+            .to_query_service_error();
+        assert_eq!(
+            error.execution_failure().unwrap().fact(),
+            original.failure_fact()
+        );
+        assert_eq!(
+            error
+                .failure_cause()
+                .unwrap()
+                .downcast_ref::<ConnectorError>()
+                .unwrap(),
+            &original
+        );
     }
 }

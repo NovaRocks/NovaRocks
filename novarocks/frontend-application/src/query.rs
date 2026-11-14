@@ -39,9 +39,7 @@ use crate::query_execution::dml::insert::InsertEngine;
 use crate::query_execution::dml::mutation::MutationEngine;
 use crate::query_execution::dml::truncate::TruncateEngine;
 use crate::query_execution::logical_execution::LogicalExecutionLauncher;
-use crate::query_execution::maintenance::command::{
-    MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
-};
+use crate::query_execution::maintenance::command::MaintenanceCommandExecutor;
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
 use async_trait::async_trait;
@@ -49,13 +47,12 @@ use novarocks_parser::ast::{self, Statement as ParsedStatement};
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::admitted_query_context::{RequestAdmission, RequestContext};
-use novarocks_query_application::api::{
-    BackendCommandExecutor, CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind,
-    CommandFuture, MaintenanceCommandConsumer, MaterializedViewCommand,
-    MaterializedViewCommandConsumer, OptionalCommandFuture, QueryExecutionError,
-    StatisticsCommandConsumer,
-};
 use novarocks_query_application::api::{BackendTopologyService, BackendTopologySnapshot};
+use novarocks_query_application::api::{
+    CatalogCommandConsumer, CommandContext, CommandError, CommandErrorKind, CommandFuture,
+    MaintenanceCommandConsumer, MaterializedViewCommand, MaterializedViewCommandConsumer,
+    OptionalCommandFuture, QueryExecutionError, StatisticsCommandConsumer,
+};
 use novarocks_query_application::api::{QueryResult, build_string_query_result};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::cpu::QueryBlockingExecutor;
@@ -84,7 +81,7 @@ use novarocks_query_application::session_outcome::{
 };
 use novarocks_query_application::session_value::StatementSessionError;
 use novarocks_query_application::sql::admission::{
-    admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
+    requires_lake_publication_deadline, typed_statement_work_class,
 };
 use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
@@ -373,36 +370,15 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
 
     fn execute(
         &self,
-        command: novarocks_sql::semantic::StatisticsSqlCommand,
-        request_context: RequestContext,
-        command_context: CommandContext,
+        _command: novarocks_sql::semantic::StatisticsSqlCommand,
+        _request_context: RequestContext,
+        _command_context: CommandContext,
     ) -> CommandFuture {
-        let statistics = self.statistics.clone();
-        Box::pin(async move {
-            if request_context.execution().cancellation().is_cancelled() {
-                return Err(command_error(
-                    CommandErrorKind::Cancelled,
-                    "statistics command was cancelled before asynchronous admission",
-                ));
-            }
-            command_context.scope().check().map_err(|error| {
-                command_error(
-                    CommandErrorKind::Cancelled,
-                    format!("statistics command scope is no longer active: {error}"),
-                )
-            })?;
-            let result = statistics
-                .execute_command(
-                    &command,
-                    request_context.session().current_catalog(),
-                    request_context.session().current_database(),
-                    Some(request_context.execution()),
-                )
-                .await
-                .map_err(|e| CommandError::new(CommandErrorKind::Rejected, e))?;
-            // Keep the admitted command context through the borrowed operation.
-            drop(command_context);
-            Ok(result)
+        Box::pin(async {
+            Err(CommandError::new(
+                CommandErrorKind::Conflict,
+                "statistics requires its original governed statement source",
+            ))
         })
     }
 }
@@ -410,7 +386,6 @@ impl StatisticsCommandConsumer for FrontendStatisticsCommandConsumer {
 #[derive(Clone)]
 struct FrontendMaintenanceCommandConsumer {
     maintenance: MaintenanceCommandExecutor,
-    maintenance_read: MaintenanceReadCommandExecutor,
     executor: QueryBlockingExecutor,
     #[cfg(novarocks_dev_controls)]
     statement_observation:
@@ -464,22 +439,12 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
             });
         }
         let maintenance = self.maintenance.clone();
-        let maintenance_read = self.maintenance_read.clone();
         execute_product_command_edge(
             self.executor.clone(),
             request_context,
             command_context,
-            move |context, command_context| match command {
-                novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command) => {
-                    maintenance_read
-                        .execute_command(
-                            &command,
-                            context.session().current_catalog(),
-                            context.session().current_database(),
-                        )
-                        .map_err(CommandError::from)
-                }
-                command => maintenance
+            move |context, command_context| {
+                maintenance
                     .execute_non_metadata_command(
                         &command,
                         context.session().current_catalog(),
@@ -487,7 +452,7 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
                         context.execution(),
                         command_context.connector_context(),
                     )
-                    .map_err(maintenance_command_error),
+                    .map_err(maintenance_command_error)
             },
         )
     }
@@ -550,7 +515,6 @@ pub(crate) fn product_command_router(
     iceberg_ref: IcebergRefCommandExecutor,
     statistics: StatisticsCommandExecutor,
     maintenance: MaintenanceCommandExecutor,
-    maintenance_read: MaintenanceReadCommandExecutor,
     executor: QueryBlockingExecutor,
     state_store: Option<crate::state_store::execution::StateStoreOriginalBinding>,
     #[cfg(novarocks_dev_controls)] statement_observation: Option<
@@ -568,7 +532,6 @@ pub(crate) fn product_command_router(
         Arc::new(FrontendStatisticsCommandConsumer { statistics }),
         Arc::new(FrontendMaintenanceCommandConsumer {
             maintenance,
-            maintenance_read,
             executor,
             #[cfg(novarocks_dev_controls)]
             statement_observation: statement_observation.as_ref().map(Arc::downgrade),
@@ -578,7 +541,6 @@ pub(crate) fn product_command_router(
 
 #[derive(Clone)]
 struct TypedCommandRoute {
-    backend: BackendCommandExecutor,
     view: ViewCommandExecutor,
     mv: Arc<dyn MaterializedViewCommandConsumer>,
     mv_call: MvCommandExecutor,
@@ -587,14 +549,12 @@ struct TypedCommandRoute {
 
 impl TypedCommandRoute {
     fn new(
-        backend: BackendCommandExecutor,
         view: ViewCommandExecutor,
         mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
         executor: QueryBlockingExecutor,
     ) -> Self {
         Self {
-            backend,
             view,
             mv,
             mv_call,
@@ -604,24 +564,6 @@ impl TypedCommandRoute {
 }
 
 impl SpecializedStatementRoute for TypedCommandRoute {
-    fn execute_show_backends(
-        &self,
-        context: &RequestContext,
-        command_context: &CommandContext,
-    ) -> CommandFuture {
-        let backend = self.backend.clone();
-        execute_product_command_edge(
-            self.executor.clone(),
-            context.clone(),
-            command_context.clone(),
-            move |context, _command_context| {
-                backend
-                    .show_backends(context.execution().role())
-                    .map(StatementResult::Query)
-            },
-        )
-    }
-
     fn execute_maintenance_call(
         &self,
         statement: &novarocks_parser::ast::CallStatement,
@@ -1098,7 +1040,6 @@ impl FrontendQueryService {
         required_constant_interpreter: Arc<crate::RequiredConstantInterpreter>,
         query_compiler: FrontendQueryCompiler,
         product_command_router: ProductCommandRouter,
-        backend_command_executor: BackendCommandExecutor,
         view_command_executor: ViewCommandExecutor,
         mv_command_consumer: Arc<dyn MaterializedViewCommandConsumer>,
         mv_command_executor: MvCommandExecutor,
@@ -1130,7 +1071,6 @@ impl FrontendQueryService {
             required_constant_interpreter,
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
-                backend_command_executor,
                 view_command_executor,
                 mv_command_consumer,
                 mv_command_executor,
@@ -1285,9 +1225,6 @@ impl FrontendQuerySession {
                     StatementKind::Empty,
                 ),
             );
-        }
-        if let Some(error) = admin_raise_engine_error(trimmed)? {
-            return Err(error);
         }
         let source = statement_execution_source(statement);
         let parsed_statement = parse_single_statement(source)
@@ -1766,15 +1703,18 @@ impl FrontendQuerySession {
             },
             None => command_context,
         };
-        if let Ok(Some(ProductSqlCommand::Catalog(
-            command @ (novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
-            | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }),
-        ))) = lower_product_sql_command(&parsed_statement)
+        if let Ok(Some(ProductSqlCommand::Catalog(command))) =
+            lower_product_sql_command(&parsed_statement)
+            && matches!(
+                command.as_ref(),
+                novarocks_sql::semantic::CatalogSqlCommand::CreateCatalog(_)
+                    | novarocks_sql::semantic::CatalogSqlCommand::DropCatalog { .. }
+            )
         {
             let action = match self
                 .service
                 .product_command_router
-                .prepare_catalog_statement_action(command, context, command_context)
+                .prepare_catalog_statement_action(*command, context, command_context)
             {
                 Ok(action) => action,
                 Err(error) => {
@@ -1790,7 +1730,7 @@ impl FrontendQuerySession {
         }
         if let Ok(Some(ProductSqlCommand::Statistics(
             command @ (novarocks_sql::semantic::StatisticsSqlCommand::AnalyzeTable { .. }
-            | novarocks_sql::semantic::StatisticsSqlCommand::ShowTableStats { .. }),
+            | novarocks_sql::semantic::StatisticsSqlCommand::ShowStats { .. }),
         ))) = lower_product_sql_command(&parsed_statement)
         {
             let action = match self
@@ -1841,7 +1781,6 @@ impl FrontendQuerySession {
             if matches!(
                 mv,
                 MaterializedViewStatement::Refresh(_)
-                    | MaterializedViewStatement::Show(_)
                     | MaterializedViewStatement::ExplainRefresh(_)
                     | MaterializedViewStatement::Create(_)
                     | MaterializedViewStatement::Drop(_)
@@ -2169,13 +2108,6 @@ impl FrontendQuerySession {
                         }
                     }
                 }
-            }),
-            ParsedStatement::ShowBackends(_) => Box::pin(async move {
-                let result = command_executor
-                    .execute_show_backends(&context, &command_context)
-                    .await
-                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
-                Ok((result, execution_owner))
             }),
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
@@ -2549,6 +2481,8 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
 fn typed_statement_result_window_class(statement: &ParsedStatement) -> ResultWindowClass {
     match statement {
         ParsedStatement::Dml(_)
+        | ParsedStatement::Maintenance(ast::MaintenanceStatement::Optimize(_))
+        | ParsedStatement::Statistics(ast::StatisticsStatement::AnalyzeTable(_))
         | ParsedStatement::MaterializedView(ast::MaterializedViewStatement::Refresh(_)) => {
             ResultWindowClass::Internal
         }
@@ -2857,6 +2791,8 @@ mod tests {
 
         for sql in [
             "INSERT INTO target VALUES (1)",
+            "ALTER TABLE ice.db.target OPTIMIZE",
+            "ANALYZE TABLE ice.db.target",
             "EXPLAIN ANALYZE SELECT 1",
             "CALL ice.system.rewrite_data_files(table => 'db.orders')",
             "CALL ice.system.rewrite_position_delete_files(table => 'db.orders')",
@@ -2882,7 +2818,7 @@ mod tests {
         );
         for sql in [
             "EXPLAIN SELECT 1",
-            "SHOW MATERIALIZED VIEWS",
+            "SHOW STATS FOR ice.db.orders",
             "ALTER MATERIALIZED VIEW mv PAUSE REFRESH",
             "CREATE DATABASE result_capacity_test",
             "CALL ice.system.rewrite_manifests(table => 'db.orders')",

@@ -84,8 +84,7 @@ SELECT k1, v2 FROM proj_mv ORDER BY k1, v2;
 -- query 7
 -- SHOW MATERIALIZED VIEWS includes StorageEngine column with value 'iceberg'.
 -- @result_contains=proj_mv
--- @result_contains=iceberg
-SHOW MATERIALIZED VIEWS;
+SELECT * FROM system.runtime.materialized_view_states WHERE catalog_name = 'mv_phase4a_${uuid0}';
 
 -- query 8
 -- @cleanup=true

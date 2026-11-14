@@ -22,6 +22,13 @@ true	true
 main_matches_pre_opt
 1
 
+-- query 7
+-- types	varchar	bigint
+metric_name	metric_value
+rewritten_data_files_count	3
+removed_delete_files_count	1
+added_data_files_count	1
+
 -- query 8
 -- types	bigint	bigint
 n_rows	n_unique_row_ids

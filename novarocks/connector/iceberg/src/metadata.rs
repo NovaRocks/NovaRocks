@@ -229,7 +229,7 @@ impl IcebergMetadata {
         self.table_object_binding_from_metadata(metadata)
     }
 
-    fn table_object_binding_from_metadata(
+    pub(crate) fn table_object_binding_from_metadata(
         &self,
         metadata: ConnectorTableMetadata,
     ) -> Result<ConnectorTableObjectBinding, ConnectorError> {
@@ -372,12 +372,11 @@ impl ConnectorMetadata for IcebergMetadata {
     fn admit_table_job(
         &self,
         request: novarocks_spi::connector::ConnectorTableJobAdmissionRequest,
-    ) -> Result<novarocks_spi::connector::ConnectorTableJobAdmission, ConnectorError> {
+    ) -> Result<(), ConnectorError> {
         use crate::catalog::admission::{
-            CatalogAdmission, CatalogAdmissionRequest, CatalogInitiation, CatalogOperation,
-            connector_unsupported,
+            CatalogAdmissionRequest, CatalogInitiation, CatalogOperation, connector_unsupported,
         };
-        use novarocks_spi::connector::{ConnectorTableJobAdmission, ConnectorTableJobKind};
+        use novarocks_spi::connector::ConnectorTableJobKind;
         if request.table.instance_id != self.descriptor.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -387,21 +386,15 @@ impl ConnectorMetadata for IcebergMetadata {
         self.validate_context(&request.context)?;
         let operation = match request.job {
             ConnectorTableJobKind::Statistics => CatalogOperation::Statistics,
-            ConnectorTableJobKind::RewriteDataFiles => CatalogOperation::RewriteDataFiles,
         };
         self.runtime
             .novarocks_catalog()
             .admit(&CatalogAdmissionRequest::new(
                 operation,
                 crate::catalog::CatalogTableName::new(request.table.namespace, request.table.table),
-                CatalogInitiation::StatementJob,
+                CatalogInitiation::Statement,
             ))
-            .map(|admission| match admission {
-                CatalogAdmission::Admitted => ConnectorTableJobAdmission::Detached,
-                CatalogAdmission::AdmittedAwaitingCompletion => {
-                    ConnectorTableJobAdmission::AwaitTerminal
-                }
-            })
+            .map(|_| ())
             .map_err(connector_unsupported)
     }
 
@@ -1254,11 +1247,19 @@ impl IcebergMetadata {
             },
         ))
     }
+    /// Summary ancestry needs complete snapshot metadata from this same original
+    /// observation; ordinary catalog projection may request refs only.
+    pub(crate) fn prepare_statistics_summary_table(
+        &self,
+        request: ConnectorTableRequest,
+    ) -> novarocks_spi::connector::ConnectorTablePreparationFuture<'_> {
+        self.prepare_source_table(request)
+    }
     pub(crate) fn statistics_read_preparation_bytes() -> Result<usize, ConnectorError> {
         fn bytes<A, B, F>(_: fn(A, B) -> F) -> usize {
             std::mem::size_of::<F>()
         }
-        bytes(Self::prepare_table_original)
+        bytes(Self::prepare_source_table_original)
             .checked_add(std::mem::size_of::<IcebergPreparedTableFacts>())
             .ok_or_else(|| {
                 ConnectorError::new(
@@ -2489,6 +2490,12 @@ fn is_metadata_column(name: &str) -> bool {
     )
 }
 
+pub(crate) fn is_metadata_table_alias(requested: &str) -> bool {
+    requested
+        .rsplit_once('$')
+        .is_some_and(|(_, suffix)| parse_metadata_table_type(suffix).is_some())
+}
+
 fn resolve_table_request(
     requested: &str,
     resolution: ConnectorTableResolution,
@@ -3010,9 +3017,12 @@ mod plan_splits_pruning_tests {
             };
             // Source capture requests complete history through its own port;
             // ordinary catalog projection retains its existing refs request.
-            for (source, expected) in [(false, crate::catalog::SnapshotLoading::Refs), (true, crate::catalog::SnapshotLoading::All)] {
-                let preparation = if source { metadata.prepare_source_table(request.clone()).await }
-                    else { metadata.prepare_table(request.clone()).await }.unwrap();
+            for (source, expected) in [(0, crate::catalog::SnapshotLoading::Refs), (1, crate::catalog::SnapshotLoading::All), (2, crate::catalog::SnapshotLoading::All)] {
+                let preparation = match source {
+                    0=>metadata.prepare_table(request.clone()).await,
+                    1=>metadata.prepare_source_table(request.clone()).await,
+                    _=>metadata.prepare_statistics_summary_table(request.clone()).await,
+                }.unwrap();
                 let observed = with_pure_schema_creation(&request.context, |creation| metadata.create_prepared_table(preparation, creation).map_err(metadata_creation_error)).unwrap();
                 let facts = observed.source_read_facts().unwrap()
                     .value::<crate::catalog_control::statistics::scoped_cpu::scoped_prepared_source::IcebergObservedSourceReadFacts>(metadata.descriptor.instance_id.as_str()).unwrap();
@@ -3771,18 +3781,14 @@ mod plan_splits_pruning_tests {
 
     #[test]
     fn table_job_admission_uses_the_exact_owner_without_any_external_io() {
-        use novarocks_spi::connector::{
-            ConnectorTableJobAdmission, ConnectorTableJobAdmissionRequest, ConnectorTableJobKind,
-        };
+        use novarocks_spi::connector::{ConnectorTableJobAdmissionRequest, ConnectorTableJobKind};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap().to_string();
         for catalog_type in ["hive", "hadoop", "rest"] {
             let (_executor, warehouse, provider) = provider_with_catalog(catalog_type, &address);
-            for job in [
-                ConnectorTableJobKind::Statistics,
-                ConnectorTableJobKind::RewriteDataFiles,
-            ] {
+            {
+                let job = ConnectorTableJobKind::Statistics;
                 let answer = provider.admit_table_job(ConnectorTableJobAdmissionRequest {
                     table: ConnectorTableIdentity {
                         instance_id: provider.descriptor.instance_id.clone(),
@@ -3798,10 +3804,8 @@ mod plan_splits_pruning_tests {
                         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                         assert!(error.message().contains("read-only compatibility entry"));
                     }
-                    "hadoop" => {
-                        assert_eq!(answer.unwrap(), ConnectorTableJobAdmission::AwaitTerminal)
-                    }
-                    "rest" => assert_eq!(answer.unwrap(), ConnectorTableJobAdmission::Detached),
+                    "hadoop" => answer.unwrap(),
+                    "rest" => answer.unwrap(),
                     _ => unreachable!(),
                 }
                 assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), 0);

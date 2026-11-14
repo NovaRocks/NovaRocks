@@ -1294,8 +1294,10 @@ async fn explain_counted_with_initial_schema(
         );
         // The same fake Provider projects the retained source facts; this call
         // cannot load metadata or start SourceRead work (both callbacks panic).
-        let ports = source.ports(state.readiness.clone(), state.entrance.clone());
-        let actual_read_schema = io.schema(&ports, &table, &context).await.unwrap();
+        let actual_read_schema = io
+            .schema(fixture.explain_ports.as_ref().unwrap(), &table, &context)
+            .await
+            .unwrap();
         assert!(
             actual_read_schema
                 .fields()

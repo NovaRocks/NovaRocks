@@ -10190,7 +10190,6 @@ mod tests {
             for class in [
                 WorkClass::Query,
                 WorkClass::MaterializedView,
-                WorkClass::Statistics,
                 WorkClass::TableMaintenance,
                 WorkClass::Management,
             ] {

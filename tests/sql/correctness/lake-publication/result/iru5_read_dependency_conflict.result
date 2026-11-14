@@ -5,7 +5,7 @@ id	value
 2	20
 3	30
 
--- query 7
+-- query 6
 -- types	bigint	bigint
 id	value
 1	10

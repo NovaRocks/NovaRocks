@@ -2197,7 +2197,7 @@ fn probe(
     let row = rows
         .iter()
         .find(|row| row.grpc_port == port)
-        .context("SHOW BACKENDS omitted the Native ingress target")?;
+        .context("backend topology omitted the Native ingress target")?;
     ensure!(
         row.is_eligible_live(),
         "Native ingress target is not eligible-live"

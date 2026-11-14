@@ -20,11 +20,11 @@
 -- @tags=write_path,starrocks_table,iceberg,optimize,row_lineage
 -- Test Point:
 --   Iceberg v3 ALTER TABLE OPTIMIZE compacts visible rows from data + DV files
---   into a fresh data file set and reports FINISHED.
+--   into a fresh data file set and returns after publication.
 -- Method:
 --   Create a v3 row-lineage Iceberg table in a Hadoop catalog, INSERT rows in
 --   two snapshots, DELETE rows to create deletion-vector state, run
---   ALTER TABLE OPTIMIZE, wait for it via wait_alter_optimize, and verify
+--   ALTER TABLE OPTIMIZE, consume its synchronous metrics, and verify
 --   visible rows are preserved before and after the rewrite.
 -- Scope:
 --   Standalone Iceberg v3 row-lineage OPTIMIZE end-to-end via SQL surface.
@@ -66,8 +66,6 @@ DELETE FROM opt_ice_${uuid0}.ns_${uuid0}.orders WHERE id = 4;
 SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 3
--- @skip_result_check=true
--- @wait_alter_optimize=orders
 -- @db=ns_${uuid0}
 ALTER TABLE orders OPTIMIZE;
 

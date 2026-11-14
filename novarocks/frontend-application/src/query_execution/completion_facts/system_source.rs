@@ -79,9 +79,11 @@ enum Response {
     Names(Result<Vec<String>, SystemTableError>),
     Exists(Result<bool, SystemTableError>),
     Open(Result<Inventory, SystemTableError>),
+    // Keep one loaded row with the original response without inflating every
+    // other receiving variant. The Box changes layout, not payload custody.
     Next(
         Inventory,
-        Result<Option<MaterializedViewFacts>, SystemTableError>,
+        Result<Option<Box<MaterializedViewFacts>>, SystemTableError>,
     ),
     Current(Result<Vec<MvSourceObservation>, SystemTableError>),
 }
@@ -194,6 +196,55 @@ impl Drop for OperationLoan<'_> {
     }
 }
 impl FrontendSystemTableFacts {
+    async fn open_materialized_views(
+        &self,
+        include_freshness: bool,
+        include_definition: bool,
+        states: bool,
+    ) -> Result<Inventory, SystemTableError> {
+        let requests = self.store_requests()?;
+        let readiness = Arc::clone(&self.owners.mv_readiness);
+        let management = self.owners.materialized_view_management();
+        self.install(Box::pin(async move {
+            Response::Open(
+                readiness
+                    .in_requests(requests)
+                    .local_projection_inventory()
+                    .await
+                    .map(|inventory| {
+                        let inventory = ListableMaterializedViews::new(
+                            inventory,
+                            include_freshness,
+                            include_definition,
+                        );
+                        Box::new(if states {
+                            inventory.with_state_facts(management)
+                        } else {
+                            inventory
+                        }) as Inventory
+                    })
+                    .map_err(repository_error),
+            )
+        }))?;
+        let Response::Open(result) = self.receive().await else {
+            panic!("original MV inventory open response");
+        };
+        let inventory = result?;
+        // The exhausted previous cursor is retired outside the original mutex.
+        let retired = self
+            .io
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inventory
+            .replace(inventory);
+        drop(retired);
+        Ok(Box::new(InventoryBorrow {
+            source: self
+                .self_ref
+                .upgrade()
+                .expect("same original snapshot source"),
+        }))
+    }
     pub(super) fn new(
         owners: CompletionFactOwners,
         scope: StatementFactScope,
@@ -558,13 +609,13 @@ impl FrontendSystemTableFacts {
         self.install(Box::pin(async move {
             let mut inventory = inventory;
             let result = inventory.next().await;
-            Response::Next(inventory, result)
+            Response::Next(inventory, result.map(|facts| facts.map(Box::new)))
         }))?;
         let Response::Next(inventory, result) = self.receive().await else {
             panic!("original MV inventory response");
         };
         self.io.lock().unwrap_or_else(|p| p.into_inner()).inventory = Some(inventory);
-        result
+        result.map(|facts| facts.map(|facts| *facts))
     }
 }
 struct InventoryBorrow {
@@ -689,42 +740,64 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
         include_definition: bool,
         _: &ConnectorRequestContext,
     ) -> Result<Inventory, SystemTableError> {
+        self.open_materialized_views(include_freshness, include_definition, false)
+            .await
+    }
+    async fn materialized_view_states(
+        &self,
+        _: &ConnectorRequestContext,
+    ) -> Result<Inventory, SystemTableError> {
+        self.open_materialized_views(false, false, true).await
+    }
+    async fn upstream_materialized_views(
+        &self,
+        projection: &novarocks_mv_application::state_store_repository::keyed::LoadedKeyedMvProjection,
+        _: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, SystemTableError> {
         let requests = self.store_requests()?;
         let readiness = Arc::clone(&self.owners.mv_readiness);
+        let projection = projection.clone();
         self.install(Box::pin(async move {
-            Response::Open(
-                readiness
-                    .in_requests(requests)
-                    .local_projection_inventory()
-                    .await
-                    .map(|inventory| {
-                        Box::new(ListableMaterializedViews::new(
-                            inventory,
-                            include_freshness,
-                            include_definition,
-                        )) as Inventory
-                    })
-                    .map_err(repository_error),
+            Response::Names(
+                async {
+                    let dependencies = readiness
+                        .in_requests(requests)
+                        .list_ready_dependencies_by_downstream(&projection)
+                        .await
+                        .map_err(repository_error)?;
+                    let mut names = Vec::new();
+                    let mut seen = std::collections::BTreeSet::new();
+                    for dependency in &dependencies {
+                        use novarocks_mv_application::dependency::MvDependencyObjectType;
+                        if dependency.upstream.object_type
+                            != MvDependencyObjectType::MaterializedView
+                        {
+                            continue;
+                        }
+                        let upstream = &dependency.upstream;
+                        let catalog = upstream.catalog.as_deref().ok_or_else(|| {
+                            SystemTableError::Provider(ConnectorError::new(
+                                ConnectorErrorKind::CorruptData,
+                                "materialized-view dependency has no catalog identity",
+                            ))
+                        })?;
+                        let name = format!(
+                            "{catalog}.{}.{}",
+                            upstream.database_or_namespace, upstream.name
+                        );
+                        if seen.insert((catalog, &upstream.database_or_namespace, &upstream.name)) {
+                            names.push(name);
+                        }
+                    }
+                    Ok(names)
+                }
+                .await,
             )
         }))?;
-        let Response::Open(result) = self.receive().await else {
-            panic!("original MV inventory open response");
+        let Response::Names(result) = self.receive().await else {
+            panic!("original MV dependency response");
         };
-        let inventory = result?;
-        // The exhausted previous cursor is retired outside the original mutex.
-        let retired = self
-            .io
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .inventory
-            .replace(inventory);
-        drop(retired);
-        Ok(Box::new(InventoryBorrow {
-            source: self
-                .self_ref
-                .upgrade()
-                .expect("same original snapshot source"),
-        }))
+        result
     }
     async fn current_sources(
         &self,
@@ -772,7 +845,10 @@ impl StatementSystemTableSource for FrontendSystemTableFacts {
             )
             .map_err(health_error)?
     }
-    fn stage_row(&self, values: &[Option<&str>]) -> Result<RowStage, SystemTableError> {
+    fn stage_row(
+        &self,
+        values: &[crate::system_tables::SystemValueRef<'_>],
+    ) -> Result<RowStage, SystemTableError> {
         self.cpu()?.stage_system_row(values).map_err(health_error)?
     }
     async fn materialize_batch(&self) -> Result<(), SystemTableError> {

@@ -11,20 +11,15 @@ workspace = true
 novarocks-failure-contract.workspace = true
 novarocks-type-contract.workspace = true
 novarocks-coordination-contract.workspace = true
-novarocks-workload-control.workspace = true
 hex.workspace = true
 novarocks-query-application.workspace = true
 novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
-novarocks-types.workspace = true
-novarocks-sql.workspace = true
-novarocks-resource-contract.workspace = true
 bytes.workspace = true
 novarocks-state-store-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

@@ -278,7 +278,7 @@ pub(crate) struct JointLedger {
     pub(super) driver_closed: bool,
     /// Count of local_blocked flags in this same original request inventory.
     pub(super) local_waiters: usize,
-    control_empty_facts: [Option<Arc<ResponsibilityFacts>>; 5],
+    control_empty_facts: [Option<Arc<ResponsibilityFacts>>; WorkClass::ALL.len()],
 }
 impl JointLedger {
     pub(super) fn has_reclaimable_dependencies(&self) -> bool {

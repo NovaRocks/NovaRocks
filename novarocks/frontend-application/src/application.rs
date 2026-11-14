@@ -2406,14 +2406,6 @@ impl FrontendApplicationHost {
         Arc::clone(self.topology()) as novarocks_query_application::api::BackendTopologyService
     }
 
-    /// Frontend composition-time read-only backend command leaf.
-    pub fn backend_topology_command_port(
-        &self,
-    ) -> Arc<dyn novarocks_query_application::api::BackendTopologyCommandPort> {
-        Arc::clone(self.topology())
-            as Arc<dyn novarocks_query_application::api::BackendTopologyCommandPort>
-    }
-
     pub async fn shutdown(&mut self) -> Result<(), FrontendApplicationError> {
         self.shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
             .await

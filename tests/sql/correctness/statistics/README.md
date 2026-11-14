@@ -19,11 +19,16 @@ under the License.
 
 # statistics
 
-Focused statistics regressions for the 128-bit `LARGEINT` path inherited from
-the former low-cardinality companion suite. The suite is runner-managed native
-`1FE+3BE`, backed by SQLite StateStore and the shared Iceberg REST fixture: an
-`ANALYZE` assertion therefore exercises durable job ownership and distributed
-collection instead of the standalone convenience path.
+本 suite 覆盖统计与原低基数 companion suite 的 128 位 `LARGEINT` 回归。runner
+启动原生 `1FE+3BE`、SQLite StateStore；本地 MinIO 模式为本次调用启动独有的 Iceberg REST
+和 MinIO fixture，node-local 模式保留原 publication 与能力检查。表与种子数据由 suite 自己创建，不依赖共享预置数据。`ANALYZE` 因而沿原语句
+Root 和 query permit 验证分布式采集、发布及实际资源退出。
+
+隔离时，存储权限来自 runner 真正启动的 fixture handle：其 `RestStorageBinding` 原样绑定到
+NamespaceGuard，端点、凭证与 fixture 环境同步投影给 NovaRocks、Spark 和 Trino 消费者，
+最后由同一 fixture owner 清理。外部私有 Stock publication 的 URI 本身不授予存储权限；
+这里复用现有隔离 fixture 路径，不关闭共享存储检查。此 suite 与依赖共享环境的 suite
+不能放在同一次 runner 调用中；分别运行各 suite。
 
 The suite deliberately uses small tables. Its purpose is statistics collection
 and plan visibility, not aggregate or low-cardinality runtime behavior.

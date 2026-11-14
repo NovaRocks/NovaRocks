@@ -1,0 +1,20 @@
+-- query 2
+-- types	varchar	varchar	bigint	boolean	timestamp(3) with time zone	bigint	varchar	varchar	boolean	array(varchar)
+name	refresh_policy	refresh_interval_ms	refresh_paused	last_refresh_time	last_refresh_rows	manageability	manageability_reason	base_identity_matches	upstream_materialized_views
+state_interval	INTERVAL	300000	false	NULL	NULL	MANAGEABLE	NULL	true	[]
+state_manual	MANUAL	NULL	false	NULL	NULL	MANAGEABLE	NULL	true	[]
+
+-- query 4
+-- types	varchar	varchar	bigint	boolean
+name	refresh_policy	refresh_interval_ms	refresh_paused
+state_interval	INTERVAL	300000	true
+
+-- query 6
+-- types	varchar	boolean	bigint
+name	has_publication_prepared_time	last_refresh_rows
+state_manual	true	2
+
+-- query 7
+-- types	varchar
+table_name
+materialized_view_states

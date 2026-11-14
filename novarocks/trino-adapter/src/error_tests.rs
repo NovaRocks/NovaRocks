@@ -46,6 +46,7 @@ const TRINO_STANDARD_ERROR_CODES: &[(&str, i32, &str)] = &[
     ("NUMERIC_VALUE_OUT_OF_RANGE", 19, "USER_ERROR"),
     ("QUERY_TEXT_TOO_LARGE", 35, "USER_ERROR"),
     ("ADMINISTRATIVELY_KILLED", 38, "USER_ERROR"),
+    ("INVALID_ANALYZE_PROPERTY", 42, "USER_ERROR"),
     ("CATALOG_NOT_FOUND", 44, "USER_ERROR"),
     ("SCHEMA_NOT_FOUND", 45, "USER_ERROR"),
     ("TABLE_NOT_FOUND", 46, "USER_ERROR"),
@@ -95,6 +96,21 @@ fn retired_metadata_commands_are_syntax_errors_at_the_trino_boundary() {
         "SHOW VIEWS IN x",
         "SHOW BASIC STATS META",
         "SHOW HISTOGRAM STATS META",
+        "SHOW ALTER TABLE OPTIMIZE",
+        "SHOW ANALYZE",
+        "SHOW ANALYZE JOBS",
+        "SHOW TABLE STATS t",
+        "SHOW MATERIALIZED VIEWS",
+        "SHOW BACKENDS",
+        "CANCEL ANALYZE 1",
+        "KILL ANALYZE 1",
+        "ADMIN RAISE ENGINE ERROR 'CommitUnknown'",
+        "DROP STATS t",
+        "DROP HISTOGRAM ON t (c)",
+        "DROP MULTIPLE COLUMNS STATS t",
+        "ANALYZE FULL TABLE t",
+        "ANALYZE SAMPLE TABLE t",
+        "ANALYZE TABLE t WITH SYNC MODE",
     ] {
         let parse = novarocks_parser::parse(sql)
             .expect_err("retired metadata command must fail in parsing");
@@ -150,6 +166,7 @@ fn expected_descriptor_name(code: &str) -> &'static str {
         "sql.analyze.type_mismatch" => "TYPE_MISMATCH",
         "sql.analyze.invalid_literal" => "INVALID_LITERAL",
         "sql.analyze.invalid_argument" => "INVALID_ARGUMENTS",
+        "sql.analyze.invalid_analyze_property" => "INVALID_ANALYZE_PROPERTY",
         "sql.analyze.too_many_arguments" => "TOO_MANY_ARGUMENTS",
         "sql.analyze.invalid_query_shape" | "query.execution.invalid_data" => "GENERIC_USER_ERROR",
         "query.execution.merge_target_row_multiple_matches"

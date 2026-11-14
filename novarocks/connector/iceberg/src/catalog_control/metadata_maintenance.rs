@@ -505,6 +505,7 @@ impl MaintenanceEngine {
         };
         let preflight_journal = journal.clone();
         let publisher = journal.observe_prepared(Arc::new(CatalogPublisher {
+            expected_table_uuid: None,
             catalog_operation: CatalogOperation::RewriteManifests,
             catalog: Arc::clone(self.runtime.novarocks_catalog()),
             ident,

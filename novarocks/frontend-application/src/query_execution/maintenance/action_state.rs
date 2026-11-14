@@ -122,6 +122,7 @@ impl MaintenanceActionState {
             body: Some(body),
         })
     }
+    #[cfg(test)]
     pub(super) fn has_engine(&self) -> Result<bool, String> {
         let original = self.original.lock().unwrap_or_else(|p| p.into_inner());
         Ok(original

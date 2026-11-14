@@ -85,6 +85,7 @@ struct Captured {
 #[derive(Clone, Copy)]
 enum OutputMode {
     Rows,
+    OptimizeRows,
     InternalRows,
     CallRows,
     CallEmpty,
@@ -429,6 +430,7 @@ impl QuerySession for Session {
             | OutputMode::FailureWithEffect(_, _) => {
                 (StatementKind::Insert, StatementOutputShape::Rows)
             }
+            OutputMode::OptimizeRows => (StatementKind::Optimize, StatementOutputShape::ResultSet),
             OutputMode::Rows | OutputMode::InternalRows => {
                 (StatementKind::Query, StatementOutputShape::ResultSet)
             }
@@ -483,6 +485,7 @@ impl QuerySession for Session {
                 Some(originating_error(reason).attach_external_effect_disposition(effect))
             }
             OutputMode::Rows
+            | OutputMode::OptimizeRows
             | OutputMode::InternalRows
             | OutputMode::CallRows
             | OutputMode::CallEmpty
@@ -594,6 +597,8 @@ impl QuerySession for Session {
                 QuerySessionOutput::GovernedQuery(result),
                 if matches!(self.state.mode, OutputMode::CallRows) {
                     StatementKind::Call
+                } else if matches!(self.state.mode, OutputMode::OptimizeRows) {
+                    StatementKind::Optimize
                 } else {
                     StatementKind::Query
                 },
@@ -2103,4 +2108,24 @@ async fn header_property_catalog_admission_preserves_ready_absent_unavailable_an
         );
         assert_eq!(fixture.state.capacity.snapshot().held_positions, [0; 4]);
     }
+}
+
+#[tokio::test]
+async fn optimize_result_set_keeps_rows_and_table_execute_update_type() {
+    let fixture = Fixture::configured(
+        false,
+        false,
+        OutputMode::OptimizeRows,
+        Duration::from_secs(60),
+        None,
+    );
+    let (entry, _) = fixture.register();
+    let page = get(&fixture.registry, &entry, 0).await;
+    let wire = json(&page);
+    assert_eq!(wire["data"], serde_json::json!([["row-one"], ["row-two"]]));
+    assert_eq!(wire["updateType"], "ALTER TABLE EXECUTE");
+    assert!(wire.get("updateCount").is_none());
+    let terminal = get(&fixture.registry, &entry, next(&page)).await;
+    assert_eq!(json(&terminal)["stats"]["state"], "FINISHED");
+    assert!(json(&terminal).get("nextUri").is_none());
 }

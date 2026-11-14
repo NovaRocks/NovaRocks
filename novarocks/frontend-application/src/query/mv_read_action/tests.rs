@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual SQLite/ordinary-QB/closed-CPU composition of the prepared SHOW Source.
+//! Actual SQLite/ordinary-QB/closed-CPU composition of the prepared Explain Source.
 use super::*;
+use crate::mv::domain::{iceberg_refresh::IcebergMvCorePorts, readiness::MvReadinessPort};
 use crate::query_execution::internal_result_cpu::InternalResultCpuOwner;
+use novarocks_mv_application::management::ManagementEntrance;
 use novarocks_query_application::{
     cancellation::QueryCancellationView,
     cpu::{QueryBlockingExecutorConfig, QueryBlockingExecutorOwner},
@@ -31,8 +33,8 @@ use novarocks_state_store_sqlite::{
     SQLITE_STATE_STORE_PROVIDER_ID, SqliteStateStoreProviderFactory,
 };
 use novarocks_workload_control::{
-    CancellationReason, ControlStorageConfig, ResultCapacityConfig, ResultWindowGrant, RootWork,
-    WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    ControlStorageConfig, ResultCapacityConfig, ResultWindowGrant, RootWork, WorkClass,
+    WorkRequest, WorkloadConfig, WorkloadControl,
     joint_admission::{JointProgress, JointProgressDriver, ResponsibilityConfig},
 };
 use std::{
@@ -66,6 +68,7 @@ struct Fixture {
     _directory: tempfile::TempDir,
     host: StateStoreHost,
     readiness_service: Option<novarocks_mv_application::readiness::MvKeyedReadinessService>,
+    explain_ports: Option<IcebergMvCorePorts>,
     ordinary: QueryBlockingExecutorOwner,
     cpu: InternalResultCpuOwner,
     control: WorkloadControl,
@@ -75,9 +78,6 @@ struct Fixture {
     state: Option<State>,
 }
 impl Fixture {
-    async fn new() -> Self {
-        Self::for_explain(None).await
-    }
     async fn for_explain(level: Option<novarocks_sql::compiler::ExplainLevel>) -> Self {
         Self::with_source_explain(level, None).await
     }
@@ -86,7 +86,7 @@ impl Fixture {
         source: Option<Arc<source_projection_tests::SourceFixture>>,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("show-original.sqlite");
+        let path = directory.path().join("explain-original.sqlite");
         let mut registry = StateStoreProviderRegistry::new();
         registry
             .register(StateStoreProviderRegistration::new(
@@ -237,7 +237,8 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let input = if let Some(level) = level {
+        let input = {
+            let level = level.expect("Explain fixture requires an explicit level");
             let ports = if let Some(source) = &source {
                 source.ports(readiness.clone(), entrance.clone())
             } else {
@@ -267,7 +268,7 @@ impl Fixture {
                     )
                 }
             };
-            ReadRequest::Explain(Box::new(MvExplainPreparationInput {
+            Box::new(MvExplainPreparationInput {
                 ports,
                 current_catalog: Some("ice".into()),
                 current_database: if source.is_some() { "sales" } else { "db" }.into(),
@@ -283,13 +284,9 @@ impl Fixture {
                     64 * 1024,
                 )
                 .unwrap(),
-            }))
-        } else {
-            ReadRequest::Show {
-                catalog: Some("ice".into()),
-                statement: MvShowStatement { database: None },
-            }
+            })
         };
+        let explain_ports = input.ports.clone();
         let mut state = State {
             family: novarocks_result_contract::ClientPresentationFamily::TrinoJson(
                 novarocks_result_contract::TrinoJsonFacts {
@@ -298,8 +295,6 @@ impl Fixture {
                     variant_binary: true,
                 },
             ),
-            readiness,
-            entrance,
             binding,
             runtime: tokio::runtime::Handle::current(),
             cancellation: QueryCancellationView::governed(scope.cancellation().unwrap(), None),
@@ -312,7 +307,6 @@ impl Fixture {
             io: Some(io),
             store: None,
             original: None,
-            future: None,
             job: None,
             marker: None,
             cpu: cpu.runtime(),
@@ -331,6 +325,7 @@ impl Fixture {
             _directory: directory,
             host,
             readiness_service: Some(readiness_service),
+            explain_ports: Some(explain_ports),
             ordinary,
             cpu,
             control,
@@ -375,6 +370,7 @@ impl Fixture {
         // The fixture's seed-only alias is not a live SQLite consumer after
         // the original State has closed. Release it before the host's exact
         // single-owner close checks its repository/store strong references.
+        drop(self.explain_ports.take());
         drop(self.readiness_service.take());
         drop(self.local.take());
         if cancelled {
@@ -426,160 +422,6 @@ impl Fixture {
             .await
             .unwrap();
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn show_original_sqlite_qb1_returns_local_rows_without_holding_an_internal_position() {
-    let mut fixture = Fixture::new().await;
-    let original = fixture
-        .state
-        .as_ref()
-        .unwrap()
-        .original
-        .as_ref()
-        .unwrap()
-        .clone();
-    let StatementActionValue::Local(result) = fixture.business().await.unwrap() else {
-        panic!("SHOW must return the original Local result")
-    };
-    assert_eq!(result.row_count(), 0);
-    assert_eq!(
-        result
-            .columns()
-            .map(|column| column.name.to_owned())
-            .collect::<Vec<_>>(),
-        [
-            "Name",
-            "Database",
-            "StorageEngine",
-            "RefreshMode",
-            "LastRefreshTime",
-            "LastRefreshRows",
-            "BaseTables",
-            "SelectText",
-            "Dependencies",
-            "RefreshPaused",
-            "NextRefreshTime",
-            "LastSchedulerError",
-            "MaxStalenessMs",
-            "RefreshState",
-            "RetryAfterTime",
-            "Manageability",
-        ]
-    );
-    assert!(fixture.state.as_ref().unwrap().local_health().is_none());
-    assert!(!original.cpu_unreturned.load(Ordering::Acquire));
-    assert!(
-        fixture.state.as_ref().unwrap().job.is_none(),
-        "actual worker/forwarder footer preceded result transfer"
-    );
-    drop(fixture.state.as_mut().unwrap().origin.take());
-    drop(fixture.local.take());
-    assert_eq!(
-        fixture
-            .control
-            .snapshot()
-            .result_windows
-            .held_positions
-            .iter()
-            .sum::<usize>(),
-        1,
-        "only the actual returned Local graph owns its delivery position"
-    );
-    drop(result);
-    assert_eq!(
-        fixture.control.snapshot().result_windows.held_positions,
-        [0; 4],
-        "the same SS/MIO residual cannot pin delivery or an Internal computation position"
-    );
-    assert_eq!(fixture.control.snapshot().root_responsibilities, 1);
-    drop(original);
-    fixture.close(false).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn show_original_cancelled_borrow_keeps_the_same_pending_sqlite_input_and_closes_it() {
-    let mut fixture = Fixture::new().await;
-    let reservation = fixture.ordinary.executor().try_reserve().unwrap();
-    let state = fixture.state.as_mut().unwrap();
-    let original = state.original.as_ref().unwrap().clone();
-    let weak = Arc::downgrade(&original);
-    state.future = Some(Box::pin(run_io(original.clone())));
-    let mut cx = Context::from_waker(std::task::Waker::noop());
-    {
-        let mut borrower = Box::pin(std::future::poll_fn(|cx| {
-            state.progress(cx);
-            let result = state.poll_io(cx);
-            state.progress(cx);
-            result
-        }));
-        assert!(borrower.as_mut().poll(&mut cx).is_pending());
-    }
-    assert!(state.future.is_some());
-    assert!(Arc::ptr_eq(state.original.as_ref().unwrap(), &original));
-    assert!(weak.upgrade().is_some());
-    fixture.root.owner.cancel(CancellationReason::Requested);
-    drop(reservation);
-    {
-        let state = fixture.state.as_mut().unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            with_original_driver(
-                &fixture.control,
-                &mut fixture.driver,
-                std::future::poll_fn(|cx| {
-                    state.progress(cx);
-                    let result = state.poll_io(cx);
-                    state.progress(cx);
-                    result
-                }),
-            ),
-        )
-        .await
-        .expect("same cancelled read receives its original output and child exit");
-    }
-    let original_cause = {
-        let body = original.body.lock().unwrap();
-        let error = body
-            .as_ref()
-            .unwrap()
-            .result
-            .as_ref()
-            .unwrap()
-            .as_ref()
-            .err()
-            .expect("actual repository cancellation is stable before public selection");
-        error
-            .failure_cause()
-            .expect("actual repository source retained")
-            .clone()
-    };
-    let error = match fixture.business().await {
-        Err(error) => error,
-        Ok(_) => panic!("the original cancelled read cannot become an empty legacy inventory"),
-    };
-    assert_eq!(
-        error.failure_cause(),
-        Some(&original_cause),
-        "late MIO/root stop cannot replace the original repository cause"
-    );
-    use novarocks_failure_contract::FailureProjection;
-    assert_eq!(
-        error.execution_failure().unwrap().fact(),
-        original_cause.failure_fact()
-    );
-    assert!(
-        fixture.state.as_ref().unwrap().local_health().is_none(),
-        "ordinary cancellation is not physical health failure"
-    );
-    assert!(fixture.state.as_ref().unwrap().future.is_none());
-    assert!(
-        weak.upgrade().is_some(),
-        "same original remains for residual close"
-    );
-    drop(original);
-    fixture.close(true).await;
-    assert!(weak.upgrade().is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

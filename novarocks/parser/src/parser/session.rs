@@ -43,9 +43,7 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
     {
         return parse_transaction_control(parser).map(Some);
     }
-    // `KILL ANALYZE` is owned by the preceding statistics family. Preserve
-    // that ownership even if this parser is ever reused in another order.
-    if parser.current_is_word("KILL") && !parser.peek_word(1, "ANALYZE") {
+    if parser.current_is_word("KILL") {
         return parse_kill(parser).map(Some);
     }
     Ok(None)
@@ -215,10 +213,7 @@ fn parse_kill(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseEr
 #[cfg(test)]
 mod tests {
     use crate::{
-        ast::{
-            KillKind, SessionStatement, SetScope, Statement, StatisticsStatement,
-            TransactionControlKind,
-        },
+        ast::{KillKind, SessionStatement, SetScope, Statement, TransactionControlKind},
         parser,
         printer::print_statement,
     };
@@ -293,12 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn does_not_take_kill_analyze_from_statistics() {
-        let statements = parser::parse("KILL ANALYZE 17").expect("statistics command should parse");
-        assert!(matches!(
-            statements.as_slice(),
-            [Statement::Statistics(StatisticsStatement::CancelAnalyze(_))]
-        ));
+    fn kill_analyze_is_a_typed_syntax_error() {
+        let source = "KILL ANALYZE 17";
+        assert_eq!(
+            parser::parse(source)
+                .unwrap_err()
+                .to_user_error(source)
+                .code()
+                .as_str(),
+            "sql.parse.unexpected_token"
+        );
     }
 
     #[test]

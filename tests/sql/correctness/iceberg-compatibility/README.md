@@ -21,6 +21,8 @@ under the License.
 
 This suite validates cross-engine Iceberg compatibility.
 
+本地 MinIO 模式下，runner 为本次 suite 启动独有的 REST Catalog 和 MinIO，并将原 fixture env-file、端点和凭据投影给 Spark 与 NovaRocks；node-local 模式保留原 publication 与能力检查。各 case 在本次 namespace 内生成数据，不依赖共享预置表；隔离时由原 fixture handle 提供存储权限并负责清理。此 suite 应单独调用，不与普通共享环境 suite 混跑。
+
 The cases create Iceberg format-v3 tables with Spark through the workspace REST
 Catalog and MinIO object store, then read the tables through NovaRocks. Current
 coverage includes:

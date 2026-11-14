@@ -362,12 +362,6 @@ pub(crate) fn required(step: &SqlStep) -> Vec<&'static str> {
     if m.iceberg_orphan_fixture_absent {
         kinds.push("iceberg_orphan_absent");
     }
-    if m.wait_alter_column.is_some()
-        || m.wait_alter_rollup.is_some()
-        || m.wait_alter_optimize.is_some()
-    {
-        kinds.push("wait_alter");
-    }
     kinds
 }
 

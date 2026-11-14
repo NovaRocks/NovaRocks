@@ -135,9 +135,6 @@ impl TrinoCaseSession {
     pub(crate) fn cancel_slot(&self) -> crate::fault_injection::QueryCancelSlot {
         self.cancel_slot.clone()
     }
-    pub(crate) fn original_deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
     pub(crate) fn set_operation_deadline(&mut self, deadline: Option<Instant>) {
         self.operation_deadline = deadline;
     }
@@ -1182,6 +1179,52 @@ mod session_tests {
             assert_eq!(session.state.properties, properties);
         }
         assert!(peer.finish().is_empty());
+    }
+
+    #[test]
+    fn table_execute_rows_reach_the_runner_and_golden_with_update_type() {
+        let peer = Peer::start(vec![
+            Reply::queued("/v1/statement", "/metrics"),
+            Reply::json(
+                "GET",
+                "/metrics",
+                r#"{"id":"q","updateType":"ALTER TABLE EXECUTE","columns":[{"name":"metric_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"metric_value","type":"bigint","typeSignature":{"rawType":"bigint","arguments":[]}}],"data":[["rewritten_data_files_count",3],["removed_delete_files_count",0],["added_data_files_count",1]],"nextUri":"$BASE/end"}"#,
+            ),
+            Reply::json(
+                "GET",
+                "/end",
+                r#"{"id":"q","updateType":"ALTER TABLE EXECUTE"}"#,
+            ),
+        ]);
+        let mut session = peer.session();
+        let outcome = session.execute_query(9, "ALTER TABLE t OPTIMIZE", None);
+        let (ok, execution, message) = outcome.summary();
+        assert!(ok, "{message}");
+        let execution = execution.unwrap();
+        assert_eq!(execution.typed_results.len(), 1);
+        let result = &execution.typed_results[0];
+        assert_eq!(result.update_type.as_deref(), Some("ALTER TABLE EXECUTE"));
+        assert_eq!(result.update_count, None);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(execution.rows.len(), 3);
+        let blocks =
+            crate::golden::execution::blocks_from_results(&execution.typed_results).unwrap();
+        assert_eq!(blocks.len(), 1);
+        let crate::golden::Block::Typed { names, rows, .. } = &blocks[0] else {
+            panic!("the table-execute relation must produce a typed golden block");
+        };
+        assert_eq!(names, &["metric_name", "metric_value"]);
+        assert_eq!(
+            rows,
+            &vec![
+                vec!["rewritten_data_files_count".to_owned(), "3".to_owned()],
+                vec!["removed_delete_files_count".to_owned(), "0".to_owned()],
+                vec!["added_data_files_count".to_owned(), "1".to_owned()]
+            ]
+        );
+        let requests = peer.finish();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].path, "/end");
     }
 
     #[test]
@@ -3327,9 +3370,33 @@ mod session_tests {
     }
 
     #[test]
+    fn equivalence_metadata_uses_the_current_catalog_and_exact_schema() {
+        let mut replies = boundary_values(&[7]);
+        replies.extend([
+            Reply::queued("/v1/statement", "/mv-definition"),
+            Reply::json("GET", "/mv-definition", r#"{"id":"q","columns":[{"name":"name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"schema_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"definition","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}}],"data":[["target_mv","other","SELECT wrong"],["target_mv","ns","SELECT recompute"]]}"#),
+        ]);
+        replies.extend(boundary_values(&[7]));
+        let peer = Peer::start(replies);
+        let mut session = peer.session();
+        session.state.catalog = Some("chosen'catalog".into());
+        let mut log = String::new();
+        crate::run_imv_equivalence_check("target_mv", &mut session, 5, Some("ns"), None, &mut log)
+            .unwrap();
+        assert_eq!(
+            posted_requests(&peer.finish()),
+            [
+                "SELECT * FROM ns.target_mv",
+                "SELECT name, schema_name, definition FROM system.metadata.materialized_views WHERE catalog_name = 'chosen''catalog'",
+                "SELECT recompute",
+            ]
+        );
+    }
+
+    #[test]
     fn outer_conversion_equivalence_assertion_uses_extra_queries_and_preserves_failure() {
         let mut replies = boundary_values(&[7, 2]);
-        replies.extend([Reply::queued("/v1/statement", "/mv-show"), Reply::json("GET", "/mv-show", r#"{"id":"q","columns":[{"name":"Name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"SelectText","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}}],"data":[["target_mv","SELECT recompute"]]}"#)]);
+        replies.extend([Reply::queued("/v1/statement", "/mv-show"), Reply::json("GET", "/mv-show", r#"{"id":"q","columns":[{"name":"name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"definition","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"schema_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}}],"data":[["target_mv","SELECT recompute","ns"]]}"#)]);
         replies.extend(boundary_values(&[3, 7, 7]));
         let peer = Peer::start(replies);
         let temp = tempfile::TempDir::new().unwrap();
@@ -3346,14 +3413,17 @@ mod session_tests {
             boundary_cleanup(3),
         ];
         let initial = "-- query 1\n-- legacy\nv\n7\n\n-- query 2\n-- legacy\nv\n7\n";
-        let (outcome, evidence, _) = run_boundary_steps(
+        let (outcome, evidence, _) = run_boundary_steps_configured(
             &peer,
             &temp,
             crate::Mode::Record,
             true,
             steps,
             Some(initial),
-            Box::new(BoundaryServer),
+            (Box::new(BoundaryServer), |ctx| {
+                ctx.target_conn_base.catalog = Some("test_catalog".into());
+                ctx.target_admin_conn.catalog = Some("test_catalog".into());
+            }),
         );
         assert!(matches!(outcome.status, crate::CaseStatus::Fail));
         assert!(oracle_recorded(&evidence, 1, "imv_equivalence", "fail"));
@@ -3362,7 +3432,7 @@ mod session_tests {
             [
                 "SELECT 7",
                 "SELECT * FROM target_mv",
-                "SHOW MATERIALIZED VIEWS",
+                "SELECT name, schema_name, definition FROM system.metadata.materialized_views WHERE catalog_name = 'test_catalog'",
                 "SELECT recompute",
                 "SELECT 7",
                 "SELECT 99"
@@ -3646,7 +3716,7 @@ mod session_tests {
         let mut replies = boundary_values(&[7, 7]);
         replies.extend([
             Reply::queued("/v1/statement", "/mv-show"),
-            Reply::json("GET", "/mv-show", r#"{"id":"q","columns":[{"name":"Name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"SelectText","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}}],"data":[["target_mv","SELECT 11; SELECT broken"]]}"#),
+            Reply::json("GET", "/mv-show", r#"{"id":"q","columns":[{"name":"name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"definition","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}},{"name":"schema_name","type":"varchar","typeSignature":{"rawType":"varchar","arguments":[{"kind":"LONG","value":2147483647}]}}],"data":[["target_mv","SELECT 11; SELECT broken","ns"]]}"#),
         ]);
         replies.extend(boundary_values(&[11]));
         replies.push(Reply::json(
@@ -3670,14 +3740,17 @@ mod session_tests {
             boundary_cleanup(3),
         ];
         let initial = "-- query 1\n-- legacy\nv\n7\n\n-- query 2\n-- legacy\nv\n7\n";
-        let (outcome, evidence, golden) = run_boundary_steps(
+        let (outcome, evidence, golden) = run_boundary_steps_configured(
             &peer,
             &temp,
             crate::Mode::Record,
             true,
             steps,
             Some(initial),
-            Box::new(BoundaryServer),
+            (Box::new(BoundaryServer), |ctx| {
+                ctx.target_conn_base.catalog = Some("test_catalog".into());
+                ctx.target_admin_conn.catalog = Some("test_catalog".into());
+            }),
         );
         assert!(matches!(outcome.status, crate::CaseStatus::Fail));
         assert_eq!(std::fs::read_to_string(golden).unwrap(), initial);
@@ -3703,7 +3776,7 @@ mod session_tests {
             [
                 "SELECT 7",
                 "SELECT * FROM target_mv",
-                "SHOW MATERIALIZED VIEWS",
+                "SELECT name, schema_name, definition FROM system.metadata.materialized_views WHERE catalog_name = 'test_catalog'",
                 "SELECT 11",
                 "SELECT broken",
                 "SELECT 99"
@@ -4547,7 +4620,7 @@ mod session_tests {
                 crate::SqlStepOutcome::from_session(raw).3,
                 Some(crate::ExecutionFailureOrigin::Statement)
             );
-            assert_eq!(session.original_deadline(), Some(owner));
+            assert_eq!(session.deadline, Some(owner));
             assert_eq!(session.operation_deadline, None);
             assert_eq!(session.state.properties["query_timeout"], "1");
             release.join().unwrap();
@@ -4600,7 +4673,7 @@ mod session_tests {
                 crate::SqlStepOutcome::from_session(raw).3,
                 Some(crate::ExecutionFailureOrigin::Infrastructure)
             );
-            assert_eq!(session.original_deadline(), original_deadline);
+            assert_eq!(session.deadline, original_deadline);
             assert_eq!(session.operation_deadline, operation_deadline);
             assert_eq!(
                 session.state.properties["query_timeout"],

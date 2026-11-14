@@ -17,12 +17,7 @@
 
 //! Read-only MV commands borrow their original Root and Local delivery.
 use super::mv_action::MvExecutionServices;
-use crate::mv::domain::{
-    analysis_adapter::{MvShowResultRows, MvShowRowSelection},
-    application::{MvApplicationError, MvShowStatement},
-    iceberg_refresh::IcebergMvCorePorts,
-    readiness::MvReadinessPort,
-};
+use crate::mv::domain::application::MvApplicationError;
 use crate::query_execution::{
     internal_result_cpu::{InternalResultCpu, MvCpuJob},
     maintenance::io_admission::MetadataIoAdmission,
@@ -38,12 +33,6 @@ use crate::query_execution::{
 use crate::state_store::execution::{StateStoreOriginalBinding, StateStoreOriginalOwner};
 use crate::wake::StatusIntakeWake;
 use novarocks_failure_contract::SharedFailureCause;
-use novarocks_mv_application::{
-    management::ManagementEntrance,
-    persistence::dependency::StoredMvDependency,
-    readiness::{ListedKeyedMvProjection, MvKeyedProjectionInventory},
-    repository::MvRepositoryError,
-};
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
     api::{
@@ -60,8 +49,6 @@ use novarocks_query_application::{
 use novarocks_state_store_api::StateStoreExecutionRequests;
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError, WorkScope};
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -69,47 +56,15 @@ use std::{
     task::{Context, Poll},
 };
 
-/// Parser-lowered closed read requests, not refresh publication admission.
-pub(crate) enum ReadRequest {
-    Show {
-        catalog: Option<String>,
-        statement: MvShowStatement,
-    },
-    Explain(Box<MvExplainPreparationInput>),
-}
-
-type IoFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Turn {
-    Inventory,
     Explain,
     ExplainFinish,
-    Start,
-    Next,
-    Select,
-    Dependencies,
-    Append,
-    Finish,
     Done,
 }
-impl Turn {
-    fn is_io(self) -> bool {
-        matches!(self, Self::Inventory | Self::Next | Self::Dependencies)
-    }
-}
 struct Body {
-    readiness: Arc<MvReadinessPort>,
-    entrance: Arc<ManagementEntrance>,
-    requests: Arc<dyn StateStoreExecutionRequests>,
-    show: Option<(Option<String>, MvShowStatement)>,
     explain_lines: Option<Vec<String>>,
     turn: Turn,
-    inventory: Option<MvKeyedProjectionInventory>,
-    next: Option<Result<Option<ListedKeyedMvProjection>, MvRepositoryError>>,
-    listed: Option<ListedKeyedMvProjection>,
-    selection: Option<MvShowRowSelection>,
-    dependencies: Option<Result<Vec<StoredMvDependency>, MvRepositoryError>>,
-    rows: Option<MvShowResultRows>,
     producer: Option<LocalResultProducer>,
     result: Option<Result<OwnedLocalResult, QueryServiceError>>,
 }
@@ -163,74 +118,7 @@ impl MvReadOriginal {
         self.cpu_unreturned.store(true, Ordering::Release);
         let mut loan = BodyLoan::take(self);
         let body = loan.body.as_mut().unwrap();
-        let result = match body.turn {
-            Turn::Start => {
-                body.inventory
-                    .as_mut()
-                    .expect("original inventory received")
-                    .order_by_namespace_and_name();
-                MvShowResultRows::new().map(|rows| {
-                    body.rows = Some(rows);
-                    body.turn = Turn::Next;
-                })
-            }
-            Turn::Select => {
-                if let Some(listed) = body.listed.as_ref() {
-                    body.rows
-                        .as_ref()
-                        .unwrap()
-                        .begin_row(
-                            listed,
-                            Some(body.entrance.as_ref()),
-                            body.show.as_ref().unwrap().0.as_deref(),
-                            &body.show.as_ref().unwrap().1,
-                            None,
-                        )
-                        .map(|selection| match selection {
-                            None => {
-                                body.listed.take();
-                                body.turn = Turn::Next;
-                            }
-                            Some(selection) => {
-                                body.turn = if selection.read_dependencies {
-                                    Turn::Dependencies
-                                } else {
-                                    Turn::Append
-                                };
-                                body.selection = Some(selection);
-                            }
-                        })
-                } else {
-                    body.turn = Turn::Finish;
-                    Ok(())
-                }
-            }
-            Turn::Append => {
-                let dependencies = match body.dependencies.take() {
-                    Some(Ok(value)) => value,
-                    Some(Err(error)) => {
-                        body.refuse(repository_error(error));
-                        Vec::new()
-                    }
-                    None => Vec::new(),
-                };
-                if body.turn == Turn::Done {
-                    Ok(())
-                } else {
-                    body.rows
-                        .as_mut()
-                        .unwrap()
-                        .append(
-                            &body.listed.as_ref().unwrap().loaded.projection,
-                            body.selection.take().unwrap(),
-                            &dependencies,
-                        )
-                        .map(|()| {
-                            body.listed.take();
-                            body.turn = Turn::Next;
-                        })
-                }
-            }
+        match body.turn {
             Turn::ExplainFinish => {
                 let lines = body.explain_lines.take().expect("original Explain output");
                 let result = body
@@ -241,24 +129,8 @@ impl MvReadOriginal {
                     .map_err(contract);
                 body.result = Some(result);
                 body.turn = Turn::Done;
-                Ok(())
             }
-            Turn::Finish => {
-                let rows = body.rows.take().expect("SHOW's one row collector");
-                let result = body
-                    .producer
-                    .take()
-                    .expect("positive original Local producer")
-                    .produce(|| rows.finish())
-                    .map_err(contract);
-                body.result = Some(result);
-                body.turn = Turn::Done;
-                Ok(())
-            }
-            _ => panic!("MV read CPU cannot poll repository I/O"),
-        };
-        if let Err(detail) = result {
-            body.refuse(contract(detail));
+            _ => panic!("MV Explain CPU cannot poll preparation I/O"),
         }
         drop(loan);
         self.cpu_unreturned.store(false, Ordering::Release);
@@ -284,60 +156,10 @@ impl MvReadOriginal {
         let body = loan.body.as_mut().unwrap();
         // An unsuccessful collector has no delivery graph. Retire it before
         // releasing its positive Local allowance, while the primary is stable.
-        drop(body.rows.take());
         drop(body.producer.take());
         body.result
             .take()
             .ok_or_else(|| contract("MV read original result was already transferred"))?
-    }
-}
-// Each concrete leaf receives raw output before destroying the SAME child.
-// Cancellation of a borrowed poll never takes this future from its Action.
-async fn run_io(source: Arc<MvReadOriginal>) {
-    let mut loan = BodyLoan::take(&source);
-    let body = loan.body.as_mut().unwrap();
-    match body.turn {
-        Turn::Inventory => {
-            let execution = body.readiness.in_requests(body.requests.clone());
-            let mut child = Box::pin(execution.local_projection_inventory());
-            let raw = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
-            match raw {
-                Ok(inventory) => {
-                    body.inventory = Some(inventory);
-                    body.turn = Turn::Start;
-                }
-                Err(error) => {
-                    body.result = Some(Err(repository_error(error)));
-                    body.turn = Turn::Done;
-                }
-            }
-            drop(child);
-        }
-        Turn::Next => {
-            let mut child = Box::pin(body.inventory.as_mut().unwrap().next_listable());
-            let raw = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
-            body.next = Some(raw);
-            drop(child);
-            match body.next.take().unwrap() {
-                Ok(listed) => {
-                    body.listed = listed;
-                    body.turn = Turn::Select;
-                }
-                Err(error) => body.refuse(repository_error(error)),
-            }
-        }
-        Turn::Dependencies => {
-            let execution = body.readiness.in_requests(body.requests.clone());
-            let mut child = Box::pin(
-                execution
-                    .list_local_dependencies_by_downstream(&body.listed.as_ref().unwrap().loaded),
-            );
-            let raw = std::future::poll_fn(|cx| child.as_mut().poll(cx)).await;
-            body.dependencies = Some(raw);
-            drop(child);
-            body.turn = Turn::Append;
-        }
-        _ => panic!("SHOW I/O cannot execute its pure row turn"),
     }
 }
 #[derive(Default)]
@@ -361,13 +183,7 @@ fn work(error: WorkError) -> QueryServiceError {
         "MV read original workload operation refused",
     ))
 }
-fn repository_error(error: MvRepositoryError) -> QueryServiceError {
-    let original = error
-        .original_failure()
-        .cloned()
-        .unwrap_or_else(|| SharedFailureCause::new(error));
-    QueryServiceError::from_failure_cause(original)
-}
+
 fn domain_error(error: MvApplicationError) -> QueryServiceError {
     super::routed_execution_service_error(super::product_command_error(
         crate::mv::command::mv_application_command_error(error),
@@ -399,8 +215,6 @@ struct Explain {
 }
 struct State {
     family: novarocks_result_contract::ClientPresentationFamily,
-    readiness: Arc<MvReadinessPort>,
-    entrance: Arc<ManagementEntrance>,
     binding: StateStoreOriginalBinding,
     runtime: tokio::runtime::Handle,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
@@ -408,12 +222,11 @@ struct State {
     scope: WorkScope,
     origin: Option<ResultWindowAlias>,
     producer: Option<LocalResultProducer>,
-    input: Option<ReadRequest>,
+    input: Option<Box<MvExplainPreparationInput>>,
     explain: Option<Explain>,
     io: Option<Arc<MetadataIoAdmission>>,
     store: Option<StateStoreOriginalOwner>,
     original: Option<Arc<MvReadOriginal>>,
-    future: Option<IoFuture>,
     job: Option<MvCpuJob>,
     marker: Option<Result<(), ExecutionFailureInput>>,
     cpu: InternalResultCpu,
@@ -432,9 +245,8 @@ struct Residual {
     state: State,
 }
 pub(crate) fn prepare(
-    ports: IcebergMvCorePorts,
     services: MvExecutionServices,
-    request: ReadRequest,
+    request: Box<MvExplainPreparationInput>,
     execution: QueryExecutionContext,
     family: novarocks_result_contract::ClientPresentationFamily,
 ) -> Result<Box<dyn GovernedStatementAction>, CommandError> {
@@ -462,16 +274,10 @@ pub(crate) fn prepare(
         .blocking
         .provider_creator_cpu()
         .map_err(|error| CommandError::from_failure_cause(SharedFailureCause::new(error)))?;
-    let entrance = ports
-        .management_entrance()
-        .map_err(|detail| CommandError::new(CommandErrorKind::Failed, detail))?
-        .clone();
     let scope = capacity.root_scope().clone();
     Ok(Box::new(Action {
         state: Some(State {
             family,
-            readiness: ports.readiness().clone(),
-            entrance,
             binding,
             runtime: services.data.handle().clone(),
             cancellation: execution.cancellation().clone(),
@@ -484,7 +290,6 @@ pub(crate) fn prepare(
             io: None,
             store: None,
             original: None,
-            future: None,
             job: None,
             marker: None,
             cpu,
@@ -538,20 +343,7 @@ impl State {
             self.ordinary_io.get_or_insert(error);
         }
     }
-    fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(future) = self.future.as_mut() else {
-            return Poll::Ready(());
-        };
-        self.in_foreign = true;
-        if future.as_mut().poll(cx).is_pending() {
-            self.in_foreign = false;
-            return Poll::Pending;
-        }
-        // The original raw value was received before this opaque child Drop.
-        drop(self.future.take());
-        self.in_foreign = false;
-        Poll::Ready(())
-    }
+
     fn poll_explain(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let explain = self.explain.as_mut().unwrap();
         self.in_foreign = true;
@@ -697,77 +489,58 @@ impl State {
                 .map_err(QueryServiceError::from_failure_cause)?,
         );
 
-        let request = self.input.take().expect("one original MV read request");
-        let (show, turn) = match request {
-            ReadRequest::Show { catalog, statement } => {
-                (Some((catalog, statement)), Turn::Inventory)
-            }
-            ReadRequest::Explain(input) => {
-                let mut input = *input;
-                let io = self.io.as_ref().unwrap();
-                let capacity = io.root_capacity().map_err(work)?;
-                let window = capacity.try_window_alias().map_err(work)?;
-                input.context = input.context.with_io_admission(io.clone());
-                let original = io.original_result_scope(&input.context).map_err(|error| {
-                    QueryServiceError::from_failure_cause(SharedFailureCause::new(error))
-                })?;
-                let gate = Arc::new(MvRefreshPreparationIo::new(
-                    MvRefreshPreparationServices {
-                        cpu: self.cpu.clone(),
-                        scope: self.scope.clone(),
-                        window: window.clone(),
-                        cancellation: self.cancellation.clone(),
-                        runtime: self.runtime.clone(),
-                        wake: self.wake.clone(),
-                        requests: requests.clone(),
-                    },
-                    original,
+        let mut input = *self.input.take().expect("one original MV Explain request");
+        let io = self.io.as_ref().unwrap();
+        let capacity = io.root_capacity().map_err(work)?;
+        let window = capacity.try_window_alias().map_err(work)?;
+        input.context = input.context.with_io_admission(io.clone());
+        let original = io.original_result_scope(&input.context).map_err(|error| {
+            QueryServiceError::from_failure_cause(SharedFailureCause::new(error))
+        })?;
+        let gate = Arc::new(MvRefreshPreparationIo::new(
+            MvRefreshPreparationServices {
+                cpu: self.cpu.clone(),
+                scope: self.scope.clone(),
+                window: window.clone(),
+                cancellation: self.cancellation.clone(),
+                runtime: self.runtime.clone(),
+                wake: self.wake.clone(),
+                requests: requests.clone(),
+            },
+            original,
+        ));
+        let reader = MvRefreshPreparationOriginal::for_explain(input, gate.clone());
+        let custody = MvRefreshTurnCustody::new(
+            gate,
+            self.cpu.clone(),
+            self.scope.clone(),
+            window,
+            self.cancellation.clone(),
+            self.runtime.clone(),
+            self.wake.clone(),
+        );
+        self.explain = Some(Explain {
+            reader: reader.clone(),
+            turn: custody,
+            result: None,
+            received: false,
+        });
+        self.explain
+            .as_mut()
+            .unwrap()
+            .turn
+            .install_preparation(reader)
+            .map_err(|returned| {
+                debug_assert!(Arc::ptr_eq(
+                    &returned,
+                    &self.explain.as_ref().unwrap().reader
                 ));
-                let reader = MvRefreshPreparationOriginal::for_explain(input, gate.clone());
-                let custody = MvRefreshTurnCustody::new(
-                    gate,
-                    self.cpu.clone(),
-                    self.scope.clone(),
-                    window,
-                    self.cancellation.clone(),
-                    self.runtime.clone(),
-                    self.wake.clone(),
-                );
-                self.explain = Some(Explain {
-                    reader: reader.clone(),
-                    turn: custody,
-                    result: None,
-                    received: false,
-                });
-                self.explain
-                    .as_mut()
-                    .unwrap()
-                    .turn
-                    .install_preparation(reader)
-                    .map_err(|returned| {
-                        debug_assert!(Arc::ptr_eq(
-                            &returned,
-                            &self.explain.as_ref().unwrap().reader
-                        ));
-                        contract("MV Explain reader already installed")
-                    })?;
-                (None, Turn::Explain)
-            }
-        };
+                contract("MV Explain reader already installed")
+            })?;
         self.original = Some(Arc::new(MvReadOriginal {
             body: Mutex::new(Some(Body {
-                readiness: self.readiness.clone(),
-                entrance: self.entrance.clone(),
-                requests,
-                show,
                 explain_lines: None,
-                turn,
-                inventory: None,
-                next: None,
-                listed: None,
-                selection: None,
-                dependencies: None,
-                rows: None,
+                turn: Turn::Explain,
                 producer: self.producer.take(),
                 result: None,
             })),
@@ -800,8 +573,6 @@ impl State {
                 .is_some_and(|explain| !explain.received)
             {
                 self.poll_explain(cx)
-            } else if self.future.is_some() {
-                self.poll_io(cx)
             } else {
                 self.poll_cpu(cx)
             };
@@ -824,30 +595,26 @@ impl State {
             if turn == Turn::Done {
                 break;
             }
-            if turn.is_io() {
-                self.future = Some(Box::pin(run_io(original)));
-            } else {
-                let admission = (|| {
-                    let capacity = self.io.as_ref().unwrap().root_capacity().map_err(work)?;
-                    let source = self
-                        .cpu
-                        .provider_creator_source(&self.scope)
-                        .map_err(work)?;
-                    Ok::<_, QueryServiceError>((capacity.try_window_alias().map_err(work)?, source))
-                })();
-                match admission {
-                    Ok((window, source)) => {
-                        self.job = Some(self.cpu.submit_mv_read(
-                            original,
-                            window,
-                            source,
-                            self.cancellation.clone(),
-                            &self.runtime,
-                            self.wake.clone(),
-                        ));
-                    }
-                    Err(error) => original.reject_in(error),
+            let admission = (|| {
+                let capacity = self.io.as_ref().unwrap().root_capacity().map_err(work)?;
+                let source = self
+                    .cpu
+                    .provider_creator_source(&self.scope)
+                    .map_err(work)?;
+                Ok::<_, QueryServiceError>((capacity.try_window_alias().map_err(work)?, source))
+            })();
+            match admission {
+                Ok((window, source)) => {
+                    self.job = Some(self.cpu.submit_mv_read(
+                        original,
+                        window,
+                        source,
+                        self.cancellation.clone(),
+                        &self.runtime,
+                        self.wake.clone(),
+                    ));
                 }
+                Err(error) => original.reject_in(error),
             }
         }
         match std::task::ready!(self.poll_explain_closed(cx)) {
@@ -902,10 +669,9 @@ impl State {
             store.request_close();
         }
         self.progress(cx);
-        let io_done = self.poll_io(cx).is_ready();
         let cpu_done = self.poll_cpu(cx).is_ready();
         self.progress(cx);
-        if !io_done || !cpu_done {
+        if !cpu_done {
             return Poll::Pending;
         }
         if let Some(error) = self.local_health() {

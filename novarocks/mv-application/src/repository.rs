@@ -184,14 +184,6 @@ impl MvProjectionVersion {
     }
 }
 
-/// Local dependency display reads share one exact page contract with a
-/// complete thin classification inventory and a separate finite collector.
-#[derive(Clone, Copy, Debug)]
-pub struct MvDependencyReadBound {
-    pub entries: usize,
-    pub collection_bytes: usize,
-}
-
 /// Thin identities from one complete StateStore snapshot. These are inventory
 /// locators, never authority to consume an old projection or manage its target.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -179,23 +179,6 @@ fn budget(
                     sum(&mut total, delay)?;
                 }
                 let meta = &step.meta;
-                for (selected, polls) in [
-                    (meta.wait_alter_column.is_some(), 60),
-                    (meta.wait_alter_rollup.is_some(), 120),
-                    (meta.wait_alter_optimize.is_some(), 300),
-                ] {
-                    if selected {
-                        sum(
-                            &mut total,
-                            mul(
-                                query
-                                    .checked_add(1000)
-                                    .context("ALTER poll budget overflow")?,
-                                polls,
-                            )?,
-                        )?;
-                    }
-                }
                 let helpers = usize::from(meta.imv_stateless_rebuild.is_some()) * 3
                     + usize::from(meta.imv_equivalence_check.is_some()) * 3
                     + usize::from(

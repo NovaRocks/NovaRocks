@@ -19,12 +19,12 @@ under the License.
 
 # 维护 / 治理
 
-> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持 whole-table OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收要求 Provider 安全证明；当前源码用 `ConnectorCleanupScanSafety::Unproven` 在扫描/删除前明确拒绝 REST/Hadoop 缺证路径。完整调用面与原生验收仍需独立核对，不能据本文宣称全部迁移完成。增量压缩、sort-order rewrite 和通用定时调度仍待补。
+> Iceberg 的运维操作包括压缩小文件、清理历史 snapshot、回收孤儿文件、重写 manifest 与重写 deletion vector。NovaRocks 支持按 Trino 规则选择文件的 OPTIMIZE、EXPIRE SNAPSHOTS、REWRITE MANIFESTS 与 V3 Puffin deletion-vector repack；扫描型回收要求 Provider 安全证明；当前源码用 `ConnectorCleanupScanSafety::Unproven` 在扫描/删除前明确拒绝 REST/Hadoop 缺证路径。完整调用面与原生验收仍需独立核对，不能据本文宣称全部迁移完成。增量压缩、sort-order rewrite 和通用定时调度仍待补。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `ALTER TABLE ... OPTIMIZE`（whole-table 文件压缩） | ✅ | 异步 job |
-| `OPTIMIZE` 增量（仅小文件 / 仅 partition） | ❌ | |
+| `ALTER TABLE ... OPTIMIZE`（选择文件压缩） | ✅ | 原语句内执行，返回三行指标 |
+| `OPTIMIZE` 选择文件 | ✅ | 默认阈值 100MB；任意 WHERE 与阈值参数尚未开放 |
 | `EXPIRE SNAPSHOTS` | ✅ | 语句内 action |
 | `REMOVE ORPHAN FILES` | 受限 | REST/Hadoop 安全证明为 UNPROVEN；缺证应明确拒绝 |
 | `REWRITE MANIFESTS` | ✅ | 语句内 action |
@@ -43,67 +43,58 @@ under the License.
 
 maintenance 的三层职责是固定的：
 
-- `novarocks-frontend-application` 的 `FrontendTableMaintenanceService` 是 application
-  owner，负责 SQL 路由、异步 optimize job repository/worker 与生命周期。
-- Frontend Application 通过 consumer-owned `TableMaintenanceEngine` port 提供 target
-  resolve 与执行能力，不再拥有第二套 maintenance job service。
-- Iceberg connector 仍是 catalog、snapshot/file、rewrite/expire/orphan、commit、cache
-  invalidation 与 MV target snapshot adopt 的唯一执行 truth。
+- Frontend 的 governed Action 拥有原语句的 Root、查询许可、冻结会话设置与原执行 Source。
+- `TableMaintenanceProduct` 保留表级活动互斥、共享业务算法与 GC first-observation；不拥有后台 job、队列、worker 或历史。
+- Iceberg connector 拥有 catalog、snapshot/file、rewrite/expire/orphan、commit、cache invalidation 与 MV target snapshot adopt 的外部事实。
 
-Optimize job、操作、lease、checkpoint 与历史仅属于当前 FE 进程；重启后不会恢复旧 job 或
-`SHOW ALTER TABLE OPTIMIZE` 历史。它们不以 StateStore 为执行前提。
-StateStore 在本领域仅可保存 GC first-observation Accelerator；该记录可重建，不是 job repository，
-也不授予 catalog mutation、跨重启接管或删除权。所有手动与自动维护仍须通过实际 Provider 能力准入；
-是否配置 StateStore 都不能解除扫描 GC 的缺证限制。
+OPTIMIZE 与 ANALYZE 都等待本语句的必要业务结果及实际资源退出，随后返回结果；不再提交进程内作业。
+StateStore 在维护领域仅可保存 GC first-observation Accelerator；该记录可重建，不授予 catalog mutation、
+跨重启接管或删除权。是否配置 StateStore 都不能解除扫描 GC 的缺证限制。
 
-当前 lifecycle 只支持单 FE owner。关闭先停止新 job，通知现有 owner，并继续观察原 worker、
-Provider/CPU Source 及 StateStore 动作的实际退出。shutdown 等待期限结束不等于这些对象已关闭；
-未退出的原责任仍由同一监督者保管，不能只因 job 终态就释放其访问能力或关闭仍被借用的 Store。
-该边界不提供多 FE lease、takeover 或 fencing。多 FE active/standby 的 claim 与
-破坏性操作 fencing 需要独立协议。
+同表 OPTIMIZE 沿原表级活动互斥，不同表可并行。取消先停止尚未派发的工作，并让原 Source 驱动取消、
+关闭与实际退出；业务终态、取消意图、shutdown 等待期限都不能代替 Provider/Native/CPU 的真实退出。
+publication 仍区分 KnownUncommitted、KnownCommitted 与 CommitUnknown；未知结果不自动重试或回滚。
+该边界不提供跨 FE 或外部 writer 的锁，正确性仍依赖 Catalog OCC。见 [ADR-0232](../../adr/ADR-0232-statement-owned-maintenance-statistics-and-state-surfaces.md)。
 
-## ✅ Whole-table OPTIMIZE
+## ✅ OPTIMIZE
 
 ```sql
 ALTER TABLE orders OPTIMIZE;
-SHOW ALTER TABLE OPTIMIZE
-  FROM iceberg_catalog.database
-  WHERE TableName = 'orders'
-  ORDER BY CreateTime DESC
-  LIMIT 10;
 ```
 
-`ALTER TABLE ... OPTIMIZE` 在当前进程的 job runtime 接受后返回，rewrite 由 Frontend
-Application 的 maintenance worker 异步执行。调用方必须轮询 `SHOW ALTER TABLE OPTIMIZE`，并以 `FINISHED` 或 `FAILED`
-作为业务终态；这不证明残余 Provider/Native/CPU 工作或对象回收已经退出。
-Spark-style `CALL ...rewrite_data_files(...)` 则在同一语句内返回 action 结果。
+现有写法直接在原语句内执行；结果为 `(metric_name varchar, metric_value bigint)`，依次返回：
 
-行为：
+| metric_name | metric_value |
+| --- | --- |
+| rewritten_data_files_count | 实际重写的数据文件数 |
+| removed_delete_files_count | 实际移除的删除文件数 |
+| added_data_files_count | 实际新增的数据文件数；无已证明计数时为 NULL |
 
-- 把当前 snapshot 的所有 data file 重写到一组新 file（按当前 partition spec）
-- 同时合并 V2 position-delete / V3 DV：被删行不出现在新 file 中，DV blob 在重写完成后失效
-- 跨历史 partition spec：所有老文件按其 spec 解释，重写到当前 spec
-- 写出新 manifest；老 snapshot 过期与其文件回收分别取证，不能由新快照提交推断老文件已经删除
-- V3 row-lineage 表保留现有 `_row_id` 与 `_last_updated_sequence_number`，rewrite 不分配新 row ID
+Trino `updateType` 为 `ALTER TABLE EXECUTE`，不填 `updateCount`；客户端须继续取到终页确认。
+没有可重写文件时三项均为 0，不产生新 snapshot。`ALTER TABLE ... EXECUTE optimize` 的新写法与参数
+不在当前语法中，后续语言扩展另行开放。
 
-SQL 入口为 `novarocks/frontend-application/src/query/maintenance_action.rs`；后台接收与执行位于
-`novarocks/frontend-application/src/table_maintenance/{mod,worker}.rs` 和
-`novarocks/frontend-application/src/query_execution/maintenance/rewrite_job.rs`。
-Table Maintenance 的共享业务算法位于 `novarocks/table-maintenance/src/product.rs`，
-Iceberg 的重写事实与提交实现位于 `novarocks/connector/iceberg/src/commit/rewrite_data_files.rs`。
-这些入口说明当前接线；完整迁移、删旧和原生验收尚未由本文宣告完成。
+文件选择遵循 Trino 的默认 100MB（100 × 1024 × 1024 bytes）阈值：
 
-## ❌ OPTIMIZE 增量
+- 没有挂靠删除且大于阈值的数据文件跳过。
+- 当前 partition spec 内，某分区仅有一个且不带删除的候选文件时跳过；两个以上候选，或任一候选带删除，则重写该分区的候选文件。
+- 遇到旧 partition spec 的候选文件时，全部候选文件重写；输入仍按各自的 spec 解释，输出使用当前 spec。
+- 只移除选中的 data files 与挂靠在它们上的 V2 position deletes / V3 deletion vectors；未选文件与删除保留。
+- 快照 `total-*` 从父快照扣除本次移除量并加上本次新增量；V3 `_row_id` 与 `_last_updated_sequence_number` 保留，不分配新 row ID。
 
-Spec：
+捕获的物理对象身份贯穿规划与提交，表被替换时以 typed `TARGET_REPLACED` 拒绝；规划前发现替换不派发工作。
+提交仍用 `RefUnchanged`：规划后目标 ref 的任意新提交都会触发冲突，尚不采用 Trino 允许并发追加的校验。
+新快照提交不证明旧 snapshot 或文件已回收；过期与物理回收分别取证。
 
-```sql
--- 暂未实现
-ALTER TABLE orders OPTIMIZE WHERE size_in_bytes < 16777216;     -- 仅压小文件
-ALTER TABLE orders OPTIMIZE WHERE country = 'CN';               -- 仅压指定 partition
-```
+实现入口为 `novarocks/frontend-application/src/query_execution/maintenance/rewrite_job/direct.rs`，
+共享业务算法在 `novarocks/table-maintenance/src/product.rs`，Iceberg 选择与提交在
+`novarocks/connector/iceberg/src/distributed_rewrite/` 和
+`novarocks/connector/iceberg/src/commit/selected_rewrite.rs`。
+这些入口不构成全工作区或原生验收完成证明。
 
-**TODO**：未实现。当前只能 whole-table 压缩，对大表代价高。
+## ❌ OPTIMIZE 自定义选择参数
+
+任意 `WHERE`、自定义文件阈值与 sort-order rewrite 尚未开放；当前旧写法使用上述固定选择规则。
 
 ## ✅ EXPIRE SNAPSHOTS
 
@@ -304,6 +295,6 @@ ALTER TABLE orders REWRITE DATA FILES BY SORT ORDER (user_id, ts DESC);
 
 Spec / 工程实践：基于 schedule 自动跑 OPTIMIZE / EXPIRE / ORPHAN，类似 Snowflake auto-clustering 或 Databricks `OPTIMIZE` cron。
 
-frontend service 已承接 MV policy 发出的 typed automatic action/optimize submission，但尚未提供
-面向普通表的通用 schedule。运维方仍需用外部 cron / Airflow 调度；其中异步
-`ALTER TABLE ... OPTIMIZE` 必须继续轮询 `SHOW ALTER TABLE OPTIMIZE` 到终态。
+当前没有面向普通表的通用 schedule，也不以进程内作业系统承接自动 OPTIMIZE。
+运维方可用外部 cron / Airflow 直接执行普通维护语句，并等待该语句结果和终页；不轮询作业列表。
+未来的自动调度须有独立的来源与生命周期合同，不能借此恢复跨重启作业接管。

@@ -49,6 +49,9 @@ pub(super) fn prepare(
             context.session().current_database(),
             context.execution(),
             command_context.connector_context(),
+            family,
+            #[cfg(novarocks_dev_controls)]
+            observation.clone(),
         )
         .map_err(maintenance_command_error)?
     {

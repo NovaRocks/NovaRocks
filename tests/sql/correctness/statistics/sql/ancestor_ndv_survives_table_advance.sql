@@ -46,60 +46,27 @@ INSERT INTO statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_
 ANALYZE TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 5
--- Wait for this case's own job. SHOW ANALYZE JOBS lists every job the
--- frontend holds, so any SUCCEEDED job left by another case would otherwise
--- end the wait before this table has been measured. The table is unique to
--- this case and analyzed exactly once, so its one row is that job.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_hadoop_${suite_uuid0}
--- @result_rows_where=namespace=nr_ancestor_${suite_uuid0}
--- @result_rows_where=table=advance_${uuid0}
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
+-- On S itself the sketch is published against the queried snapshot, so its
+-- NDV is four and its manifest row count is four.
+SHOW STATS FOR statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
 -- query 6
--- On S itself the sketch is published against the queried snapshot, so its
--- basis is that snapshot and its rows are the queried rows.
--- @retry_count=20
--- @retry_interval_ms=500
--- @result_contains=theta_ndv:k
--- @result_contains=PROVIDER_ARTIFACT
--- @result_contains=APPROXIMATE
--- @result_contains=SAME
--- @result_contains=IDENTICAL
--- @skip_result_check=true
-SHOW TABLE STATS statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
-
--- query 7
 -- Advance the table to S'. Nothing re-analyzes it.
 -- @skip_result_check=true
 INSERT INTO statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0} VALUES
     (5, 50), (6, 60);
 
--- query 8
--- The distinct count is still readable, and now says plainly that it was
--- measured somewhere else: a basis digest instead of SAME, and a basis holding
--- a subset of the rows now being queried. Before the ancestor walk this metric
--- simply vanished once the table moved.
--- @retry_count=20
--- @retry_interval_ms=500
--- @result_contains=theta_ndv:k
--- @result_contains=PROVIDER_ARTIFACT
--- @result_contains=BASIS_IS_SUBSET
--- @result_contains=sha256:
--- @skip_result_check=true
-SHOW TABLE STATS statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
+-- query 7
+-- The ancestor NDV remains four while current bounds and row count advance.
+SHOW STATS FOR statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
--- query 9
+-- query 8
 -- The row count is not carried along with it. It comes from the queried
 -- snapshot's own manifest, so it reports six rows rather than the four the
 -- sketch was measured over.
 -- @result_contains=6
 SELECT COUNT(*) FROM statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};
 
--- query 10
+-- query 9
 -- @skip_result_check=true
 DROP TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0};

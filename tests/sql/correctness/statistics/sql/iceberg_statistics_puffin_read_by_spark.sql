@@ -44,26 +44,13 @@ SPARK_SQL
 printf 'SPARK_STATISTICS_SOURCE_READY\n'
 
 -- query 2
--- REST ANALYZE submits a detached job. Observe the originating collection
--- through this step's exact nomination; publication is checked separately below.
+-- REST ANALYZE publishes before returning; the exact collection nomination
+-- and independent Spark read below cover execution and the durable artifact.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
 ANALYZE TABLE statistics_cat_${suite_uuid0}.${suite_uuid0}.puffin_spark_${uuid0};
 
 -- query 3
--- Wait for this case's own job, not any SUCCEEDED job on the shared
--- frontend. The table is unique to this case and analyzed exactly once.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_cat_${suite_uuid0}
--- @result_rows_where=namespace=${suite_uuid0}
--- @result_rows_where=table=puffin_spark_${uuid0}
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 4
 -- @result_contains=SPARK_PUFFIN_STATISTICS_OK
 shell: set -eu
 tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-statistics-XXXXXX.scala")"
@@ -89,7 +76,7 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "SPARK_PUFFIN_STATISTICS_OK"
 
--- query 5
+-- query 4
 -- @result_contains=SPARK_STATISTICS_SOURCE_DROPPED
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-statistics-drop-XXXXXX.sql")"

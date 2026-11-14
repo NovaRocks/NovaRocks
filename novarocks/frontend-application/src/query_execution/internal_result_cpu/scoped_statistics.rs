@@ -232,7 +232,6 @@ struct CreatorPortState {
 #[derive(Clone)]
 pub(super) enum CreatorCpuMode {
     InternalProvider,
-    ForegroundBinding,
     ForegroundRead,
     ProviderMetadata,
     ProviderMetadataSettlement(
@@ -352,36 +351,6 @@ impl InternalResultCpu {
             runtime,
             wake,
             CreatorCpuMode::InternalProvider,
-        )
-    }
-    /// Foreground Statistics metadata capture only. Existing Local/Client
-    /// retention is authentic; no Internal decoder/collection capacity is minted.
-    pub(crate) fn statistics_binding_cpu_port(
-        &self,
-        scope: &WorkScope,
-        window: ResultWindowAlias,
-        lease: &ConnectorStatisticsSession,
-        cancellation: QueryCancellationView,
-        runtime: tokio::runtime::Handle,
-        wake: Arc<dyn StatusIntakeWake>,
-    ) -> Result<Arc<dyn StatisticsCpuPort>, WorkError> {
-        if !window.is_for_scope(scope)
-            || !matches!(
-                window.class(),
-                ResultWindowClass::Local | ResultWindowClass::Client
-            )
-        {
-            return Err(WorkError::Conflict);
-        }
-        scope.check()?;
-        self.make_statistics_cpu_port(
-            scope,
-            window,
-            lease,
-            cancellation,
-            runtime,
-            wake,
-            CreatorCpuMode::ForegroundBinding,
         )
     }
     fn make_statistics_cpu_port(
@@ -575,14 +544,6 @@ impl StatisticsCpuPort for ScopedProviderCreatorCpu {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Statistics input cannot use a Rewrite-only CPU source",
-            ));
-        }
-        if matches!(self.mode, CreatorCpuMode::ForegroundBinding)
-            && !matches!(source, StatisticsCpuInput::Binding(_))
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "foreground Statistics CPU source supports metadata binding only",
             ));
         }
         if matches!(self.mode, CreatorCpuMode::ForegroundRead)

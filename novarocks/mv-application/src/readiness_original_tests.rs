@@ -315,13 +315,7 @@ async fn readiness_original_view_keeps_same_context_through_install_candidates_i
     let mut inventory = view.projection_inventory().await.unwrap();
     let mut listable = view.projection_inventory().await.unwrap();
     let dependencies = view
-        .list_ready_dependencies_by_downstream_bounded(
-            &loaded,
-            crate::repository::MvDependencyReadBound {
-                entries: 32,
-                collection_bytes: 1024 * 1024,
-            },
-        )
+        .list_ready_dependencies_by_downstream(&loaded)
         .await
         .unwrap();
     assert_eq!(

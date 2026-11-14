@@ -1,7 +1,7 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/statistics-application/**", "novarocks/connector/iceberg/**"]
+paths = ["novarocks/frontend-application/src/statistics/**", "novarocks/frontend-application/src/query_execution/statistics/**", "novarocks/spi/src/connector/statistics/**", "novarocks/spi/src/connector/statistics.rs", "novarocks/result-render/**", "novarocks/connector/iceberg/**"]
 
 [reuse]
 scope = "suite"

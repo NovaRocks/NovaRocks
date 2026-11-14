@@ -69,8 +69,6 @@ REFRESH MATERIALIZED VIEW fact_mv_${uuid0};
 INSERT INTO fact VALUES (2, 'west', 5);
 
 -- query 3
--- @skip_result_check=true
--- @wait_alter_optimize=fact
 ALTER TABLE fact OPTIMIZE;
 
 -- query 4

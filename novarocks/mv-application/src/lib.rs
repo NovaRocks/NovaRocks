@@ -34,9 +34,9 @@ pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static s
 }
 
 pub mod activity;
-mod bounded_dependencies;
 pub mod candidate;
 pub mod dependency;
+mod dependency_validation;
 pub mod freshness;
 pub mod maintenance;
 pub mod management;

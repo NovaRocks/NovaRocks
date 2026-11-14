@@ -286,29 +286,17 @@ USE ice_hms_${uuid0}.iru7_${uuid0};
 CREATE MATERIALIZED VIEW agg_mv DISTRIBUTED BY HASH(p) BUCKETS 1 PROPERTIES ('storage_engine'='iceberg') AS SELECT p, SUM(id) AS s FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 GROUP BY p;
 
 -- query 53
--- @result_rows_where=TableName=v3
--- @result_rows_count=0
-SHOW ALTER TABLE OPTIMIZE FROM ice_hms_${uuid0}.iru7_${uuid0} WHERE TableName = 'v3';
-
--- query 54
--- @result_rows_where=catalog=ice_hms_${uuid0}
--- @result_rows_where=namespace=iru7_${uuid0}
--- @result_rows_where=table=v3
--- @result_rows_count=0
-SHOW ANALYZE JOBS;
-
--- query 55
 -- @result_contains=INVENTORY_UNCHANGED
 shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fixture.py" after iru7_${uuid0}
 
--- query 56
+-- query 54
 SELECT id, p FROM ice_hms_${uuid0}.iru7_${uuid0}.v3 ORDER BY id;
 
--- query 57
+-- query 55
 SELECT name FROM system.metadata.materialized_views
 WHERE catalog_name = 'ice_hms_${uuid0}' AND schema_name = 'iru7_${uuid0}' AND name = 'agg_mv';
 
--- query 58
+-- query 56
 -- Spark's prepare action creates exactly v1, v2 and v3, with no views.
 -- Static expectation: NOT_RECORDED / NOT_VERIFIED; HMS runs deferred by user.
 SELECT table_name AS table_name, table_type AS table_type
@@ -316,7 +304,7 @@ FROM ice_hms_${uuid0}.information_schema.tables
 WHERE table_catalog = 'ice_hms_${uuid0}' AND table_schema = 'iru7_${uuid0}'
 ORDER BY table_name;
 
--- query 59
+-- query 57
 -- HMS has no view enumeration capability, so it supplies no VIEW rows.
 -- Static expectation only: the private HMS fixture is not run in this task.
 SELECT table_name
@@ -324,12 +312,12 @@ FROM ice_hms_${uuid0}.information_schema.tables
 WHERE table_schema = 'iru7_${uuid0}' AND table_type = 'VIEW'
 ORDER BY table_name;
 
--- query 60
+-- query 58
 -- @cleanup=true
 -- @result_contains=HMS_CLEANUP_OK
 shell: python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-hms/fixture.py" cleanup iru7_${uuid0}
 
--- query 61
+-- query 59
 -- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG ice_hms_${uuid0};

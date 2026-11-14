@@ -24,44 +24,27 @@
 
 use arrow::datatypes::FieldRef;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use novarocks_statistics_application::{
-    StatisticsAttemptError as CoreStatisticsAttemptError,
-    StatisticsAttemptExecutor as CoreStatisticsAttemptExecutor, StatisticsColumns,
-    StatisticsFailure, StatisticsJob, StatisticsPublicationFact, StatisticsPublicationOutcome,
+use super::publication::{
+    StatisticsAttemptError as CoreStatisticsAttemptError, StatisticsFailure,
+    StatisticsPublicationFact, StatisticsPublicationOutcome,
 };
 
-use crate::statistics_jobs::application::{
+use crate::statistics::application::{
     StatisticsApplicationError, StatisticsAttemptRequest, StatisticsColumnIntent,
 };
-use novarocks_query_application::api::BackendTopologyService;
 use novarocks_spi::connector::{
-    ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
+    ConnectorMutationOperationId, ConnectorOperationControl, ConnectorRequestContext,
     ExternalMutationFinalization, ExternalMutationOutcome, StatisticsCollectionStartRequest,
     StatisticsColumnSelection,
 };
 
-/// Exact Frontend composition leaves retained by the process-owned ANALYZE worker.
-/// Each collection takes a fresh live topology snapshot. The worker persists
-/// only a logical target and physical object ID; a current binding, its data
-/// version, and schema columns are attempt-local facts.
+/// Exact Frontend composition leaves retained by the original ANALYZE action.
+/// The same capture supplies the binding, data version and schema to collection.
 #[derive(Clone)]
 pub struct StatisticsAttemptExecutorPorts {
     constant_policy: novarocks_functions::ConstantPolicy,
     static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
-    execution_role: novarocks_types::ClusterRole,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    /// The composition root's single typed control registry. A collection is
-    /// an ordinary typed read, so it resolves its relation through the same
-    /// installed generation every statement does.
-    #[expect(
-        dead_code,
-        reason = "Retains the original process Connector control host through ANALYZE execution and teardown."
-    )]
-    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
-    backend_topology: BackendTopologyService,
-    client: QueryExecutionClient,
     launcher: Arc<dyn LogicalExecutionLauncher>,
     completion: CompletionFactOwners,
     execution_runtime: (
@@ -69,21 +52,11 @@ pub struct StatisticsAttemptExecutorPorts {
         crate::native::data_runtime::FrontendDataRuntime,
     ),
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    attempt_timeout: Duration,
     runtime: tokio::runtime::Handle,
 }
 
 impl StatisticsAttemptExecutorPorts {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Explicit role-owned ANALYZE capabilities at composition."
-    )]
     pub(crate) fn new(
-        execution_role: novarocks_types::ClusterRole,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
-        backend_topology: BackendTopologyService,
-        client: QueryExecutionClient,
         launcher: Arc<dyn LogicalExecutionLauncher>,
         completion: CompletionFactOwners,
         execution_runtime: (
@@ -91,7 +64,6 @@ impl StatisticsAttemptExecutorPorts {
             crate::native::data_runtime::FrontendDataRuntime,
         ),
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-        runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
         runtime: tokio::runtime::Handle,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: crate::query_execution::package_freeze::CompiledPackageCarrier,
@@ -99,16 +71,10 @@ impl StatisticsAttemptExecutorPorts {
         Self {
             constant_policy,
             static_plan_carrier,
-            execution_role,
-            connector_control,
-            typed_connector_control,
-            backend_topology,
-            client,
             launcher,
             completion,
             execution_runtime,
             function_catalog,
-            attempt_timeout: runtime_policy.max_attempt_duration(),
             runtime,
         }
     }
@@ -121,28 +87,37 @@ fn resolve_columns(
     match &request.columns {
         StatisticsColumnIntent::AllColumns => Ok(bound_columns.to_vec()),
         StatisticsColumnIntent::Explicit(requested_columns) => {
+            if requested_columns.is_empty() {
+                return Err(StatisticsApplicationError::invalid_analyze_property(
+                    "ANALYZE columns must not be empty",
+                ));
+            }
             let mut resolved = Vec::with_capacity(requested_columns.len());
             for requested in requested_columns {
                 let mut matches = bound_columns
                     .iter()
                     .filter(|bound| bound.name().eq_ignore_ascii_case(requested));
                 let Some(column) = matches.next() else {
-                    return Err(StatisticsApplicationError::new(format!(
-                        "ANALYZE requested column '{requested}' does not exist on the rebound table"
-                    )));
+                    return Err(StatisticsApplicationError::invalid_analyze_property(
+                        format!(
+                            "ANALYZE requested column '{requested}' does not exist on the captured table"
+                        ),
+                    ));
                 };
                 if matches.next().is_some() {
-                    return Err(StatisticsApplicationError::new(format!(
-                        "ANALYZE requested column '{requested}' matches multiple rebound table columns"
-                    )));
+                    return Err(StatisticsApplicationError::invalid_analyze_property(
+                        format!(
+                            "ANALYZE requested column '{requested}' matches multiple captured table columns"
+                        ),
+                    ));
                 }
                 if resolved
                     .iter()
                     .any(|existing: &FieldRef| existing.name().eq_ignore_ascii_case(column.name()))
                 {
-                    return Err(StatisticsApplicationError::new(format!(
-                        "ANALYZE requested column '{requested}' is duplicated"
-                    )));
+                    return Err(StatisticsApplicationError::invalid_analyze_property(
+                        format!("ANALYZE requested column '{requested}' is duplicated"),
+                    ));
                 }
                 resolved.push(column.clone());
             }
@@ -171,9 +146,9 @@ use crate::query_execution::{
 };
 use novarocks_query_application::{
     admitted_query_context::QueryExecutionContext,
-    api::{QueryExecutionClient, StatementNativeHealthFailure},
+    api::StatementNativeHealthFailure,
     cancellation::QueryCancellationView,
-    session_control::{GovernedActionContext, GovernedBackgroundAction, GovernedStatementResidual},
+    session_control::GovernedActionContext,
     session_error::{QueryServiceError, QueryServiceErrorKind},
 };
 use novarocks_spi::connector::{
@@ -181,7 +156,6 @@ use novarocks_spi::connector::{
     LakePublicationDisposition, StatisticsArtifactDraft, StatisticsCpuPort,
     StatisticsPublicationClose, StatisticsPublicationReady,
 };
-use novarocks_statistics_application::{StatisticsJobAdmission, StatisticsJobProgress};
 use novarocks_workload_control::{WorkError, WorkScope};
 use std::{
     future::Future,
@@ -226,262 +200,6 @@ impl FrontendStatisticsAttemptExecutor {
     pub(crate) fn new(ports: StatisticsAttemptExecutorPorts) -> Self {
         Self { ports }
     }
-    async fn execute_original(
-        &self,
-        job: StatisticsJob,
-        admission: StatisticsJobAdmission,
-        progress: StatisticsJobProgress,
-    ) -> Result<(), CoreStatisticsAttemptError> {
-        let mut originals = admission.into_originals();
-        let result = self
-            .mount_original(&job, &mut originals, progress.clone())
-            .await;
-        if originals.owner.is_some() {
-            // No Provider request is created in startup. Only the original
-            // finite Root proposal is polled before the shared bank owns it.
-            progress
-                .retire_unmounted(originals, now_ms())
-                .map_err(|e| Self::failure(e.to_string()))?;
-        }
-        result
-    }
-    async fn mount_original(
-        &self,
-        job: &StatisticsJob,
-        originals: &mut novarocks_statistics_application::StatisticsJobOriginals,
-        progress: StatisticsJobProgress,
-    ) -> Result<(), CoreStatisticsAttemptError> {
-        let scope = originals
-            .owner
-            .as_ref()
-            .ok_or_else(|| Self::failure("statistics Root is absent"))?
-            .scope();
-        let (deadline, cancellation) = self.context(&scope)?;
-        let instance = novarocks_spi::connector::ConnectorInstanceId::parse(&job.target.catalog)
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let planning_pin = self
-            .ports
-            .connector_control
-            .acquire_current(&instance)
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let statistics_session = planning_pin
-            .derive_statistics_lease()
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let profile = statistics_session
-            .collection_io_profile()
-            .map_err(|e| Self::failure(e.to_string()))?;
-        // The original action header remains a responsibility fact. Provider
-        // profile/SDK layout declarations do not authorize actual Result bytes.
-        let metadata = std::mem::size_of::<StatisticsAction>() as u64;
-        let io = MetadataIoAdmission::new(scope.clone(), profile, metadata)
-            .map_err(Self::scope_error)?;
-        io.adopt_original_payload_in(&mut originals.root_payload)
-            .map_err(Self::scope_error)?;
-        // The former repository view was only a retention alias of this same
-        // payload. Drop it after the original MIO field has accepted custody.
-        drop(originals.result_capacity.take());
-        std::future::poll_fn(
-            |cx| match io.poll_progress(originals.owner.as_ref().unwrap(), cx) {
-                Ok(true) => Poll::Ready(Ok(())),
-                Ok(false) => Poll::Pending,
-                Err(e) => Poll::Ready(Err(Self::scope_error(e))),
-            },
-        )
-        .await?;
-        let capacity = io.root_capacity().map_err(Self::scope_error)?;
-        let topology = self
-            .ports
-            .backend_topology
-            .snapshot()
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let mut execution = QueryExecutionContext::new(
-            self.ports.execution_role,
-            topology,
-            Some(deadline),
-            cancellation.clone(),
-            novarocks_sql::compiler::SessionOptimizerSettings::default(),
-            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-        )
-        .with_result_capacity(capacity.clone())
-        .map_err(Self::scope_error)?;
-        #[cfg(novarocks_dev_controls)]
-        let observation = originals
-            .test_statement_nomination
-            .as_deref()
-            .and_then(|nomination| {
-                self.ports
-                    .launcher
-                    .resolve_statement_observation(nomination)
-            });
-        #[cfg(novarocks_dev_controls)]
-        if let Some(nomination) = originals.test_statement_nomination.take() {
-            execution = execution
-                .with_test_statement_nomination(nomination)
-                .map_err(Self::failure)?;
-        }
-        let context = self
-            .collection_context(deadline, cancellation.clone())
-            .map_err(Self::application_error)?
-            .with_io_admission(
-                Arc::clone(&io) as Arc<dyn novarocks_spi::connector::ConnectorIoAdmissionPort>
-            );
-        let wake = Arc::new(StatisticsWake::default());
-        let cpu = self
-            .ports
-            .execution_runtime
-            .0
-            .provider_creator_cpu()
-            .map_err(Self::scope_error)?;
-        let cpu = cpu
-            .statistics_cpu_port(
-                &scope,
-                capacity.window_alias(),
-                &statistics_session,
-                cancellation,
-                self.ports.runtime.clone(),
-                wake.clone(),
-            )
-            .map_err(Self::scope_error)?;
-        let initial = InitialComputationReservation::new(
-            self.ports
-                .launcher
-                .reserve_identity()
-                .map_err(|e| Self::failure(e.to_string()))?,
-        )
-        .map_err(|e| Self::failure(e.to_string()))?;
-        let credentials = initial.credentials();
-        let context = initial
-            .connector_request_context(
-                context,
-                #[cfg(novarocks_dev_controls)]
-                execution.test_statement_nomination(),
-            )
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let request = Self::request(job)?;
-        let mut action: Option<Box<dyn GovernedBackgroundAction>> =
-            Some(Box::new(StatisticsAction {
-                state: Some(StatisticsState {
-                    ports: self.ports.clone(),
-                    root: scope.clone(),
-                    execution: execution.clone(),
-                    context,
-                    credentials,
-                    progress: progress.clone(),
-                    relation:
-                        crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
-                            job.target.catalog.as_ref(),
-                            job.target.namespace.as_ref(),
-                            job.target.table.as_ref(),
-                        )
-                        .map_err(|e| Self::failure(e.to_string()))?,
-                    request: Some(request),
-                    planning_pin: Some(planning_pin),
-                    statistics_session: Some(statistics_session),
-                    cpu,
-                    io,
-                    wake,
-                    session: Arc::new(tokio::sync::Mutex::new(SessionSlot::default())),
-                    plan: Arc::new(tokio::sync::Mutex::new(PlanSlot::default())),
-                    provider: FrontendCompletionCustody::new(),
-                    phase: ActionPhase::Begin,
-                    pending: None,
-                    close: None,
-                    close_done: false,
-                    cleanup_observed: false,
-                    computation: StatementComputation::new(
-                        scope,
-                        initial,
-                        self.ports.launcher.clone(),
-                        #[cfg(novarocks_dev_controls)]
-                        observation,
-                    ),
-                    native_tail: None,
-                    selected: false,
-                    disposition: None,
-                    failure: None,
-                    health: None,
-                    io_close_failure: None,
-                }),
-            }));
-        let mut input = None;
-        let mut ready = None;
-        let mut exit = None;
-        let mut execution = Some(execution);
-        self.ports
-            .client
-            .prepare_background_action_in(
-                &originals.owner,
-                &mut execution,
-                &mut originals.query_concurrency,
-                &mut originals.root_payload,
-                &mut action,
-                &mut input,
-            )
-            .map_err(|e| Self::failure(e.to_string()))?;
-        let tail = self
-            .ports
-            .client
-            .start_background_action_in(&mut input, &mut originals.owner, &mut ready, &mut exit)
-            .map_err(|e| Self::failure(e.to_string()))?;
-        // The repository's original record receives the observer before any
-        // wait can disappear. This transfers observation, not physical custody.
-        progress
-            .install_exit_in(&mut exit)
-            .map_err(|e| Self::failure(e.to_string()))?;
-        tail.finish().map_err(|e| Self::failure(e.to_string()))?;
-        let receipt = ready
-            .as_mut()
-            .ok_or_else(|| Self::failure("background start returned no Ready source"))?
-            .await
-            .map_err(|original| {
-                // The already-installed exit observer retains the original
-                // source and opaque health cause. Project only safe detail.
-                Self::failure(
-                    original
-                        .health()
-                        .map_or("statistics background action panicked", |health| {
-                            health.detail()
-                        }),
-                )
-            })?;
-        let result = {
-            let original = receipt.view();
-            match original.result() {
-                novarocks_query_application::session_control::BackgroundActionResultView::Succeeded => Ok(()),
-                novarocks_query_application::session_control::BackgroundActionResultView::Failed(error) => Err(Self::failure(error.to_string())),
-            }
-        };
-        receipt.finish();
-        result
-    }
-}
-impl CoreStatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
-    fn execute<'a>(
-        &'a self,
-        job: StatisticsJob,
-        admission: StatisticsJobAdmission,
-        progress: StatisticsJobProgress,
-    ) -> Pin<Box<dyn Future<Output = Result<(), CoreStatisticsAttemptError>> + Send + 'a>> {
-        Box::pin(execute_statistics_original(
-            self.ports.clone(),
-            job,
-            admission,
-            progress,
-        ))
-    }
-}
-
-// A concrete owned factory lets the original per-Root process-source quote
-// measure the actual Starting F before any job or MIO allocation exists.
-async fn execute_statistics_original(
-    ports: StatisticsAttemptExecutorPorts,
-    job: StatisticsJob,
-    admission: StatisticsJobAdmission,
-    progress: StatisticsJobProgress,
-) -> Result<(), CoreStatisticsAttemptError> {
-    FrontendStatisticsAttemptExecutor { ports }
-        .execute_original(job, admission, progress)
-        .await
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -501,7 +219,11 @@ struct StatisticsState {
     // The Native factory borrows only a Weak. This same Arc crosses Action ->
     // residual and remains live until the original Native tail actually exits.
     credentials: Arc<InitialComputationCredentials>,
-    progress: StatisticsJobProgress,
+    business_result: Option<
+        Result<super::publication::StatisticsPublicationOutcome, CoreStatisticsAttemptError>,
+    >,
+    captured_binding: Option<super::application::StatisticsAttemptBinding>,
+    cleanup_failure: Option<super::publication::StatisticsPublicationFailure>,
     relation: crate::query_execution::statistics::StatisticsRelationIdentity,
     request: Option<StatisticsAttemptRequest>,
     planning_pin: Option<ConnectorControlPlanningPin>,
@@ -523,14 +245,8 @@ struct StatisticsState {
     disposition: Option<LakePublicationDisposition>,
     failure: Option<CoreStatisticsAttemptError>,
     health: Option<StatementNativeHealthFailure>,
-    // Keep an exited ordinary I/O refusal without changing the selected job.
+    // Keep an exited ordinary I/O refusal without changing the selected statement.
     io_close_failure: Option<WorkError>,
-}
-struct StatisticsAction {
-    state: Option<StatisticsState>,
-}
-struct StatisticsResidual {
-    state: StatisticsState,
 }
 fn service_error(error: impl ToString) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
@@ -538,14 +254,7 @@ fn service_error(error: impl ToString) -> QueryServiceError {
 fn failure(error: impl ToString) -> CoreStatisticsAttemptError {
     FrontendStatisticsAttemptExecutor::failure(error.to_string())
 }
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
-}
+
 impl Drop for StatisticsState {
     fn drop(&mut self) {
         // A refused start or notification unwind still closes the same
@@ -554,6 +263,22 @@ impl Drop for StatisticsState {
     }
 }
 impl StatisticsState {
+    fn finish_business(
+        &mut self,
+        result: Result<
+            super::publication::StatisticsPublicationOutcome,
+            CoreStatisticsAttemptError,
+        >,
+    ) -> Result<(), QueryServiceError> {
+        if self.business_result.is_none() {
+            self.business_result = Some(result);
+            Ok(())
+        } else {
+            Err(service_error(
+                "statistics statement result was already selected",
+            ))
+        }
+    }
     fn seal_credentials(&mut self) {
         if let Err(error) = self.credentials.seal_for_terminal() {
             // Keep this original ordinary failure without rewriting an already
@@ -606,9 +331,7 @@ impl StatisticsState {
                 .publication
                 .is_some();
         if !has_publication && let Some(error) = self.failure.take() {
-            self.progress
-                .finish(Err(error), now_ms())
-                .map_err(service_error)?;
+            self.finish_business(Err(error))?;
             self.selected = true;
             self.phase = ActionPhase::Finished;
             return Poll::Ready(Ok(()));
@@ -618,10 +341,12 @@ impl StatisticsState {
                 self.pending = Some(Box::pin(begin_session(
                     self.session.clone(),
                     self.request.take().unwrap(),
-                    self.planning_pin.as_ref().unwrap().clone(),
                     self.statistics_session.take().unwrap(),
                     self.context.clone(),
                     self.cpu.clone(),
+                    self.captured_binding.take().ok_or_else(|| {
+                        service_error("ANALYZE lost its original captured binding")
+                    })?,
                 )));
             }
             ActionPhase::AdmitCollection => {
@@ -633,8 +358,6 @@ impl StatisticsState {
                         .is_none()
                 };
                 if empty {
-                    self.progress.prepared(now_ms()).map_err(service_error)?;
-                    self.progress.collected(now_ms()).map_err(service_error)?;
                     self.phase = ActionPhase::Publish;
                 } else {
                     let work = owner
@@ -709,23 +432,12 @@ impl StatisticsState {
                     let assembly = match outcome {
                         Ok(assembly) => assembly,
                         Err(original) => {
-                            let projected = match &original {
-                                StatisticsPreparationFailure::Domain(error) => {
-                                    CoreStatisticsAttemptError::Failed(StatisticsFailure {
-                                        compile_control: error.compile_control_error(),
-                                        message: Arc::from(error.to_string()),
-                                    })
-                                }
-                                StatisticsPreparationFailure::Cpu(error) => {
-                                    failure(error.user_error())
-                                }
-                            };
+                            let projected = preparation_failure(&original);
                             self.plan.try_lock().map_err(service_error)?.failure = Some(original);
                             return self.fail(projected, cx);
                         }
                     };
                     self.computation.install_assembly(assembly)?;
-                    self.progress.prepared(now_ms()).map_err(service_error)?;
                 }
                 std::task::ready!(self.computation.poll_ready(
                     &self.ports.execution_runtime,
@@ -753,11 +465,13 @@ impl StatisticsState {
                         .take_native_tail()
                         .map_err(|error| self.retain_health(error))?,
                 );
-                self.progress.collected(now_ms()).map_err(service_error)?;
                 self.phase = ActionPhase::Publish;
             }
             ActionPhase::Publish => {
-                self.pending = Some(Box::pin(publish_session(self.session.clone())));
+                self.pending = Some(Box::pin(publish_session(
+                    self.session.clone(),
+                    self.context.clone(),
+                )));
             }
             ActionPhase::Finished => {
                 if !self.selected {
@@ -781,9 +495,7 @@ impl StatisticsState {
                         }
                         _ => None,
                     };
-                    self.progress
-                        .finish(Ok(outcome), now_ms())
-                        .map_err(service_error)?;
+                    self.finish_business(Ok(outcome))?;
                     self.selected = true;
                 }
                 return Poll::Ready(Ok(()));
@@ -810,9 +522,9 @@ impl StatisticsState {
         if let Some(health) = &self.health {
             return Poll::Ready(Err(health.clone()));
         }
-        self.io
-            .poll_continuing(cx)
-            .map_err(|e| health("statistics original I/O failed", Arc::new(e)))?;
+        if let Err(error) = self.io.poll_continuing(cx) {
+            self.io_close_failure.get_or_insert(error);
+        }
         if let Some(future) = self.pending.as_mut() {
             match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -870,14 +582,7 @@ impl StatisticsState {
                 if let Some(failure) =
                     cleanup.and_then(FrontendStatisticsAttemptExecutor::finalization_failure)
                 {
-                    self.progress
-                        .record_publication_cleanup_failure(failure)
-                        .map_err(|error| {
-                            health(
-                                "statistics cleanup observation was not retained",
-                                Arc::new(error),
-                            )
-                        })?;
+                    self.cleanup_failure.get_or_insert(failure);
                 }
             }
             self.cleanup_observed = true;
@@ -896,183 +601,58 @@ impl StatisticsState {
         Poll::Ready(Ok(()))
     }
 }
+fn preparation_failure(original: &StatisticsPreparationFailure) -> CoreStatisticsAttemptError {
+    let error = match original {
+        StatisticsPreparationFailure::Cpu(input) => {
+            QueryServiceError::from_execution_failure(input.as_ref().clone())
+        }
+        StatisticsPreparationFailure::Domain(error) => {
+            QueryServiceError::from_execution_failure(error.clone().into_execution_failure_input())
+                .with_compile_control(error.compile_control_error())
+        }
+    };
+    CoreStatisticsAttemptError::Failed(StatisticsFailure { error })
+}
 fn health(
     message: &'static str,
     cause: Arc<dyn std::error::Error + Send + Sync>,
 ) -> StatementNativeHealthFailure {
     StatementNativeHealthFailure::actual_exit_unproven(message, cause)
 }
-impl GovernedBackgroundAction for StatisticsAction {
-    fn poll_action(
-        &mut self,
-        context: &mut GovernedActionContext<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), QueryServiceError>> {
-        let state = self.state.as_mut().unwrap();
-        match state.poll_business(context, cx) {
-            Poll::Ready(Err(error)) if !state.selected => {
-                // Product state selects an ordinary failure independently of
-                // the shared bank's process-health result.
-                state
-                    .progress
-                    .finish(Err(failure(&error)), now_ms())
-                    .map_err(service_error)?;
-                state.selected = true;
-                Poll::Ready(Err(error))
-            }
-            result => result,
-        }
-    }
-    fn external_effect_disposition(
-        &self,
-    ) -> Option<novarocks_query_application::api::StatementExternalEffectDisposition> {
-        self.state
-            .as_ref()
-            .and_then(|s| s.disposition)
-            .map(crate::query::external_effect_from_lake)
-    }
-    fn local_health_failure(&self) -> Option<StatementNativeHealthFailure> {
-        self.state.as_ref().and_then(|s| {
-            s.health
-                .clone()
-                .or_else(|| s.io.health_failure())
-                .or_else(|| s.computation.local_health_failure())
-                .or_else(|| {
-                    s.cpu.local_failure().map(|cause| {
-                        health("statistics provider CPU actual exit is unproven", cause)
-                    })
-                })
-        })
-    }
-    fn handoff_residual_in(
-        &mut self,
-        target: &mut Option<Box<dyn GovernedStatementResidual>>,
-    ) -> Result<(), StatementNativeHealthFailure> {
-        if target.is_some() {
-            return Err(health(
-                "statistics residual receiver is occupied",
-                Arc::new(WorkError::Conflict),
-            ));
-        }
-        if let Some(state) = self.state.as_mut() {
-            state.seal_credentials();
-        }
-        if let Some(state) = self.state.take() {
-            *target = Some(Box::new(StatisticsResidual { state }));
-        }
-        Ok(())
-    }
-}
-impl GovernedStatementResidual for StatisticsResidual {
-    fn poll_retirement(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), StatementNativeHealthFailure>> {
-        self.state.poll_close(cx)
-    }
-}
-
 impl FrontendStatisticsAttemptExecutor {
     fn failure(message: impl Into<String>) -> CoreStatisticsAttemptError {
         CoreStatisticsAttemptError::Failed(StatisticsFailure {
-            compile_control: None,
-            message: Arc::from(message.into()),
+            error: service_error(Into::<String>::into(message)),
         })
     }
 
-    fn scope_error(error: novarocks_workload_control::WorkError) -> CoreStatisticsAttemptError {
-        if matches!(error, novarocks_workload_control::WorkError::Cancelled(_)) {
-            CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
-                compile_control: None,
-                message: Arc::from(error.to_string()),
-            })
+    fn scope_error(error: WorkError) -> CoreStatisticsAttemptError {
+        let cancelled = matches!(error, WorkError::Cancelled(_));
+        let failure = StatisticsFailure {
+            error: QueryServiceError::from_compile_control(
+                novarocks_type_contract::CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::from_static_detail(
+                        error,
+                        "statistics original workload refused progress",
+                    ),
+                ),
+            ),
+        };
+        if cancelled {
+            CoreStatisticsAttemptError::Cancelled(failure)
         } else {
-            Self::failure(error.to_string())
+            CoreStatisticsAttemptError::Failed(failure)
         }
-    }
-
-    fn application_error(error: StatisticsApplicationError) -> CoreStatisticsAttemptError {
-        Self::application_error_ref(&error)
     }
     fn application_error_ref(error: &StatisticsApplicationError) -> CoreStatisticsAttemptError {
+        let failure = StatisticsFailure {
+            error: error.to_query_service_error(),
+        };
         if error.target_binding_failure().is_some() {
-            CoreStatisticsAttemptError::Stale(StatisticsFailure {
-                compile_control: None,
-                message: Arc::from(error.to_string()),
-            })
+            CoreStatisticsAttemptError::Stale(failure)
         } else {
-            Self::failure(error.to_string())
+            CoreStatisticsAttemptError::Failed(failure)
         }
-    }
-
-    fn request(
-        job: &StatisticsJob,
-    ) -> Result<StatisticsAttemptRequest, CoreStatisticsAttemptError> {
-        let operation_id = novarocks_spi::connector::LakePublicationId::try_from_uuid(
-            job.publication_id.as_uuid(),
-        )
-        .map_err(|error| Self::failure(error.to_string()))?;
-        Ok(StatisticsAttemptRequest {
-            operation_id,
-            connector_instance_id: job.target.catalog.to_string(),
-            namespace: job.target.namespace.to_string(),
-            table: job.target.table.to_string(),
-            object_id: job.target.object_id.to_vec(),
-            columns: match &job.columns {
-                StatisticsColumns::All => StatisticsColumnIntent::AllColumns,
-                StatisticsColumns::Explicit(columns) => StatisticsColumnIntent::Explicit(
-                    columns.iter().map(ToString::to_string).collect(),
-                ),
-            },
-        })
-    }
-
-    fn context(
-        &self,
-        scope: &novarocks_workload_control::WorkScope,
-    ) -> Result<
-        (
-            Instant,
-            novarocks_query_application::cancellation::QueryCancellationView,
-        ),
-        CoreStatisticsAttemptError,
-    > {
-        scope.check().map_err(Self::scope_error)?;
-        let deadline = scope
-            .cancellation()
-            .map_err(Self::scope_error)?
-            .deadline()
-            .map(Into::into)
-            .unwrap_or_else(|| Instant::now() + self.ports.attempt_timeout);
-        let cancellation =
-            novarocks_query_application::cancellation::QueryCancellationView::governed(
-                scope.cancellation().map_err(Self::scope_error)?,
-                None,
-            );
-        if cancellation.is_cancelled() {
-            return Err(CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
-                compile_control: None,
-                message: Arc::from("statistics attempt cancelled before phase start"),
-            }));
-        }
-        Ok((deadline, cancellation))
-    }
-
-    fn collection_context(
-        &self,
-        deadline: Instant,
-        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
-        crate::connector::query_connector_request_context_on_runtime(
-            &self.ports.runtime,
-            deadline,
-            cancellation,
-        )
-        .map(|context| {
-            context
-                .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt)
-        })
-        .map_err(StatisticsApplicationError::new)
     }
 
     #[cfg(test)]
@@ -1083,7 +663,7 @@ impl FrontendStatisticsAttemptExecutor {
     }
     fn publication_failure(
         error: &novarocks_spi::connector::ConnectorMutationFailure,
-    ) -> novarocks_statistics_application::StatisticsPublicationFailure {
+    ) -> super::publication::StatisticsPublicationFailure {
         use novarocks_failure_contract::FailureProjection;
         let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
         let mut compile_control = None;
@@ -1096,7 +676,7 @@ impl FrontendStatisticsAttemptExecutor {
             }
             current = cause.source();
         }
-        let observation = novarocks_statistics_application::StatisticsPublicationFailure::capture(
+        let observation = super::publication::StatisticsPublicationFailure::capture(
             error.failure_fact(),
             compile_control,
             error,
@@ -1113,7 +693,7 @@ impl FrontendStatisticsAttemptExecutor {
     }
     fn finalization_failure(
         value: &ExternalMutationFinalization,
-    ) -> Option<novarocks_statistics_application::StatisticsPublicationFailure> {
+    ) -> Option<super::publication::StatisticsPublicationFailure> {
         match value {
             ExternalMutationFinalization::Complete => None,
             ExternalMutationFinalization::Failed(error) => Some(Self::publication_failure(error)),
@@ -1182,38 +762,33 @@ impl FrontendStatisticsAttemptExecutor {
 async fn begin_session(
     slot: Arc<tokio::sync::Mutex<SessionSlot>>,
     request: StatisticsAttemptRequest,
-    planning: ConnectorControlPlanningPin,
     statistics_session: ConnectorStatisticsSession,
     context: ConnectorRequestContext,
     cpu: Arc<dyn StatisticsCpuPort>,
+    binding: super::application::StatisticsAttemptBinding,
 ) -> Result<(), CoreStatisticsAttemptError> {
     // This stable slot remains owned by Action/Residual if its waiter unwinds.
     let mut original = slot.lock().await;
-    let binding = match super::application::rebind_table_object_async(
-        &planning,
-        context.clone(),
-        &request,
-        cpu.clone(),
-    )
-    .await
-    {
-        Ok(binding) => binding,
-        Err(error) => {
-            let projected = FrontendStatisticsAttemptExecutor::application_error_ref(&error);
-            original.binding_failure = Some(error);
-            return Err(projected);
-        }
-    };
     let selection = match &request.columns {
         StatisticsColumnIntent::AllColumns => StatisticsColumnSelection::Default,
-        StatisticsColumnIntent::Explicit(_) => StatisticsColumnSelection::explicit(
-            resolve_columns(&request, &binding.sql_columns)
-                .map_err(FrontendStatisticsAttemptExecutor::application_error)?
-                .into_iter()
-                .map(|c| Arc::from(c.name().as_str()))
-                .collect(),
-        )
-        .map_err(failure)?,
+        StatisticsColumnIntent::Explicit(_) => {
+            let columns = match resolve_columns(&request, &binding.sql_columns) {
+                Ok(columns) => columns,
+                Err(error) => {
+                    let projected =
+                        FrontendStatisticsAttemptExecutor::application_error_ref(&error);
+                    original.binding_failure = Some(error);
+                    return Err(projected);
+                }
+            };
+            StatisticsColumnSelection::explicit(
+                columns
+                    .into_iter()
+                    .map(|column| Arc::from(column.name().as_str()))
+                    .collect(),
+            )
+            .map_err(failure)?
+        }
     };
     let start = match statistics_session
         .begin_collection_async(
@@ -1294,10 +869,8 @@ async fn prepare_plan(
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let projected = CoreStatisticsAttemptError::Failed(StatisticsFailure {
-                compile_control: error.compile_control_error(),
-                message: Arc::from(error.to_string()),
-            });
+            let projected =
+                preparation_failure(&StatisticsPreparationFailure::Domain(error.clone()));
             original.failure = Some(StatisticsPreparationFailure::Domain(error));
             Err(projected)
         }
@@ -1305,6 +878,7 @@ async fn prepare_plan(
 }
 async fn publish_session(
     slot: Arc<tokio::sync::Mutex<SessionSlot>>,
+    context: ConnectorRequestContext,
 ) -> Result<(), CoreStatisticsAttemptError> {
     let mut original = slot.lock().await;
     let SessionSlot {
@@ -1314,10 +888,20 @@ async fn publish_session(
         provider_failure,
         ..
     } = &mut *original;
+    if let Err(error) = context.check_active() {
+        let projected = failure(&error);
+        *provider_failure = Some(error);
+        return Err(projected);
+    }
     let session = session
         .as_mut()
         .ok_or_else(|| failure("statistics publication has no original session"))?;
     if let Err(error) = session.prepare_publication_async(artifacts).await {
+        let projected = failure(&error);
+        *provider_failure = Some(error);
+        return Err(projected);
+    }
+    if let Err(error) = context.check_active() {
         let projected = failure(&error);
         *provider_failure = Some(error);
         return Err(projected);
@@ -1371,6 +955,7 @@ async fn close_session(
 pub(super) mod tests {
     use super::*;
     use bytes::Bytes;
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_spi::connector::{
         ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
         ExternalMutationEffect, ProviderBindingEpoch, StatisticsArtifactIdentity,
@@ -1457,6 +1042,8 @@ pub(super) mod tests {
         settled: bool,
         prepared: bool,
         published: bool,
+        stop_on_prepare: Option<novarocks_spi::connector::ConnectorStopOwner>,
+        close_gate: Option<Arc<tokio::sync::Notify>>,
     }
     impl EmptyCollectionSession {
         fn receipt(&self) -> StatisticsReceipt {
@@ -1493,6 +1080,9 @@ pub(super) mod tests {
                 assert!(!self.prepared);
                 drop(artifacts.take());
                 self.prepared = true;
+                if let Some(stop) = &self.stop_on_prepare {
+                    stop.request_stop();
+                }
                 Ok(())
             })
         }
@@ -1525,6 +1115,9 @@ pub(super) mod tests {
         ) -> StatisticsSessionFuture<'a, StatisticsPublicationClose> {
             Box::pin(async move {
                 assert_eq!(self.close_calls.fetch_add(1, Ordering::SeqCst), 0);
+                if let Some(gate) = &self.close_gate {
+                    gate.notified().await;
+                }
                 let outcome = if self.published {
                     ExternalMutationOutcome::KnownCommitted {
                         effect: ExternalMutationEffect::NoOp,
@@ -1550,6 +1143,7 @@ pub(super) mod tests {
     }
     fn empty_session(
         settled: bool,
+        close_gate: Option<Arc<tokio::sync::Notify>>,
     ) -> (
         Arc<tokio::sync::Mutex<SessionSlot>>,
         Arc<AtomicUsize>,
@@ -1568,6 +1162,8 @@ pub(super) mod tests {
                 settled,
                 prepared: false,
                 published: false,
+                stop_on_prepare: None,
+                close_gate,
             })),
             artifacts: Some(Vec::new()),
             ..SessionSlot::default()
@@ -1580,10 +1176,12 @@ pub(super) mod tests {
     }
     #[tokio::test]
     async fn empty_collection_is_retained_until_needed_publication_without_a_query_request() {
-        let (slot, finishes, closes) = empty_session(false);
+        let (slot, finishes, closes) = empty_session(false, None);
         assert!(slot.lock().await.program.is_none());
         assert_eq!(finishes.load(Ordering::SeqCst), 0);
-        publish_session(slot.clone()).await.unwrap();
+        publish_session(slot.clone(), crate::connector::test_request_context())
+            .await
+            .unwrap();
         let original = slot.lock().await;
         assert!(
             original.session.is_some(),
@@ -1600,22 +1198,208 @@ pub(super) mod tests {
             "publication does not manufacture GC exit"
         );
     }
-    // Reuse the actual async session/publish_session component in the Attached
-    // waiter regression. Both SPI variants carry the same original NoOp fact.
-    pub(in crate::statistics_jobs) async fn no_op_publication_for_test(
-        settled: bool,
-    ) -> StatisticsPublicationOutcome {
-        let (slot, finishes, closes) = empty_session(settled);
-        publish_session(slot.clone()).await.unwrap();
-        let original = slot.lock().await;
-        let outcome = FrontendStatisticsAttemptExecutor::publication_ready_outcome(
-            original.publication.as_ref().unwrap(),
-        );
-        assert_eq!(outcome.fact(), StatisticsPublicationFact::NoOp);
-        assert!(original.session.is_some());
+    #[tokio::test]
+    async fn both_no_op_publication_shapes_keep_original_session_until_close() {
+        for settled in [false, true] {
+            let (slot, finishes, closes) = empty_session(settled, None);
+            publish_session(slot.clone(), crate::connector::test_request_context())
+                .await
+                .unwrap();
+            let original = slot.lock().await;
+            let outcome = FrontendStatisticsAttemptExecutor::publication_ready_outcome(
+                original.publication.as_ref().unwrap(),
+            );
+            assert_eq!(outcome.fact(), StatisticsPublicationFact::NoOp);
+            assert!(original.session.is_some());
+            assert_eq!(finishes.load(Ordering::SeqCst), 1);
+            assert_eq!(closes.load(Ordering::SeqCst), 0);
+        }
+    }
+    struct CloseOnlyCpu(Arc<AtomicUsize>);
+    impl StatisticsCpuPort for CloseOnlyCpu {
+        fn submit_in(
+            &self,
+            _: &mut Option<novarocks_spi::connector::StatisticsCpuInput>,
+        ) -> Result<(), ConnectorError> {
+            panic!("close does not dispatch new CPU work")
+        }
+        fn poll_finished(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            panic!("close does not wait for computation readiness")
+        }
+        fn poll_closed(&self, _: &mut Context<'_>) -> Poll<Result<(), ConnectorError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+        fn local_failure(&self) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+            None
+        }
+        fn metadata_bytes(&self) -> Result<std::num::NonZeroU64, ConnectorError> {
+            Ok(std::num::NonZeroU64::new(1).unwrap())
+        }
+    }
+    #[tokio::test]
+    async fn publication_readiness_waits_for_real_provider_close_and_cpu_exit() {
+        use futures::FutureExt;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (slot, finishes, closes) = empty_session(false, Some(gate.clone()));
+        let context = crate::connector::test_request_context();
+        publish_session(slot.clone(), context.clone())
+            .await
+            .unwrap();
         assert_eq!(finishes.load(Ordering::SeqCst), 1);
-        assert_eq!(closes.load(Ordering::SeqCst), 0);
-        outcome
+        let cpu_closes = Arc::new(AtomicUsize::new(0));
+        let mut closing = Box::pin(close_session(
+            slot.clone(),
+            Arc::new(tokio::sync::Mutex::new(PlanSlot::default())),
+            FrontendCompletionCustody::new(),
+            context,
+            Arc::new(CloseOnlyCpu(cpu_closes.clone())),
+        ));
+        assert!(
+            closing.as_mut().now_or_never().is_none(),
+            "NeededReady cannot invent actual close"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cpu_closes.load(Ordering::SeqCst),
+            0,
+            "provider retains the original close before CPU exit"
+        );
+        gate.notify_one();
+        closing.await.unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(cpu_closes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            slot.lock().await.close,
+            Some(StatisticsPublicationClose::Observed {
+                owned_objects_disposed: true,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn preparation_cpu_and_domain_failures_keep_the_original_selected_input() {
+        use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        let input = ExecutionFailureInput::new(
+            WorkError::Capacity("original statistics capacity").failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating(
+                "original selected statistics failure",
+            ),
+            ExecutionFailureSite::Backend {
+                process: novarocks_types::BackendProcessId::new_v7(),
+            },
+        );
+        for original in [
+            StatisticsPreparationFailure::Cpu(Box::new(input.clone())),
+            StatisticsPreparationFailure::Domain(DistributedQueryError::from_execution(
+                input.clone(),
+            )),
+        ] {
+            let projected = preparation_failure(&original).failure().error;
+            assert_eq!(projected.execution_failure(), Some(&input));
+        }
+        let cause = novarocks_type_contract::CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(WorkError::Cancelled(
+                novarocks_workload_control::CancellationReason::Requested,
+            )),
+        );
+        let original = DistributedQueryError::from_encode(
+            novarocks_plan_codec::PhysicalEncodeError::Control(cause.clone()),
+        );
+        let expected = original.clone().into_execution_failure_input();
+        let projected = preparation_failure(&StatisticsPreparationFailure::Domain(original))
+            .failure()
+            .error;
+        assert_eq!(projected.execution_failure(), Some(&expected));
+        assert_eq!(projected.compile_control_error(), Some(cause));
+        let selected = DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "opaque owner detail",
+        );
+        assert_eq!(
+            preparation_failure(&StatisticsPreparationFailure::Domain(selected.clone()))
+                .failure()
+                .error
+                .execution_failure(),
+            Some(&selected.into_execution_failure_input())
+        );
+    }
+    #[test]
+    fn workload_stops_keep_the_original_cause_and_descriptor() {
+        use novarocks_failure_contract::FailureProjection;
+        for work in [
+            WorkError::Cancelled(novarocks_workload_control::CancellationReason::Requested),
+            WorkError::Cancelled(novarocks_workload_control::CancellationReason::DeadlineExceeded),
+            WorkError::Capacity("test resource"),
+        ] {
+            let failure = FrontendStatisticsAttemptExecutor::scope_error(work.clone());
+            let original = failure.failure();
+            let control = original.error.compile_control_error().unwrap();
+            let novarocks_type_contract::CompileControlError::Source(cause) = &control else {
+                panic!("original scope source")
+            };
+            assert_eq!(cause.downcast_ref::<WorkError>(), Some(&work));
+            let error = StatisticsApplicationError::from_statistics_attempt(
+                novarocks_spi::connector::LakePublicationId::new_v7(),
+                &super::super::application::StatisticsTableTarget {
+                    catalog: "ice".into(),
+                    namespace: "db".into(),
+                    table: "t".into(),
+                },
+                &Err(failure),
+            )
+            .unwrap()
+            .to_query_service_error();
+            assert_eq!(
+                error.execution_failure().unwrap().fact(),
+                work.failure_fact()
+            );
+            assert_eq!(error.compile_control_error(), Some(control));
+        }
+    }
+    #[tokio::test]
+    async fn cancellation_before_finish_never_dispatches_publication() {
+        for during_prepare in [false, true] {
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+            let context = crate::connector::connector_request_context(None, stop.view()).unwrap();
+            let slot = Arc::new(tokio::sync::Mutex::new(SessionSlot {
+                session: Some(Box::new(EmptyCollectionSession {
+                    descriptor: ConnectorInstanceDescriptor {
+                        provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                        instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+                    },
+                    finish_calls: finishes.clone(),
+                    close_calls: Arc::new(AtomicUsize::new(0)),
+                    settled: false,
+                    prepared: false,
+                    published: false,
+                    stop_on_prepare: during_prepare.then(|| stop.clone()),
+                    close_gate: None,
+                })),
+                artifacts: Some(Vec::new()),
+                ..Default::default()
+            }));
+            if !during_prepare {
+                stop.request_stop();
+            }
+            assert!(publish_session(slot.clone(), context).await.is_err());
+            assert_eq!(finishes.load(Ordering::SeqCst), 0);
+            let original = slot.lock().await;
+            assert!(original.publication.is_none());
+            let cause = original.provider_failure.as_ref().unwrap();
+            assert_eq!(
+                StatisticsApplicationError::from_connector_error(cause.clone())
+                    .to_query_service_error()
+                    .execution_failure()
+                    .unwrap()
+                    .fact(),
+                cause.failure_fact()
+            );
+        }
     }
     #[test]
     fn explicit_statistics_columns_keep_missing_duplicate_and_ambiguous_rejections() {
@@ -1634,7 +1418,15 @@ pub(super) mod tests {
             ),
         };
         let a = Arc::new(Field::new("a", DataType::Int64, true));
-        assert!(resolve_columns(&request(vec!["missing"]), std::slice::from_ref(&a)).is_err());
+        for names in [vec![], vec!["missing"], vec!["a", "A"]] {
+            let error = resolve_columns(&request(names), std::slice::from_ref(&a))
+                .unwrap_err()
+                .to_query_service_error();
+            assert_eq!(
+                error.user_error().unwrap().code().as_str(),
+                "sql.analyze.invalid_analyze_property"
+            );
+        }
         assert!(resolve_columns(&request(vec!["a", "A"]), std::slice::from_ref(&a)).is_err());
         assert!(
             resolve_columns(
@@ -1645,3 +1437,6 @@ pub(super) mod tests {
         );
     }
 }
+
+mod statement;
+pub(crate) use statement::StatisticsStatementExecutor;

@@ -525,10 +525,8 @@ fn validate_theta_properties(
         ));
     }
     if let Some(rendered) = properties.get(crate::stats_loader::NDV_PROPERTY) {
-        let supplied = rendered
-            .parse::<f64>()
-            .map_err(|_| invalid("Iceberg Theta write statistics ndv property is not numeric"))?;
-        if !supplied.is_finite() || supplied < 0.0 || supplied.to_bits() != estimate.to_bits() {
+        let supplied = crate::stats_loader::parse_ndv_property(rendered).map_err(invalid)?;
+        if supplied != crate::stats_loader::integer_ndv_estimate(estimate).map_err(invalid)? {
             return Err(invalid(
                 "Iceberg Theta write statistics ndv property does not match its body",
             ));
@@ -552,7 +550,9 @@ fn normalized_theta_artifact(
         body,
         BTreeMap::from([(
             crate::stats_loader::NDV_PROPERTY.to_string(),
-            estimate.to_string(),
+            crate::stats_loader::integer_ndv_estimate(estimate)
+                .map_err(invalid)?
+                .to_string(),
         )]),
         retention,
     )
@@ -4240,6 +4240,14 @@ mod statistics_contract_tests {
     fn supplied_ndv_property_must_match_theta_body_estimate() {
         let exact = BTreeMap::from([(crate::stats_loader::NDV_PROPERTY.to_string(), "7".into())]);
         validate_theta_properties(&exact, 7.0).expect("exact NDV");
+        validate_theta_properties(&exact, 7.9).expect("truncated estimate NDV");
+        for rendered in ["7.9", " 7", "7 "] {
+            let invalid = BTreeMap::from([(
+                crate::stats_loader::NDV_PROPERTY.to_string(),
+                rendered.into(),
+            )]);
+            assert!(validate_theta_properties(&invalid, 7.9).is_err());
+        }
 
         let mismatched =
             BTreeMap::from([(crate::stats_loader::NDV_PROPERTY.to_string(), "8".into())]);

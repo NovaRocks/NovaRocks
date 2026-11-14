@@ -35,7 +35,6 @@ pub enum MaterializedViewStatement {
     Drop(DropMaterializedView),
     Alter(AlterMaterializedView),
     Refresh(RefreshMaterializedView),
-    Show(ShowMaterializedViews),
     ExplainRefresh(ExplainRefreshMaterializedView),
 }
 
@@ -46,7 +45,6 @@ impl MaterializedViewStatement {
             Self::Drop(value) => value.span,
             Self::Alter(value) => value.span,
             Self::Refresh(value) => value.span,
-            Self::Show(value) => value.span,
             Self::ExplainRefresh(value) => value.span,
         }
     }
@@ -107,12 +105,6 @@ pub struct RefreshMaterializedView {
 pub enum MaterializedViewRefreshMode {
     Sync,
     Async,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowMaterializedViews {
-    pub database: Option<ObjectName>,
-    pub span: Span,
 }
 
 /// The syntax-level `EXPLAIN [VERBOSE|COSTS] REFRESH MATERIALIZED VIEW` wrapper.
@@ -186,7 +178,6 @@ pub(crate) fn write_sql(statement: &MaterializedViewStatement, output: &mut Stri
         MaterializedViewStatement::Drop(value) => write_drop(value, output),
         MaterializedViewStatement::Alter(value) => write_alter(value, output),
         MaterializedViewStatement::Refresh(value) => write_refresh(value, output),
-        MaterializedViewStatement::Show(value) => write_show(value, output),
         MaterializedViewStatement::ExplainRefresh(value) => {
             output.push_str("EXPLAIN");
             match value.level {
@@ -286,14 +277,6 @@ fn write_refresh(value: &RefreshMaterializedView, output: &mut String) {
             MaterializedViewRefreshMode::Async => "ASYNC",
         });
         output.push_str(" MODE");
-    }
-}
-
-fn write_show(value: &ShowMaterializedViews, output: &mut String) {
-    output.push_str("SHOW MATERIALIZED VIEWS");
-    if let Some(database) = &value.database {
-        output.push_str(" FROM ");
-        output.push_str(&print_object_name(database));
     }
 }
 
@@ -424,11 +407,6 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &MaterializedV
             walk_alter_action(visitor, &value.action);
         }
         MaterializedViewStatement::Refresh(value) => visitor.visit_object_name(&value.name),
-        MaterializedViewStatement::Show(value) => {
-            if let Some(database) = &value.database {
-                visitor.visit_object_name(database);
-            }
-        }
         MaterializedViewStatement::ExplainRefresh(value) => {
             visitor.visit_object_name(&value.refresh.name)
         }
@@ -482,12 +460,6 @@ pub(crate) fn fold<F: Fold + ?Sized>(
         MaterializedViewStatement::Refresh(mut value) => {
             value.name = folder.fold_object_name(value.name);
             MaterializedViewStatement::Refresh(value)
-        }
-        MaterializedViewStatement::Show(mut value) => {
-            value.database = value
-                .database
-                .map(|database| folder.fold_object_name(database));
-            MaterializedViewStatement::Show(value)
         }
         MaterializedViewStatement::ExplainRefresh(mut value) => {
             value.refresh.name = folder.fold_object_name(value.refresh.name);

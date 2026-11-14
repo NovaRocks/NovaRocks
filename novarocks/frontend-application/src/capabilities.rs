@@ -33,22 +33,18 @@ use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::kernels as domain;
+use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::maintenance::command as maintenance_command;
-use crate::query_execution::maintenance::{
-    BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory, BackgroundMaintenanceEngine,
-    TableMaintenanceEngine, TableMaintenanceService,
-};
 use crate::query_execution::package_freeze::CompiledPackageCarrier;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::BackendTopologyService;
-use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
 use novarocks_query_application::system_tables::SystemTableRegistry;
 use novarocks_query_application::view::ViewService;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvProductAdapter, command as mv_command};
+use crate::statistics::application::StatisticsApplicationPort;
 use crate::statistics::command::StatisticsCommandExecutor;
-use crate::statistics_jobs::application::StatisticsApplicationPort;
 use crate::view::command::ViewCommandExecutor;
 
 use crate::query::compiler::FrontendQueryCompiler;
@@ -343,22 +339,6 @@ pub(crate) fn statistics_command_executor(
     StatisticsCommandExecutor::new(application)
 }
 
-/// Leaf port for FE-owned backend membership commands.
-#[derive(Clone)]
-pub struct BackendCommandPorts {
-    topology: Arc<dyn BackendTopologyCommandPort>,
-}
-
-impl BackendCommandPorts {
-    pub fn new(topology: Arc<dyn BackendTopologyCommandPort>) -> Self {
-        Self { topology }
-    }
-}
-
-pub fn backend_command_executor(ports: BackendCommandPorts) -> BackendCommandExecutor {
-    BackendCommandExecutor::new(ports.topology)
-}
-
 /// Leaf ports for `ALTER ICEBERG REF`.
 #[derive(Clone)]
 pub struct IcebergRefCommandPorts {
@@ -485,14 +465,6 @@ pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
     maintenance_command::MaintenanceCommandExecutor::new(ports.kernel(), ports.runtime)
-}
-
-/// Build the read-only maintenance command capability.  It deliberately has
-/// no catalog, provider, or request-execution port.
-pub fn maintenance_read_command_executor(
-    service: Arc<dyn TableMaintenanceService>,
-) -> maintenance_command::MaintenanceReadCommandExecutor {
-    maintenance_command::MaintenanceReadCommandExecutor::new(service)
 }
 
 /// Leaf ports for MV metadata and refresh execution.
@@ -800,122 +772,15 @@ pub(crate) fn mv_refresh_provider_activation(
     )
 }
 
-pub use crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutorPorts;
+pub use crate::statistics::attempt_executor::StatisticsAttemptExecutorPorts;
 
 /// Build the product worker's explicit prepare/collect/publish adapter from
 /// the same role-owned leaves. This is constructed before SQL serving opens;
 /// it is deliberately not a late-bound sink on the product port.
 pub(crate) fn statistics_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
-) -> Arc<dyn novarocks_statistics_application::StatisticsAttemptExecutor> {
-    Arc::new(
-        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(ports),
-    )
-}
-
-/// Build the automatic-maintenance engine from the same maintenance command
-/// leaves plus a Frontend-supplied attempt factory.  Each automatic attempt
-/// obtains a fresh topology and cancellation scope through that factory.
-pub fn background_maintenance_engine(
-    ports: MaintenanceCommandPorts,
-    attempt_factory: Arc<dyn BackgroundMaintenanceAttemptFactory>,
-) -> Arc<dyn TableMaintenanceEngine> {
-    Arc::new(BackgroundMaintenanceEngine::new(
-        ports.kernel(),
-        attempt_factory,
-    ))
-}
-
-/// Capture one automatic-maintenance attempt from the Frontend's live role
-/// and topology. `QueryExecutionContext` remains opaque so callers cannot
-/// manufacture a default topology, deadline, or cancellation identity.
-pub fn background_maintenance_attempt(
-    role: novarocks_types::ClusterRole,
-    topology: BackendTopologyService,
-    max_attempt_duration: std::time::Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<BackgroundMaintenanceAttempt, String> {
-    original_maintenance_context(role, topology, max_attempt_duration, runtime, None, None)
-}
-
-/// Bind only original Root control/deadline. MIO and the computation source
-/// must install their own positive capacity before any physical work.
-pub fn original_background_maintenance_attempt(
-    role: novarocks_types::ClusterRole,
-    topology: BackendTopologyService,
-    max_attempt_duration: std::time::Duration,
-    runtime: &tokio::runtime::Handle,
-    owner: &novarocks_workload_control::WorkOwner,
-) -> Result<BackgroundMaintenanceAttempt, String> {
-    let root = owner.scope();
-    root.check().map_err(|e| e.to_string())?;
-    let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::from_root_owner(owner)
-        .map_err(|error| error.to_string())?;
-    original_maintenance_context(
-        role,
-        topology,
-        max_attempt_duration,
-        runtime,
-        Some(&capacity),
-        Some(&root),
-    )
-}
-
-fn original_maintenance_context(
-    role: novarocks_types::ClusterRole,
-    topology: BackendTopologyService,
-    max_attempt_duration: std::time::Duration,
-    runtime: &tokio::runtime::Handle,
-    capacity: Option<
-        &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
-    >,
-    original_root: Option<&novarocks_workload_control::WorkScope>,
-) -> Result<BackgroundMaintenanceAttempt, String> {
-    let topology = topology.snapshot().map_err(|error| error.to_string())?;
-    let deadline = std::time::Instant::now()
-        .checked_add(max_attempt_duration)
-        .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
-    let (cancellation, deadline) = match original_root {
-        Some(root) => {
-            let view = root.cancellation().map_err(|error| error.to_string())?;
-            let deadline = view
-                .deadline()
-                .map(std::time::Instant::from)
-                .map_or(deadline, |root_deadline| root_deadline.min(deadline));
-            (
-                novarocks_query_application::cancellation::QueryCancellationView::governed(
-                    view, None,
-                ),
-                deadline,
-            )
-        }
-        None => (
-            novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
-            deadline,
-        ),
-    };
-    let execution = novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
-        role,
-        topology,
-        Some(deadline),
-        cancellation,
-        novarocks_sql::compiler::SessionOptimizerSettings::default(),
-        novarocks_sql::sql_mode::SqlSemanticSettings::default(),
-    );
-    let execution = match capacity {
-        Some(capacity) => execution
-            .with_result_capacity(capacity.clone())
-            .map_err(|error| error.to_string())?,
-        None => execution,
-    };
-    let connector_context = crate::connector::connector_request_context_for_execution_on_runtime(
-        None, &execution, runtime,
-    )?
-    .with_initiation(novarocks_spi::connector::ConnectorRequestInitiation::JobAttempt);
-    Ok(BackgroundMaintenanceAttempt::new(
-        execution,
-        connector_context,
-    ))
+) -> Arc<crate::statistics::attempt_executor::FrontendStatisticsAttemptExecutor> {
+    Arc::new(crate::statistics::attempt_executor::FrontendStatisticsAttemptExecutor::new(ports))
 }
 
 /// Leaf ports for the Frontend-owned MV background worker.

@@ -80,6 +80,8 @@ Pass `images.trino.image_id` from that result as `NOVA_TRINO_REFERENCE_IMAGE`.
 The scripts do not select or validate a reference version. The result file is
 separate from command diagnostics; failed preparation does not publish a result.
 
+The SQL runner's isolated REST publication uses its original `runtime.catalog` network and generated warehouse, with explicit schema/table locations and actual data-file prefix checks. Shared publications continue to use `runtime.machine`, the original run identity and scratch scope. Both paths use the original `trino_run.py` owner for exact-container start, execution and cleanup.
+
 The caller must also supply the original `NOVA_FIXTURE_RUN_CONTEXT`. Shared REST
 namespaces use the original run identity and scratch scope. Temporary containers
 retain the publication's exact network, image command and original deadline;

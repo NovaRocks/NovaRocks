@@ -96,7 +96,6 @@ pub struct ScopeSnapshot {
 pub struct WorkClassTotals {
     pub query: u64,
     pub materialized_view: u64,
-    pub statistics: u64,
     pub table_maintenance: u64,
     pub management: u64,
 }
@@ -108,7 +107,6 @@ impl WorkClassTotals {
             WorkClass::MaterializedView => {
                 self.materialized_view = self.materialized_view.saturating_add(1)
             }
-            WorkClass::Statistics => self.statistics = self.statistics.saturating_add(1),
             WorkClass::TableMaintenance => {
                 self.table_maintenance = self.table_maintenance.saturating_add(1)
             }

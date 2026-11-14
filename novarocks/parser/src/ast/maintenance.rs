@@ -32,7 +32,6 @@ pub enum MaintenanceStatement {
     RewriteManifests(RewriteManifests),
     ExpireSnapshots(ExpireSnapshots),
     RemoveOrphanFiles(RemoveOrphanFiles),
-    ShowOptimize(ShowAlterTableOptimize),
 }
 
 impl MaintenanceStatement {
@@ -43,7 +42,6 @@ impl MaintenanceStatement {
             Self::RewriteManifests(statement) => statement.span,
             Self::ExpireSnapshots(statement) => statement.span,
             Self::RemoveOrphanFiles(statement) => statement.span,
-            Self::ShowOptimize(statement) => statement.span,
         }
     }
 }
@@ -151,39 +149,6 @@ pub struct RemoveOrphanFiles {
     pub span: Span,
 }
 
-/// `SHOW ALTER TABLE OPTIMIZE` and its optional presentation clauses.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowAlterTableOptimize {
-    pub from: Option<ObjectName>,
-    pub filter: Option<ShowOptimizeFilter>,
-    pub order_by: Option<ShowOptimizeOrder>,
-    pub limit: Option<Literal>,
-    pub span: Span,
-}
-
-/// A simple equality filter in `SHOW ALTER TABLE OPTIMIZE`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowOptimizeFilter {
-    pub column: Ident,
-    pub value: Literal,
-    pub span: Span,
-}
-
-/// An `ORDER BY` item in `SHOW ALTER TABLE OPTIMIZE`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowOptimizeOrder {
-    pub column: Ident,
-    pub direction: Option<SortDirection>,
-    pub span: Span,
-}
-
-/// An explicit `ORDER BY` direction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SortDirection {
-    Asc,
-    Desc,
-}
-
 pub(crate) fn write_sql(statement: &MaintenanceStatement, output: &mut String) {
     match statement {
         MaintenanceStatement::Call(statement) => write_call(statement, output),
@@ -221,7 +186,6 @@ pub(crate) fn write_sql(statement: &MaintenanceStatement, output: &mut String) {
             output.push_str(" REMOVE ORPHAN FILES OLDER THAN ");
             write_value(&statement.older_than, output);
         }
-        MaintenanceStatement::ShowOptimize(statement) => write_show_optimize(statement, output),
     }
 }
 
@@ -252,21 +216,6 @@ pub(crate) fn walk<V: Visit + ?Sized>(visitor: &mut V, statement: &MaintenanceSt
         MaintenanceStatement::RemoveOrphanFiles(statement) => {
             visitor.visit_object_name(&statement.table);
             walk_value(visitor, &statement.older_than);
-        }
-        MaintenanceStatement::ShowOptimize(statement) => {
-            if let Some(from) = &statement.from {
-                visitor.visit_object_name(from);
-            }
-            if let Some(filter) = &statement.filter {
-                visitor.visit_ident(&filter.column);
-                visitor.visit_literal(&filter.value);
-            }
-            if let Some(order_by) = &statement.order_by {
-                visitor.visit_ident(&order_by.column);
-            }
-            if let Some(limit) = &statement.limit {
-                visitor.visit_literal(limit);
-            }
         }
     }
 }
@@ -333,23 +282,6 @@ pub(crate) fn fold<F: Fold + ?Sized>(
                 span: statement.span,
             })
         }
-        MaintenanceStatement::ShowOptimize(statement) => {
-            MaintenanceStatement::ShowOptimize(ShowAlterTableOptimize {
-                from: statement.from.map(|name| folder.fold_object_name(name)),
-                filter: statement.filter.map(|filter| ShowOptimizeFilter {
-                    column: folder.fold_ident(filter.column),
-                    value: folder.fold_literal(filter.value),
-                    span: filter.span,
-                }),
-                order_by: statement.order_by.map(|order_by| ShowOptimizeOrder {
-                    column: folder.fold_ident(order_by.column),
-                    direction: order_by.direction,
-                    span: order_by.span,
-                }),
-                limit: statement.limit.map(|limit| folder.fold_literal(limit)),
-                span: statement.span,
-            })
-        }
     }
 }
 
@@ -368,35 +300,6 @@ fn write_call(statement: &CallStatement, output: &mut String) {
         write_value(&argument.value, output);
     }
     output.push(')');
-}
-
-fn write_show_optimize(statement: &ShowAlterTableOptimize, output: &mut String) {
-    output.push_str("SHOW ALTER TABLE OPTIMIZE");
-    if let Some(from) = &statement.from {
-        output.push_str(" FROM ");
-        write_object_name(from, output);
-    }
-    if let Some(filter) = &statement.filter {
-        output.push_str(" WHERE ");
-        write_ident(&filter.column, output);
-        output.push_str(" = ");
-        write_literal(&filter.value, output);
-    }
-    if let Some(order_by) = &statement.order_by {
-        output.push_str(" ORDER BY ");
-        write_ident(&order_by.column, output);
-        if let Some(direction) = order_by.direction {
-            output.push(' ');
-            output.push_str(match direction {
-                SortDirection::Asc => "ASC",
-                SortDirection::Desc => "DESC",
-            });
-        }
-    }
-    if let Some(limit) = &statement.limit {
-        output.push_str(" LIMIT ");
-        write_literal(limit, output);
-    }
 }
 
 fn write_value(value: &MaintenanceValue, output: &mut String) {

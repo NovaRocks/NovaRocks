@@ -12,7 +12,7 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,package-isolation
--- A corrupt document package quarantines only its exact target. SHOW keeps
+-- A corrupt document package quarantines only its exact target. The state table keeps
 -- a diagnostic row with UNAVAILABLE; a fault-free sweep restores it.
 
 -- query 1
@@ -63,7 +63,7 @@ SELECT 1;
 -- @result_contains=a_mv
 -- @result_contains=UNAVAILABLE
 USE lnp3d_pkg_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT name, manageability, manageability_reason FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_pkg_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 4
 -- @restart_fe_after_step=true
@@ -74,7 +74,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_contains=a_mv
 USE lnp3d_pkg_${uuid0}.ns_${uuid0};
-SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
+SELECT name, manageability, manageability_reason FROM system.runtime.materialized_view_states WHERE catalog_name = 'lnp3d_pkg_${uuid0}' AND schema_name = 'ns_${uuid0}';
 
 -- query 6
 -- @retry_count=40

@@ -639,6 +639,7 @@ mod tests {
         let preflight_journal = journal.clone();
         let publisher = journal.observe_prepared(Arc::new(
             crate::commit::attempt::prepared::CatalogPublisher {
+                expected_table_uuid: None,
                 catalog_operation: crate::catalog::admission::CatalogOperation::Overwrite,
                 catalog: Arc::clone(&fixture.owner),
                 ident: fixture.table_ident.clone(),

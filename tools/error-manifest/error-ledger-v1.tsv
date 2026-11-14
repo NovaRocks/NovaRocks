@@ -33,6 +33,7 @@ sql.admit.session_transaction_unsupported	Admit	Active
 sql.admit.update_unsupported_form	Admit	Active
 sql.analyze.duplicate_column_name	Analyze	Active
 sql.analyze.internal	Analyze	Active
+sql.analyze.invalid_analyze_property	Analyze	Active
 sql.analyze.invalid_argument	Analyze	Active
 sql.analyze.invalid_literal	Analyze	Active
 sql.analyze.invalid_query_shape	Analyze	Active

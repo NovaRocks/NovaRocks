@@ -51,6 +51,10 @@ impl MaintenanceCommandExecutor {
         current_database: &str,
         execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
         connector: &novarocks_spi::connector::ConnectorRequestContext,
+        family: novarocks_result_contract::ClientPresentationFamily,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
     ) -> Result<
         Option<Box<dyn novarocks_query_application::session_control::GovernedStatementAction>>,
         novarocks_table_maintenance::runtime::TerminalError,
@@ -67,7 +71,7 @@ impl MaintenanceCommandExecutor {
         else {
             return Ok(None);
         };
-        super::rewrite_submission::prepare(
+        super::rewrite_job::direct::prepare_optimize(
             &self.kernel,
             &name_parts,
             MaintenanceRequestContext {
@@ -76,6 +80,9 @@ impl MaintenanceCommandExecutor {
             },
             execution,
             connector,
+            family,
+            #[cfg(novarocks_dev_controls)]
+            observation,
         )
         .map(Some)
     }
@@ -598,35 +605,6 @@ impl MaintenanceCommandCall {
     }
 }
 
-#[derive(Clone)]
-pub struct MaintenanceReadCommandExecutor {
-    service: Arc<dyn TableMaintenanceService>,
-}
-
-impl MaintenanceReadCommandExecutor {
-    pub fn new(service: Arc<dyn TableMaintenanceService>) -> Self {
-        Self { service }
-    }
-
-    /// Executes a semantic `SHOW ALTER TABLE OPTIMIZE` presentation command.
-    pub fn execute_command(
-        &self,
-        statement: &novarocks_sql::semantic::command::ShowOptimizeSqlCommand,
-        current_catalog: Option<&str>,
-        current_database: &str,
-    ) -> Result<StatementResult, String> {
-        self.service
-            .handle_typed_show_optimize(
-                crate::table_maintenance::lower_semantic_show_optimize(statement)?,
-                MaintenanceRequestContext {
-                    current_catalog,
-                    current_database,
-                },
-            )
-            .map(statement_result)
-    }
-}
-
 fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
     match result {
         MaintenanceStatementResult::Ok => StatementResult::Ok,
@@ -636,59 +614,7 @@ fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
 
 #[cfg(test)]
 mod tests {
-    use super::super::TableMaintenanceEngine;
-    use super::*;
-    use std::sync::Arc;
     use std::thread;
-
-    struct ReadOnlyService {
-        called: std::sync::atomic::AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl TableMaintenanceService for ReadOnlyService {
-        fn start(&self, _engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn handle_typed_show_optimize(
-            &self,
-            _statement: crate::table_maintenance::ParsedShowOptimize,
-            _context: MaintenanceRequestContext<'_>,
-        ) -> Result<MaintenanceStatementResult, String> {
-            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(MaintenanceStatementResult::Ok)
-        }
-
-        async fn shutdown_until(&self, _deadline: std::time::Instant) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn request_shutdown_for_process_exit(&self) {}
-    }
-
-    #[test]
-    fn show_optimize_uses_read_only_service_without_engine() {
-        let service = Arc::new(ReadOnlyService {
-            called: std::sync::atomic::AtomicBool::new(false),
-        });
-        let executor = MaintenanceReadCommandExecutor::new(Arc::clone(&service) as Arc<_>);
-        let statement =
-            novarocks_query_application::sql::parse_single_statement("SHOW ALTER TABLE OPTIMIZE")
-                .expect("parser statement");
-        let Some(novarocks_query_application::sql::ProductSqlCommand::Maintenance(
-            novarocks_sql::semantic::MaintenanceSqlCommand::ShowOptimize(command),
-        )) = novarocks_query_application::sql::lower_product_sql_command(&statement)
-            .expect("lower semantic command")
-        else {
-            panic!("expected semantic SHOW ALTER TABLE OPTIMIZE");
-        };
-        let result = executor
-            .execute_command(&command, Some("ice"), "db")
-            .expect("execute");
-        assert!(matches!(result, StatementResult::Ok));
-        assert!(service.called.load(std::sync::atomic::Ordering::SeqCst));
-    }
 
     #[test]
     fn injected_process_runtime_drives_work_from_a_plain_worker_thread() {

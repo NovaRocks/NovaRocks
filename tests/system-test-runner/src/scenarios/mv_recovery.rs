@@ -170,10 +170,13 @@ impl Scenario for MvStateStoreRestart {
         let views = query(
             context,
             &mut conn,
-            "SHOW MATERIALIZED VIEWS FROM ns",
+            &format!(
+                "SELECT name FROM system.runtime.materialized_view_states WHERE catalog_name = '{}' AND schema_name = 'ns' ORDER BY name",
+                catalog.replace('\'', "''")
+            ),
             "list MV definitions after FE restart",
         )?;
-        let names = mv_show_names(&views)?;
+        let names = mv_state_names(&views)?;
         if names != ["orders_mv", "orders_mv_2"] {
             bail!(
                 "MV definitions did not survive StateStore restart: names={names:?}; {}",
@@ -943,11 +946,24 @@ fn require_refresh_paused(
     view: &str,
     expected: bool,
 ) -> Result<()> {
-    let rows = conn.execute("SHOW MATERIALIZED VIEWS")?;
-    let actual = mv_show_field(&rows, view, "RefreshPaused")?;
-    if actual != expected.to_string() {
+    let rows = materialized_view_states(conn)?;
+    let name = mv_state_column(&rows, "name", "varchar")?;
+    let paused = mv_state_column(&rows, "refresh_paused", "boolean")?;
+    let targets = rows
+        .rows
+        .iter()
+        .filter(|row| matches!(row.get(name), Some(TrinoValue::Text(name)) if name == view))
+        .collect::<Vec<_>>();
+    ensure!(
+        targets.len() == 1,
+        "MV state table omitted or duplicated {view}"
+    );
+    let Some(TrinoValue::Boolean(actual)) = targets[0].get(paused) else {
+        bail!("MV state table omitted its typed refresh_paused");
+    };
+    if *actual != expected {
         bail!(
-            "{view} RefreshPaused is {actual}, expected {expected}; {}",
+            "{view} refresh_paused is {actual}, expected {expected}; {}",
             context.diagnostics()
         );
     }
@@ -2987,7 +3003,17 @@ fn mv_report_text<'a>(
     };
     Ok(value)
 }
-fn mv_show_column(result: &StatementResult, name: &str) -> Result<usize> {
+fn materialized_view_states(conn: &mut SqlSession) -> Result<StatementResult> {
+    let catalog = conn
+        .session()
+        .catalog
+        .as_deref()
+        .context("MV state read requires its selected catalog")?
+        .replace('\'', "''");
+    conn.execute(format!("SELECT name, refresh_paused, manageability, manageability_reason FROM system.runtime.materialized_view_states WHERE catalog_name = '{catalog}' AND schema_name = 'ns' ORDER BY name"))
+        .context("read materialized-view state facts")
+}
+fn mv_state_column(result: &StatementResult, name: &str, ty: &str) -> Result<usize> {
     let columns = result
         .columns
         .iter()
@@ -2998,22 +3024,22 @@ fn mv_show_column(result: &StatementResult, name: &str) -> Result<usize> {
     ensure!(
         result.is_result_set()
             && columns.len() == 1
-            && result.columns[columns[0]].type_signature.raw_type == "varchar",
-        "SHOW MATERIALIZED VIEWS omitted or duplicated declared text {name}"
+            && result.columns[columns[0]].type_signature.raw_type == ty,
+        "MV state table omitted or duplicated declared {ty} column {name}"
     );
     Ok(columns[0])
 }
-fn mv_show_names(result: &StatementResult) -> Result<Vec<String>> {
-    let index = mv_show_column(result, "Name")?;
+fn mv_state_names(result: &StatementResult) -> Result<Vec<String>> {
+    let index = mv_state_column(result, "name", "varchar")?;
     result
         .rows
         .iter()
         .map(|row| mv_report_text(result, row, index).map(str::to_owned))
         .collect()
 }
-fn mv_show_field(result: &StatementResult, view: &str, field: &str) -> Result<String> {
-    let name = mv_show_column(result, "Name")?;
-    let value = mv_show_column(result, field)?;
+fn mv_state_text(result: &StatementResult, view: &str, field: &str) -> Result<String> {
+    let name = mv_state_column(result, "name", "varchar")?;
+    let value = mv_state_column(result, field, "varchar")?;
     let targets = result
         .rows
         .iter()
@@ -3021,7 +3047,7 @@ fn mv_show_field(result: &StatementResult, view: &str, field: &str) -> Result<St
         .collect::<Vec<_>>();
     ensure!(
         targets.len() == 1,
-        "SHOW MATERIALIZED VIEWS omitted or duplicated exact target {view}"
+        "MV state table omitted or duplicated exact target {view}"
     );
     mv_report_text(result, targets[0], value).map(str::to_owned)
 }
@@ -3068,16 +3094,15 @@ fn assert_mv_quarantined_after_base_replacement(
 ) -> Result<()> {
     context.remaining("verify MV is quarantined after same-name base replacement")?;
     context.action("verify MV is quarantined after same-name base replacement");
-    let views = conn
-        .execute("SHOW MATERIALIZED VIEWS FROM ns")
-        .context("list MVs after same-name base replacement")?;
-    let manageability = mv_show_field(&views, mv, "Manageability")?;
-    if !manageability.starts_with("UNAVAILABLE:")
-        || !manageability
+    let views = materialized_view_states(conn)?;
+    let manageability = mv_state_text(&views, mv, "manageability")?;
+    let reason = mv_state_text(&views, mv, "manageability_reason")?;
+    if manageability != "UNAVAILABLE"
+        || !reason
             .contains("published MV base occurrence 0 no longer resolves to its frozen object")
     {
         bail!(
-            "same-name replacement MV is listed as {manageability:?}, expected source identity quarantine; {}",
+            "same-name replacement MV is listed as {manageability:?} ({reason:?}), expected source identity quarantine; {}",
             context.diagnostics()
         );
     }

@@ -42,25 +42,12 @@ INSERT INTO statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint
 ANALYZE TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0};
 
 -- query 5
--- Wait for this case's own job, not any SUCCEEDED job on the shared
--- frontend. The table is unique to this case and analyzed exactly once.
--- @retry_count=60
--- @retry_interval_ms=1000
--- @result_rows_where=catalog=statistics_hadoop_${suite_uuid0}
--- @result_rows_where=namespace=nr_largeint_${suite_uuid0}
--- @result_rows_where=table=largeint_minmax_${uuid0}
--- @result_rows_count=1
--- @result_rows_expect=state=SUCCEEDED
--- @skip_result_check=true
-SHOW ANALYZE JOBS;
-
--- query 6
 -- @result_contains=min-max stats
 -- @skip_result_check=true
 EXPLAIN VERBOSE
 SELECT DISTINCT k
 FROM statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0};
 
--- query 7
+-- query 6
 -- @skip_result_check=true
 DROP TABLE statistics_hadoop_${suite_uuid0}.nr_largeint_${suite_uuid0}.largeint_minmax_${uuid0} FORCE;
