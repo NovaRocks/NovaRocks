@@ -1553,5 +1553,167 @@ class BoundedOperationInventoryTest(unittest.TestCase):
                 machine.MachineDocker().settle_operations(base, inventory_deadline=time.monotonic() + 30)
 
 
+
+class OwnedContainerCleanupSettlementTests(unittest.TestCase):
+    """Exercise the real owner entry, lock and two persisted original journals.
+
+    Independent daemon/inspect doubles supply physical postconditions without
+    Docker. These tests protect narrow cleanup settlement and retained failure,
+    not actual daemon absence or native-run qualification.
+    """
+
+    def fixture(self, directory):
+        daemon = "test-daemon"
+        owner = machine.MachineOwner(Path(directory), daemon=daemon)
+        backend, base = owner.backend, owner.base
+        generation, version, identity = "b" * 32, "c" * 64, "d" * 64
+        state = dict(schema=machine.PROTOCOL, kind="machine", id=base.name,
+            namespace=base.name, daemon_id=daemon, control_root=str(owner.root),
+            project=machine.PROJECT, phase="ready", generation=generation, version=version,
+            network="owned-network", images={"mc": {"image_id": "sha256:" + "e" * 64}})
+        journal = base / "operations" / ("control-" + "a" * 32 + ".json")
+        creation = base / "activations" / generation / "operations" / (machine.PROJECT + "-mc-" + "f" * 32 + ".json")
+        fact = dict(schema=1, kind="control", phase="command-unknown", mutating=True,
+            control_root=str(owner.root), machine=base.name, cli_pid=12345,
+            command_dispatched=True, command_exit=0, timed_out=True,
+            command_succeeded=False, interrupted=False, leader_waited=True,
+            group_exit_confirmed=True, group_exit_observed=True,
+            group_exit_observed_monotonic=1234.51)
+        request = dict(operation="control", args=["container", "rm", "--force", identity],
+            environment=backend.environment, deadline_monotonic=1234.5)
+        created = dict(schema=1, phase="settled", container_absent=True,
+            container_name=creation.stem, generation=generation,
+            image_id=state["images"]["mc"]["image_id"],
+            labels={**backend.labels(state), "novarocks.fixture.version": version,
+                    "novarocks.fixture.activation": generation},
+            create_dispatched=True, create_exit=0, create_reply_id=identity,
+            container_id=identity, error="ContainerCleanupFailed", timed_out=True,
+            command_exit=143, command_succeeded=False)
+        created_request = dict(environment=backend.environment, network=state["network"],
+            env_file=str(creation.with_suffix(".env")), script="original secret payload must not escape",
+            deadline_monotonic=1230.0)
+        for path, value in ((base / "state.json", state), (journal, fact),
+                (journal.with_suffix(".request"), request), (creation, created),
+                (creation.with_suffix(".request"), created_request)):
+            runtime.atomic_json(path, value)
+        runtime.atomic_bytes(journal.with_suffix(".stdout"), b"")
+        runtime.atomic_bytes(Path(str(journal.with_suffix(".stdout")) + ".stderr"), b"")
+        return owner, journal, creation, fact
+
+    def test_exact_original_cleanup_settles_without_replaying_rm_or_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner, journal, creation, fact = self.fixture(directory)
+            other = owner.base / "operations" / ("control-" + "9" * 32 + ".json")
+            runtime.atomic_json(other, {"schema": 1, "phase": "command-unknown", "mutating": True})
+            originals = {path: path.read_bytes() for path in
+                (journal.with_suffix(".request"), creation, creation.with_suffix(".request"),
+                 owner.base / "state.json", other)}
+
+            def absent(kind, identity, *, absent_ok):
+                self.assertIsNotNone(owner.backend.maintenance_fd)
+                self.assertEqual(owner.backend.maintenance_base, owner.base)
+                with (owner.base / "maintenance.lock").open("rb") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        machine.fcntl.flock(contender, machine.fcntl.LOCK_EX | machine.fcntl.LOCK_NB)
+                return None
+
+            with mock.patch.object(owner.backend, "daemon_id", return_value="test-daemon"), \
+                    mock.patch.object(owner.backend, "inspect", side_effect=absent) as inspect, \
+                    mock.patch.object(owner.backend, "command", side_effect=AssertionError("no mutation replay")), \
+                    mock.patch.object(owner.backend, "settle_operations", side_effect=AssertionError("one exact obligation only")):
+                result = owner.resolve_owned_container_cleanup(journal, creation)
+            inspect.assert_called_once_with("container", "d" * 64, absent_ok=True)
+            saved = runtime.read_json(journal)
+            self.assertEqual(saved["phase"], "settled")
+            for key, value in fact.items():
+                if key != "phase":
+                    self.assertEqual(saved[key], value)
+            self.assertFalse(saved["command_succeeded"])
+            self.assertTrue(saved["timed_out"])
+            self.assertEqual(result["cleanup_obligation"], "settled")
+            self.assertNotIn("secret payload", json.dumps(result))
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+            self.assertIsNone(getattr(owner.backend, "operation_deadline", None))
+
+    def test_missing_foreign_or_incomplete_original_facts_refuse_without_rewrite(self):
+        changes = ("foreign-id", "unknown-create", "missing-exit", "wrong-verb",
+                   "name-selector", "wrong-image", "wrong-generation", "not-absent", "not-timeout",
+                   "foreign-label", "missing-group-exit", "missing-material", "wrong-current-generation",
+                   "malformed-image-state", "nonzero-native-exit", "nonempty-original-output")
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                owner, journal, creation, _ = self.fixture(directory)
+                target = journal.with_suffix(".request") if change in ("wrong-verb", "name-selector") else creation
+                value = runtime.read_json(target)
+                if change == "foreign-id":
+                    value["container_id"] = "0" * 64
+                elif change == "unknown-create":
+                    value.pop("create_reply_id")
+                elif change == "wrong-verb":
+                    value["args"] = ["volume", "rm", "--force", "d" * 64]
+                elif change == "name-selector":
+                    value["args"][-1] = creation.stem
+                elif change == "wrong-image":
+                    value["image_id"] = "sha256:" + "0" * 64
+                elif change == "wrong-generation":
+                    value["generation"] = "0" * 32
+                elif change == "not-absent":
+                    value["container_absent"] = False
+                elif change == "foreign-label":
+                    value["labels"]["novarocks.fixture.owner"] = "foreign-machine"
+                elif change in ("wrong-current-generation", "malformed-image-state"):
+                    target = owner.base / "state.json"
+                    value = runtime.read_json(target)
+                    if change == "wrong-current-generation":
+                        value["generation"] = "0" * 32
+                    else:
+                        value["images"]["mc"] = None
+                elif change in ("missing-exit", "missing-group-exit", "not-timeout", "nonzero-native-exit"):
+                    target, value = journal, runtime.read_json(journal)
+                    key = {"missing-exit": "leader_waited", "missing-group-exit": "group_exit_observed",
+                           "not-timeout": "timed_out", "nonzero-native-exit": "command_exit"}[change]
+                    value[key] = 1 if change == "nonzero-native-exit" else False
+                if change == "missing-material":
+                    creation.with_suffix(".request").unlink()
+                elif change == "nonempty-original-output":
+                    runtime.atomic_bytes(journal.with_suffix(".stdout"), b"not an empty native reply")
+                else:
+                    runtime.atomic_json(target, value)
+                before = journal.read_bytes()
+                with mock.patch.object(owner.backend, "daemon_id", return_value="test-daemon"), \
+                        mock.patch.object(owner.backend, "inspect", side_effect=AssertionError("reject before daemon absence")):
+                    with self.assertRaises(runtime.RuntimeFailure):
+                        owner.resolve_owned_container_cleanup(journal, creation)
+                self.assertEqual(journal.read_bytes(), before)
+
+    def test_daemon_absence_error_or_changed_material_never_settles(self):
+        for change in ("present", "daemon-error", "daemon-replaced", "changed-request", "deadline-after-observation"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                owner, journal, creation, _ = self.fixture(directory)
+                before = journal.read_bytes()
+                now = [1000.0]
+
+                def inspect(*args, **kwargs):
+                    if change == "present":
+                        return {"Id": "d" * 64}
+                    if change == "daemon-error":
+                        raise runtime.RuntimeFailure("DockerUnavailable", "native absence not observed")
+                    if change == "changed-request":
+                        request = runtime.read_json(journal.with_suffix(".request"))
+                        request["args"][-1] = "0" * 64
+                        runtime.atomic_json(journal.with_suffix(".request"), request)
+                    if change == "deadline-after-observation":
+                        now[0] += owner.timeout + 1
+                    return None
+
+                observed = ["test-daemon", "foreign-daemon"] if change == "daemon-replaced" else None
+                with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                        mock.patch.object(owner.backend, "daemon_id", side_effect=observed, return_value="test-daemon"), \
+                        mock.patch.object(owner.backend, "inspect", side_effect=inspect):
+                    with self.assertRaises(runtime.RuntimeFailure):
+                        owner.resolve_owned_container_cleanup(journal, creation)
+                self.assertEqual(journal.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
