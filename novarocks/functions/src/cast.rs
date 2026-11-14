@@ -45,10 +45,8 @@ use std::{error::Error, fmt};
 #[path = "cast_calendar.rs"]
 mod calendar;
 
-#[path = "cast/f3_scalar.rs"]
 mod f3_scalar;
 
-#[path = "cast/f3_array.rs"]
 mod f3_array;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2169,78 +2167,6 @@ impl PreparedCastRecipe {
     }
 }
 
-#[cfg(test)]
-#[path = "cast_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "cast_float_tests.rs"]
-mod float_tests;
-
-#[cfg(test)]
-#[path = "cast_float_identity_tests.rs"]
-mod float_identity_tests;
-
-#[cfg(test)]
-#[path = "cast_bool_tests.rs"]
-mod bool_tests;
-
-#[cfg(test)]
-#[path = "cast_unsigned_tests.rs"]
-mod unsigned_tests;
-
-#[cfg(test)]
-#[path = "cast_timestamp_tests.rs"]
-mod timestamp_tests;
-
-#[cfg(test)]
-#[path = "cast_temporal_carrier_tests.rs"]
-mod temporal_carrier_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal_text_tests.rs"]
-mod decimal_text_tests;
-
-#[cfg(test)]
-#[path = "cast_largeint_text_tests.rs"]
-mod largeint_text_tests;
-
-#[cfg(test)]
-#[path = "cast_date_float_tests.rs"]
-mod date_float_tests;
-
-#[cfg(test)]
-#[path = "cast_float_date_tests.rs"]
-mod float_date_tests;
-
-#[cfg(test)]
-#[path = "cast_binary_text_tests.rs"]
-mod binary_text_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal_float_tests.rs"]
-mod decimal_float_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal_float32_tests.rs"]
-mod decimal_float32_tests;
-
-#[cfg(test)]
-#[path = "cast_decimal128_rescale_tests.rs"]
-mod decimal128_rescale_tests;
-
-#[cfg(test)]
-#[path = "cast_observed_list_tests.rs"]
-mod observed_list_tests;
-
-#[cfg(test)]
-#[path = "cast_float_decimal128_tests.rs"]
-mod float_decimal128_tests;
-
-#[cfg(test)]
-#[path = "cast_nested_identity_tests.rs"]
-mod nested_identity_tests;
-
 fn temporal_row_failure(
     cause: crate::temporal_carrier::TemporalCastFailure,
     ordinal: usize,
@@ -2253,3 +2179,6 @@ fn temporal_row_failure(
         ClassifiedTemporalCastFailure::Outer(cause) => Err(KernelFailure::from_domain(cause)),
     }
 }
+
+#[cfg(test)]
+mod tests;

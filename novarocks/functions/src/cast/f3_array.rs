@@ -1056,5 +1056,4 @@ fn retag(
 }
 
 #[cfg(test)]
-#[path = "f3_array/tests.rs"]
 mod tests;

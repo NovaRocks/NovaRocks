@@ -274,5 +274,4 @@ fn reject_unresolved_error(
 }
 
 #[cfg(test)]
-#[path = "nullsafe_tests.rs"]
 mod tests;

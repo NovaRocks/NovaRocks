@@ -420,5 +420,4 @@ fn row_error(
 }
 
 #[cfg(test)]
-#[path = "f3_scalar/tests.rs"]
 mod tests;

@@ -226,5 +226,4 @@ pub fn may_raise(source: &DataType, target: &DataType, policy: DecimalOverflowPo
 }
 
 #[cfg(test)]
-#[path = "integral_decimal128_tests.rs"]
 mod tests;

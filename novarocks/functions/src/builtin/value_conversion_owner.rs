@@ -347,10 +347,6 @@ pub(super) fn prepared_for_test_with_policy(
     tests::prepare(source, target, policy)
 }
 
-#[cfg(test)]
-#[path = "value_conversion_owner_tests.rs"]
-mod tests;
-
 impl ValueConversionOwner {
     fn refine_selected_core(
         &self,
@@ -430,3 +426,6 @@ impl ValueConversionOwner {
         work.finish_result(result, compile_failure)
     }
 }
+
+#[cfg(test)]
+mod tests;
