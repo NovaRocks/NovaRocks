@@ -1501,7 +1501,7 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
     assert_eq!(traces.len(), 2);
     assert_eq!(traces[0]["attempt"], 0);
     assert_eq!(traces[1]["attempt"], 1);
-    assert_ne!(traces[0]["snapshot"], traces[1]["snapshot"]);
+    assert_eq!(traces[0]["snapshot"], traces[1]["snapshot"]);
     let snapshots = |trace: &Value| {
         trace["request"]["updates"]
             .as_array()
@@ -1532,11 +1532,13 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
             .parent_snapshot_id(),
         Some(other_snapshot)
     );
-    assert!(
+    assert_eq!(
         actual
             .metadata
             .snapshot_by_id(first[0]["snapshot-id"].as_i64().unwrap())
-            .is_none()
+            .unwrap()
+            .manifest_list(),
+        second[0]["manifest-list"].as_str().unwrap()
     );
     assert_eq!(actual.metadata.next_row_id(), 2);
     let attempt = operation.begin_attempt().unwrap();
@@ -1562,18 +1564,17 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
                 .to_owned()
         ])
     );
-    for record in operation.artifacts().unwrap().iter().filter(
-        |r| matches!(r.origin, ArtifactOrigin::Produced { attempt, .. } if attempt.ordinal() == 0),
-    ) {
-        assert!(
-            !attempt
+    for (snapshot, expected_exists) in [(&first[0], false), (&second[0], true)] {
+        assert_eq!(
+            attempt
                 .file_io()
-                .new_input(record.object.path())
+                .new_input(snapshot["manifest-list"].as_str().unwrap())
                 .unwrap()
                 .exists()
                 .await
                 .unwrap(),
-            "failed attempt object must be removed"
+            expected_exists,
+            "only the published attempt's manifest list must remain"
         );
     }
     java.record("retry-traces",&json!({"dispatches":traces,"metadata":semantic_facts(&actual.metadata),"cleanup":format!("{:?}",report.cleanup)}));
